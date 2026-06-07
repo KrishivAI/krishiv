@@ -23,6 +23,17 @@ pub struct FeatureRow {
 }
 
 /// Parquet-backed feature store with point-in-time lookup.
+///
+/// **Memory model**: [`Self::open`] eagerly parses every on-disk Parquet
+/// fragment into the in-memory `live` vector (and a derived entity index) so
+/// that [`Self::lookup`] can serve point-in-time queries without per-call
+/// disk I/O. `live` then grows monotonically as [`Self::append`] is called —
+/// there is no automatic eviction. Deployments that materialize TTL'd
+/// features over long-running streams should call [`Self::compact_expired`]
+/// periodically to bound memory; deployments with very large historical
+/// fragment sets or non-TTL'd unbounded growth should keep `table` scoped to
+/// a bounded retention window upstream (e.g. via periodic table rotation),
+/// since this store is not designed for lazy/paged fragment loading.
 #[derive(Debug)]
 pub struct FeatureStoreSink {
     root: PathBuf,
@@ -242,6 +253,50 @@ impl FeatureStoreSink {
             }
         }
         Ok(best.into_iter().map(|(k, (_, v))| (k, v)).collect())
+    }
+
+    /// Drop rows from the in-memory `live` set whose TTL has expired as of
+    /// `now_ms`, rebuilding the entity index. Rows with no `ttl_ms` are
+    /// retained.
+    ///
+    /// `live` only ever grows via [`Self::append`]/[`Self::reload_from_fragments`]
+    /// and is never otherwise pruned, so long-running streaming feature
+    /// stores with TTL'd rows would otherwise accumulate unbounded memory —
+    /// [`Self::lookup`] already filters expired rows out of query results,
+    /// so removing them here changes only memory footprint, not query
+    /// semantics. Hosts that materialize TTL'd features should call this
+    /// periodically (e.g. on a timer or before each `append`).
+    ///
+    /// Returns the number of rows removed.
+    pub fn compact_expired(&self, now_ms: u64) -> ConnectorResult<usize> {
+        let mut guard = self
+            .live
+            .write()
+            .map_err(|e| ConnectorError::Parquet(format!("feature store lock: {e}")))?;
+        let before = guard.len();
+        guard.retain(|row| match row.ttl_ms {
+            Some(ttl) => now_ms.saturating_sub(row.created_at_ms) <= ttl,
+            None => true,
+        });
+        let removed = before - guard.len();
+        if removed > 0 {
+            let mut index = BTreeMap::new();
+            for (idx, row) in guard.iter().enumerate() {
+                let entity_id = row
+                    .entity_key
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("|");
+                index.entry(entity_id).or_insert_with(Vec::new).push(idx);
+            }
+            let mut index_guard = self
+                .live_index
+                .write()
+                .map_err(|e| ConnectorError::Parquet(format!("feature store lock: {e}")))?;
+            *index_guard = index;
+        }
+        Ok(removed)
     }
 
     /// Number of on-disk parquet fragments (for tests).

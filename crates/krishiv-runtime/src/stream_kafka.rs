@@ -115,7 +115,7 @@ mod tests {
     use super::encode_stream_kafka_partition;
 
     fn make_batch(keys: &[&str], times: &[i64]) -> RecordBatch {
-        krishiv_common::arrow::make_test_key_ts_batch(keys.to_vec(), times.to_vec())
+        krishiv_common::test_fixtures::make_test_key_ts_batch(keys.to_vec(), times.to_vec())
     }
 
     fn make_batch_with_value(keys: &[&str], times: &[i64], values: &[i64]) -> RecordBatch {

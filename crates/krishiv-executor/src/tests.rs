@@ -3105,7 +3105,7 @@ mod executor_tests {
 
         // Build an input batch: events at t=100 and t=12_000 ms in a 10s window.
         // With lag=0 the second event advances the watermark past the first window.
-        let batch = krishiv_common::arrow::make_test_key_ts_batch(
+        let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(
             vec!["a", "a"],
             vec![100_i64, 12_000_i64],
         );
@@ -3143,10 +3143,10 @@ mod executor_tests {
         use std::sync::Arc;
 
         // First drain: single event in [0, 10000).  Window not yet emitted.
-        let batch1 = krishiv_common::arrow::make_test_key_ts_batch(vec!["a"], vec![500_i64]);
+        let batch1 = krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![500_i64]);
 
         // Second drain: event that advances watermark past 10000, closing the window.
-        let batch2 = krishiv_common::arrow::make_test_key_ts_batch(vec!["a"], vec![15_000_i64]);
+        let batch2 = krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![15_000_i64]);
 
         // The runner is CLONED between drains to simulate a re-used runner; its
         // `loop_executors` Arc is shared so state survives.
@@ -3201,7 +3201,7 @@ mod executor_tests {
         .unwrap();
         let fragment = format!("stream:loop:no-drainer-job|{window_spec}");
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-        let batch = krishiv_common::arrow::make_test_key_ts_batch(
+        let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(
             vec!["a", "a"],
             vec![100_i64, 12_000_i64],
         );
@@ -3220,7 +3220,7 @@ mod executor_tests {
     async fn legacy_stream_continuous_fragment_is_rejected() {
         let fragment = "stream:continuous:legacy-job";
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-        let batch = krishiv_common::arrow::make_test_key_ts_batch(vec!["a"], vec![100_i64]);
+        let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![100_i64]);
         let assignment = make_loop_assignment_with_batches(fragment, &[batch]);
 
         let error = runner

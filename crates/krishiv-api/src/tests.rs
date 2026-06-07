@@ -439,7 +439,7 @@ fn tumbling_window_carries_correct_config() {
 #[test]
 fn tumbling_window_collect_executes_in_embedded_mode() {
     let session = Session::builder().build().unwrap();
-    let batch = krishiv_common::arrow::make_test_user_ts_batch(
+    let batch = krishiv_common::test_fixtures::make_test_user_ts_batch(
         vec!["a", "a", "b"],
         vec![1_000, 5_000, 2_000],
     );
@@ -459,7 +459,7 @@ fn tumbling_window_collect_executes_in_embedded_mode() {
 #[test]
 fn sliding_window_collect_via_unified_runtime() {
     let session = Session::builder().build().unwrap();
-    let batch = krishiv_common::arrow::make_test_user_ts_batch(
+    let batch = krishiv_common::test_fixtures::make_test_user_ts_batch(
         vec!["a", "a", "b"],
         vec![1_000, 5_000, 2_000],
     );
@@ -478,7 +478,7 @@ fn sliding_window_collect_via_unified_runtime() {
 #[test]
 fn session_window_collect_via_unified_runtime() {
     let session = Session::builder().build().unwrap();
-    let batch = krishiv_common::arrow::make_test_user_ts_batch(vec!["a", "b"], vec![1_000, 8_000]);
+    let batch = krishiv_common::test_fixtures::make_test_user_ts_batch(vec!["a", "b"], vec![1_000, 8_000]);
     let stream = session
         .memory_stream("events", vec![StreamBatch::new(0, batch)])
         .unwrap();
@@ -494,7 +494,7 @@ fn session_window_collect_via_unified_runtime() {
 #[test]
 fn session_subsequent_window_collects() {
     let session = Session::builder().build().unwrap();
-    let batch = krishiv_common::arrow::make_test_user_ts_batch(vec!["a"], vec![1_000]);
+    let batch = krishiv_common::test_fixtures::make_test_user_ts_batch(vec!["a"], vec![1_000]);
     for _ in 0..2 {
         let stream = session
             .memory_stream("events", vec![StreamBatch::new(0, batch.clone())])

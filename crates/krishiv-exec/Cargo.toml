@@ -21,6 +21,9 @@ tracing = { workspace = true }
 async-stream = "0.3.6"
 futures.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [lib]
 path = "src/lib.rs"
 

@@ -733,3 +733,82 @@ mod proto_tests {
         assert_eq!(format!("{id}"), "job/with:special@chars");
     }
 }
+
+/// Fuzz-style "never panics" tests for protobuf → domain wire deserialisation.
+///
+/// `cargo-fuzz` requires a nightly toolchain and sanitizer support that this
+/// workspace does not provision; `proptest` gives equivalent adversarial-input
+/// coverage (arbitrary scalar/string/enum-tag generation, shrinking on
+/// failure) entirely on stable. These tests feed `from_wire` malformed,
+/// out-of-range, and empty field values — only `Ok`/`Err` are valid outcomes,
+/// a panic is a bug.
+#[cfg(test)]
+mod wire_fuzz {
+    use crate::wire::v1;
+    use crate::wire::{
+        deregister_executor_request_from_wire, deregister_executor_response_from_wire,
+        register_executor_response_from_wire, task_cancellation_request_from_wire,
+    };
+    use proptest::prelude::*;
+
+    fn arb_string() -> impl Strategy<Value = String> {
+        prop_oneof![Just(String::new()), "[a-zA-Z0-9_/:@.-]{0,32}", "\\PC{0,16}",]
+    }
+
+    fn arb_version() -> impl Strategy<Value = Option<v1::TransportVersion>> {
+        prop::option::of(
+            (0u32..=5, 0u32..=5)
+                .prop_map(|(major, minor)| v1::TransportVersion { major, minor }),
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn deregister_executor_request_from_wire_never_panics(
+            version in arb_version(),
+            executor_id in arb_string(),
+            lease_generation in any::<u64>(),
+            reason in arb_string(),
+        ) {
+            let wire = v1::DeregisterExecutorRequest { version, executor_id, lease_generation, reason };
+            let _ = deregister_executor_request_from_wire(wire);
+        }
+
+        #[test]
+        fn deregister_executor_response_from_wire_never_panics(
+            version in arb_version(),
+            executor_id in arb_string(),
+            lease_generation in any::<u64>(),
+            disposition in any::<i32>(),
+            message in arb_string(),
+        ) {
+            let wire = v1::DeregisterExecutorResponse { version, executor_id, lease_generation, disposition, message };
+            let _ = deregister_executor_response_from_wire(wire);
+        }
+
+        #[test]
+        fn register_executor_response_from_wire_never_panics(
+            version in arb_version(),
+            executor_id in arb_string(),
+            lease_generation in any::<u64>(),
+            disposition in any::<i32>(),
+            message in arb_string(),
+        ) {
+            let wire = v1::RegisterExecutorResponse { version, executor_id, lease_generation, disposition, message };
+            let _ = register_executor_response_from_wire(wire);
+        }
+
+        #[test]
+        fn task_cancellation_request_from_wire_never_panics(
+            version in arb_version(),
+            job_id in arb_string(),
+            stage_id in arb_string(),
+            task_id in arb_string(),
+            attempt_id in any::<u32>(),
+            reason in arb_string(),
+        ) {
+            let wire = v1::TaskCancellationRequest { version, job_id, stage_id, task_id, attempt_id, reason };
+            let _ = task_cancellation_request_from_wire(wire);
+        }
+    }
+}

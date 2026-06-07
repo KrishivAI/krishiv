@@ -1,12 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::array::Int64Array;
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use krishiv_state::{Namespace, StateBackend, StateResult};
 
 use crate::aggregate::{AggExpr, AggState};
 use crate::join::extract_agg_key;
-use crate::window::tumbling::build_window_record_batch;
+use crate::window::tumbling::{build_window_output_schema, build_window_record_batch};
 use crate::{ExecError, ExecResult};
 
 /// Configuration for a sliding event-time window operator (R5.2).
@@ -34,6 +36,15 @@ pub struct SlidingWindowSpec {
 ///
 /// Each event is placed into every window `[w, w + size)` where
 /// `w` is a multiple of `slide_ms` and `w ≤ event_time_ms < w + size`.
+///
+/// **Memory bound**: like [`TumblingWindowOperator`](super::tumbling::TumblingWindowOperator),
+/// `accumulators` retains one entry per `(key, window_start)` until the
+/// watermark closes that window; sliding windows additionally fan each event
+/// out into `ceil(window_size_ms / slide_ms)` overlapping windows, so live
+/// state is roughly that factor larger than tumbling for the same key
+/// cardinality. There is no key-eviction or TTL — bound memory by choosing
+/// `window_size_ms`/`slide_ms` and watermark lag appropriate to the expected
+/// key cardinality, and pre-aggregate/filter upstream for high-cardinality keys.
 #[derive(Debug)]
 pub struct SlidingWindowOperator {
     spec: SlidingWindowSpec,
@@ -42,6 +53,9 @@ pub struct SlidingWindowOperator {
     prev_watermark_ms: i64,
     /// Total late events dropped by this operator since creation.
     pub late_events_dropped: u64,
+    /// Output schema, fixed for the operator's lifetime; cached so closed
+    /// windows don't rebuild `Schema`/`Field` vectors per row.
+    output_schema: Arc<Schema>,
 }
 
 impl SlidingWindowOperator {
@@ -66,11 +80,14 @@ impl SlidingWindowOperator {
                 spec.window_size_ms, spec.slide_ms,
             )));
         }
+        let output_schema =
+            build_window_output_schema(&spec.key_column, &spec.key_column_type, &spec.agg_exprs);
         Ok(Self {
             spec,
             accumulators: HashMap::new(),
             prev_watermark_ms: i64::MIN,
             late_events_dropped: 0,
+            output_schema,
         })
     }
 
@@ -250,7 +267,7 @@ impl SlidingWindowOperator {
     ) -> ExecResult<RecordBatch> {
         let window_end_ms = window_start_ms + self.spec.window_size_ms as i64;
         build_window_record_batch(
-            &self.spec.key_column,
+            &self.output_schema,
             &self.spec.key_column_type,
             key_value,
             window_start_ms,

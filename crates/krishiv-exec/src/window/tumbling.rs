@@ -44,23 +44,39 @@ pub struct TumblingWindowSpec {
 /// Output schema per closed window:
 /// `key_column (Utf8), window_start_ms (Int64), window_end_ms (Int64),
 ///  …agg output columns (Int64)`.
+///
+/// **Memory bound**: `accumulators` holds one entry per `(key, window_start)`
+/// pair until the watermark closes that window, at which point the entry is
+/// flushed and removed. There is no key-eviction or TTL on open windows —
+/// memory is bounded by `live_key_cardinality × open_window_count`, which the
+/// deployment must keep finite by choosing `window_size_ms` and watermark lag
+/// appropriate to the expected key cardinality. Pipelines with unbounded or
+/// very high-cardinality keys should reduce `window_size_ms` and/or
+/// pre-aggregate/filter keys upstream rather than rely on this operator to
+/// bound state.
 pub struct TumblingWindowOperator {
     spec: TumblingWindowSpec,
     accumulators: HashMap<(String, i64), AggState>,
     prev_watermark_ms: i64,
     pub late_events_dropped: u64,
     late_event_handler: Option<Box<dyn LateEventHandler>>,
+    /// Output schema, fixed for the operator's lifetime; cached so closed
+    /// windows don't rebuild `Schema`/`Field` vectors per row.
+    output_schema: Arc<Schema>,
 }
 
 impl TumblingWindowOperator {
     /// Create a new operator.
     pub fn new(spec: TumblingWindowSpec) -> Self {
+        let output_schema =
+            build_window_output_schema(&spec.key_column, &spec.key_column_type, &spec.agg_exprs);
         Self {
             spec,
             accumulators: HashMap::new(),
             prev_watermark_ms: i64::MIN,
             late_events_dropped: 0,
             late_event_handler: None,
+            output_schema,
         }
     }
 
@@ -240,7 +256,7 @@ impl TumblingWindowOperator {
     ) -> ExecResult<RecordBatch> {
         let window_end_ms = window_start_ms + self.spec.window_size_ms as i64;
         build_window_record_batch(
-            &self.spec.key_column,
+            &self.output_schema,
             &self.spec.key_column_type,
             key_value,
             window_start_ms,
@@ -259,16 +275,17 @@ impl TumblingWindowOperator {
 /// the output schema and column layout stay in sync automatically.
 /// `key_type` is the Arrow type tag for the key column (`"int32"`, `"int64"`,
 /// `"float64"`, `"utf8"`, `"bool"`).
-pub(crate) fn build_window_record_batch(
+/// Build the (fixed) output schema for a tumbling/sliding window operator.
+///
+/// The schema depends only on `key_column`, `key_type`, and `agg_exprs`,
+/// which are immutable for the operator's lifetime — callers should compute
+/// this once (e.g. in `new`) and reuse the cached `Arc<Schema>` for every
+/// closed window, rather than rebuilding `Schema`/`Field` vectors per row.
+pub(crate) fn build_window_output_schema(
     key_column: &str,
     key_type: &str,
-    key_value: &str,
-    window_start_ms: i64,
-    window_end_ms: i64,
     agg_exprs: &[AggExpr],
-    state: &AggState,
-) -> ExecResult<RecordBatch> {
-    use std::sync::Arc as StdArc;
+) -> Arc<Schema> {
     let key_dtype = key_type_to_arrow_data_type(key_type);
     let mut fields = vec![
         Field::new(key_column, key_dtype, false),
@@ -282,7 +299,19 @@ pub(crate) fn build_window_record_batch(
         };
         fields.push(Field::new(&agg.output_column, dtype, false));
     }
-    let schema = StdArc::new(Schema::new(fields));
+    Arc::new(Schema::new(fields))
+}
+
+pub(crate) fn build_window_record_batch(
+    schema: &Arc<Schema>,
+    key_type: &str,
+    key_value: &str,
+    window_start_ms: i64,
+    window_end_ms: i64,
+    agg_exprs: &[AggExpr],
+    state: &AggState,
+) -> ExecResult<RecordBatch> {
+    let schema = Arc::clone(schema);
     let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = vec![
         key_value_to_typed_array(key_type, key_value),
         Arc::new(Int64Array::from(vec![window_start_ms])),
@@ -401,5 +430,113 @@ mod state_tests {
         });
         restored.restore_from_state(&backend, &ns).expect("restore");
         assert_eq!(restored.open_window_count(), 1);
+    }
+}
+
+/// Property-based aggregation-correctness tests for `TumblingWindowOperator`.
+///
+/// `cargo-fuzz` requires a nightly toolchain and sanitizer support that this
+/// workspace does not provision; `proptest` gives equivalent adversarial-input
+/// coverage (arbitrary in-order event sequences, shrinking on failure) entirely
+/// on stable, so it is the practical choice for exercising window aggregation
+/// invariants such as "every accepted row is counted exactly once" and
+/// "the windowed sum equals the sum of its inputs".
+#[cfg(test)]
+mod aggregation_proptests {
+    use super::*;
+    use crate::aggregate::AggFunction;
+    use proptest::prelude::*;
+
+    /// Arbitrary in-order `(event_time_ms, value)` sequences confined to a
+    /// single 1000ms window `[0, 1000)`, with values small enough that their
+    /// sum cannot overflow `i64`.
+    fn arb_single_window_events() -> impl Strategy<Value = Vec<(i64, i64)>> {
+        prop::collection::vec((0i64..1000, -10_000i64..10_000), 0..32).prop_map(|mut events| {
+            events.sort_by_key(|(ts, _)| *ts);
+            events
+        })
+    }
+
+    fn make_batch(events: &[(i64, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let keys = vec!["k"; events.len()];
+        let timestamps: Vec<i64> = events.iter().map(|(ts, _)| *ts).collect();
+        let values: Vec<i64> = events.iter().map(|(_, v)| *v).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(Int64Array::from(timestamps)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .expect("schema and array lengths match")
+    }
+
+    fn spec() -> TumblingWindowSpec {
+        TumblingWindowSpec {
+            key_column: "k".into(),
+            key_column_type: "utf8".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            agg_exprs: vec![
+                AggExpr {
+                    function: AggFunction::Count,
+                    input_column: String::new(),
+                    output_column: "cnt".into(),
+                },
+                AggExpr {
+                    function: AggFunction::Sum,
+                    input_column: "v".into(),
+                    output_column: "sum_v".into(),
+                },
+            ],
+        }
+    }
+
+    proptest! {
+        /// Closing a single window over an arbitrary in-order event sequence
+        /// must never panic, and — when the sequence is non-empty — must
+        /// yield exactly one output row whose `cnt`/`sum_v` losslessly
+        /// reflect every accepted input row exactly once.
+        #[test]
+        fn tumbling_window_count_and_sum_are_lossless(events in arb_single_window_events()) {
+            let mut op = TumblingWindowOperator::new(spec());
+            let batch = make_batch(&events);
+
+            // Watermark = window_size_ms closes the single `[0, 1000)` window.
+            let outputs = op.process_batch(&batch, 1000).expect("process_batch");
+
+            if events.is_empty() {
+                prop_assert!(outputs.is_empty());
+            } else {
+                prop_assert_eq!(outputs.len(), 1);
+                let out = &outputs[0];
+                prop_assert_eq!(out.num_rows(), 1);
+
+                let cnt = out
+                    .column(out.schema().index_of("cnt").unwrap())
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0);
+                let sum_v = out
+                    .column(out.schema().index_of("sum_v").unwrap())
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0);
+
+                prop_assert_eq!(cnt as usize, events.len());
+                prop_assert_eq!(sum_v, events.iter().map(|(_, v)| v).sum::<i64>());
+            }
+
+            // No state should remain open once the only window has closed.
+            prop_assert_eq!(op.open_window_count(), 0);
+        }
     }
 }

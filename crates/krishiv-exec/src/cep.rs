@@ -8,6 +8,11 @@ use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
 
 use crate::ExecResult;
 
+/// Default cap on the number of distinct per-key CEP states retained in
+/// memory. When exceeded, the least-recently-active key is evicted to bound
+/// memory under high key cardinality (mirrors [`krishiv_cep::PartitionedCepMatcher`]).
+pub const DEFAULT_MAX_CEP_KEYS: usize = 1024;
+
 /// Keyed CEP operator executing a compiled sequential pattern.
 #[derive(Debug)]
 pub struct CepOperator {
@@ -15,6 +20,9 @@ pub struct CepOperator {
     key_column: String,
     states: HashMap<Vec<u8>, CepKeyState>,
     last_barrier_epoch: u64,
+    /// Maximum number of distinct keys retained before evicting the
+    /// least-recently-active one. See [`DEFAULT_MAX_CEP_KEYS`].
+    max_keys: usize,
 }
 
 impl CepOperator {
@@ -24,7 +32,15 @@ impl CepOperator {
             key_column: key_column.into(),
             states: HashMap::new(),
             last_barrier_epoch: 0,
+            max_keys: DEFAULT_MAX_CEP_KEYS,
         }
+    }
+
+    /// Override the maximum number of distinct per-key states retained in
+    /// memory before the least-recently-active key is evicted.
+    pub fn with_max_keys(mut self, max_keys: usize) -> Self {
+        self.max_keys = max_keys.max(1);
+        self
     }
 
     pub fn last_barrier_epoch(&self) -> u64 {
@@ -33,6 +49,11 @@ impl CepOperator {
 
     pub fn key_column(&self) -> &str {
         &self.key_column
+    }
+
+    /// Number of currently tracked per-key CEP states.
+    pub fn key_count(&self) -> usize {
+        self.states.len()
     }
 
     /// Process a batch keyed by raw key bytes; `stage_name` identifies the pattern stage.
@@ -44,8 +65,19 @@ impl CepOperator {
         event_time_ms: i64,
     ) -> Vec<Vec<RecordBatch>> {
         let state = self.states.entry(key).or_default();
-        self.matcher
-            .process_event(state, stage_name, batch, event_time_ms)
+        let result = self
+            .matcher
+            .process_event(state, stage_name, batch, event_time_ms);
+        if self.states.len() > self.max_keys
+            && let Some(stalest) = self
+                .states
+                .iter()
+                .min_by_key(|(_, state)| state.last_event_ms)
+                .map(|(k, _)| k.clone())
+        {
+            self.states.remove(&stalest);
+        }
+        result
     }
 
     /// Checkpoint barrier fence: record the committed epoch for restore alignment.

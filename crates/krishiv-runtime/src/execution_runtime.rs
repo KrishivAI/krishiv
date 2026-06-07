@@ -335,18 +335,19 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         use krishiv_common::async_util::block_on;
         let body = ExecutePlanBody::from_plan(plan)?;
         let action = KrishivFlightAction::ExecutePlan(body);
-        let result = block_on(self.pool.do_action(&action));
-        match result {
-            Ok(_) => {}
-            Err(ref e) if is_server_unimplemented(e) => {
-                if !allow_remote_sql_comment_fallback() {
-                    return Err(e.clone());
+        block_on(async {
+            match self.pool.do_action(&action).await {
+                Ok(_) => Ok(()),
+                Err(e) if is_server_unimplemented(&e) => {
+                    if !allow_remote_sql_comment_fallback() {
+                        return Err(e);
+                    }
+                    let sql = crate::flight_client::plan_to_sql(plan);
+                    self.pool.execute_sql(&sql).await.map(|_| ())
                 }
-                let sql = crate::flight_client::plan_to_sql(plan);
-                let _ = block_on(self.pool.execute_sql(&sql))?;
+                Err(e) => Err(e),
             }
-            Err(e) => return Err(e),
-        }
+        })?;
         Ok(ExecutionReport::new(
             "distributed",
             plan.name(),
@@ -385,25 +386,26 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
             batches_b64,
             response_watermark_ms: None,
         });
-        let result = block_on(self.pool.do_action(&action));
-        match result {
-            Ok(body) => {
-                let watermark = serde_json::from_slice::<BoundedWindowBody>(&body)
-                    .ok()
-                    .and_then(|r| r.response_watermark_ms);
-                let batches = decode_ipc_response(&body)?;
-                Ok((batches, watermark))
-            }
-            Err(ref e) if is_server_unimplemented(e) => {
-                if !allow_remote_sql_comment_fallback() {
-                    return Err(e.clone());
+        block_on(async {
+            match self.pool.do_action(&action).await {
+                Ok(body) => {
+                    let watermark = serde_json::from_slice::<BoundedWindowBody>(&body)
+                        .ok()
+                        .and_then(|r| r.response_watermark_ms);
+                    let batches = decode_ipc_response(&body)?;
+                    Ok((batches, watermark))
                 }
-                let sql = encode_bounded_window(topic, spec, &input_batches)?;
-                let batches = block_on(self.pool.execute_sql(&sql))?;
-                Ok((batches, None))
+                Err(e) if is_server_unimplemented(&e) => {
+                    if !allow_remote_sql_comment_fallback() {
+                        return Err(e);
+                    }
+                    let sql = encode_bounded_window(topic, spec, &input_batches)?;
+                    let batches = self.pool.execute_sql(&sql).await?;
+                    Ok((batches, None))
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        }
+        })
     }
 
     fn collect_batch_sql(
@@ -421,21 +423,22 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
             tables: tables_to_batch_sql(tables),
             is_streaming,
         });
-        let result = block_on(self.pool.do_action(&action));
-        match result {
-            Ok(body) => decode_ipc_response(&body),
-            Err(ref e) if is_server_unimplemented(e) => {
-                if !allow_remote_sql_comment_fallback() {
-                    return Err(e.clone());
+        block_on(async {
+            match self.pool.do_action(&action).await {
+                Ok(body) => decode_ipc_response(&body),
+                Err(e) if is_server_unimplemented(&e) => {
+                    if !allow_remote_sql_comment_fallback() {
+                        return Err(e);
+                    }
+                    let mut sql = encode_batch_sql(query, &tables_to_batch_sql(tables));
+                    if is_streaming {
+                        sql = format!("-- krishiv:streaming=true\n{sql}");
+                    }
+                    self.pool.execute_sql(&sql).await
                 }
-                let mut sql = encode_batch_sql(query, &tables_to_batch_sql(tables));
-                if is_streaming {
-                    sql = format!("-- krishiv:streaming=true\n{sql}");
-                }
-                block_on(self.pool.execute_sql(&sql))
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        }
+        })
     }
 
     fn explain_sql(&self, query: &str) -> RuntimeResult<String> {
@@ -459,19 +462,19 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
             job_id: job_id.to_string(),
             spec: spec.to_plan_spec(),
         });
-        let result = block_on(self.pool.do_action(&action));
-        match result {
-            Ok(_) => Ok(()),
-            Err(ref e) if is_server_unimplemented(e) => {
-                if !allow_remote_sql_comment_fallback() {
-                    return Err(e.clone());
+        block_on(async {
+            match self.pool.do_action(&action).await {
+                Ok(_) => Ok(()),
+                Err(e) if is_server_unimplemented(&e) => {
+                    if !allow_remote_sql_comment_fallback() {
+                        return Err(e);
+                    }
+                    let sql = encode_continuous_register(job_id, spec)?;
+                    self.pool.execute_sql(&sql).await.map(|_| ())
                 }
-                let sql = encode_continuous_register(job_id, spec)?;
-                let _ = block_on(self.pool.execute_sql(&sql))?;
-                Ok(())
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        }
+        })
     }
 
     fn push_continuous_stream_input(
@@ -487,19 +490,19 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
             job_id: job_id.to_string(),
             batches_b64,
         });
-        let result = block_on(self.pool.do_action(&action));
-        match result {
-            Ok(_) => Ok(()),
-            Err(ref e) if is_server_unimplemented(e) => {
-                if !allow_remote_sql_comment_fallback() {
-                    return Err(e.clone());
+        block_on(async {
+            match self.pool.do_action(&action).await {
+                Ok(_) => Ok(()),
+                Err(e) if is_server_unimplemented(&e) => {
+                    if !allow_remote_sql_comment_fallback() {
+                        return Err(e);
+                    }
+                    let sql = encode_continuous_push(job_id, &batches)?;
+                    self.pool.execute_sql(&sql).await.map(|_| ())
                 }
-                let sql = encode_continuous_push(job_id, &batches)?;
-                let _ = block_on(self.pool.execute_sql(&sql))?;
-                Ok(())
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        }
+        })
     }
 
     fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
@@ -510,18 +513,19 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         let action = KrishivFlightAction::ContinuousDrain(ContinuousDrainBody {
             job_id: job_id.to_string(),
         });
-        let result = block_on(self.pool.do_action(&action));
-        match result {
-            Ok(body) => decode_ipc_response(&body),
-            Err(ref e) if is_server_unimplemented(e) => {
-                if !allow_remote_sql_comment_fallback() {
-                    return Err(e.clone());
+        block_on(async {
+            match self.pool.do_action(&action).await {
+                Ok(body) => decode_ipc_response(&body),
+                Err(e) if is_server_unimplemented(&e) => {
+                    if !allow_remote_sql_comment_fallback() {
+                        return Err(e);
+                    }
+                    let sql = encode_continuous_drain(job_id);
+                    self.pool.execute_sql(&sql).await
                 }
-                let sql = encode_continuous_drain(job_id);
-                block_on(self.pool.execute_sql(&sql))
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        }
+        })
     }
 
     fn flight_url(&self) -> Option<&str> {

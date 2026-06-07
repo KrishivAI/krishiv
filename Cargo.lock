@@ -4096,6 +4096,7 @@ dependencies = [
  "krishiv-lakehouse",
  "krishiv-plan",
  "krishiv-state",
+ "proptest",
  "serde_json",
  "smallvec",
  "thiserror 1.0.69",
@@ -4261,6 +4262,7 @@ version = "0.1.0"
 dependencies = [
  "krishiv-common",
  "krishiv-proto",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -4271,6 +4273,7 @@ name = "krishiv-proto"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "proptest",
  "prost 0.14.3",
  "prost-build 0.14.3",
  "prost-types 0.14.3",

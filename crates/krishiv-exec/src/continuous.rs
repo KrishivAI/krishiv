@@ -218,6 +218,8 @@ pub struct ContinuousWindowExecutor {
     /// each cycle uses the watermark from the previous cycle rather than falling
     /// back to wall-clock time.  Starts at `i64::MIN` (no watermark seen yet).
     last_watermark_ms: i64,
+    /// Total rows rejected by `quality_hook` across all drain cycles.
+    rejected_rows_total: u64,
 }
 
 impl ContinuousWindowExecutor {
@@ -246,7 +248,15 @@ impl ContinuousWindowExecutor {
             operator: build_operator(&spec, &agg_exprs, state_dir)?,
             quality_hook: None,
             last_watermark_ms: i64::MIN,
+            rejected_rows_total: 0,
         })
+    }
+
+    /// Total rows rejected by the data-quality hook across all drain cycles.
+    ///
+    /// `0` if no [`StreamQualityHook`] is attached.
+    pub fn rejected_rows_total(&self) -> u64 {
+        self.rejected_rows_total
     }
 
     /// Attach a data-quality hook that filters each output batch.
@@ -324,7 +334,16 @@ impl ContinuousWindowExecutor {
         if let Some(hook) = self.quality_hook.as_mut() {
             let mut output = Vec::with_capacity(raw.len());
             for batch in raw {
-                let (accepted, _rejected_count) = hook.filter(batch)?;
+                let (accepted, rejected_count) = hook.filter(batch)?;
+                if rejected_count > 0 {
+                    self.rejected_rows_total =
+                        self.rejected_rows_total.saturating_add(rejected_count as u64);
+                    tracing::debug!(
+                        rejected_count,
+                        rejected_rows_total = self.rejected_rows_total,
+                        "quality hook rejected rows from continuous window output"
+                    );
+                }
                 if accepted.num_rows() > 0 {
                     output.push(accepted);
                 }

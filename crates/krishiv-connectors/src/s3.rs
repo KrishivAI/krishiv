@@ -55,10 +55,13 @@ impl S3Source {
     pub async fn open(store: Arc<dyn ObjectStore>, path: impl Into<Path>) -> ConnectorResult<Self> {
         let path = path.into();
 
-        let meta = store.head(&path).await.map_err(|e| ConnectorError::ObjectStore {
-            message: format!("failed to stat object '{}': {e}", path),
-            status: None,
-        })?;
+        let meta = store
+            .head(&path)
+            .await
+            .map_err(|e| ConnectorError::ObjectStore {
+                message: format!("failed to stat object '{}': {e}", path),
+                status: None,
+            })?;
         let file_size = meta.size;
 
         let schema = Self::probe_schema(&store, &path, file_size).await?;
@@ -82,12 +85,14 @@ impl S3Source {
     ) -> ConnectorResult<SchemaRef> {
         let reader =
             ParquetObjectReader::new(Arc::clone(store), path.clone()).with_file_size(file_size);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.map_err(|e| {
-            ConnectorError::Parquet(format!(
-                "failed to build Parquet stream reader for '{}': {e}",
-                path
-            ))
-        })?;
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| {
+                ConnectorError::Parquet(format!(
+                    "failed to build Parquet stream reader for '{}': {e}",
+                    path
+                ))
+            })?;
         Ok(builder.schema().clone())
     }
 
@@ -103,12 +108,14 @@ impl S3Source {
         file_size: u64,
     ) -> ConnectorResult<ObjectBatchStream> {
         let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(file_size);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.map_err(|e| {
-            ConnectorError::Parquet(format!(
-                "failed to build Parquet stream reader for '{}': {e}",
-                path
-            ))
-        })?;
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| {
+                ConnectorError::Parquet(format!(
+                    "failed to build Parquet stream reader for '{}': {e}",
+                    path
+                ))
+            })?;
         let stream = builder.build().map_err(|e| {
             ConnectorError::Parquet(format!("failed to create Parquet batch stream: {e}"))
         })?;
@@ -239,14 +246,24 @@ impl CheckpointSource for S3Source {
 ///
 /// Batches are buffered in memory.  On [`Sink::flush`] all batches are
 /// serialised to a Parquet byte buffer and uploaded atomically via
-/// [`ObjectStore::put`]. Pending batches are capped to avoid unbounded memory.
+/// [`ObjectStore::put`]. Pending batches are capped both by count and by
+/// total in-memory byte size to avoid unbounded memory growth from a small
+/// number of very large batches.
 const MAX_PENDING_BATCHES: usize = 1_024;
+
+/// Default cap on the total in-memory size (bytes, per [`RecordBatch::get_array_memory_size`])
+/// of batches buffered before [`Sink::flush`] must be called. Bounds memory
+/// when a handful of large batches would otherwise stay under
+/// [`MAX_PENDING_BATCHES`] but still exhaust memory.
+const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct S3Sink {
     store: Arc<dyn ObjectStore>,
     path: Path,
     schema: Option<SchemaRef>,
     pending: Vec<RecordBatch>,
+    pending_bytes: usize,
+    max_pending_bytes: usize,
 }
 
 impl S3Sink {
@@ -257,7 +274,16 @@ impl S3Sink {
             path: path.into(),
             schema: None,
             pending: Vec::new(),
+            pending_bytes: 0,
+            max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
         }
+    }
+
+    /// Override the maximum total in-memory size (bytes) of batches buffered
+    /// before [`Sink::flush`] must be called.
+    pub fn with_max_pending_bytes(mut self, max_pending_bytes: usize) -> Self {
+        self.max_pending_bytes = max_pending_bytes;
+        self
     }
 
     /// Return the object path this sink will write to.
@@ -285,6 +311,19 @@ impl Sink for S3Sink {
                 status: None,
             });
         }
+        let batch_bytes = batch.get_array_memory_size();
+        if !self.pending.is_empty()
+            && self.pending_bytes.saturating_add(batch_bytes) > self.max_pending_bytes
+        {
+            return Err(ConnectorError::ObjectStore {
+                message: format!(
+                    "S3Sink pending byte limit ({} bytes) exceeded; flush before writing more",
+                    self.max_pending_bytes
+                ),
+                status: None,
+            });
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(batch_bytes);
         self.pending.push(batch);
         Ok(())
     }
@@ -309,9 +348,9 @@ impl Sink for S3Sink {
                     ConnectorError::Parquet(format!("failed to write Parquet batch: {e}"))
                 })?;
             }
-            writer
-                .close()
-                .map_err(|e| ConnectorError::Parquet(format!("failed to close Parquet writer: {e}")))?;
+            writer.close().map_err(|e| {
+                ConnectorError::Parquet(format!("failed to close Parquet writer: {e}"))
+            })?;
         }
 
         // Upload.
@@ -325,6 +364,7 @@ impl Sink for S3Sink {
             })?;
 
         self.pending.clear();
+        self.pending_bytes = 0;
         Ok(())
     }
 }

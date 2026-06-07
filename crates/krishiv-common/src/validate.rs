@@ -42,29 +42,40 @@ pub fn validate_safe_id(id: &str, label: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Check that an identifier matches the safe character class `[A-Za-z0-9_.-]+`.
+/// Check that an identifier matches the safe character class `[A-Za-z0-9_.-]+`
+/// and contains no `..` traversal sequence.
 ///
-/// Rejects empty strings and any character outside the allowed set.
+/// Rejects empty strings, any character outside the allowed set, and `..`.
 /// Prevents comment-injection attacks (the `*/` sequence is impossible
-/// inside a valid identifier).
+/// inside a valid identifier) and keeps this allowlist consistent with
+/// [`validate_safe_id`]'s blocklist: without the `..` check, a string like
+/// `".."` would pass this allowlist's character class yet be rejected by
+/// `validate_safe_id`, so a caller could be misled into treating it as safe
+/// for path construction.
 ///
 /// This is the canonical replacement for
 /// `krishiv_runtime::flight_protocol::is_safe_identifier`.
 pub fn is_safe_identifier(s: &str) -> bool {
     !s.is_empty()
+        && !s.contains("..")
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
-/// Check that a filesystem path field matches `[A-Za-z0-9_.-/ ]+`.
+/// Check that a filesystem path field matches `[A-Za-z0-9_.-/ ]+` and
+/// contains no `..` traversal sequence.
 ///
-/// Same as `is_safe_identifier` plus `/` and space. Prevents `*/` injection
-/// through path fields in comment protocols.
+/// Same as `is_safe_identifier` plus `/` and space, with the same `..`
+/// rejection for consistency with [`validate_safe_id`]. Prevents `*/`
+/// injection through path fields in comment protocols and keeps this
+/// allowlist from accepting traversal sequences that the canonical
+/// path-safety blocklist would reject.
 ///
 /// This is the canonical replacement for
 /// `krishiv_runtime::flight_protocol::is_safe_path`.
 pub fn is_safe_path(s: &str) -> bool {
     !s.is_empty()
+        && !s.contains("..")
         && s.chars().all(|c| {
             c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ' '
         })
@@ -179,6 +190,17 @@ mod tests {
         assert!(!is_safe_identifier("table\0name"));
     }
 
+    #[test]
+    fn safe_identifier_dotdot_rejected() {
+        // Regression: ".." matches the `[A-Za-z0-9_.-]+` character class but
+        // must be rejected so this allowlist stays consistent with
+        // `validate_safe_id`'s traversal blocklist (P1 roadmap finding).
+        assert!(!is_safe_identifier(".."));
+        assert!(!is_safe_identifier("../etc"));
+        assert!(!is_safe_identifier("table..name"));
+        assert!(is_safe_identifier("table.v1"));
+    }
+
     // ── is_safe_path ──────────────────────────────────────────────────
 
     #[test]
@@ -196,6 +218,15 @@ mod tests {
     fn safe_path_special_chars_rejected() {
         assert!(!is_safe_path("path\0with null"));
         assert!(!is_safe_path("path*with star"));
+    }
+
+    #[test]
+    fn safe_path_dotdot_rejected() {
+        // Regression: traversal sequences must be rejected consistently with
+        // `validate_safe_id` (P1 roadmap finding).
+        assert!(!is_safe_path("../etc/passwd"));
+        assert!(!is_safe_path("bucket/../secret"));
+        assert!(is_safe_path("bucket/key/file.v1.txt"));
     }
 
     // ── is_safe_base64 ────────────────────────────────────────────────

@@ -816,4 +816,119 @@ mod tests {
         assert_eq!(parsed.source_id_column.as_deref(), Some("src:col"));
         assert_eq!(parsed.source_watermark_lags.get("ns:orders"), Some(&1_000));
     }
+
+    // ── Fuzz-style adversarial validation (Phase 5: no fuzz coverage for
+    // validate_window_execution_spec) ──────────────────────────────────────
+    //
+    // `cargo-fuzz` requires a nightly toolchain and sanitizer support that
+    // this workspace does not provision; `proptest` gives equivalent
+    // adversarial-input coverage (arbitrary/edge-case generation, shrinking
+    // on failure) entirely on stable, so it is the practical choice here.
+    mod adversarial_validation {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_window_kind() -> impl Strategy<Value = WindowKind> {
+            prop_oneof![
+                Just(WindowKind::Tumbling),
+                Just(WindowKind::Sliding),
+                Just(WindowKind::Session),
+            ]
+        }
+
+        fn arb_agg_kind() -> impl Strategy<Value = WindowAggKind> {
+            prop_oneof![
+                Just(WindowAggKind::Count),
+                Just(WindowAggKind::Sum),
+                Just(WindowAggKind::Min),
+                Just(WindowAggKind::Max),
+                Just(WindowAggKind::Avg),
+            ]
+        }
+
+        fn arb_agg() -> impl Strategy<Value = WindowAgg> {
+            (arb_agg_kind(), "[a-zA-Z0-9_ ]{0,8}", "[a-zA-Z0-9_ ]{0,8}").prop_map(
+                |(kind, input_column, output_column)| WindowAgg {
+                    kind,
+                    input_column,
+                    output_column,
+                },
+            )
+        }
+
+        fn arb_spec() -> impl Strategy<Value = WindowExecutionSpec> {
+            (
+                "[a-zA-Z0-9_ ]{0,8}",
+                "[a-zA-Z0-9_ ]{0,8}",
+                any::<u64>(),
+                arb_window_kind(),
+                any::<u64>(),
+                proptest::option::of(any::<u64>()),
+                proptest::option::of(any::<u64>()),
+                proptest::collection::vec(arb_agg(), 0..4),
+                proptest::option::of(any::<u64>()),
+            )
+                .prop_map(
+                    |(
+                        key_column,
+                        event_time_column,
+                        watermark_lag_ms,
+                        window_kind,
+                        window_size_ms,
+                        slide_ms,
+                        session_gap_ms,
+                        agg_exprs,
+                        state_ttl_ms,
+                    )| WindowExecutionSpec {
+                        key_column,
+                        key_column_type: default_key_type(),
+                        event_time_column,
+                        watermark_lag_ms,
+                        window_kind,
+                        window_size_ms,
+                        slide_ms,
+                        session_gap_ms,
+                        agg_exprs,
+                        state_ttl_ms,
+                        source_watermark_lags: HashMap::new(),
+                        source_id_column: None,
+                    },
+                )
+        }
+
+        proptest! {
+            /// Adversarial inputs (empty/whitespace names, zero/huge durations,
+            /// missing slide/gap, duplicate output columns, …) must always be
+            /// rejected or accepted cleanly — never panic.
+            #[test]
+            fn validate_window_execution_spec_never_panics(spec in arb_spec()) {
+                let _ = validate_window_execution_spec(&spec);
+            }
+
+            /// A spec that validates Ok must satisfy the invariants the
+            /// validator is supposed to enforce, regardless of how the
+            /// arbitrary input was shaped.
+            #[test]
+            fn validated_spec_satisfies_invariants(spec in arb_spec()) {
+                if validate_window_execution_spec(&spec).is_ok() {
+                    prop_assert!(!spec.key_column.trim().is_empty());
+                    prop_assert!(!spec.event_time_column.trim().is_empty());
+                    prop_assert!(spec.window_size_ms > 0);
+                    prop_assert!(!spec.agg_exprs.is_empty());
+                    if spec.window_kind == WindowKind::Sliding {
+                        prop_assert!(matches!(spec.slide_ms, Some(s) if s > 0));
+                    }
+                    if spec.window_kind == WindowKind::Session {
+                        prop_assert!(matches!(spec.session_gap_ms, Some(g) if g > 0));
+                    }
+                    prop_assert_ne!(spec.state_ttl_ms, Some(0));
+                    let mut seen = HashSet::with_capacity(spec.agg_exprs.len());
+                    for agg in &spec.agg_exprs {
+                        prop_assert!(!agg.output_column.trim().is_empty());
+                        prop_assert!(seen.insert(agg.output_column.clone()));
+                    }
+                }
+            }
+        }
+    }
 }

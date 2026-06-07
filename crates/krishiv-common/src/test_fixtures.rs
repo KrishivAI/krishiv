@@ -1,3 +1,10 @@
+//! Shared `RecordBatch`/schema fixtures for tests across the workspace.
+//!
+//! These helpers build canonical test batches so individual crates' test
+//! suites don't each redefine the same schema/array boilerplate. Not gated
+//! behind `#[cfg(test)]` because `cfg(test)` items are crate-local and these
+//! are consumed from other crates' test modules.
+
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;

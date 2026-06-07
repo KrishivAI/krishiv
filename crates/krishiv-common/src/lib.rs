@@ -6,7 +6,7 @@
 //! - SHA-256 hashing (`hash` module)
 //! - Identifier and path validation (`validate` module)
 
-pub mod arrow;
+pub mod test_fixtures;
 pub mod async_util;
 #[cfg(feature = "chaos")]
 pub mod chaos;

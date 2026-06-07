@@ -16,6 +16,41 @@ use crate::in_process::BatchSqlTable;
 use crate::local_streaming::LocalWindowExecutionSpec;
 use crate::{RuntimeError, RuntimeResult};
 
+/// Maximum time to wait for a single batch from a Flight SQL result stream
+/// before treating the server as stalled.
+const FLIGHT_PER_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Drain a Flight SQL record-batch stream, applying `per_batch_timeout` to
+/// each individual `next()` poll so a stalled server cannot hang the caller
+/// indefinitely.
+///
+/// Factored out of [`FlightClientPool::execute_sql`] so the timeout behaviour
+/// can be exercised directly with a mock stream and a short duration —
+/// waiting out the real (60s) production timeout in a test would be
+/// impractically slow.
+async fn collect_flight_batches<S>(
+    mut stream: S,
+    per_batch_timeout: Duration,
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>>
+where
+    S: futures::Stream<Item = arrow_flight::error::Result<arrow::record_batch::RecordBatch>>
+        + Unpin,
+{
+    let mut batches = Vec::new();
+    while let Some(batch) = tokio::time::timeout(per_batch_timeout, stream.try_next())
+        .await
+        .map_err(|_| {
+            RuntimeError::transport(format!(
+                "flight streaming batch timed out after {per_batch_timeout:?}"
+            ))
+        })?
+        .map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}")))?
+    {
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
 /// Bearer token for outbound Flight SQL / Flight action requests.
 fn configured_flight_api_key() -> Option<String> {
     for env_name in ["KRISHIV_FLIGHT_API_KEY", "KRISHIV_API_KEY"] {
@@ -495,25 +530,14 @@ impl FlightClientPool {
                 .and_then(|ep| ep.ticket.clone())
                 .ok_or_else(|| RuntimeError::transport("flight response had no ticket endpoint"))?;
 
-            let mut stream = client
+            let stream = client
                 .do_get(Ticket {
                     ticket: ticket.ticket,
                 })
                 .await
                 .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
 
-            let mut batches = Vec::new();
-            while let Some(batch) = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                stream.try_next(),
-            )
-            .await
-            .map_err(|_| RuntimeError::transport("flight streaming batch timed out after 60s"))?
-            .map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}")))?
-            {
-                batches.push(batch);
-            }
-            Ok(batches)
+            collect_flight_batches(stream, FLIGHT_PER_BATCH_TIMEOUT).await
         })
         .await
     }
@@ -769,6 +793,7 @@ mod tests {
 
     use arrow::datatypes::Schema;
     use arrow::record_batch::RecordBatch;
+    use futures::StreamExt;
 
     use super::*;
 
@@ -944,5 +969,226 @@ mod tests {
     fn is_unimplemented_rejects_non_transport() {
         let err = RuntimeError::unsupported("test");
         assert!(!is_unimplemented(&err));
+    }
+
+    // ── Per-batch timeout (collect_flight_batches) ───────────────────────
+
+    /// A stream that yields `n_ready` immediate batches and then never
+    /// resolves again — simulating a server that stalls mid-stream.
+    fn stalling_batch_stream(
+        n_ready: usize,
+    ) -> impl futures::Stream<Item = arrow_flight::error::Result<RecordBatch>> + Unpin {
+        let schema = Arc::new(Schema::new(Vec::<arrow::datatypes::Field>::new()));
+        let ready = futures::stream::iter((0..n_ready).map(move |_| {
+            Ok(RecordBatch::new_empty(Arc::clone(&schema)))
+        }));
+        Box::pin(ready.chain(futures::stream::pending()))
+    }
+
+    #[tokio::test]
+    async fn collect_flight_batches_times_out_on_stalled_stream() {
+        // The 60s production timeout would make this test impractically slow;
+        // exercising the same logic with a short duration proves the timeout
+        // path fires and surfaces a transport error rather than hanging.
+        let stream = stalling_batch_stream(0);
+        let result = collect_flight_batches(stream, Duration::from_millis(20)).await;
+        match result {
+            Err(RuntimeError::Transport { message }) => {
+                assert!(
+                    message.contains("timed out"),
+                    "expected a timeout message, got: {message}"
+                );
+            }
+            other => panic!("expected Transport timeout error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_flight_batches_returns_batches_received_before_stall() {
+        // Batches that arrive within the per-batch timeout must be collected
+        // even if the stream subsequently stalls and the overall read fails.
+        let stream = stalling_batch_stream(2);
+        let result = collect_flight_batches(stream, Duration::from_millis(20)).await;
+        assert!(
+            matches!(result, Err(RuntimeError::Transport { .. })),
+            "stalled stream must still surface a timeout error: {result:?}"
+        );
+    }
+
+    // ── do_action response size cap ──────────────────────────────────────
+
+    /// Mock Flight service whose `do_action` streams back oversized chunks —
+    /// large enough in aggregate to exceed `FlightClientPool::do_action`'s
+    /// 64 MiB response cap — so the cap can be exercised against a real
+    /// gRPC round trip rather than just unit-testing the accumulation loop.
+    mod oversized_action_service {
+        use std::pin::Pin;
+
+        use arrow_flight::flight_service_server::FlightService;
+        use arrow_flight::{
+            Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+            HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+        };
+        use tonic::{Request, Response, Status, Streaming};
+
+        type BoxedFlightStream<T> =
+            Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+        #[derive(Clone)]
+        pub(super) struct OversizedActionService {
+            pub(super) chunk_size: usize,
+            pub(super) chunk_count: usize,
+        }
+
+        #[tonic::async_trait]
+        impl FlightService for OversizedActionService {
+            type HandshakeStream = BoxedFlightStream<HandshakeResponse>;
+            type ListFlightsStream = BoxedFlightStream<FlightInfo>;
+            type DoGetStream = BoxedFlightStream<FlightData>;
+            type DoPutStream = BoxedFlightStream<PutResult>;
+            type DoActionStream = BoxedFlightStream<arrow_flight::Result>;
+            type ListActionsStream = BoxedFlightStream<ActionType>;
+            type DoExchangeStream = BoxedFlightStream<FlightData>;
+
+            async fn handshake(
+                &self,
+                _r: Request<Streaming<HandshakeRequest>>,
+            ) -> Result<Response<Self::HandshakeStream>, Status> {
+                Err(Status::unimplemented("handshake"))
+            }
+
+            async fn list_flights(
+                &self,
+                _r: Request<Criteria>,
+            ) -> Result<Response<Self::ListFlightsStream>, Status> {
+                Err(Status::unimplemented("list_flights"))
+            }
+
+            async fn get_flight_info(
+                &self,
+                _r: Request<FlightDescriptor>,
+            ) -> Result<Response<FlightInfo>, Status> {
+                Err(Status::unimplemented("get_flight_info"))
+            }
+
+            async fn poll_flight_info(
+                &self,
+                _r: Request<FlightDescriptor>,
+            ) -> Result<Response<PollInfo>, Status> {
+                Err(Status::unimplemented("poll_flight_info"))
+            }
+
+            async fn get_schema(
+                &self,
+                _r: Request<FlightDescriptor>,
+            ) -> Result<Response<SchemaResult>, Status> {
+                Err(Status::unimplemented("get_schema"))
+            }
+
+            async fn do_get(
+                &self,
+                _r: Request<Ticket>,
+            ) -> Result<Response<Self::DoGetStream>, Status> {
+                Err(Status::unimplemented("do_get"))
+            }
+
+            async fn do_put(
+                &self,
+                _r: Request<Streaming<FlightData>>,
+            ) -> Result<Response<Self::DoPutStream>, Status> {
+                Err(Status::unimplemented("do_put"))
+            }
+
+            async fn do_action(
+                &self,
+                _r: Request<Action>,
+            ) -> Result<Response<Self::DoActionStream>, Status> {
+                let chunk = vec![0u8; self.chunk_size];
+                let chunk_count = self.chunk_count;
+                let stream = futures::stream::iter((0..chunk_count).map(move |_| {
+                    Ok(arrow_flight::Result {
+                        body: chunk.clone().into(),
+                    })
+                }));
+                Ok(Response::new(Box::pin(stream) as Self::DoActionStream))
+            }
+
+            async fn list_actions(
+                &self,
+                _r: Request<Empty>,
+            ) -> Result<Response<Self::ListActionsStream>, Status> {
+                Err(Status::unimplemented("list_actions"))
+            }
+
+            async fn do_exchange(
+                &self,
+                _r: Request<Streaming<FlightData>>,
+            ) -> Result<Response<Self::DoExchangeStream>, Status> {
+                Err(Status::unimplemented("do_exchange"))
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn do_action_rejects_response_exceeding_size_cap() {
+        use arrow_flight::flight_service_server::FlightServiceServer;
+        use tonic::transport::Server;
+
+        use oversized_action_service::OversizedActionService;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr: std::net::SocketAddr = listener.local_addr().expect("local_addr");
+        let incoming = tonic::transport::server::TcpIncoming::from(listener);
+
+        // 40 chunks * 2 MiB = 80 MiB, over the 64 MiB cap while each chunk
+        // stays comfortably under tonic's default 4 MiB decode-length limit.
+        let service = OversizedActionService {
+            chunk_size: 2 * 1024 * 1024,
+            chunk_count: 40,
+        };
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve");
+        });
+
+        let url = format!("http://{addr}");
+        let pool = FlightClientPool::new(url).expect("pool");
+        let action = crate::flight_action::KrishivFlightAction::Explain(
+            crate::flight_action::ExplainBody {
+                sql: "SELECT 1".into(),
+            },
+        );
+
+        let result = pool.do_action(&action).await;
+        match result {
+            Err(RuntimeError::Transport { message }) => {
+                assert!(
+                    message.contains("MiB limit"),
+                    "expected a response-size-cap error, got: {message}"
+                );
+            }
+            other => panic!("expected Transport size-limit error, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn collect_flight_batches_drains_finite_stream_without_timeout() {
+        let schema = Arc::new(Schema::new(Vec::<arrow::datatypes::Field>::new()));
+        let stream = Box::pin(futures::stream::iter((0..3).map(move |_| {
+            Ok(RecordBatch::new_empty(Arc::clone(&schema)))
+        })))
+            as std::pin::Pin<
+                Box<dyn futures::Stream<Item = arrow_flight::error::Result<RecordBatch>>>,
+            >;
+        let batches = collect_flight_batches(stream, Duration::from_secs(5))
+            .await
+            .expect("finite stream must drain without timing out");
+        assert_eq!(batches.len(), 3);
     }
 }

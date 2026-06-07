@@ -37,6 +37,15 @@ pub(crate) struct SessionState {
 }
 
 /// Session event-time window operator (R5.2).
+///
+/// **Memory bound**: `sessions` holds one open [`SessionState`] per key until
+/// inactivity exceeding the session gap closes it (flushed and removed on
+/// watermark advance). There is no key-eviction or TTL beyond the session-gap
+/// closure itself, so memory is bounded by the number of keys with an
+/// in-flight session at any instant. Deployments with very high-cardinality
+/// or long-lived keys should choose a session gap and watermark lag that keep
+/// this bounded, and pre-aggregate/filter keys upstream where cardinality is
+/// unbounded.
 pub struct SessionWindowOperator {
     spec: SessionWindowSpec,
     // Keyed by serialised key value.
@@ -44,16 +53,38 @@ pub struct SessionWindowOperator {
     prev_watermark_ms: i64,
     /// Total late events dropped by this operator since creation.
     pub late_events_dropped: u64,
+    /// Output schema, fixed for the operator's lifetime; cached so closed
+    /// sessions don't rebuild `Schema`/`Field` vectors per row.
+    output_schema: Arc<Schema>,
+}
+
+fn build_session_output_schema(spec: &SessionWindowSpec) -> Arc<Schema> {
+    let key_dtype = key_type_to_data_type(&spec.key_column_type);
+    let mut fields = vec![
+        Field::new(&spec.key_column, key_dtype, false),
+        Field::new("session_start_ms", DataType::Int64, false),
+        Field::new("session_end_ms", DataType::Int64, false),
+    ];
+    for agg in &spec.agg_exprs {
+        let dtype = match agg.function {
+            AggFunction::Avg => DataType::Float64,
+            _ => DataType::Int64,
+        };
+        fields.push(Field::new(&agg.output_column, dtype, false));
+    }
+    Arc::new(Schema::new(fields))
 }
 
 impl SessionWindowOperator {
     /// Create a new session window operator.
     pub fn new(spec: SessionWindowSpec) -> Self {
+        let output_schema = build_session_output_schema(&spec);
         Self {
             spec,
             sessions: HashMap::new(),
             prev_watermark_ms: i64::MIN,
             late_events_dropped: 0,
+            output_schema,
         }
     }
 
@@ -296,20 +327,7 @@ impl SessionWindowOperator {
         session_end_ms: i64,
         state: &AggState,
     ) -> ExecResult<RecordBatch> {
-        let key_dtype = key_type_to_data_type(&self.spec.key_column_type);
-        let mut fields = vec![
-            Field::new(&self.spec.key_column, key_dtype, false),
-            Field::new("session_start_ms", DataType::Int64, false),
-            Field::new("session_end_ms", DataType::Int64, false),
-        ];
-        for agg in &self.spec.agg_exprs {
-            let dtype = match agg.function {
-                AggFunction::Avg => DataType::Float64,
-                _ => DataType::Int64,
-            };
-            fields.push(Field::new(&agg.output_column, dtype, false));
-        }
-        let schema = Arc::new(Schema::new(fields));
+        let schema = Arc::clone(&self.output_schema);
         let mut columns: Vec<Arc<dyn arrow::array::Array>> = vec![
             key_value_to_typed_column(&self.spec.key_column_type, key_value),
             Arc::new(Int64Array::from(vec![session_start_ms])),
@@ -513,6 +531,65 @@ mod session_state_tests {
         assert!(
             out.is_empty(),
             "session with gap=i64::MAX should not close at watermark 1000"
+        );
+    }
+
+    fn ts_batch(key: &str, event_time_ms: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![key])),
+                Arc::new(Int64Array::from(vec![event_time_ms])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Regression test: a watermark that decreases between batches must not
+    /// move the operator's internal late-event threshold (`prev_watermark_ms`)
+    /// backwards. If it did, an event that is genuinely late relative to the
+    /// high-water mark already observed could be wrongly accepted by a later
+    /// batch, corrupting already-closed session state (the Phase 1 bug this
+    /// guards against).
+    #[test]
+    fn session_window_non_monotonic_watermark_does_not_lower_late_threshold() {
+        let spec = SessionWindowSpec {
+            key_column: "k".into(),
+            key_column_type: "utf8".into(),
+            event_time_column: "ts".into(),
+            session_gap_ms: 1000,
+            agg_exprs: vec![AggExpr {
+                input_column: String::new(),
+                output_column: "cnt".into(),
+                function: AggFunction::Count,
+            }],
+        };
+        let mut op = SessionWindowOperator::new(spec);
+
+        // Batch 1: advance the watermark to 5000.
+        op.process_batch(&ts_batch("a", 5000), 5000)
+            .expect("process batch1");
+        assert_eq!(op.late_events_dropped, 0);
+
+        // Batch 2: a DECREASING watermark (100 < 5000) must not move the
+        // operator's internal late-event threshold backwards.
+        op.process_batch(&ts_batch("a", 5100), 100)
+            .expect("process batch2");
+        assert_eq!(op.late_events_dropped, 0);
+
+        // Batch 3: an event at ts=4000 is older than the watermark already
+        // established in batch 1 (5000). If the decreasing watermark from
+        // batch 2 had corrupted the late threshold down to 100, this event
+        // would be wrongly accepted instead of dropped as late.
+        op.process_batch(&ts_batch("a", 4000), 5000)
+            .expect("process batch3");
+        assert_eq!(
+            op.late_events_dropped, 1,
+            "decreasing watermark must not reopen the late-event threshold"
         );
     }
 }

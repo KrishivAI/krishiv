@@ -182,7 +182,8 @@ impl TemporalJoinOperator {
                     .values()
                     .find_map(|state| state.versions.values().next().map(|batch| batch.schema()))
             });
-            let schema = build_joined_schema(stream_batch.schema(), table_schema)?;
+            let schema =
+                build_joined_schema(stream_batch.schema(), table_schema, !self.spec.inner_join)?;
             return Ok(RecordBatch::new_empty(schema));
         }
 
@@ -199,7 +200,8 @@ impl TemporalJoinOperator {
             )?);
         }
 
-        let schema = build_joined_schema(stream_batch.schema(), table_schema)?;
+        let schema =
+            build_joined_schema(stream_batch.schema(), table_schema, !self.spec.inner_join)?;
 
         RecordBatch::try_new(schema, arrays).map_err(|e| ExecError::Arrow(e.to_string()))
     }
@@ -232,9 +234,18 @@ fn slice_column(array: &ArrayRef, offset: usize, length: usize) -> ArrayRef {
     array.slice(offset, length)
 }
 
+/// Build the schema for joined output rows.
+///
+/// `table_columns_nullable` must be `true` for left-outer joins: unmatched
+/// stream rows emit `null` table-derived columns (see the "Left outer" branch
+/// in [`TemporalJoinOperator::join`]), so the table-derived fields must be
+/// declared nullable regardless of the source table schema's own nullability —
+/// otherwise `RecordBatch::try_new` rejects the batch with "declared as
+/// non-nullable but contains null values".
 fn build_joined_schema(
     stream_schema: SchemaRef,
     table_schema: Option<SchemaRef>,
+    table_columns_nullable: bool,
 ) -> ExecResult<SchemaRef> {
     let stream_fields: Vec<Field> = stream_schema
         .fields()
@@ -250,7 +261,8 @@ fn build_joined_schema(
             } else {
                 f.name().clone()
             };
-            fields.push(Field::new(name, f.data_type().clone(), f.is_nullable()));
+            let nullable = f.is_nullable() || table_columns_nullable;
+            fields.push(Field::new(name, f.data_type().clone(), nullable));
         }
     }
     Ok(Arc::new(Schema::new(fields)))
@@ -487,6 +499,38 @@ mod tests {
             result.num_rows(),
             0,
             "inner join with no match must return empty"
+        );
+    }
+
+    #[test]
+    fn temporal_join_left_outer_unmatched_row_emits_null_table_columns() {
+        let spec = TemporalJoinSpec {
+            stream_time_col: "ts".into(),
+            join_keys: vec!["id".into()],
+            inner_join: false,
+        };
+        let mut op = TemporalJoinOperator::new(spec, 10_000);
+
+        // Only key "a" has table state; "b" never appears in keyed_state, so
+        // it must fall through to the left-outer "no match" branch.
+        op.upsert_version("a", 1000, table_batch("a", 100));
+
+        let stream = stream_batch(vec!["a", "b"], vec![1500, 1500]);
+        let result = op.join(&stream).unwrap();
+
+        assert_eq!(
+            result.num_rows(),
+            2,
+            "left outer join must emit a row for every stream row, matched or not"
+        );
+        assert_eq!(result.num_columns(), 5);
+
+        let score_col = result.column(result.schema().index_of("score").unwrap());
+        let scores = score_col.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(scores.value(0), 100, "matched row carries the joined table value");
+        assert!(
+            scores.is_null(1),
+            "unmatched row must carry null table columns rather than being dropped"
         );
     }
 

@@ -599,4 +599,28 @@ mod tests {
             "count at i64::MAX must return Err(InvalidInput), got {result:?}"
         );
     }
+
+    #[test]
+    fn sum_overflow_returns_error() {
+        // Regression: a running Sum near i64::MAX must report an error rather
+        // than silently wrapping (Phase 1 fix for unchecked accumulation).
+        let exprs = vec![AggExpr {
+            function: AggFunction::Sum,
+            input_column: "v".into(),
+            output_column: "sum_v".into(),
+        }];
+        let mut state = AggState::new(&exprs);
+        state.values[0] = i64::MAX - 5;
+        state.has_value[0] = true;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![10i64]))]).unwrap();
+
+        let result = state.update(&exprs, &batch, 0);
+        assert!(
+            matches!(result, Err(ExecError::InvalidInput(_))),
+            "sum overflow near i64::MAX must return Err(InvalidInput), got {result:?}"
+        );
+    }
 }

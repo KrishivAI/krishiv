@@ -18,6 +18,9 @@ tonic-prost.workspace = true
 [features]
 serde = ["dep:serde"]
 
+[dev-dependencies]
+proptest = "1"
+
 [build-dependencies]
 prost-build.workspace = true
 protoc-bin-vendored.workspace = true

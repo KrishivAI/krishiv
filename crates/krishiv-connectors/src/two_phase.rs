@@ -181,6 +181,14 @@ impl LocalParquetTwoPhaseCommitSink {
         self.quality_config = Some(config.compile()?);
         Ok(self)
     }
+
+    /// Test-only: seed `next_handle` directly so overflow behaviour can be
+    /// exercised without iterating `prepare()` up to `u64::MAX` times.
+    #[cfg(test)]
+    pub(crate) fn with_next_handle_for_test(mut self, next_handle: u64) -> Self {
+        self.next_handle = next_handle;
+        self
+    }
 }
 
 impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
@@ -307,6 +315,53 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
                 e.kind(),
                 format!("parquet 2pc abort: remove {:?}: {e}", handle.staging_path),
             ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    fn make_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Regression: `prepare()` must report an error when `next_handle` would
+    /// overflow `u64`, rather than wrapping back to handle 0 and risking a
+    /// collision with an already-committed file (Phase 1 fix for unchecked
+    /// `+= 1` accumulation).
+    #[test]
+    fn prepare_reports_error_on_handle_id_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink =
+            LocalParquetTwoPhaseCommitSink::new(dir.path()).with_next_handle_for_test(u64::MAX);
+        let batch = make_batch();
+
+        let result = sink.prepare(0, &batch);
+        match result {
+            Err(ConnectorError::Parquet(message)) => {
+                assert!(
+                    message.contains("overflow"),
+                    "expected an overflow error, got: {message}"
+                );
+            }
+            other => panic!("expected ConnectorError::Parquet overflow error, got {other:?}"),
         }
     }
 }
