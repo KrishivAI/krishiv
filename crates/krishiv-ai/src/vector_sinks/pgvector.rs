@@ -6,9 +6,9 @@ mod imp {
     use sqlx::PgPool;
     use sqlx::postgres::PgPoolOptions;
 
-    use crate::batch::EmbeddingBatch;
-    use crate::id::point_id_from_doc_epoch;
-    use crate::traits::{
+    use super::super::batch::EmbeddingBatch;
+    use super::super::id::point_id_from_doc_epoch;
+    use super::super::traits::{
         PayloadFilter, PayloadValue, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult,
         validate_identifier,
     };

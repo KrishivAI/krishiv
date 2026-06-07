@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use krishiv_ai::{
-    EmbeddingDevice, EmbeddingModelRegistry, HuggingFaceEmbeddingModel, MarkdownSectionChunker,
-    ModelKey, RecursiveTextChunker, SentenceChunker, TokenAwareChunker,
+    EmbeddingDevice, EmbeddingModelRegistry, HuggingFaceEmbeddingModel, InMemoryVectorSink,
+    MarkdownSectionChunker, ModelKey, RecursiveTextChunker, SentenceChunker, TokenAwareChunker,
+    VectorSink,
 };
-use krishiv_vector_sinks::{InMemoryVectorSink, VectorSink};
 use pyo3::prelude::*;
 
 use crate::RUNTIME;

@@ -8,6 +8,7 @@ pub mod embed;
 pub mod llm;
 pub mod memo;
 pub mod rag;
+pub mod vector_sinks;
 
 pub use chunk::{
     Chunk, MarkdownSectionChunker, RecursiveTextChunker, SentenceChunker, TextChunker,
@@ -23,6 +24,17 @@ pub use llm::{
 };
 pub use memo::{MemoEntry, MemoStore, memo_key};
 pub use rag::{RagIndexPipeline, RagIndexResult, RagQuery, RefreshPolicy};
+pub use vector_sinks::{
+    EmbeddingBatch, InMemoryVectorSink, LanceDbSink, PayloadFilter, PayloadValue, PineconeSink,
+    ScoredChunk, VectorSink, VectorSinkConfig, VectorSinkError, VectorSinkRegistry,
+    WeaviateSink, point_id_from_doc_epoch, validate_identifier,
+};
 
 #[cfg(feature = "fastembed-local")]
 pub use embed::HuggingFaceEmbeddingModel;
+
+#[cfg(feature = "pgvector")]
+pub use vector_sinks::PgvectorSink;
+
+#[cfg(feature = "qdrant")]
+pub use vector_sinks::QdrantSink;

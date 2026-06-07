@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use crate::batch::EmbeddingBatch;
+use super::batch::EmbeddingBatch;
 
 /// JSON-compatible payload value for vector store metadata.
 #[derive(Debug, Clone, PartialEq)]

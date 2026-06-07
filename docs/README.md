@@ -51,7 +51,6 @@ Core implementation choices:
 | `krishiv-governance` | Audit, lineage, and policy support. |
 | `krishiv-udf` | UDF contracts and execution limits. |
 | `krishiv-ai` | AI/RAG and embedding support. |
-| `krishiv-vector-sinks` | Vector sink contracts and implementations. |
 | `krishiv-bench`, `krishiv-cep` | Benchmarks and CEP support. Fault-injection/chaos tests live in `krishiv-common`'s `chaos` feature + `tests/chaos_suite.rs`. Schema registry helpers live in `krishiv-connectors`'s `schema-registry` feature. |
 
 ## Runtime Modes

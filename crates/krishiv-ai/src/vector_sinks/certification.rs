@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::batch::EmbeddingBatch;
-use crate::memory::InMemoryVectorSink;
-use crate::traits::{PayloadValue, VectorSink};
+use super::batch::EmbeddingBatch;
+use super::memory::InMemoryVectorSink;
+use super::traits::{PayloadValue, VectorSink};
 
 /// Trait-level idempotency certification (ADR-R17.3).
 #[tokio::test]

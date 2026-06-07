@@ -135,7 +135,7 @@ impl EmbedderConfig {
     }
 }
 
-/// Vector sink configuration (delegates to krishiv-vector-sinks JSON).
+/// Vector sink configuration (delegates to krishiv-ai::vector_sinks JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorSinkPlanConfig {
     pub sink_type: String,

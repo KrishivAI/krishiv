@@ -3930,13 +3930,15 @@ dependencies = [
  "hex",
  "krishiv-common",
  "krishiv-plan",
- "krishiv-vector-sinks",
  "mockito",
+ "parquet 58.3.0",
+ "qdrant-client",
  "redb",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "tempfile",
  "thiserror 1.0.69",
  "tiktoken-rs",
@@ -4283,7 +4285,6 @@ dependencies = [
  "krishiv-sql",
  "krishiv-state",
  "krishiv-udf",
- "krishiv-vector-sinks",
  "parquet 58.3.0",
  "pyo3",
  "pyo3-arrow",
@@ -4459,30 +4460,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tower 0.5.3",
-]
-
-[[package]]
-name = "krishiv-vector-sinks"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-trait",
- "dashmap",
- "futures",
- "hex",
- "krishiv-common",
- "mockito",
- "parquet 58.3.0",
- "qdrant-client",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]

@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
 
-use crate::batch::EmbeddingBatch;
-use crate::id::point_id_from_doc_epoch;
-use crate::traits::{PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult};
+use super::batch::EmbeddingBatch;
+use super::id::point_id_from_doc_epoch;
+use super::traits::{PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult};
 
 /// Pinecone REST upsert sink.
 #[derive(Clone)]
@@ -189,7 +189,7 @@ impl VectorSink for PineconeSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::VectorSink;
+    use super::super::traits::VectorSink;
 
     #[tokio::test]
     async fn pinecone_upsert_retries_same_epoch() {

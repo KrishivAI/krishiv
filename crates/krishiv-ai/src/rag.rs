@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use krishiv_vector_sinks::{EmbeddingBatch, PayloadValue, VectorSink};
+use crate::vector_sinks::{EmbeddingBatch, PayloadValue, VectorSink};
 
 use crate::chunk::{Chunk, TextChunker};
 use crate::embed::EmbeddingModel;
@@ -79,7 +79,7 @@ where
                 .zip(embs.iter())
                 .zip(texts_to_embed.iter())
             {
-                let point_id = krishiv_vector_sinks::point_id_from_doc_epoch(
+                let point_id = crate::vector_sinks::point_id_from_doc_epoch(
                     &format!("{doc_id}:{chunk_index}"),
                     self.epoch,
                 );
@@ -131,7 +131,7 @@ impl RagQuery {
         &self,
         query_text: &str,
         top_k: usize,
-    ) -> Result<Vec<krishiv_vector_sinks::ScoredChunk>, String> {
+    ) -> Result<Vec<crate::vector_sinks::ScoredChunk>, String> {
         let vector = self
             .embedder
             .embed_batch(&[query_text.to_string()])
@@ -157,7 +157,7 @@ mod tests {
     use crate::chunk::RecursiveTextChunker;
     use crate::embed::HuggingFaceEmbeddingModel;
     use crate::{EmbeddingDevice, EmbeddingModelRegistry, ModelKey};
-    use krishiv_vector_sinks::InMemoryVectorSink;
+    use crate::vector_sinks::InMemoryVectorSink;
 
     struct CountingEmbedder {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,

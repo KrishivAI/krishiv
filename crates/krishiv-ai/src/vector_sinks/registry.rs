@@ -1,19 +1,20 @@
 use std::sync::Arc;
 
-use crate::VectorSinkError;
-use crate::config::VectorSinkConfig;
-use crate::memory::InMemoryVectorSink;
-use crate::pinecone::PineconeSink;
-use crate::traits::{VectorSink, VectorSinkResult};
-use crate::weaviate::WeaviateSink;
+#[cfg(any(not(feature = "qdrant"), not(feature = "pgvector")))]
+use super::VectorSinkError;
+use super::config::VectorSinkConfig;
+use super::memory::InMemoryVectorSink;
+use super::pinecone::PineconeSink;
+use super::traits::{VectorSink, VectorSinkResult};
+use super::weaviate::WeaviateSink;
 
-use crate::lancedb_sink::LanceDbSink;
+use super::lancedb_sink::LanceDbSink;
 
 #[cfg(feature = "pgvector")]
-use crate::pgvector::PgvectorSink;
+use super::pgvector::PgvectorSink;
 
 #[cfg(feature = "qdrant")]
-use crate::qdrant::QdrantSink;
+use super::qdrant::QdrantSink;
 
 /// Registry of named vector sinks (R17 connector integration).
 #[derive(Default)]

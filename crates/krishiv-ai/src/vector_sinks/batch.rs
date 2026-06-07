@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::traits::PayloadValue;
+use super::traits::PayloadValue;
 
 /// Columnar embedding write batch for vector sinks.
 #[derive(Debug, Clone, PartialEq)]

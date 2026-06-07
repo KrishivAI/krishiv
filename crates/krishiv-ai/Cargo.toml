@@ -10,6 +10,10 @@ license.workspace = true
 default = []
 fastembed-local = ["dep:fastembed"]
 tiktoken = ["dep:tiktoken-rs"]
+# Vector sink backends (merged from the former krishiv-vector-sinks crate).
+vector-sinks = ["qdrant", "pgvector"]
+qdrant = ["dep:qdrant-client"]
+pgvector = ["dep:sqlx"]
 
 [dependencies]
 arrow = { workspace = true }
@@ -20,12 +24,14 @@ fastembed = { workspace = true, optional = true }
 hex = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-plan = { path = "../krishiv-plan" }
-krishiv-vector-sinks = { path = "../krishiv-vector-sinks" }
+parquet = { workspace = true }
+qdrant-client = { workspace = true, optional = true }
 redb = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+sqlx = { workspace = true, optional = true }
 twox-hash = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }

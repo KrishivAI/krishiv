@@ -17,10 +17,10 @@ use async_trait::async_trait;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-use crate::batch::EmbeddingBatch;
-use crate::id::point_id_from_doc_epoch;
-use crate::memory::InMemoryVectorSink;
-use crate::traits::{PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult};
+use super::batch::EmbeddingBatch;
+use super::id::point_id_from_doc_epoch;
+use super::memory::InMemoryVectorSink;
+use super::traits::{PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult};
 
 /// Lance-style local sink: persists Parquet under `uri` and serves queries from an in-memory index.
 #[derive(Debug)]

@@ -3,9 +3,9 @@ use std::sync::RwLock;
 
 use async_trait::async_trait;
 
-use crate::batch::EmbeddingBatch;
-use crate::id::point_id_from_doc_epoch;
-use crate::traits::{
+use super::batch::EmbeddingBatch;
+use super::id::point_id_from_doc_epoch;
+use super::traits::{
     PayloadFilter, PayloadValue, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult,
 };
 

@@ -26,7 +26,6 @@ members = [
     "crates/krishiv-governance",
     "crates/krishiv-bench",
     "crates/krishiv-cep",
-    "crates/krishiv-vector-sinks",
 ]
 default-members = [
     "crates/krishiv",
@@ -54,7 +53,6 @@ default-members = [
     "crates/krishiv-metrics",
     "crates/krishiv-governance",
     "crates/krishiv-cep",
-    "crates/krishiv-vector-sinks",
 ]
 resolver = "3"
 

@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 
 //! Vector store sinks for embedding upsert and nearest-neighbor query (R17).
 
