@@ -138,16 +138,18 @@ impl SessionWindowOperator {
                 serde_json::from_slice(&payload).map_err(|e| StateError::CorruptEntry {
                     message: e.to_string(),
                 })?;
-            let session_start_ms = parsed["session_start_ms"].as_i64().ok_or_else(|| {
-                StateError::CorruptEntry {
-                    message: "missing or invalid session_start_ms".into(),
-                }
-            })?;
-            let last_event_time_ms = parsed["last_event_time_ms"].as_i64().ok_or_else(|| {
-                StateError::CorruptEntry {
-                    message: "missing or invalid last_event_time_ms".into(),
-                }
-            })?;
+            let session_start_ms =
+                parsed["session_start_ms"]
+                    .as_i64()
+                    .ok_or_else(|| StateError::CorruptEntry {
+                        message: "missing or invalid session_start_ms".into(),
+                    })?;
+            let last_event_time_ms =
+                parsed["last_event_time_ms"]
+                    .as_i64()
+                    .ok_or_else(|| StateError::CorruptEntry {
+                        message: "missing or invalid last_event_time_ms".into(),
+                    })?;
             let values: Vec<i64> = parsed["values"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
@@ -508,6 +510,9 @@ mod session_state_tests {
         .unwrap();
         // Must not panic; session gap = i64::MAX so session never closes.
         let out = op.process_batch(&batch, 1000).unwrap();
-        assert!(out.is_empty(), "session with gap=i64::MAX should not close at watermark 1000");
+        assert!(
+            out.is_empty(),
+            "session with gap=i64::MAX should not close at watermark 1000"
+        );
     }
 }

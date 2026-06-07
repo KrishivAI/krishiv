@@ -78,11 +78,7 @@ impl MemoCache {
     pub fn cache_info(&self) -> (u64, u64, usize) {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
-        let size = self
-            .inner
-            .lock()
-            .map(|g| g.map.len())
-            .unwrap_or(0);
+        let size = self.inner.lock().map(|g| g.map.len()).unwrap_or(0);
         (hits, misses, size)
     }
 
@@ -188,13 +184,19 @@ mod tests {
                 c.store(key, batch(i as i64)).unwrap();
                 // Immediately look it up — must find the value we just stored.
                 let hit = c.lookup(key);
-                assert!(hit.is_some(), "concurrent store then lookup must succeed for thread {i}");
+                assert!(
+                    hit.is_some(),
+                    "concurrent store then lookup must succeed for thread {i}"
+                );
             }));
         }
         for h in handles {
             h.join().expect("thread panicked");
         }
         let (_, _, size) = cache.cache_info();
-        assert_eq!(size, 8, "all 8 unique keys must be present after concurrent stores");
+        assert_eq!(
+            size, 8,
+            "all 8 unique keys must be present after concurrent stores"
+        );
     }
 }

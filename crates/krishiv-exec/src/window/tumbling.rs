@@ -72,12 +72,10 @@ impl TumblingWindowOperator {
             ));
         }
         if spec.window_size_ms > i64::MAX as u64 {
-            return Err(ExecError::InvalidWindowConfig(
-                format!(
-                    "tumbling window_size_ms ({}) exceeds i64::MAX",
-                    spec.window_size_ms,
-                ),
-            ));
+            return Err(ExecError::InvalidWindowConfig(format!(
+                "tumbling window_size_ms ({}) exceeds i64::MAX",
+                spec.window_size_ms,
+            )));
         }
         Ok(())
     }

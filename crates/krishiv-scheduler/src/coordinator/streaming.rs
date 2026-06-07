@@ -43,11 +43,15 @@ impl Coordinator {
 
         // Wire incoming executor streaming progress reports to the global metrics registry (Phase 3 H3 / GAP-OB-04)
         let metrics = krishiv_metrics::global_metrics();
-        metrics.set_watermark_ms(&report.job_id, report.watermark_ms);
+        metrics.set_watermark_ms(report.job_id.as_str(), report.watermark_ms);
         // Note: report.rows_emitted is a cumulative counter representing newly emitted rows since task start.
         // We use set_streaming_rows to set the absolute cumulative updates correctly without double-counting.
-        metrics.set_streaming_rows(&report.job_id, &report.task_id, report.rows_emitted);
-        metrics.set_state_bytes(&report.job_id, report.state_bytes);
+        metrics.set_streaming_rows(
+            report.job_id.as_str(),
+            report.task_id.as_str(),
+            report.rows_emitted,
+        );
+        metrics.set_state_bytes(report.job_id.as_str(), report.state_bytes);
     }
 
     /// Populate `streaming_task_index` for all tasks in a job after assignment.

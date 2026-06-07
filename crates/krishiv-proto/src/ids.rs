@@ -28,6 +28,13 @@ impl IdError {
         }
     }
 
+    pub(crate) fn range(kind: &'static str) -> Self {
+        Self {
+            kind,
+            reason: "start must not exceed end",
+        }
+    }
+
     /// Identifier kind that failed validation.
     pub fn kind(&self) -> &'static str {
         self.kind
@@ -75,6 +82,8 @@ id_type!(JobId, "job id");
 id_type!(StageId, "stage id");
 id_type!(TaskId, "task id");
 id_type!(ExecutorId, "executor id");
+id_type!(PartitionId, "partition id");
+id_type!(OperatorId, "operator id");
 
 /// Monotonic task attempt identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

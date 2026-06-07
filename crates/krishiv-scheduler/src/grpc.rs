@@ -476,7 +476,9 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
                 coord
                     .pending_acks
                     .values()
-                    .filter(|ack| req.operator_id.is_empty() || ack.operator_id == req.operator_id)
+                    .filter(|ack| {
+                        req.operator_id.is_empty() || ack.operator_id.as_str() == req.operator_id
+                    })
                     .filter_map(|ack| {
                         ack.snapshot_path.as_ref().map(|path| StateSnapshotInfo {
                             task_id: ack.task_id.as_str().to_owned(),
@@ -779,12 +781,34 @@ fn trace_and_auth_interceptor(
 }
 
 /// Serve the coordinator/executor gRPC API on an already-bound listener.
+///
+/// Equivalent to [`serve_coordinator_executor_grpc_with_listener_and_tracker`]
+/// with a fresh, unobserved [`crate::rpc_drain::InFlightTracker`] — use that
+/// function instead when the caller needs to drain in-flight calls before
+/// shutdown (e.g. coordinator demotion).
 pub async fn serve_coordinator_executor_grpc_with_listener(
     listener: tokio::net::TcpListener,
     coordinator: SharedCoordinator,
 ) -> Result<(), tonic::transport::Error> {
+    serve_coordinator_executor_grpc_with_listener_and_tracker(
+        listener,
+        coordinator,
+        crate::rpc_drain::InFlightTracker::new(),
+    )
+    .await
+}
+
+/// Serve the coordinator/executor gRPC API, reporting every in-flight call
+/// into `tracker` so the caller can drain outstanding RPCs before demoting
+/// the coordinator (R11) instead of relying on a fixed sleep.
+pub async fn serve_coordinator_executor_grpc_with_listener_and_tracker(
+    listener: tokio::net::TcpListener,
+    coordinator: SharedCoordinator,
+    tracker: crate::rpc_drain::InFlightTracker,
+) -> Result<(), tonic::transport::Error> {
     let coordinator_for_management = coordinator.clone();
     tonic::transport::Server::builder()
+        .layer(crate::rpc_drain::InFlightLayer::new(tracker))
         .add_service(tonic::service::interceptor::InterceptedService::new(
             coordinator_executor_grpc_server(coordinator),
             trace_and_auth_interceptor,

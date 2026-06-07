@@ -6,7 +6,8 @@ use crate::executor::{
     HeartbeatThrottleCommand, ShufflePartitionOutput, TaskOutputMetadata, TaskRuntimeStats,
 };
 use crate::ids::{
-    AttemptId, ExecutorId, FencingToken, JobId, LeaseGeneration, StageId, TaskId, TransportVersion,
+    AttemptId, ExecutorId, FencingToken, JobId, LeaseGeneration, OperatorId, PartitionId, StageId,
+    TaskId, TransportVersion,
 };
 use crate::lifecycle::{ExecutorState, TaskState};
 use crate::executor::TraceContext;
@@ -275,7 +276,7 @@ pub fn executor_heartbeat_request_from_wire(
                 .streaming_progress
                 .into_iter()
                 .map(streaming_progress_report_from_wire)
-                .collect(),
+                .collect::<WireResult<Vec<_>>>()?,
         );
     }
     if !value.hot_key_reports.is_empty() {
@@ -284,7 +285,7 @@ pub fn executor_heartbeat_request_from_wire(
                 .hot_key_reports
                 .into_iter()
                 .map(hot_key_report_from_wire)
-                .collect(),
+                .collect::<WireResult<Vec<_>>>()?,
         );
     }
     if !value.streaming_task_states.is_empty() {
@@ -414,8 +415,8 @@ fn streaming_progress_report_to_wire(
     value: &crate::StreamingProgressReport,
 ) -> v1::StreamingProgressReport {
     v1::StreamingProgressReport {
-        job_id: value.job_id.clone(),
-        task_id: value.task_id.clone(),
+        job_id: value.job_id.as_str().to_owned(),
+        task_id: value.task_id.as_str().to_owned(),
         watermark_ms: value.watermark_ms,
         rows_emitted: value.rows_emitted,
         batches_emitted: value.batches_emitted,
@@ -427,17 +428,19 @@ fn streaming_progress_report_to_wire(
 
 fn streaming_progress_report_from_wire(
     value: v1::StreamingProgressReport,
-) -> crate::StreamingProgressReport {
-    crate::StreamingProgressReport {
-        job_id: value.job_id,
-        task_id: value.task_id,
+) -> WireResult<crate::StreamingProgressReport> {
+    let job_id = JobId::try_new(value.job_id).map_err(WireError::from_id)?;
+    let task_id = TaskId::try_new(value.task_id).map_err(WireError::from_id)?;
+    Ok(crate::StreamingProgressReport {
+        job_id,
+        task_id,
         watermark_ms: value.watermark_ms,
         rows_emitted: value.rows_emitted,
         batches_emitted: value.batches_emitted,
         state_bytes: value.state_bytes,
         source_offset: value.source_offset,
         timestamp_ms: value.timestamp_ms,
-    }
+    })
 }
 
 fn hot_key_report_to_wire(value: &crate::HeartbeatHotKeyReport) -> v1::HeartbeatHotKeyReport {
@@ -446,20 +449,23 @@ fn hot_key_report_to_wire(value: &crate::HeartbeatHotKeyReport) -> v1::Heartbeat
         estimated_count: value.estimated_count,
         max_error: value.max_error,
         heat_score: value.heat_score,
-        job_id: value.job_id.clone(),
+        job_id: value.job_id.as_str().to_owned(),
         source_id: value.source_id.clone(),
     }
 }
 
-fn hot_key_report_from_wire(value: v1::HeartbeatHotKeyReport) -> crate::HeartbeatHotKeyReport {
-    crate::HeartbeatHotKeyReport {
+fn hot_key_report_from_wire(
+    value: v1::HeartbeatHotKeyReport,
+) -> WireResult<crate::HeartbeatHotKeyReport> {
+    let job_id = JobId::try_new(value.job_id).map_err(WireError::from_id)?;
+    Ok(crate::HeartbeatHotKeyReport {
         key: value.key,
         estimated_count: value.estimated_count,
         max_error: value.max_error,
         heat_score: value.heat_score,
-        job_id: value.job_id,
+        job_id,
         source_id: value.source_id,
-    }
+    })
 }
 
 fn streaming_task_state_to_wire(
@@ -1401,7 +1407,7 @@ fn transport_disposition_from_wire(value: i32) -> WireResult<TransportDispositio
 pub fn checkpoint_ack_request_to_wire(value: CheckpointAckRequest) -> v1::CheckpointAckRequest {
     v1::CheckpointAckRequest {
         job_id: value.job_id.as_str().to_owned(),
-        operator_id: value.operator_id,
+        operator_id: value.operator_id.as_str().to_owned(),
         task_id: value.task_id.as_str().to_owned(),
         epoch: value.epoch,
         fencing_token: value.fencing_token.as_u64(),
@@ -1409,7 +1415,7 @@ pub fn checkpoint_ack_request_to_wire(value: CheckpointAckRequest) -> v1::Checkp
             .source_offsets
             .into_iter()
             .map(|o| v1::CheckpointSourceOffset {
-                partition_id: o.partition_id,
+                partition_id: o.partition_id.as_str().to_owned(),
                 offset: o.offset,
             })
             .collect(),
@@ -1422,16 +1428,21 @@ pub fn checkpoint_ack_request_from_wire(
     value: v1::CheckpointAckRequest,
 ) -> WireResult<CheckpointAckRequest> {
     let job_id = JobId::try_new(value.job_id).map_err(WireError::from_id)?;
+    let operator_id = OperatorId::try_new(value.operator_id).map_err(WireError::from_id)?;
     let task_id = TaskId::try_new(value.task_id).map_err(WireError::from_id)?;
     let fencing_token = FencingToken::try_new(value.fencing_token).map_err(WireError::from_id)?;
     let source_offsets = value
         .source_offsets
         .into_iter()
-        .map(|o| CheckpointSourceOffset {
-            partition_id: o.partition_id,
-            offset: o.offset,
+        .map(|o| {
+            let partition_id =
+                PartitionId::try_new(o.partition_id).map_err(WireError::from_id)?;
+            Ok(CheckpointSourceOffset {
+                partition_id,
+                offset: o.offset,
+            })
         })
-        .collect();
+        .collect::<WireResult<Vec<_>>>()?;
     let snapshot_path = if value.snapshot_path.is_empty() {
         None
     } else {
@@ -1439,7 +1450,7 @@ pub fn checkpoint_ack_request_from_wire(
     };
     Ok(CheckpointAckRequest {
         job_id,
-        operator_id: value.operator_id,
+        operator_id,
         task_id,
         epoch: value.epoch,
         fencing_token,

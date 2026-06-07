@@ -94,19 +94,12 @@ impl FromStr for DurabilityProfile {
 }
 
 /// Error returned for an unknown durability profile.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown durability profile '{value}'")]
 pub struct DurabilityProfileParseError {
     /// Supplied profile value.
     pub value: String,
 }
-
-impl fmt::Display for DurabilityProfileParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown durability profile '{}'", self.value)
-    }
-}
-
-impl std::error::Error for DurabilityProfileParseError {}
 
 /// Concrete durability expectations per component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

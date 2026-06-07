@@ -887,8 +887,9 @@ impl Source for RdkafkaKafkaSource {
         match msg {
             // Poll timeout — no message ready on this cycle; caller retries.
             Err(_timeout) => Ok(None),
-            Ok(Err(e)) => Err(crate::ConnectorError::IoStr {
+            Ok(Err(e)) => Err(crate::ConnectorError::Kafka {
                 message: format!("rdkafka receive error: {e}"),
+                retriable: true,
             }),
             Ok(Ok(msg)) => {
                 // C6: Track offset per partition. Log when a new partition is

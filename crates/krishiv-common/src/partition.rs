@@ -1,6 +1,5 @@
 //! Deterministic Arrow record-batch partitioning.
 
-use std::fmt;
 use std::num::NonZeroUsize;
 
 use arrow::array::{
@@ -19,7 +18,8 @@ use crate::hash::sha256_bytes_multi;
 const PARTITION_KEY_HASH_DOMAIN: &[u8] = b"krishiv.partition-key.v1\0";
 
 /// A batch cannot be partitioned without violating keyed execution semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid partitioning input: {message}")]
 pub struct PartitionError {
     message: String,
 }
@@ -36,14 +36,6 @@ impl PartitionError {
         &self.message
     }
 }
-
-impl fmt::Display for PartitionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "invalid partitioning input: {}", self.message)
-    }
-}
-
-impl std::error::Error for PartitionError {}
 
 fn supported_key_type(data_type: &DataType) -> bool {
     matches!(

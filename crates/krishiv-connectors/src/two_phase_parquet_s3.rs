@@ -7,9 +7,7 @@ use arrow::record_batch::RecordBatch;
 use crate::{ConnectorCapabilities, ConnectorError, ConnectorResult, TwoPhaseCommitSink};
 
 fn io_err(context: &str, e: std::io::Error) -> ConnectorError {
-    ConnectorError::IoStr {
-        message: format!("{context}: {e}"),
-    }
+    ConnectorError::Io(std::io::Error::new(e.kind(), format!("{context}: {e}")))
 }
 
 fn publish_staged_file(staging_path: &Path, final_path: &Path) -> ConnectorResult<()> {
@@ -82,20 +80,14 @@ impl TwoPhaseParquetSink {
                     .map_err(|e| io_err("read staging entry type", e))?
                     .is_file()
                 {
-                    return Err(ConnectorError::IoStr {
-                        message: format!(
-                            "orphan staging contains non-file entry: {:?}",
-                            entry.path()
-                        ),
-                    });
+                    return Err(ConnectorError::Parquet(format!(
+                        "orphan staging contains non-file entry: {:?}",
+                        entry.path()
+                    )));
                 }
-                let staging_name =
-                    entry
-                        .file_name()
-                        .into_string()
-                        .map_err(|name| ConnectorError::IoStr {
-                            message: format!("non-UTF-8 staging file name: {name:?}"),
-                        })?;
+                let staging_name = entry.file_name().into_string().map_err(|name| {
+                    ConnectorError::Parquet(format!("non-UTF-8 staging file name: {name:?}"))
+                })?;
                 let final_path = base_dir
                     .join("data")
                     .join(format!("epoch-{epoch}-{staging_name}"));
@@ -116,21 +108,16 @@ impl TwoPhaseCommitSink for TwoPhaseParquetSink {
 
     fn prepare(&mut self, epoch: u64, batch: &RecordBatch) -> ConnectorResult<Self::Handle> {
         if epoch != self.epoch {
-            return Err(ConnectorError::IoStr {
-                message: "prepare epoch mismatch".into(),
-            });
+            return Err(ConnectorError::Parquet("prepare epoch mismatch".into()));
         }
         let staging_dir = self.staging_dir();
         std::fs::create_dir_all(&staging_dir).map_err(|e| io_err("create staging dir", e))?;
 
         let (id, staging_path, final_path, file) = loop {
             let id = self.next_id;
-            self.next_id = self
-                .next_id
-                .checked_add(1)
-                .ok_or_else(|| ConnectorError::IoStr {
-                    message: "Parquet two-phase commit handle space exhausted".into(),
-                })?;
+            self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
+                ConnectorError::Parquet("Parquet two-phase commit handle space exhausted".into())
+            })?;
             let staging_name = format!("part-{id}.parquet");
             let staging_path = staging_dir.join(&staging_name);
             let final_path = self
@@ -152,15 +139,13 @@ impl TwoPhaseCommitSink for TwoPhaseParquetSink {
 
         let write_result = (|| {
             let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
-                .map_err(|e| ConnectorError::IoStr {
-                    message: format!("parquet writer: {e}"),
-                })?;
-            writer.write(batch).map_err(|e| ConnectorError::IoStr {
-                message: format!("parquet write: {e}"),
-            })?;
-            writer.close().map_err(|e| ConnectorError::IoStr {
-                message: format!("parquet close: {e}"),
-            })?;
+                .map_err(|e| ConnectorError::Parquet(format!("parquet writer: {e}")))?;
+            writer
+                .write(batch)
+                .map_err(|e| ConnectorError::Parquet(format!("parquet write: {e}")))?;
+            writer
+                .close()
+                .map_err(|e| ConnectorError::Parquet(format!("parquet close: {e}")))?;
             Ok(())
         })();
         if let Err(error) = write_result {
@@ -197,12 +182,10 @@ impl TwoPhaseCommitSink for TwoPhaseParquetSink {
             Err(error)
                 if error.kind() == std::io::ErrorKind::NotFound && !handle.final_path.exists() => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ConnectorError::IoStr {
-                    message: format!(
-                        "cannot abort committed Parquet handle at {:?}",
-                        handle.final_path
-                    ),
-                });
+                return Err(ConnectorError::Parquet(format!(
+                    "cannot abort committed Parquet handle at {:?}",
+                    handle.final_path
+                )));
             }
             Err(error) => return Err(io_err("remove staging file on abort", error)),
         }

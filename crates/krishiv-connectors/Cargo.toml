@@ -20,8 +20,9 @@ schema-registry = ["dep:krishiv-schema-registry"]
 
 [dependencies]
 arrow = { workspace = true }
-parquet = { workspace = true }
+parquet = { workspace = true, features = ["object_store", "async"] }
 bytes = { workspace = true }
+futures = { workspace = true }
 thiserror = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-exec = { path = "../krishiv-exec" }

@@ -93,12 +93,19 @@ pub fn execute_bounded_window(
         MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
     let mut output = Vec::new();
 
+    // Clone the shared spec fields once; only the arm matching `window_kind`
+    // runs, so these are moved (not re-cloned) into whichever operator spec
+    // gets constructed below.
+    let key_column = spec.key_column.clone();
+    let key_column_type = spec.key_column_type.clone();
+    let event_time_column = spec.event_time_column.clone();
+
     match spec.window_kind {
         WindowKind::Tumbling => {
             let tw_spec = TumblingWindowSpec {
-                key_column: spec.key_column.clone(),
-                key_column_type: spec.key_column_type.clone(),
-                event_time_column: spec.event_time_column.clone(),
+                key_column,
+                key_column_type,
+                event_time_column,
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
@@ -125,9 +132,9 @@ pub fn execute_bounded_window(
         WindowKind::Sliding => {
             let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);
             let sw_spec = SlidingWindowSpec {
-                key_column: spec.key_column.clone(),
-                key_column_type: spec.key_column_type.clone(),
-                event_time_column: spec.event_time_column.clone(),
+                key_column,
+                key_column_type,
+                event_time_column,
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
                 agg_exprs,
@@ -153,9 +160,9 @@ pub fn execute_bounded_window(
         WindowKind::Session => {
             let gap_ms = spec.session_gap_ms.unwrap_or(spec.window_size_ms);
             let sess_spec = SessionWindowSpec {
-                key_column: spec.key_column.clone(),
-                key_column_type: spec.key_column_type.clone(),
-                event_time_column: spec.event_time_column.clone(),
+                key_column,
+                key_column_type,
+                event_time_column,
                 session_gap_ms: gap_ms,
                 agg_exprs,
             };
@@ -182,8 +189,103 @@ pub fn execute_bounded_window(
     Ok(output)
 }
 
-pub fn execute_streaming_window(
+/// Dispatches `process_batch`/`flush` across the three state-backed window
+/// operator kinds so the streaming-execution loop can be written once instead
+/// of three times (see roadmap: "3x duplicated window stream implementations").
+enum StreamingWindowOp {
+    Tumbling(StateBackedTumblingWindowOperator),
+    Sliding(StateBackedSlidingWindowOperator),
+    Session(StateBackedSessionWindowOperator),
+}
+
+impl StreamingWindowOp {
+    fn process_batch(
+        &mut self,
+        batch: &RecordBatch,
+        watermark_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        match self {
+            Self::Tumbling(op) => op.process_batch(batch, watermark_ms),
+            Self::Sliding(op) => op.process_batch(batch, watermark_ms),
+            Self::Session(op) => op.process_batch(batch, watermark_ms),
+        }
+    }
+
+    fn flush(&mut self) -> ExecResult<Vec<RecordBatch>> {
+        match self {
+            Self::Tumbling(op) => op.flush_closed_windows(i64::MAX),
+            Self::Sliding(op) => op.flush_closed_windows(i64::MAX),
+            Self::Session(op) => op.flush_closed_sessions(i64::MAX),
+        }
+    }
+}
+
+/// Drive a state-backed window operator over an input stream, advancing the
+/// watermark per batch and yielding window outputs as they're produced,
+/// followed by a final flush of any remaining windows once the input ends.
+///
+/// Shared by all `WindowKind` arms of `execute_streaming_window` so the
+/// watermark-tracking and yield/error-propagation logic is implemented once.
+fn stream_window_operator(
     mut input: Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>,
+    spec: WindowExecutionSpec,
+    mut op: StreamingWindowOp,
+) -> Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>> {
+    let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
+    let mut multi_watermark =
+        MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
+
+    let stream = async_stream::stream! {
+        while let Some(batch_res) = input.next().await {
+            match batch_res {
+                Ok(batch) => {
+                    multi_watermark.apply_idle_source_policy();
+                    let wm = match advance_effective_watermark(
+                        &batch,
+                        &spec.event_time_column,
+                        spec.source_id_column.as_deref(),
+                        &spec.source_watermark_lags,
+                        &mut single_watermark,
+                        &mut multi_watermark,
+                    ) {
+                        Ok(wm) => wm,
+                        Err(e) => {
+                            yield Err(e);
+                            continue;
+                        }
+                    };
+                    match op.process_batch(&batch, wm) {
+                        Ok(output_batches) => {
+                            for out_batch in output_batches {
+                                yield Ok(out_batch);
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            }
+        }
+        match op.flush() {
+            Ok(output_batches) => {
+                for out_batch in output_batches {
+                    yield Ok(out_batch);
+                }
+            }
+            Err(e) => yield Err(e),
+        }
+    };
+    Box::pin(stream)
+}
+
+pub fn execute_streaming_window(
+    input: Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>,
     spec: WindowExecutionSpec,
     state_dir: Option<&std::path::Path>,
 ) -> ExecResult<Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>> {
@@ -195,205 +297,64 @@ pub fn execute_streaming_window(
 
     let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
 
-    match spec.window_kind {
+    // Clone the shared spec fields once; only the arm matching `window_kind`
+    // runs, so these are moved (not re-cloned) into whichever operator spec
+    // gets constructed below.
+    let key_column = spec.key_column.clone();
+    let key_column_type = spec.key_column_type.clone();
+    let event_time_column = spec.event_time_column.clone();
+
+    let op = match spec.window_kind {
         WindowKind::Tumbling => {
             let tw_spec = TumblingWindowSpec {
-                key_column: spec.key_column.clone(),
-                key_column_type: spec.key_column_type.clone(),
-                event_time_column: spec.event_time_column.clone(),
+                key_column,
+                key_column_type,
+                event_time_column,
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
             TumblingWindowOperator::validate_spec(&tw_spec)
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
-            let mut op =
+            let op =
                 StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
-            let mut multi_watermark =
-                MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
-
-            let stream = async_stream::stream! {
-                while let Some(batch_res) = input.next().await {
-                    match batch_res {
-                        Ok(batch) => {
-                            multi_watermark.apply_idle_source_policy();
-                            let wm = match advance_effective_watermark(
-                                &batch,
-                                &spec.event_time_column,
-                                spec.source_id_column.as_deref(),
-                                &spec.source_watermark_lags,
-                                &mut single_watermark,
-                                &mut multi_watermark,
-                            ) {
-                                Ok(wm) => wm,
-                                Err(e) => {
-                                    yield Err(e);
-                                    continue;
-                                }
-                            };
-                            match op.process_batch(&batch, wm) {
-                                Ok(output_batches) => {
-                                    for out_batch in output_batches {
-                                        yield Ok(out_batch);
-                                    }
-                                }
-                                Err(e) => {
-                                    yield Err(e);
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            yield Err(e);
-                            return;
-                        }
-                    }
-                }
-                match op.flush_closed_windows(i64::MAX) {
-                    Ok(output_batches) => {
-                        for out_batch in output_batches {
-                            yield Ok(out_batch);
-                        }
-                    }
-                    Err(e) => yield Err(e),
-                }
-            };
-            Ok(Box::pin(stream))
+            StreamingWindowOp::Tumbling(op)
         }
         WindowKind::Sliding => {
             let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);
             let sw_spec = SlidingWindowSpec {
-                key_column: spec.key_column.clone(),
-                key_column_type: spec.key_column_type.clone(),
-                event_time_column: spec.event_time_column.clone(),
+                key_column,
+                key_column_type,
+                event_time_column,
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
                 agg_exprs,
             };
             let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
-            let mut op =
+            let op =
                 StateBackedSlidingWindowOperator::new(sw_spec, state, "window-exec", "sliding")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
-            let mut multi_watermark =
-                MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
-
-            let stream = async_stream::stream! {
-                while let Some(batch_res) = input.next().await {
-                    match batch_res {
-                        Ok(batch) => {
-                            multi_watermark.apply_idle_source_policy();
-                            let wm = match advance_effective_watermark(
-                                &batch,
-                                &spec.event_time_column,
-                                spec.source_id_column.as_deref(),
-                                &spec.source_watermark_lags,
-                                &mut single_watermark,
-                                &mut multi_watermark,
-                            ) {
-                                Ok(wm) => wm,
-                                Err(e) => {
-                                    yield Err(e);
-                                    continue;
-                                }
-                            };
-                            match op.process_batch(&batch, wm) {
-                                Ok(output_batches) => {
-                                    for out_batch in output_batches {
-                                        yield Ok(out_batch);
-                                    }
-                                }
-                                Err(e) => {
-                                    yield Err(e);
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            yield Err(e);
-                            return;
-                        }
-                    }
-                }
-                match op.flush_closed_windows(i64::MAX) {
-                    Ok(output_batches) => {
-                        for out_batch in output_batches {
-                            yield Ok(out_batch);
-                        }
-                    }
-                    Err(e) => yield Err(e),
-                }
-            };
-            Ok(Box::pin(stream))
+            StreamingWindowOp::Sliding(op)
         }
         WindowKind::Session => {
             let session_gap_ms = spec.session_gap_ms.unwrap_or(spec.window_size_ms);
             let sess_spec = SessionWindowSpec {
-                key_column: spec.key_column.clone(),
-                key_column_type: spec.key_column_type.clone(),
-                event_time_column: spec.event_time_column.clone(),
+                key_column,
+                key_column_type,
+                event_time_column,
                 session_gap_ms,
                 agg_exprs,
             };
             let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
-            let mut op =
+            let op =
                 StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
-            let mut multi_watermark =
-                MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
-
-            let stream = async_stream::stream! {
-                while let Some(batch_res) = input.next().await {
-                    match batch_res {
-                        Ok(batch) => {
-                            multi_watermark.apply_idle_source_policy();
-                            let wm = match advance_effective_watermark(
-                                &batch,
-                                &spec.event_time_column,
-                                spec.source_id_column.as_deref(),
-                                &spec.source_watermark_lags,
-                                &mut single_watermark,
-                                &mut multi_watermark,
-                            ) {
-                                Ok(wm) => wm,
-                                Err(e) => {
-                                    yield Err(e);
-                                    continue;
-                                }
-                            };
-                            match op.process_batch(&batch, wm) {
-                                Ok(output_batches) => {
-                                    for out_batch in output_batches {
-                                        yield Ok(out_batch);
-                                    }
-                                }
-                                Err(e) => {
-                                    yield Err(e);
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            yield Err(e);
-                            return;
-                        }
-                    }
-                }
-                match op.flush_closed_sessions(i64::MAX) {
-                    Ok(output_batches) => {
-                        for out_batch in output_batches {
-                            yield Ok(out_batch);
-                        }
-                    }
-                    Err(e) => yield Err(e),
-                }
-            };
-            Ok(Box::pin(stream))
+            StreamingWindowOp::Session(op)
         }
-    }
+    };
+
+    Ok(stream_window_operator(input, spec, op))
 }
 
 /// Convert legacy runtime local spec fields into a plan `WindowExecutionSpec`.

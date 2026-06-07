@@ -19,11 +19,7 @@ pub struct IntervalJoinSpec {
 
 impl IntervalJoinSpec {
     /// Construct a spec with a sensible default buffer limit (65 536 events per side per key).
-    pub fn new(
-        key_column: impl Into<String>,
-        lower_bound_ms: i64,
-        upper_bound_ms: i64,
-    ) -> Self {
+    pub fn new(key_column: impl Into<String>, lower_bound_ms: i64, upper_bound_ms: i64) -> Self {
         Self {
             lower_bound_ms,
             upper_bound_ms,

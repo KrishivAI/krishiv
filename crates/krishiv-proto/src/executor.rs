@@ -359,7 +359,7 @@ pub struct HeartbeatHotKeyReport {
     /// Heat score: `estimated_count / total_items_seen` (0.0–1.0).
     pub heat_score: f64,
     /// Job id this report belongs to.
-    pub job_id: String,
+    pub job_id: JobId,
     /// Source or operator id that produced this report.
     pub source_id: String,
 }
@@ -459,9 +459,9 @@ impl StreamingTaskState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamingProgressReport {
     /// Job that owns the streaming task.
-    pub job_id: String,
+    pub job_id: JobId,
     /// Task that produced this snapshot.
-    pub task_id: String,
+    pub task_id: TaskId,
     /// Current event-time watermark in milliseconds since epoch.
     pub watermark_ms: i64,
     /// Total rows emitted since task start (cumulative).
@@ -477,10 +477,10 @@ pub struct StreamingProgressReport {
 }
 
 impl StreamingProgressReport {
-    pub fn new(job_id: impl Into<String>, task_id: impl Into<String>) -> Self {
+    pub fn new(job_id: JobId, task_id: TaskId) -> Self {
         Self {
-            job_id: job_id.into(),
-            task_id: task_id.into(),
+            job_id,
+            task_id,
             watermark_ms: 0,
             rows_emitted: 0,
             batches_emitted: 0,

@@ -61,12 +61,10 @@ impl SlidingWindowOperator {
             ));
         }
         if spec.window_size_ms > i64::MAX as u64 || spec.slide_ms > i64::MAX as u64 {
-            return Err(ExecError::InvalidWindowConfig(
-                format!(
-                    "sliding window size ({}) or slide ({}) exceeds i64::MAX",
-                    spec.window_size_ms, spec.slide_ms,
-                ),
-            ));
+            return Err(ExecError::InvalidWindowConfig(format!(
+                "sliding window size ({}) or slide ({}) exceeds i64::MAX",
+                spec.window_size_ms, spec.slide_ms,
+            )));
         }
         Ok(Self {
             spec,
@@ -144,7 +142,10 @@ impl SlidingWindowOperator {
             }
         };
 
-        let count = match (size as u64).checked_add(slide_ms).and_then(|n| n.checked_sub(1)) {
+        let count = match (size as u64)
+            .checked_add(slide_ms)
+            .and_then(|n| n.checked_sub(1))
+        {
             Some(n) => (n / slide_ms) as usize,
             None => usize::MAX,
         };

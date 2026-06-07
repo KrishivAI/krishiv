@@ -214,10 +214,16 @@ mod tests {
         let key_with_nulls: Vec<u8> = vec![0x00, 0x01, 0xFF, 0x00, 0xAB];
         let encoded = encode_key_hex(&key_with_nulls);
         let decoded = decode_key_hex(&encoded).expect("valid hex must decode");
-        assert_eq!(decoded, key_with_nulls, "hex round-trip must preserve null bytes");
+        assert_eq!(
+            decoded, key_with_nulls,
+            "hex round-trip must preserve null bytes"
+        );
 
         // Also verify that an odd-length hex string is rejected.
-        assert!(decode_key_hex("abc").is_none(), "odd-length hex must return None");
+        assert!(
+            decode_key_hex("abc").is_none(),
+            "odd-length hex must return None"
+        );
     }
 
     #[test]

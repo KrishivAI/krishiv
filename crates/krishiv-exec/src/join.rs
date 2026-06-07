@@ -621,8 +621,7 @@ fn build_outer_join_batch(
 
     // Right columns: matched rows get their real index; unmatched rows get None
     // so Arrow's `take` produces null values rather than copying row 0.
-    let mut right_idx_opt: Vec<Option<u32>> =
-        right_indices.iter().map(|&r| Some(r)).collect();
+    let mut right_idx_opt: Vec<Option<u32>> = right_indices.iter().map(|&r| Some(r)).collect();
     right_idx_opt.extend(std::iter::repeat(None).take(unmatched_left.len()));
     let right_idx_arr: ArrayRef = Arc::new(UInt32Array::from(right_idx_opt));
 
@@ -660,9 +659,7 @@ fn build_outer_join_batch(
             continue;
         }
         let col = right.column(i);
-        columns.push(
-            take(col, &right_idx_arr, None).map_err(|e| ExecError::Arrow(e.to_string()))?,
-        );
+        columns.push(take(col, &right_idx_arr, None).map_err(|e| ExecError::Arrow(e.to_string()))?);
     }
     RecordBatch::try_new(nullable_schema, columns).map_err(|e| ExecError::Arrow(e.to_string()))
 }

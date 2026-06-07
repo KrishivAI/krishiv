@@ -97,39 +97,36 @@ fn remote_execution_from_env() -> bool {
 }
 
 /// Returns a per-call fresh embedded runtime for orphan `DataFrame::new`/
-/// `Stream::new` constructors.  Previously this returned a process-global
+/// `Stream::new` constructors. Previously this returned a process-global
 /// `OnceLock` instance shared across every session — a major contention
 /// hotspot under parallel workloads (C1).
 ///
 /// The returned runtime carries its own `InProcessCluster` and ids; dropping
 /// it tears down the cluster.
-pub(crate) fn shared_embedded_runtime() -> Arc<dyn ExecutionRuntime> {
-    // OnceLock kept around to avoid breaking any external code that might
-    // observe a stable identity across calls — but we always return a *fresh*
-    // runtime so concurrent constructors get isolated coordinators.  The
-    // OnceLock itself is unused for hand-out; left here for backward-compat
-    // marker placement only.
-    let _ = std::sync::OnceLock::<()>::new();
-    let cluster = match InProcessCluster::new() {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            tracing::error!(error = %e, "failed to create in-process cluster");
-            panic!("orphan embedded in-process cluster: {e}");
+///
+/// Returns an error rather than panicking so that callers can surface
+/// cluster/runtime construction failures (e.g. resource exhaustion) through
+/// the public `Result`-based API instead of aborting the process.
+pub(crate) fn shared_embedded_runtime() -> Result<Arc<dyn ExecutionRuntime>> {
+    let cluster = InProcessCluster::new().map_err(|e| {
+        tracing::error!(error = %e, "failed to create in-process cluster");
+        KrishivError::Runtime {
+            message: format!("orphan embedded in-process cluster: {e}"),
         }
-    };
-    match build_execution_runtime(
+    })?;
+    build_execution_runtime(
         RuntimeMode::Embedded,
-        Some(cluster),
+        Some(Arc::new(cluster)),
         None,
         None,
         ExecutionPlacement::LocalInProcess,
-    ) {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to build embedded runtime");
-            panic!("embedded in-process runtime placement is valid: {e}");
+    )
+    .map_err(|e| {
+        tracing::error!(error = %e, "failed to build embedded runtime");
+        KrishivError::Runtime {
+            message: format!("embedded in-process runtime placement is invalid: {e}"),
         }
-    }
+    })
 }
 
 fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {

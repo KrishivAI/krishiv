@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 
 use crate::{
     CheckpointSource, ConnectorCapabilities, ConnectorError, ConnectorResult, ParquetOffset, Sink,
@@ -18,52 +18,101 @@ use crate::{
 // ParquetSource
 // ---------------------------------------------------------------------------
 
-/// A bounded, rewindable source that reads all batches from a Parquet file.
+/// A bounded, rewindable source that streams batches from a Parquet file.
 ///
-/// The file is read eagerly on [`ParquetSource::open`]; subsequent calls to
-/// [`Source::read_batch`] iterate over the in-memory batch vector.
+/// [`ParquetSource::open`] only validates the file and reads its schema; the
+/// underlying [`ParquetRecordBatchReader`] is created lazily and pulls one
+/// batch at a time on [`Source::read_batch`], so the whole file is never
+/// materialised in memory at once. Rewinding ([`Source::reset`]) or restoring
+/// a checkpoint re-opens the file and re-positions the reader by skipping the
+/// requested number of batches — the standard trade-off for sequential file
+/// formats that lack a random-access batch index.
 pub struct ParquetSource {
     path: PathBuf,
-    schema: Option<SchemaRef>,
-    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+    reader: Option<ParquetRecordBatchReader>,
     cursor: usize,
 }
 
 impl ParquetSource {
-    /// Open a Parquet file and eagerly load all record batches.
+    /// Open a Parquet file, validating it and reading its schema.
+    ///
+    /// Batches are not read until [`Source::read_batch`] is called.
     pub fn open(path: impl AsRef<Path>) -> ConnectorResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::open(&path).map_err(|e| ConnectorError::IoStr {
-            message: format!("failed to open '{}': {e}", path.display()),
-        })?;
-
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| ConnectorError::IoStr {
-                message: format!(
-                    "failed to build Parquet reader for '{}': {e}",
-                    path.display()
-                ),
-            })?;
-
-        let schema = builder.schema().clone();
-        let reader = builder.build().map_err(|e| ConnectorError::IoStr {
-            message: format!("failed to create Parquet batch reader: {e}"),
-        })?;
-
-        let mut batches = Vec::new();
-        for result in reader {
-            let batch = result.map_err(|e| ConnectorError::IoStr {
-                message: format!("error reading Parquet batch: {e}"),
-            })?;
-            batches.push(batch);
-        }
+        let schema = Self::probe_schema(&path)?;
 
         Ok(Self {
             path,
-            schema: Some(schema),
-            batches,
+            schema,
+            reader: None,
             cursor: 0,
         })
+    }
+
+    /// Open the file and read just its Arrow schema, without building a batch reader.
+    fn probe_schema(path: &Path) -> ConnectorResult<SchemaRef> {
+        let file = File::open(path).map_err(|e| {
+            ConnectorError::Parquet(format!("failed to open '{}': {e}", path.display()))
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+            ConnectorError::Parquet(format!(
+                "failed to build Parquet reader for '{}': {e}",
+                path.display()
+            ))
+        })?;
+        Ok(builder.schema().clone())
+    }
+
+    /// Open a fresh batch reader positioned at the start of the file.
+    fn open_reader(&self) -> ConnectorResult<ParquetRecordBatchReader> {
+        let file = File::open(&self.path).map_err(|e| {
+            ConnectorError::Parquet(format!("failed to open '{}': {e}", self.path.display()))
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+            ConnectorError::Parquet(format!(
+                "failed to build Parquet reader for '{}': {e}",
+                self.path.display()
+            ))
+        })?;
+        builder.build().map_err(|e| {
+            ConnectorError::Parquet(format!("failed to create Parquet batch reader: {e}"))
+        })
+    }
+
+    /// Open a fresh reader and skip forward `skip` batches, returning the
+    /// positioned reader. Errors if the file has fewer than `skip` batches.
+    fn reader_skipped_to(&self, skip: usize) -> ConnectorResult<ParquetRecordBatchReader> {
+        let mut reader = self.open_reader()?;
+        for seen in 0..skip {
+            match reader.next() {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    return Err(ConnectorError::Parquet(format!(
+                        "error reading Parquet batch: {e}"
+                    )));
+                }
+                None => {
+                    return Err(ConnectorError::Offset {
+                        message: format!(
+                            "Parquet offset {} is past the final batch {} for '{}'",
+                            skip,
+                            seen,
+                            self.path.display()
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(reader)
+    }
+
+    /// Lazily build (or rebuild, after a rewind/restore) the active reader.
+    fn ensure_reader(&mut self) -> ConnectorResult<&mut ParquetRecordBatchReader> {
+        if self.reader.is_none() {
+            self.reader = Some(self.reader_skipped_to(self.cursor)?);
+        }
+        Ok(self.reader.as_mut().expect("reader populated above"))
     }
 
     /// Return the path this source was opened from.
@@ -71,9 +120,9 @@ impl ParquetSource {
         &self.path
     }
 
-    /// Return the Arrow schema inferred from the Parquet file, if opened.
+    /// Return the Arrow schema inferred from the Parquet file.
     pub fn schema(&self) -> Option<SchemaRef> {
-        self.schema.clone()
+        Some(self.schema.clone())
     }
 }
 
@@ -86,12 +135,20 @@ impl Source for ParquetSource {
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
-        if self.cursor >= self.batches.len() {
-            return Ok(None);
+        let reader = self.ensure_reader()?;
+        match reader.next() {
+            Some(Ok(batch)) => {
+                self.cursor += 1;
+                Ok(Some(batch))
+            }
+            Some(Err(e)) => Err(ConnectorError::Parquet(format!(
+                "error reading Parquet batch: {e}"
+            ))),
+            None => {
+                self.reader = None;
+                Ok(None)
+            }
         }
-        let batch = self.batches[self.cursor].clone();
-        self.cursor += 1;
-        Ok(Some(batch))
     }
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
@@ -102,6 +159,7 @@ impl Source for ParquetSource {
 
     fn reset(&mut self) {
         self.cursor = 0;
+        self.reader = None;
     }
 }
 
@@ -115,17 +173,12 @@ impl CheckpointSource for ParquetSource {
     }
 
     fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()> {
-        if offset.batch_index > self.batches.len() {
-            return Err(ConnectorError::Offset {
-                message: format!(
-                    "Parquet offset {} is past the final batch {} for '{}'",
-                    offset.batch_index,
-                    self.batches.len(),
-                    self.path.display()
-                ),
-            });
-        }
+        // Validate eagerly by positioning a fresh reader at the requested
+        // batch index, then adopt it — this both checks the offset and avoids
+        // re-reading the same prefix again on the next `read_batch`.
+        let reader = self.reader_skipped_to(offset.batch_index)?;
         self.cursor = offset.batch_index;
+        self.reader = Some(reader);
         Ok(())
     }
 }
@@ -169,13 +222,11 @@ impl Sink for ParquetSink {
     async fn write_batch(&mut self, batch: RecordBatch) -> ConnectorResult<()> {
         if self.writer.is_none() {
             let schema = batch.schema();
-            let file = File::create(&self.path).map_err(|e| ConnectorError::IoStr {
-                message: format!("failed to create '{}': {e}", self.path.display()),
+            let file = File::create(&self.path).map_err(|e| {
+                ConnectorError::Parquet(format!("failed to create '{}': {e}", self.path.display()))
             })?;
             let writer = ArrowWriter::try_new(file, schema.clone(), None).map_err(|e| {
-                ConnectorError::IoStr {
-                    message: format!("failed to create Parquet writer: {e}"),
-                }
+                ConnectorError::Parquet(format!("failed to create Parquet writer: {e}"))
             })?;
             self.schema = Some(schema);
             self.writer = Some(writer);
@@ -183,21 +234,21 @@ impl Sink for ParquetSink {
 
         self.writer
             .as_mut()
-            .ok_or_else(|| ConnectorError::IoStr {
-                message: "Parquet writer not initialized; call write_batch with a schema-bearing batch first".into(),
+            .ok_or_else(|| {
+                ConnectorError::Parquet(
+                    "Parquet writer not initialized; call write_batch with a schema-bearing batch first".into(),
+                )
             })?
             .write(&batch)
-            .map_err(|e| ConnectorError::IoStr {
-                message: format!("failed to write Parquet batch: {e}"),
-            })?;
+            .map_err(|e| ConnectorError::Parquet(format!("failed to write Parquet batch: {e}")))?;
         Ok(())
     }
 
     async fn flush(&mut self) -> ConnectorResult<()> {
         if let Some(writer) = self.writer.take() {
-            writer.close().map_err(|e| ConnectorError::IoStr {
-                message: format!("failed to close Parquet writer: {e}"),
-            })?;
+            writer
+                .close()
+                .map_err(|e| ConnectorError::Parquet(format!("failed to close Parquet writer: {e}")))?;
         }
         Ok(())
     }

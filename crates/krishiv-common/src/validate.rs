@@ -8,18 +8,11 @@
 //! All crates that validate untrusted identifiers should import from here.
 
 /// Error type for validation failures.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
 pub struct ValidationError {
     pub message: String,
 }
-
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for ValidationError {}
 
 /// Validate that an identifier is safe for use in filesystem paths.
 ///

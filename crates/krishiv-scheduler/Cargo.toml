@@ -30,6 +30,7 @@ tokio = { workspace = true, features = ["net", "time", "sync", "signal"] }
 tokio-stream.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 tonic.workspace = true
+tower = { workspace = true }
 tracing.workspace = true
 async-trait.workspace = true
 dashmap = { workspace = true }
@@ -40,7 +41,6 @@ thiserror = { workspace = true }
 arrow = { workspace = true }
 krishiv-connectors = { path = "../krishiv-connectors" }
 tempfile = { workspace = true }
-tower = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

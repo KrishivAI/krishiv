@@ -55,7 +55,7 @@ impl TransactionalKafkaSink {
         epoch: u64,
     ) -> ConnectorResult<Self> {
         if krishiv_common::forbids_simulation_connectors(profile) {
-            return Err(ConnectorError::IoStr {
+            return Err(ConnectorError::Config {
                 message: "TransactionalKafkaSink is an in-memory simulator and cannot be used in \
                           durable profiles; wire a broker-backed rdkafka transactional producer"
                     .into(),
@@ -92,8 +92,9 @@ impl TwoPhaseCommitSink for TransactionalKafkaSink {
 
     fn prepare(&mut self, epoch: u64, batch: &RecordBatch) -> ConnectorResult<Self::Handle> {
         if epoch != self.epoch {
-            return Err(ConnectorError::IoStr {
+            return Err(ConnectorError::Kafka {
                 message: format!("epoch mismatch: expected {}", self.epoch),
+                retriable: false,
             });
         }
         let id = self.next_handle;

@@ -129,20 +129,7 @@ impl Coordinator {
         let mut throttles = Vec::new();
 
         for report in reports {
-            if report.job_id.is_empty() {
-                continue;
-            }
-            let job_id = match JobId::try_new(report.job_id.clone()) {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::warn!(
-                        raw_job_id = %report.job_id,
-                        error = %e,
-                        "ignoring hot-key report with invalid job_id from executor"
-                    );
-                    continue;
-                }
-            };
+            let job_id = report.job_id.clone();
             let is_hot = report.heat_score >= HOT_KEY_HEAT_THRESHOLD;
             let applied = is_hot && !self.adaptive_override.disable_hot_key_splitting;
             let log = AdaptiveDecisionLog {

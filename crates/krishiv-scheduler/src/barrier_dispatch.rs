@@ -124,7 +124,8 @@ impl Coordinator {
             let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
             let request = CheckpointAckRequest {
                 job_id: job_id.clone(),
-                operator_id: format!("op-{}", task_id.as_str()),
+                operator_id: krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
+                    .expect("task_id is non-empty, so operator_id is non-empty"),
                 task_id: task_id.clone(),
                 epoch,
                 fencing_token,

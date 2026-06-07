@@ -485,7 +485,8 @@ impl TaskRunner {
         if req.epoch <= self.last_acked_epoch {
             return Ok(CheckpointAckRequest {
                 job_id: req.job_id,
-                operator_id: self.operator_id.clone(),
+                operator_id: krishiv_proto::OperatorId::try_new(self.operator_id.clone())
+                    .expect("operator_id is always non-empty"),
                 task_id: self.task_id.clone(),
                 epoch: self.last_acked_epoch, // signal: stale
                 fencing_token: req.fencing_token,
@@ -560,7 +561,11 @@ impl TaskRunner {
         // Build source offsets.
         let source_offsets = if self.kafka_source_offset >= 0 {
             vec![CheckpointSourceOffset {
-                partition_id: format!("kafka-{}", self.task_id.as_str()),
+                partition_id: krishiv_proto::PartitionId::try_new(format!(
+                    "kafka-{}",
+                    self.task_id.as_str()
+                ))
+                .expect("task_id is non-empty, so partition_id is non-empty"),
                 offset: self.kafka_source_offset,
             }]
         } else {
@@ -571,7 +576,8 @@ impl TaskRunner {
 
         Ok(CheckpointAckRequest {
             job_id: req.job_id,
-            operator_id: self.operator_id.clone(),
+            operator_id: krishiv_proto::OperatorId::try_new(self.operator_id.clone())
+                .expect("operator_id is always non-empty"),
             task_id: self.task_id.clone(),
             epoch: req.epoch,
             fencing_token: req.fencing_token,

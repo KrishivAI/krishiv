@@ -201,7 +201,7 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
             use arrow::array::BooleanArray;
             let result = check_batch_compiled(batch, qc)?;
             if result.failed {
-                return Err(ConnectorError::IoStr {
+                return Err(ConnectorError::Quality {
                     message: format!("data quality Fail action triggered at epoch {}", epoch),
                 });
             }
@@ -211,11 +211,10 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
                 let keep_mask: BooleanArray = (0..batch.num_rows())
                     .map(|i| Some(result.accepted_indices.contains(&i)))
                     .collect();
-                filtered = arrow::compute::filter_record_batch(batch, &keep_mask).map_err(|e| {
-                    ConnectorError::IoStr {
+                filtered = arrow::compute::filter_record_batch(batch, &keep_mask)
+                    .map_err(|e| ConnectorError::Schema {
                         message: e.to_string(),
-                    }
-                })?;
+                    })?;
                 &filtered
             }
         } else {
@@ -225,9 +224,7 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
         let (staging_path, final_path, file) = loop {
             let handle_id = self.next_handle;
             self.next_handle = self.next_handle.checked_add(1).ok_or_else(|| {
-                ConnectorError::IoStr {
-                    message: "parquet 2pc prepare: handle ID overflow".into(),
-                }
+                ConnectorError::Parquet("parquet 2pc prepare: handle ID overflow".into())
             })?;
             let staging_name = format!("{epoch}-{handle_id}.parquet.tmp");
             let final_name = format!("{epoch}-{handle_id}.parquet");
@@ -244,23 +241,23 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
                 Ok(file) => break (staging_path, final_path, file),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
-                    return Err(ConnectorError::IoStr {
-                        message: format!("parquet 2pc prepare: cannot create {staging_name}: {e}"),
-                    });
+                    return Err(ConnectorError::Parquet(format!(
+                        "parquet 2pc prepare: cannot create {staging_name}: {e}"
+                    )));
                 }
             }
         };
 
         let mut writer = ::parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
-            .map_err(|e| ConnectorError::IoStr {
-                message: format!("parquet 2pc prepare: cannot create writer: {e}"),
+            .map_err(|e| {
+                ConnectorError::Parquet(format!("parquet 2pc prepare: cannot create writer: {e}"))
             })?;
-        writer.write(batch).map_err(|e| ConnectorError::IoStr {
-            message: format!("parquet 2pc prepare: write error: {e}"),
+        writer.write(batch).map_err(|e| {
+            ConnectorError::Parquet(format!("parquet 2pc prepare: write error: {e}"))
         })?;
-        writer.close().map_err(|e| ConnectorError::IoStr {
-            message: format!("parquet 2pc prepare: close error: {e}"),
-        })?;
+        writer
+            .close()
+            .map_err(|e| ConnectorError::Parquet(format!("parquet 2pc prepare: close error: {e}")))?;
 
         Ok(ParquetCommitHandle {
             epoch,
@@ -282,20 +279,22 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
                 if handle.final_path.exists() {
                     Ok(())
                 } else {
-                    Err(ConnectorError::IoStr {
-                        message: format!(
+                    Err(ConnectorError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
                             "parquet 2pc commit: rename {:?} to {:?}: staging missing and final absent: {e}",
                             handle.staging_path, handle.final_path
                         ),
-                    })
+                    )))
                 }
             }
-            Err(e) => Err(ConnectorError::IoStr {
-                message: format!(
+            Err(e) => Err(ConnectorError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
                     "parquet 2pc commit: rename {:?} to {:?}: {e}",
                     handle.staging_path, handle.final_path
                 ),
-            }),
+            ))),
         }
     }
 
@@ -304,9 +303,10 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
         match std::fs::remove_file(&handle.staging_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(ConnectorError::IoStr {
-                message: format!("parquet 2pc abort: remove {:?}: {e}", handle.staging_path),
-            }),
+            Err(e) => Err(ConnectorError::Io(std::io::Error::new(
+                e.kind(),
+                format!("parquet 2pc abort: remove {:?}: {e}", handle.staging_path),
+            ))),
         }
     }
 }

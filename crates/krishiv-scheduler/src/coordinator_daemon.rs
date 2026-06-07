@@ -21,9 +21,10 @@ use tokio::time::{Duration, interval};
 use crate::InMemoryMetadataStore;
 use crate::auth::configured_coordinator_bearer_token;
 use crate::store::MetadataStore;
+use crate::rpc_drain::InFlightTracker;
 use crate::{
     ClusterControlPlane, Coordinator, LeaderElection, SharedCoordinator, SingleNodeLeader,
-    scheduler_metrics, serve_coordinator_executor_grpc_with_listener,
+    scheduler_metrics, serve_coordinator_executor_grpc_with_listener_and_tracker,
 };
 
 #[cfg(feature = "redb")]
@@ -232,7 +233,12 @@ pub async fn run_cluster_control_plane(
     });
 
     let coordinator = ccp.shared_coordinator().clone();
-    let grpc_serve = serve_coordinator_executor_grpc_with_listener(listener, coordinator.clone());
+    let in_flight = InFlightTracker::new();
+    let grpc_serve = serve_coordinator_executor_grpc_with_listener_and_tracker(
+        listener,
+        coordinator.clone(),
+        in_flight.clone(),
+    );
 
     tokio::select! {
         result = grpc_serve => {
@@ -254,11 +260,17 @@ pub async fn run_cluster_control_plane(
     leader_task.abort();
     let _ = leader_task.await;
 
-    // Brief drain window before demoting: allows in-flight gRPC handlers
-    // (heartbeats, task updates) to complete so the new leader doesn't see
-    // stale state. A full RPC-drain barrier would require tracking active
-    // calls; this 2-second fence closes the common fast-shutdown race (R11).
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Drain in-flight gRPC handlers (heartbeats, task updates) before
+    // demoting so the new leader doesn't observe stale state mid-write
+    // (R11). Bounded by a timeout fallback in case a handler is wedged —
+    // unlike the old fixed 2-second sleep, this returns as soon as the
+    // server is actually idle and still makes forward progress if not.
+    if !in_flight.drain(Duration::from_secs(10)).await {
+        tracing::warn!(
+            active_calls = in_flight.active_count(),
+            "RPC drain timed out with calls still in flight; proceeding with demotion"
+        );
+    }
 
     // Demote coordinator and release leadership.
     {
@@ -980,7 +992,12 @@ pub async fn run_standalone_coordinator(
         listener.local_addr()?
     );
 
-    let grpc_serve = serve_coordinator_executor_grpc_with_listener(listener, coordinator.clone());
+    let in_flight = InFlightTracker::new();
+    let grpc_serve = serve_coordinator_executor_grpc_with_listener_and_tracker(
+        listener,
+        coordinator.clone(),
+        in_flight.clone(),
+    );
 
     tokio::select! {
         result = grpc_serve => {
@@ -999,7 +1016,14 @@ pub async fn run_standalone_coordinator(
         }
     }
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // See the leader-mode shutdown path above (R11): drain in-flight RPCs
+    // instead of sleeping a fixed window.
+    if !in_flight.drain(Duration::from_secs(10)).await {
+        tracing::warn!(
+            active_calls = in_flight.active_count(),
+            "RPC drain timed out with calls still in flight; proceeding with demotion"
+        );
+    }
 
     {
         let mut coord = coordinator.write().await;

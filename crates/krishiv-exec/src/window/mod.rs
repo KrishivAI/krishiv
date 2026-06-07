@@ -188,7 +188,8 @@ impl MultiSourceWatermarkState {
         if watermark_ms > *entry {
             *entry = watermark_ms;
         }
-        self.last_update_ms.insert(source_id.to_owned(), elapsed_ms());
+        self.last_update_ms
+            .insert(source_id.to_owned(), elapsed_ms());
         // Track whether the *effective* watermark (minimum across all sources) advanced.
         let effective = self.effective_watermark_ms();
         if effective > self.prev_effective_watermark_ms {

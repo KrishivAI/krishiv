@@ -11,10 +11,10 @@ hex = { workspace = true }
 arrow = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
-thiserror = { workspace = true, optional = true }
+thiserror = { workspace = true }
 
 [features]
-chaos = ["dep:thiserror"]
+chaos = []
 
 [lints]
 workspace = true

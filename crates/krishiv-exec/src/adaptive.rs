@@ -229,8 +229,7 @@ impl SinkLatencyTracker {
     pub fn record_write(&mut self, latency_ms: u64) {
         self.write_count += 1;
         // Welford: mean_n = mean_{n-1} + (x - mean_{n-1}) / n
-        self.running_mean +=
-            (latency_ms as f64 - self.running_mean) / self.write_count as f64;
+        self.running_mean += (latency_ms as f64 - self.running_mean) / self.write_count as f64;
         self.max_latency_ms = self.max_latency_ms.max(latency_ms);
     }
 

@@ -39,16 +39,15 @@ pub enum ConnectorError {
     /// Invalid, incompatible, or unrestorable source offset.
     #[error("connector offset error: {message}")]
     Offset { message: String },
+    /// Data quality rule violation (e.g. a `Fail` action threshold was reached).
+    #[error("connector data quality error: {message}")]
+    Quality { message: String },
     /// Operation is not supported by this connector.
     #[error("connector unsupported: {message}")]
     Unsupported { message: String },
     /// A certification test assertion failed.
     #[error("connector certification failed: {reason}")]
     CertificationFailed { reason: String },
-    /// Migration alias: callers that previously used `Io { message }` form.
-    #[allow(non_camel_case_types)]
-    #[error("connector I/O error: {message}")]
-    IoStr { message: String },
 }
 
 /// Convenience result alias for connector operations.

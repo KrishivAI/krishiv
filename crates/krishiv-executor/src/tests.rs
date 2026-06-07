@@ -289,7 +289,7 @@ mod executor_tests {
         let service = AcceptingCoordinatorService;
         let req = CheckpointAckRequest {
             job_id: JobId::try_new("job-ck-1").unwrap(),
-            operator_id: "operator-1".to_owned(),
+            operator_id: krishiv_proto::OperatorId::try_new("operator-1").unwrap(),
             task_id: TaskId::try_new("task-ck-1").unwrap(),
             epoch: 1,
             fencing_token: FencingToken::initial(),

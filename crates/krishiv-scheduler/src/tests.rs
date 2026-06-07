@@ -2854,12 +2854,13 @@ mod scheduler_tests {
     ) -> CheckpointAckRequest {
         CheckpointAckRequest {
             job_id: job_id.clone(),
-            operator_id: format!("operator-{task_id}"),
+            operator_id: krishiv_proto::OperatorId::try_new(format!("operator-{task_id}")).unwrap(),
             task_id: TaskId::try_new(task_id).unwrap(),
             epoch,
             fencing_token,
             source_offsets: vec![krishiv_proto::CheckpointSourceOffset {
-                partition_id: format!("partition-{task_id}"),
+                partition_id: krishiv_proto::PartitionId::try_new(format!("partition-{task_id}"))
+                    .unwrap(),
                 offset: 100,
             }],
             snapshot_path,
@@ -4095,7 +4096,11 @@ mod scheduler_tests {
         // Simulate executor acking the checkpoint.
         let ack = CheckpointAckRequest {
             job_id: job_id.clone(),
-            operator_id: format!("operator-{}", task_id.as_str()),
+            operator_id: krishiv_proto::OperatorId::try_new(format!(
+                "operator-{}",
+                task_id.as_str()
+            ))
+            .unwrap(),
             task_id: task_id.clone(),
             epoch,
             fencing_token,
@@ -4543,7 +4548,7 @@ mod scheduler_tests {
                 estimated_count: 500,
                 max_error: 10,
                 heat_score: 0.35,
-                job_id: job_id.as_str().to_owned(),
+                job_id: job_id.clone(),
                 source_id: "src-0".into(),
             }]);
 
@@ -4585,7 +4590,7 @@ mod scheduler_tests {
                 estimated_count: 1000,
                 max_error: 0,
                 heat_score: 0.9,
-                job_id: job_id.as_str().to_owned(),
+                job_id: job_id.clone(),
                 source_id: "src-0".into(),
             }]);
 
@@ -4619,7 +4624,7 @@ mod scheduler_tests {
                 estimated_count: 300,
                 max_error: 5,
                 heat_score: 0.3,
-                job_id: job_id.as_str().to_owned(),
+                job_id: job_id.clone(),
                 source_id: "src-0".into(),
             },
             HeartbeatHotKeyReport {
@@ -4627,7 +4632,7 @@ mod scheduler_tests {
                 estimated_count: 200,
                 max_error: 3,
                 heat_score: 0.2,
-                job_id: job_id.as_str().to_owned(),
+                job_id: job_id.clone(),
                 source_id: "src-0".into(),
             },
         ];

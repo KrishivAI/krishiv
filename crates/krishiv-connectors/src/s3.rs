@@ -5,14 +5,18 @@
 //! object_store abstraction layer).
 
 use std::any::Any;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use futures::StreamExt;
 use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload, path::Path};
 use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::async_reader::{
+    ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
+};
 
 use crate::{
     CheckpointSource, ConnectorCapabilities, ConnectorError, ConnectorResult, ParquetOffset, Sink,
@@ -23,62 +27,137 @@ use crate::{
 // S3Source
 // ---------------------------------------------------------------------------
 
-/// A bounded, rewindable source that reads a Parquet object from an
-/// [`ObjectStore`].
+type ObjectBatchStream = Pin<Box<ParquetRecordBatchStream<ParquetObjectReader>>>;
+
+/// A bounded, rewindable source that streams Parquet record batches from an
+/// object in an [`ObjectStore`].
 ///
-/// The object is downloaded eagerly on [`S3Source::open`]; subsequent calls to
-/// [`Source::read_batch`] iterate over the in-memory batch vector.
+/// [`S3Source::open`] only fetches the object's size and Arrow schema; the
+/// underlying [`ParquetRecordBatchStream`] is created lazily and pulls one
+/// batch at a time over the network on [`Source::read_batch`], so the whole
+/// object is never downloaded into memory at once. Rewinding
+/// ([`Source::reset`]) or restoring a checkpoint re-opens the stream and
+/// re-positions it by skipping the requested number of batches — the standard
+/// trade-off for sequential formats that lack a random-access batch index.
 pub struct S3Source {
-    // Retained to keep the store alive and for future rewind/re-read operations.
-    _store: Arc<dyn ObjectStore>,
+    store: Arc<dyn ObjectStore>,
     path: Path,
-    schema: Option<SchemaRef>,
-    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+    file_size: u64,
+    stream: Option<ObjectBatchStream>,
     cursor: usize,
 }
 
 impl S3Source {
-    /// Download the object at `path` from `store` and eagerly load all Parquet
-    /// record batches.
+    /// Open a Parquet object, validating it and reading its schema.
+    ///
+    /// Batches are not downloaded until [`Source::read_batch`] is called.
     pub async fn open(store: Arc<dyn ObjectStore>, path: impl Into<Path>) -> ConnectorResult<Self> {
         let path = path.into();
 
-        // Download the full object.
-        let get_result = store.get(&path).await.map_err(|e| ConnectorError::IoStr {
-            message: format!("failed to get object '{}': {e}", path),
+        let meta = store.head(&path).await.map_err(|e| ConnectorError::ObjectStore {
+            message: format!("failed to stat object '{}': {e}", path),
+            status: None,
         })?;
-        let raw: Bytes = get_result
-            .bytes()
-            .await
-            .map_err(|e| ConnectorError::IoStr {
-                message: format!("failed to read bytes from '{}': {e}", path),
-            })?;
+        let file_size = meta.size;
 
-        // Parse as Parquet.
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(raw).map_err(|e| ConnectorError::IoStr {
-                message: format!("failed to build Parquet reader for '{}': {e}", path),
-            })?;
-        let schema = builder.schema().clone();
-        let reader = builder.build().map_err(|e| ConnectorError::IoStr {
-            message: format!("failed to build Parquet batch reader for '{}': {e}", path),
-        })?;
-
-        let mut batches = Vec::new();
-        for result in reader {
-            let batch = result.map_err(|e| ConnectorError::IoStr {
-                message: format!("error reading Parquet batch from '{}': {e}", path),
-            })?;
-            batches.push(batch);
-        }
+        let schema = Self::probe_schema(&store, &path, file_size).await?;
 
         Ok(Self {
-            _store: store,
+            store,
             path,
-            schema: Some(schema),
-            batches,
+            schema,
+            file_size,
+            stream: None,
             cursor: 0,
         })
+    }
+
+    /// Open a streaming reader and read just its Arrow schema, without
+    /// building the batch stream.
+    async fn probe_schema(
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        file_size: u64,
+    ) -> ConnectorResult<SchemaRef> {
+        let reader =
+            ParquetObjectReader::new(Arc::clone(store), path.clone()).with_file_size(file_size);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.map_err(|e| {
+            ConnectorError::Parquet(format!(
+                "failed to build Parquet stream reader for '{}': {e}",
+                path
+            ))
+        })?;
+        Ok(builder.schema().clone())
+    }
+
+    /// Open a fresh batch stream positioned at the start of the object.
+    ///
+    /// Takes owned `store`/`path`/`file_size` (rather than `&self`) so the
+    /// returned future does not capture a `&S3Source` — the stream's inner
+    /// decoder types are `Send` but not `Sync`, which would otherwise make
+    /// `&S3Source` (and thus `read_batch`'s future) non-`Send`.
+    async fn open_stream(
+        store: Arc<dyn ObjectStore>,
+        path: Path,
+        file_size: u64,
+    ) -> ConnectorResult<ObjectBatchStream> {
+        let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(file_size);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.map_err(|e| {
+            ConnectorError::Parquet(format!(
+                "failed to build Parquet stream reader for '{}': {e}",
+                path
+            ))
+        })?;
+        let stream = builder.build().map_err(|e| {
+            ConnectorError::Parquet(format!("failed to create Parquet batch stream: {e}"))
+        })?;
+        Ok(Box::pin(stream))
+    }
+
+    /// Open a fresh stream and skip forward `skip` batches, returning the
+    /// positioned stream. Errors if the object has fewer than `skip` batches.
+    async fn stream_skipped_to(
+        store: Arc<dyn ObjectStore>,
+        path: Path,
+        file_size: u64,
+        skip: usize,
+    ) -> ConnectorResult<ObjectBatchStream> {
+        let mut stream = Self::open_stream(store, path.clone(), file_size).await?;
+        for seen in 0..skip {
+            match stream.next().await {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    return Err(ConnectorError::Parquet(format!(
+                        "error reading Parquet batch: {e}"
+                    )));
+                }
+                None => {
+                    return Err(ConnectorError::Offset {
+                        message: format!(
+                            "object-store Parquet offset {} is past the final batch {} for '{}'",
+                            skip, seen, path
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(stream)
+    }
+
+    /// Lazily build (or rebuild, after a rewind/restore) the active stream.
+    async fn ensure_stream(&mut self) -> ConnectorResult<&mut ObjectBatchStream> {
+        if self.stream.is_none() {
+            let stream = Self::stream_skipped_to(
+                Arc::clone(&self.store),
+                self.path.clone(),
+                self.file_size,
+                self.cursor,
+            )
+            .await?;
+            self.stream = Some(stream);
+        }
+        Ok(self.stream.as_mut().expect("stream populated above"))
     }
 
     /// Return the object path this source was opened from.
@@ -88,7 +167,7 @@ impl S3Source {
 
     /// Return the Arrow schema inferred from the Parquet object.
     pub fn schema(&self) -> Option<SchemaRef> {
-        self.schema.clone()
+        Some(self.schema.clone())
     }
 }
 
@@ -101,12 +180,20 @@ impl Source for S3Source {
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
-        if self.cursor >= self.batches.len() {
-            return Ok(None);
+        let stream = self.ensure_stream().await?;
+        match stream.next().await {
+            Some(Ok(batch)) => {
+                self.cursor += 1;
+                Ok(Some(batch))
+            }
+            Some(Err(e)) => Err(ConnectorError::Parquet(format!(
+                "error reading Parquet batch: {e}"
+            ))),
+            None => {
+                self.stream = None;
+                Ok(None)
+            }
         }
-        let batch = self.batches[self.cursor].clone();
-        self.cursor += 1;
-        Ok(Some(batch))
     }
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
@@ -118,6 +205,7 @@ impl Source for S3Source {
     /// Reset the cursor to the beginning so the source can be read again.
     fn reset(&mut self) {
         self.cursor = 0;
+        self.stream = None;
     }
 }
 
@@ -131,17 +219,13 @@ impl CheckpointSource for S3Source {
     }
 
     fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()> {
-        if offset.batch_index > self.batches.len() {
-            return Err(ConnectorError::Offset {
-                message: format!(
-                    "object-store Parquet offset {} is past the final batch {} for '{}'",
-                    offset.batch_index,
-                    self.batches.len(),
-                    self.path
-                ),
-            });
-        }
+        // `restore_offset` is synchronous, but positioning a network-backed
+        // stream requires async I/O. Adopt the offset and drop the active
+        // stream so the next `read_batch` lazily rebuilds and re-validates it
+        // — `stream_skipped_to` returns `ConnectorError::Offset` if the
+        // object has fewer batches than the requested index.
         self.cursor = offset.batch_index;
+        self.stream = None;
         Ok(())
     }
 }
@@ -194,10 +278,11 @@ impl Sink for S3Sink {
             self.schema = Some(batch.schema());
         }
         if self.pending.len() >= MAX_PENDING_BATCHES {
-            return Err(ConnectorError::IoStr {
+            return Err(ConnectorError::ObjectStore {
                 message: format!(
                     "S3Sink pending batch limit ({MAX_PENDING_BATCHES}) exceeded; flush before writing more"
                 ),
+                status: None,
             });
         }
         self.pending.push(batch);
@@ -209,26 +294,24 @@ impl Sink for S3Sink {
             return Ok(());
         }
 
-        let schema = self.schema.clone().ok_or_else(|| ConnectorError::IoStr {
-            message: "S3Sink::flush: schema not set (no batches written)".into(),
+        let schema = self.schema.clone().ok_or_else(|| {
+            ConnectorError::Parquet("S3Sink::flush: schema not set (no batches written)".into())
         })?;
 
         // Serialise all pending batches to a Parquet byte buffer.
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut writer = ArrowWriter::try_new(&mut buf, schema, None).map_err(|e| {
-                ConnectorError::IoStr {
-                    message: format!("failed to create Parquet writer: {e}"),
-                }
+                ConnectorError::Parquet(format!("failed to create Parquet writer: {e}"))
             })?;
             for batch in &self.pending {
-                writer.write(batch).map_err(|e| ConnectorError::IoStr {
-                    message: format!("failed to write Parquet batch: {e}"),
+                writer.write(batch).map_err(|e| {
+                    ConnectorError::Parquet(format!("failed to write Parquet batch: {e}"))
                 })?;
             }
-            writer.close().map_err(|e| ConnectorError::IoStr {
-                message: format!("failed to close Parquet writer: {e}"),
-            })?;
+            writer
+                .close()
+                .map_err(|e| ConnectorError::Parquet(format!("failed to close Parquet writer: {e}")))?;
         }
 
         // Upload.
@@ -236,8 +319,9 @@ impl Sink for S3Sink {
         self.store
             .put(&self.path, payload)
             .await
-            .map_err(|e| ConnectorError::IoStr {
+            .map_err(|e| ConnectorError::ObjectStore {
                 message: format!("failed to put object '{}': {e}", self.path),
+                status: None,
             })?;
 
         self.pending.clear();

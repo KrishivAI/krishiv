@@ -41,7 +41,7 @@ pub use executor::{
 };
 pub use ids::{
     AttemptId, CoordinatorId, ExecutorId, FencingToken, IdError, JobId, LeaseGeneration,
-    ProtoResult, StageId, TaskId, TransportVersion,
+    OperatorId, PartitionId, ProtoResult, StageId, TaskId, TransportVersion,
 };
 pub use io::{ConnectorCapabilityFlags, ShuffleReadConfig, ShuffleWriteConfig, TaskSpec};
 pub use job::{JobSpec, StageSpec};

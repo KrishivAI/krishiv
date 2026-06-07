@@ -557,7 +557,11 @@ mod tests {
         let stream = stream_batch(vec!["a"], vec![2000]);
         let result = op.join(&stream).unwrap();
         // Must emit 2 rows: one for each table row.
-        assert_eq!(result.num_rows(), 2, "multi-row table version must produce one output row per table row");
+        assert_eq!(
+            result.num_rows(),
+            2,
+            "multi-row table version must produce one output row per table row"
+        );
         let score_col = result.column(result.schema().index_of("score").unwrap());
         let scores = score_col.as_any().downcast_ref::<Int64Array>().unwrap();
         let mut score_vals: Vec<i64> = (0..2).map(|i| scores.value(i)).collect();
@@ -599,6 +603,10 @@ mod tests {
         assert_eq!(result.num_rows(), 1);
         let score_col = result.column(result.schema().index_of("score").unwrap());
         let scores = score_col.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(scores.value(0), 42, "key 'a|b' must match its own table version, not key 'a'");
+        assert_eq!(
+            scores.value(0),
+            42,
+            "key 'a|b' must match its own table version, not key 'a'"
+        );
     }
 }

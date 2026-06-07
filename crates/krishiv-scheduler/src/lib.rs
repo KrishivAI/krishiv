@@ -40,6 +40,7 @@ pub mod in_process;
 pub mod job;
 pub mod job_coordinator;
 pub mod llm_quota;
+pub mod rpc_drain;
 pub mod store;
 pub mod transport;
 
@@ -90,6 +91,7 @@ pub use grpc::{
     CoordinatorExecutorGrpcService, CoordinatorExecutorTonicService,
     CoordinatorManagementGrpcService, coordinator_executor_grpc_server,
     coordinator_management_grpc_server, serve_coordinator_executor_grpc_with_listener,
+    serve_coordinator_executor_grpc_with_listener_and_tracker,
 };
 pub use heartbeat::{
     ExecutorHealthSnapshot, ExecutorHeartbeatAge, ExecutorRecord, ExecutorRegistry,

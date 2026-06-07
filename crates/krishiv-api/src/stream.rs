@@ -60,7 +60,7 @@ impl Stream {
             execution_mode,
             None,
             None,
-            crate::session::shared_embedded_runtime(),
+            crate::session::shared_embedded_runtime()?,
         ))
     }
 

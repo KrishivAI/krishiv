@@ -99,8 +99,11 @@ impl fmt::Debug for DataFrame {
 
 impl DataFrame {
     /// Create a logical-only DataFrame.
-    pub fn new(logical_plan: LogicalPlan) -> Self {
-        Self {
+    ///
+    /// Returns an error if the orphan embedded runtime backing this DataFrame
+    /// cannot be constructed (e.g. the in-process cluster fails to start).
+    pub fn new(logical_plan: LogicalPlan) -> Result<Self> {
+        Ok(Self {
             logical_plan,
             sql_dataframe: None,
             sql_query: None,
@@ -109,10 +112,10 @@ impl DataFrame {
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             _coordinator_url: None,
-            runtime: crate::session::shared_embedded_runtime(),
+            runtime: crate::session::shared_embedded_runtime()?,
             registered_parquet: Arc::new(DashMap::new()),
             force_local: false,
-        }
+        })
     }
 
     /// Force collection from the local DataFusion plan regardless of runtime mode.

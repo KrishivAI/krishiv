@@ -7,7 +7,7 @@ use crate::ids::*;
 /// One source partition offset captured at the barrier boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointSourceOffset {
-    pub partition_id: String,
+    pub partition_id: PartitionId,
     pub offset: i64,
 }
 
@@ -23,7 +23,7 @@ pub struct InitiateCheckpointRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointAckRequest {
     pub job_id: JobId,
-    pub operator_id: String,
+    pub operator_id: OperatorId,
     pub task_id: TaskId,
     pub epoch: u64,
     pub fencing_token: FencingToken,

@@ -305,7 +305,7 @@ impl CheckpointCoordinator {
             let expected = krishiv_checkpoint::snapshot_path(
                 self.job_id.as_str(),
                 current_epoch,
-                &ack.operator_id,
+                ack.operator_id.as_str(),
                 ack.task_id.as_str(),
             );
             if snapshot_path != &expected {
@@ -333,7 +333,7 @@ impl CheckpointCoordinator {
         let mut offset_map: HashMap<String, i64> = HashMap::new();
         for ack in self.pending_acks.values() {
             for so in &ack.source_offsets {
-                offset_map.insert(so.partition_id.clone(), so.offset);
+                offset_map.insert(so.partition_id.as_str().to_owned(), so.offset);
             }
         }
         let source_offsets: Vec<SourceOffsetRecord> = offset_map
@@ -349,7 +349,7 @@ impl CheckpointCoordinator {
             .values()
             .filter_map(|ack| {
                 ack.snapshot_path.as_ref().map(|path| OperatorSnapshotRef {
-                    operator_id: ack.operator_id.clone(),
+                    operator_id: ack.operator_id.as_str().to_owned(),
                     task_id: ack.task_id.as_str().to_owned(),
                     snapshot_path: path.clone(),
                 })
@@ -559,7 +559,7 @@ impl CheckpointCoordinator {
         let mut offset_map: HashMap<String, i64> = HashMap::new();
         for ack in self.pending_acks.values() {
             for so in &ack.source_offsets {
-                offset_map.insert(so.partition_id.clone(), so.offset);
+                offset_map.insert(so.partition_id.as_str().to_owned(), so.offset);
             }
         }
         let source_offsets: Vec<SourceOffsetRecord> = offset_map
@@ -576,7 +576,7 @@ impl CheckpointCoordinator {
             .values()
             .filter_map(|ack| {
                 ack.snapshot_path.as_ref().map(|path| OperatorSnapshotRef {
-                    operator_id: ack.operator_id.clone(),
+                    operator_id: ack.operator_id.as_str().to_owned(),
                     task_id: ack.task_id.as_str().to_owned(),
                     snapshot_path: path.clone(),
                 })
@@ -803,7 +803,8 @@ mod tests {
 
     use krishiv_checkpoint::{LocalFsCheckpointStorage, write_operator_snapshot};
     use krishiv_proto::{
-        CheckpointAckRequest, CheckpointSourceOffset, FencingToken, JobId, TaskId,
+        CheckpointAckRequest, CheckpointSourceOffset, FencingToken, JobId, OperatorId,
+        PartitionId, TaskId,
     };
 
     use super::{CheckpointCoordinator, CheckpointCoordinatorState};
@@ -816,12 +817,12 @@ mod tests {
     ) -> CheckpointAckRequest {
         CheckpointAckRequest {
             job_id: job_id.clone(),
-            operator_id: format!("op-{task_id}"),
+            operator_id: OperatorId::try_new(format!("op-{task_id}")).unwrap(),
             task_id: TaskId::try_new(task_id).unwrap(),
             epoch,
             fencing_token,
             source_offsets: vec![CheckpointSourceOffset {
-                partition_id: "p0".into(),
+                partition_id: PartitionId::try_new("p0").unwrap(),
                 offset: 1,
             }],
             snapshot_path: None,

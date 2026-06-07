@@ -1209,15 +1209,16 @@ impl CdcEventSource for RdkafkaCdcEventSource {
         let mut events = Vec::with_capacity(max.min(64));
 
         for _ in 0..max {
-            let msg = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    tokio::time::timeout(
-                        std::time::Duration::from_millis(self.poll_timeout_ms),
-                        self.consumer.recv(),
-                    )
-                    .await
-                })
-            });
+            // `poll_records` is a sync trait method invoked from async pipeline
+            // loops, so receiving from the async Kafka consumer requires
+            // re-entering a runtime. `krishiv_common::async_util::block_on`
+            // picks the correct strategy for the active runtime flavor —
+            // the naive `block_in_place(|| Handle::current().block_on(..))`
+            // pattern panics on current-thread runtimes.
+            let msg = krishiv_common::async_util::block_on(tokio::time::timeout(
+                std::time::Duration::from_millis(self.poll_timeout_ms),
+                self.consumer.recv(),
+            ));
 
             match msg {
                 // Timed out – no more messages available right now.
@@ -1859,7 +1860,12 @@ mod tests {
         let result = pipeline
             .run_with_source(source, |_| Ok(()), shutdown_rx)
             .await;
-        assert!(result.unwrap_err().contains("Debezium parse error"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Debezium parse error")
+        );
     }
 
     #[tokio::test]
@@ -2072,6 +2078,6 @@ mod tests {
         );
         let result = pipeline.run().await;
         let err = result.expect_err("run() without durable sink must return Err");
-        assert!(err.contains("cannot prove downstream durability"));
+        assert!(err.to_string().contains("cannot prove downstream durability"));
     }
 }

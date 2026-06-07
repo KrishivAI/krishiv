@@ -559,7 +559,7 @@ mod tests {
             batches,
             Arc::new(Mutex::new(LocalJobRegistry::default())),
             Arc::new(AtomicU64::new(1)),
-            shared_embedded_runtime(),
+            shared_embedded_runtime().expect("embedded runtime for test"),
             Arc::new(DashMap::<String, PathBuf>::new()),
         )
     }

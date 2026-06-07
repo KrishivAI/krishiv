@@ -386,9 +386,9 @@ mod connector_tests {
         ) -> ConnectorResult<()> {
             self.events.push("write");
             if self.fail_write {
-                return Err(ConnectorError::IoStr {
-                    message: "injected write failure".into(),
-                });
+                return Err(ConnectorError::Io(std::io::Error::other(
+                    "injected write failure",
+                )));
             }
             Ok(())
         }
@@ -396,9 +396,9 @@ mod connector_tests {
         async fn flush(&mut self) -> ConnectorResult<()> {
             self.events.push("flush");
             if self.fail_flush {
-                return Err(ConnectorError::IoStr {
-                    message: "injected flush failure".into(),
-                });
+                return Err(ConnectorError::Io(std::io::Error::other(
+                    "injected flush failure",
+                )));
             }
             Ok(())
         }
@@ -445,7 +445,7 @@ mod connector_tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(err, ConnectorError::IoStr { .. }));
+        assert!(matches!(err, ConnectorError::Io(_)));
         assert_eq!(sink.events, vec!["write"]);
         assert!(committer.committed.is_empty());
     }
@@ -467,7 +467,7 @@ mod connector_tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(err, ConnectorError::IoStr { .. }));
+        assert!(matches!(err, ConnectorError::Io(_)));
         assert_eq!(sink.events, vec!["write", "flush"]);
         assert!(committer.committed.is_empty());
     }
