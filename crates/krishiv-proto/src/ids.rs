@@ -96,7 +96,15 @@ impl AttemptId {
 
     /// Next monotonic attempt id.
     pub fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+        let next = self.0.saturating_add(1);
+        if next == u32::MAX {
+            eprintln!(
+                "WARN krishiv-proto: AttemptId saturated at u32::MAX (current={}); \
+                 further retries cannot be distinguished",
+                self.0
+            );
+        }
+        Self(next)
     }
 
     /// Numeric attempt id.

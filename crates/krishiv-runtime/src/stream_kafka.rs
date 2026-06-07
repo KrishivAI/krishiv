@@ -1,10 +1,42 @@
 //! Encode in-memory [`RecordBatch`]es as `stream-kafka:` input partition descriptors.
 
-use arrow::array::Int64Array;
+use arrow::array::{Int32Array, Int64Array, StringArray};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use krishiv_exec::join::extract_agg_key;
 
 use crate::RuntimeError;
+
+fn extract_column_as_string(
+    batch: &RecordBatch,
+    col_idx: usize,
+    row: usize,
+) -> Result<String, RuntimeError> {
+    let col = batch.column(col_idx);
+    let col_name = batch.schema().field(col_idx).name().to_owned();
+    match col.data_type() {
+        DataType::Utf8 => {
+            let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                RuntimeError::transport(format!("column '{col_name}' Utf8 downcast failed"))
+            })?;
+            Ok(arr.value(row).to_owned())
+        }
+        DataType::Int64 => {
+            let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                RuntimeError::transport(format!("column '{col_name}' Int64 downcast failed"))
+            })?;
+            Ok(arr.value(row).to_string())
+        }
+        DataType::Int32 => {
+            let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                RuntimeError::transport(format!("column '{col_name}' Int32 downcast failed"))
+            })?;
+            Ok(arr.value(row).to_string())
+        }
+        other => Err(RuntimeError::transport(format!(
+            "column '{col_name}' has unsupported type {other} for stream-kafka key"
+        ))),
+    }
+}
 
 /// Build a `stream-kafka:` partition description for executor streaming tasks.
 pub fn encode_stream_kafka_partition(
@@ -35,9 +67,7 @@ pub fn encode_stream_kafka_partition(
 
     let mut records = Vec::new();
     for row in 0..batch.num_rows() {
-        let key = extract_agg_key(batch, key_idx, row)
-            .map_err(|e| RuntimeError::transport(e.to_string()))?
-            .to_string();
+        let key = extract_column_as_string(batch, key_idx, row)?;
         let time_arr = batch
             .column(time_idx)
             .as_any()
@@ -47,11 +77,17 @@ pub fn encode_stream_kafka_partition(
             })?;
         let ts = time_arr.value(row);
         let val = if let Some(vidx) = value_idx {
-            let raw = extract_agg_key(batch, vidx, row)
-                .map_err(|e| RuntimeError::transport(e.to_string()))?
-                .to_string();
-            raw.parse::<i64>()
-                .map_err(|e| RuntimeError::transport(format!("value column parse error: {e}")))?
+            batch
+                .column(vidx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    RuntimeError::transport(format!(
+                        "value column '{}' must be Int64",
+                        value_column.unwrap_or("")
+                    ))
+                })?
+                .value(row)
         } else {
             0
         };
@@ -236,6 +272,6 @@ mod tests {
         .unwrap();
         let err =
             encode_stream_kafka_partition("t", 0, 0, &batch, "key", "ts", Some("val")).unwrap_err();
-        assert!(err.to_string().contains("value column parse error"));
+        assert!(err.to_string().contains("value column") && err.to_string().contains("must be Int64"));
     }
 }

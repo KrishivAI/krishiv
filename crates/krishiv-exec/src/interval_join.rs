@@ -1,6 +1,7 @@
 //! Stream-stream interval join (R16 S3.2) with per-key partitioning.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 
@@ -36,7 +37,7 @@ impl IntervalJoinSpec {
 #[derive(Debug, Clone)]
 struct BufferedEvent {
     event_time_ms: i64,
-    batch: RecordBatch,
+    batch: Arc<RecordBatch>,
 }
 
 /// Per-key buffers for both join sides.
@@ -58,11 +59,11 @@ impl IntervalJoinBuffers {
         &mut self,
         is_left: bool,
         event_time_ms: i64,
-        batch: RecordBatch,
+        batch: Arc<RecordBatch>,
         lower_bound_ms: i64,
         upper_bound_ms: i64,
         max_buffer: usize,
-    ) -> Vec<(RecordBatch, RecordBatch)> {
+    ) -> Vec<(Arc<RecordBatch>, Arc<RecordBatch>)> {
         let (this_buf, other_buf) = if is_left {
             (&mut self.left, &mut self.right)
         } else {
@@ -77,9 +78,9 @@ impl IntervalJoinBuffers {
             };
             if delta >= lower_bound_ms && delta <= upper_bound_ms {
                 if is_left {
-                    matches.push((batch.clone(), other.batch.clone()));
+                    matches.push((Arc::clone(&batch), Arc::clone(&other.batch)));
                 } else {
-                    matches.push((other.batch.clone(), batch.clone()));
+                    matches.push((Arc::clone(&other.batch), Arc::clone(&batch)));
                 }
             }
         }
@@ -124,12 +125,15 @@ impl PerKeyIntervalJoin {
     }
 
     /// Push an event onto the left side for `key`.
+    ///
+    /// Returns matched pairs as `(left, right)` `Arc<RecordBatch>` tuples so
+    /// callers can fan out matches to multiple consumers without per-fan copies.
     pub fn push_left(
         &mut self,
         key: &str,
         event_time_ms: i64,
         batch: RecordBatch,
-    ) -> Vec<(RecordBatch, RecordBatch)> {
+    ) -> Vec<(Arc<RecordBatch>, Arc<RecordBatch>)> {
         let max_buf = self.spec.max_buffer_per_side;
         let state = self
             .states
@@ -138,7 +142,7 @@ impl PerKeyIntervalJoin {
         state.push_side(
             true,
             event_time_ms,
-            batch,
+            Arc::new(batch),
             self.spec.lower_bound_ms,
             self.spec.upper_bound_ms,
             max_buf,
@@ -146,12 +150,15 @@ impl PerKeyIntervalJoin {
     }
 
     /// Push an event onto the right side for `key`.
+    ///
+    /// Returns matched pairs as `(left, right)` `Arc<RecordBatch>` tuples so
+    /// callers can fan out matches to multiple consumers without per-fan copies.
     pub fn push_right(
         &mut self,
         key: &str,
         event_time_ms: i64,
         batch: RecordBatch,
-    ) -> Vec<(RecordBatch, RecordBatch)> {
+    ) -> Vec<(Arc<RecordBatch>, Arc<RecordBatch>)> {
         let max_buf = self.spec.max_buffer_per_side;
         let state = self
             .states
@@ -160,7 +167,7 @@ impl PerKeyIntervalJoin {
         state.push_side(
             false,
             event_time_ms,
-            batch,
+            Arc::new(batch),
             self.spec.lower_bound_ms,
             self.spec.upper_bound_ms,
             max_buf,

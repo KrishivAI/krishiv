@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 /// Typed error returned by [`FaultInjector::apply`].
 #[derive(Debug, thiserror::Error)]
 pub enum ChaosError {
@@ -40,7 +38,7 @@ impl FaultInjector {
         }
         let idx = self
             .call_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         &self.faults[idx % self.faults.len()]
     }
 

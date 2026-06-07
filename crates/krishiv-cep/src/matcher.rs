@@ -121,7 +121,6 @@ impl SequentialPatternMatcher {
     }
 }
 
-#[allow(dead_code)] // compiled with workspace; integration lands in streaming exec path
 /// Partitioned wrapper routing events to per-key [`SequentialPatternMatcher`] instances (P3-27).
 #[derive(Debug, Clone)]
 pub struct PartitionedCepMatcher<K>

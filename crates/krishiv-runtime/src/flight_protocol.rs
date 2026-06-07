@@ -11,11 +11,8 @@
 //!   a job_id containing `*/` could end the comment early and inject SQL).
 
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::path::PathBuf;
 
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -155,7 +152,7 @@ pub fn encode_continuous_register(
 
 /// Encode remote continuous input push.
 pub fn encode_continuous_push(job_id: &str, batches: &[RecordBatch]) -> RuntimeResult<String> {
-    let ipc = encode_batches_ipc(batches)?;
+    let ipc = crate::flight_action::encode_batches(batches)?;
     Ok(format!(
         "/* {CONTINUOUS_PUSH}:{job_id}:{ipc} */ SELECT 1 AS pushed"
     ))
@@ -176,7 +173,7 @@ pub fn encode_bounded_window(
     let spec_json = serde_json::to_string(&plan_spec)
         .map_err(|e| RuntimeError::transport(format!("window spec serialization: {e}")))?;
     let spec_b64 = BASE64.encode(spec_json.as_bytes());
-    let ipc = encode_batches_ipc(input_batches)?;
+    let ipc = crate::flight_action::encode_batches(input_batches)?;
     Ok(format!(
         "/* {BOUNDED_WINDOW}:{topic}:{spec_b64}:{ipc} */ SELECT 1 AS windowed"
     ))
@@ -274,7 +271,7 @@ fn parse_comment(comment: &str) -> Option<FlightDirective> {
         if !is_safe_identifier(job_id) || (!ipc.is_empty() && !is_safe_base64(ipc)) {
             return None;
         }
-        let batches = decode_batches_ipc(ipc).ok()?;
+        let batches = crate::flight_action::decode_batches(ipc).ok()?;
         return Some(FlightDirective::ContinuousPush {
             job_id: job_id.to_string(),
             batches,
@@ -302,7 +299,7 @@ fn parse_comment(comment: &str) -> Option<FlightDirective> {
             return None;
         }
         let spec = decode_window_spec(spec_b64).ok()?;
-        let input_batches = decode_batches_ipc(ipc).ok()?;
+        let input_batches = crate::flight_action::decode_batches(ipc).ok()?;
         return Some(FlightDirective::BoundedWindow {
             topic: topic.to_string(),
             spec,
@@ -345,41 +342,6 @@ fn decode_window_spec(encoded: &str) -> RuntimeResult<WindowExecutionSpec> {
         .map_err(|e| RuntimeError::transport(format!("invalid window spec json: {e}")))
 }
 
-fn encode_batches_ipc(batches: &[RecordBatch]) -> RuntimeResult<String> {
-    if batches.is_empty() {
-        return Ok(String::new());
-    }
-    let schema = batches[0].schema();
-    let mut buffer = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buffer, &schema)
-            .map_err(|e| RuntimeError::transport(format!("ipc encode failed: {e}")))?;
-        for batch in batches {
-            writer
-                .write(batch)
-                .map_err(|e| RuntimeError::transport(format!("ipc write failed: {e}")))?;
-        }
-        writer
-            .finish()
-            .map_err(|e| RuntimeError::transport(format!("ipc finish failed: {e}")))?;
-    }
-    Ok(BASE64.encode(buffer))
-}
-
-fn decode_batches_ipc(encoded: &str) -> RuntimeResult<Vec<RecordBatch>> {
-    if encoded.is_empty() {
-        return Ok(Vec::new());
-    }
-    let bytes = BASE64
-        .decode(encoded)
-        .map_err(|e| RuntimeError::transport(format!("invalid batch ipc encoding: {e}")))?;
-    let cursor = Cursor::new(bytes);
-    let reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| RuntimeError::transport(format!("ipc decode failed: {e}")))?;
-    reader
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| RuntimeError::transport(format!("ipc read failed: {e}")))
-}
 
 /// Whether any directive requires special handling before normal SQL execution.
 pub fn has_control_directive(directives: &[FlightDirective]) -> bool {

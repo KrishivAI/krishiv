@@ -103,94 +103,106 @@ impl InProcessCluster {
 }
 
 pub(crate) fn local_spec_to_plan_spec(spec: &LocalWindowExecutionSpec) -> WindowExecutionSpec {
-    use krishiv_exec::AggFunction;
-    use krishiv_plan::window::{WindowAgg, WindowAggKind};
+    WindowExecutionSpec::from(spec)
+}
 
-    let (window_kind, slide_ms, session_gap_ms) = match &spec.window_kind {
-        crate::local_streaming::LocalWindowKind::Tumbling => (WindowKind::Tumbling, None, None),
-        crate::local_streaming::LocalWindowKind::Sliding { slide_ms } => {
-            (WindowKind::Sliding, Some(*slide_ms), None)
-        }
-        crate::local_streaming::LocalWindowKind::Session { gap_ms } => {
-            (WindowKind::Session, None, Some(*gap_ms))
-        }
-    };
+impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
+    fn from(spec: &LocalWindowExecutionSpec) -> Self {
+        use krishiv_exec::AggFunction;
+        use krishiv_plan::window::{WindowAgg, WindowAggKind};
 
-    WindowExecutionSpec {
-        key_column: spec.key_column.clone(),
-        key_column_type: spec.key_column_type.clone(),
-        event_time_column: spec.event_time_column.clone(),
-        watermark_lag_ms: spec.watermark_lag_ms,
-        window_kind,
-        window_size_ms: spec.window_size_ms,
-        slide_ms,
-        session_gap_ms,
-        agg_exprs: spec
-            .agg_exprs
-            .iter()
-            .map(|a| {
-                let kind = match a.function {
-                    AggFunction::Count => WindowAggKind::Count,
-                    AggFunction::Sum => WindowAggKind::Sum,
-                    AggFunction::Min => WindowAggKind::Min,
-                    AggFunction::Max => WindowAggKind::Max,
-                    AggFunction::Avg => WindowAggKind::Avg,
-                };
-                WindowAgg {
-                    kind,
-                    input_column: a.input_column.clone(),
-                    output_column: a.output_column.clone(),
-                }
-            })
-            .collect(),
-        state_ttl_ms: spec.state_ttl_ms,
-        source_watermark_lags: spec.source_watermark_lags.clone(),
-        source_id_column: spec.source_id_column.clone(),
+        let (window_kind, slide_ms, session_gap_ms) = match &spec.window_kind {
+            crate::local_streaming::LocalWindowKind::Tumbling => (WindowKind::Tumbling, None, None),
+            crate::local_streaming::LocalWindowKind::Sliding { slide_ms } => {
+                (WindowKind::Sliding, Some(*slide_ms), None)
+            }
+            crate::local_streaming::LocalWindowKind::Session { gap_ms } => {
+                (WindowKind::Session, None, Some(*gap_ms))
+            }
+        };
+
+        WindowExecutionSpec {
+            key_column: spec.key_column.clone(),
+            key_column_type: spec.key_column_type.clone(),
+            event_time_column: spec.event_time_column.clone(),
+            watermark_lag_ms: spec.watermark_lag_ms,
+            window_kind,
+            window_size_ms: spec.window_size_ms,
+            slide_ms,
+            session_gap_ms,
+            agg_exprs: spec
+                .agg_exprs
+                .iter()
+                .map(|a| {
+                    let kind = match a.function {
+                        AggFunction::Count => WindowAggKind::Count,
+                        AggFunction::Sum => WindowAggKind::Sum,
+                        AggFunction::Min => WindowAggKind::Min,
+                        AggFunction::Max => WindowAggKind::Max,
+                        AggFunction::Avg => WindowAggKind::Avg,
+                    };
+                    WindowAgg {
+                        kind,
+                        input_column: a.input_column.clone(),
+                        output_column: a.output_column.clone(),
+                    }
+                })
+                .collect(),
+            state_ttl_ms: spec.state_ttl_ms,
+            source_watermark_lags: spec.source_watermark_lags.clone(),
+            source_id_column: spec.source_id_column.clone(),
+        }
     }
 }
 
 pub fn plan_spec_to_local(spec: &WindowExecutionSpec) -> LocalWindowExecutionSpec {
-    use krishiv_exec::{AggExpr, AggFunction};
-    use krishiv_plan::window::WindowAggKind;
+    LocalWindowExecutionSpec::from(spec)
+}
 
-    let window_kind = match spec.window_kind {
-        WindowKind::Tumbling => crate::local_streaming::LocalWindowKind::Tumbling,
-        WindowKind::Sliding => crate::local_streaming::LocalWindowKind::Sliding {
-            slide_ms: spec.slide_ms.unwrap_or(spec.window_size_ms),
-        },
-        WindowKind::Session => crate::local_streaming::LocalWindowKind::Session {
-            gap_ms: spec.session_gap_ms.unwrap_or(spec.window_size_ms),
-        },
-    };
+impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
+    fn from(spec: &WindowExecutionSpec) -> Self {
+        use krishiv_exec::{AggExpr, AggFunction};
+        use krishiv_plan::window::WindowAggKind;
 
-    LocalWindowExecutionSpec {
-        key_column: spec.key_column.clone(),
-        key_column_type: spec.key_column_type.clone(),
-        event_time_column: spec.event_time_column.clone(),
-        watermark_lag_ms: spec.watermark_lag_ms,
-        window_kind,
-        window_size_ms: spec.window_size_ms,
-        agg_exprs: spec
-            .agg_exprs
-            .iter()
-            .map(|a| {
-                let function = match a.kind {
-                    WindowAggKind::Count => AggFunction::Count,
-                    WindowAggKind::Sum => AggFunction::Sum,
-                    WindowAggKind::Min => AggFunction::Min,
-                    WindowAggKind::Max => AggFunction::Max,
-                    WindowAggKind::Avg => AggFunction::Avg,
-                };
-                AggExpr {
-                    function,
-                    input_column: a.input_column.clone(),
-                    output_column: a.output_column.clone(),
-                }
-            })
-            .collect(),
-        state_ttl_ms: spec.state_ttl_ms,
-        source_watermark_lags: spec.source_watermark_lags.clone(),
-        source_id_column: spec.source_id_column.clone(),
+        let window_kind = match spec.window_kind {
+            WindowKind::Tumbling => crate::local_streaming::LocalWindowKind::Tumbling,
+            WindowKind::Sliding => crate::local_streaming::LocalWindowKind::Sliding {
+                slide_ms: spec.slide_ms.unwrap_or(spec.window_size_ms),
+            },
+            WindowKind::Session => crate::local_streaming::LocalWindowKind::Session {
+                gap_ms: spec.session_gap_ms.unwrap_or(spec.window_size_ms),
+            },
+        };
+
+        LocalWindowExecutionSpec {
+            key_column: spec.key_column.clone(),
+            key_column_type: spec.key_column_type.clone(),
+            event_time_column: spec.event_time_column.clone(),
+            watermark_lag_ms: spec.watermark_lag_ms,
+            window_kind,
+            window_size_ms: spec.window_size_ms,
+            agg_exprs: spec
+                .agg_exprs
+                .iter()
+                .map(|a| {
+                    let function = match a.kind {
+                        WindowAggKind::Count => AggFunction::Count,
+                        WindowAggKind::Sum => AggFunction::Sum,
+                        WindowAggKind::Min => AggFunction::Min,
+                        WindowAggKind::Max => AggFunction::Max,
+                        WindowAggKind::Avg => AggFunction::Avg,
+                    };
+                    AggExpr {
+                        function,
+                        input_column: a.input_column.clone(),
+                        output_column: a.output_column.clone(),
+                    }
+                })
+                .collect(),
+            state_ttl_ms: spec.state_ttl_ms,
+            source_watermark_lags: spec.source_watermark_lags.clone(),
+            source_id_column: spec.source_id_column.clone(),
+        }
     }
 }
 pub fn fragment_from_local_spec(spec: &LocalWindowExecutionSpec) -> String {

@@ -124,8 +124,7 @@ impl PyBatch {
     }
 }
 
-#[pyfunction]
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn make_example_batch() -> PyBatch {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};

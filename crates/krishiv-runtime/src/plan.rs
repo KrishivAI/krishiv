@@ -31,6 +31,7 @@ pub fn streaming_spec_from_plan(
     }
 
     let mut key_column = String::new();
+    let mut key_column_type = String::from("utf8");
     let mut event_time_column = String::new();
     let mut watermark_lag_ms = 0u64;
     let mut window_kind = None;
@@ -55,6 +56,7 @@ pub fn streaming_spec_from_plan(
             }
             NodeOp::Window { spec } => {
                 key_column = spec.key_column.clone();
+                key_column_type = spec.key_column_type.clone();
                 event_time_column = spec.event_time_column.clone();
                 watermark_lag_ms = spec.watermark_lag_ms;
                 window_size_ms = spec.window_size_ms;
@@ -92,7 +94,7 @@ pub fn streaming_spec_from_plan(
 
     Ok(LocalWindowExecutionSpec {
         key_column,
-        key_column_type: String::from("utf8"),
+        key_column_type,
         event_time_column,
         watermark_lag_ms,
         window_kind,

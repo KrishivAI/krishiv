@@ -130,17 +130,6 @@ impl CheckpointSource for ParquetSource {
     }
 }
 
-impl ParquetSource {
-    /// Reset the read cursor back to position 0.
-    ///
-    /// After calling `reset()`, the next call to [`Source::read_batch`] will
-    /// return the first batch again, fulfilling the "rewindable" capability
-    /// advertised by [`Source::capabilities`].
-    pub fn reset(&mut self) -> Result<(), ConnectorError> {
-        Source::reset(self);
-        Ok(())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // ParquetSink

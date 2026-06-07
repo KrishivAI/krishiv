@@ -45,7 +45,7 @@ fn next_cluster_suffix() -> u64 {
 }
 
 /// Parquet table registration forwarded to executor SQL tasks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BatchSqlTable {
     pub table_name: String,
     pub path: PathBuf,
@@ -109,19 +109,19 @@ impl InProcessStreamingRuntime {
         // executor id so multiple sessions sharing the same process do not
         // collide in metadata stores or audit logs (C1).
         let coordinator_id = CoordinatorId::try_new(format!("in-process-coord-{suffix}"))
-            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
         let coordinator = Arc::new(Mutex::new(Coordinator::active(coordinator_id)));
         let executor_id = ExecutorId::try_new(format!("in-process-exec-{suffix}"))
-            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
         let descriptor = ExecutorDescriptor::new(executor_id.clone(), "localhost", 8)
             .with_task_endpoint(IN_PROCESS_TASK_ENDPOINT);
         {
-            let mut coord = coordinator.lock().map_err(|_| {
-                RuntimeError::transport("coordinator lock poisoned during executor registration")
+            let mut coord = coordinator.lock().map_err(|_| RuntimeError::InvalidState {
+                message: "coordinator lock poisoned during executor registration".into(),
             })?;
             coord
                 .register_executor(descriptor)
-                .map_err(|e| RuntimeError::transport(e.to_string()))?;
+                .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
         }
         // Build sharded inner locks after registering the local executor so the
         // bridge starts from the same control-plane state as the coordinator.
@@ -129,10 +129,8 @@ impl InProcessStreamingRuntime {
             Arc<RwLock<ExecutorInner>>,
             Arc<RwLock<CheckpointInner>>,
         ) = {
-            let coord = coordinator.lock().map_err(|_| {
-                RuntimeError::transport(
-                    "coordinator lock poisoned during bridge inner-state extraction",
-                )
+            let coord = coordinator.lock().map_err(|_| RuntimeError::InvalidState {
+                message: "coordinator lock poisoned during bridge inner-state extraction".into(),
             })?;
             let (checkpoint_coordinators, checkpoint_notify_sent, barrier_dispatch_sent) =
                 coord.checkpoint_inner_parts();
@@ -179,7 +177,7 @@ impl InProcessStreamingRuntime {
     fn next_job_id(&self) -> RuntimeResult<JobId> {
         let n = self.job_counter.fetch_add(1, Ordering::Relaxed);
         JobId::try_new(format!("in-process-{}-job-{n}", self.suffix))
-            .map_err(|e| RuntimeError::transport(e.to_string()))
+            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })
     }
 
     pub fn continuous_registry(&self) -> &ContinuousStreamRegistry {
@@ -214,7 +212,7 @@ impl InProcessStreamingRuntime {
         self.runner
             .sql_engine()
             .deregister_streaming_source(name)
-            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
         let prefix = format!("{name}:");
         self.runner
             .registered_parquet_cache()
@@ -227,7 +225,7 @@ impl InProcessStreamingRuntime {
         self.runner
             .sql_engine()
             .is_streaming_query(query)
-            .map_err(|e| RuntimeError::transport(format!("sql parse error: {e}")))
+            .map_err(|e| RuntimeError::PlanRejected { reason: format!("sql parse error: {e}") })
     }
 
     /// Execute batch SQL on the in-process executor via the coordinator. → executor (`sql:` fragment).
@@ -250,7 +248,8 @@ impl InProcessStreamingRuntime {
             // Skip tables already registered in a previous inline call to avoid
             // redundant DataFusion re-registration (file footer re-read).
             for table in &tables {
-                let cache_key = format!("{}:{}", table.table_name, table.path.display());
+                let canonical_path = table.path.canonicalize().unwrap_or_else(|_| table.path.clone());
+                let cache_key = format!("{}:{}", table.table_name, canonical_path.display());
                 // Atomic check-and-insert via DashMap entry API prevents the TOCTOU
                 // race where two concurrent threads both see contains_key==false,
                 // both call register_parquet, and the second call fails.
@@ -337,22 +336,22 @@ impl InProcessStreamingRuntime {
         stream_partitions: Vec<InputPartition>,
     ) -> RuntimeResult<Vec<RecordBatch>> {
         let job_id = self.next_job_id()?;
-        let task_id =
-            TaskId::try_new("task-0").map_err(|e| RuntimeError::transport(e.to_string()))?;
-        let stage_id =
-            StageId::try_new("stage-0").map_err(|e| RuntimeError::transport(e.to_string()))?;
+        let task_id = TaskId::try_new("task-0")
+            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
+        let stage_id = StageId::try_new("stage-0")
+            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
         let job_spec = JobSpec::new(job_id.clone(), fragment.to_string(), kind).with_stage(
             StageSpec::new(stage_id, "stage-0")
                 .with_task(TaskSpec::new(task_id.clone(), fragment.to_string())),
         );
 
         {
-            let mut coord = self.coordinator.lock().map_err(|_| {
-                RuntimeError::transport("coordinator lock poisoned during job submission")
+            let mut coord = self.coordinator.lock().map_err(|_| RuntimeError::InvalidState {
+                message: "coordinator lock poisoned during job submission".into(),
             })?;
             match coord.submit_job(job_spec) {
                 Ok(SubmitOutcome::Accepted) | Ok(SubmitOutcome::Queued { .. }) => {}
-                Err(e) => return Err(RuntimeError::transport(e.to_string())),
+                Err(e) => return Err(RuntimeError::InvalidState { message: e.to_string() }),
             }
         }
 
@@ -505,7 +504,9 @@ impl InProcessStreamingRuntime {
                 // Succeeded and makes the next stage's tasks eligible for assignment.
                 {
                     let mut coord = self.coordinator.lock().map_err(|_| {
-                        RuntimeError::transport("coordinator lock poisoned during coordinator tick")
+                        RuntimeError::InvalidState {
+                            message: "coordinator lock poisoned during coordinator tick".into(),
+                        }
                     })?;
                     let _ = coord.coordinator_tick();
                 }
@@ -518,8 +519,8 @@ impl InProcessStreamingRuntime {
         // JobCoordinator entry growing unboundedly, and coordinator_tick would
         // iterate over all of them on every subsequent call.
         {
-            let mut coord = self.coordinator.lock().map_err(|_| {
-                RuntimeError::transport("coordinator lock poisoned during job eviction")
+            let mut coord = self.coordinator.lock().map_err(|_| RuntimeError::InvalidState {
+                message: "coordinator lock poisoned during job eviction".into(),
             })?;
             coord.evict_completed_job(&job_id);
         }

@@ -2,27 +2,32 @@
 
 use krishiv_scheduler::configured_coordinator_bearer_token;
 use krishiv_scheduler::decode_inline_record_batches;
-use std::sync::OnceLock;
 
 use crate::flight_protocol::parquet_file_to_ipc_b64;
 use crate::in_process::BatchSqlTable;
 use crate::{RuntimeError, RuntimeResult};
 
+/// Per-request timeout for coordinator HTTP calls (seconds).
+const COORDINATOR_HTTP_REQUEST_TIMEOUT_SECS: u64 = 60;
+
+/// Job-level poll deadline for batch-SQL and bounded-window jobs (seconds).
+const BOUNDED_WINDOW_POLL_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum coordinator HTTP response size (bytes) — guards against unbounded
+/// memory growth when reading large JSON responses.
+const COORDINATOR_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Process-global `reqwest::Client` shared across all coordinator HTTP calls.
-///
-/// `reqwest::Client` holds an internal connection pool — creating a new one on
-/// every call throws away pooled TCP connections and pays the TLS handshake cost
-/// on every request. Using a single shared client lets the pool reuse connections
-/// across `execute_coordinator_batch_sql`, `execute_coordinator_continuous_push`,
-/// etc.
-///
-/// `reqwest::Client::clone()` is cheap (Arc-backed). In the extremely unlikely
-/// case of a concurrent cold start, two clients may be built; the `set` loser is
-/// dropped and its clone is returned — both clients are valid.
-static COORDINATOR_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+/// Wrapped in a `Mutex<Option<...>>` so tests can inject a mock client and
+/// reset between test runs for isolation.
+static COORDINATOR_HTTP_CLIENT: std::sync::Mutex<Option<reqwest::Client>> =
+    std::sync::Mutex::new(None);
 
 fn coordinator_http_client() -> RuntimeResult<reqwest::Client> {
-    if let Some(client) = COORDINATOR_HTTP_CLIENT.get() {
+    let mut guard = COORDINATOR_HTTP_CLIENT
+        .lock()
+        .map_err(|_| RuntimeError::transport("HTTP client mutex poisoned"))?;
+    if let Some(ref client) = *guard {
         return Ok(client.clone());
     }
     // Load Mozilla's trusted CA roots at compile time via `webpki-root-certs`
@@ -35,14 +40,30 @@ fn coordinator_http_client() -> RuntimeResult<reqwest::Client> {
         }
     }
     let client = builder
-        // Per-request timeout caps individual HTTP calls at 60 s.
-        // The job-level poll loop enforces a separate 300 s deadline,
+        // Per-request timeout caps individual HTTP calls.
+        // The job-level poll loop enforces a separate deadline,
         // so this guards against TCP-level stalls within a single request.
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(COORDINATOR_HTTP_REQUEST_TIMEOUT_SECS))
         .build()
         .map_err(|e| RuntimeError::transport(format!("HTTP client build failed: {e}")))?;
-    let _ = COORDINATOR_HTTP_CLIENT.set(client.clone()); // ignore if another thread won the race
-    Ok(COORDINATOR_HTTP_CLIENT.get().unwrap_or(&client).clone())
+    *guard = Some(client.clone());
+    Ok(client)
+}
+
+/// Inject a custom HTTP client for test isolation. Only available in test builds.
+#[cfg(test)]
+pub(crate) fn set_test_http_client(client: reqwest::Client) {
+    if let Ok(mut guard) = COORDINATOR_HTTP_CLIENT.lock() {
+        *guard = Some(client);
+    }
+}
+
+/// Reset the shared HTTP client so the next call rebuilds it. Only for tests.
+#[cfg(test)]
+pub(crate) fn reset_test_http_client() {
+    if let Ok(mut guard) = COORDINATOR_HTTP_CLIENT.lock() {
+        *guard = None;
+    }
 }
 
 fn apply_coordinator_bearer(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -86,8 +107,8 @@ struct BatchSqlInlineTableJson {
 
 #[derive(serde::Deserialize)]
 struct BatchSqlResponseBody {
-    #[allow(dead_code)]
-    job_id: String,
+    #[serde(rename = "job_id")]
+    _job_id: String,
     state: String,
     #[serde(default)]
     inline_record_batch_ipc: Vec<Vec<u8>>,
@@ -136,9 +157,17 @@ async fn poll_batch_sql_job(
                 poll_resp.status()
             )));
         }
-        let payload: BatchSqlResponseBody = poll_resp
-            .json()
+        let resp_bytes = poll_resp
+            .bytes()
             .await
+            .map_err(|e| RuntimeError::transport(format!("batch-sql poll read failed: {e}")))?;
+        if resp_bytes.len() > COORDINATOR_MAX_RESPONSE_BYTES {
+            return Err(RuntimeError::transport(format!(
+                "batch-sql poll response exceeded {} MiB limit",
+                COORDINATOR_MAX_RESPONSE_BYTES / (1024 * 1024)
+            )));
+        }
+        let payload: BatchSqlResponseBody = serde_json::from_slice(&resp_bytes)
             .map_err(|e| RuntimeError::transport(format!("batch-sql poll decode failed: {e}")))?;
         match payload.state.as_str() {
             "Succeeded" => {
@@ -226,7 +255,7 @@ pub async fn execute_coordinator_batch_sql(
 
     // Step 2: poll until terminal state.
     let poll_url = format!("{base}/api/v1/batch-sql/{job_id}");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(BOUNDED_WINDOW_POLL_TIMEOUT_SECS);
     poll_batch_sql_job(&client, &poll_url, &job_id, deadline).await
 }
 
@@ -280,7 +309,7 @@ pub async fn execute_coordinator_batch_sql_inline(
         .job_id;
 
     let poll_url = format!("{base}/api/v1/batch-sql/{job_id}");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(BOUNDED_WINDOW_POLL_TIMEOUT_SECS);
     poll_batch_sql_job(&client, &poll_url, &job_id, deadline).await
 }
 
@@ -304,7 +333,6 @@ pub async fn execute_coordinator_bounded_window(
 
     #[derive(serde::Deserialize)]
     struct BoundedWindowResponse {
-        job_id: String,
         inline_record_batch_ipc: Vec<Vec<u8>>,
     }
 
@@ -330,10 +358,19 @@ pub async fn execute_coordinator_bounded_window(
         )));
     }
 
-    let payload: BoundedWindowResponse = response.json().await.map_err(|e| {
+    let resp_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("bounded-window HTTP read failed: {e}")))?;
+    if resp_bytes.len() > COORDINATOR_MAX_RESPONSE_BYTES {
+        return Err(RuntimeError::transport(format!(
+            "bounded-window response exceeded {} MiB limit",
+            COORDINATOR_MAX_RESPONSE_BYTES / (1024 * 1024)
+        )));
+    }
+    let payload: BoundedWindowResponse = serde_json::from_slice(&resp_bytes).map_err(|e| {
         RuntimeError::transport(format!("bounded-window HTTP response decode failed: {e}"))
     })?;
-    let _ = payload.job_id;
     decode_inline_record_batches(&payload.inline_record_batch_ipc).map_err(RuntimeError::transport)
 }
 

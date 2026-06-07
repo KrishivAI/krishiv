@@ -99,7 +99,10 @@ pub fn check_batch_compiled(
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "system clock before UNIX epoch in quality check; using 0");
+            std::time::Duration::ZERO
+        })
         .as_millis() as i64;
 
     for (rule, action) in &config.rules {
@@ -319,7 +322,10 @@ pub fn check_batch(
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "system clock before UNIX epoch in quality check; using 0");
+            std::time::Duration::ZERO
+        })
         .as_millis() as i64;
 
     for (rule, action) in &config.rules {

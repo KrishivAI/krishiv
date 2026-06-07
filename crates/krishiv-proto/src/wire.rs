@@ -9,6 +9,7 @@ use crate::ids::{
     AttemptId, ExecutorId, FencingToken, JobId, LeaseGeneration, StageId, TaskId, TransportVersion,
 };
 use crate::lifecycle::{ExecutorState, TaskState};
+use crate::executor::TraceContext;
 use crate::task::{
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment, InputPartition,
     InputPartitionDescriptor, KeyGroupRange, MemoryKafkaRecord, OutputContract,
@@ -43,13 +44,31 @@ impl WireError {
 
 type WireResult<T> = Result<T, WireError>;
 
+fn trace_context_to_wire(ctx: Option<&TraceContext>) -> (String, String) {
+    match ctx {
+        Some(c) => (c.traceparent.clone(), c.tracestate.clone()),
+        None => (String::new(), String::new()),
+    }
+}
+
+fn trace_context_from_wire(traceparent: String, tracestate: String) -> Option<TraceContext> {
+    if traceparent.is_empty() {
+        None
+    } else {
+        Some(TraceContext { traceparent, tracestate })
+    }
+}
+
 /// Convert a domain registration request to protobuf.
 pub fn register_executor_request_to_wire(
     value: RegisterExecutorRequest,
 ) -> v1::RegisterExecutorRequest {
+    let (trace_parent, trace_state) = trace_context_to_wire(value.trace_context());
     v1::RegisterExecutorRequest {
         version: Some(transport_version_to_wire(value.version())),
         descriptor: Some(executor_descriptor_to_wire(value.descriptor())),
+        trace_parent,
+        trace_state,
     }
 }
 
@@ -59,7 +78,11 @@ pub fn register_executor_request_from_wire(
 ) -> WireResult<RegisterExecutorRequest> {
     let version = transport_version_from_wire(required(value.version, "version")?)?;
     let descriptor = executor_descriptor_from_wire(required(value.descriptor, "descriptor")?)?;
-    Ok(RegisterExecutorRequest::new(descriptor).with_version(version))
+    let mut req = RegisterExecutorRequest::new(descriptor).with_version(version);
+    if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
+        req = req.with_trace_context(ctx);
+    }
+    Ok(req)
 }
 
 /// Convert a domain registration response to protobuf.
@@ -156,6 +179,7 @@ pub fn deregister_executor_response_from_wire(
 pub fn executor_heartbeat_request_to_wire(
     value: ExecutorHeartbeatRequest,
 ) -> v1::ExecutorHeartbeatRequest {
+    let (trace_parent, trace_state) = trace_context_to_wire(value.trace_context());
     v1::ExecutorHeartbeatRequest {
         version: Some(transport_version_to_wire(value.version())),
         executor_id: value.executor_id().as_str().to_owned(),
@@ -192,6 +216,8 @@ pub fn executor_heartbeat_request_to_wire(
             .iter()
             .map(streaming_task_state_to_wire)
             .collect(),
+        trace_parent,
+        trace_state,
     }
 }
 
@@ -269,6 +295,9 @@ pub fn executor_heartbeat_request_from_wire(
             .collect::<WireResult<Vec<_>>>()?;
         req = req.with_streaming_task_states(states);
     }
+    if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
+        req = req.with_trace_context(ctx);
+    }
 
     Ok(req)
 }
@@ -277,6 +306,7 @@ pub fn executor_heartbeat_request_from_wire(
 pub fn executor_heartbeat_response_to_wire(
     value: ExecutorHeartbeatResponse,
 ) -> v1::ExecutorHeartbeatResponse {
+    let (trace_parent, trace_state) = trace_context_to_wire(value.trace_context());
     v1::ExecutorHeartbeatResponse {
         version: Some(transport_version_to_wire(value.version())),
         lease_generation: value.lease_generation().as_u64(),
@@ -301,6 +331,8 @@ pub fn executor_heartbeat_response_to_wire(
             .iter()
             .map(heartbeat_throttle_command_to_wire)
             .collect(),
+        trace_parent,
+        trace_state,
     }
 }
 
@@ -353,6 +385,9 @@ pub fn executor_heartbeat_response_from_wire(
             })
             .collect::<WireResult<Vec<_>>>()?;
         response = response.with_checkpoint_commands(cmds);
+    }
+    if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
+        response = response.with_trace_context(ctx);
     }
     Ok(response)
 }
@@ -503,6 +538,7 @@ fn heartbeat_throttle_command_from_wire(
 pub fn executor_task_assignment_to_wire(
     value: ExecutorTaskAssignment,
 ) -> WireResult<v1::ExecutorTaskAssignment> {
+    let (trace_parent, trace_state) = trace_context_to_wire(value.trace_context());
     Ok(v1::ExecutorTaskAssignment {
         version: Some(transport_version_to_wire(value.version())),
         job_id: value.job_id().as_str().to_owned(),
@@ -526,6 +562,9 @@ pub fn executor_task_assignment_to_wire(
         memory_limit_bytes: value.memory_limit_bytes().unwrap_or(0),
         shuffle_write: value.shuffle_write().map(shuffle_write_config_to_wire),
         shuffle_read: value.shuffle_read().map(shuffle_read_config_to_wire),
+        requires_reattach: value.requires_reattach(),
+        trace_parent,
+        trace_state,
     })
 }
 
@@ -582,11 +621,18 @@ pub fn executor_task_assignment_from_wire(
     if let Some(sr) = value.shuffle_read {
         assignment = assignment.with_shuffle_read(shuffle_read_config_from_wire(sr)?);
     }
+    if value.requires_reattach {
+        assignment = assignment.with_requires_reattach(true);
+    }
+    if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
+        assignment = assignment.with_trace_context(ctx);
+    }
     Ok(assignment)
 }
 
 /// Convert a domain task status request to protobuf.
 pub fn task_status_request_to_wire(value: TaskStatusRequest) -> v1::TaskStatusRequest {
+    let (trace_parent, trace_state) = trace_context_to_wire(value.trace_context());
     v1::TaskStatusRequest {
         version: Some(transport_version_to_wire(value.version())),
         job_id: value.job_id().as_str().to_owned(),
@@ -598,6 +644,8 @@ pub fn task_status_request_to_wire(value: TaskStatusRequest) -> v1::TaskStatusRe
         state: task_state_to_wire(value.state()) as i32,
         message: value.message().unwrap_or_default().to_owned(),
         output_metadata: value.output_metadata().map(task_output_metadata_to_wire),
+        trace_parent,
+        trace_state,
     }
 }
 
@@ -623,6 +671,9 @@ pub fn task_status_request_from_wire(
     }
     if let Some(output_metadata) = value.output_metadata {
         request = request.with_output_metadata(task_output_metadata_from_wire(output_metadata)?);
+    }
+    if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
+        request = request.with_trace_context(ctx);
     }
     Ok(request)
 }
@@ -661,10 +712,13 @@ pub fn task_cancellation_request_from_wire(
 
 /// Convert a domain task status response to protobuf.
 pub fn task_status_response_to_wire(value: TaskStatusResponse) -> v1::TaskStatusResponse {
+    let (trace_parent, trace_state) = trace_context_to_wire(value.trace_context());
     v1::TaskStatusResponse {
         version: Some(transport_version_to_wire(value.version())),
         disposition: transport_disposition_to_wire(value.disposition()) as i32,
         message: value.message().unwrap_or_default().to_owned(),
+        trace_parent,
+        trace_state,
     }
 }
 
@@ -677,6 +731,9 @@ pub fn task_status_response_from_wire(
     let mut response = TaskStatusResponse::new(disposition).with_version(version);
     if !value.message.is_empty() {
         response = response.with_message(value.message);
+    }
+    if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
+        response = response.with_trace_context(ctx);
     }
     Ok(response)
 }
@@ -718,6 +775,9 @@ fn task_output_metadata_to_wire(value: &TaskOutputMetadata) -> v1::TaskOutputMet
                 flight_endpoint: p.flight_endpoint.clone(),
             })
             .collect(),
+        watermark_ms: value.watermark_ms().unwrap_or(0),
+        has_watermark_ms: value.watermark_ms().is_some(),
+        has_runtime_stats: value.runtime_stats().is_some(),
     }
 }
 
@@ -733,6 +793,14 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
             .map(|p| ShufflePartitionOutput::new(p.partition_id, p.size_bytes, p.flight_endpoint))
             .collect()
     } else {
+        let ids_len = value.shuffle_partition_ids.len();
+        let bytes_len = value.shuffle_partition_bytes.len();
+        let endpoints_len = value.shuffle_flight_endpoints.len();
+        if (bytes_len > 0 && bytes_len != ids_len) || (endpoints_len > 0 && endpoints_len != ids_len) {
+            return Err(WireError::new(format!(
+                "mismatched deprecated shuffle arrays: ids={ids_len} bytes={bytes_len} endpoints={endpoints_len}"
+            )));
+        }
         value
             .shuffle_partition_ids
             .into_iter()
@@ -753,7 +821,9 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
     if !value.inline_record_batch_ipc.is_empty() {
         meta = meta.with_inline_record_batch_ipc(value.inline_record_batch_ipc);
     }
-    let has_stats = value.input_rows > 0
+    // Use has_runtime_stats flag (field 17) when set; fall back to non-zero check for older messages.
+    let has_stats = value.has_runtime_stats
+        || value.input_rows > 0
         || value.output_rows > 0
         || value.cpu_nanos > 0
         || value.spill_bytes > 0
@@ -766,6 +836,9 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
             memory_bytes: value.memory_bytes,
             spill_bytes: value.spill_bytes,
         });
+    }
+    if value.has_watermark_ms {
+        meta = meta.with_watermark_ms(value.watermark_ms);
     }
     Ok(meta)
 }
@@ -1088,6 +1161,7 @@ fn input_partition_descriptor_from_wire(
 fn plan_fragment_to_wire(value: &PlanFragment) -> v1::PlanFragment {
     v1::PlanFragment {
         description: value.description().to_owned(),
+        is_streaming: value.is_streaming(),
     }
 }
 
@@ -1095,7 +1169,7 @@ fn plan_fragment_from_wire(value: v1::PlanFragment) -> WireResult<PlanFragment> 
     if value.description.trim().is_empty() {
         return Err(WireError::new("plan fragment description cannot be empty"));
     }
-    Ok(PlanFragment::new(value.description))
+    Ok(PlanFragment::new(value.description).with_streaming(value.is_streaming))
 }
 
 fn output_contract_to_wire(value: &OutputContract) -> v1::OutputContract {

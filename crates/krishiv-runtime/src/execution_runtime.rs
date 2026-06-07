@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_plan::{ExecutionKind, PhysicalPlan};
+use krishiv_plan::PhysicalPlan;
 
 use crate::in_process::BatchSqlTable;
 use crate::in_process_cluster::InProcessCluster;
@@ -276,13 +276,13 @@ impl RemoteExecutionRuntime {
         session_mode: RuntimeMode,
         coordinator_grpc_url: Option<String>,
         placement: ExecutionPlacement,
-    ) -> Self {
-        Self {
-            pool: crate::flight_client::FlightClientPool::new(flight_url),
+    ) -> crate::RuntimeResult<Self> {
+        Ok(Self {
+            pool: crate::flight_client::FlightClientPool::new(flight_url)?,
             coordinator_grpc_url,
             session_mode,
             placement,
-        }
+        })
     }
 
     /// Start background health checks for the Flight client pool.
@@ -412,13 +412,30 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         tables: &[BatchTableRegistration],
         is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>> {
+        use crate::flight_action::{BatchSqlBody, KrishivFlightAction};
+        use crate::flight_client::decode_ipc_response;
         use crate::flight_protocol::encode_batch_sql;
         use krishiv_common::async_util::block_on;
-        let mut sql = encode_batch_sql(query, &tables_to_batch_sql(tables));
-        if is_streaming {
-            sql = format!("-- krishiv:streaming=true\n{sql}");
+        let action = KrishivFlightAction::BatchSql(BatchSqlBody {
+            query: query.to_owned(),
+            tables: tables_to_batch_sql(tables),
+            is_streaming,
+        });
+        let result = block_on(self.pool.do_action(&action));
+        match result {
+            Ok(body) => decode_ipc_response(&body),
+            Err(ref e) if is_server_unimplemented(e) => {
+                if !allow_remote_sql_comment_fallback() {
+                    return Err(e.clone());
+                }
+                let mut sql = encode_batch_sql(query, &tables_to_batch_sql(tables));
+                if is_streaming {
+                    sql = format!("-- krishiv:streaming=true\n{sql}");
+                }
+                block_on(self.pool.execute_sql(&sql))
+            }
+            Err(e) => Err(e),
         }
-        block_on(self.pool.execute_sql(&sql))
     }
 
     fn explain_sql(&self, query: &str) -> RuntimeResult<String> {
@@ -552,7 +569,7 @@ pub fn build_execution_runtime(
                 RuntimeMode::SingleNode,
                 coordinator_grpc_url,
                 ExecutionPlacement::SingleNodeDaemon,
-            )))
+            )?))
         }
         (RuntimeMode::Distributed, ExecutionPlacement::RemoteClusterRequired) => {
             let url = coordinator_flight_url.ok_or_else(|| {
@@ -565,7 +582,7 @@ pub fn build_execution_runtime(
                 RuntimeMode::Distributed,
                 coordinator_grpc_url,
                 ExecutionPlacement::RemoteClusterRequired,
-            )))
+            )?))
         }
         (RuntimeMode::Embedded, _) => Err(RuntimeError::unsupported(
             "Embedded mode only supports LocalInProcess placement",
@@ -581,10 +598,6 @@ pub fn build_execution_runtime(
     }
 }
 
-/// Classify a plan for routing without executing it.
-pub fn plan_execution_kind(plan: &PhysicalPlan) -> ExecutionKind {
-    plan.kind()
-}
 
 #[cfg(test)]
 mod tests {
@@ -1075,13 +1088,13 @@ mod tests {
     #[test]
     fn plan_execution_kind_batch() {
         let plan = PhysicalPlan::new("test", ExecutionKind::Batch);
-        assert_eq!(super::plan_execution_kind(&plan), ExecutionKind::Batch);
+        assert_eq!(plan.kind(), ExecutionKind::Batch);
     }
 
     #[test]
     fn plan_execution_kind_streaming() {
         let plan = PhysicalPlan::new("test", ExecutionKind::Streaming);
-        assert_eq!(super::plan_execution_kind(&plan), ExecutionKind::Streaming);
+        assert_eq!(plan.kind(), ExecutionKind::Streaming);
     }
 
     #[test]
@@ -1230,29 +1243,49 @@ mod tests {
         assert_eq!(report.backend(), "single-node");
     }
 
-    // ── G1: is_streaming flag encoding in remote collect_batch_sql ────────────
+    // ── G1: typed BatchSql action carries is_streaming flag ──────────────────
 
     #[test]
-    fn remote_collect_batch_sql_streaming_flag_prefixes_comment() {
-        // Documents that is_streaming=true is encoded as a first-line SQL comment
-        // so the remote Flight handler can detect streaming intent without a
-        // separate gRPC field.  The constant format must not change without
-        // updating the server-side parser.
-        let query = "SELECT * FROM events";
-        let streaming_sql = format!("-- krishiv:streaming=true\n{query}");
-        assert!(
-            streaming_sql.starts_with("-- krishiv:streaming=true\n"),
-            "streaming flag must be the first line of the encoded SQL"
-        );
-        assert!(
-            streaming_sql.contains(query),
-            "original query must be preserved after the streaming comment"
-        );
-        // Verify the non-streaming path does not add the prefix.
-        let batch_sql = query.to_string();
-        assert!(
-            !batch_sql.starts_with("-- krishiv:streaming=true"),
-            "batch SQL must not carry the streaming comment prefix"
-        );
+    fn remote_collect_batch_sql_uses_typed_action() {
+        use crate::flight_action::{BatchSqlBody, KrishivFlightAction};
+        // Verify the typed action correctly carries is_streaming.
+        let body = BatchSqlBody {
+            query: "SELECT * FROM events".to_owned(),
+            tables: vec![],
+            is_streaming: true,
+        };
+        let action = KrishivFlightAction::BatchSql(body);
+        assert_eq!(action.action_type(), "krishiv.v1.batch_sql");
+        match &action {
+            KrishivFlightAction::BatchSql(b) => {
+                assert!(b.is_streaming);
+                assert_eq!(b.query, "SELECT * FROM events");
+            }
+            other => panic!("expected BatchSql, got {other:?}"),
+        }
+        // Verify batch (non-streaming) action.
+        let batch_body = BatchSqlBody {
+            query: "SELECT 1".to_owned(),
+            tables: vec![],
+            is_streaming: false,
+        };
+        let batch_action = KrishivFlightAction::BatchSql(batch_body);
+        match &batch_action {
+            KrishivFlightAction::BatchSql(b) => assert!(!b.is_streaming),
+            other => panic!("expected BatchSql, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_sql_action_round_trips() {
+        use crate::flight_action::{BatchSqlBody, KrishivFlightAction};
+        let action = KrishivFlightAction::BatchSql(BatchSqlBody {
+            query: "SELECT id FROM t".to_owned(),
+            tables: vec![],
+            is_streaming: true,
+        });
+        let bytes = action.to_action_body().expect("encode");
+        let decoded = KrishivFlightAction::from_action_body(&bytes).expect("decode");
+        assert_eq!(action, decoded);
     }
 }

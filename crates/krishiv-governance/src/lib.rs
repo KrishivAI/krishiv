@@ -518,14 +518,12 @@ pub struct HttpEmitter {
 
 impl HttpEmitter {
     /// **Beta API**: Create an [`HttpEmitter`] that sends events to the given endpoint URL.
-    pub fn new(endpoint: impl Into<String>) -> Self {
-        Self {
-            endpoint: endpoint.into(),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("reqwest client builder failed; this indicates a TLS backend init error"),
-        }
+    pub fn new(endpoint: impl Into<String>) -> Result<Self, EmitError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| EmitError::Transport(format!("reqwest client init failed: {e}")))?;
+        Ok(Self { endpoint: endpoint.into(), client })
     }
 }
 
@@ -563,13 +561,13 @@ pub struct AsyncHttpEmitter {
 impl AsyncHttpEmitter {
     /// **Beta API**: Create a new [`AsyncHttpEmitter`] pointing at the endpoint URL
     /// with a bounded capacity (e.g. 1024 events) and spawn its delivery worker task.
-    pub fn new(endpoint: impl Into<String>, capacity: usize) -> Self {
+    pub fn new(endpoint: impl Into<String>, capacity: usize) -> Result<Self, EmitError> {
         let endpoint_str = endpoint.into();
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<RunEvent>(capacity);
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .expect("reqwest client");
+            .map_err(|e| EmitError::Transport(format!("reqwest client init failed: {e}")))?;
 
         tokio::spawn(async move {
             while let Some(event) = receiver.recv().await {
@@ -597,7 +595,7 @@ impl AsyncHttpEmitter {
             }
         });
 
-        Self { sender }
+        Ok(Self { sender })
     }
 }
 
@@ -888,7 +886,7 @@ mod tests {
             .create_async()
             .await;
 
-        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url())).expect("emitter");
         let event = sample_run_event();
         let result = emitter.emit(event).await;
         assert!(result.is_err(), "400 must be an error");
@@ -909,7 +907,7 @@ mod tests {
             .create_async()
             .await;
 
-        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url())).expect("emitter");
         let event = sample_run_event();
         let result = emitter.emit(event).await;
         assert!(result.is_err(), "429 must be an error");
@@ -930,7 +928,7 @@ mod tests {
             .create_async()
             .await;
 
-        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url())).expect("emitter");
         let event = sample_run_event();
         let result = emitter.emit(event).await;
         assert!(result.is_err(), "500 must be an error");
@@ -950,7 +948,7 @@ mod tests {
             .create_async()
             .await;
 
-        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url())).expect("emitter");
         let event = sample_run_event();
         assert!(emitter.emit(event).await.is_ok(), "200 must succeed");
     }
@@ -964,7 +962,7 @@ mod tests {
             .create_async()
             .await;
 
-        let emitter = AsyncHttpEmitter::new(format!("{}/lineage", server.url()), 10);
+        let emitter = AsyncHttpEmitter::new(format!("{}/lineage", server.url()), 10).expect("emitter");
         let event = sample_run_event();
         assert!(emitter.emit(event).await.is_ok(), "Async emit must succeed");
 

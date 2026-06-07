@@ -367,7 +367,10 @@ impl BroadcastJoin {
     }
 
     /// Build from the broadcast (smaller) side.
-    pub fn build(self, broadcast_batch: &RecordBatch) -> ExecResult<BuiltBroadcastJoin> {
+    ///
+    /// The batch is stored behind an `Arc` so multiple probes share the same
+    /// backing allocation without per-probe copies.
+    pub fn build(self, broadcast_batch: Arc<RecordBatch>) -> ExecResult<BuiltBroadcastJoin> {
         let key_idx = broadcast_batch
             .schema()
             .index_of(&self.join_key)
@@ -375,13 +378,13 @@ impl BroadcastJoin {
 
         let mut index: HashMap<AggKey, Vec<u32>> = HashMap::new();
         for row in 0..broadcast_batch.num_rows() {
-            let key = extract_agg_key(broadcast_batch, key_idx, row)?;
+            let key = extract_agg_key(&broadcast_batch, key_idx, row)?;
             index.entry(key).or_default().push(row as u32);
         }
 
         Ok(BuiltBroadcastJoin {
             join_key: self.join_key,
-            broadcast: broadcast_batch.clone(),
+            broadcast: broadcast_batch,
             index,
         })
     }
@@ -390,7 +393,7 @@ impl BroadcastJoin {
 /// A pre-built broadcast join table ready to probe.
 pub struct BuiltBroadcastJoin {
     join_key: String,
-    broadcast: RecordBatch,
+    broadcast: Arc<RecordBatch>,
     /// Pre-built hash map: typed key → broadcast (right) row indices.
     index: HashMap<AggKey, Vec<u32>>,
 }

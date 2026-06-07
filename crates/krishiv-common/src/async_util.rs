@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::future::Future;
 use std::sync::OnceLock;
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
@@ -47,7 +45,14 @@ pub fn block_on<T, F: Future<Output = T>>(fut: F) -> T {
 pub fn unix_now_ms_checked() -> Result<i64, SystemTimeError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .map(|d| {
+            i64::try_from(d.as_millis()).unwrap_or_else(|_| {
+                tracing::warn!(
+                    "unix_now_ms_checked: timestamp exceeds i64::MAX milliseconds; clamping"
+                );
+                i64::MAX
+            })
+        })
 }
 
 pub fn unix_now_ms() -> i64 {

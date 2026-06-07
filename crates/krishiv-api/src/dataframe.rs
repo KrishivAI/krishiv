@@ -73,8 +73,7 @@ pub struct DataFrame {
     mode: ExecutionMode,
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
-    #[allow(dead_code)]
-    coordinator_url: Option<String>,
+    _coordinator_url: Option<String>,
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
     /// When true, always collect from the local DataFusion plan even in remote
@@ -109,7 +108,7 @@ impl DataFrame {
             mode: ExecutionMode::Embedded,
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
-            coordinator_url: None,
+            _coordinator_url: None,
             runtime: crate::session::shared_embedded_runtime(),
             registered_parquet: Arc::new(DashMap::new()),
             force_local: false,
@@ -142,7 +141,7 @@ impl DataFrame {
             mode,
             jobs,
             next_job_id,
-            coordinator_url,
+            _coordinator_url: coordinator_url,
             runtime,
             registered_parquet,
             force_local: false,
@@ -169,7 +168,7 @@ impl DataFrame {
             mode,
             jobs,
             next_job_id,
-            coordinator_url: None,
+            _coordinator_url: None,
             runtime,
             registered_parquet,
             force_local: false,
@@ -376,10 +375,11 @@ impl DataFrame {
     }
 
     fn start_job(&self, name: &str) -> JobId {
-        let id = JobId::new(format!(
+        let id = JobId::try_new(format!(
             "local-{}",
             self.next_job_id.fetch_add(1, Ordering::SeqCst)
-        ));
+        ))
+        .expect("job id is always non-empty");
         self.update_job(&id, name, JobState::Pending);
         id
     }

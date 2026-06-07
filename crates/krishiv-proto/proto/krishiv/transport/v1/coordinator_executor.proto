@@ -42,6 +42,9 @@ message ExecutorDescriptor {
 message RegisterExecutorRequest {
   TransportVersion version = 1;
   ExecutorDescriptor descriptor = 2;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 3;
+  string trace_state = 4;
 }
 
 message RegisterExecutorResponse {
@@ -124,6 +127,9 @@ message ExecutorHeartbeatRequest {
   repeated HeartbeatHotKeyReport hot_key_reports = 14;
   // Re-attach protocol: per-task streaming state for coordinator-restart recovery.
   repeated StreamingTaskStateWire streaming_task_states = 15;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 16;
+  string trace_state = 17;
 }
 
 message InitiateCheckpointCommand {
@@ -142,6 +148,9 @@ message ExecutorHeartbeatResponse {
   repeated InitiateCheckpointCommand initiate_checkpoints = 6;
   // R7.2: per-source backpressure credit directives from the adaptive governor.
   repeated HeartbeatThrottleCommand source_throttles = 7;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 8;
+  string trace_state = 9;
 }
 
 message ShuffleWriteConfigWire {
@@ -177,6 +186,11 @@ message ExecutorTaskAssignment {
   // R4a: shuffle write/read configuration (omitted for non-shuffle tasks).
   ShuffleWriteConfigWire shuffle_write = 17;
   ShuffleReadConfigWire shuffle_read = 18;
+  // Explicit re-attach signal: true for continuous streaming tasks.
+  bool requires_reattach = 19;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 20;
+  string trace_state = 21;
 }
 
 message InputPartition {
@@ -213,6 +227,10 @@ message MemoryKafkaRecord {
 
 message PlanFragment {
   string description = 1;
+  // Explicit execution model — true for streaming (continuous) tasks, false for
+  // batch (terminal) tasks. When absent (false), the executor falls back to
+  // description-based detection for backward compatibility.
+  bool is_streaming = 2;
 }
 
 message OutputContract {
@@ -240,6 +258,9 @@ message TaskStatusRequest {
   TaskState state = 8;
   string message = 9;
   TaskOutputMetadata output_metadata = 10;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 11;
+  string trace_state = 12;
 }
 
 // Structured shuffle partition output (replaces the parallel shuffle_partition_*
@@ -271,6 +292,12 @@ message TaskOutputMetadata {
   uint64 memory_bytes = 13;
   // Structured shuffle partition outputs (preferred over fields 5-7).
   repeated ShufflePartitionOutputWire shuffle_partitions = 14;
+  // Maximum event-time watermark (ms) emitted by streaming window tasks.
+  int64 watermark_ms = 15;
+  // True when watermark_ms carries a valid value (distinguishes 0 from absent).
+  bool has_watermark_ms = 16;
+  // True when runtime stats are present (allows zero-output tasks to carry stats).
+  bool has_runtime_stats = 17;
 }
 
 message TaskCancellationRequest {
@@ -286,6 +313,9 @@ message TaskStatusResponse {
   TransportVersion version = 1;
   TransportDisposition disposition = 2;
   string message = 3;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 4;
+  string trace_state = 5;
 }
 
 enum ExecutorState {

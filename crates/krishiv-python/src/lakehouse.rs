@@ -115,14 +115,13 @@ pub fn schema_registry_confluent(url: String, format: &str) -> PyResult<PySchema
     };
     let config = krishiv_schema_registry::SchemaRegistryConfig::new(url, fmt)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    Ok(PySchemaRegistryConfig { inner: config })
+    Ok(PySchemaRegistryConfig { _inner: config })
 }
 
 #[pyclass(name = "SchemaRegistryConfig")]
 #[doc = "**Alpha**: The config struct is accepted but not yet consumed by any source or sink in the Python API. Schema fetching is deferred."]
 pub struct PySchemaRegistryConfig {
-    #[allow(dead_code)]
-    pub(crate) inner: krishiv_schema_registry::SchemaRegistryConfig,
+    pub(crate) _inner: krishiv_schema_registry::SchemaRegistryConfig,
 }
 
 use krishiv_catalog::iceberg_rest::{

@@ -52,23 +52,21 @@ enum RelationKind {
 #[pyclass(name = "DataFrame", unsendable)]
 pub struct PyRelation {
     kind: RelationKind,
-    /// Cached collected result (used for repeated calls like `show` after `collect`).
-    #[allow(dead_code)]
-    cached: Mutex<Option<PyQueryResult>>,
+    _cached: Mutex<Option<PyQueryResult>>,
 }
 
 impl PyRelation {
     pub fn from_dataframe(df: krishiv_api::DataFrame) -> Self {
         Self {
             kind: RelationKind::Batch(df),
-            cached: Mutex::new(None),
+            _cached: Mutex::new(None),
         }
     }
 
     pub fn from_pipeline(pipeline: StreamPipeline) -> Self {
         Self {
             kind: RelationKind::Stream(pipeline),
-            cached: Mutex::new(None),
+            _cached: Mutex::new(None),
         }
     }
 

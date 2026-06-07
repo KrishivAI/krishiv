@@ -103,7 +103,6 @@ fn make_hop_end() -> datafusion::logical_expr::ScalarUDF {
 
 /// Extract an i64 value from a `ColumnarValue` argument (scalar or array).
 /// Returns `None` for SQL NULL.
-#[allow(dead_code)]
 fn extract_scalar_i64(cv: &ColumnarValue) -> Result<Option<i64>, DataFusionError> {
     use datafusion::scalar::ScalarValue;
     match cv {

@@ -3,6 +3,8 @@
 //! Set `KRISHIV_PRODUCTION=1` to enable fail-closed behavior for metadata writes,
 //! anonymous HTTP/Flight surfaces, simulation connectors, and legacy task fragments.
 
+use std::sync::OnceLock;
+
 use crate::durability::DurabilityProfile;
 
 /// When set to `1`, `true`, or `yes`, enables production fail-closed defaults.
@@ -37,8 +39,12 @@ pub fn resolve_durability_profile() -> DurabilityProfile {
 }
 
 /// Returns whether the process is running in production mode.
+///
+/// Cached on first call via `OnceLock` so the env var is read exactly once per
+/// process lifetime, guaranteeing a consistent value across all callers.
 pub fn is_production_mode() -> bool {
-    truthy_env(PRODUCTION_ENV)
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| truthy_env(PRODUCTION_ENV))
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -93,8 +99,23 @@ pub fn requires_http_auth(profile: DurabilityProfile) -> bool {
 }
 
 /// Whether anonymous HTTP is explicitly allowed via env override.
+///
+/// Logs a warning at first call when the override is active in production mode,
+/// since this bypasses HTTP authentication for control-plane routes.
+/// Cached on first call via `OnceLock`.
 pub fn allow_anonymous_http_override() -> bool {
-    truthy_env(ALLOW_ANONYMOUS_HTTP_ENV)
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let enabled = truthy_env(ALLOW_ANONYMOUS_HTTP_ENV);
+        if enabled && is_production_mode() {
+            tracing::warn!(
+                env = ALLOW_ANONYMOUS_HTTP_ENV,
+                "anonymous HTTP override is active in production mode; \
+                 control-plane routes are unauthenticated"
+            );
+        }
+        enabled
+    })
 }
 
 /// Kafka SQL streaming should disable auto-commit when this returns true.
@@ -158,7 +179,8 @@ impl NativeScalarUdfPolicy {
 }
 
 fn allows_full_privilege_udfs() -> bool {
-    truthy_env(ALLOW_FULL_PRIVILEGE_UDFS_ENV)
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| truthy_env(ALLOW_FULL_PRIVILEGE_UDFS_ENV))
 }
 
 /// Native scalar UDF execution is forbidden under durable profiles unless opted in.

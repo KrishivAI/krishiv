@@ -6,6 +6,8 @@ use arrow::record_batch::RecordBatch;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::error::ConnectorError;
+
 /// A CDC operation type from Debezium.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,13 +219,13 @@ pub trait CdcEventSource: Send {
     ///
     /// Returns an empty `Vec` when the source is exhausted (signals pipeline
     /// shutdown). Returns `Err` on unrecoverable source failures.
-    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String>;
+    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, ConnectorError>;
 
     /// Poll records with source offset identity.
     ///
     /// Sources that can expose real Kafka offsets should override this method.
     /// The default preserves legacy in-memory behavior with synthetic offsets.
-    fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, String> {
+    fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, ConnectorError> {
         Ok(self
             .poll_events(max)?
             .into_iter()
@@ -242,7 +244,7 @@ pub trait CdcEventSource: Send {
     /// Default implementation is a no-op (stateless / in-memory sources).
     /// Kafka-backed sources must override this to flush consumer offsets only
     /// after the batch has been durably committed downstream (P1-14).
-    fn commit_offsets(&mut self) -> Result<(), String> {
+    fn commit_offsets(&mut self) -> Result<(), ConnectorError> {
         Ok(())
     }
 }
@@ -265,7 +267,7 @@ impl InMemoryCdcEventSource {
 }
 
 impl CdcEventSource for InMemoryCdcEventSource {
-    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, ConnectorError> {
         let n = max.min(self.events.len());
         Ok(self.events.drain(..n).collect())
     }
@@ -358,9 +360,9 @@ impl CdcToLakehousePipeline {
     }
 
     /// Validate the pipeline configuration. Returns an error if required fields are missing.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ConnectorError> {
         if self.source_topic.trim().is_empty() {
-            return Err("source_topic must not be empty".into());
+            return Err(ConnectorError::Cdc("source_topic must not be empty".into()));
         }
         if self.kafka_brokers.is_empty()
             || self
@@ -368,13 +370,15 @@ impl CdcToLakehousePipeline {
                 .iter()
                 .any(|broker| broker.trim().is_empty())
         {
-            return Err("kafka_brokers must contain only non-blank addresses".into());
+            return Err(ConnectorError::Cdc(
+                "kafka_brokers must contain only non-blank addresses".into(),
+            ));
         }
         if self.iceberg_catalog.trim().is_empty() {
-            return Err("iceberg_catalog must not be empty".into());
+            return Err(ConnectorError::Cdc("iceberg_catalog must not be empty".into()));
         }
         if self.iceberg_table.trim().is_empty() {
-            return Err("iceberg_table must not be empty".into());
+            return Err(ConnectorError::Cdc("iceberg_table must not be empty".into()));
         }
         if self.primary_key_columns.is_empty()
             || self
@@ -382,7 +386,9 @@ impl CdcToLakehousePipeline {
                 .iter()
                 .any(|column| column.trim().is_empty())
         {
-            return Err("primary_key_columns must not be empty for upsert semantics".into());
+            return Err(ConnectorError::Cdc(
+                "primary_key_columns must not be empty for upsert semantics".into(),
+            ));
         }
         let unique_primary_keys = self
             .primary_key_columns
@@ -390,24 +396,26 @@ impl CdcToLakehousePipeline {
             .map(|column| column.trim())
             .collect::<std::collections::HashSet<_>>();
         if unique_primary_keys.len() != self.primary_key_columns.len() {
-            return Err("primary_key_columns must not contain duplicates".into());
+            return Err(ConnectorError::Cdc(
+                "primary_key_columns must not contain duplicates".into(),
+            ));
         }
         if self.batch_size == 0 {
-            return Err("batch_size must be greater than zero".into());
+            return Err(ConnectorError::Cdc("batch_size must be greater than zero".into()));
         }
         if self
             .schema_registry_url
             .as_deref()
             .is_some_and(|url| url.trim().is_empty())
         {
-            return Err("schema_registry_url must not be blank".into());
+            return Err(ConnectorError::Cdc("schema_registry_url must not be blank".into()));
         }
         #[cfg(not(feature = "schema-registry"))]
         if self.schema_registry_url.is_some() {
-            return Err(
+            return Err(ConnectorError::Cdc(
                 "schema_registry_url requires the krishiv-connectors schema-registry feature"
                     .into(),
-            );
+            ));
         }
         Ok(())
     }
@@ -424,10 +432,10 @@ impl CdcToLakehousePipeline {
         mut source: S,
         mut on_batch: F,
         shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<(), String>
+    ) -> Result<(), ConnectorError>
     where
         S: CdcEventSource,
-        F: FnMut(RecordBatch) -> Result<(), String>,
+        F: FnMut(RecordBatch) -> Result<(), ConnectorError>,
     {
         self.validate()?;
         let mut schema_state = CdcSchemaEvolutionState::default();
@@ -441,7 +449,9 @@ impl CdcToLakehousePipeline {
             .as_deref()
             .map(krishiv_schema_registry::SchemaRegistryClient::new)
             .transpose()
-            .map_err(|error| format!("invalid schema-registry configuration: {error}"))?;
+            .map_err(|error| {
+                ConnectorError::Cdc(format!("invalid schema-registry configuration: {error}"))
+            })?;
         #[cfg(not(feature = "schema-registry"))]
         let _ = &self.schema_registry_url; // suppress unused warning
 
@@ -464,18 +474,18 @@ impl CdcToLakehousePipeline {
                 .filter(|record| record.raw_bytes.is_some())
                 .count();
             if binary_record_count != 0 && binary_record_count != raw.len() {
-                return Err(
+                return Err(ConnectorError::Cdc(
                     "CDC source returned a mixed batch of binary and plain-text records".into(),
-                );
+                ));
             }
 
             // Decode binary records using the explicitly configured registry
             // format; otherwise parse Debezium JSON envelopes.
             #[cfg(feature = "schema-registry")]
-            let batch_result: Result<RecordBatch, String> = {
+            let batch_result: Result<RecordBatch, ConnectorError> = {
                 if binary_record_count == raw.len() {
                     let client = registry_client.as_ref().ok_or_else(|| {
-                        "binary CDC records require schema_registry_url".to_string()
+                        ConnectorError::Cdc("binary CDC records require schema_registry_url".into())
                     })?;
                     let format = match self.schema_registry_format {
                         CdcSchemaRegistryFormat::Avro => {
@@ -488,49 +498,55 @@ impl CdcToLakehousePipeline {
                     let mut batches = Vec::with_capacity(raw.len());
                     for (i, record) in raw.iter().enumerate() {
                         let bytes = record.raw_bytes.as_deref().ok_or_else(|| {
-                            "CDC binary batch shape changed during decoding".to_string()
+                            ConnectorError::Cdc(
+                                "CDC binary batch shape changed during decoding".into(),
+                            )
                         })?;
                         let (_schema, decoded) = client
                             .decode_with_format(bytes, format)
                             .await
                             .map_err(|error| {
-                                format!("schema-registry decode error at index {i}: {error}")
+                                ConnectorError::Cdc(format!(
+                                    "schema-registry decode error at index {i}: {error}"
+                                ))
                             })?;
                         batches.extend(decoded);
                     }
                     if batches.is_empty() {
-                        return Err(
+                        return Err(ConnectorError::Cdc(
                             "schema-registry decoder produced no rows for a non-empty source batch"
                                 .into(),
-                        );
+                        ));
                     }
-                    concat_registry_batches(&batches)
+                    concat_registry_batches(&batches).map_err(ConnectorError::Cdc)
                 } else {
-                    let events = parse_debezium_records(&raw)?;
+                    let events = parse_debezium_records(&raw).map_err(ConnectorError::Cdc)?;
                     if events.is_empty() {
                         continue;
                     }
-                    build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))
+                    build_batch_from_events(&events)
+                        .map_err(|e| ConnectorError::Cdc(format!("batch error: {e}")))
                 }
             };
             #[cfg(not(feature = "schema-registry"))]
-            let batch_result: Result<RecordBatch, String> = {
+            let batch_result: Result<RecordBatch, ConnectorError> = {
                 if binary_record_count != 0 {
-                    return Err(
+                    return Err(ConnectorError::Cdc(
                         "binary CDC records require the krishiv-connectors schema-registry feature"
                             .into(),
-                    );
+                    ));
                 }
-                let events = parse_debezium_records(&raw)?;
+                let events = parse_debezium_records(&raw).map_err(ConnectorError::Cdc)?;
                 if events.is_empty() {
                     continue;
                 }
-                build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))
+                build_batch_from_events(&events)
+                    .map_err(|e| ConnectorError::Cdc(format!("batch error: {e}")))
             };
 
             let mut batch = batch_result?;
             if self.schema_evolution {
-                batch = schema_state.normalize(batch)?;
+                batch = schema_state.normalize(batch).map_err(ConnectorError::Cdc)?;
             }
             on_batch(batch)?;
             // P1-14: commit offsets only after the downstream sink write succeeds.
@@ -550,7 +566,7 @@ impl CdcToLakehousePipeline {
         source: S,
         iceberg: &I,
         shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<Vec<i64>, String>
+    ) -> Result<Vec<i64>, ConnectorError>
     where
         S: CdcEventSource,
         I: krishiv_lakehouse::IcebergTwoPhaseCommit,
@@ -569,7 +585,7 @@ impl CdcToLakehousePipeline {
         iceberg: &I,
         shutdown: tokio::sync::watch::Receiver<bool>,
         max_commits: usize,
-    ) -> Result<Vec<i64>, String>
+    ) -> Result<Vec<i64>, ConnectorError>
     where
         S: CdcEventSource,
         I: krishiv_lakehouse::IcebergTwoPhaseCommit,
@@ -584,7 +600,7 @@ impl CdcToLakehousePipeline {
         iceberg: &I,
         shutdown: tokio::sync::watch::Receiver<bool>,
         max_commits: Option<usize>,
-    ) -> Result<Vec<i64>, String>
+    ) -> Result<Vec<i64>, ConnectorError>
     where
         S: CdcEventSource,
         I: krishiv_lakehouse::IcebergTwoPhaseCommit,
@@ -607,10 +623,10 @@ impl CdcToLakehousePipeline {
                 }
             }
             if raw.iter().any(|record| record.raw_bytes.is_some()) {
-                return Err(
+                return Err(ConnectorError::Cdc(
                     "binary schema-registry records are not supported by the Iceberg CDC sink path"
                         .into(),
-                );
+                ));
             }
 
             let events = raw
@@ -622,28 +638,32 @@ impl CdcToLakehousePipeline {
                         record.partition_id,
                         record.offset,
                     )
-                    .map_err(|e| format!("Debezium parse error at batch index {i}: {e}"))
+                    .map_err(|e| {
+                        ConnectorError::Cdc(format!(
+                            "Debezium parse error at batch index {i}: {e}"
+                        ))
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if events.is_empty() {
                 continue;
             }
 
-            let mut batch =
-                build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))?;
+            let mut batch = build_batch_from_events(&events)
+                .map_err(|e| ConnectorError::Cdc(format!("batch error: {e}")))?;
             if self.schema_evolution {
-                batch = schema_state.normalize(batch)?;
+                batch = schema_state.normalize(batch).map_err(ConnectorError::Cdc)?;
             }
             let offsets = kafka_offsets_for_events(&events);
             let staged = iceberg
                 .prepare(vec![batch])
                 .await
-                .map_err(|e| format!("iceberg prepare failed: {e}"))?;
+                .map_err(|e| ConnectorError::Cdc(format!("iceberg prepare failed: {e}")))?;
             let snapshot_id = match iceberg.commit(staged.clone(), offsets).await {
                 Ok(snapshot_id) => snapshot_id,
                 Err(e) => {
                     let _ = iceberg.abort(staged).await;
-                    return Err(format!("iceberg commit failed: {e}"));
+                    return Err(ConnectorError::Cdc(format!("iceberg commit failed: {e}")));
                 }
             };
             source.commit_offsets()?;
@@ -662,9 +682,14 @@ impl CdcToLakehousePipeline {
     /// durable sink argument. Use [`run_live_kafka_with_iceberg_sink`] or
     /// [`run_with_source`] with a sink callback that durably commits the batch
     /// before returning.
-    pub async fn run(&self) -> Result<(), String> {
+    pub async fn run(&self) -> Result<(), ConnectorError> {
         self.validate()?;
-        Err("CdcToLakehousePipeline::run() is disabled because it cannot prove downstream durability; use run_live_kafka_with_iceberg_sink or run_with_source with a durable sink callback".to_string())
+        Err(ConnectorError::Cdc(
+            "CdcToLakehousePipeline::run() is disabled because it cannot prove downstream \
+             durability; use run_live_kafka_with_iceberg_sink or run_with_source with a durable \
+             sink callback"
+                .into(),
+        ))
     }
 
     /// Run CDC ingestion from live Kafka into an Iceberg two-phase sink.
@@ -676,7 +701,7 @@ impl CdcToLakehousePipeline {
         &self,
         iceberg: &I,
         shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<Vec<i64>, String>
+    ) -> Result<Vec<i64>, ConnectorError>
     where
         I: krishiv_lakehouse::IcebergTwoPhaseCommit,
     {
@@ -1055,17 +1080,17 @@ impl KafkaCdcConfig {
         self
     }
 
-    /// Validate the configuration.  Returns an error message if required
-    /// fields are missing or inconsistent.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Validate the configuration.  Returns an error if required fields are
+    /// missing or inconsistent.
+    pub fn validate(&self) -> Result<(), ConnectorError> {
         if self.bootstrap_servers.is_empty() {
-            return Err("bootstrap_servers must not be empty".into());
+            return Err(ConnectorError::Cdc("bootstrap_servers must not be empty".into()));
         }
         if self.group_id.is_empty() {
-            return Err("group_id must not be empty".into());
+            return Err(ConnectorError::Cdc("group_id must not be empty".into()));
         }
         if self.topic.is_empty() {
-            return Err("topic must not be empty".into());
+            return Err(ConnectorError::Cdc("topic must not be empty".into()));
         }
         // If any SASL field is set, all three must be set.
         let sasl_fields = [
@@ -1075,9 +1100,9 @@ impl KafkaCdcConfig {
         ];
         let sasl_count = sasl_fields.iter().filter(|&&v| v).count();
         if sasl_count != 0 && sasl_count != 3 {
-            return Err(
+            return Err(ConnectorError::Cdc(
                 "sasl_mechanism, sasl_username, and sasl_password must all be set together".into(),
-            );
+            ));
         }
         Ok(())
     }
@@ -1103,9 +1128,9 @@ impl RdkafkaCdcEventSource {
     /// Create a new source from a [`KafkaCdcConfig`].
     ///
     /// Validates the config, builds a `StreamConsumer`, and subscribes to the
-    /// configured topic.  Returns an error string if configuration or consumer
+    /// configured topic.  Returns `ConnectorError` if configuration or consumer
     /// creation fails.
-    pub fn new(config: &KafkaCdcConfig) -> Result<Self, String> {
+    pub fn new(config: &KafkaCdcConfig) -> Result<Self, ConnectorError> {
         use rdkafka::ClientConfig;
         use rdkafka::consumer::Consumer;
 
@@ -1132,11 +1157,11 @@ impl RdkafkaCdcEventSource {
 
         let consumer: rdkafka::consumer::StreamConsumer = client_config
             .create()
-            .map_err(|e| format!("rdkafka consumer creation failed: {e}"))?;
+            .map_err(|e| ConnectorError::Cdc(format!("rdkafka consumer creation failed: {e}")))?;
 
         consumer
             .subscribe(&[config.topic.as_str()])
-            .map_err(|e| format!("rdkafka subscribe failed: {e}"))?;
+            .map_err(|e| ConnectorError::Cdc(format!("rdkafka subscribe failed: {e}")))?;
 
         Ok(Self {
             consumer: std::sync::Arc::new(consumer),
@@ -1154,11 +1179,11 @@ impl RdkafkaCdcEventSource {
     /// Commit consumer group offsets for the currently assigned partitions.
     ///
     /// Called internally after a successful downstream sink commit.
-    fn commit_offsets_inner(&self) -> Result<(), String> {
+    fn commit_offsets_inner(&self) -> Result<(), ConnectorError> {
         use rdkafka::consumer::Consumer;
         self.consumer
             .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
-            .map_err(|e| format!("rdkafka offset commit failed: {e}"))
+            .map_err(|e| ConnectorError::Cdc(format!("rdkafka offset commit failed: {e}")))
     }
 }
 
@@ -1169,7 +1194,7 @@ impl CdcEventSource for RdkafkaCdcEventSource {
     /// Each call blocks for at most `poll_timeout_ms` per message.  Returns an
     /// empty `Vec` when no messages are available within the timeout window
     /// (the pipeline interprets this as a momentary idle, not shutdown).
-    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, ConnectorError> {
         Ok(self
             .poll_records(max)?
             .into_iter()
@@ -1178,7 +1203,7 @@ impl CdcEventSource for RdkafkaCdcEventSource {
     }
 
     /// Poll up to `max` Debezium records with real Kafka partition/offset metadata.
-    fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, String> {
+    fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, ConnectorError> {
         use rdkafka::Message;
 
         let mut events = Vec::with_capacity(max.min(64));
@@ -1198,17 +1223,17 @@ impl CdcEventSource for RdkafkaCdcEventSource {
                 // Timed out – no more messages available right now.
                 Err(_timeout) => break,
                 Ok(Err(e)) => {
-                    return Err(format!("rdkafka receive error: {e}"));
+                    return Err(ConnectorError::Cdc(format!("rdkafka receive error: {e}")));
                 }
                 Ok(Ok(msg)) => {
                     let payload = match msg.payload_view::<str>() {
                         Some(Ok(s)) => s.to_string(),
                         Some(Err(e)) => {
-                            return Err(format!(
+                            return Err(ConnectorError::Cdc(format!(
                                 "rdkafka payload is not valid UTF-8 at partition {} offset {}: {e}",
                                 msg.partition(),
                                 msg.offset()
-                            ));
+                            )));
                         }
                         None => {
                             tracing::warn!(
@@ -1220,7 +1245,10 @@ impl CdcEventSource for RdkafkaCdcEventSource {
                         }
                     };
                     let partition_id = u32::try_from(msg.partition()).map_err(|_| {
-                        format!("rdkafka returned invalid partition {}", msg.partition())
+                        ConnectorError::Cdc(format!(
+                            "rdkafka returned invalid partition {}",
+                            msg.partition()
+                        ))
                     })?;
                     events.push(RawCdcRecord::new(payload, partition_id, msg.offset()));
                 }
@@ -1234,7 +1262,7 @@ impl CdcEventSource for RdkafkaCdcEventSource {
         true
     }
 
-    fn commit_offsets(&mut self) -> Result<(), String> {
+    fn commit_offsets(&mut self) -> Result<(), ConnectorError> {
         self.commit_offsets_inner()
     }
 }
@@ -1285,13 +1313,13 @@ impl CdcOffsetTracker {
         }
     }
 
-    pub fn commit_offset(&mut self, partition: u32, offset: i64) -> Result<(), String> {
+    pub fn commit_offset(&mut self, partition: u32, offset: i64) -> Result<(), ConnectorError> {
         self.offsets.insert(partition, offset);
         let key = partition.to_le_bytes().to_vec();
         let value = offset.to_le_bytes().to_vec();
         self.backend
             .put(&self.ns, key, value)
-            .map_err(|e| format!("state backend error: {:?}", e))?;
+            .map_err(|e| ConnectorError::Cdc(format!("state backend error: {e:?}")))?;
         Ok(())
     }
 
@@ -1458,9 +1486,10 @@ mod tests {
             vec!["id".into()],
         )
         .with_batch_size(0);
-        assert_eq!(
-            zero_batch.validate().unwrap_err(),
-            "batch_size must be greater than zero"
+        let err = zero_batch.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("batch_size must be greater than zero"),
+            "unexpected error: {err}"
         );
 
         let duplicate_keys = CdcToLakehousePipeline::new(
@@ -1470,9 +1499,10 @@ mod tests {
             "warehouse.orders",
             vec!["id".into(), "id".into()],
         );
-        assert_eq!(
-            duplicate_keys.validate().unwrap_err(),
-            "primary_key_columns must not contain duplicates"
+        let err = duplicate_keys.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("primary_key_columns must not contain duplicates"),
+            "unexpected error: {err}"
         );
     }
 
@@ -1492,6 +1522,7 @@ mod tests {
             pipeline
                 .validate()
                 .unwrap_err()
+                .to_string()
                 .contains("schema-registry feature")
         );
     }
@@ -1504,11 +1535,11 @@ mod tests {
         }
 
         impl CdcEventSource for MixedSource {
-            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, String> {
+            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, ConnectorError> {
                 Ok(Vec::new())
             }
 
-            fn poll_records(&mut self, _max: usize) -> Result<Vec<RawCdcRecord>, String> {
+            fn poll_records(&mut self, _max: usize) -> Result<Vec<RawCdcRecord>, ConnectorError> {
                 Ok(self.records.take().unwrap_or_default())
             }
         }
@@ -1538,7 +1569,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.contains("mixed batch"));
+        assert!(error.to_string().contains("mixed batch"));
     }
 
     #[cfg(feature = "schema-registry")]
@@ -1549,11 +1580,11 @@ mod tests {
         }
 
         impl CdcEventSource for BinarySource {
-            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, String> {
+            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, ConnectorError> {
                 Ok(Vec::new())
             }
 
-            fn poll_records(&mut self, _max: usize) -> Result<Vec<RawCdcRecord>, String> {
+            fn poll_records(&mut self, _max: usize) -> Result<Vec<RawCdcRecord>, ConnectorError> {
                 Ok(self.records.take().unwrap_or_default())
             }
         }
@@ -1579,7 +1610,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.contains("require schema_registry_url"));
+        assert!(error.to_string().contains("require schema_registry_url"));
     }
 
     #[test]
@@ -1721,12 +1752,12 @@ mod tests {
         }
 
         impl CdcEventSource for CommitCountingSource {
-            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, ConnectorError> {
                 let n = max.min(self.events.len());
                 Ok(self.events.drain(..n).collect())
             }
 
-            fn commit_offsets(&mut self) -> Result<(), String> {
+            fn commit_offsets(&mut self) -> Result<(), ConnectorError> {
                 self.commits.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -1769,12 +1800,12 @@ mod tests {
         }
 
         impl CdcEventSource for CommitCountingSource {
-            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, ConnectorError> {
                 let n = max.min(self.events.len());
                 Ok(self.events.drain(..n).collect())
             }
 
-            fn commit_offsets(&mut self) -> Result<(), String> {
+            fn commit_offsets(&mut self) -> Result<(), ConnectorError> {
                 self.commits.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -1800,10 +1831,17 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let result = pipeline
-            .run_with_source(source, |_| Err("sink failed".to_string()), shutdown_rx)
+            .run_with_source(
+                source,
+                |_| Err(ConnectorError::Cdc("sink failed".into())),
+                shutdown_rx,
+            )
             .await;
 
-        assert_eq!(result.unwrap_err(), "sink failed");
+        assert!(
+            result.unwrap_err().to_string().contains("sink failed"),
+            "unexpected error"
+        );
         assert_eq!(commits.load(Ordering::SeqCst), 0);
     }
 
@@ -1876,12 +1914,12 @@ mod tests {
         }
 
         impl CdcEventSource for CommitTrackingSource {
-            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, ConnectorError> {
                 let n = max.min(self.events.len());
                 Ok(self.events.drain(..n).collect())
             }
 
-            fn commit_offsets(&mut self) -> Result<(), String> {
+            fn commit_offsets(&mut self) -> Result<(), ConnectorError> {
                 self.commits += 1;
                 Ok(())
             }
@@ -1941,7 +1979,7 @@ mod tests {
         }
 
         impl CdcEventSource for MetadataSource {
-            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, ConnectorError> {
                 Ok(self
                     .poll_records(max)?
                     .into_iter()
@@ -1949,7 +1987,7 @@ mod tests {
                     .collect())
             }
 
-            fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, String> {
+            fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, ConnectorError> {
                 let n = max.min(self.records.len());
                 Ok(self.records.drain(..n).collect())
             }
@@ -2001,7 +2039,7 @@ mod tests {
     async fn run_with_source_shutdown_stops_loop() {
         struct InfiniteSource;
         impl CdcEventSource for InfiniteSource {
-            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, String> {
+            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, ConnectorError> {
                 Ok(vec![])
             }
         }

@@ -30,8 +30,7 @@ use crate::{
 /// [`Source::read_batch`] iterate over the in-memory batch vector.
 pub struct S3Source {
     // Retained to keep the store alive and for future rewind/re-read operations.
-    #[allow(dead_code)]
-    store: Arc<dyn ObjectStore>,
+    _store: Arc<dyn ObjectStore>,
     path: Path,
     schema: Option<SchemaRef>,
     batches: Vec<RecordBatch>,
@@ -74,7 +73,7 @@ impl S3Source {
         }
 
         Ok(Self {
-            store,
+            _store: store,
             path,
             schema: Some(schema),
             batches,

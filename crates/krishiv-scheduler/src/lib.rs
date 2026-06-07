@@ -117,6 +117,3 @@ mod tests;
 
 pub(crate) use grpc::status_from_scheduler_error;
 
-// #[cfg(test)]
-// pub(crate) use krishiv_proto::{ExecutorDescriptor, ExecutorId};
-// (removed to resolve duplicate re-export during test profile build; tests qualify via krishiv_proto directly)

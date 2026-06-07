@@ -695,6 +695,21 @@ impl KrishivFlightSqlService {
                     .map_err(KrishivActionError::Status)?;
                 Ok(Vec::new())
             }
+            A::BatchSql(body) => {
+                let mut sql = krishiv_runtime::flight_protocol::encode_batch_sql(
+                    &body.query,
+                    &body.tables,
+                );
+                if body.is_streaming {
+                    sql = format!("-- krishiv:streaming=true\n{sql}");
+                }
+                let batches = self
+                    .host
+                    .execute_sql(&sql)
+                    .await
+                    .map_err(KrishivActionError::Status)?;
+                encode_batches_ipc(&batches)
+            }
         }
     }
 }

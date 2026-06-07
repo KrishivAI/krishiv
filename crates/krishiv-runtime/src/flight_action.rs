@@ -39,6 +39,7 @@ pub mod tags {
     pub const BOUNDED_WINDOW: &str = "bounded_window";
     pub const EXPLAIN: &str = "explain";
     pub const EXECUTE_PLAN: &str = "execute_plan";
+    pub const BATCH_SQL: &str = "batch_sql";
 }
 
 /// Build a stable action type for a tag — `format!("krishiv.v1.{tag}")`.
@@ -79,6 +80,15 @@ pub struct ContinuousDrainBody {
     pub job_id: String,
 }
 
+/// Request-only bounded-window action body (no response fields).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BoundedWindowRequest {
+    pub topic: String,
+    pub spec: WindowExecutionSpec,
+    pub batches_b64: String,
+}
+
+/// Full bounded-window body including optional server-populated response fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BoundedWindowBody {
     pub topic: String,
@@ -98,6 +108,17 @@ impl BoundedWindowBody {
             topic,
             spec,
             batches_b64,
+            response_watermark_ms: None,
+        }
+    }
+}
+
+impl From<BoundedWindowRequest> for BoundedWindowBody {
+    fn from(req: BoundedWindowRequest) -> Self {
+        Self {
+            topic: req.topic,
+            spec: req.spec,
+            batches_b64: req.batches_b64,
             response_watermark_ms: None,
         }
     }
@@ -151,6 +172,18 @@ impl ExecutePlanBody {
     }
 }
 
+/// Typed body for a batch-SQL `DoAction` request.
+///
+/// Carries the query, optional table registrations, and the streaming intent
+/// flag. This replaces the fragile `-- krishiv:streaming=true` SQL-comment
+/// protocol (H2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BatchSqlBody {
+    pub query: String,
+    pub tables: Vec<crate::in_process::BatchSqlTable>,
+    pub is_streaming: bool,
+}
+
 /// Typed Flight `DoAction` payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind")]
@@ -162,6 +195,7 @@ pub enum KrishivFlightAction {
     BoundedWindow(BoundedWindowBody),
     Explain(ExplainBody),
     ExecutePlan(ExecutePlanBody),
+    BatchSql(BatchSqlBody),
 }
 
 impl KrishivFlightAction {
@@ -175,6 +209,7 @@ impl KrishivFlightAction {
             Self::BoundedWindow(_) => tags::BOUNDED_WINDOW,
             Self::Explain(_) => tags::EXPLAIN,
             Self::ExecutePlan(_) => tags::EXECUTE_PLAN,
+            Self::BatchSql(_) => tags::BATCH_SQL,
         };
         action_type(tag)
     }

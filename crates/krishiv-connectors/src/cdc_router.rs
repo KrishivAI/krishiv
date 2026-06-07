@@ -80,7 +80,7 @@ impl CdcRouter {
         source: &mut S,
         max: usize,
     ) -> Result<usize, ConnectorError> {
-        let raw = source.poll_events(max).map_err(ConnectorError::Cdc)?;
+        let raw = source.poll_events(max)?;
         let mut routed = 0usize;
         let mut dropped = 0usize;
         for (i, json) in raw.iter().enumerate() {

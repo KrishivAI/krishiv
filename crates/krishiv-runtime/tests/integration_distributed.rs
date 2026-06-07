@@ -222,7 +222,7 @@ async fn cluster_bounded_window_collect() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flight_sql_server_submit_sql_verify() {
-    use krishiv_runtime::flight_client::execute_remote_sql;
+    use krishiv_runtime::flight_client::{FlightClientPool, execute_remote_sql};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -239,7 +239,8 @@ async fn flight_sql_server_submit_sql_verify() {
     });
 
     let url = format!("http://{addr}");
-    let batches = execute_remote_sql(&url, "SELECT 99 AS val")
+    let pool = FlightClientPool::new(&url).expect("pool");
+    let batches = execute_remote_sql(&pool, "SELECT 99 AS val")
         .await
         .expect("remote sql");
 
@@ -261,7 +262,7 @@ async fn flight_sql_server_submit_sql_verify() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flight_sql_register_parquet_query() {
-    use krishiv_runtime::flight_client::execute_remote_sql;
+    use krishiv_runtime::flight_client::{FlightClientPool, execute_remote_sql};
 
     // Create a parquet file to register.
     let dir = tempfile::tempdir().unwrap();
@@ -303,18 +304,19 @@ async fn flight_sql_register_parquet_query() {
     });
 
     let url = format!("http://{addr}");
+    let pool = FlightClientPool::new(&url).expect("pool");
 
     // Register the parquet table via Flight SQL comment directive.
     let register_sql = format!(
         "/* krishiv-register-parquet:table=flight_items,path={} */ SELECT 1",
         parquet_path.display()
     );
-    let reg_result = execute_remote_sql(&url, &register_sql).await;
+    let reg_result = execute_remote_sql(&pool, &register_sql).await;
     // Registration may succeed or be ignored; continue with query.
     let _ = reg_result;
 
     // Query: simple scalar to confirm server is alive.
-    let batches = execute_remote_sql(&url, "SELECT 'parquet_ready' AS status")
+    let batches = execute_remote_sql(&pool, "SELECT 'parquet_ready' AS status")
         .await
         .expect("query");
     assert!(!batches.is_empty());
@@ -462,7 +464,7 @@ async fn distributed_backend_end_to_end() {
     });
 
     let url = format!("http://{addr}");
-    let backend = DistributedBackend::new(url);
+    let backend = DistributedBackend::new(url).expect("backend");
 
     let plan = PhysicalPlan::new("SELECT 100 AS result", ExecutionKind::Batch);
     let report = backend

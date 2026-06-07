@@ -36,7 +36,6 @@ impl PolicyEnforcingSqlEngine {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub(crate) fn inner(&self) -> &SqlEngine {
         &self.inner
     }

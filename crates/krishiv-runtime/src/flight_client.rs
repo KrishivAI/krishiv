@@ -154,18 +154,6 @@ fn normalize_flight_endpoint(url: &str) -> RuntimeResult<String> {
     }
 }
 
-async fn connect_flight_client(
-    endpoint: &str,
-) -> RuntimeResult<FlightSqlServiceClient<AuthenticatedFlightChannel>> {
-    let channel = Endpoint::from_shared(endpoint.to_string())
-        .map_err(|e| RuntimeError::transport(format!("invalid coordinator URL: {e}")))?
-        .connect_timeout(std::time::Duration::from_secs(FLIGHT_CONNECT_TIMEOUT_SECS))
-        .timeout(std::time::Duration::from_secs(FLIGHT_REQUEST_TIMEOUT_SECS))
-        .connect()
-        .await
-        .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))?;
-    Ok(flight_sql_client(channel))
-}
 
 async fn connect_flight_channel(endpoint: &str) -> RuntimeResult<Channel> {
     let ep = endpoint.to_string();
@@ -205,30 +193,22 @@ struct EndpointHealth {
 }
 
 impl FlightClientPool {
-    pub fn new(flight_url: impl Into<String>) -> Self {
+    pub fn new(flight_url: impl Into<String>) -> RuntimeResult<Self> {
         let url = flight_url.into();
-        // Normalize eagerly so a bad URL fails at construction rather than
-        // surfacing as an opaque tonic error on the first request.
-        let endpoint = normalize_flight_endpoint(&url)
-            .unwrap_or_else(|_| {
-                let trimmed = url.trim().to_string();
-                tracing::warn!(url = %url, "Flight URL normalization failed; using trimmed input");
-                trimmed
-            });
-        assert!(!endpoint.is_empty(), "Flight URL is empty after normalization");
+        let endpoint = normalize_flight_endpoint(&url)?;
         let health = EndpointHealth {
             endpoint: endpoint.clone(),
             consecutive_failures: 0,
             last_check: None,
             is_healthy: true,
         };
-        Self {
+        Ok(Self {
             endpoints: vec![endpoint],
             current: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             channel: Arc::new(tokio::sync::RwLock::new(None)),
             health_state: Arc::new(tokio::sync::RwLock::new(vec![health])),
             health_check_handle: Arc::new(tokio::sync::Mutex::new(None)),
-        }
+        })
     }
 
     pub fn with_alternate(mut self, url: impl Into<String>) -> Self {
@@ -242,7 +222,9 @@ impl FlightClientPool {
                     last_check: None,
                     is_healthy: true,
                 };
-                self.health_state.blocking_write().push(health);
+                if let Some(rw) = Arc::get_mut(&mut self.health_state) {
+                    rw.get_mut().push(health);
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -565,6 +547,15 @@ impl FlightClientPool {
     }
 }
 
+impl std::fmt::Debug for FlightClientPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlightClientPool")
+            .field("flight_url", &self.flight_url())
+            .field("endpoint_count", &self.endpoints.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for FlightClientPool {
     fn drop(&mut self) {
         // Try to stop health checks - best effort
@@ -576,23 +567,23 @@ impl Drop for FlightClientPool {
     }
 }
 
-/// Submit `plan` to the remote Flight endpoint.
+/// Submit `plan` to the remote Flight endpoint via the pool.
 ///
 /// Prefers the typed [`KrishivFlightAction::ExecutePlan`] payload sent over
 /// `do_action`.  Falls back to the legacy SQL-comment protocol when the
 /// server does not understand the action type — preserves backward compat for
 /// older deployments.
-pub async fn execute_remote_plan(flight_url: &str, plan: &PhysicalPlan) -> RuntimeResult<()> {
+pub async fn execute_remote_plan(pool: &FlightClientPool, plan: &PhysicalPlan) -> RuntimeResult<()> {
     use crate::flight_action::{ExecutePlanBody, KrishivFlightAction};
     let body = ExecutePlanBody::from_plan(plan)?;
     let action = KrishivFlightAction::ExecutePlan(body);
-    match do_action(flight_url, &action).await {
+    match pool.do_action(&action).await {
         Ok(_) => Ok(()),
         Err(e) if is_unimplemented(&e) => {
             if !krishiv_common::allows_remote_sql_comment_fallback() {
                 return Err(e);
             }
-            let _ = execute_remote_sql(flight_url, &plan_to_sql(plan)).await?;
+            let _ = execute_remote_sql(pool, &plan_to_sql(plan)).await?;
             Ok(())
         }
         Err(e) => Err(e),
@@ -601,55 +592,26 @@ pub async fn execute_remote_plan(flight_url: &str, plan: &PhysicalPlan) -> Runti
 
 /// Execute SQL remotely via Flight and return all result batches.
 pub async fn execute_remote_sql(
-    flight_url: &str,
+    pool: &FlightClientPool,
     sql: &str,
 ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
-    let endpoint = normalize_flight_endpoint(flight_url)?;
-    let mut client = connect_flight_client(&endpoint).await?;
-
-    let flight_info = client
-        .execute(sql.to_string(), None)
-        .await
-        .map_err(|e| RuntimeError::transport(format!("flight execute failed: {e}")))?;
-
-    let ticket = flight_info
-        .endpoint
-        .first()
-        .and_then(|ep| ep.ticket.clone())
-        .ok_or_else(|| RuntimeError::transport("flight response had no ticket endpoint"))?;
-
-    let mut stream = client
-        .do_get(Ticket {
-            ticket: ticket.ticket,
-        })
-        .await
-        .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
-
-    let mut batches = Vec::new();
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}")))?
-    {
-        batches.push(batch);
-    }
-    Ok(batches)
+    pool.execute_sql(sql).await
 }
 
 /// Execute batch SQL remotely with catalog sync directives.
 pub async fn execute_remote_batch_sql(
-    flight_url: &str,
+    pool: &FlightClientPool,
     query: &str,
     tables: &[BatchSqlTable],
 ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
     let sql = encode_batch_sql(query, tables);
-    execute_remote_sql(flight_url, &sql).await
+    execute_remote_sql(pool, &sql).await
 }
 
 /// Explain SQL remotely via Flight.
-pub async fn execute_remote_explain(flight_url: &str, query: &str) -> RuntimeResult<String> {
+pub async fn execute_remote_explain(pool: &FlightClientPool, query: &str) -> RuntimeResult<String> {
     let sql = encode_explain_sql(query);
-    let batches = execute_remote_sql(flight_url, &sql).await?;
+    let batches = execute_remote_sql(pool, &sql).await?;
     Ok(flight_explain_from_batches(&batches))
 }
 
@@ -676,14 +638,14 @@ pub fn flight_explain_from_batches(batches: &[arrow::record_batch::RecordBatch])
     }
 }
 
-/// Register a continuous streaming job on the remote Flight host.
+/// Register a continuous streaming job on the remote Flight host via the pool.
 ///
 /// Prefers the typed [`KrishivFlightAction::ContinuousRegister`] payload sent
 /// over `do_action`.  Falls back to the legacy SQL-comment protocol when the
 /// server does not understand the action type — preserves backward compat for
 /// older deployments.
 pub async fn execute_remote_continuous_register(
-    flight_url: &str,
+    pool: &FlightClientPool,
     job_id: &str,
     spec: &LocalWindowExecutionSpec,
 ) -> RuntimeResult<()> {
@@ -692,23 +654,23 @@ pub async fn execute_remote_continuous_register(
         job_id: job_id.to_string(),
         spec: spec.to_plan_spec(),
     });
-    match do_action(flight_url, &action).await {
+    match pool.do_action(&action).await {
         Ok(_) => Ok(()),
         Err(e) if is_unimplemented(&e) => {
             if !krishiv_common::allows_remote_sql_comment_fallback() {
                 return Err(e);
             }
             let sql = encode_continuous_register(job_id, spec)?;
-            let _ = execute_remote_sql(flight_url, &sql).await?;
+            let _ = execute_remote_sql(pool, &sql).await?;
             Ok(())
         }
         Err(e) => Err(e),
     }
 }
 
-/// Push input batches to a remote continuous streaming job.
+/// Push input batches to a remote continuous streaming job via the pool.
 pub async fn execute_remote_continuous_push(
-    flight_url: &str,
+    pool: &FlightClientPool,
     job_id: &str,
     batches: Vec<arrow::record_batch::RecordBatch>,
 ) -> RuntimeResult<()> {
@@ -718,45 +680,45 @@ pub async fn execute_remote_continuous_push(
         job_id: job_id.to_string(),
         batches_b64,
     });
-    match do_action(flight_url, &action).await {
+    match pool.do_action(&action).await {
         Ok(_) => Ok(()),
         Err(e) if is_unimplemented(&e) => {
             if !krishiv_common::allows_remote_sql_comment_fallback() {
                 return Err(e);
             }
             let sql = encode_continuous_push(job_id, &batches)?;
-            let _ = execute_remote_sql(flight_url, &sql).await?;
+            let _ = execute_remote_sql(pool, &sql).await?;
             Ok(())
         }
         Err(e) => Err(e),
     }
 }
 
-/// Drain output from a remote continuous streaming job.
+/// Drain output from a remote continuous streaming job via the pool.
 pub async fn execute_remote_continuous_drain(
-    flight_url: &str,
+    pool: &FlightClientPool,
     job_id: &str,
 ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
     use crate::flight_action::{ContinuousDrainBody, KrishivFlightAction};
     let action = KrishivFlightAction::ContinuousDrain(ContinuousDrainBody {
         job_id: job_id.to_string(),
     });
-    match do_action(flight_url, &action).await {
+    match pool.do_action(&action).await {
         Ok(body) => decode_ipc_response(&body),
         Err(e) if is_unimplemented(&e) => {
             if !krishiv_common::allows_remote_sql_comment_fallback() {
                 return Err(e);
             }
             let sql = encode_continuous_drain(job_id);
-            execute_remote_sql(flight_url, &sql).await
+            execute_remote_sql(pool, &sql).await
         }
         Err(e) => Err(e),
     }
 }
 
-/// Execute a bounded window pipeline on the remote Flight host.
+/// Execute a bounded window pipeline on the remote Flight host via the pool.
 pub async fn execute_remote_bounded_window(
-    flight_url: &str,
+    pool: &FlightClientPool,
     topic: &str,
     input_batches: Vec<arrow::record_batch::RecordBatch>,
     spec: &LocalWindowExecutionSpec,
@@ -769,14 +731,14 @@ pub async fn execute_remote_bounded_window(
         batches_b64,
         response_watermark_ms: None,
     });
-    match do_action(flight_url, &action).await {
+    match pool.do_action(&action).await {
         Ok(body) => decode_ipc_response(&body),
         Err(e) if is_unimplemented(&e) => {
             if !krishiv_common::allows_remote_sql_comment_fallback() {
                 return Err(e);
             }
             let sql = encode_bounded_window(topic, spec, &input_batches)?;
-            execute_remote_sql(flight_url, &sql).await
+            execute_remote_sql(pool, &sql).await
         }
         Err(e) => Err(e),
     }
@@ -800,54 +762,6 @@ pub fn decode_ipc_response(body: &[u8]) -> RuntimeResult<Vec<arrow::record_batch
         .map_err(|e| RuntimeError::transport(format!("ipc read response: {e}")))
 }
 
-/// Low-level helper: send a typed Krishiv action to the Flight server.
-pub(crate) async fn do_action(
-    flight_url: &str,
-    action: &crate::flight_action::KrishivFlightAction,
-) -> RuntimeResult<Vec<u8>> {
-    use futures::StreamExt;
-    let endpoint = normalize_flight_endpoint(flight_url)?;
-    let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
-        .map_err(|e| RuntimeError::transport(format!("invalid coordinator URL: {e}")))?
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .connect()
-        .await
-        .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))?;
-    let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
-    let body = action.to_action_body()?;
-    let req = arrow_flight::Action {
-        r#type: action.action_type(),
-        body: body.into(),
-    };
-    let mut stream = client
-        .do_action(apply_flight_auth(tonic::Request::new(req)))
-        .await
-        .map_err(|s| {
-            if s.code() == tonic::Code::Unimplemented {
-                RuntimeError::ServerUnimplemented {
-                    message: s.message().to_string(),
-                }
-            } else {
-                RuntimeError::transport(format!("do_action: {s}"))
-            }
-        })?
-        .into_inner();
-
-    let mut buf = Vec::new();
-    while let Some(item) = stream.next().await {
-        let part = item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
-        buf.extend_from_slice(&part.body);
-        const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
-        if buf.len() > MAX_RESPONSE_BYTES {
-            return Err(RuntimeError::transport(format!(
-                "do_action response exceeded {} MiB limit",
-                MAX_RESPONSE_BYTES / (1024 * 1024)
-            )));
-        }
-    }
-    Ok(buf)
-}
 
 #[cfg(test)]
 mod tests {

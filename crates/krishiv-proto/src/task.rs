@@ -924,19 +924,34 @@ impl InputPartition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanFragment {
     description: String,
+    /// Explicit execution model: `true` for streaming (continuous) tasks.
+    /// When `false`, the executor falls back to description-based detection.
+    is_streaming: bool,
 }
 
 impl PlanFragment {
-    /// Create a plan fragment descriptor.
+    /// Create a plan fragment descriptor (batch by default).
     pub fn new(description: impl Into<String>) -> Self {
         Self {
             description: description.into(),
+            is_streaming: false,
         }
+    }
+
+    /// Set the explicit streaming flag, consuming `self`.
+    pub fn with_streaming(mut self, is_streaming: bool) -> Self {
+        self.is_streaming = is_streaming;
+        self
     }
 
     /// Human-readable fragment description.
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Whether this fragment runs a streaming (continuous) execution model.
+    pub fn is_streaming(&self) -> bool {
+        self.is_streaming
     }
 }
 

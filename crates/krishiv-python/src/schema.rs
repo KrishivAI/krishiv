@@ -16,8 +16,7 @@ const FIELDS_ATTR: &str = "_krishiv_fields";
 #[pyclass(from_py_object, name = "Schema", subclass)]
 #[derive(Clone)]
 pub struct PySchema {
-    #[allow(dead_code)]
-    fields: Vec<(String, DataType)>,
+    _fields: Vec<(String, DataType)>,
 }
 
 impl PySchema {
@@ -72,7 +71,7 @@ impl PySchema {
 impl PySchema {
     #[new]
     fn new() -> Self {
-        Self { fields: vec![] }
+        Self { _fields: vec![] }
     }
 
     #[classmethod]

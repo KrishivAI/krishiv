@@ -1,22 +1,6 @@
-use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
-
-/// Create a single-column `Int32` schema with the given field name.
-pub fn make_single_int_schema(name: &str) -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]))
-}
-
-/// Create a single-column `RecordBatch` containing a single `Int32Array`.
-///
-/// # Panics
-/// Panics only if the schema and array length are mismatched, which cannot
-/// happen with the values provided here.
-pub fn make_single_int_batch(field_name: &str, values: Vec<i32>) -> RecordBatch {
-    let schema = make_single_int_schema(field_name);
-    let array = Arc::new(Int32Array::from(values)) as ArrayRef;
-    RecordBatch::try_new(schema, vec![array]).expect("schema and array length match")
-}
 
 /// Create a canonical test schema containing `"user_id"` (Utf8) and `"ts"` (Int64).
 fn make_test_user_ts_schema() -> SchemaRef {

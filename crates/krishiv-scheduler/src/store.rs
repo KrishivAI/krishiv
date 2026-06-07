@@ -1044,6 +1044,7 @@ impl NonBlockingStoreHandle {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StoreCommand>(STORE_CHANNEL_CAPACITY);
             let bg_store = std::sync::Arc::clone(&inner);
             let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
             tokio::spawn(async move {
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
@@ -1051,6 +1052,7 @@ impl NonBlockingStoreHandle {
                             in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let bg = std::sync::Arc::clone(&bg_store);
                             let in_flight_done = std::sync::Arc::clone(&in_flight);
+                            let notify_done = std::sync::Arc::clone(&notify);
                             tokio::task::spawn_blocking(move || {
                                 let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Err(e) = guard.append_event(event) {
@@ -1060,6 +1062,7 @@ impl NonBlockingStoreHandle {
                                     );
                                 }
                                 in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                notify_done.notify_one();
                             })
                             .await
                             .ok();
@@ -1068,6 +1071,7 @@ impl NonBlockingStoreHandle {
                             in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let bg = std::sync::Arc::clone(&bg_store);
                             let in_flight_done = std::sync::Arc::clone(&in_flight);
+                            let notify_done = std::sync::Arc::clone(&notify);
                             tokio::task::spawn_blocking(move || {
                                 let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Err(e) = guard.save_job(&record) {
@@ -1077,18 +1081,20 @@ impl NonBlockingStoreHandle {
                                     );
                                 }
                                 in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                notify_done.notify_one();
                             })
                             .await
                             .ok();
                         }
                         StoreCommand::Flush(reply) => {
-                            // Wait for in-flight tasks to complete using a
-                            // Notify-based approach instead of busy-waiting.
+                            // Wait for all in-flight spawn_blocking tasks to complete.
+                            // Uses Notify wakeups set by each task on completion so
+                            // the loop only wakes when real progress is made.
                             loop {
                                 if in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                                     break;
                                 }
-                                tokio::task::yield_now().await;
+                                notify.notified().await;
                             }
                             let _ = reply.send(());
                         }

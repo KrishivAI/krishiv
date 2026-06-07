@@ -24,10 +24,22 @@ pub enum ExecutionModel {
 }
 
 impl ExecutionModel {
-    /// Infer the execution model from the plan fragment description.
+    /// Infer the execution model from a [`PlanFragment`].
     ///
-    /// All `stream:` prefixed fragments use the streaming model.
-    /// Everything else is treated as batch (existing behaviour is preserved).
+    /// Prefers the explicit `is_streaming` flag set by the scheduler. Falls back
+    /// to description-based detection for fragments produced by older schedulers
+    /// that do not populate the flag.
+    pub fn from_plan_fragment(fragment: &krishiv_proto::PlanFragment) -> crate::ExecutorResult<Self> {
+        if fragment.is_streaming() {
+            return Ok(Self::Streaming);
+        }
+        Self::from_fragment(fragment.description())
+    }
+
+    /// Infer the execution model from a plain description string.
+    ///
+    /// Used as a fallback when the `PlanFragment::is_streaming` flag is absent
+    /// (e.g. fragments emitted by older scheduler versions).
     pub fn from_fragment(fragment: &str) -> crate::ExecutorResult<Self> {
         let profile = krishiv_common::resolve_durability_profile();
         let typed = krishiv_plan::TypedTaskFragment::decode_for_profile(fragment, profile)

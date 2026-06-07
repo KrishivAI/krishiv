@@ -127,7 +127,6 @@ impl PyStream {
         self.tumbling_window_ms(window_secs.saturating_mul(1000))
     }
 
-    #[allow(dead_code)]
     fn _tumbling_window_secs_body(&self, window_secs: u64) -> PyResult<PyWindowedStream> {
         ensure_watermark_before_window(
             &self.pipeline.watermark_column,

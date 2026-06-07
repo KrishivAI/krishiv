@@ -999,7 +999,7 @@ impl ExecutorTaskRunner {
         }
 
         let model =
-            crate::ExecutionModel::from_fragment(assignment.plan_fragment().description().trim())
+            crate::ExecutionModel::from_plan_fragment(assignment.plan_fragment())
                 .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let fragment_body = crate::fragment::common::task_fragment_body(
             assignment.plan_fragment().description().trim(),
@@ -1128,7 +1128,6 @@ impl ExecutorTaskRunner {
     ///
     /// All R1–R4 fragment kinds route through here.  The function collects
     /// output and returns it so the caller can report `TaskState::Succeeded`.
-    #[allow(dead_code)]
     pub(crate) async fn execute_batch_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
@@ -1137,7 +1136,6 @@ impl ExecutorTaskRunner {
     }
 
     /// Execute a streaming (continuous) stage fragment.
-    #[allow(dead_code)]
     pub(crate) async fn execute_streaming_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,

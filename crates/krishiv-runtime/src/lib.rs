@@ -108,21 +108,7 @@ impl RuntimeError {
     }
 }
 
-/// Stable job identifier used by local and future distributed runtimes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct JobId(String);
-
-impl JobId {
-    /// Create a job id.
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Borrow the id string.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+pub use krishiv_proto::JobId;
 
 /// Minimal job state for R1 local job listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,27 +171,23 @@ impl JobStatus {
 /// Local in-memory job registry for bootstrap CLI/status behavior.
 #[derive(Debug, Default, Clone)]
 pub struct LocalJobRegistry {
-    jobs: Vec<JobStatus>,
+    jobs: std::collections::HashMap<String, JobStatus>,
 }
 
 impl LocalJobRegistry {
     /// Add or replace a job status.
     pub fn upsert(&mut self, status: JobStatus) {
-        if let Some(existing) = self.jobs.iter_mut().find(|job| job.id == status.id) {
-            *existing = status;
-        } else {
-            self.jobs.push(status);
-        }
+        self.jobs.insert(status.id().as_str().to_owned(), status);
     }
 
     /// List known jobs.
-    pub fn list(&self) -> &[JobStatus] {
-        &self.jobs
+    pub fn list(&self) -> Vec<&JobStatus> {
+        self.jobs.values().collect()
     }
 
     /// Snapshot known jobs.
     pub fn snapshot(&self) -> Vec<JobStatus> {
-        self.jobs.clone()
+        self.jobs.values().cloned().collect()
     }
 }
 
@@ -340,20 +322,28 @@ impl ExecutionBackend for EmbeddedBackend {
 /// This is the one backend that genuinely needs async I/O.  We use `block_on`
 /// at its single sync/async seam — the `ExecutionBackend::execute` trait method
 /// is sync to prevent nested `block_on` deadlocks in embedded/single-node callers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DistributedBackend {
-    flight_url: String,
+    pool: flight_client::FlightClientPool,
+}
+
+impl std::fmt::Debug for DistributedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistributedBackend")
+            .field("flight_url", &self.pool.flight_url())
+            .finish()
+    }
 }
 
 impl DistributedBackend {
-    pub fn new(flight_url: impl Into<String>) -> Self {
-        Self {
-            flight_url: flight_url.into(),
-        }
+    pub fn new(flight_url: impl Into<String>) -> RuntimeResult<Self> {
+        Ok(Self {
+            pool: flight_client::FlightClientPool::new(flight_url)?,
+        })
     }
 
     pub fn flight_url(&self) -> &str {
-        &self.flight_url
+        self.pool.flight_url()
     }
 }
 
@@ -365,14 +355,14 @@ impl ExecutionBackend for DistributedBackend {
     fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         debug!(
             backend = "distributed",
-            coordinator = %self.flight_url,
+            coordinator = %self.pool.flight_url(),
             plan = %plan.name(),
             kind = %plan.kind(),
             sql = %flight_client::plan_to_sql(plan),
             "DistributedBackend: submitting plan via Flight SQL"
         );
         krishiv_common::async_util::block_on(flight_client::execute_remote_plan(
-            &self.flight_url,
+            &self.pool,
             plan,
         ))?;
         Ok(ExecutionReport::new(
@@ -413,7 +403,7 @@ mod distributed_flight_tests {
         });
 
         let url = format!("http://{addr}");
-        let backend = DistributedBackend::new(url);
+        let backend = DistributedBackend::new(url).expect("backend");
         let plan = PhysicalPlan::new("SELECT 1 AS n", ExecutionKind::Batch);
         // execute is now sync — no .await needed, no nested block_on risk
         let report = backend.execute(&plan).expect("execute");
@@ -513,25 +503,24 @@ mod tests {
 
     #[test]
     fn job_id_new_and_as_str() {
-        let id = JobId::new("job-42");
+        let id = JobId::try_new("job-42").unwrap();
         assert_eq!(id.as_str(), "job-42");
     }
 
     #[test]
-    fn job_id_empty_string() {
-        let id = JobId::new("");
-        assert_eq!(id.as_str(), "");
+    fn job_id_empty_is_rejected() {
+        assert!(JobId::try_new("").is_err(), "empty job id must be rejected");
     }
 
     #[test]
     fn job_id_special_chars() {
-        let id = JobId::new("j-1.2_3");
+        let id = JobId::try_new("j-1.2_3").unwrap();
         assert_eq!(id.as_str(), "j-1.2_3");
     }
 
     #[test]
     fn job_id_clone_eq_hash() {
-        let a = JobId::new("x");
+        let a = JobId::try_new("x").unwrap();
         let b = a.clone();
         assert_eq!(a, b);
         use std::collections::HashMap;
@@ -562,7 +551,7 @@ mod tests {
 
     #[test]
     fn job_status_constructors_and_accessors() {
-        let id = JobId::new("j1");
+        let id = JobId::try_new("j1").unwrap();
         let status = JobStatus::new(id.clone(), "my-job", JobState::Running);
         assert_eq!(status.id(), &id);
         assert_eq!(status.name(), "my-job");
@@ -571,7 +560,7 @@ mod tests {
 
     #[test]
     fn job_status_clone_and_eq() {
-        let s1 = JobStatus::new(JobId::new("j1"), "j", JobState::Pending);
+        let s1 = JobStatus::new(JobId::try_new("j1").unwrap(), "j", JobState::Pending);
         let s2 = s1.clone();
         assert_eq!(s1, s2);
     }
@@ -585,7 +574,7 @@ mod tests {
     #[test]
     fn local_job_registry_upsert_adds_new() {
         let mut reg = LocalJobRegistry::default();
-        let s = JobStatus::new(JobId::new("j1"), "job1", JobState::Pending);
+        let s = JobStatus::new(JobId::try_new("j1").unwrap(), "job1", JobState::Pending);
         reg.upsert(s);
         assert_eq!(reg.list().len(), 1);
         assert_eq!(reg.list()[0].id().as_str(), "j1");
@@ -594,8 +583,8 @@ mod tests {
     #[test]
     fn local_job_registry_upsert_replaces_existing() {
         let mut reg = LocalJobRegistry::default();
-        reg.upsert(JobStatus::new(JobId::new("j1"), "v1", JobState::Pending));
-        reg.upsert(JobStatus::new(JobId::new("j1"), "v2", JobState::Running));
+        reg.upsert(JobStatus::new(JobId::try_new("j1").unwrap(), "v1", JobState::Pending));
+        reg.upsert(JobStatus::new(JobId::try_new("j1").unwrap(), "v2", JobState::Running));
         assert_eq!(reg.list().len(), 1);
         assert_eq!(reg.list()[0].name(), "v2");
         assert_eq!(reg.list()[0].state(), JobState::Running);
@@ -604,10 +593,39 @@ mod tests {
     #[test]
     fn local_job_registry_snapshot() {
         let mut reg = LocalJobRegistry::default();
-        reg.upsert(JobStatus::new(JobId::new("j1"), "a", JobState::Pending));
-        reg.upsert(JobStatus::new(JobId::new("j2"), "b", JobState::Running));
+        reg.upsert(JobStatus::new(JobId::try_new("j1").unwrap(), "a", JobState::Pending));
+        reg.upsert(JobStatus::new(JobId::try_new("j2").unwrap(), "b", JobState::Running));
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn local_job_registry_list_ordering_independent() {
+        let mut reg = LocalJobRegistry::default();
+        let ids = ["alpha", "beta", "gamma", "delta"];
+        for id in &ids {
+            reg.upsert(JobStatus::new(JobId::try_new(*id).unwrap(), *id, JobState::Pending));
+        }
+        let listed: std::collections::HashSet<String> =
+            reg.list().iter().map(|s| s.id().as_str().to_owned()).collect();
+        for id in &ids {
+            assert!(listed.contains(*id), "missing job {id}");
+        }
+        assert_eq!(listed.len(), ids.len());
+    }
+
+    #[test]
+    fn local_job_registry_snapshot_ordering_independent() {
+        let mut reg = LocalJobRegistry::default();
+        reg.upsert(JobStatus::new(JobId::try_new("x").unwrap(), "x", JobState::Pending));
+        reg.upsert(JobStatus::new(JobId::try_new("y").unwrap(), "y", JobState::Running));
+        reg.upsert(JobStatus::new(JobId::try_new("x").unwrap(), "x2", JobState::Succeeded));
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 2);
+        let names: std::collections::HashSet<String> =
+            snap.iter().map(|s| s.name().to_owned()).collect();
+        assert!(names.contains("x2"), "upsert should have replaced x");
+        assert!(names.contains("y"));
     }
 
     #[test]
@@ -661,14 +679,14 @@ mod tests {
 
     #[test]
     fn distributed_backend_new_and_flight_url() {
-        let b = DistributedBackend::new("http://localhost:50051");
+        let b = DistributedBackend::new("http://localhost:50051").unwrap();
         assert_eq!(b.flight_url(), "http://localhost:50051");
         assert_eq!(b.backend_name(), "distributed");
     }
 
     #[test]
     fn distributed_backend_clone() {
-        let b = DistributedBackend::new("http://x");
+        let b = DistributedBackend::new("http://x").unwrap();
         let b2 = b.clone();
         assert_eq!(b2.flight_url(), "http://x");
     }

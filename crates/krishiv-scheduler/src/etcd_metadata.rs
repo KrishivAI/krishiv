@@ -1,7 +1,6 @@
 //! etcd-backed durable metadata store for bare-metal cluster recovery.
 
 use etcd_client::Client;
-use tokio::sync::Mutex;
 
 use crate::store::{
     EventLogEvent, MetadataStore, decode_metadata_snapshot_with_executors,
@@ -21,7 +20,7 @@ const METADATA_SNAPSHOT_KEY: &str = "/krishiv/metadata/snapshot";
 /// snapshot exceeds 1 MiB so operators can detect approaching the limit
 /// before writes start failing.
 pub struct EtcdMetadataStore {
-    client: Mutex<Client>,
+    client: std::sync::Mutex<Client>,
     events: Vec<EventLogEvent>,
     jobs: Vec<JobRecord>,
     executor_descriptors: Vec<krishiv_proto::ExecutorDescriptor>,
@@ -54,7 +53,7 @@ impl EtcdMetadataStore {
                 }
             };
         Ok(Self {
-            client: Mutex::new(client),
+            client: std::sync::Mutex::new(client),
             events,
             jobs,
             executor_descriptors,
@@ -88,7 +87,7 @@ impl EtcdMetadataStore {
                 "etcd metadata snapshot exceeds 1 MiB; etcd default limit is 1.5 MiB"
             );
         }
-        let mut client = self.client.blocking_lock().clone();
+        let mut client = self.client.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let handle = tokio::task::spawn_blocking(move || {
             // Drive the async etcd put on a one-shot current-thread runtime
             // rather than on the parent runtime's handle. The etcd client

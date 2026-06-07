@@ -262,7 +262,7 @@ mod tests {
         let hash_join = HashJoin::new("id", "id");
         let hash_result = hash_join.join(&left, &right).unwrap();
 
-        let broadcast = BroadcastJoin::new("id").build(&right).unwrap();
+        let broadcast = BroadcastJoin::new("id").build(Arc::new(right)).unwrap();
         let broadcast_result = broadcast.probe(&left).unwrap();
 
         assert_eq!(hash_result.num_rows(), broadcast_result.num_rows());
@@ -277,7 +277,7 @@ mod tests {
         let broadcast = make_int32_keyed_batch("id", vec![1, 2, 3]);
         let probe = make_int32_keyed_batch("id", vec![1, 1, 2, 3, 4]);
 
-        let built = BroadcastJoin::new("id").build(&broadcast).unwrap();
+        let built = BroadcastJoin::new("id").build(Arc::new(broadcast)).unwrap();
         let result = built.probe(&probe).unwrap();
 
         // id=1 matches twice, id=2 once, id=3 once → 4 rows
@@ -289,7 +289,7 @@ mod tests {
         let broadcast = make_int32_keyed_batch("id", vec![1, 2, 3]);
         let probe = make_int32_keyed_batch("id", vec![]);
 
-        let built = BroadcastJoin::new("id").build(&broadcast).unwrap();
+        let built = BroadcastJoin::new("id").build(Arc::new(broadcast)).unwrap();
         let result = built.probe(&probe).unwrap();
 
         assert_eq!(result.num_rows(), 0);

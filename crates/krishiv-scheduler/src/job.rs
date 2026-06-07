@@ -359,7 +359,10 @@ impl JobRecord {
                         ),
                         executor_id,
                         lease_generation,
-                        PlanFragment::new(task_description.clone()),
+                        PlanFragment::new(task_description.clone()).with_streaming(
+                            krishiv_plan::execution_kind_from_fragment(&task_description)
+                                == PlanExecutionKind::Streaming,
+                        ),
                         OutputContract::new(
                             OutputContractKind::InlineRecordBatches,
                             format!("inline result for {}", task.task_id()),

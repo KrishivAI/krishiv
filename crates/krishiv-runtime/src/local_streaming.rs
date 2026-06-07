@@ -71,7 +71,7 @@ pub fn execute_windowed_stream(
 ) -> Result<Vec<RecordBatch>, RuntimeError> {
     let plan_spec = spec.to_plan_spec();
     execute_bounded_window(input_batches, &plan_spec, None)
-        .map_err(|e| RuntimeError::transport(e.to_string()))
+        .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })
 }
 
 /// Run windowed aggregation lazily over an unbounded input stream.
@@ -92,11 +92,7 @@ pub fn execute_streaming_window(
 > {
     let plan_spec = spec.to_plan_spec();
     krishiv_exec::execute_streaming_window(input, plan_spec, None)
-        .map_err(|e| RuntimeError::transport(e.to_string()))
-}
-
-fn default_key_column_type() -> String {
-    String::from("utf8")
+        .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })
 }
 
 #[cfg(test)]
@@ -127,7 +123,7 @@ mod tests {
     fn tumbling_window_produces_closed_buckets() {
         let spec = LocalWindowExecutionSpec {
             key_column: String::from("user_id"),
-            key_column_type: default_key_column_type(),
+            key_column_type: "utf8".into(),
             event_time_column: String::from("ts"),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Tumbling,
@@ -146,7 +142,7 @@ mod tests {
     fn session_window_produces_output() {
         let spec = LocalWindowExecutionSpec {
             key_column: String::from("user_id"),
-            key_column_type: default_key_column_type(),
+            key_column_type: "utf8".into(),
             event_time_column: String::from("ts"),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Session { gap_ms: 5_000 },
@@ -164,7 +160,7 @@ mod tests {
     fn empty_input_returns_empty() {
         let spec = LocalWindowExecutionSpec {
             key_column: String::from("user_id"),
-            key_column_type: default_key_column_type(),
+            key_column_type: "utf8".into(),
             event_time_column: String::from("ts"),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Tumbling,
@@ -182,7 +178,7 @@ mod tests {
     fn sliding_window_produces_output() {
         let spec = LocalWindowExecutionSpec {
             key_column: String::from("user_id"),
-            key_column_type: default_key_column_type(),
+            key_column_type: "utf8".into(),
             event_time_column: String::from("ts"),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Sliding { slide_ms: 5_000 },
@@ -208,7 +204,7 @@ mod tests {
     fn to_plan_spec_roundtrip() {
         let spec = LocalWindowExecutionSpec {
             key_column: "k".into(),
-            key_column_type: default_key_column_type(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 100,
             window_kind: LocalWindowKind::Sliding { slide_ms: 3_000 },
@@ -258,7 +254,7 @@ mod tests {
         .unwrap();
         let spec = LocalWindowExecutionSpec {
             key_column: "k".into(),
-            key_column_type: default_key_column_type(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Tumbling,

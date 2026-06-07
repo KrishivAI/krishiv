@@ -88,6 +88,15 @@ impl std::fmt::Debug for ContinuousJobEntry {
 /// Default maximum pending input batches per job before backpressure kicks in.
 const DEFAULT_MAX_PENDING_BATCHES: usize = 1024;
 
+fn schemas_structurally_equal(a: &arrow::datatypes::Schema, b: &arrow::datatypes::Schema) -> bool {
+    a.fields().len() == b.fields().len()
+        && a.fields().iter().zip(b.fields().iter()).all(|(af, bf)| {
+            af.name() == bf.name()
+                && af.data_type() == bf.data_type()
+                && af.is_nullable() == bf.is_nullable()
+        })
+}
+
 /// Registry for long-running streaming jobs (session-scoped).
 #[derive(Debug)]
 pub struct ContinuousStreamRegistry {
@@ -200,15 +209,15 @@ impl ContinuousStreamRegistry {
                 component: "input",
                 operation: "push_input",
             })?;
-        if let Some(expected_schema) = &input.schema
-            && expected_schema != &incoming_schema
-        {
-            return Err(ContinuousStreamError::SchemaMismatch {
-                job_id: job_id.to_owned(),
-                expected: format!("{expected_schema:?}"),
-                actual: format!("{incoming_schema:?}"),
+        if let Some(expected_schema) = &input.schema {
+            if !schemas_structurally_equal(expected_schema, &incoming_schema) {
+                return Err(ContinuousStreamError::SchemaMismatch {
+                    job_id: job_id.to_owned(),
+                    expected: format!("{expected_schema:?}"),
+                    actual: format!("{incoming_schema:?}"),
+                }
+                .into());
             }
-            .into());
         }
         let current = input.batches.len();
         let attempted = batches.len();
@@ -427,6 +436,21 @@ impl ContinuousStreamRegistry {
                 Ok(())
             }
         }
+    }
+
+    /// Remove a registered continuous job and its in-memory state.
+    ///
+    /// Returns `Ok(())` when the job was found and removed. Returns
+    /// [`ContinuousStreamError::JobNotFound`] when no job with `job_id` exists,
+    /// so callers can distinguish intentional deregistration from stale references.
+    pub fn deregister_job(&self, job_id: &str) -> RuntimeResult<()> {
+        if self.jobs.remove(job_id).is_none() {
+            return Err(ContinuousStreamError::JobNotFound {
+                job_id: job_id.to_owned(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// List all registered job ids.
