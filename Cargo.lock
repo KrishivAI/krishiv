@@ -4167,6 +4167,18 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
+=======
+name = "krishiv-lakehouse"
+version = "0.1.0"
+dependencies = [
+ "krishiv-connectors",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+>>>>>>> origin/main
 name = "krishiv-metrics"
 version = "0.1.0"
 dependencies = [

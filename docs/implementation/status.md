@@ -1,5 +1,6 @@
 # Krishiv Implementation Status
 
+<<<<<<< HEAD
 ## Remove `krishiv-lakehouse` crate (2026-06-07)
 
 Removed the standalone `krishiv-lakehouse` facade crate after the physical
@@ -17,6 +18,8 @@ cargo check --workspace
 TMPDIR=/workspace/tmp cargo test -p krishiv-connectors --test exactly_once --features exactly-once-integration
 ```
 
+=======
+>>>>>>> origin/main
 ## Connector follow-ups and lakehouse merge (2026-06-07)
 
 Completed connector consolidation follow-ups on branch
