@@ -3898,7 +3898,6 @@ dependencies = [
  "krishiv-executor",
  "krishiv-flight-sql",
  "krishiv-governance",
- "krishiv-lakehouse",
  "krishiv-metrics",
  "krishiv-operator",
  "krishiv-proto",
@@ -3955,10 +3954,10 @@ dependencies = [
  "dashmap",
  "futures",
  "krishiv-common",
+ "krishiv-connectors",
  "krishiv-exec",
  "krishiv-flight-sql",
  "krishiv-governance",
- "krishiv-lakehouse",
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-sql",
@@ -4080,7 +4079,7 @@ dependencies = [
  "krishiv-ai",
  "krishiv-cep",
  "krishiv-common",
- "krishiv-lakehouse",
+ "krishiv-connectors",
  "krishiv-plan",
  "krishiv-state",
  "proptest",
@@ -4165,15 +4164,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "krishiv-lakehouse"
-version = "0.1.0"
-dependencies = [
- "krishiv-connectors",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -4270,7 +4260,6 @@ dependencies = [
  "krishiv-connectors",
  "krishiv-exec",
  "krishiv-governance",
- "krishiv-lakehouse",
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-sql",
@@ -4388,7 +4377,6 @@ dependencies = [
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-governance",
- "krishiv-lakehouse",
  "krishiv-optimizer",
  "krishiv-plan",
  "krishiv-udf",

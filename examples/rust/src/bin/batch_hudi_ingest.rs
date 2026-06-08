@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 2. Initialize the Hudi writer and write to the local directory
     {
-        let writer = krishiv_lakehouse::HudiCowWriter::open(&hudi_path);
+        let writer = krishiv_connectors::lakehouse::HudiCowWriter::open(&hudi_path);
         writer.append(batch)?;
     }
 
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let df = session
         .read_hudi_async(
             hudi_path.to_string_lossy(),
-            krishiv_lakehouse::HudiQueryType::Snapshot,
+            krishiv_connectors::lakehouse::HudiQueryType::Snapshot,
             None,
         )
         .await?;

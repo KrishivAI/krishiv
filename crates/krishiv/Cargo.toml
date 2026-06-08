@@ -52,16 +52,15 @@ etcd = ["krishiv-scheduler/etcd"]
 kafka = ["krishiv-connectors/kafka"]
 redb = ["krishiv-scheduler/redb"]
 state = ["krishiv-connectors/state"]
-iceberg = ["krishiv-lakehouse/iceberg"]
-delta = ["krishiv-lakehouse/delta"]
+iceberg = ["krishiv-connectors/iceberg"]
+delta = ["krishiv-connectors/delta"]
 
 [dependencies]
 krishiv-common = { path = "../krishiv-common" }
 krishiv-api = { path = "../krishiv-api" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
-krishiv-connectors = { path = "../krishiv-connectors" }
-krishiv-lakehouse = { path = "../krishiv-lakehouse" }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-operator = { path = "../krishiv-operator", optional = true, default-features = false }
 krishiv-ui = { path = "../krishiv-ui" }

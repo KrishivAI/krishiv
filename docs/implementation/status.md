@@ -1,5 +1,22 @@
 # Krishiv Implementation Status
 
+## Remove `krishiv-lakehouse` crate (2026-06-07)
+
+Removed the standalone `krishiv-lakehouse` facade crate after the physical
+merge into `krishiv-connectors::lakehouse`:
+
+- Migrated all dependents (`krishiv-sql`, `krishiv-exec`, `krishiv-api`,
+  `krishiv-python`, `krishiv`, `examples/rust`) to
+  `krishiv_connectors::lakehouse` (or root re-exports with `lakehouse` feature).
+- Moved `exactly_once` integration test to `krishiv-connectors/tests/`.
+- Dropped the crate from workspace members and updated docs.
+
+Validation:
+```bash
+cargo check --workspace
+TMPDIR=/workspace/tmp cargo test -p krishiv-connectors --test exactly_once --features exactly-once-integration
+```
+
 ## Connector follow-ups and lakehouse merge (2026-06-07)
 
 Completed connector consolidation follow-ups on branch

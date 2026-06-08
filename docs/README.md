@@ -40,13 +40,12 @@ Core implementation choices:
 | `krishiv-shuffle` | In-memory, local disk, object-store, and Flight-oriented shuffle support. |
 | `krishiv-state` | In-memory, redb-backed, TTL, migration, and incremental state support. |
 | `krishiv-checkpoint` | Checkpoint/savepoint metadata, storage, fencing, restore helpers. |
-| `krishiv-connectors` | Connector traits and Parquet/Kafka/S3-style integration paths. |
+| `krishiv-connectors` | Connector traits, Parquet/Kafka/S3 paths, and lakehouse helpers (`lakehouse` feature: Iceberg/Delta/Hudi). |
 | `krishiv-optimizer` | Optimizer rule and adaptive-planning support. |
 | `krishiv-operator` | Kubernetes CRD and operator integration. |
 | `krishiv-ui` | Status API and web UI assets. |
 | `krishiv-flight-sql` | Arrow Flight SQL service. |
 | `krishiv-python` | PyO3 Python bindings. |
-| `krishiv-lakehouse` | Iceberg/Delta/Hudi-oriented lakehouse helpers. |
 | `krishiv-metrics` | Metrics, tracing, and debug report structures. |
 | `krishiv-governance` | Audit, lineage, and policy support. |
 | `krishiv-udf` | UDF contracts and execution limits. |

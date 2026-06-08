@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use krishiv_api::{QueryResult, Session, SessionBuilder};
 use krishiv_common::async_util::block_on;
-use krishiv_lakehouse::HudiQueryType;
+use krishiv_connectors::lakehouse::HudiQueryType;
 
 use crate::cli::CliResponse;
 

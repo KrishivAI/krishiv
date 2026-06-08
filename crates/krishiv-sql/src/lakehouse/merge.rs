@@ -97,20 +97,20 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
         .strip_prefix("delta:`")
         .and_then(|p| p.strip_suffix('`'))
     {
-        krishiv_lakehouse::merge_delta(path, source_batches, merge_key, true, true)
+        krishiv_connectors::lakehouse::merge_delta(path, source_batches, merge_key, true, true)
             .await
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?
     } else if let Some(path) = target.strip_prefix("delta.") {
-        krishiv_lakehouse::merge_delta(path, source_batches, merge_key, true, true)
+        krishiv_connectors::lakehouse::merge_delta(path, source_batches, merge_key, true, true)
             .await
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?
     } else if target.starts_with("iceberg:") {
         let r = dry_run_merge(ctx, &target, source_batches, merge_key).await?;
-        krishiv_lakehouse::MergeDeltaResult {
+        krishiv_connectors::lakehouse::MergeDeltaResult {
             rows_inserted: r.rows_inserted,
             rows_updated: r.rows_updated,
             rows_deleted: r.rows_deleted,
@@ -230,7 +230,7 @@ async fn dry_run_merge(
     })
 }
 
-fn merge_result_batch(result: krishiv_lakehouse::MergeDeltaResult) -> RecordBatch {
+fn merge_result_batch(result: krishiv_connectors::lakehouse::MergeDeltaResult) -> RecordBatch {
     merge_metrics_batch(
         result.rows_inserted,
         result.rows_updated,

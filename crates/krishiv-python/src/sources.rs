@@ -125,7 +125,7 @@ fn read_iceberg_impl(
     use crate::schema::PySchema;
     use std::sync::Arc;
 
-    use krishiv_lakehouse::{
+    use krishiv_connectors::lakehouse::{
         IcebergScanOptions, IcebergTableRef, LakehouseTable, MemoryLakehouseTable, SchemaField,
         SchemaVersion,
     };

@@ -12,11 +12,10 @@ chrono = { workspace = true }
 dashmap = { workspace = true }
 thiserror = { workspace = true }
 datafusion = { workspace = true }
-krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse", "iceberg", "s3"] }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse", "iceberg", "s3", "delta", "hudi"] }
 krishiv-cep = { path = "../krishiv-cep" }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-governance = { path = "../krishiv-governance" }
-krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-optimizer = { path = "../krishiv-optimizer" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-udf = { path = "../krishiv-udf" }
@@ -34,7 +33,7 @@ tokio-stream.workspace = true
 
 [features]
 default = ["delta"]
-delta = ["krishiv-lakehouse/delta"]
+delta = ["krishiv-connectors/delta"]
 
 [dev-dependencies]
 tokio = { workspace = true }

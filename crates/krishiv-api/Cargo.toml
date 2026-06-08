@@ -16,7 +16,7 @@ krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
 krishiv-state = { path = "../krishiv-state" }
 krishiv-exec = { path = "../krishiv-exec" }
-krishiv-lakehouse = { path = "../krishiv-lakehouse" }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse", "hudi"] }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-udf = { path = "../krishiv-udf" }
 dashmap = { workspace = true }

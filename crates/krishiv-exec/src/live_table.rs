@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_lakehouse::{DeltaOp, DeltaStore, MemoryDeltaStore};
+use krishiv_connectors::lakehouse::{DeltaOp, DeltaStore, MemoryDeltaStore};
 
 use crate::ExecError;
 use crate::schema_normalize::SchemaNormalizeOperator;
@@ -104,7 +104,7 @@ mod tests {
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
-    use krishiv_lakehouse::DeltaOp;
+    use krishiv_connectors::lakehouse::DeltaOp;
 
     use super::*;
 

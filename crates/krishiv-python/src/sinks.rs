@@ -155,7 +155,7 @@ impl PyIcebergSink {
         #[cfg(feature = "iceberg")]
         {
             use krishiv_common::async_util::block_on;
-            use krishiv_lakehouse::IcebergFsTable;
+            use krishiv_connectors::lakehouse::IcebergFsTable;
             use std::path::PathBuf;
 
             let records: Vec<arrow::record_batch::RecordBatch> =

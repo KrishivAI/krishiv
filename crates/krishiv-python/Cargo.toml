@@ -13,10 +13,9 @@ path = "src/lib.rs"
 [dependencies]
 krishiv-api = { path = "../krishiv-api" }
 krishiv-common = { path = "../krishiv-common" }
-krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse", "schema-registry"] }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse", "schema-registry", "iceberg", "hudi"] }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-governance = { path = "../krishiv-governance" }
-krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-state = { path = "../krishiv-state" }
 krishiv-ai = { path = "../krishiv-ai", optional = true }
@@ -36,7 +35,7 @@ futures.workspace = true
 default = []
 extension-module = ["pyo3/extension-module"]
 kafka = ["krishiv-connectors/kafka"]
-iceberg = ["krishiv-lakehouse/iceberg"]
+iceberg = ["krishiv-connectors/iceberg"]
 ai = ["dep:krishiv-ai", "krishiv-ai/fastembed-local"]
 vector-sinks = ["ai", "krishiv-ai/vector-sinks"]
 qdrant = ["dep:krishiv-ai", "krishiv-ai/qdrant"]
