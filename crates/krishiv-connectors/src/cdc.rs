@@ -569,7 +569,7 @@ impl CdcToLakehousePipeline {
     ) -> Result<Vec<i64>, ConnectorError>
     where
         S: CdcEventSource,
-        I: krishiv_lakehouse::IcebergTwoPhaseCommit,
+        I: crate::lakehouse::IcebergTwoPhaseCommit,
     {
         self.run_with_iceberg_sink_inner(source, iceberg, shutdown, None)
             .await
@@ -588,7 +588,7 @@ impl CdcToLakehousePipeline {
     ) -> Result<Vec<i64>, ConnectorError>
     where
         S: CdcEventSource,
-        I: krishiv_lakehouse::IcebergTwoPhaseCommit,
+        I: crate::lakehouse::IcebergTwoPhaseCommit,
     {
         self.run_with_iceberg_sink_inner(source, iceberg, shutdown, Some(max_commits))
             .await
@@ -603,7 +603,7 @@ impl CdcToLakehousePipeline {
     ) -> Result<Vec<i64>, ConnectorError>
     where
         S: CdcEventSource,
-        I: krishiv_lakehouse::IcebergTwoPhaseCommit,
+        I: crate::lakehouse::IcebergTwoPhaseCommit,
     {
         self.validate()?;
         let mut schema_state = CdcSchemaEvolutionState::default();
@@ -703,7 +703,7 @@ impl CdcToLakehousePipeline {
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Vec<i64>, ConnectorError>
     where
-        I: krishiv_lakehouse::IcebergTwoPhaseCommit,
+        I: crate::lakehouse::IcebergTwoPhaseCommit,
     {
         self.validate()?;
         let config = KafkaCdcConfig::new(
@@ -1908,7 +1908,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_iceberg_sink_commits_snapshot_then_offsets() {
-        use krishiv_lakehouse::{
+        use crate::lakehouse::{
             IcebergTableRef, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable, SchemaField,
             SchemaVersion,
         };
@@ -1975,7 +1975,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_iceberg_sink_preserves_source_offsets() {
-        use krishiv_lakehouse::{
+        use crate::lakehouse::{
             IcebergTableRef, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable, SchemaField,
             SchemaVersion,
         };

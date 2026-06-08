@@ -12,7 +12,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::{LakehouseError, LakehouseResult};
+use super::{LakehouseError, LakehouseResult};
 
 /// Hudi query type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -4040,10 +4040,11 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "chrono",
  "dashmap",
  "futures",
+ "iceberg",
  "krishiv-common",
- "krishiv-lakehouse",
  "krishiv-proto",
  "krishiv-state",
  "mockito",
@@ -4053,6 +4054,7 @@ dependencies = [
  "prost 0.14.3",
  "qdrant-client",
  "rdkafka",
+ "redb",
  "regex",
  "reqwest 0.13.4",
  "serde",
@@ -4063,6 +4065,7 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
+ "url",
  "wiremock",
 ]
 
@@ -4168,24 +4171,9 @@ dependencies = [
 name = "krishiv-lakehouse"
 version = "0.1.0"
 dependencies = [
- "arrow",
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "iceberg",
  "krishiv-connectors",
- "object_store",
- "parquet 58.3.0",
- "rdkafka",
- "redb",
- "serde",
- "serde_json",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]

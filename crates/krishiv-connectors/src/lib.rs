@@ -6,6 +6,8 @@
 
 // Submodules with implementations
 #[cfg(feature = "lakehouse")]
+pub mod lakehouse;
+#[cfg(feature = "lakehouse")]
 pub mod cdc;
 #[cfg(all(feature = "lakehouse", feature = "kafka"))]
 pub mod cdc_router;
@@ -78,3 +80,19 @@ pub use feature_store::{FeatureRow, FeatureStoreSink, InMemoryFeatureStream};
 
 #[cfg(all(feature = "state", feature = "lakehouse"))]
 pub use cdc::CdcOffsetTracker;
+
+#[cfg(feature = "lakehouse")]
+pub use lakehouse::{
+    AsOfSpec, DeltaEntry, DeltaObjectStoreReader, DeltaOp, DeltaStore, DeltaTableHandle,
+    DeltaWriteMode, HudiCowWriter, HudiObjectStoreReader, HudiObjectStoreWriter, HudiQueryType,
+    HudiSnapshotReader, HudiWriteResult, IcebergFsTable, IcebergScanOptions, IcebergTableRef,
+    IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY, LakehouseError, LakehouseResult,
+    LakehouseTable, MemoryDeltaStore, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable,
+    MergeDeltaResult, MultiWriterGuard, PartitionField, PartitionSpecResolver,
+    PartitionSpecVersion, RedbDeltaStore, SchemaField, SchemaVersion, StagedSnapshot,
+    check_write_precondition, kafka_offsets_json, merge_delta, parse_kafka_offsets_json,
+    remove_merge_key_column, write_delta, write_hudi_cow_append, write_hudi_cow_fixture,
+    write_hudi_cow_upsert,
+};
+#[cfg(all(feature = "lakehouse", feature = "kafka"))]
+pub use lakehouse::{KafkaDeltaStore, RdkafkaDeltaStore};

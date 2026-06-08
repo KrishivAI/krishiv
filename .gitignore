@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 .tmp/
+tmp/
 **/target/
 **/.fastembed_cache/
 /.DS_Store

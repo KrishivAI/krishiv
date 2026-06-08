@@ -5,8 +5,8 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::local_delta;
-use crate::{LakehouseError, LakehouseResult};
+use super::local_delta;
+use super::{LakehouseError, LakehouseResult};
 
 /// Write mode for Delta tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

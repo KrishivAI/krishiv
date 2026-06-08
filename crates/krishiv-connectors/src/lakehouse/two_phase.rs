@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 
-use crate::{LakehouseError, LakehouseTable, MemoryLakehouseTable};
+use super::{LakehouseError, LakehouseTable, MemoryLakehouseTable};
 
 pub const KAFKA_OFFSETS_SUMMARY_KEY: &str = "krishiv.kafka.committed_offsets";
 
@@ -105,7 +105,9 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use crate::{IcebergTableRef, MemoryLakehouseTable, SchemaField, SchemaVersion};
+    use crate::lakehouse::{
+        IcebergTableRef, MemoryLakehouseTable, SchemaField, SchemaVersion,
+    };
 
     use super::*;
 

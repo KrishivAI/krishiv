@@ -8,7 +8,7 @@ use arrow::record_batch::RecordBatch;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::LakehouseError;
+use super::LakehouseError;
 
 const DELTA_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("delta_log");
 
