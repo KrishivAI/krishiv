@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use krishiv_common::PRODUCTION_ENV;
-use krishiv_governance::{AuthProvider, Principal, Role, StaticApiKeyAuthProvider};
+use krishiv_plan::governance::{AuthProvider, Principal, Role, StaticApiKeyAuthProvider};
 
 // ── gRPC auth enforcement (P3-20) ─────────────────────────────────────────────
 
@@ -448,7 +448,7 @@ macro_rules! require_auth {
 ///
 /// Reads the `authorization` header. If it starts with `"Bearer "` the token
 /// is extracted and returned as `Bearer { subject: <token> }`. In R9 the token
-/// is the API key validated by `krishiv_governance::StaticApiKeyAuthProvider`;
+/// is the API key validated by `krishiv_plan::governance::StaticApiKeyAuthProvider`;
 /// JWT/OIDC validation is deferred to R10.
 ///
 /// Returns `Anonymous` when no header is present or parsing fails.

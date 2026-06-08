@@ -11,13 +11,13 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::function::AccumulatorFactoryFunction;
 use datafusion::logical_expr::{Accumulator, ColumnarValue, Volatility, create_udaf, create_udf};
 
-use krishiv_udf::{DefaultSandboxedExecutor, ResourceLimits, SandboxedUdfExecutor};
+use krishiv_plan::udf::{DefaultSandboxedExecutor, ResourceLimits, SandboxedUdfExecutor};
 
 /// Register every scalar UDF in `registry` with the DataFusion session context.
 /// Uses unlimited (default) ResourceLimits for backward compatibility.
 pub fn sync_scalar_udfs(
     ctx: &datafusion::prelude::SessionContext,
-    registry: &krishiv_udf::UdfRegistry,
+    registry: &krishiv_plan::udf::UdfRegistry,
 ) -> Result<(), DataFusionError> {
     sync_scalar_udfs_with_limits(ctx, registry, ResourceLimits::default())
 }
@@ -27,7 +27,7 @@ pub fn sync_scalar_udfs(
 /// from the job; DefaultSandboxedExecutor will enforce them at execution time.
 pub fn sync_scalar_udfs_with_limits(
     ctx: &datafusion::prelude::SessionContext,
-    registry: &krishiv_udf::UdfRegistry,
+    registry: &krishiv_plan::udf::UdfRegistry,
     limits: ResourceLimits,
 ) -> Result<(), DataFusionError> {
     sync_scalar_udfs_with_limits_for_profile(
@@ -44,7 +44,7 @@ pub fn sync_scalar_udfs_with_limits(
 /// duration of a higher-level registration operation.
 pub fn sync_scalar_udfs_with_limits_for_profile(
     ctx: &datafusion::prelude::SessionContext,
-    registry: &krishiv_udf::UdfRegistry,
+    registry: &krishiv_plan::udf::UdfRegistry,
     limits: ResourceLimits,
     profile: krishiv_common::DurabilityProfile,
 ) -> Result<(), DataFusionError> {
@@ -58,7 +58,7 @@ pub fn sync_scalar_udfs_with_limits_for_profile(
 
 pub(crate) fn sync_scalar_udfs_with_limits_for_policy(
     ctx: &datafusion::prelude::SessionContext,
-    registry: &krishiv_udf::UdfRegistry,
+    registry: &krishiv_plan::udf::UdfRegistry,
     limits: ResourceLimits,
     policy: krishiv_common::NativeScalarUdfPolicy,
 ) -> Result<(), DataFusionError> {
@@ -120,7 +120,7 @@ pub(crate) fn sync_scalar_udfs_with_limits_for_policy(
 /// Register aggregate UDFs from `registry` with DataFusion (P1-21).
 pub fn sync_aggregate_udfs(
     ctx: &datafusion::prelude::SessionContext,
-    registry: &krishiv_udf::UdfRegistry,
+    registry: &krishiv_plan::udf::UdfRegistry,
 ) -> Result<(), DataFusionError> {
     let profile = krishiv_common::resolve_durability_profile();
     if krishiv_common::profile_forbids_native_scalar_udfs(profile)
@@ -156,7 +156,7 @@ pub fn sync_aggregate_udfs(
                 let udf = Arc::clone(&udf);
                 Ok(Box::new(KrishivAggregateAccumulator {
                     udf,
-                    state: krishiv_udf::AggState::default(),
+                    state: krishiv_plan::udf::AggState::default(),
                 }) as Box<dyn Accumulator>)
             }
         });
@@ -175,11 +175,11 @@ pub fn sync_aggregate_udfs(
     Ok(())
 }
 
-/// DataFusion Accumulator bridge that delegates to a [`krishiv_udf::AggregateUdf`].
+/// DataFusion Accumulator bridge that delegates to a [`krishiv_plan::udf::AggregateUdf`].
 #[derive(Debug)]
 struct KrishivAggregateAccumulator {
-    udf: Arc<dyn krishiv_udf::AggregateUdf>,
-    state: krishiv_udf::AggState,
+    udf: Arc<dyn krishiv_plan::udf::AggregateUdf>,
+    state: krishiv_plan::udf::AggState,
 }
 
 impl Accumulator for KrishivAggregateAccumulator {
@@ -234,7 +234,7 @@ impl Accumulator for KrishivAggregateAccumulator {
                     "merge_batch: offset out of bounds".into(),
                 ));
             }
-            let other = krishiv_udf::AggState {
+            let other = krishiv_plan::udf::AggState {
                 data: data_slice[start..end].to_vec(),
             };
             let old_state = std::mem::take(&mut self.state);
@@ -291,16 +291,16 @@ fn read_offset(buf: &[u8], pos: usize, width: usize) -> datafusion::error::Resul
 }
 
 fn krishiv_scalar_to_datafusion(
-    value: &krishiv_udf::ScalarValue,
+    value: &krishiv_plan::udf::ScalarValue,
 ) -> datafusion::error::Result<datafusion::scalar::ScalarValue> {
     use datafusion::scalar::ScalarValue as DfScalar;
     match value {
-        krishiv_udf::ScalarValue::Null => Ok(DfScalar::Null),
-        krishiv_udf::ScalarValue::Int64(v) => Ok(DfScalar::Int64(Some(*v))),
-        krishiv_udf::ScalarValue::Float64(v) => Ok(DfScalar::Float64(Some(*v))),
-        krishiv_udf::ScalarValue::Utf8(v) => Ok(DfScalar::Utf8(Some(v.clone()))),
-        krishiv_udf::ScalarValue::Boolean(v) => Ok(DfScalar::Boolean(Some(*v))),
-        krishiv_udf::ScalarValue::Bytes(v) => Ok(DfScalar::Binary(Some(v.clone()))),
+        krishiv_plan::udf::ScalarValue::Null => Ok(DfScalar::Null),
+        krishiv_plan::udf::ScalarValue::Int64(v) => Ok(DfScalar::Int64(Some(*v))),
+        krishiv_plan::udf::ScalarValue::Float64(v) => Ok(DfScalar::Float64(Some(*v))),
+        krishiv_plan::udf::ScalarValue::Utf8(v) => Ok(DfScalar::Utf8(Some(v.clone()))),
+        krishiv_plan::udf::ScalarValue::Boolean(v) => Ok(DfScalar::Boolean(Some(*v))),
+        krishiv_plan::udf::ScalarValue::Bytes(v) => Ok(DfScalar::Binary(Some(v.clone()))),
     }
 }
 
@@ -308,7 +308,7 @@ fn krishiv_scalar_to_datafusion(
 /// `SqlEngine` when registering a `LANGUAGE sql` UDTF at DDL time).
 pub fn register_single_table_udf(
     ctx: &datafusion::prelude::SessionContext,
-    udf: Arc<dyn krishiv_udf::TableUdf>,
+    udf: Arc<dyn krishiv_plan::udf::TableUdf>,
 ) -> Result<(), DataFusionError> {
     let udf_name = udf.name().to_string();
     let output_schema = udf.output_schema().clone();
@@ -325,7 +325,7 @@ pub fn register_single_table_udf(
 /// Register table UDFs from `registry` with DataFusion (P1-21).
 pub fn sync_table_udfs(
     ctx: &datafusion::prelude::SessionContext,
-    registry: &krishiv_udf::UdfRegistry,
+    registry: &krishiv_plan::udf::UdfRegistry,
 ) -> Result<(), DataFusionError> {
     for name in registry.table_names() {
         let Some(udf) = registry.get_table(name) else {
@@ -349,7 +349,7 @@ pub fn sync_table_udfs(
 
 #[derive(Debug)]
 struct KrishivTableFunctionImpl {
-    inner: Arc<dyn krishiv_udf::TableUdf>,
+    inner: Arc<dyn krishiv_plan::udf::TableUdf>,
     schema: arrow::datatypes::Schema,
 }
 
@@ -362,7 +362,7 @@ impl TableFunctionImpl for KrishivTableFunctionImpl {
         // pass them to the UDTF body. Computed expressions cannot be evaluated
         // correctly at this synchronous table-function boundary, so fail
         // closed instead of silently replacing them with NULL.
-        let scalar_args: Vec<krishiv_udf::ScalarValue> =
+        let scalar_args: Vec<krishiv_plan::udf::ScalarValue> =
             args.iter()
                 .map(expr_to_scalar)
                 .collect::<datafusion::error::Result<_>>()?;
@@ -375,55 +375,55 @@ impl TableFunctionImpl for KrishivTableFunctionImpl {
     }
 }
 
-/// Extract a [`krishiv_udf::ScalarValue`] from a DataFusion literal expression.
+/// Extract a [`krishiv_plan::udf::ScalarValue`] from a DataFusion literal expression.
 fn expr_to_scalar(
     expr: &datafusion::logical_expr::Expr,
-) -> datafusion::error::Result<krishiv_udf::ScalarValue> {
+) -> datafusion::error::Result<krishiv_plan::udf::ScalarValue> {
     use datafusion::logical_expr::Expr;
     use datafusion::scalar::ScalarValue as DfScalar;
     match expr {
-        Expr::Literal(value, _) if value.is_null() => Ok(krishiv_udf::ScalarValue::Null),
+        Expr::Literal(value, _) if value.is_null() => Ok(krishiv_plan::udf::ScalarValue::Null),
         Expr::Literal(DfScalar::Int8(Some(v)), _) => {
-            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+            Ok(krishiv_plan::udf::ScalarValue::Int64(i64::from(*v)))
         }
         Expr::Literal(DfScalar::Int16(Some(v)), _) => {
-            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+            Ok(krishiv_plan::udf::ScalarValue::Int64(i64::from(*v)))
         }
         Expr::Literal(DfScalar::Int32(Some(v)), _) => {
-            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+            Ok(krishiv_plan::udf::ScalarValue::Int64(i64::from(*v)))
         }
-        Expr::Literal(DfScalar::Int64(Some(v)), _) => Ok(krishiv_udf::ScalarValue::Int64(*v)),
+        Expr::Literal(DfScalar::Int64(Some(v)), _) => Ok(krishiv_plan::udf::ScalarValue::Int64(*v)),
         Expr::Literal(DfScalar::UInt8(Some(v)), _) => {
-            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+            Ok(krishiv_plan::udf::ScalarValue::Int64(i64::from(*v)))
         }
         Expr::Literal(DfScalar::UInt16(Some(v)), _) => {
-            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+            Ok(krishiv_plan::udf::ScalarValue::Int64(i64::from(*v)))
         }
         Expr::Literal(DfScalar::UInt32(Some(v)), _) => {
-            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+            Ok(krishiv_plan::udf::ScalarValue::Int64(i64::from(*v)))
         }
         Expr::Literal(DfScalar::UInt64(Some(v)), _) => i64::try_from(*v)
-            .map(krishiv_udf::ScalarValue::Int64)
+            .map(krishiv_plan::udf::ScalarValue::Int64)
             .map_err(|_| {
                 DataFusionError::Execution(format!(
                     "UDTF unsigned integer argument {v} exceeds the supported i64 range"
                 ))
             }),
         Expr::Literal(DfScalar::Float32(Some(v)), _) => {
-            Ok(krishiv_udf::ScalarValue::Float64(f64::from(*v)))
+            Ok(krishiv_plan::udf::ScalarValue::Float64(f64::from(*v)))
         }
-        Expr::Literal(DfScalar::Float64(Some(v)), _) => Ok(krishiv_udf::ScalarValue::Float64(*v)),
+        Expr::Literal(DfScalar::Float64(Some(v)), _) => Ok(krishiv_plan::udf::ScalarValue::Float64(*v)),
         Expr::Literal(DfScalar::Utf8(Some(v)), _)
         | Expr::Literal(DfScalar::Utf8View(Some(v)), _)
         | Expr::Literal(DfScalar::LargeUtf8(Some(v)), _) => {
-            Ok(krishiv_udf::ScalarValue::Utf8(v.clone()))
+            Ok(krishiv_plan::udf::ScalarValue::Utf8(v.clone()))
         }
-        Expr::Literal(DfScalar::Boolean(Some(v)), _) => Ok(krishiv_udf::ScalarValue::Boolean(*v)),
+        Expr::Literal(DfScalar::Boolean(Some(v)), _) => Ok(krishiv_plan::udf::ScalarValue::Boolean(*v)),
         Expr::Literal(DfScalar::Binary(Some(v)), _)
         | Expr::Literal(DfScalar::BinaryView(Some(v)), _)
         | Expr::Literal(DfScalar::LargeBinary(Some(v)), _)
         | Expr::Literal(DfScalar::FixedSizeBinary(_, Some(v)), _) => {
-            Ok(krishiv_udf::ScalarValue::Bytes(v.clone()))
+            Ok(krishiv_plan::udf::ScalarValue::Bytes(v.clone()))
         }
         Expr::Literal(value, _) => Err(DataFusionError::Execution(format!(
             "unsupported UDTF literal argument {value:?}"
@@ -492,7 +492,7 @@ fn columnar_values_to_record_batch(
 mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
-    use krishiv_udf::{MultiplyScalarUdf, ResourceLimits, UdfRegistry};
+    use krishiv_plan::udf::{MultiplyScalarUdf, ResourceLimits, UdfRegistry};
 
     #[test]
     fn sync_scalar_udfs_with_limits_accepts_non_default_budget() {

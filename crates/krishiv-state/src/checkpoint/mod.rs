@@ -3196,7 +3196,7 @@ mod tests {
     fn rescaler_task_for_key_group_covers_full_range() {
         let rescaler = super::rescaling::KeyGroupRescaler::new(4, 4);
         let mut tasks_used = std::collections::HashSet::new();
-        for kg in 0..krishiv_state::key_group::NUM_KEY_GROUPS {
+        for kg in 0..crate::key_group::NUM_KEY_GROUPS {
             let task = rescaler.task_for_key_group(kg);
             assert!(task < 4);
             tasks_used.insert(task);
@@ -3224,7 +3224,7 @@ mod tests {
         // range contains that key group.
         for new_p in [1u32, 2, 3, 4, 8, 16, 32] {
             let rescaler = super::rescaling::KeyGroupRescaler::new(4, new_p);
-            for kg in 0..krishiv_state::key_group::NUM_KEY_GROUPS {
+            for kg in 0..crate::key_group::NUM_KEY_GROUPS {
                 let task = rescaler.task_for_key_group(kg);
                 let range = rescaler.range_for_task(task).unwrap();
                 assert!(
@@ -3654,7 +3654,7 @@ mod tests {
 
     #[tokio::test]
     async fn object_store_checkpoint_write_read_roundtrip() {
-        use crate::object_store::ObjectStoreCheckpointStorage;
+        use crate::checkpoint::object_store::ObjectStoreCheckpointStorage;
         use std::sync::Arc;
 
         let inner = Arc::new(::object_store::memory::InMemory::new());
@@ -3674,7 +3674,7 @@ mod tests {
 
     #[tokio::test]
     async fn object_store_checkpoint_missing_returns_none() {
-        use crate::object_store::ObjectStoreCheckpointStorage;
+        use crate::checkpoint::object_store::ObjectStoreCheckpointStorage;
         use std::sync::Arc;
 
         let inner = Arc::new(::object_store::memory::InMemory::new());

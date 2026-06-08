@@ -142,7 +142,7 @@ mod tests {
     use arrow::array::ArrayRef;
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use krishiv_udf::ScalarUdf;
+    use krishiv_plan::udf::ScalarUdf;
 
     use crate::RUNTIME;
     use crate::call_python_udf;
@@ -208,7 +208,7 @@ mod tests {
                 });
                 &FIELD
             }
-            fn call(&self, _batch: &RecordBatch) -> Result<ArrayRef, krishiv_udf::UdfError> {
+            fn call(&self, _batch: &RecordBatch) -> Result<ArrayRef, krishiv_plan::udf::UdfError> {
                 panic!("intentional panic from test")
             }
         }
@@ -218,14 +218,14 @@ mod tests {
         let batch = RecordBatch::new_empty(schema);
         let result = RUNTIME.block_on(call_python_udf(udf, batch));
         assert!(
-            matches!(result, Err(krishiv_udf::UdfError::Panic(_))),
+            matches!(result, Err(krishiv_plan::udf::UdfError::Panic(_))),
             "expected UdfError::Panic, got: {result:?}"
         );
     }
 
     #[test]
     fn python_scalar_udf_name() {
-        let udf = krishiv_udf::MultiplyScalarUdf::new("my_udf", "x", 2);
+        let udf = krishiv_plan::udf::MultiplyScalarUdf::new("my_udf", "x", 2);
         assert_eq!(udf.name(), "my_udf");
     }
 

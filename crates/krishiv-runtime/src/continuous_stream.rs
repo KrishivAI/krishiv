@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
-use krishiv_exec::ContinuousWindowExecutor;
+use krishiv_dataflow::ContinuousWindowExecutor;
 use krishiv_plan::window::WindowExecutionSpec;
 
 use crate::RuntimeResult;
@@ -403,7 +403,7 @@ impl ContinuousStreamRegistry {
         spec: WindowExecutionSpec,
         snapshot_bytes: &[u8],
     ) -> RuntimeResult<()> {
-        use krishiv_exec::ContinuousWindowExecutor;
+        use krishiv_dataflow::ContinuousWindowExecutor;
         let job_id = job_id.into();
         if job_id.trim().is_empty() {
             return Err(ContinuousStreamError::InvalidJobId.into());

@@ -7,14 +7,14 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_common::async_util::block_on;
-use krishiv_governance::{AuthProvider, PolicyHook};
+use krishiv_plan::governance::{AuthProvider, PolicyHook};
 use krishiv_runtime::{
     BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobStatus,
     LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
 };
 use krishiv_sql::policy::PolicyEnforcingSqlEngine;
 use krishiv_sql::{ContinuousTableInput, SqlEngine};
-use krishiv_udf::{ScalarUdf, UdfRegistry};
+use krishiv_plan::udf::{ScalarUdf, UdfRegistry};
 
 use crate::dataframe::DataFrame;
 use crate::error::{KrishivError, Result};
@@ -669,7 +669,7 @@ impl Session {
         };
 
         let sync_result = block_on(self.sql_engine.sync_scalar_udfs_with_limits_for_policy(
-            krishiv_udf::ResourceLimits::default(),
+            krishiv_plan::udf::ResourceLimits::default(),
             policy,
         ));
         if let Err(error) = sync_result {
@@ -1202,7 +1202,7 @@ pub(crate) async fn runtime_collect_batch_sql(
 #[cfg(test)]
 mod udf_registration_tests {
     use super::*;
-    use krishiv_udf::MultiplyScalarUdf;
+    use krishiv_plan::udf::MultiplyScalarUdf;
 
     #[test]
     fn durable_profile_rejects_registration_without_mutating_registry() {

@@ -11,21 +11,19 @@ arrow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
-krishiv-governance = { path = "../krishiv-governance" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
 krishiv-state = { path = "../krishiv-state" }
-krishiv-exec = { path = "../krishiv-exec" }
+krishiv-dataflow = { path = "../krishiv-dataflow" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse", "hudi"] }
 krishiv-sql = { path = "../krishiv-sql" }
-krishiv-udf = { path = "../krishiv-udf" }
 dashmap = { workspace = true }
 tokio = { workspace = true }
 futures.workspace = true
 
 [dev-dependencies]
 krishiv-common = { path = "../krishiv-common" }
-krishiv-udf = { path = "../krishiv-udf" }
+krishiv-plan = { path = "../krishiv-plan" }
 krishiv-flight-sql = { path = "../krishiv-flight-sql" }
 parquet = { workspace = true }
 tempfile = { workspace = true }

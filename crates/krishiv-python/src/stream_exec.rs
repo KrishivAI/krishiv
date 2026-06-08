@@ -186,7 +186,7 @@ pub(crate) fn spawn_pipeline_stream(
 
             use futures::StreamExt;
             let mapped_input_stream = input_stream
-                .map(|res| res.map_err(|e| krishiv_exec::ExecError::InvalidWindowConfig(e)));
+                .map(|res| res.map_err(|e| krishiv_dataflow::ExecError::InvalidWindowConfig(e)));
 
             let output_res =
                 krishiv_api::execute_streaming_window(Box::pin(mapped_input_stream), &spec);

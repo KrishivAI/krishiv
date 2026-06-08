@@ -19,7 +19,7 @@ use datafusion::dataframe::DataFrame as DataFusionDataFrame;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, parser::Parser};
 
-use krishiv_optimizer::{CostModel, Optimizer};
+use krishiv_plan::optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
 pub mod catalog;
@@ -129,7 +129,7 @@ pub enum SqlError {
     DataFusion { message: String },
     /// Krishiv logical-plan optimization failed.
     #[error(transparent)]
-    Optimizer(#[from] krishiv_optimizer::OptimizerError),
+    Optimizer(#[from] krishiv_plan::optimizer::OptimizerError),
     /// Access denied by auth or policy check.
     #[error("access denied: {reason}")]
     AccessDenied { reason: String },
@@ -223,7 +223,7 @@ pub struct SqlEngine {
     context: SessionContext,
     krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
     view_registry: Option<std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>>,
-    udf_registry: Option<std::sync::Arc<std::sync::RwLock<krishiv_udf::UdfRegistry>>>,
+    udf_registry: Option<std::sync::Arc<std::sync::RwLock<krishiv_plan::udf::UdfRegistry>>>,
     /// Table names registered as unbounded streaming sources.
     /// Wrapped in `Arc<RwLock<>>` so that Session clones share the same set.
     streaming_sources: Arc<RwLock<std::collections::HashSet<String>>>,
@@ -236,7 +236,7 @@ pub struct SqlEngine {
     has_streaming_sources: Arc<AtomicBool>,
     /// Optional UDF resource limits to apply when syncing UDFs for this engine.
     /// Set for job-specific engines so sandbox enforcement uses the job's budgets.
-    udf_limits: Option<krishiv_udf::ResourceLimits>,
+    udf_limits: Option<krishiv_plan::udf::ResourceLimits>,
     /// Monotonically increasing version counter; incremented on every UDF
     /// registration or removal. Used to skip `sync_all_udfs()` when nothing
     /// has changed since the last sync.
@@ -636,7 +636,7 @@ impl SqlEngine {
     /// Configure this engine with explicit UDF resource limits (Track E).
     /// When set, calls to `sql()` and direct UDF syncs will use these budgets
     /// instead of unlimited defaults. Intended for job-specific engines.
-    pub fn with_udf_limits(mut self, limits: krishiv_udf::ResourceLimits) -> Self {
+    pub fn with_udf_limits(mut self, limits: krishiv_plan::udf::ResourceLimits) -> Self {
         self.udf_limits = Some(limits);
         self
     }
@@ -729,8 +729,8 @@ impl SqlEngine {
         name: impl Into<String>,
         schema: arrow::datatypes::Schema,
         f: impl Fn(
-            &[krishiv_udf::ScalarValue],
-        ) -> Result<arrow::record_batch::RecordBatch, krishiv_udf::UdfError>
+            &[krishiv_plan::udf::ScalarValue],
+        ) -> Result<arrow::record_batch::RecordBatch, krishiv_plan::udf::UdfError>
         + Send
         + Sync
         + 'static,
@@ -797,7 +797,7 @@ impl SqlEngine {
     #[must_use]
     pub fn with_udf_registry(
         mut self,
-        registry: std::sync::Arc<std::sync::RwLock<krishiv_udf::UdfRegistry>>,
+        registry: std::sync::Arc<std::sync::RwLock<krishiv_plan::udf::UdfRegistry>>,
     ) -> Self {
         self.udf_registry = Some(registry);
         // Mark UDFs as dirty so the first sql() call syncs them.
@@ -851,7 +851,7 @@ impl SqlEngine {
     /// This is the concrete Track E seam from job limits to UDF execution.
     pub async fn sync_scalar_udfs_with_limits(
         &self,
-        limits: krishiv_udf::ResourceLimits,
+        limits: krishiv_plan::udf::ResourceLimits,
     ) -> SqlResult<()> {
         self.sync_scalar_udfs_with_limits_for_profile(
             limits,
@@ -863,7 +863,7 @@ impl SqlEngine {
     /// Register scalar UDFs using a caller-resolved durability profile.
     pub async fn sync_scalar_udfs_with_limits_for_profile(
         &self,
-        limits: krishiv_udf::ResourceLimits,
+        limits: krishiv_plan::udf::ResourceLimits,
         profile: krishiv_common::DurabilityProfile,
     ) -> SqlResult<()> {
         self.sync_scalar_udfs_with_limits_for_policy(
@@ -876,7 +876,7 @@ impl SqlEngine {
     /// Register scalar UDFs using a caller-snapshotted policy decision.
     pub async fn sync_scalar_udfs_with_limits_for_policy(
         &self,
-        limits: krishiv_udf::ResourceLimits,
+        limits: krishiv_plan::udf::ResourceLimits,
         policy: krishiv_common::NativeScalarUdfPolicy,
     ) -> SqlResult<()> {
         let Some(registry) = &self.udf_registry else {
@@ -1109,7 +1109,7 @@ impl SqlEngine {
                 })
                 .collect();
             let schema = arrow::datatypes::Schema::new(fields);
-            let udf: std::sync::Arc<dyn krishiv_udf::TableUdf> = std::sync::Arc::new(
+            let udf: std::sync::Arc<dyn krishiv_plan::udf::TableUdf> = std::sync::Arc::new(
                 create_function_ddl::SqlBodyTableUdf::try_new(
                     &ddl.function_name,
                     schema,
@@ -1803,7 +1803,7 @@ mod view_cache_tests {
 
 #[cfg(test)]
 mod tests {
-    use krishiv_optimizer::{Cost, CostModel, Optimizer, OptimizerError, OptimizerRule};
+    use krishiv_plan::optimizer::{Cost, CostModel, Optimizer, OptimizerError, OptimizerRule};
     use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
     use super::{
@@ -1990,13 +1990,13 @@ mod tests {
 mod udf_sql_tests {
     use std::sync::Arc;
 
-    use krishiv_udf::MultiplyScalarUdf;
+    use krishiv_plan::udf::MultiplyScalarUdf;
 
     use super::SqlEngine;
 
     #[tokio::test]
     async fn registered_scalar_udf_visible_in_sql() {
-        let registry = Arc::new(std::sync::RwLock::new(krishiv_udf::UdfRegistry::new()));
+        let registry = Arc::new(std::sync::RwLock::new(krishiv_plan::udf::UdfRegistry::new()));
         registry
             .write()
             .unwrap()
@@ -2044,7 +2044,7 @@ mod udtf_ddl_tests {
 
     #[tokio::test]
     async fn create_function_returns_table_rejects_unsupported_languages() {
-        let registry = Arc::new(std::sync::RwLock::new(krishiv_udf::UdfRegistry::new()));
+        let registry = Arc::new(std::sync::RwLock::new(krishiv_plan::udf::UdfRegistry::new()));
         let engine = SqlEngine::new().with_udf_registry(Arc::clone(&registry));
 
         let rust_result = engine

@@ -15,10 +15,8 @@ arrow = { workspace = true }
 axum = { workspace = true }
 base64 = "0.22"
 futures = { workspace = true }
-krishiv-checkpoint = { path = "../krishiv-checkpoint" }
-krishiv-governance = { path = "../krishiv-governance" }
+krishiv-state = { path = "../krishiv-state" }
 krishiv-metrics = { path = "../krishiv-metrics" }
-krishiv-optimizer = { path = "../krishiv-optimizer" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-shuffle = { path = "../krishiv-shuffle" }

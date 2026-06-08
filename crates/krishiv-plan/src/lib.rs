@@ -15,6 +15,10 @@ pub mod streaming;
 pub mod streaming_plan;
 pub mod task_fragment;
 pub mod window;
+pub mod udf;
+pub mod governance;
+pub mod optimizer;
+pub mod cep;
 pub use graph::lower_to_physical;
 pub use r17::{
     ChunkerConfig, DataSource, EmbedderConfig, FeatureDef, FeatureSchema, FeatureStore,

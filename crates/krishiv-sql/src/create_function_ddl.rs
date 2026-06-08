@@ -3,7 +3,7 @@
 //! DataFusion does not natively understand the Krishiv-extended
 //! `CREATE FUNCTION … RETURNS TABLE (col TYPE, …) LANGUAGE … AS '…'` syntax.
 //! This module intercepts such statements before they reach DataFusion and
-//! registers a [`TableUdf`][krishiv_udf::TableUdf] backed by either:
+//! registers a [`TableUdf`][krishiv_plan::udf::TableUdf] backed by either:
 //!
 //! * A SQL body (`LANGUAGE sql AS '…'`) — executed via the session context.
 //! * A runtime-provided Rust closure — registered via `SqlEngine::register_table_udf_fn`.
@@ -17,7 +17,7 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use regex::Regex;
 
-use krishiv_udf::{ScalarValue, TableUdf, UdfError};
+use krishiv_plan::udf::{ScalarValue, TableUdf, UdfError};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Parsed CREATE FUNCTION descriptor

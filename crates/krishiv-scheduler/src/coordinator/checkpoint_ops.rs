@@ -128,12 +128,12 @@ impl Coordinator {
         };
 
         if res.is_ok() {
-            krishiv_governance::audit_log(
+            krishiv_plan::governance::audit_log(
                 "scheduler",
-                &krishiv_governance::AuditAction::SavepointCreated {
+                &krishiv_plan::governance::AuditAction::SavepointCreated {
                     job_id: job_id.to_string(),
                 },
-                krishiv_governance::AuditOutcome::Allowed,
+                krishiv_plan::governance::AuditOutcome::Allowed,
             );
         }
         res
@@ -312,7 +312,7 @@ impl Coordinator {
         }
 
         let storage = Self::open_checkpoint_storage(storage_path)?;
-        let valid_epochs = krishiv_checkpoint::list_valid_epochs(storage.as_ref(), job_id.as_str())
+        let valid_epochs = krishiv_state::checkpoint::list_valid_epochs(storage.as_ref(), job_id.as_str())
             .map_err(|e| SchedulerError::InvalidJob {
                 message: format!("cannot list checkpoint epochs for job {job_id}: {e}"),
             })?;
@@ -320,7 +320,7 @@ impl Coordinator {
             .into_iter()
             .filter(|candidate| *candidate > epoch)
         {
-            krishiv_checkpoint::delete_epoch(storage.as_ref(), job_id.as_str(), future_epoch)
+            krishiv_state::checkpoint::delete_epoch(storage.as_ref(), job_id.as_str(), future_epoch)
                 .map_err(|e| SchedulerError::InvalidJob {
                     message: format!(
                         "cannot prune checkpoint epoch {future_epoch} after restoring job {job_id} \
@@ -328,7 +328,7 @@ impl Coordinator {
                     ),
                 })?;
         }
-        krishiv_checkpoint::write_epoch_hint(storage.as_ref(), job_id.as_str(), epoch).map_err(
+        krishiv_state::checkpoint::write_epoch_hint(storage.as_ref(), job_id.as_str(), epoch).map_err(
             |e| SchedulerError::InvalidJob {
                 message: format!("cannot activate checkpoint epoch {epoch} for job {job_id}: {e}"),
             },
@@ -351,13 +351,13 @@ impl Coordinator {
         self.barrier_dispatch_sent.retain(|(jid, _)| jid != job_id);
         self.notify.notify_waiters();
 
-        krishiv_governance::audit_log(
+        krishiv_plan::governance::audit_log(
             "scheduler",
-            &krishiv_governance::AuditAction::SavepointRestored {
+            &krishiv_plan::governance::AuditAction::SavepointRestored {
                 job_id: job_id.to_string(),
                 epoch,
             },
-            krishiv_governance::AuditOutcome::Allowed,
+            krishiv_plan::governance::AuditOutcome::Allowed,
         );
 
         Ok(metadata)

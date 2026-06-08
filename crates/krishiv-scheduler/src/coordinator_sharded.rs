@@ -162,9 +162,9 @@ impl CheckpointInner {
         &mut self,
         job_id: &JobId,
         epoch: u64,
-    ) -> krishiv_checkpoint::CheckpointResult<()> {
+    ) -> krishiv_state::checkpoint::CheckpointResult<()> {
         let coord = self.coordinators.get_mut(job_id).ok_or_else(|| {
-            krishiv_checkpoint::CheckpointError::Storage {
+            krishiv_state::checkpoint::CheckpointError::Storage {
                 message: format!(
                     "cannot finalize checkpoint epoch {epoch}: job {job_id} is not registered"
                 ),

@@ -71,7 +71,7 @@ pub enum SchedulerError {
     InvalidPlan { message: String },
     /// Adaptive query optimization failed.
     #[error(transparent)]
-    Optimizer(#[from] krishiv_optimizer::OptimizerError),
+    Optimizer(#[from] krishiv_plan::optimizer::OptimizerError),
     /// Coordinator/executor transport failed.
     #[error("transport error: {message}")]
     Transport { message: String },

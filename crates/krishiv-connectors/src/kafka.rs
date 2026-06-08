@@ -622,7 +622,7 @@ impl OffsetCommitter<KafkaOffset> for InMemoryKafkaOffsetCommitter {
 ///
 /// Each `read_batch` call polls a single Kafka message, deserialises the JSON
 /// payload into a single-row `RecordBatch` (all columns as `Utf8`), and returns
-/// it.  Offset commits are triggered when [`RdkafkaKafkaSource::commit_watermark`]
+/// it.  Offset commits are triggered when [`RdkafkaKafkaSource::commit_offsets`]
 /// is called — typically after the downstream sink has acknowledged the data —
 /// providing at-least-once delivery semantics.
 ///
@@ -750,22 +750,6 @@ impl RdkafkaKafkaSource {
                 topic = %self.topic,
                 error = %e,
                 "rdkafka offset commit failed"
-            );
-        }
-    }
-
-    /// Deprecated alias for [`commit_offsets`].
-    #[deprecated(since = "0.1.0", note = "use commit_offsets() instead")]
-    pub fn commit_watermark(&self) {
-        use rdkafka::consumer::Consumer;
-        if let Err(e) = self
-            .consumer
-            .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
-        {
-            tracing::warn!(
-                topic = %self.topic,
-                error = %e,
-                "rdkafka watermark commit failed"
             );
         }
     }

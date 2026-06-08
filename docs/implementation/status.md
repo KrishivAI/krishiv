@@ -1,25 +1,5 @@
 # Krishiv Implementation Status
 
-<<<<<<< HEAD
-## Remove `krishiv-lakehouse` crate (2026-06-07)
-
-Removed the standalone `krishiv-lakehouse` facade crate after the physical
-merge into `krishiv-connectors::lakehouse`:
-
-- Migrated all dependents (`krishiv-sql`, `krishiv-exec`, `krishiv-api`,
-  `krishiv-python`, `krishiv`, `examples/rust`) to
-  `krishiv_connectors::lakehouse` (or root re-exports with `lakehouse` feature).
-- Moved `exactly_once` integration test to `krishiv-connectors/tests/`.
-- Dropped the crate from workspace members and updated docs.
-
-Validation:
-```bash
-cargo check --workspace
-TMPDIR=/workspace/tmp cargo test -p krishiv-connectors --test exactly_once --features exactly-once-integration
-```
-
-=======
->>>>>>> origin/main
 ## Connector follow-ups and lakehouse merge (2026-06-07)
 
 Completed connector consolidation follow-ups on branch
@@ -141,8 +121,34 @@ complete cleanly end-to-end with the lakehouse fix in place).
 
 ---
 
-## Roadmap Phase 5 (Testing) regression sweep — continued (2026-06-07)
+## Crate consolidation: Merge 6 crates into 3 (2026-06-08)
 
+Reduced the workspace from 30 to 25 crates by merging small single-domain crates:
+
+1. **Renamed `krishiv-exec` → `krishiv-dataflow`**: Eliminated confusion with
+   `krishiv-executor`. Updated all Cargo.toml dependencies and Rust import paths.
+2. **Merged into `krishiv-plan`**: `krishiv-udf`, `krishiv-governance`,
+   `krishiv-cep`, `krishiv-optimizer` — all plan/rule/policy extensions consumed
+   by the same downstream crates. Each became a `pub mod` (udf, governance, cep,
+   optimizer) with source files copied from the original crates.
+3. **Merged `krishiv-checkpoint` into `krishiv-state`**: Both are durability/cold-storage
+   domain crates; checkpoint already depended on state. Checkpoint became
+   `crate::checkpoint` submodule with internal crate:: → super:: path rewrites.
+
+Old crate directories (checkpoint, udf, governance, cep, optimizer, exec) were
+deleted and removed from workspace members/default-members in root Cargo.toml.
+
+Validation:
+```bash
+cargo check --workspace
+```
+
+Next useful command:
+```bash
+cargo test --workspace --lib --no-fail-fast --exclude krishiv-python
+```
+
+---
 Continued implementing roadmap.md Phase 5 testing items 155-175 (regression
 tests for prior-wave fixes plus untriaged coverage gaps):
 

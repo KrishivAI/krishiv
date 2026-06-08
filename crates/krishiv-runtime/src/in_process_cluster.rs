@@ -108,7 +108,7 @@ pub(crate) fn local_spec_to_plan_spec(spec: &LocalWindowExecutionSpec) -> Window
 
 impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
     fn from(spec: &LocalWindowExecutionSpec) -> Self {
-        use krishiv_exec::AggFunction;
+        use krishiv_dataflow::AggFunction;
         use krishiv_plan::window::{WindowAgg, WindowAggKind};
 
         let (window_kind, slide_ms, session_gap_ms) = match &spec.window_kind {
@@ -161,7 +161,7 @@ pub fn plan_spec_to_local(spec: &WindowExecutionSpec) -> LocalWindowExecutionSpe
 
 impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
     fn from(spec: &WindowExecutionSpec) -> Self {
-        use krishiv_exec::{AggExpr, AggFunction};
+        use krishiv_dataflow::{AggExpr, AggFunction};
         use krishiv_plan::window::WindowAggKind;
 
         let window_kind = match spec.window_kind {

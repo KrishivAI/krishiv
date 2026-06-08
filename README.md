@@ -49,8 +49,8 @@ Primary crates:
 - `krishiv-runtime` - embedded, single-node, and distributed runtime routing.
 - `krishiv-scheduler` - coordinator, metadata, leadership, task lifecycle.
 - `krishiv-executor` - executor process and task runner.
-- `krishiv-exec` - Arrow operator runtime.
-- `krishiv-shuffle`, `krishiv-state`, `krishiv-checkpoint` - data-plane services.
+- `krishiv-dataflow` - Arrow operator runtime.
+- `krishiv-shuffle`, `krishiv-state` - data-plane services (checkpoint merged into state).
 - `krishiv-connectors` - I/O, sinks, and lakehouse helpers (Iceberg/Delta/Hudi via `lakehouse` feature); vector sinks live in `krishiv-ai::vector_sinks`.
 - `krishiv-operator`, `krishiv-ui`, `krishiv-flight-sql`, `krishiv-python` - deployment and interface surfaces.
 

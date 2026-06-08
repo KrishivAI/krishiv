@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use krishiv_checkpoint::CheckpointStorage;
+use krishiv_state::checkpoint::CheckpointStorage;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointEpochInfo, CoordinatorExecutorService,
     CoordinatorManagementService, DeregisterExecutorRequest, DeregisterExecutorResponse,
@@ -435,7 +435,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
                 let (is_savepoint, savepoint_label) = storage
                     .as_ref()
                     .and_then(|s| {
-                        krishiv_checkpoint::read_epoch_metadata(
+                        krishiv_state::checkpoint::read_epoch_metadata(
                             s.as_ref(),
                             req.job_id.as_str(),
                             epoch,

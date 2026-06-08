@@ -11,7 +11,7 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanError, PlanNode};
+use crate::{ExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanError, PlanNode};
 
 /// Result type for logical and adaptive optimizer pipelines.
 pub type OptimizerResult<T> = Result<T, OptimizerError>;
@@ -603,7 +603,7 @@ impl SmallFilePlanner {
 ///
 /// Usage:
 /// ```
-/// use krishiv_optimizer::{AqeOptimizer, CoalesceRule, StreamingAqeGuard};
+/// use krishiv_plan::optimizer::{AqeOptimizer, CoalesceRule, StreamingAqeGuard};
 /// let mut aqe = AqeOptimizer::new();
 /// aqe.add_guarded_rule(Box::new(CoalesceRule::new(64 * 1024 * 1024)));
 /// ```
@@ -821,7 +821,7 @@ impl OptimizerRule for PredicatePushdownRule {
                 matches!(
                     nodes[idx].op(),
                     Some(NodeOp::Join {
-                        join_type: krishiv_plan::JoinType::Inner
+                        join_type: crate::JoinType::Inner
                     })
                 )
             }) {
@@ -1131,7 +1131,7 @@ pub fn default_aqe_optimizer() -> AqeOptimizer {
 
 #[cfg(test)]
 mod tests {
-    use krishiv_plan::{ExecutionKind, FieldType, LogicalPlan, NodeOp, PhysicalPlan, PlanNode};
+    use crate::{ExecutionKind, FieldType, LogicalPlan, NodeOp, PhysicalPlan, PlanNode};
 
     use super::{
         AqeOptimizer, AqeRule, CoalesceAdvice, CoalesceRule, Cost, Optimizer, OptimizerError,
@@ -1782,7 +1782,7 @@ mod tests {
     /// resulting plan must have `target_partitions ≤ 10`.
     #[test]
     fn coalesce_rule_reduces_200_small_partitions() {
-        use krishiv_plan::NodeOp;
+        use crate::NodeOp;
 
         use crate::AqeRule;
 
@@ -1807,7 +1807,7 @@ mod tests {
         let coalesce_node = rewritten
             .nodes()
             .iter()
-            .find(|n: &&krishiv_plan::PlanNode| {
+            .find(|n: &&crate::PlanNode| {
                 matches!(n.op(), Some(NodeOp::CoalescePartitions { .. }))
             });
 
@@ -1818,7 +1818,7 @@ mod tests {
 
         // Extract target_partitions from the node and verify it is ≤ 10.
         if let Some(NodeOp::CoalescePartitions { target_partitions }) =
-            coalesce_node.and_then(|n: &krishiv_plan::PlanNode| n.op())
+            coalesce_node.and_then(|n: &crate::PlanNode| n.op())
         {
             assert!(
                 *target_partitions <= 10,
@@ -1860,12 +1860,12 @@ mod tests {
     fn scan_with_schema(
         id: &str,
         table: &str,
-        schema_fields: &[(&str, krishiv_plan::FieldType)],
+        schema_fields: &[(&str, crate::FieldType)],
     ) -> PlanNode {
-        let schema = krishiv_plan::PlanSchema::new(
+        let schema = crate::PlanSchema::new(
             schema_fields
                 .iter()
-                .map(|(name, ft)| krishiv_plan::SchemaField::new(*name, ft.clone()))
+                .map(|(name, ft)| crate::SchemaField::new(*name, ft.clone()))
                 .collect(),
         );
         PlanNode::new(id, format!("scan {table}"), ExecutionKind::Batch)
@@ -2412,7 +2412,7 @@ mod tests {
 
     #[test]
     fn coalesce_rule_apply_stamps_coalesce_node() {
-        use krishiv_plan::NodeOp;
+        use crate::NodeOp;
         let stats = make_stats_with_memory(&[100, 200, 300]);
         let rule = CoalesceRule::new(1000);
         let plan = PhysicalPlan::new("test", ExecutionKind::Batch);
@@ -3023,7 +3023,7 @@ mod tests {
     fn predicate_pushdown_preserves_existing_scan_filters() {
         let plan = LogicalPlan::new("test", ExecutionKind::Batch)
             .with_node({
-                let schema = krishiv_plan::PlanSchema::new(vec![krishiv_plan::SchemaField::new(
+                let schema = crate::PlanSchema::new(vec![crate::SchemaField::new(
                     "a",
                     FieldType::Int32,
                 )]);
@@ -3269,7 +3269,7 @@ mod tests {
         PlanNode::new(id, "join", ExecutionKind::Batch)
             .with_inputs(vec![left.to_string(), right.to_string()])
             .with_op(NodeOp::Join {
-                join_type: krishiv_plan::JoinType::Inner,
+                join_type: crate::JoinType::Inner,
             })
     }
 
@@ -3388,7 +3388,7 @@ mod tests {
         let join = PlanNode::new("join", "left join", ExecutionKind::Batch)
             .with_inputs(["left", "right"])
             .with_op(NodeOp::Join {
-                join_type: krishiv_plan::JoinType::Left,
+                join_type: crate::JoinType::Left,
             });
         let plan = LogicalPlan::new("test", ExecutionKind::Batch)
             .with_node(scan_with_schema(

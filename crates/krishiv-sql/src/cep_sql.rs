@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
-use krishiv_cep::{
+use krishiv_plan::cep::{
     CepKeyState, CompiledPattern, PartitionedCepMatcher, Pattern, SequentialPatternMatcher,
 };
 use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PlanNode};
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn execute_match_recognize_three_stage_pattern_produces_match() {
-        use krishiv_cep::Pattern;
+        use krishiv_plan::cep::Pattern;
         use std::time::Duration;
         let pattern = Pattern::begin("A")
             .followed_by("B")
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn execute_match_recognize_no_match_when_window_expired() {
-        use krishiv_cep::Pattern;
+        use krishiv_plan::cep::Pattern;
         use std::time::Duration;
         let pattern = Pattern::begin("A")
             .followed_by("B")
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn execute_match_recognize_empty_source_returns_empty() {
-        use krishiv_cep::Pattern;
+        use krishiv_plan::cep::Pattern;
         use std::time::Duration;
         let pattern = Pattern::begin("A")
             .followed_by("B")
@@ -538,7 +538,7 @@ mod tests {
     fn execute_match_recognize_two_keys_both_complete() {
         use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
-        use krishiv_cep::Pattern;
+        use krishiv_plan::cep::Pattern;
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -591,7 +591,7 @@ mod tests {
         // because the expiry check is strict greater-than (not >=).
         use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
-        use krishiv_cep::Pattern;
+        use krishiv_plan::cep::Pattern;
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -634,7 +634,7 @@ mod tests {
     fn execute_match_recognize_one_ms_past_window_does_not_match() {
         use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
-        use krishiv_cep::Pattern;
+        use krishiv_plan::cep::Pattern;
         use std::sync::Arc;
         use std::time::Duration;
 

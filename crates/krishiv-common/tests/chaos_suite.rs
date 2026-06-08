@@ -53,7 +53,7 @@ async fn dead_letter_sink_fail_action_returns_error() {
 /// Policy hook denies table access for a principal without permission.
 #[test]
 fn policy_hook_denies_table_access() {
-    use krishiv_governance::{MaskingRule, PolicyHook, Principal, Role};
+    use krishiv_plan::governance::{MaskingRule, PolicyHook, Principal, Role};
 
     struct DenyAllPolicy;
     impl PolicyHook for DenyAllPolicy {
@@ -133,7 +133,7 @@ async fn leader_election_simulation_acquire_release() {
 /// Only the one with the matching token should succeed.
 #[test]
 fn split_brain_second_coordinator_commit_rejected() {
-    use krishiv_checkpoint::{CheckpointMetadata, validate_fencing_token};
+    use krishiv_state::checkpoint::{CheckpointMetadata, validate_fencing_token};
 
     let current_token: u64 = 2;
 
@@ -234,7 +234,7 @@ fn duplicate_task_delivery_same_epoch_idempotent() {
 /// coordinator with token=5 (which came after it in the leadership sequence).
 #[test]
 fn coordinator_restart_rejects_future_token_on_restore() {
-    use krishiv_checkpoint::{CheckpointMetadata, validate_fencing_token_for_restore};
+    use krishiv_state::checkpoint::{CheckpointMetadata, validate_fencing_token_for_restore};
 
     let restored_coordinator_token: u64 = 3;
 

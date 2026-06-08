@@ -54,9 +54,6 @@ pub use storage_uri::open_shuffle_backend_from_uri;
 pub use store::{PartitionId, ShuffleBackend, ShufflePartition, ShuffleStore, ShuffleStream};
 pub use tiered_store::TieredShuffleStore;
 
-// StoreError is deprecated but retained for source compatibility.
-#[allow(deprecated)]
-pub use error::StoreError;
 
 #[cfg(test)]
 mod tests;

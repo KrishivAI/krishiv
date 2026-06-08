@@ -1,6 +1,6 @@
 //! Barrier injection tests (R16 S1.2).
 
-use krishiv_exec::queue::{OperatorMessage, operator_queue};
+use krishiv_dataflow::queue::{OperatorMessage, operator_queue};
 use krishiv_executor::barrier_transport::{BarrierInjector, make_checkpoint_barrier};
 
 #[test]

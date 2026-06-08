@@ -1,5 +1,5 @@
 [package]
-name = "krishiv-exec"
+name = "krishiv-dataflow"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,6 @@ smallvec = "1"
 thiserror = { workspace = true }
 krishiv-ai = { path = "../krishiv-ai" }
 krishiv-common = { path = "../krishiv-common" }
-krishiv-cep = { path = "../krishiv-cep" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-state = { path = "../krishiv-state" }

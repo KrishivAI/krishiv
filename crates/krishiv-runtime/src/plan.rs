@@ -1,6 +1,6 @@
 //! Physical plan classification helpers (ADR-12.5).
 
-use krishiv_exec::{AggExpr, AggFunction};
+use krishiv_dataflow::{AggExpr, AggFunction};
 use krishiv_plan::window::{WindowAggKind, WindowKind};
 use krishiv_plan::{ExecutionKind, NodeOp, PhysicalPlan};
 

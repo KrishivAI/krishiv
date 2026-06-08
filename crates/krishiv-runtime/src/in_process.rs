@@ -544,7 +544,7 @@ impl InProcessStreamingRuntime {
         // and a window spec; the coordinator path added no value for this operation.
         // The `topic` argument was only used to name the InMemory partition — irrelevant
         // for the computation itself, so it is intentionally unused here.
-        krishiv_exec::execute_bounded_window(input_batches, spec, None)
+        krishiv_dataflow::execute_bounded_window(input_batches, spec, None)
             .map_err(|e| RuntimeError::transport(e.to_string()))
     }
 

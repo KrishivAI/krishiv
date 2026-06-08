@@ -17,11 +17,11 @@ thiserror = { workspace = true }
 chaos = []
 
 [dev-dependencies]
-krishiv-checkpoint = { path = "../krishiv-checkpoint" }
+krishiv-state = { path = "../krishiv-state" }
 krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
-krishiv-governance = { path = "../krishiv-governance" }
+krishiv-plan = { path = "../krishiv-plan" }
 krishiv-operator = { path = "../krishiv-operator" }
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 

@@ -496,7 +496,7 @@ async fn sql_over_in_memory_recordbatch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sql_with_udf_registration() {
-    use krishiv_udf::MultiplyScalarUdf;
+    use krishiv_plan::udf::MultiplyScalarUdf;
 
     let temp = tempdir().unwrap();
     let path = temp.path().join("measurements.parquet");

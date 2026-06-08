@@ -19,7 +19,7 @@ use kube::api::{Api, ObjectMeta as KubeObjectMeta, Patch, PatchParams, PostParam
 /// Fencing: each successful `try_acquire` increments the fencing token so stale
 /// coordinators are rejected at [`validate_fencing_token`] call sites.
 ///
-/// [`validate_fencing_token`]: krishiv_checkpoint::validate_fencing_token
+/// [`validate_fencing_token`]: krishiv_state::checkpoint::validate_fencing_token
 pub struct K8sLeaseElection {
     lease_name: String,
     namespace: String,

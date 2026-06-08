@@ -3,7 +3,7 @@
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use krishiv_exec::memo::MemoCache;
+use krishiv_dataflow::memo::MemoCache;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;

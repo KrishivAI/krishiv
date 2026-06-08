@@ -404,7 +404,7 @@ async fn stream_state_maintained_across_drain_cycles() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_with_udf_applied_in_query() {
-    use krishiv_udf::MultiplyScalarUdf;
+    use krishiv_plan::udf::MultiplyScalarUdf;
 
     let session = Session::builder().build().expect("session build");
 

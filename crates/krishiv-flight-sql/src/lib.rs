@@ -25,7 +25,7 @@ use prost::Message as _; // brings encode_to_vec() into scope
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
-use krishiv_governance::{
+use krishiv_plan::governance::{
     AuthProvider, MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider,
 };
 use krishiv_sql::SqlEngine;
@@ -831,7 +831,7 @@ pub async fn run_flight_server(
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use krishiv_governance::{MaskingRule, PolicyHook, Role, StaticApiKeyAuthProvider};
+    use krishiv_plan::governance::{MaskingRule, PolicyHook, Role, StaticApiKeyAuthProvider};
     use tonic::metadata::MetadataValue;
 
     fn make_auth_service() -> KrishivFlightSqlService {

@@ -6,7 +6,7 @@ use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use krishiv_governance::{
+use krishiv_plan::governance::{
     AuditOutcome, AuditSink, MaskingRule, Principal, Role, RoleBasedPolicyHook,
     StaticApiKeyAuthProvider,
 };
@@ -17,23 +17,23 @@ use krishiv_sql::policy::PolicyEnforcingSqlEngine;
 
 /// A global capture sink. Tests filter events by unique principal name to
 /// avoid cross-test interference from parallel execution.
-static CAPTURED_EVENTS: std::sync::LazyLock<std::sync::Mutex<Vec<krishiv_governance::AuditEvent>>> =
+static CAPTURED_EVENTS: std::sync::LazyLock<std::sync::Mutex<Vec<krishiv_plan::governance::AuditEvent>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 struct GlobalCaptureAuditSink;
 
 impl AuditSink for GlobalCaptureAuditSink {
-    fn record(&self, event: &krishiv_governance::AuditEvent) {
+    fn record(&self, event: &krishiv_plan::governance::AuditEvent) {
         CAPTURED_EVENTS.lock().unwrap().push(event.clone());
     }
 }
 
 fn install_capture_audit_sink() {
-    let _ = krishiv_governance::set_audit_sink(Box::new(GlobalCaptureAuditSink));
+    let _ = krishiv_plan::governance::set_audit_sink(Box::new(GlobalCaptureAuditSink));
 }
 
 /// Return all captured events filtered by the given principal name.
-fn events_for_principal(principal_name: &str) -> Vec<krishiv_governance::AuditEvent> {
+fn events_for_principal(principal_name: &str) -> Vec<krishiv_plan::governance::AuditEvent> {
     CAPTURED_EVENTS
         .lock()
         .unwrap()
@@ -104,7 +104,7 @@ fn make_standard_auth_provider() -> Arc<StaticApiKeyAuthProvider> {
 
 async fn make_engine(
     auth: Arc<StaticApiKeyAuthProvider>,
-    policy: Arc<dyn krishiv_governance::PolicyHook>,
+    policy: Arc<dyn krishiv_plan::governance::PolicyHook>,
     tables: Vec<(&str, Vec<RecordBatch>)>,
 ) -> PolicyEnforcingSqlEngine {
     let inner = SqlEngine::new();
@@ -275,7 +275,7 @@ async fn row_level_security_filters_rows_for_reader() {
     install_capture_audit_sink();
 
     struct RlsPolicy;
-    impl krishiv_governance::PolicyHook for RlsPolicy {
+    impl krishiv_plan::governance::PolicyHook for RlsPolicy {
         fn check_table_access(&self, _p: &Principal, _table: &str) -> bool {
             true
         }
@@ -471,7 +471,7 @@ async fn column_masking_redact_rule_for_reader() {
     install_capture_audit_sink();
 
     struct RedactNamePolicy;
-    impl krishiv_governance::PolicyHook for RedactNamePolicy {
+    impl krishiv_plan::governance::PolicyHook for RedactNamePolicy {
         fn check_table_access(&self, _p: &Principal, _table: &str) -> bool {
             true
         }

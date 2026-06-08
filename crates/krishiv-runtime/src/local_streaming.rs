@@ -1,7 +1,7 @@
-//! Bounded window execution (delegates to unified `krishiv-exec` operator runtime).
+//! Bounded window execution (delegates to unified `krishiv-dataflow` operator runtime).
 
 use arrow::record_batch::RecordBatch;
-use krishiv_exec::{AggExpr, AggFunction, execute_bounded_window};
+use krishiv_dataflow::{AggExpr, AggFunction, execute_bounded_window};
 use krishiv_plan::window::WindowExecutionSpec;
 
 use crate::RuntimeError;
@@ -78,20 +78,20 @@ pub fn execute_windowed_stream(
 pub fn execute_streaming_window(
     input: std::pin::Pin<
         Box<
-            dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_exec::ExecError>> + Send,
+            dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_dataflow::ExecError>> + Send,
         >,
     >,
     spec: &LocalWindowExecutionSpec,
 ) -> Result<
     std::pin::Pin<
         Box<
-            dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_exec::ExecError>> + Send,
+            dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_dataflow::ExecError>> + Send,
         >,
     >,
     RuntimeError,
 > {
     let plan_spec = spec.to_plan_spec();
-    krishiv_exec::execute_streaming_window(input, plan_spec, None)
+    krishiv_dataflow::execute_streaming_window(input, plan_spec, None)
         .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })
 }
 

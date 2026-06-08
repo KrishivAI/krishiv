@@ -77,7 +77,7 @@ pub use krishiv_api::{DataType, Field, Schema, SchemaRef};
 
 // ── UDF API ───────────────────────────────────────────────────────────────────
 
-pub use krishiv_udf::{AggregateUdf, ScalarUdf, TableUdf, UdfError, UdfRegistry};
+pub use krishiv_plan::udf::{AggregateUdf, ScalarUdf, TableUdf, UdfError, UdfRegistry};
 
 // ── Connector API ─────────────────────────────────────────────────────────────
 

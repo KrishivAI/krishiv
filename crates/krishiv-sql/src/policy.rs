@@ -5,7 +5,7 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use krishiv_governance::{
+use krishiv_plan::governance::{
     AuditAction, AuditOutcome, AuthProvider, MaskingRule, PolicyHook, Principal, audit_log,
 };
 
@@ -404,7 +404,7 @@ fn masking_rule_for_field(
 mod tests {
     use super::*;
     use arrow::array::Array;
-    use krishiv_governance::{MaskingRule, Principal, Role, StaticApiKeyAuthProvider};
+    use krishiv_plan::governance::{MaskingRule, Principal, Role, StaticApiKeyAuthProvider};
 
     struct DenyTablePolicy {
         denied_table: String,

@@ -31,7 +31,7 @@ impl std::fmt::Debug for PythonScalarUdf {
     }
 }
 
-impl krishiv_udf::ScalarUdf for PythonScalarUdf {
+impl krishiv_plan::udf::ScalarUdf for PythonScalarUdf {
     fn name(&self) -> &str {
         &self.name
     }
@@ -44,7 +44,7 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
         &self.output_field
     }
 
-    fn call(&self, batch: &RecordBatch) -> Result<ArrayRef, krishiv_udf::UdfError> {
+    fn call(&self, batch: &RecordBatch) -> Result<ArrayRef, krishiv_plan::udf::UdfError> {
         Python::attach(|py| {
             // ── Arrow-native fast path ────────────────────────────────────────
             // If the Python callable has `_krishiv_arrow_udf = True`, pass the
@@ -62,18 +62,18 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
             if is_arrow_native {
                 let py_batch = pyo3_arrow::PyRecordBatch::new(batch.clone());
                 let result = self.callable.call1(py, (py_batch,)).map_err(|e| {
-                    krishiv_udf::UdfError::Execution {
+                    krishiv_plan::udf::UdfError::Execution {
                         message: format!("arrow-native UDF call failed: {e}"),
                     }
                 })?;
                 let out_batch: RecordBatch = result
                     .extract::<pyo3_arrow::PyRecordBatch>(py)
-                    .map_err(|e| krishiv_udf::UdfError::Execution {
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: format!("arrow-native UDF must return a pyarrow.RecordBatch: {e}"),
                     })?
                     .into_inner();
                 if out_batch.num_columns() == 0 {
-                    return Err(krishiv_udf::UdfError::Execution {
+                    return Err(krishiv_plan::udf::UdfError::Execution {
                         message: "arrow-native UDF returned a RecordBatch with 0 columns; \
                                   the first column is used as the output array"
                             .into(),
@@ -85,7 +85,7 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
             macro_rules! to_py_list {
                 ($col:expr, $arr_ty:ty, $native:ty, $field:expr) => {{
                     let arr = $col.as_any().downcast_ref::<$arr_ty>().ok_or_else(|| {
-                        krishiv_udf::UdfError::InvalidArgument {
+                        krishiv_plan::udf::UdfError::InvalidArgument {
                             message: format!(
                                 "column '{}' declared {} but downcast failed",
                                 $field.name(),
@@ -97,7 +97,7 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                     for v in arr.iter() {
                         cells.push(match v {
                             Some(x) => Some(x.into_pyobject(py).map_err(|e| {
-                                krishiv_udf::UdfError::Execution {
+                                krishiv_plan::udf::UdfError::Execution {
                                     message: e.to_string(),
                                 }
                             })?),
@@ -105,7 +105,7 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                         });
                     }
                     let list =
-                        PyList::new(py, cells).map_err(|e| krishiv_udf::UdfError::Execution {
+                        PyList::new(py, cells).map_err(|e| krishiv_plan::udf::UdfError::Execution {
                             message: e.to_string(),
                         })?;
                     list.into_any()
@@ -115,7 +115,7 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
             macro_rules! from_py_list {
                 ($result:expr, $native:ty, $arr_ty:ty, $nrows:expr) => {{
                     let list = $result.cast_bound::<PyList>(py).map_err(|e| {
-                        krishiv_udf::UdfError::Execution {
+                        krishiv_plan::udf::UdfError::Execution {
                             message: format!(
                                 "UDF must return a list for {} output: {e}",
                                 stringify!($arr_ty)
@@ -128,7 +128,7 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                             None
                         } else {
                             Some(item.extract::<$native>().map_err(|e| {
-                                krishiv_udf::UdfError::Execution {
+                                krishiv_plan::udf::UdfError::Execution {
                                     message: format!(
                                         "cannot convert item to {}: {e}",
                                         stringify!($native)
@@ -165,13 +165,13 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                         to_py_list!(col, TimestampNanosecondArray, i64, field)
                     }
                     dt => {
-                        return Err(krishiv_udf::UdfError::InvalidArgument {
+                        return Err(krishiv_plan::udf::UdfError::InvalidArgument {
                             message: format!("unsupported column data type: {dt}"),
                         });
                     }
                 };
                 dict.set_item(field.name(), py_list).map_err(|e| {
-                    krishiv_udf::UdfError::Execution {
+                    krishiv_plan::udf::UdfError::Execution {
                         message: e.to_string(),
                     }
                 })?;
@@ -180,7 +180,7 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
             let result =
                 self.callable
                     .call1(py, (dict,))
-                    .map_err(|e| krishiv_udf::UdfError::Execution {
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: e.to_string(),
                     })?;
 
@@ -204,7 +204,7 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                 DataType::Timestamp(_, _) => {
                     from_py_list!(result, i64, TimestampNanosecondArray, nrows)
                 }
-                dt => Err(krishiv_udf::UdfError::InvalidArgument {
+                dt => Err(krishiv_plan::udf::UdfError::InvalidArgument {
                     message: format!("unsupported output data type: {dt}"),
                 }),
             }
@@ -213,12 +213,12 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
 }
 
 pub async fn call_python_udf(
-    udf: Arc<dyn krishiv_udf::ScalarUdf>,
+    udf: Arc<dyn krishiv_plan::udf::ScalarUdf>,
     batch: RecordBatch,
-) -> Result<ArrayRef, krishiv_udf::UdfError> {
+) -> Result<ArrayRef, krishiv_plan::udf::UdfError> {
     tokio::task::spawn_blocking(move || udf.call(&batch))
         .await
-        .map_err(|e| krishiv_udf::UdfError::Panic(e.to_string()))?
+        .map_err(|e| krishiv_plan::udf::UdfError::Panic(e.to_string()))?
 }
 
 pub const UDF_META_ATTR: &str = "__krishiv_udf__";
@@ -272,7 +272,7 @@ pub(crate) fn build_python_scalar_udf(
     input_types: &Bound<'_, PyDict>,
     output_type: &str,
     output_name: Option<String>,
-) -> PyResult<Arc<dyn krishiv_udf::ScalarUdf>> {
+) -> PyResult<Arc<dyn krishiv_plan::udf::ScalarUdf>> {
     let input_schema = schema_from_input_types(input_types)?;
     let output_field = Field::new(
         output_name.unwrap_or_else(|| name.clone()),

@@ -1,7 +1,7 @@
 //! CLI dispatch for the `krishiv` binary.
 
 use krishiv_api::Session;
-use krishiv_checkpoint::{
+use krishiv_state::checkpoint::{
     LocalFsCheckpointStorage, list_valid_epochs, read_epoch_metadata, validate_epoch,
 };
 use krishiv_common::async_util::block_on;
@@ -1065,7 +1065,7 @@ fn run_checkpoints_list(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
 #[cfg(test)]
 mod tests {
     use super::{CoordinatorMode, dispatch};
-    use krishiv_checkpoint::{
+    use krishiv_state::checkpoint::{
         CheckpointMetadata, CheckpointStorage, IntegrityManifest, LocalFsCheckpointStorage,
         metadata_path, write_epoch_metadata, write_manifest,
     };

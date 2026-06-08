@@ -113,12 +113,12 @@ impl Coordinator {
         // GAP-OB-01: Increment jobs_submitted counter.
         JOBS_SUBMITTED_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         krishiv_metrics::global_metrics().inc_tasks_submitted();
-        krishiv_governance::audit_log(
+        krishiv_plan::governance::audit_log(
             "scheduler",
-            &krishiv_governance::AuditAction::JobSubmitted {
+            &krishiv_plan::governance::AuditAction::JobSubmitted {
                 job_id: inserted_job_id.to_string(),
             },
-            krishiv_governance::AuditOutcome::Allowed,
+            krishiv_plan::governance::AuditOutcome::Allowed,
         );
 
         // GAP-OB-06: Emit OpenLineage START event.
@@ -127,14 +127,14 @@ impl Coordinator {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let _j_id = inserted_job_id.to_string();
             handle.spawn(async move {
-                let event = krishiv_governance::new_run_event(
-                    krishiv_governance::RunEventType::Start,
+                let event = krishiv_plan::governance::new_run_event(
+                    krishiv_plan::governance::RunEventType::Start,
                     job_name,
                     namespace,
                     vec![],
                     vec![],
                 );
-                krishiv_governance::emit_lineage_event(event).await;
+                krishiv_plan::governance::emit_lineage_event(event).await;
             });
         }
 
@@ -160,12 +160,12 @@ impl Coordinator {
             job.cancel();
         }
 
-        krishiv_governance::audit_log(
+        krishiv_plan::governance::audit_log(
             "scheduler",
-            &krishiv_governance::AuditAction::JobCancelled {
+            &krishiv_plan::governance::AuditAction::JobCancelled {
                 job_id: job_id.to_string(),
             },
-            krishiv_governance::AuditOutcome::Allowed,
+            krishiv_plan::governance::AuditOutcome::Allowed,
         );
 
         if !self.gc_ready_jobs.contains(job_id) {
@@ -185,14 +185,14 @@ impl Coordinator {
         // Emit OpenLineage FAIL event for job cancellation (Phase 3 M5 / GAP-OB-06)
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let event = krishiv_governance::new_run_event(
-                    krishiv_governance::RunEventType::Fail,
+                let event = krishiv_plan::governance::new_run_event(
+                    krishiv_plan::governance::RunEventType::Fail,
                     job_name,
                     namespace,
                     vec![],
                     vec![],
                 );
-                krishiv_governance::emit_lineage_event(event).await;
+                krishiv_plan::governance::emit_lineage_event(event).await;
             });
         }
         Ok(())
@@ -248,15 +248,15 @@ impl Coordinator {
         // so the task can be re-assigned to a healthy executor on the next launch cycle.
         if terminal_state == TaskState::Failed {
             krishiv_metrics::global_metrics().inc_tasks_failed();
-            krishiv_governance::audit_log(
+            krishiv_plan::governance::audit_log(
                 "scheduler",
-                &krishiv_governance::AuditAction::TaskFailed {
+                &krishiv_plan::governance::AuditAction::TaskFailed {
                     job_id: job_id.to_string(),
                     stage_id: stage_id.to_string(),
                     task_id: task_id.to_string(),
                     attempt_id: attempt,
                 },
-                krishiv_governance::AuditOutcome::Allowed,
+                krishiv_plan::governance::AuditOutcome::Allowed,
             );
 
             let threshold = self.config.circuit_breaker_failure_threshold();
@@ -361,18 +361,18 @@ impl Coordinator {
             // Emit OpenLineage COMPLETE/FAIL events (Phase 3 M5 / GAP-OB-06)
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let event_type = match state {
-                    JobState::Succeeded => krishiv_governance::RunEventType::Complete,
-                    _ => krishiv_governance::RunEventType::Fail,
+                    JobState::Succeeded => krishiv_plan::governance::RunEventType::Complete,
+                    _ => krishiv_plan::governance::RunEventType::Fail,
                 };
                 handle.spawn(async move {
-                    let event = krishiv_governance::new_run_event(
+                    let event = krishiv_plan::governance::new_run_event(
                         event_type,
                         job_name,
                         namespace,
                         vec![],
                         vec![],
                     );
-                    krishiv_governance::emit_lineage_event(event).await;
+                    krishiv_plan::governance::emit_lineage_event(event).await;
                 });
             }
         }
@@ -470,7 +470,7 @@ impl Coordinator {
         job_id: JobId,
         plan: &PhysicalPlan,
     ) -> SchedulerResult<SubmitOutcome> {
-        let aqe = krishiv_optimizer::default_aqe_optimizer();
+        let aqe = krishiv_plan::optimizer::default_aqe_optimizer();
         let (optimized, _applied) = aqe.apply(plan.clone(), &[])?;
         self.submit_job(job_spec_from_physical_plan(job_id, &optimized)?)
     }

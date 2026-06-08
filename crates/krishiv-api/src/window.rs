@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_exec::AggExpr;
+use krishiv_dataflow::AggExpr;
 use krishiv_runtime::{LocalWindowExecutionSpec, LocalWindowKind};
 
 use crate::error::{KrishivError, Result};

@@ -18,14 +18,14 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use dashmap::DashMap;
-use krishiv_checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
+use krishiv_state::checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use krishiv_common::durability::DurabilityProfile;
 use krishiv_proto::{InitiateCheckpointRequest, JobId, TaskAttemptRef};
 use krishiv_shuffle::{
     InMemoryShuffleStore, LocalDiskShuffleStore, ShuffleBackend, open_shuffle_backend_from_uri,
 };
 use krishiv_state::FjallStateBackend;
-use krishiv_udf;
+use krishiv_plan::udf;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tonic::transport::Server;
@@ -321,7 +321,7 @@ async fn heartbeat_loop(
         .with_barrier_ack_registry(barrier_ack_registry)
         .with_key_group_ranges(key_group_ranges)
         .with_running_attempts(running_attempts)
-        .with_udf_limits(krishiv_udf::ResourceLimits::default());
+        .with_udf_limits(krishiv_plan::udf::ResourceLimits::default());
     // Wire durable state dir so stream:loop: window operators use file-backed state.
     if let Some(ref dir) = state_dir {
         runner_builder = runner_builder.with_state_dir(dir.clone());
@@ -438,7 +438,7 @@ async fn heartbeat_loop(
                 runner_loop
                     .drain_pending_barriers(
                         Arc::clone(&backend) as Arc<dyn krishiv_state::StateBackend>,
-                        Arc::clone(&storage) as Arc<dyn krishiv_checkpoint::CheckpointStorage>,
+                        Arc::clone(&storage) as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
                         coord.as_ref().clone(),
                     )
                     .await;
@@ -522,7 +522,7 @@ async fn heartbeat_loop(
                                     .initiate_checkpoint_for_job(
                                         &req,
                                         Arc::clone(&state_backend) as Arc<dyn krishiv_state::StateBackend>,
-                                        Arc::clone(&checkpoint_storage) as Arc<dyn krishiv_checkpoint::CheckpointStorage>,
+                                        Arc::clone(&checkpoint_storage) as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
                                         coord_service.as_ref().clone(),
                                     )
                                     .await

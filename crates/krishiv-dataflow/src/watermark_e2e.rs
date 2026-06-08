@@ -4,7 +4,7 @@ use crate::cep::CepOperator;
 use crate::interval_join::{IntervalJoinSpec, PerKeyIntervalJoin};
 use crate::side_output::{SideOutput, SideOutputRouter};
 use crate::window::{MultiSourceWatermarkState, WatermarkState};
-use krishiv_cep::{CompiledPattern, PatternStage};
+use krishiv_plan::cep::{CompiledPattern, PatternStage};
 
 /// Combined operator pipeline for watermark E2E validation.
 #[derive(Debug)]

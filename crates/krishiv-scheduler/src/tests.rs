@@ -2,7 +2,7 @@
 mod scheduler_tests {
     use std::sync::{Arc, Mutex, Once};
 
-    use krishiv_checkpoint::{
+    use krishiv_state::checkpoint::{
         CheckpointMetadata, CheckpointStorage, IntegrityManifest, LocalFsCheckpointStorage,
         list_valid_epochs, write_epoch_metadata, write_manifest,
     };
@@ -2995,7 +2995,7 @@ mod scheduler_tests {
             CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 5000, 2);
 
         // Write state snapshots so the manifest can hash them.
-        krishiv_checkpoint::write_operator_snapshot(
+        krishiv_state::checkpoint::write_operator_snapshot(
             storage.as_ref(),
             "job-ck-1",
             1,
@@ -3004,7 +3004,7 @@ mod scheduler_tests {
             b"state bytes",
         )
         .unwrap();
-        krishiv_checkpoint::write_operator_snapshot(
+        krishiv_state::checkpoint::write_operator_snapshot(
             storage.as_ref(),
             "job-ck-1",
             1,
@@ -3019,9 +3019,9 @@ mod scheduler_tests {
         assert!(coord.is_awaiting_acks());
 
         let snap_path1 =
-            krishiv_checkpoint::snapshot_path("job-ck-1", 1, "operator-task-1", "task-1");
+            krishiv_state::checkpoint::snapshot_path("job-ck-1", 1, "operator-task-1", "task-1");
         let snap_path2 =
-            krishiv_checkpoint::snapshot_path("job-ck-1", 1, "operator-task-2", "task-2");
+            krishiv_state::checkpoint::snapshot_path("job-ck-1", 1, "operator-task-2", "task-2");
         let ack1 = make_ack(
             &job_id,
             "task-1",
@@ -3049,7 +3049,7 @@ mod scheduler_tests {
         assert_eq!(coord.current_epoch(), 1);
 
         // Verify metadata was written to storage.
-        let meta = krishiv_checkpoint::read_epoch_metadata(storage.as_ref(), "job-ck-1", 1)
+        let meta = krishiv_state::checkpoint::read_epoch_metadata(storage.as_ref(), "job-ck-1", 1)
             .unwrap()
             .unwrap();
         assert_eq!(meta.epoch, 1);
@@ -3057,7 +3057,7 @@ mod scheduler_tests {
         assert!(!meta.is_savepoint);
 
         // Verify manifest exists and epoch validates.
-        assert!(krishiv_checkpoint::validate_epoch(storage.as_ref(), "job-ck-1", 1).unwrap());
+        assert!(krishiv_state::checkpoint::validate_epoch(storage.as_ref(), "job-ck-1", 1).unwrap());
     }
 
     #[test]
@@ -3147,7 +3147,7 @@ mod scheduler_tests {
         let done = coord.receive_ack(ack).unwrap();
         assert!(done);
 
-        let meta = krishiv_checkpoint::read_epoch_metadata(storage.as_ref(), "job-ck-sp", 1)
+        let meta = krishiv_state::checkpoint::read_epoch_metadata(storage.as_ref(), "job-ck-sp", 1)
             .unwrap()
             .unwrap();
         assert!(
@@ -3512,7 +3512,7 @@ mod scheduler_tests {
         storage_epoch: u64,
         meta: &CheckpointMetadata,
     ) {
-        use krishiv_checkpoint::{metadata_path, write_epoch_hint};
+        use krishiv_state::checkpoint::{metadata_path, write_epoch_hint};
 
         storage
             .write_bytes(
@@ -3532,7 +3532,7 @@ mod scheduler_tests {
 
     #[test]
     fn coordinator_restore_rejects_hash_mismatched_epoch() {
-        use krishiv_checkpoint::metadata_path;
+        use krishiv_state::checkpoint::metadata_path;
 
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
         let storage_path = storage.base_dir().to_string_lossy().to_string();
@@ -3631,7 +3631,7 @@ mod scheduler_tests {
 
     #[test]
     fn restore_activation_does_not_prune_when_metadata_identity_is_invalid() {
-        use krishiv_checkpoint::{latest_valid_epoch, metadata_path};
+        use krishiv_state::checkpoint::{latest_valid_epoch, metadata_path};
 
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
         let storage_path = storage.base_dir().to_string_lossy().to_string();
@@ -3701,7 +3701,7 @@ mod scheduler_tests {
 
     #[test]
     fn coordinator_restore_activation_prunes_future_epochs_and_uses_live_token() {
-        use krishiv_checkpoint::latest_valid_epoch;
+        use krishiv_state::checkpoint::latest_valid_epoch;
 
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
         let storage_path = storage.base_dir().to_string_lossy().to_string();
@@ -3908,7 +3908,7 @@ mod scheduler_tests {
 
     #[test]
     fn chaos_4_corrupt_checkpoint_fallback_to_prior_valid_epoch() {
-        use krishiv_checkpoint::{
+        use krishiv_state::checkpoint::{
             CheckpointStorage, metadata_path, validate_epoch, write_epoch_metadata, write_manifest,
         };
 
@@ -3975,7 +3975,7 @@ mod scheduler_tests {
 
     #[test]
     fn chaos_e6_rolling_upgrade_savepoint_restore_preserves_epoch_sequence() {
-        use krishiv_checkpoint::read_epoch_metadata;
+        use krishiv_state::checkpoint::read_epoch_metadata;
 
         let storage: std::sync::Arc<dyn CheckpointStorage> =
             std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());

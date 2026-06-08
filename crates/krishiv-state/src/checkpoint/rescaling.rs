@@ -1,6 +1,6 @@
 //! Key-group rescaling for checkpoint restore (R16 S4.2).
 
-use krishiv_state::key_group::{KeyGroupRange, key_group_ranges_for_parallelism};
+use crate::key_group::{KeyGroupRange, key_group_ranges_for_parallelism};
 
 /// Computes key-group → task slot mapping when restoring with new parallelism.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +43,7 @@ impl KeyGroupRescaler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use krishiv_state::key_group::NUM_KEY_GROUPS;
+    use crate::key_group::NUM_KEY_GROUPS;
 
     #[test]
     fn rescale_4_to_2_maps_all_key_groups() {

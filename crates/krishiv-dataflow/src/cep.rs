@@ -3,14 +3,14 @@
 use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_cep::{CepKeyState, CompiledPattern, SequentialPatternMatcher};
+use krishiv_plan::cep::{CepKeyState, CompiledPattern, SequentialPatternMatcher};
 use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
 
 use crate::ExecResult;
 
 /// Default cap on the number of distinct per-key CEP states retained in
 /// memory. When exceeded, the least-recently-active key is evicted to bound
-/// memory under high key cardinality (mirrors [`krishiv_cep::PartitionedCepMatcher`]).
+/// memory under high key cardinality (mirrors [`krishiv_plan::cep::PartitionedCepMatcher`]).
 pub const DEFAULT_MAX_CEP_KEYS: usize = 1024;
 
 /// Keyed CEP operator executing a compiled sequential pattern.
@@ -211,7 +211,7 @@ fn decode_key_hex(hex: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use krishiv_cep::Pattern;
+    use krishiv_plan::cep::Pattern;
     use std::time::Duration;
 
     #[test]

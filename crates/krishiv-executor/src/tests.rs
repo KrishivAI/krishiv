@@ -2374,7 +2374,7 @@ mod executor_tests {
         );
     }
 
-    use krishiv_checkpoint::{CheckpointStorage, LocalFsCheckpointStorage, snapshot_path};
+    use krishiv_state::checkpoint::{CheckpointStorage, LocalFsCheckpointStorage, snapshot_path};
     use krishiv_proto::InitiateCheckpointRequest;
     use krishiv_state::{FjallStateBackend, StateBackend};
 
@@ -2389,8 +2389,8 @@ mod executor_tests {
             &self,
             _path: &str,
             _data: &[u8],
-        ) -> krishiv_checkpoint::CheckpointResult<()> {
-            Err(krishiv_checkpoint::CheckpointError::Storage {
+        ) -> krishiv_state::checkpoint::CheckpointResult<()> {
+            Err(krishiv_state::checkpoint::CheckpointError::Storage {
                 message: "injected write failure".to_string(),
             })
         }
@@ -2398,21 +2398,21 @@ mod executor_tests {
         async fn read_bytes_async(
             &self,
             _path: &str,
-        ) -> krishiv_checkpoint::CheckpointResult<Option<Vec<u8>>> {
+        ) -> krishiv_state::checkpoint::CheckpointResult<Option<Vec<u8>>> {
             Ok(None)
         }
 
         async fn list_dir_async(
             &self,
             _prefix: &str,
-        ) -> krishiv_checkpoint::CheckpointResult<Vec<String>> {
+        ) -> krishiv_state::checkpoint::CheckpointResult<Vec<String>> {
             Ok(Vec::new())
         }
 
         async fn delete_prefix_async(
             &self,
             _prefix: &str,
-        ) -> krishiv_checkpoint::CheckpointResult<()> {
+        ) -> krishiv_state::checkpoint::CheckpointResult<()> {
             Ok(())
         }
 
@@ -2420,21 +2420,21 @@ mod executor_tests {
             &self,
             _path: &str,
             _data: &[u8],
-        ) -> krishiv_checkpoint::CheckpointResult<()> {
-            Err(krishiv_checkpoint::CheckpointError::Storage {
+        ) -> krishiv_state::checkpoint::CheckpointResult<()> {
+            Err(krishiv_state::checkpoint::CheckpointError::Storage {
                 message: "injected write failure".to_string(),
             })
         }
 
-        fn read_bytes(&self, _path: &str) -> krishiv_checkpoint::CheckpointResult<Option<Vec<u8>>> {
+        fn read_bytes(&self, _path: &str) -> krishiv_state::checkpoint::CheckpointResult<Option<Vec<u8>>> {
             Ok(None)
         }
 
-        fn list_dir(&self, _prefix: &str) -> krishiv_checkpoint::CheckpointResult<Vec<String>> {
+        fn list_dir(&self, _prefix: &str) -> krishiv_state::checkpoint::CheckpointResult<Vec<String>> {
             Ok(Vec::new())
         }
 
-        fn delete_prefix(&self, _prefix: &str) -> krishiv_checkpoint::CheckpointResult<()> {
+        fn delete_prefix(&self, _prefix: &str) -> krishiv_state::checkpoint::CheckpointResult<()> {
             Ok(())
         }
     }

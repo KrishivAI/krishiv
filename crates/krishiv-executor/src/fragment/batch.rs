@@ -7,7 +7,7 @@ use std::sync::Arc;
 use krishiv_proto::{ExecutorTaskAssignment, TaskRuntimeStats};
 #[cfg(feature = "kafka")]
 use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDescriptor};
-use krishiv_udf::ResourceLimits;
+use krishiv_plan::udf::ResourceLimits;
 
 use super::common::{
     parse_local_parquet_partitions, read_connector_parquet_partitions, read_inline_ipc_partitions,
@@ -308,7 +308,7 @@ async fn execute_window_fragment(
     let output_batches = tokio::task::spawn_blocking(move || {
         // Bounded tasks replay their complete InlineIpc input after failure.
         // Reopening partial persistent state would double-apply rows on retry.
-        krishiv_exec::execute_bounded_window(input_batches, &plan_spec, None)
+        krishiv_dataflow::execute_bounded_window(input_batches, &plan_spec, None)
     })
     .await
     .map_err(|e| ExecutorError::LocalExecution {

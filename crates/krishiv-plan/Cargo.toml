@@ -9,14 +9,25 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlparser = "0.61"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-proto = { path = "../krishiv-proto" }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+mockito = { workspace = true }
 
 [lints]
 workspace = true

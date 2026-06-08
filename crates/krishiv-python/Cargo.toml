@@ -14,12 +14,10 @@ path = "src/lib.rs"
 krishiv-api = { path = "../krishiv-api" }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse", "schema-registry", "iceberg", "hudi"] }
-krishiv-exec = { path = "../krishiv-exec" }
-krishiv-governance = { path = "../krishiv-governance" }
+krishiv-dataflow = { path = "../krishiv-dataflow" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-state = { path = "../krishiv-state" }
 krishiv-ai = { path = "../krishiv-ai", optional = true }
-krishiv-udf = { path = "../krishiv-udf" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
 dashmap = { workspace = true }

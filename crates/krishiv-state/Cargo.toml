@@ -9,17 +9,21 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-tempfile.workspace = true
+async-trait = { workspace = true }
+bytes = { workspace = true }
+fjall = "3.1.4"
+futures = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
-thiserror = { workspace = true }
+object_store = { workspace = true, features = ["aws", "fs"] }
 redb.workspace = true
-tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tempfile.workspace = true
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+tracing = { workspace = true }
 twox-hash = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
-fjall = "3.1.4"
 
 [dev-dependencies]
 tempfile.workspace = true

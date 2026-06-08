@@ -9,7 +9,7 @@ use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 
-use krishiv_governance::{MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
+use krishiv_plan::governance::{MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
 use krishiv_runtime::LocalWindowKind;
 
 use crate::error::KrishivError;
@@ -707,7 +707,7 @@ fn with_coordinator_sets_distributed_mode() {
 
 #[test]
 fn session_register_scalar_udf() {
-    use krishiv_udf::MultiplyScalarUdf;
+    use krishiv_plan::udf::MultiplyScalarUdf;
 
     let session = SessionBuilder::new().build().unwrap();
     assert!(session.scalar_udf_names().is_empty());

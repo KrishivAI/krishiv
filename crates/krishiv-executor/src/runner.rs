@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
-use krishiv_checkpoint::{CheckpointStorage, snapshot_path};
+use krishiv_state::checkpoint::{CheckpointStorage, snapshot_path};
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
     CoordinatorExecutorService, ExecutorTaskAssignment, FencingToken, InitiateCheckpointRequest,
@@ -18,7 +18,7 @@ use krishiv_proto::{
 };
 use krishiv_sql::SqlEngine;
 use krishiv_state::StateBackend;
-use krishiv_udf::ResourceLimits;
+use krishiv_plan::udf::ResourceLimits;
 
 use crate::{
     ExecutorAssignmentInbox, ExecutorError, ExecutorResult, SharedBarrierAckRegistry,
@@ -663,7 +663,7 @@ pub struct ExecutorTaskRunner {
     /// `Arc<Mutex<…>>` because the runner is cloned between tasks but all
     /// clones must share the same stateful executor for a given job.
     pub(crate) loop_executors:
-        Arc<DashMap<String, Arc<std::sync::Mutex<krishiv_exec::ContinuousWindowExecutor>>>>,
+        Arc<DashMap<String, Arc<std::sync::Mutex<krishiv_dataflow::ContinuousWindowExecutor>>>>,
     /// Live executor lease generation, shared with the heartbeat loop.
     /// Used to stamp checkpoint-fanout RPCs without round-tripping through
     /// the gRPC service (B10).  Defaults to `LeaseGeneration::initial()`.
@@ -875,7 +875,7 @@ impl ExecutorTaskRunner {
     /// Configure UDF resource limits directly on the runner.
     /// This creates a SqlEngine with the given limits for sandbox enforcement
     /// during task execution.
-    pub fn with_udf_limits(mut self, limits: krishiv_udf::ResourceLimits) -> Self {
+    pub fn with_udf_limits(mut self, limits: krishiv_plan::udf::ResourceLimits) -> Self {
         let engine = Arc::new(SqlEngine::new().with_udf_limits(limits));
         self.sql_engine = engine;
         self
@@ -1014,7 +1014,7 @@ impl ExecutorTaskRunner {
         let is_continuous_cycle = fragment_body.starts_with("stream:loop:");
 
         // Build resource limits from assignment (propagated from job spec).
-        let udf_limits = krishiv_udf::ResourceLimits {
+        let udf_limits = krishiv_plan::udf::ResourceLimits {
             max_memory_bytes: assignment.memory_limit_bytes(),
             max_execution_time_ms: assignment.cpu_limit_nanos().map(|n| (n / 1_000_000) as u64),
         };
@@ -1686,7 +1686,7 @@ mod runner_tests {
             fencing_token: krishiv_proto::FencingToken::initial(),
         };
         let state_backend = krishiv_state::FjallStateBackend::ephemeral().unwrap();
-        let storage = krishiv_checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap();
+        let storage = krishiv_state::checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap();
         let ack = runner
             .handle_initiate_checkpoint(req, &state_backend, &storage)
             .unwrap();
@@ -1704,7 +1704,7 @@ mod runner_tests {
             fencing_token: krishiv_proto::FencingToken::initial(),
         };
         let state_backend = krishiv_state::FjallStateBackend::ephemeral().unwrap();
-        let storage = krishiv_checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap();
+        let storage = krishiv_state::checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap();
         let ack = runner
             .handle_initiate_checkpoint(req, &state_backend, &storage)
             .unwrap();

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use krishiv_checkpoint::{
+use krishiv_state::checkpoint::{
     CheckpointMetadata, CheckpointResult, CheckpointStorage, IntegrityManifest,
     OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch, latest_valid_epoch_async,
     list_valid_epochs, read_epoch_metadata, read_epoch_metadata_async, read_operator_snapshot,
@@ -302,7 +302,7 @@ impl CheckpointCoordinator {
             ));
         }
         if let Some(snapshot_path) = &ack.snapshot_path {
-            let expected = krishiv_checkpoint::snapshot_path(
+            let expected = krishiv_state::checkpoint::snapshot_path(
                 self.job_id.as_str(),
                 current_epoch,
                 ack.operator_id.as_str(),
@@ -374,7 +374,7 @@ impl CheckpointCoordinator {
         };
 
         // Validate fencing token before committing to storage.
-        krishiv_checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())
+        krishiv_state::checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())
             .map_err(|e| format!("fencing token mismatch for job {}: {e}", self.job_id))?;
 
         Ok(PendingCommit {
@@ -404,7 +404,7 @@ impl CheckpointCoordinator {
         // Build manifest: hash metadata.json + each snapshot file.
         let mut manifest = IntegrityManifest::new();
         let meta_json = serde_json::to_vec_pretty(metadata).map_err(|e| {
-            krishiv_checkpoint::CheckpointError::Storage {
+            krishiv_state::checkpoint::CheckpointError::Storage {
                 message: format!("metadata serialize for manifest: {e}"),
             }
         })?;
@@ -422,7 +422,7 @@ impl CheckpointCoordinator {
                 let rel_path = format!("{}/{}/state.bin", snap_ref.operator_id, snap_ref.task_id);
                 manifest.insert_bytes(&rel_path, &bytes);
             } else {
-                return Err(krishiv_checkpoint::CheckpointError::Corrupt {
+                return Err(krishiv_state::checkpoint::CheckpointError::Corrupt {
                     epoch,
                     message: format!(
                         "snapshot {} referenced by checkpoint ack is missing",
@@ -437,24 +437,24 @@ impl CheckpointCoordinator {
 
         write_epoch_hint_async(commit.storage.as_ref(), job_id, epoch).await?;
 
-        krishiv_governance::audit_log(
+        krishiv_plan::governance::audit_log(
             "scheduler",
-            &krishiv_governance::AuditAction::CheckpointCommitted {
+            &krishiv_plan::governance::AuditAction::CheckpointCommitted {
                 job_id: job_id.to_string(),
                 epoch,
                 fencing_token: metadata.fencing_token,
             },
-            krishiv_governance::AuditOutcome::Allowed,
+            krishiv_plan::governance::AuditOutcome::Allowed,
         );
 
-        krishiv_governance::audit_log(
+        krishiv_plan::governance::audit_log(
             "scheduler",
-            &krishiv_governance::AuditAction::SinkCommitCompleted {
+            &krishiv_plan::governance::AuditAction::SinkCommitCompleted {
                 job_id: job_id.to_string(),
                 sink_id: "global".to_string(),
                 epoch,
             },
-            krishiv_governance::AuditOutcome::Allowed,
+            krishiv_plan::governance::AuditOutcome::Allowed,
         );
 
         Ok(epoch)
@@ -472,7 +472,7 @@ impl CheckpointCoordinator {
             CheckpointCoordinatorState::Committing {
                 epoch: committing_epoch,
             } => {
-                return Err(krishiv_checkpoint::CheckpointError::Storage {
+                return Err(krishiv_state::checkpoint::CheckpointError::Storage {
                     message: format!(
                         "cannot finalize checkpoint epoch {epoch} for job {}: \
                          coordinator is committing epoch {committing_epoch}",
@@ -481,7 +481,7 @@ impl CheckpointCoordinator {
                 });
             }
             state => {
-                return Err(krishiv_checkpoint::CheckpointError::Storage {
+                return Err(krishiv_state::checkpoint::CheckpointError::Storage {
                     message: format!(
                         "cannot finalize checkpoint epoch {epoch} for job {}: \
                          coordinator state is {state:?}",
@@ -511,7 +511,7 @@ impl CheckpointCoordinator {
     ) -> CheckpointResult<()> {
         metadata.validate()?;
         if metadata.job_id != self.job_id.as_str() {
-            return Err(krishiv_checkpoint::CheckpointError::Corrupt {
+            return Err(krishiv_state::checkpoint::CheckpointError::Corrupt {
                 epoch: metadata.epoch,
                 message: format!(
                     "checkpoint metadata job_id {} does not match coordinator job_id {}",
@@ -522,7 +522,7 @@ impl CheckpointCoordinator {
 
         let token = active_fencing_token.unwrap_or(metadata.fencing_token);
         self.fencing_token = FencingToken::try_new(token).map_err(|error| {
-            krishiv_checkpoint::CheckpointError::Storage {
+            krishiv_state::checkpoint::CheckpointError::Storage {
                 message: format!("invalid active fencing token {token}: {error}"),
             }
         })?;
@@ -546,7 +546,7 @@ impl CheckpointCoordinator {
         let epoch = match &self.state {
             CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
             _ => {
-                return Err(krishiv_checkpoint::CheckpointError::Storage {
+                return Err(krishiv_state::checkpoint::CheckpointError::Storage {
                     message: format!(
                         "commit_epoch called but coordinator for job {} is not awaiting acks",
                         self.job_id
@@ -603,15 +603,15 @@ impl CheckpointCoordinator {
         // Validate fencing token before committing to storage.
         // Rejects any attempt to write a checkpoint whose token doesn't match
         // the current coordinator generation, preventing split-brain writes.
-        krishiv_checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())
-            .map_err(|e| krishiv_checkpoint::CheckpointError::Storage {
+        krishiv_state::checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())
+            .map_err(|e| krishiv_state::checkpoint::CheckpointError::Storage {
                 message: format!("fencing token mismatch for job {}: {e}", self.job_id),
             })?;
 
         // Build manifest: hash metadata.json + each snapshot file.
         let mut manifest = IntegrityManifest::new();
         let meta_json = serde_json::to_vec_pretty(&metadata).map_err(|e| {
-            krishiv_checkpoint::CheckpointError::Storage {
+            krishiv_state::checkpoint::CheckpointError::Storage {
                 message: format!("metadata serialize for manifest: {e}"),
             }
         })?;
@@ -628,7 +628,7 @@ impl CheckpointCoordinator {
                 let rel_path = format!("{}/{}/state.bin", snap_ref.operator_id, snap_ref.task_id);
                 manifest.insert_bytes(&rel_path, &bytes);
             } else {
-                return Err(krishiv_checkpoint::CheckpointError::Corrupt {
+                return Err(krishiv_state::checkpoint::CheckpointError::Corrupt {
                     epoch,
                     message: format!(
                         "snapshot {} referenced by checkpoint ack is missing",
@@ -659,24 +659,24 @@ impl CheckpointCoordinator {
         // manifest file.
         write_epoch_hint(self.storage.as_ref(), self.job_id.as_str(), epoch)?;
 
-        krishiv_governance::audit_log(
+        krishiv_plan::governance::audit_log(
             "scheduler",
-            &krishiv_governance::AuditAction::CheckpointCommitted {
+            &krishiv_plan::governance::AuditAction::CheckpointCommitted {
                 job_id: self.job_id.to_string(),
                 epoch,
                 fencing_token: self.fencing_token.as_u64(),
             },
-            krishiv_governance::AuditOutcome::Allowed,
+            krishiv_plan::governance::AuditOutcome::Allowed,
         );
 
-        krishiv_governance::audit_log(
+        krishiv_plan::governance::audit_log(
             "scheduler",
-            &krishiv_governance::AuditAction::SinkCommitCompleted {
+            &krishiv_plan::governance::AuditAction::SinkCommitCompleted {
                 job_id: self.job_id.to_string(),
                 sink_id: "global".to_string(),
                 epoch,
             },
-            krishiv_governance::AuditOutcome::Allowed,
+            krishiv_plan::governance::AuditOutcome::Allowed,
         );
 
         self.state = CheckpointCoordinatorState::Committed { epoch };
@@ -694,7 +694,7 @@ impl CheckpointCoordinator {
     pub async fn commit_epoch_async(&mut self) -> CheckpointResult<u64> {
         let commit = self
             .extract_commit_data()
-            .map_err(|e| krishiv_checkpoint::CheckpointError::Storage { message: e })?;
+            .map_err(|e| krishiv_state::checkpoint::CheckpointError::Storage { message: e })?;
         let epoch = commit.epoch;
 
         Self::commit_storage(commit).await?;
@@ -721,14 +721,14 @@ impl CheckpointCoordinator {
             reason: reason.to_owned(),
         };
 
-        krishiv_governance::audit_log(
+        krishiv_plan::governance::audit_log(
             "scheduler",
-            &krishiv_governance::AuditAction::CheckpointAborted {
+            &krishiv_plan::governance::AuditAction::CheckpointAborted {
                 job_id: self.job_id.to_string(),
                 epoch,
                 reason: Some(reason.to_owned()),
             },
-            krishiv_governance::AuditOutcome::Allowed,
+            krishiv_plan::governance::AuditOutcome::Allowed,
         );
     }
 
@@ -746,7 +746,7 @@ impl CheckpointCoordinator {
                 self.state = CheckpointCoordinatorState::Committed { epoch };
                 Ok(Some(epoch))
             }
-            Err(krishiv_checkpoint::CheckpointError::NoValidEpoch) => Ok(None),
+            Err(krishiv_state::checkpoint::CheckpointError::NoValidEpoch) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -766,7 +766,7 @@ impl CheckpointCoordinator {
                 self.state = CheckpointCoordinatorState::Committed { epoch };
                 Ok(Some(epoch))
             }
-            Err(krishiv_checkpoint::CheckpointError::NoValidEpoch) => Ok(None),
+            Err(krishiv_state::checkpoint::CheckpointError::NoValidEpoch) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -801,7 +801,7 @@ impl CheckpointCoordinator {
 mod tests {
     use std::sync::Arc;
 
-    use krishiv_checkpoint::{LocalFsCheckpointStorage, write_operator_snapshot};
+    use krishiv_state::checkpoint::{LocalFsCheckpointStorage, write_operator_snapshot};
     use krishiv_proto::{
         CheckpointAckRequest, CheckpointSourceOffset, FencingToken, JobId, OperatorId,
         PartitionId, TaskId,
@@ -833,7 +833,7 @@ mod tests {
     /// even when expected_task_count == 0.
     #[test]
     fn checkpoint_timeout_aborts_stuck_epoch_with_zero_expected_tasks() {
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-timeout-zero").unwrap();
         let mut coord = CheckpointCoordinator::new_for_test(job_id, storage, 1_000, 0);
@@ -857,7 +857,7 @@ mod tests {
         // token; the resulting metadata's fencing_token will match the *current* token
         // (taken from coord.fencing_token), so the write should succeed.
         // The guard prevents a *different* coordinator (stale token) from committing.
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-fence").unwrap();
         let mut coord =
@@ -886,7 +886,7 @@ mod tests {
 
         // The committed metadata must carry the correct fencing token.
         let meta =
-            krishiv_checkpoint::read_epoch_metadata(storage.as_ref(), "job-fence", 1).unwrap();
+            krishiv_state::checkpoint::read_epoch_metadata(storage.as_ref(), "job-fence", 1).unwrap();
         assert_eq!(
             meta.unwrap().fencing_token,
             2,
@@ -896,14 +896,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_receive_ack_commits_epoch_without_blocking_wrapper() {
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-async-ck").unwrap();
         let mut coord =
             CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
 
         assert_eq!(coord.initiate().unwrap(), 1);
-        krishiv_checkpoint::write_operator_snapshot_async(
+        krishiv_state::checkpoint::write_operator_snapshot_async(
             storage.as_ref(),
             "job-async-ck",
             1,
@@ -929,7 +929,7 @@ mod tests {
         coord.finalize_commit(1).unwrap();
 
         let meta =
-            krishiv_checkpoint::read_epoch_metadata_async(storage.as_ref(), "job-async-ck", 1)
+            krishiv_state::checkpoint::read_epoch_metadata_async(storage.as_ref(), "job-async-ck", 1)
                 .await
                 .unwrap()
                 .expect("metadata");
@@ -942,7 +942,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finalize_commit_rejects_mismatched_epoch_without_state_change() {
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-finalize-guard").unwrap();
         let mut coord =
@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn checkpoint_inner_finalize_ack_rejects_mismatched_epoch() {
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-inner-finalize-guard").unwrap();
         let mut coord =
@@ -1010,7 +1010,7 @@ mod tests {
     fn commit_epoch_rejects_tampered_fencing_token() {
         // If the metadata's fencing_token is somehow different from self.fencing_token
         // (e.g. a buggy ack injector), commit_epoch must fail.
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-fence-bad").unwrap();
         let mut coord =
@@ -1040,7 +1040,7 @@ mod tests {
 
     #[test]
     fn receive_ack_rejects_mismatched_job_id() {
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ack-contract").unwrap();
         let other_job_id = JobId::try_new("job-other").unwrap();
@@ -1065,7 +1065,7 @@ mod tests {
 
     #[test]
     fn receive_ack_rejects_noncanonical_snapshot_path() {
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ack-path").unwrap();
         let mut coord =
@@ -1080,7 +1080,7 @@ mod tests {
 
         assert!(error.contains("snapshot path"), "unexpected error: {error}");
         assert!(
-            krishiv_checkpoint::read_epoch_metadata(storage.as_ref(), "job-ack-path", 1)
+            krishiv_state::checkpoint::read_epoch_metadata(storage.as_ref(), "job-ack-path", 1)
                 .unwrap()
                 .is_none(),
             "invalid ack must not write checkpoint metadata"
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn receive_ack_rejects_missing_snapshot_without_sealing_epoch() {
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-missing-snapshot").unwrap();
         let mut coord =
@@ -1097,7 +1097,7 @@ mod tests {
         coord.initiate().unwrap();
 
         let mut ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
-        ack.snapshot_path = Some(krishiv_checkpoint::snapshot_path(
+        ack.snapshot_path = Some(krishiv_state::checkpoint::snapshot_path(
             "job-missing-snapshot",
             1,
             "op-task-1",
@@ -1109,24 +1109,24 @@ mod tests {
 
         assert!(error.contains("missing"), "unexpected error: {error}");
         assert!(
-            krishiv_checkpoint::read_epoch_metadata(storage.as_ref(), "job-missing-snapshot", 1)
+            krishiv_state::checkpoint::read_epoch_metadata(storage.as_ref(), "job-missing-snapshot", 1)
                 .unwrap()
                 .is_none(),
             "missing snapshot must fail before metadata is written"
         );
         assert!(
-            !krishiv_checkpoint::validate_epoch(storage.as_ref(), "job-missing-snapshot", 1)
+            !krishiv_state::checkpoint::validate_epoch(storage.as_ref(), "job-missing-snapshot", 1)
                 .unwrap()
         );
         assert!(matches!(
-            krishiv_checkpoint::latest_valid_epoch(storage.as_ref(), "job-missing-snapshot"),
-            Err(krishiv_checkpoint::CheckpointError::NoValidEpoch)
+            krishiv_state::checkpoint::latest_valid_epoch(storage.as_ref(), "job-missing-snapshot"),
+            Err(krishiv_state::checkpoint::CheckpointError::NoValidEpoch)
         ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_commit_storage_rejects_missing_snapshot_without_sealing_epoch() {
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-async-missing-snapshot").unwrap();
         let mut coord =
@@ -1134,7 +1134,7 @@ mod tests {
         coord.initiate().unwrap();
 
         let mut ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
-        ack.snapshot_path = Some(krishiv_checkpoint::snapshot_path(
+        ack.snapshot_path = Some(krishiv_state::checkpoint::snapshot_path(
             "job-async-missing-snapshot",
             1,
             "op-task-1",
@@ -1153,7 +1153,7 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(
-            krishiv_checkpoint::read_epoch_metadata_async(
+            krishiv_state::checkpoint::read_epoch_metadata_async(
                 storage.as_ref(),
                 "job-async-missing-snapshot",
                 1
@@ -1164,12 +1164,12 @@ mod tests {
             "missing async snapshot must fail before metadata is written"
         );
         assert!(matches!(
-            krishiv_checkpoint::latest_valid_epoch_async(
+            krishiv_state::checkpoint::latest_valid_epoch_async(
                 storage.as_ref(),
                 "job-async-missing-snapshot"
             )
             .await,
-            Err(krishiv_checkpoint::CheckpointError::NoValidEpoch)
+            Err(krishiv_state::checkpoint::CheckpointError::NoValidEpoch)
         ));
     }
 
@@ -1178,7 +1178,7 @@ mod tests {
         // Critical split-brain defense: a token *higher* than the current leader's
         // token must be rejected (the old `<` check would have accepted it).
         // This test would have passed with the buggy `<` logic.
-        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-higher-token").unwrap();
         let mut coord =

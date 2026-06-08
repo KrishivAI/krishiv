@@ -2,13 +2,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use krishiv_exec::ContinuousWindowExecutor;
-use krishiv_udf::ResourceLimits;
+use krishiv_dataflow::ContinuousWindowExecutor;
+use krishiv_plan::udf::ResourceLimits;
 
 use crate::fragment::common::task_fragment_body;
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
-use krishiv_exec::execute_bounded_window;
+use krishiv_dataflow::execute_bounded_window;
 use krishiv_plan::window::{WindowAggKind, WindowExecutionSpec, decode_window_execution_spec};
 use krishiv_proto::ExecutorTaskAssignment;
 

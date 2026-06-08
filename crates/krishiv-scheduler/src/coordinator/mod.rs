@@ -1,7 +1,7 @@
 //! Coordinator state machine and shared handle.
 
 use dashmap::DashMap;
-use krishiv_checkpoint::{
+use krishiv_state::checkpoint::{
     CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
     validate_epoch, validate_fencing_token_for_restore,
 };

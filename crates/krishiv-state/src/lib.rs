@@ -17,6 +17,7 @@
 //!   removed; use `FjallStateBackend` directly.
 
 // Declared here:
+pub mod checkpoint;
 pub mod incremental;
 pub mod key_group;
 pub mod migration;

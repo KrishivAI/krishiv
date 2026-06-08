@@ -827,7 +827,7 @@ mod operator_tests {
         // Coordinator A acquires at token=1, commits epoch 1.
         // Coordinator B takes over at token=2.
         // Coordinator A tries to commit epoch 2 with its old token=1 → rejected.
-        use krishiv_checkpoint::{CheckpointError, CheckpointMetadata, validate_fencing_token};
+        use krishiv_state::checkpoint::{CheckpointError, CheckpointMetadata, validate_fencing_token};
 
         let coord_a = K8sLeaseElection::new("job-failover", "default", "pod-a");
         coord_a.try_acquire().await; // token = 1

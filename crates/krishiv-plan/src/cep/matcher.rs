@@ -2,7 +2,7 @@
 
 use arrow::record_batch::RecordBatch;
 
-use crate::pattern::CompiledPattern;
+use crate::cep::pattern::CompiledPattern;
 
 /// Partial in-progress match.
 ///
@@ -189,7 +189,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pattern::Pattern;
+    use crate::cep::pattern::Pattern;
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;

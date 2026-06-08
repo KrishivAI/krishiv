@@ -58,8 +58,8 @@ delta = ["krishiv-connectors/delta"]
 [dependencies]
 krishiv-common = { path = "../krishiv-common" }
 krishiv-api = { path = "../krishiv-api" }
-krishiv-governance = { path = "../krishiv-governance" }
-krishiv-checkpoint = { path = "../krishiv-checkpoint" }
+krishiv-plan = { path = "../krishiv-plan" }
+krishiv-state = { path = "../krishiv-state" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-operator = { path = "../krishiv-operator", optional = true, default-features = false }
@@ -70,7 +70,6 @@ krishiv-executor = { path = "../krishiv-executor" }
 krishiv-flight-sql = { path = "../krishiv-flight-sql", optional = true }
 krishiv-shuffle = { path = "../krishiv-shuffle", optional = true }
 krishiv-sql = { path = "../krishiv-sql" }
-krishiv-udf = { path = "../krishiv-udf" }
 arrow = { workspace = true }
 axum = { workspace = true }
 dotenvy = "0.15"
@@ -85,7 +84,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 arrow = { workspace = true }
 krishiv-runtime = { path = "../krishiv-runtime" }
-krishiv-udf = { path = "../krishiv-udf" }
+krishiv-plan = { path = "../krishiv-plan" }
 parquet = { workspace = true }
 tempfile = { workspace = true }
 

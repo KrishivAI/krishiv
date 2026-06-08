@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use krishiv_api::StreamBatch;
-use krishiv_governance::{Role, RoleBasedPolicyHook, StaticApiKeyAuthProvider};
+use krishiv_plan::governance::{Role, RoleBasedPolicyHook, StaticApiKeyAuthProvider};
 use krishiv_state::SharedStateMigrationRegistry;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -155,8 +155,8 @@ impl PySession {
             .map(|(key, subject, role)| Ok((key, subject, parse_role(&role)?)))
             .collect::<PyResult<Vec<_>>>()?;
         let auth = Arc::new(StaticApiKeyAuthProvider::new(auth_entries));
-        let policy_hook: Arc<dyn krishiv_governance::PolicyHook> = match policy {
-            "allow_all" | "noop" => Arc::new(krishiv_governance::NoOpPolicyHook),
+        let policy_hook: Arc<dyn krishiv_plan::governance::PolicyHook> = match policy {
+            "allow_all" | "noop" => Arc::new(krishiv_plan::governance::NoOpPolicyHook),
             "role_based" => Arc::new(RoleBasedPolicyHook),
             other => {
                 return Err(PyRuntimeError::new_err(format!(

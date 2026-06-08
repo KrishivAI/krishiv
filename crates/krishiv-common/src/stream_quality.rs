@@ -8,7 +8,7 @@ pub type StreamQualityResult<T> = Result<T, String>;
 /// Apply connector-side quality rules to a streaming output batch.
 ///
 /// Defined in `krishiv-common` so `krishiv-connectors` can implement the hook
-/// without depending on `krishiv-exec`.
+/// without depending on `krishiv-dataflow`.
 pub trait StreamQualityHook: Send {
     fn filter(&mut self, batch: RecordBatch) -> StreamQualityResult<(RecordBatch, usize)>;
 }

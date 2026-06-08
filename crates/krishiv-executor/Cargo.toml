@@ -14,17 +14,15 @@ axum = { workspace = true }
 base64 = "0.22"
 dashmap = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
-krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse"] }
 krishiv-ai = { path = "../krishiv-ai" }
-krishiv-exec = { path = "../krishiv-exec" }
+krishiv-dataflow = { path = "../krishiv-dataflow" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-shuffle = { path = "../krishiv-shuffle" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-state = { path = "../krishiv-state" }
-krishiv-udf = { path = "../krishiv-udf" }
 object_store = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "signal", "sync"] }

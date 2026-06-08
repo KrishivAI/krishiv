@@ -6,10 +6,10 @@ use arrow::array::{Array, Int64Array};
 use arrow::record_batch::RecordBatch;
 use futures::Stream;
 use futures::StreamExt;
-use krishiv_exec::interval_join::{IntervalJoinSpec, PerKeyIntervalJoin};
-use krishiv_exec::side_output::{SideOutput, SideOutputRouter};
-use krishiv_exec::temporal_join::{TemporalJoinSpec, VersionedTableState};
-use krishiv_exec::{AggExpr, ExecError, WatermarkState};
+use krishiv_dataflow::interval_join::{IntervalJoinSpec, PerKeyIntervalJoin};
+use krishiv_dataflow::side_output::{SideOutput, SideOutputRouter};
+use krishiv_dataflow::temporal_join::{TemporalJoinSpec, VersionedTableState};
+use krishiv_dataflow::{AggExpr, ExecError, WatermarkState};
 use krishiv_runtime::{LocalWindowExecutionSpec, LocalWindowKind};
 use tokio::sync::mpsc;
 
@@ -18,7 +18,7 @@ use crate::error::{KrishivError, Result};
 
 /// Alias for the inner stream error type used by the window runtime.
 type ExecStream =
-    Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, krishiv_exec::ExecError>> + Send>>;
+    Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, krishiv_dataflow::ExecError>> + Send>>;
 
 pub type KrishivStream =
     Pin<Box<dyn futures::stream::Stream<Item = std::result::Result<RecordBatch, String>> + Send>>;
@@ -512,8 +512,8 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use krishiv_exec::interval_join::IntervalJoinSpec;
-    use krishiv_exec::temporal_join::TemporalJoinSpec;
+    use krishiv_dataflow::interval_join::IntervalJoinSpec;
+    use krishiv_dataflow::temporal_join::TemporalJoinSpec;
     use krishiv_runtime::LocalJobRegistry;
 
     use super::{KrishivStream, interval_join, temporal_join};
