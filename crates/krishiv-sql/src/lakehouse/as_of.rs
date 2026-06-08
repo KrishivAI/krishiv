@@ -1,6 +1,6 @@
 //! Time travel SQL preprocessing (R18 S4, ADR-18.3).
 
-use krishiv_lakehouse::AsOfSpec;
+use krishiv_connectors::lakehouse::AsOfSpec;
 use sqlparser::ast::{
     Expr, Select, SetExpr, Statement, TableFactor, TableVersion, TableWithJoins, Value,
 };
@@ -120,7 +120,7 @@ fn table_version_to_spec(ver: TableVersion) -> Option<AsOfSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use krishiv_lakehouse::AsOfSpec;
+    use krishiv_connectors::lakehouse::AsOfSpec;
 
     #[test]
     fn parses_version_as_of() {

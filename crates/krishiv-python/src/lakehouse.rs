@@ -27,8 +27,8 @@ pub fn read_hudi(
     begin_instant: Option<String>,
 ) -> PyResult<PyDataFrame> {
     let qt = match query_type.to_lowercase().as_str() {
-        "incremental" => krishiv_lakehouse::HudiQueryType::Incremental,
-        _ => krishiv_lakehouse::HudiQueryType::Snapshot,
+        "incremental" => krishiv_connectors::lakehouse::HudiQueryType::Incremental,
+        _ => krishiv_connectors::lakehouse::HudiQueryType::Snapshot,
     };
     RUNTIME
         .block_on(
@@ -42,7 +42,7 @@ pub fn read_hudi(
 
 #[pyclass(name = "HudiWriteResult")]
 pub struct PyHudiWriteResult {
-    inner: krishiv_lakehouse::HudiWriteResult,
+    inner: krishiv_connectors::lakehouse::HudiWriteResult,
 }
 
 #[pymethods]

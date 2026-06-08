@@ -62,6 +62,7 @@ full = [
     "schema-registry",
     "state",
 ]
+exactly-once-integration = ["lakehouse"]
 
 [dependencies]
 arrow = { workspace = true }
@@ -102,6 +103,11 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 proptest = "1"
 wiremock = { workspace = true }
+
+[[test]]
+name = "exactly_once"
+path = "tests/exactly_once.rs"
+required-features = ["exactly-once-integration"]
 
 [lints]
 workspace = true

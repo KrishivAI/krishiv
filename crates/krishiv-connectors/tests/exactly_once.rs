@@ -4,19 +4,20 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use krishiv_connectors::cdc::{CdcEventSource, build_batch_from_events, parse_debezium_envelope};
-use krishiv_connectors::transactional::InMemoryTransactionalProducer;
-use krishiv_lakehouse::{
-    IcebergTableRef, IcebergTwoPhaseCommit, LakehouseTable, MemoryIcebergTwoPhaseCommit,
-    MemoryLakehouseTable, SchemaField, SchemaVersion,
+use krishiv_connectors::ConnectorError;
+use krishiv_connectors::lakehouse::{
+    IcebergScanOptions, IcebergTableRef, IcebergTwoPhaseCommit, LakehouseTable,
+    MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable, SchemaField, SchemaVersion,
 };
+use krishiv_connectors::transactional::InMemoryTransactionalProducer;
 
 struct JsonCdcSource {
     events: Vec<String>,
     cursor: usize,
 }
 
-impl krishiv_connectors::cdc::CdcEventSource for JsonCdcSource {
-    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+impl CdcEventSource for JsonCdcSource {
+    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, ConnectorError> {
         let end = (self.cursor + max).min(self.events.len());
         if self.cursor >= end {
             return Ok(Vec::new());
@@ -104,7 +105,7 @@ async fn exactly_once_ten_thousand_rows_after_crash() {
     }
 
     let scanned = lake
-        .scan(&krishiv_lakehouse::IcebergScanOptions::default())
+        .scan(&IcebergScanOptions::default())
         .await
         .unwrap();
     let total: usize = scanned.iter().map(|b| b.num_rows()).sum();

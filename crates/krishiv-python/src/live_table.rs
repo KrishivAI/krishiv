@@ -6,7 +6,7 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use krishiv_exec::live_table::{ChangeFeed, CreateLiveTableExec, RefreshLiveTableExec};
-use krishiv_lakehouse::{DeltaOp, MemoryDeltaStore};
+use krishiv_connectors::lakehouse::{DeltaOp, MemoryDeltaStore};
 use krishiv_sql::live_table::{LiveTableRegistry, execute_live_table_ddl};
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;

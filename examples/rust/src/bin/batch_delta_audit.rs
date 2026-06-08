@@ -27,10 +27,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Arc::new(StringArray::from(vec!["Alice", "Bob"])),
         ],
     )?;
-    krishiv_lakehouse::write_delta(
+    krishiv_connectors::lakehouse::write_delta(
         &delta_path,
         vec![batch_v0],
-        krishiv_lakehouse::DeltaWriteMode::Overwrite,
+        krishiv_connectors::lakehouse::DeltaWriteMode::Overwrite,
         false,
     )
     .await?;
@@ -43,10 +43,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Arc::new(StringArray::from(vec!["Charlie"])),
         ],
     )?;
-    krishiv_lakehouse::write_delta(
+    krishiv_connectors::lakehouse::write_delta(
         &delta_path,
         vec![batch_v1],
-        krishiv_lakehouse::DeltaWriteMode::Append,
+        krishiv_connectors::lakehouse::DeltaWriteMode::Append,
         false,
     )
     .await?;

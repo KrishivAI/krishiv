@@ -55,8 +55,7 @@ block-beta
 
   block:Connectors:2:2
     columns 2
-    h1("Connectors<br/><i>krishiv-connectors</i><br/>Parquet / Kafka / S3")
-    h2("Lakehouse<br/><i>krishiv-lakehouse</i><br/>Iceberg / Delta / Hudi")
+    h1("Connectors<br/><i>krishiv-connectors</i><br/>Parquet / Kafka / S3 / Lakehouse")
   end
 
   block:Storage:3:2
@@ -127,8 +126,6 @@ flowchart LR
   UDF["krishiv-udf"]
   AI["krishiv-ai"]
   OPS["krishiv-operator"]
-  LH["krishiv-lakehouse"]
-
   CLI --> API
   CLI --> SQL
   CLI --> RUNTIME
@@ -164,7 +161,6 @@ flowchart LR
   UI --> SCHED
   UI --> COMMON
   OPS --> SCHED
-  LH --> CONN
   AI --> STATE
 
   COMMON --> PROTO

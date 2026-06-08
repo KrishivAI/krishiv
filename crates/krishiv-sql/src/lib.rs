@@ -1045,7 +1045,7 @@ impl SqlEngine {
     pub async fn read_hudi(
         &self,
         path: impl AsRef<str>,
-        query_type: krishiv_lakehouse::HudiQueryType,
+        query_type: krishiv_connectors::lakehouse::HudiQueryType,
         begin_instant: Option<&str>,
     ) -> SqlResult<SqlDataFrame> {
         let path = path.as_ref();

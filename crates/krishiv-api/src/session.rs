@@ -1014,7 +1014,7 @@ impl Session {
     pub async fn read_hudi_async(
         &self,
         path: impl AsRef<str>,
-        query_type: krishiv_lakehouse::HudiQueryType,
+        query_type: krishiv_connectors::lakehouse::HudiQueryType,
         begin_instant: Option<&str>,
     ) -> Result<DataFrame> {
         let sql_dataframe = self
@@ -1033,12 +1033,12 @@ impl Session {
         &self,
         path: impl AsRef<std::path::Path>,
         dataframe: &DataFrame,
-    ) -> Result<krishiv_lakehouse::HudiWriteResult> {
+    ) -> Result<krishiv_connectors::lakehouse::HudiWriteResult> {
         let batches = dataframe.collect_async().await?.into_batches();
         let path = path.as_ref().to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let writer = krishiv_lakehouse::HudiCowWriter::open(&path);
-            let mut total = krishiv_lakehouse::HudiWriteResult {
+            let writer = krishiv_connectors::lakehouse::HudiCowWriter::open(&path);
+            let mut total = krishiv_connectors::lakehouse::HudiWriteResult {
                 instant: String::new(),
                 rows_inserted: 0,
                 rows_updated: 0,
@@ -1071,13 +1071,13 @@ impl Session {
         path: impl AsRef<std::path::Path>,
         key_column: &str,
         dataframe: &DataFrame,
-    ) -> Result<krishiv_lakehouse::HudiWriteResult> {
+    ) -> Result<krishiv_connectors::lakehouse::HudiWriteResult> {
         let batches = dataframe.collect_async().await?.into_batches();
         let path = path.as_ref().to_path_buf();
         let key_column_str = key_column.to_string();
         tokio::task::spawn_blocking(move || {
-            let writer = krishiv_lakehouse::HudiCowWriter::open(&path);
-            let mut total = krishiv_lakehouse::HudiWriteResult {
+            let writer = krishiv_connectors::lakehouse::HudiCowWriter::open(&path);
+            let mut total = krishiv_connectors::lakehouse::HudiWriteResult {
                 instant: String::new(),
                 rows_inserted: 0,
                 rows_updated: 0,

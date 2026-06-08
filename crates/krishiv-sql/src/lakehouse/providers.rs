@@ -13,7 +13,7 @@ use datafusion::logical_expr::TableType;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 
-use krishiv_lakehouse::{AsOfSpec, HudiQueryType, HudiSnapshotReader};
+use krishiv_connectors::lakehouse::{AsOfSpec, HudiQueryType, HudiSnapshotReader};
 
 use crate::SqlError;
 use crate::SqlResult;
@@ -26,7 +26,7 @@ pub async fn register_delta_uri(
     version: Option<i64>,
 ) -> SqlResult<()> {
     let _ = ctx.deregister_table(table_name);
-    let handle = krishiv_lakehouse::DeltaTableHandle::open(path, version)
+    let handle = krishiv_connectors::lakehouse::DeltaTableHandle::open(path, version)
         .await
         .map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
@@ -68,7 +68,7 @@ pub async fn register_hudi_uri(
 
 #[derive(Debug)]
 struct DeltaScanProvider {
-    handle: krishiv_lakehouse::DeltaTableHandle,
+    handle: krishiv_connectors::lakehouse::DeltaTableHandle,
     schema: SchemaRef,
 }
 
