@@ -2915,18 +2915,17 @@ dependencies = [
  "axum",
  "dotenvy",
  "krishiv-api",
- "krishiv-checkpoint",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-executor",
  "krishiv-flight-sql",
- "krishiv-governance",
  "krishiv-metrics",
+ "krishiv-plan",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-shuffle",
  "krishiv-sql",
- "krishiv-udf",
+ "krishiv-state",
  "krishiv-ui",
  "libc",
  "parquet 58.3.0",
@@ -2971,40 +2970,11 @@ dependencies = [
  "futures",
  "krishiv-common",
  "krishiv-connectors",
- "krishiv-exec",
- "krishiv-governance",
+ "krishiv-dataflow",
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-sql",
  "krishiv-state",
- "krishiv-udf",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "krishiv-cep"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "serde",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "krishiv-checkpoint"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "krishiv-common",
- "krishiv-state",
- "object_store",
- "serde",
- "serde_json",
- "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -3051,7 +3021,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "krishiv-exec"
+name = "krishiv-dataflow"
 version = "0.1.0"
 dependencies = [
  "arrow",
@@ -3059,7 +3029,6 @@ dependencies = [
  "dashmap",
  "futures",
  "krishiv-ai",
- "krishiv-cep",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-plan",
@@ -3080,17 +3049,15 @@ dependencies = [
  "base64",
  "dashmap",
  "krishiv-ai",
- "krishiv-checkpoint",
  "krishiv-common",
  "krishiv-connectors",
- "krishiv-exec",
+ "krishiv-dataflow",
  "krishiv-metrics",
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
  "krishiv-sql",
  "krishiv-state",
- "krishiv-udf",
  "object_store",
  "serde_json",
  "thiserror 1.0.69",
@@ -3111,7 +3078,6 @@ dependencies = [
  "futures",
  "krishiv-api",
  "krishiv-common",
- "krishiv-governance",
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-scheduler",
@@ -3121,24 +3087,6 @@ dependencies = [
  "sha2",
  "tokio",
  "tonic",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "krishiv-governance"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "dashmap",
- "krishiv-common",
- "reqwest 0.13.3",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 1.0.69",
- "tokio",
  "tracing",
  "uuid",
 ]
@@ -3163,24 +3111,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "krishiv-optimizer"
-version = "0.1.0"
-dependencies = [
- "krishiv-plan",
- "sqlparser",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
 name = "krishiv-plan"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "async-trait",
+ "chrono",
+ "dashmap",
  "krishiv-common",
  "krishiv-proto",
+ "reqwest 0.13.3",
  "serde",
  "serde_json",
+ "sha2",
+ "sqlparser",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3209,7 +3157,7 @@ dependencies = [
  "dashmap",
  "futures",
  "krishiv-common",
- "krishiv-exec",
+ "krishiv-dataflow",
  "krishiv-executor",
  "krishiv-plan",
  "krishiv-proto",
@@ -3235,7 +3183,9 @@ dependencies = [
  "futures",
  "krishiv",
  "krishiv-api",
+ "krishiv-common",
  "krishiv-connectors",
+ "krishiv-dataflow",
  "krishiv-runtime",
  "krishiv-sql",
  "parquet 58.3.0",
@@ -3255,14 +3205,12 @@ dependencies = [
  "base64",
  "dashmap",
  "futures",
- "krishiv-checkpoint",
  "krishiv-common",
- "krishiv-governance",
  "krishiv-metrics",
- "krishiv-optimizer",
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
+ "krishiv-state",
  "redb",
  "reqwest 0.13.3",
  "serde",
@@ -3310,13 +3258,9 @@ dependencies = [
  "dashmap",
  "datafusion",
  "futures",
- "krishiv-cep",
  "krishiv-common",
  "krishiv-connectors",
- "krishiv-governance",
- "krishiv-optimizer",
  "krishiv-plan",
- "krishiv-udf",
  "regex",
  "reqwest 0.13.3",
  "serde",
@@ -3334,8 +3278,12 @@ dependencies = [
 name = "krishiv-state"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "fjall",
+ "futures",
  "krishiv-common",
+ "object_store",
  "redb",
  "serde",
  "serde_json",
@@ -3345,15 +3293,6 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
-]
-
-[[package]]
-name = "krishiv-udf"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "krishiv-common",
- "thiserror 1.0.69",
 ]
 
 [[package]]

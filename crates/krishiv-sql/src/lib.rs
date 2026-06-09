@@ -1092,7 +1092,6 @@ impl SqlEngine {
                 .deregister_table(table_name)
                 .map_err(SqlError::from)?;
         }
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         self.context
             .register_table(table_name, Arc::new(mem_table))
             .map_err(|e| SqlError::DataFusion {
@@ -1720,10 +1719,11 @@ impl SqlDataFrame {
 
         // Run the logical optimizer so BroadcastAutoRule fires on eligible scans.
         let optimizer = krishiv_plan::optimizer::default_logical_optimizer();
+        let fallback = plan.clone();
         optimizer
             .optimize(plan)
             .map(|result| result.plan)
-            .unwrap_or(plan)
+            .unwrap_or(fallback)
     }
 
     /// Explain the logical plan without executing it.

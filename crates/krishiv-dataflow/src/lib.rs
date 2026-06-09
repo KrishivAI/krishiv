@@ -75,8 +75,9 @@ pub use chunk::ChunkOperator;
 
 pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, HeavyHittersTracker,
-    HotKeyReport, RateLimiter, SinkLatencyTracker, ThrottleCommand,
+    HotKeyReport, RateLimiter, SinkLatencyTracker, StreamingPartitionAdvisor, ThrottleCommand,
 };
+pub use coalesce_partitions::{CoalescePartitionsOperator, coalesce_partition_batches};
 pub use aggregate::{AggExpr, AggFunction, LocalAggregator};
 pub use continuous::ContinuousWindowExecutor;
 pub use join::{BroadcastJoin, BuiltBroadcastJoin, HashJoin, StreamTableJoin};
