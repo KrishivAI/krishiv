@@ -468,7 +468,40 @@ async fn execute_shuffle_write_fragment(
         ));
     }
 
-    Ok(ExecutorTaskOutput::shuffle_write(total_rows, outputs))
+    // Track heavy hitters (hot keys) during this shuffle write.
+    let hot_key_reports = {
+        use krishiv_dataflow::adaptive::HeavyHittersTracker;
+        let mut tracker = HeavyHittersTracker::new(64);
+        let key_idx = batches
+            .first()
+            .and_then(|b| b.schema().index_of(key_column).ok());
+        if let Some(kidx) = key_idx {
+            for batch in &batches {
+                let col = batch.column(kidx);
+                for i in 0..col.len() {
+                    if col.is_valid(i) {
+                        tracker.observe(format!("{:?}", col.slice(i, 1)));
+                    }
+                }
+            }
+        }
+        tracker
+            .hot_keys(0.10)
+            .into_iter()
+            .map(|report| krishiv_proto::HeartbeatHotKeyReport {
+                key: report.key,
+                estimated_count: report.estimated_count,
+                max_error: report.max_error,
+                heat_score: report.heat_score,
+                job_id: assignment.job_id().clone(),
+                source_id: stage_id.to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut output = ExecutorTaskOutput::shuffle_write(total_rows, outputs);
+    output.hot_key_reports = hot_key_reports;
+    Ok(output)
 }
 
 /// Execute a typed R4a shuffle-write task backed by `InMemoryShuffleStore`.
@@ -572,7 +605,40 @@ async fn execute_inmem_shuffle_write(
         outputs.push(krishiv_proto::ShufflePartitionOutput::inline(p, size_bytes));
     }
 
-    Ok(ExecutorTaskOutput::shuffle_write(total_rows, outputs))
+    // Track heavy hitters (hot keys) during this in-memory shuffle write.
+    let hot_key_reports = {
+        use krishiv_dataflow::adaptive::HeavyHittersTracker;
+        let mut tracker = HeavyHittersTracker::new(64);
+        let key_idx = batches
+            .first()
+            .and_then(|b| b.schema().index_of(key_column.unwrap_or("")).ok());
+        if let Some(kidx) = key_idx {
+            for batch in &batches {
+                let col = batch.column(kidx);
+                for i in 0..col.len() {
+                    if col.is_valid(i) {
+                        tracker.observe(format!("{:?}", col.slice(i, 1)));
+                    }
+                }
+            }
+        }
+        tracker
+            .hot_keys(0.10)
+            .into_iter()
+            .map(|report| krishiv_proto::HeartbeatHotKeyReport {
+                key: report.key,
+                estimated_count: report.estimated_count,
+                max_error: report.max_error,
+                heat_score: report.heat_score,
+                job_id: assignment.job_id().clone(),
+                source_id: stage_id.to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut output = ExecutorTaskOutput::shuffle_write(total_rows, outputs);
+    output.hot_key_reports = hot_key_reports;
+    Ok(output)
 }
 
 /// Execute a typed R4a shuffle-read task backed by `InMemoryShuffleStore`.

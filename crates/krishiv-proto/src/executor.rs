@@ -139,6 +139,8 @@ pub struct TaskOutputMetadata {
     /// Transmitted back to the coordinator in the `TaskStatusRequest` so the
     /// coordinator can track the global low-watermark across all executor tasks.
     watermark_ms: Option<i64>,
+    /// Hot-key reports from `HeavyHittersTracker` observed during shuffle write.
+    hot_key_reports: Vec<HeartbeatHotKeyReport>,
 }
 
 impl TaskOutputMetadata {
@@ -158,6 +160,7 @@ impl TaskOutputMetadata {
             runtime_stats: None,
             inline_record_batch_ipc: Vec::new(),
             watermark_ms: None,
+            hot_key_reports: Vec::new(),
         }
     }
 
@@ -173,6 +176,18 @@ impl TaskOutputMetadata {
     pub fn with_runtime_stats(mut self, stats: TaskRuntimeStats) -> Self {
         self.runtime_stats = Some(stats);
         self
+    }
+
+    /// Attach hot-key reports.
+    #[must_use]
+    pub fn with_hot_key_reports(mut self, reports: Vec<HeartbeatHotKeyReport>) -> Self {
+        self.hot_key_reports = reports;
+        self
+    }
+
+    /// Hot-key reports.
+    pub fn hot_key_reports(&self) -> &[HeartbeatHotKeyReport] {
+        &self.hot_key_reports
     }
 
     /// Output kind label.
@@ -362,6 +377,26 @@ pub struct HeartbeatHotKeyReport {
     pub job_id: JobId,
     /// Source or operator id that produced this report.
     pub source_id: String,
+}
+
+impl Eq for HeartbeatHotKeyReport {}
+
+impl PartialOrd for HeartbeatHotKeyReport {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeartbeatHotKeyReport {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.heat_score
+            .total_cmp(&other.heat_score)
+            .then_with(|| self.key.cmp(&other.key))
+            .then_with(|| self.estimated_count.cmp(&other.estimated_count))
+            .then_with(|| self.max_error.cmp(&other.max_error))
+            .then_with(|| self.job_id.cmp(&other.job_id))
+            .then_with(|| self.source_id.cmp(&other.source_id))
+    }
 }
 
 /// Per-model LLM API usage reported by an executor (R17).

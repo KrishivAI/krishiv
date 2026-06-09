@@ -32,6 +32,7 @@ pub struct SessionBuilder {
     coordinator_url: Option<String>,
     local_cluster_grpc: Option<String>,
     state_ttl: Option<StateTtlConfig>,
+    target_parallelism: Option<std::num::NonZeroUsize>,
     /// When true, route data-plane work to the remote Flight endpoint (no local fallback).
     remote_execution: bool,
     /// Reuse an existing in-process cluster (continuous stream registry, coordinator bridge).
@@ -41,6 +42,10 @@ pub struct SessionBuilder {
     /// automatically. Explicitly disabling it in Distributed mode now fails
     /// during build instead of silently creating a local fallback runtime.
     remote_execution_explicit: bool,
+    /// Shuffle partition count override.  When set, `AutoPartitionRule` is
+    /// skipped and this value is used as the bucket count for all `Hash` /
+    /// `RoundRobin` exchange nodes.
+    shuffle_partitions: Option<u32>,
 }
 
 impl fmt::Debug for SessionBuilder {
@@ -52,6 +57,7 @@ impl fmt::Debug for SessionBuilder {
             .field("coordinator_url", &self.coordinator_url)
             .field("local_cluster_grpc", &self.local_cluster_grpc)
             .field("state_ttl", &self.state_ttl)
+            .field("target_parallelism", &self.target_parallelism)
             .field("remote_execution", &self.remote_execution)
             .field(
                 "in_process_cluster",
@@ -74,9 +80,11 @@ impl Default for SessionBuilder {
             coordinator_url: None,
             local_cluster_grpc: None,
             state_ttl: None,
+            target_parallelism: None,
             remote_execution: remote_execution_from_env(),
             in_process_cluster: None,
             remote_execution_explicit: false,
+            shuffle_partitions: None,
         }
     }
 }
@@ -151,6 +159,7 @@ impl SessionBuilder {
     /// | `KRISHIV_COORDINATOR_URL` | Arrow Flight URL | — |
     /// | `KRISHIV_COORDINATOR` | alias for `KRISHIV_COORDINATOR_URL` | — |
     /// | `KRISHIV_REMOTE_EXEC` | `1`, `true` | derived from mode |
+    /// | `KRISHIV_TARGET_PARALLELISM` | positive integer | `1` (embedded) or `available_parallelism()` |
     ///
     /// Preferred entry point for k8s and bare-metal deployments where the
     /// execution mode is injected via environment variables rather than
@@ -218,6 +227,29 @@ impl SessionBuilder {
 
         if let Some(remote) = remote_execution_from_env_opt() {
             builder = builder.with_remote_execution(remote);
+        }
+
+        if let Ok(val) = std::env::var("KRISHIV_TARGET_PARALLELISM") {
+            let n: usize = val.trim().parse().map_err(|_| {
+                KrishivError::unsupported(format!(
+                    "KRISHIV_TARGET_PARALLELISM must be a positive integer, got '{val}'"
+                ))
+            })?;
+            let nz = std::num::NonZeroUsize::new(n).ok_or_else(|| {
+                KrishivError::unsupported(
+                    "KRISHIV_TARGET_PARALLELISM must be greater than 0".to_string(),
+                )
+            })?;
+            builder = builder.with_target_parallelism(nz);
+        }
+
+        if let Ok(val) = std::env::var("KRIVISH_SHUFFLE_PARTITIONS") {
+            let n: u32 = val.trim().parse().map_err(|_| {
+                KrishivError::unsupported(format!(
+                    "KRIVISH_SHUFFLE_PARTITIONS must be a positive integer, got '{val}'"
+                ))
+            })?;
+            builder = builder.with_shuffle_partitions(n);
         }
 
         if krishiv_common::profile_requires_fail_closed_metadata(
@@ -317,6 +349,26 @@ impl SessionBuilder {
         self
     }
 
+    /// Set DataFusion `target_partitions` parallelism for this session.
+    ///
+    /// Higher values parallelise hash-join build, aggregation spilling, and
+    /// parquet scans. Default: `1` (embedded) or `available_parallelism()`
+    /// (single-node/daemon). Override via `KRISHIV_TARGET_PARALLELISM`.
+    #[must_use]
+    pub fn with_target_parallelism(mut self, n: std::num::NonZeroUsize) -> Self {
+        self.target_parallelism = Some(n);
+        self
+    }
+
+    /// Override the auto-computed shuffle partition count for all exchange
+    /// nodes in the session.  When set, `AutoPartitionRule` is bypassed and
+    /// this value is used directly.
+    #[must_use]
+    pub fn with_shuffle_partitions(mut self, n: u32) -> Self {
+        self.shuffle_partitions = Some(n);
+        self
+    }
+
     /// Build a session.
     pub fn build(self) -> Result<Session> {
         // R12: Validate that coordinator_url and local_cluster_grpc point to the
@@ -347,7 +399,18 @@ impl SessionBuilder {
         }
 
         let udf_registry = Arc::new(RwLock::new(UdfRegistry::new()));
-        let sql_engine = SqlEngine::new().with_udf_registry(Arc::clone(&udf_registry));
+        let parallelism = self.target_parallelism.unwrap_or_else(|| {
+            if matches!(self.mode, ExecutionMode::Embedded) {
+                std::num::NonZeroUsize::new(1).unwrap()
+            } else {
+                std::thread::available_parallelism()
+                    .unwrap_or(std::num::NonZeroUsize::new(1).unwrap())
+            }
+        });
+        let sql_engine = SqlEngine::new()
+            .with_target_parallelism(parallelism)
+            .with_udf_registry(Arc::clone(&udf_registry))
+            .with_shuffle_partitions(self.shuffle_partitions);
         let policy_engine = match (self.auth, self.policy) {
             (Some(auth), Some(policy)) => Some(PolicyEnforcingSqlEngine::new(
                 sql_engine.clone(),
@@ -433,6 +496,7 @@ impl SessionBuilder {
             registered_parquet: Arc::new(DashMap::new()),
             stream_jobs: Arc::new(DashMap::new()),
             unbounded_streams: Arc::new(DashMap::new()),
+            shuffle_partitions: self.shuffle_partitions,
         })
     }
 }
@@ -456,6 +520,9 @@ pub struct Session {
     registered_parquet: Arc<DashMap<String, PathBuf>>,
     stream_jobs: Arc<DashMap<String, LocalWindowExecutionSpec>>,
     unbounded_streams: Arc<DashMap<String, Arc<ContinuousTableInput>>>,
+    /// Optional override for the shuffle partition count.  When set,
+    /// `AutoPartitionRule` is bypassed for exchange nodes.
+    pub(crate) shuffle_partitions: Option<u32>,
 }
 
 impl fmt::Debug for Session {

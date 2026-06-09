@@ -11,7 +11,7 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::{ExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanError, PlanNode};
+use crate::{ExecutionKind, LogicalPlan, NodeOp, Partitioning, PhysicalPlan, PlanError, PlanNode};
 
 /// Result type for logical and adaptive optimizer pipelines.
 pub type OptimizerResult<T> = Result<T, OptimizerError>;
@@ -322,7 +322,7 @@ pub struct CoalesceRule {
 }
 
 /// Default target partition size: 128 MiB.
-const DEFAULT_TARGET_PARTITION_BYTES: u64 = 134_217_728;
+const DEFAULT_TARGET_PARTITION_BYTES: u64 = krishiv_common::partition::TARGET_BYTES_PER_PARTITION;
 
 impl CoalesceRule {
     /// Create a new `CoalesceRule` with the given minimum partition byte threshold.
@@ -514,6 +514,146 @@ impl AqeRule for CoalesceRule {
                 .with_op(NodeOp::CoalescePartitions { target_partitions }),
         );
         Some(rewritten.with_coalesced_partition_count(target_partitions))
+    }
+}
+
+// ── AutoPartitionRule ───────────────────────────────────────────────────────────
+
+/// AQE rule that adjusts the bucket count of `Hash` and `RoundRobin` exchange
+/// nodes based on the observed data volume from the previous execution.
+///
+/// The rule reads `RuntimeStats` (one per DataFusion partition), sums
+/// `memory_bytes` to obtain the total stage output size, and computes a target
+/// partition count:
+///
+/// `target = max(1, ceil(total_bytes / target_partition_bytes))`
+///
+/// The computed count is clamped to the existing bucket count so the rule only
+/// ever increases parallelism (a single execution sees monotonically non-decreasing
+/// bucket counts across AQE iterations).
+///
+/// When stats are empty (first execution) or contain no measurable memory, the
+/// rule is a no-op and returns `None`.
+pub struct AutoPartitionRule {
+    /// Desired bytes per partition.  Default: 128 MiB.
+    target_partition_bytes: u64,
+    /// Upper bound on the number of partitions.  Derived from
+    /// `target_partitions` in the session config so we never ask for more
+    /// parallelism than the runtime can supply.
+    max_buckets: u32,
+}
+
+impl AutoPartitionRule {
+    /// Create a new rule with the given max bucket count.
+    ///
+    /// Uses the default `target_partition_bytes` of 128 MiB.
+    pub fn new(max_buckets: u32) -> Self {
+        Self {
+            target_partition_bytes: DEFAULT_TARGET_PARTITION_BYTES,
+            max_buckets,
+        }
+    }
+
+    /// Set a custom `target_partition_bytes`.
+    #[must_use]
+    pub fn with_target_partition_bytes(mut self, bytes: u64) -> Self {
+        self.target_partition_bytes = bytes;
+        self
+    }
+}
+
+impl AqeRule for AutoPartitionRule {
+    fn name(&self) -> &str {
+        "auto-partition"
+    }
+
+    fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
+        // When an explicit shuffle_partitions override is set on the plan
+        // (via SET shuffle.partitions = N or SessionBuilder), use it as the
+        // target bucket count regardless of stats.  Stats may be empty on the
+        // first execution and that's fine — the override is a user intent.
+        if let Some(override_buckets) = plan.shuffle_partitions() {
+            return self.apply_override(plan, override_buckets);
+        }
+
+        if stats.is_empty() || StreamingAqeGuard::plan_is_streaming(&plan) {
+            return None;
+        }
+
+        // Sum memory across all partitions to get total stage output size.
+        let total_bytes: u64 = stats.iter().map(|s| s.memory_bytes).sum();
+        if total_bytes == 0 {
+            return None;
+        }
+
+        // Compute target partition count.
+        let target =
+            u64::from(self.max_buckets).min(
+                (total_bytes + self.target_partition_bytes - 1) / self.target_partition_bytes,
+            );
+        let target = target.max(1) as u32;
+
+        self.stamp_target(plan, target)
+    }
+}
+
+impl AutoPartitionRule {
+    /// Apply the rule with an explicit override bucket count.
+    /// Skips streaming plans, but does not require runtime stats.
+    fn apply_override(&self, plan: PhysicalPlan, target: u32) -> Option<PhysicalPlan> {
+        if StreamingAqeGuard::plan_is_streaming(&plan) {
+            return None;
+        }
+        let target = target.max(1);
+        self.stamp_target(plan, target)
+    }
+
+    /// Stamp `target` bucket count onto all Hash/RoundRobin exchange nodes
+    /// whose current count is below `target`.  Returns `None` if no node
+    /// needed adjustment.
+    fn stamp_target(&self, plan: PhysicalPlan, target: u32) -> Option<PhysicalPlan> {
+        let mut changed = false;
+        for node in plan.nodes() {
+            match node.partitioning() {
+                Partitioning::Hash { buckets, .. } | Partitioning::RoundRobin { buckets, .. }
+                    if *buckets < target =>
+                {
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+
+        if !changed {
+            return None;
+        }
+
+        let mut plan = plan;
+        for node in plan.nodes_mut() {
+            let old = node.partitioning().clone();
+            match old {
+                Partitioning::Hash { ref keys, buckets } if buckets < target => {
+                    node.set_partitioning(Partitioning::Hash {
+                        keys: keys.clone(),
+                        buckets: target,
+                    });
+                }
+                Partitioning::RoundRobin { buckets } if buckets < target => {
+                    node.set_partitioning(Partitioning::RoundRobin {
+                        buckets: target,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        tracing::debug!(
+            rule = "auto-partition",
+            target,
+            "AutoPartitionRule applied"
+        );
+
+        Some(plan)
     }
 }
 
@@ -772,6 +912,67 @@ impl Default for AqeOptimizer {
 ///   against the left and right scan inputs independently and pushed as far
 ///   down as it can go. Cross-join predicates (referencing both sides) remain
 ///   in the filter.
+/// Default threshold for auto-broadcast: tables with estimated rows below
+/// this value are candidates for broadcast join.  ~1M rows ≈ 100 MiB at 100
+/// bytes/row.
+const DEFAULT_BROADCAST_THRESHOLD_ROWS: u64 = 1_000_000;
+
+/// Logical optimizer rule that marks small scan nodes as broadcast-eligible.
+///
+/// Scans the logical plan for `NodeOp::Scan` nodes whose `estimated_rows` is
+/// set and below the threshold.  Such nodes are annotated with
+/// `broadcast_eligible = true` so the lowering pass promotes their exchange
+/// to `Broadcast` partitioning.
+///
+/// The threshold is deliberately conservative (1M rows).  Without `estimated_rows`
+/// populated from source metadata (parquet footer, Kafka stats, etc.) the rule
+/// is a no-op.
+pub struct BroadcastAutoRule {
+    /// Max rows a table can have to be considered broadcast-eligible.
+    max_rows: u64,
+}
+
+impl BroadcastAutoRule {
+    /// Create a new rule with the given max row threshold.
+    pub fn new(max_rows: u64) -> Self {
+        Self { max_rows }
+    }
+}
+
+impl OptimizerRule for BroadcastAutoRule {
+    fn name(&self) -> &str {
+        "broadcast-auto"
+    }
+
+    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+        let nodes = plan.nodes();
+        let mut changed = false;
+        let mut new_nodes: Vec<PlanNode> = Vec::with_capacity(nodes.len());
+
+        for node in nodes {
+            let is_small_scan = matches!(node.op(), Some(NodeOp::Scan { .. }))
+                && node.estimated_rows().map_or(false, |r| r <= self.max_rows);
+
+            if is_small_scan && !node.broadcast_eligible() {
+                changed = true;
+                new_nodes.push(node.clone().with_broadcast_eligible(true));
+            } else {
+                new_nodes.push(node.clone());
+            }
+        }
+
+        if !changed {
+            return None;
+        }
+
+        let mut new_plan = LogicalPlan::new(plan.name(), plan.kind());
+        for n in new_nodes {
+            new_plan = new_plan.with_node(n);
+        }
+        Some(new_plan)
+    }
+}
+
 pub struct PredicatePushdownRule;
 
 impl OptimizerRule for PredicatePushdownRule {
@@ -1112,6 +1313,7 @@ fn column_belongs_to_scan(col: &str, scan_table: &str, scan_columns: &[&str]) ->
 /// Default logical optimizer with semantics-preserving rules enabled.
 pub fn default_logical_optimizer() -> Optimizer {
     let mut optimizer = Optimizer::new();
+    optimizer.add_rule(Box::new(BroadcastAutoRule::new(DEFAULT_BROADCAST_THRESHOLD_ROWS)));
     optimizer.add_rule(Box::new(PredicatePushdownRule));
     optimizer
 }
@@ -1123,6 +1325,7 @@ pub fn default_logical_optimizer() -> Optimizer {
 /// is wired (see `AqeOptimizer::apply`).
 pub fn default_aqe_optimizer() -> AqeOptimizer {
     let mut optimizer = AqeOptimizer::new();
+    optimizer.add_guarded_rule(Box::new(AutoPartitionRule::new(64)));
     optimizer.add_guarded_rule(Box::new(CoalesceRule::new(64 * 1024 * 1024)));
     optimizer
 }
@@ -1784,7 +1987,7 @@ mod tests {
     fn coalesce_rule_reduces_200_small_partitions() {
         use crate::NodeOp;
 
-        use crate::AqeRule;
+        use crate::optimizer::AqeRule;
 
         const PARTITIONS: usize = 200;
         const ONE_MIB: u64 = 1_048_576; // 1 MiB per partition
@@ -1831,7 +2034,7 @@ mod tests {
     /// already large enough (no coalescing benefit).
     #[test]
     fn coalesce_rule_noop_when_partitions_are_large() {
-        use crate::AqeRule;
+        use crate::optimizer::AqeRule;
 
         const ONE_GIB: u64 = 1_073_741_824;
 

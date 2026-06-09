@@ -391,4 +391,44 @@ impl DataFrame {
         let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
         jobs.upsert(JobStatus::new(id.clone(), name, state));
     }
+
+    /// Insert a hash-based exchange node into the logical plan. When backed
+    /// by a SQL query, works on the logical plan directly.
+    #[must_use]
+    pub fn repartition(mut self, num_partitions: u32, key_columns: &[&str]) -> Self {
+        // Find terminal nodes (not referenced as inputs by any other node).
+        let referenced: std::collections::HashSet<&str> = self
+            .logical_plan
+            .nodes()
+            .iter()
+            .flat_map(|n| n.inputs().iter().map(|s| s.as_str()))
+            .collect();
+        let terminals: Vec<&str> = self
+            .logical_plan
+            .nodes()
+            .iter()
+            .filter_map(|n| {
+                if !referenced.contains(n.id()) {
+                    Some(n.id())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let exchange_id = format!("repartition-{}", self.logical_plan.nodes().len());
+        let exchange = krishiv_plan::PlanNode::new(
+            &exchange_id,
+            format!("exchange hash({})", key_columns.join(", ")),
+            self.logical_plan.kind(),
+        )
+        .with_inputs(terminals.iter().map(|s| s.to_string()))
+        .with_partitioning(krishiv_plan::Partitioning::Hash {
+            keys: key_columns.iter().map(|s| s.to_string()).collect(),
+            buckets: num_partitions,
+        });
+
+        self.logical_plan = self.logical_plan.with_node(exchange);
+        self
+    }
 }

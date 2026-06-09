@@ -5,7 +5,14 @@ use arrow::record_batch::RecordBatch;
 
 use crate::{ExecError, ExecResult};
 
-/// Merge `inputs` into at most `target_partitions` batches (preserving schema).
+/// Merge `inputs` into at most `target_partitions` batches using byte-size
+/// bin-packing rather than count-based chunking.
+///
+/// Each output partition accumulates input batches until it has collected
+/// roughly `total_bytes / target_partitions` bytes, then closes. The last
+/// allowed group absorbs all remaining input so the output count never exceeds
+/// `target_partitions`. This produces uniform-sized output partitions even
+/// when input batches are skewed in row count.
 pub fn coalesce_partition_batches(
     inputs: &[RecordBatch],
     target_partitions: usize,
@@ -17,18 +24,46 @@ pub fn coalesce_partition_batches(
     if inputs.len() <= target {
         return Ok(inputs.to_vec());
     }
+
     let schema = inputs[0].schema();
-    let chunk_size = inputs.len().div_ceil(target);
-    let mut outputs = Vec::with_capacity(target);
-    for chunk in inputs.chunks(chunk_size) {
-        if chunk.len() == 1 {
-            outputs.push(chunk[0].clone());
-        } else {
-            let merged =
-                concat_batches(&schema, chunk).map_err(|e| ExecError::Arrow(e.to_string()))?;
+    let total_bytes: u64 = inputs
+        .iter()
+        .map(|b| b.get_array_memory_size() as u64)
+        .sum();
+    // Guard against zero when all batches happen to be empty schema-only batches.
+    let target_bytes_per_group = (total_bytes / target as u64).max(1);
+
+    let mut outputs: Vec<RecordBatch> = Vec::with_capacity(target);
+    let mut group_start = 0usize;
+    let mut group_bytes: u64 = 0;
+
+    for (i, batch) in inputs.iter().enumerate() {
+        group_bytes += batch.get_array_memory_size() as u64;
+        let is_last_batch = i + 1 == inputs.len();
+        let groups_produced = outputs.len();
+
+        // Close this group when:
+        //  a) We've reached the byte target AND there is still room to open
+        //     more groups (groups_produced + 1 < target), so we don't flush
+        //     prematurely and leave nothing for the remaining groups.
+        //  b) This is the last input batch — flush whatever remains.
+        let should_close = is_last_batch
+            || (group_bytes >= target_bytes_per_group && groups_produced + 1 < target);
+
+        if should_close {
+            let group = &inputs[group_start..=i];
+            let merged = if group.len() == 1 {
+                group[0].clone()
+            } else {
+                concat_batches(&schema, group)
+                    .map_err(|e| ExecError::Arrow(e.to_string()))?
+            };
             outputs.push(merged);
+            group_start = i + 1;
+            group_bytes = 0;
         }
     }
+
     Ok(outputs)
 }
 
@@ -166,5 +201,51 @@ mod tests {
         let dbg = format!("{:?}", op);
         assert!(dbg.contains("CoalescePartitionsOperator"));
         assert!(dbg.contains("4"));
+    }
+
+    // ── size-aware bin-packing ────────────────────────────────────────────────
+
+    /// Equal-size batches should be distributed evenly across output groups.
+    #[test]
+    fn coalesce_size_aware_even_batches() {
+        // 6 equal-size batches → target 2 groups → 3 batches each
+        let inputs: Vec<RecordBatch> = (0..6).map(|i| batch(&[i])).collect();
+        let out = coalesce_partition_batches(&inputs, 2).unwrap();
+        assert_eq!(out.len(), 2);
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 6);
+        // Both groups should have roughly the same number of rows.
+        assert_eq!(out[0].num_rows(), 3);
+        assert_eq!(out[1].num_rows(), 3);
+    }
+
+    /// Output should never exceed target_partitions regardless of batch sizes.
+    #[test]
+    fn coalesce_never_exceeds_target() {
+        let inputs: Vec<RecordBatch> = (0..10).map(|i| batch(&[i])).collect();
+        for target in [1, 2, 3, 4, 5, 7, 9, 10] {
+            let out = coalesce_partition_batches(&inputs, target).unwrap();
+            assert!(
+                out.len() <= target,
+                "target={target}: got {} groups",
+                out.len()
+            );
+            let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 10, "target={target}: rows must be preserved");
+        }
+    }
+
+    /// All-empty batches (zero bytes) should not panic and should produce at
+    /// most target_partitions output groups.
+    #[test]
+    fn coalesce_handles_zero_byte_batches() {
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int32, false),
+            arrow::datatypes::Field::new("name", DataType::Utf8, false),
+        ]));
+        let empty = RecordBatch::new_empty(schema);
+        let inputs = vec![empty.clone(), empty.clone(), empty.clone()];
+        let out = coalesce_partition_batches(&inputs, 2).unwrap();
+        assert!(out.len() <= 2);
     }
 }

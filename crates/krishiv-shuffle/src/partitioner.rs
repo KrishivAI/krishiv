@@ -1,3 +1,12 @@
+//! Shuffle-routing hash partitioner (XxHash64).
+//!
+//! **Type boundary**: keys are hashed with XxHash64 for deterministic bucket
+//! assignment in a shuffle exchange. This is intentionally *different* from
+//! `krishiv_common::partition`, which uses SHA-256 with a domain-separation
+//! prefix for keyed-semantics partitioning (join keys, state sharding). The
+//! two hash functions are not interchangeable — never use this partitioner
+//! where keyed-semantics guarantees are required.
+
 use crate::{ShuffleError, ShuffleResult};
 use arrow::array::{
     Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray, UInt32Array,

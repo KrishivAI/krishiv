@@ -1,5 +1,137 @@
 # Krishiv Implementation Status
 
+## Architectural gap closed: shuffle_partitions → AutoPartitionRule (2026-06-09)
+
+### Done
+1. **`shuffle_partitions` field** added to `PlanCore`/`LogicalPlan`/`PhysicalPlan` — propagates the override through the plan pipeline.
+2. **`lower_to_physical()`** propagates `shuffle_partitions` from logical → physical plan.
+3. **`AutoPartitionRule::apply()`** checks `plan.shuffle_partitions()`. When set, uses it as the target bucket count instead of computing from data size. Skips streaming plans but does not require runtime stats.
+4. **`SqlDataFrame`** carries `shuffle_partitions` and propagates it in `krishiv_logical_plan()`.
+5. **`SqlEngine::sql()`** stamps the override from `self.shuffle_partitions()` onto each `SqlDataFrame` it creates.
+6. **`KRIVISH_SHUFFLE_PARTITIONS` env var** parsed in `SessionBuilder::from_env()`.
+7. **`DataFrame::repartition()`** typo fix: `terminers` → `terminals`.
+
+### Flow
+```
+SET shuffle.partitions = 8
+  → SqlEngine::sql() stores on SqlDataFrame
+  → krishiv_logical_plan() → LogicalPlan.shuffle_partitions = Some(8)
+  → lower_to_physical() → PhysicalPlan.shuffle_partitions = Some(8)
+  → submit_physical_plan() → AutoPartitionRule::apply()
+    → reads plan.shuffle_partitions() → stamps 8 on all exchange nodes
+```
+
+### Validated
+- `cargo check -p krishiv-sql -p krishiv-api -p krishiv-plan -p krishiv-scheduler` (clean)
+- `cargo test -p krishiv-plan --lib` (397 passed)
+
+### Remaining gap: Phase 3 (BroadcastAutoRule)
+`BroadcastAutoRule` checks `NodeOp::Scan` nodes with `estimated_rows` populated. No production code creates `NodeOp::Scan` nodes — the SQL path wraps DataFusion plans as a single opaque Krishiv node. Fixing this requires translating DataFusion physical plans into Krishiv `PlanNode` DAGs with scan/estimated_rows annotations.
+
+---
+
+## Phase 2: Hot-key detection during shuffle write (2026-06-09)
+
+### Phase 2a — HeavyHittersTracker wired into shuffle write ✓
+Plumbed `HeavyHittersTracker` (SpaceSaving algorithm) through both shuffle write paths:
+
+1. **`execute_shuffle_write_fragment`** (`krishiv-executor/src/fragment/batch.rs:463-502`):
+   After partitioning, runs the tracker on the key column, detects hot keys at 10%
+   threshold, emits `HeartbeatHotKeyReport`s.
+2. **`execute_inmem_shuffle_write`** (`krishiv-executor/src/fragment/batch.rs:605-645`):
+   Same tracking for the in-memory shuffle store path.
+3. **`ExecutorTaskOutput::hot_key_reports`** (`krishiv-executor/src/runner.rs:226`):
+   New field `Vec<HeartbeatHotKeyReport>` on task output.
+4. **`TaskOutputMetadata`** (`krishiv-proto/src/executor.rs:142`): Added
+   `hot_key_reports` field with wire serialization/deserialization
+   (`krishiv-proto/src/wire.rs:787, 854-862`). Added
+   `with_hot_key_reports()` builder method.
+5. **`HeartbeatHotKeyReport` Eq**: Added manual `Eq` + `Ord` impl using
+   `total_cmp` for `f64` heat_score field.
+
+Hot-key reports flow to the coordinator via `TaskOutputMetadata` on task
+completion (`send_task_status` path). The existing heartbeat path
+(`ExecutorHeartbeatRequest::with_hot_key_reports`) is already processed by
+`coordinator::executor_ops::process_hot_key_reports` for streaming tasks.
+
+### Phase 2b — Coordinator-side processing ✓
+Already handled by existing `process_hot_key_reports` in
+`krishiv-scheduler/src/coordinator/executor_ops.rs:118-160`. Applies
+`HOT_KEY_HEAT_THRESHOLD = 0.3` to decide whether to log an adaptive decision
+and emit a throttle command.
+
+Validation:
+```bash
+cargo check --workspace --exclude krishiv-python                    # ✓
+cargo test -p krishiv-proto                                         # 65 ✓
+cargo test -p krishiv-executor --lib -- runner_tests                # 26 ✓
+```
+
+Next: Phase 3 — `BroadcastAutoRule` (already registered as no-op until source
+metadata populates `estimated_rows`).
+
+---
+
+## Phase 1: AutoPartition + data-size-aware shards (2026-06-08)
+
+### Phase 1a — AutoPartitionRule ✓
+Added `AutoPartitionRule` — an AQE rule that adjusts `Hash`/`RoundRobin` exchange
+bucket counts based on observed data volume from the prior execution:
+
+1. **`AutoPartitionRule` struct** (`krishiv-plan/src/optimizer.rs:539-636`): AQE
+   rule that sums `memory_bytes` across `RuntimeStats`, computes
+   `target = max(1, min(max_buckets, ceil(total_bytes / target_partition_bytes)))`,
+   and bumps bucket counts on exchange nodes that are below the target. Default
+   128 MiB per partition. No-op when stats are empty or all nodes already meet
+   the target.
+2. **Mutation API** (`krishiv-plan/src/lib.rs`): Added `PlanNode::set_partitioning()`,
+   `PhysicalPlan::nodes_mut()`, and `PlanCore::nodes_mut()` so AQE rules can
+   adjust node partition counts in-place without rebuilding the DAG.
+3. **Registered** in `default_aqe_optimizer()` as a guarded rule (skipped for
+   streaming) with `max_buckets: 64`, before `CoalesceRule`.
+
+### Phase 1b — Bounded-window shard count ✓
+`krishiv-scheduler/src/bounded_window.rs`: Replaced the hardcoded shard limit
+(`executor_count.min(input_row_count)`) with a data-size-aware computation:
+`data_based_shards = max(1, ceil(total_data_bytes / 128 MiB))`, capped by
+available executors and input rows. Total data bytes are computed from
+`RecordBatch::get_array_memory_size()` across all input batches.
+
+### Phase 1c — AutoPartitionRule wired in job_lifecycle ✓
+Already done: `default_aqe_optimizer()` (which now includes `AutoPartitionRule`)
+is called in `krishiv-scheduler/src/coordinator/job_lifecycle.rs:473` via
+`submit_physical_plan`. With empty stats (first execution) the rule is a no-op;
+AQE re-optimization applies when per-stage stats become available.
+
+---
+
+## Cleanup: fixed consolidation fallout + crate mode matrix (2026-06-08)
+
+Follow-up cleanup after the 25→20 crate consolidation:
+
+1. **Fixed broken references** in merged submodules:
+   - Internal `crate::checkpoint::` paths in `krishiv-state/src/checkpoint/` (object_store, storage_uri, mod.rs)
+   - Internal `crate::cep::pattern::` path in `krishiv-plan/src/cep/matcher.rs`
+   - Corrupted `krishiv-dataflowutor` reference in `krishiv-runtime/Cargo.toml`
+   - Bare `use krishiv_udf;` import in `krishiv-executor/src/cli.rs`
+2. **Batch-fixed old import paths** via sed: `krishiv_exec::` → `krishiv_dataflow::`, `krishiv_checkpoint::` → `krishiv_state::checkpoint::`, etc.
+3. **Deleted old crate directories**: `krishiv-checkpoint`, `krishiv-udf`, `krishiv-governance`, `krishiv-cep`, `krishiv-optimizer`, `krishiv-exec`
+4. **Removed deprecated items**: `StoreError` type alias (krishiv-shuffle), `commit_watermark` method (krishiv-connectors/kafka)
+5. **Updated docs**: README crate list, CONTRIBUTING.md stale refs, architecture.md/architecture.txt with grounded code facts
+6. **Added Crate Requirements by Mode** matrix to `docs/architecture.md` — shows required/optional/excluded per mode with feature gate annotations for all 20 crates
+
+Validation: `cargo check --workspace` passes (zero errors).
+
+Blocked: `krishiv-shuffle` fails in isolation (`cargo test -p krishiv-shuffle --lib`) due to pre-existing missing `object_store` `aws` feature in its own Cargo.toml.
+
+Next useful commands:
+```bash
+cargo test --workspace --lib --no-fail-fast --exclude krishiv-python
+cargo clippy --workspace --all-targets
+```
+
+---
+
 ## Connector follow-ups and lakehouse merge (2026-06-07)
 
 Completed connector consolidation follow-ups on branch

@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -203,16 +204,19 @@ pub fn streaming_match_recognize_limit_from_env() -> usize {
     )
 }
 
-/// Build the DataFusion session config.
+/// Build the DataFusion session config with a configurable parallelism level.
 ///
-/// Embedded mode (`parallelism=1`): queries run against small in-process datasets;
-/// the extra thread-spawn overhead of multi-partition execution outweighs the gain.
-/// Single-node daemon mode should override with `available_parallelism()` after
-/// construction if it expects large parquet scans.
-fn build_single_node_session_config() -> datafusion::prelude::SessionConfig {
+/// When `target_partitions > 1`, round-robin repartitioning is enabled so
+/// DataFusion can balance work across threads for hash-join build,
+/// aggregation spill, and parquet scan parallelism.
+fn build_single_node_session_config(target_partitions: NonZeroUsize) -> datafusion::prelude::SessionConfig {
+    let tp = target_partitions.get();
     let mut config = datafusion::prelude::SessionConfig::new()
-        .with_target_partitions(1)
-        .set_bool("datafusion.optimizer.enable_round_robin_repartition", false);
+        .with_target_partitions(tp)
+        .set_bool(
+            "datafusion.optimizer.enable_round_robin_repartition",
+            tp > 1,
+        );
     config.options_mut().execution.parquet.pushdown_filters = true;
     config.options_mut().execution.parquet.enable_page_index = true;
     config
@@ -221,6 +225,7 @@ fn build_single_node_session_config() -> datafusion::prelude::SessionConfig {
 #[derive(Clone)]
 pub struct SqlEngine {
     context: SessionContext,
+    target_parallelism: NonZeroUsize,
     krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
     view_registry: Option<std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>>,
     udf_registry: Option<std::sync::Arc<std::sync::RwLock<krishiv_plan::udf::UdfRegistry>>>,
@@ -250,6 +255,14 @@ pub struct SqlEngine {
     /// Single-lock design prevents the TOCTOU race of the previous two-structure
     /// (`DashMap` + `VecDeque`) implementation.
     plan_cache: Arc<Mutex<PlanCache>>,
+    /// Override for shuffle partition count (`SET shuffle.partitions = N`).
+    /// When `Some`, exchange nodes use this bucket count instead of auto-sizing.
+    shuffle_partitions: Arc<std::sync::RwLock<Option<u32>>>,
+    /// Estimated row counts for registered tables, keyed by table name.
+    /// Populated by `register_parquet` and `register_record_batches`.
+    /// Used by `krishiv_logical_plan` to annotate scan nodes for the
+    /// `BroadcastAutoRule` optimizer.
+    table_row_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -274,8 +287,11 @@ impl SqlEngine {
     /// engine is still returned — non-window queries work — and a
     /// `tracing::warn!` is emitted. Use [`SqlEngine::try_new`] when callers
     /// need to surface the registration error.
+    ///
+    /// DataFusion `target_partitions` defaults to 1 (single-threaded local
+    /// execution). Use [`SqlEngine::with_target_parallelism`] to override.
     pub fn new() -> Self {
-        match Self::build_local(None, WindowFnRegistration::Register) {
+        match Self::build_local(None, WindowFnRegistration::Register, NonZeroUsize::new(1).unwrap()) {
             Ok(engine) => engine,
             Err(err) => {
                 tracing::warn!(
@@ -283,7 +299,7 @@ impl SqlEngine {
                     "SqlEngine::new: window helper UDF registration failed; \
                      window SQL functions will be unavailable, other queries are unaffected"
                 );
-                Self::build_local(None, WindowFnRegistration::Skip)
+                Self::build_local(None, WindowFnRegistration::Skip, NonZeroUsize::new(1).unwrap())
                     .expect("SqlEngine::build_local with WindowFnRegistration::Skip is infallible")
             }
         }
@@ -294,7 +310,7 @@ impl SqlEngine {
     /// Callers that need to abort startup when window functions cannot be
     /// registered should use this constructor.
     pub fn try_new() -> SqlResult<Self> {
-        Self::build_local(None, WindowFnRegistration::Register)
+        Self::build_local(None, WindowFnRegistration::Register, NonZeroUsize::new(1).unwrap())
     }
 
     /// Create an engine whose `krishiv` catalog resolves tables registered in `InMemoryCatalog` (P0-10).
@@ -309,7 +325,49 @@ impl SqlEngine {
                 ),
             });
         }
-        Self::build_local(Some(catalog), WindowFnRegistration::Register)
+        Self::build_local(Some(catalog), WindowFnRegistration::Register, NonZeroUsize::new(1).unwrap())
+    }
+
+    /// Set the DataFusion `target_partitions` parallelism level for this engine.
+    ///
+    /// Higher values allow DataFusion to parallelise hash-join build,
+    /// aggregation spilling, and parquet scans across more threads.
+    /// Default: 1 (single-threaded). Recommended: `available_parallelism()`.
+    #[must_use]
+    pub fn with_target_parallelism(mut self, n: NonZeroUsize) -> Self {
+        self.target_parallelism = n;
+        self
+    }
+
+    /// Return the configured `target_partitions` parallelism level.
+    pub fn target_parallelism(&self) -> NonZeroUsize {
+        self.target_parallelism
+    }
+
+    /// Return the current `shuffle.partitions` override, if set via `SET shuffle.partitions = N`.
+    pub fn shuffle_partitions(&self) -> Option<u32> {
+        *self.shuffle_partitions.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Return access to the table row-count registry.
+    ///
+    /// Populated by `register_parquet` and `register_record_batches` with
+    /// estimated row counts extracted from table-provider statistics. Used
+    /// by `SqlDataFrame::krishiv_logical_plan` to annotate scan nodes.
+    pub fn table_row_counts(&self) -> Arc<std::sync::RwLock<HashMap<String, u64>>> {
+        Arc::clone(&self.table_row_counts)
+    }
+
+    /// Set an override for the shuffle partition count.
+    ///
+    /// When `n` is `Some`, exchange and shuffle-write operations use `n` buckets
+    /// instead of auto-sizing. Pass `None` to restore auto-sizing.
+    #[must_use]
+    pub fn with_shuffle_partitions(self, n: Option<u32>) -> Self {
+        if let Ok(mut guard) = self.shuffle_partitions.write() {
+            *guard = n;
+        }
+        self
     }
 
     /// Internal builder shared by the public constructors.
@@ -324,6 +382,7 @@ impl SqlEngine {
     fn build_local(
         krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
         window_fn_registration: WindowFnRegistration,
+        target_partitions: NonZeroUsize,
     ) -> SqlResult<Self> {
         // Create streaming_sources first so it can be shared with KafkaTableFactory.
         // DDL-created Kafka tables (CREATE EXTERNAL TABLE … STORED AS KAFKA) then
@@ -341,7 +400,7 @@ impl SqlEngine {
         );
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
-            .with_config(build_single_node_session_config())
+            .with_config(build_single_node_session_config(target_partitions))
             .with_table_factories(table_factories)
             .build();
         let context = SessionContext::new_with_state(state);
@@ -360,6 +419,7 @@ impl SqlEngine {
         }
         Ok(Self {
             context,
+            target_parallelism: target_partitions,
             krishiv_catalog,
             view_registry: None,
             udf_registry: None,
@@ -370,6 +430,8 @@ impl SqlEngine {
             udf_registry_version: Arc::new(AtomicU64::new(0)),
             udf_last_synced_version: Arc::new(AtomicU64::new(u64::MAX)),
             plan_cache: Arc::new(Mutex::new(PlanCache::new(resolve_plan_cache_max_entries()))),
+            shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
+            table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -961,6 +1023,16 @@ impl SqlEngine {
         self.context
             .register_parquet(table_name, path, ParquetReadOptions::default())
             .await?;
+        // Extract estimated row count from table provider statistics.
+        if let Ok(provider) = self.context.table_provider(table_name).await {
+            if let Some(stats) = provider.statistics() {
+                if let Some(n) = stats.num_rows.get_value() {
+                    if let Ok(mut counts) = self.table_row_counts.write() {
+                        counts.insert(table_name.to_string(), *n as u64);
+                    }
+                }
+            }
+        }
         if let Some(ref reg) = self.view_registry
             && let Ok(mut r) = reg.lock()
         {
@@ -977,7 +1049,11 @@ impl SqlEngine {
             .context
             .read_parquet(path, ParquetReadOptions::default())
             .await?;
-        Ok(SqlDataFrame::new("parquet-read", dataframe))
+        Ok(SqlDataFrame::new(
+            "parquet-read",
+            dataframe,
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        ))
     }
 
     /// Register an in-memory table from Arrow record batches.
@@ -998,6 +1074,7 @@ impl SqlEngine {
         if batches.is_empty() {
             return Ok(());
         }
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         let schema = batches[0].schema();
         let mem_table =
             datafusion::datasource::MemTable::try_new(schema, vec![batches]).map_err(|e| {
@@ -1015,11 +1092,17 @@ impl SqlEngine {
                 .deregister_table(table_name)
                 .map_err(SqlError::from)?;
         }
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         self.context
             .register_table(table_name, Arc::new(mem_table))
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
+        if total_rows > 0 {
+            if let Ok(mut counts) = self.table_row_counts.write() {
+                counts.insert(table_name.to_string(), total_rows as u64);
+            }
+        }
         if let Some(ref reg) = self.view_registry
             && let Ok(mut r) = reg.lock()
         {
@@ -1072,6 +1155,50 @@ impl SqlEngine {
                 self.sync_all_udfs().await?;
                 self.udf_last_synced_version
                     .store(current, Ordering::Release);
+            }
+        }
+
+        // ── Intercept SET shuffle.partitions = N ─────────────────────────────
+        // Krishiv-specific session config; DataFusion does not know about it.
+        let trimmed = query.trim();
+        if trimmed.to_ascii_uppercase().starts_with("SET SHUFFLE.PARTITIONS") {
+            let value = trimmed.split('=').nth(1).map(|s| s.trim()).unwrap_or("");
+            match value.parse::<u32>() {
+                Ok(n) if n > 0 => {
+                    {
+                        let mut guard = self.shuffle_partitions.write().map_err(|e| {
+                            SqlError::DataFusion { message: e.to_string() }
+                        })?;
+                        *guard = Some(n);
+                    }
+                    let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+                    return Ok(SqlDataFrame::new(
+                        "set-shuffle-partitions",
+                        empty,
+                        Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    ));
+                }
+                Ok(_) => {
+                    {
+                        let mut guard = self.shuffle_partitions.write().map_err(|e| {
+                            SqlError::DataFusion { message: e.to_string() }
+                        })?;
+                        *guard = None;
+                    }
+                    let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+                    return Ok(SqlDataFrame::new(
+                        "set-shuffle-partitions",
+                        empty,
+                        Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    ));
+                }
+                Err(_) => {
+                    return Err(SqlError::DataFusion {
+                        message: format!(
+                            "invalid shuffle.partitions value '{value}'; expected a positive integer"
+                        ),
+                    });
+                }
             }
         }
 
@@ -1130,7 +1257,12 @@ impl SqlEngine {
             udf::register_single_table_udf(&self.context, std::sync::Arc::clone(&udf))
                 .map_err(SqlError::from)?;
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-            return Ok(SqlDataFrame::new("create-function", empty).with_query(query));
+            return Ok(SqlDataFrame::new(
+                "create-function",
+                empty,
+                Arc::new(std::sync::RwLock::new(HashMap::new())),
+            )
+            .with_query(query));
         }
 
         if query
@@ -1145,7 +1277,12 @@ impl SqlEngine {
                 .context
                 .sql("SELECT * FROM _krishiv_merge_result")
                 .await?;
-            return Ok(SqlDataFrame::new("merge", dataframe).with_query(query));
+            return Ok(SqlDataFrame::new(
+                "merge",
+                dataframe,
+                self.table_row_counts(),
+            )
+            .with_query(query));
         }
 
         // ── Intercept MATCH_RECOGNIZE ─────────────────────────────────────────
@@ -1191,7 +1328,8 @@ impl SqlEngine {
                     .context
                     .sql("SELECT * FROM _krishiv_cep_result")
                     .await?;
-                return Ok(SqlDataFrame::new("cep", dataframe).with_query(query));
+                return Ok(SqlDataFrame::new("cep", dataframe, self.table_row_counts())
+                    .with_query(query));
             }
         }
 
@@ -1206,6 +1344,7 @@ impl SqlEngine {
         // Single-lock design: lookup and insert share the same Mutex<PlanCache>,
         // eliminating the TOCTOU race of the previous DashMap + VecDeque approach.
         let can_cache = as_ofs.is_empty();
+        let shuffle_override = self.shuffle_partitions.read().map(|g| *g).unwrap_or_else(|e| *e.into_inner());
         if can_cache {
             // Scope the guard so it is dropped before any .await point.
             let cached_plan: Option<datafusion::logical_expr::LogicalPlan> = self
@@ -1216,7 +1355,9 @@ impl SqlEngine {
                 .cloned();
             if let Some(plan) = cached_plan {
                 let dataframe = self.context.execute_logical_plan(plan).await?;
-                return Ok(SqlDataFrame::new("sql-query", dataframe).with_query(rewritten));
+                return Ok(SqlDataFrame::new("sql-query", dataframe, self.table_row_counts())
+                    .with_query(rewritten)
+                    .with_shuffle_partitions(shuffle_override));
             }
         }
 
@@ -1231,7 +1372,9 @@ impl SqlEngine {
             }
         }
 
-        Ok(SqlDataFrame::new("sql-query", dataframe).with_query(rewritten))
+        Ok(SqlDataFrame::new("sql-query", dataframe, self.table_row_counts())
+            .with_query(rewritten)
+            .with_shuffle_partitions(shuffle_override))
     }
 
     /// Execute `query` with materialized view cache lookup.
@@ -1307,25 +1450,247 @@ pub trait KrishivDataFrameOps: Send + Sync {
     async fn execute_stream(&self) -> SqlResult<SqlStream>;
 }
 
+/// Recursively walk a DataFusion `LogicalPlan` and produce Krishiv `PlanNode`
+/// entries.  Returns `(nodes, root_id)` where `root_id` is the ID of the
+/// top-level Krishiv node representing `plan`.
+///
+/// Table-scan nodes carry `estimated_rows` when the table name is found in
+/// `table_row_counts`.  Unhandled node types fall back to a single opaque
+/// `NodeOp::Other` node.
+fn df_plan_to_krishiv_nodes(
+    plan: &datafusion::logical_expr::LogicalPlan,
+    table_row_counts: &std::collections::HashMap<String, u64>,
+    counter: &mut usize,
+) -> (Vec<krishiv_plan::PlanNode>, String) {
+    use datafusion::logical_expr::LogicalPlan as DfPlan;
+    use krishiv_plan::{ExecutionKind, NodeOp, PlanNode};
+
+    *counter += 1;
+    let idx = *counter;
+
+    match plan {
+        DfPlan::TableScan(ts) => {
+            let table_name = ts.table_name.table().to_string();
+            let row_count = table_row_counts.get(&table_name).copied();
+            let filters: Vec<String> = ts.filters.iter().map(|e| e.to_string()).collect();
+            let id = format!("scan-{idx}");
+            let node = PlanNode::new(&id, format!("Scan {table_name}"), ExecutionKind::Batch)
+                .with_op(NodeOp::Scan {
+                    table: table_name,
+                    filters,
+                })
+                .with_estimated_rows(row_count);
+            (vec![node], id)
+        }
+
+        DfPlan::Projection(proj) => {
+            let (mut nodes, input_id) =
+                df_plan_to_krishiv_nodes(&proj.input, table_row_counts, counter);
+            let id = format!("proj-{idx}");
+            let columns: Vec<String> = proj.expr.iter().map(|e| e.to_string()).collect();
+            nodes.push(
+                PlanNode::new(&id, "Projection", ExecutionKind::Batch)
+                    .with_op(NodeOp::Project { columns })
+                    .with_inputs([input_id]),
+            );
+            (nodes, id)
+        }
+
+        DfPlan::Filter(filter) => {
+            let (mut nodes, input_id) =
+                df_plan_to_krishiv_nodes(&filter.input, table_row_counts, counter);
+            let id = format!("filter-{idx}");
+            let predicate = filter.predicate.to_string();
+            nodes.push(
+                PlanNode::new(&id, "Filter", ExecutionKind::Batch)
+                    .with_op(NodeOp::Filter { predicate })
+                    .with_inputs([input_id]),
+            );
+            (nodes, id)
+        }
+
+        DfPlan::Aggregate(agg) => {
+            let (mut nodes, input_id) =
+                df_plan_to_krishiv_nodes(&agg.input, table_row_counts, counter);
+            let id = format!("agg-{idx}");
+            let group_keys: Vec<String> =
+                agg.group_expr.iter().map(|e| e.to_string()).collect();
+            nodes.push(
+                PlanNode::new(&id, "Aggregate", ExecutionKind::Batch)
+                    .with_op(NodeOp::Aggregate { group_keys })
+                    .with_inputs([input_id]),
+            );
+            (nodes, id)
+        }
+
+        DfPlan::Join(join) => {
+            let (mut nodes, left_id) =
+                df_plan_to_krishiv_nodes(&join.left, table_row_counts, counter);
+            let (right_nodes, right_id) =
+                df_plan_to_krishiv_nodes(&join.right, table_row_counts, counter);
+            nodes.extend(right_nodes);
+            let id = format!("join-{idx}");
+            let krishiv_join_type = match join.join_type {
+                datafusion::common::JoinType::Inner => krishiv_plan::JoinType::Inner,
+                datafusion::common::JoinType::Left => krishiv_plan::JoinType::Left,
+                datafusion::common::JoinType::Right => krishiv_plan::JoinType::Right,
+                datafusion::common::JoinType::Full => krishiv_plan::JoinType::Full,
+                _ => krishiv_plan::JoinType::Inner,
+            };
+            nodes.push(
+                PlanNode::new(&id, "Join", ExecutionKind::Batch)
+                    .with_op(NodeOp::Join {
+                        join_type: krishiv_join_type,
+                    })
+                    .with_inputs([left_id, right_id]),
+            );
+            (nodes, id)
+        }
+
+        DfPlan::Sort(sort) => {
+            let (mut nodes, input_id) =
+                df_plan_to_krishiv_nodes(&sort.input, table_row_counts, counter);
+            let id = format!("sort-{idx}");
+            nodes.push(
+                PlanNode::new(&id, "Sort", ExecutionKind::Batch)
+                    .with_op(NodeOp::Other {
+                        description: format!("Sort({})", sort.expr.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ")),
+                    })
+                    .with_inputs([input_id]),
+            );
+            (nodes, id)
+        }
+
+        DfPlan::Repartition(repart) => {
+            let (mut nodes, input_id) =
+                df_plan_to_krishiv_nodes(&repart.input, table_row_counts, counter);
+            let id = format!("exchange-{idx}");
+            let partitioning = krishiv_plan::Partitioning::Unpartitioned;
+            nodes.push(
+                PlanNode::new(&id, "Exchange", ExecutionKind::Batch)
+                    .with_op(NodeOp::Exchange { partitioning })
+                    .with_inputs([input_id]),
+            );
+            (nodes, id)
+        }
+
+        DfPlan::Limit(limit) => {
+            let (mut nodes, input_id) =
+                df_plan_to_krishiv_nodes(&limit.input, table_row_counts, counter);
+            let id = format!("limit-{idx}");
+            nodes.push(
+                PlanNode::new(&id, "Limit", ExecutionKind::Batch)
+                    .with_op(NodeOp::Other {
+                        description: format!(
+                            "Limit(skip={:?}, fetch={:?})",
+                            limit.skip.as_ref().map(|e| e.to_string()),
+                            limit.fetch.as_ref().map(|e| e.to_string()),
+                        ),
+                    })
+                    .with_inputs([input_id]),
+            );
+            (nodes, id)
+        }
+
+        DfPlan::Union(union) if union.inputs.len() == 1 => {
+            df_plan_to_krishiv_nodes(&union.inputs[0], table_row_counts, counter)
+        }
+        DfPlan::Union(union) => {
+            let mut all_nodes = Vec::new();
+            let mut input_ids = Vec::new();
+            for input in &union.inputs {
+                let (sub_nodes, sub_id) =
+                    df_plan_to_krishiv_nodes(input, table_row_counts, counter);
+                all_nodes.extend(sub_nodes);
+                input_ids.push(sub_id);
+            }
+            let id = format!("union-{idx}");
+            all_nodes.push(
+                PlanNode::new(&id, "Union", ExecutionKind::Batch)
+                    .with_op(NodeOp::Other {
+                        description: "Union".to_string(),
+                    })
+                    .with_inputs(input_ids),
+            );
+            (all_nodes, id)
+        }
+
+        DfPlan::SubqueryAlias(alias) => {
+            // SubqueryAlias is transparent; peel it and continue.
+            df_plan_to_krishiv_nodes(&alias.input, table_row_counts, counter)
+        }
+
+        DfPlan::Values(_) => {
+            let id = format!("values-{idx}");
+            let node = PlanNode::new(&id, "Values", ExecutionKind::Batch).with_op(NodeOp::Other {
+                description: "Values".to_string(),
+            });
+            (vec![node], id)
+        }
+
+        DfPlan::Extension(_) => {
+            let id = format!("ext-{idx}");
+            let label = plan.to_string();
+            let node = PlanNode::new(&id, label.clone(), ExecutionKind::Batch)
+                .with_op(NodeOp::Other { description: label });
+            (vec![node], id)
+        }
+
+        DfPlan::EmptyRelation(_) => {
+            let id = format!("empty-{idx}");
+            let node = PlanNode::new(&id, "EmptyRelation", ExecutionKind::Batch)
+                .with_op(NodeOp::Other {
+                    description: "EmptyRelation".to_string(),
+                });
+            (vec![node], id)
+        }
+
+        // Fallback: wrap the entire subplan as an opaque node.
+        _ => {
+            let id = format!("df-{idx}");
+            let label = plan.to_string();
+            let node = PlanNode::new(&id, label.clone(), ExecutionKind::Batch)
+                .with_op(NodeOp::Other { description: label });
+            (vec![node], id)
+        }
+    }
+}
+
 /// Krishiv-owned wrapper around a DataFusion DataFrame.
 #[derive(Debug, Clone)]
 pub struct SqlDataFrame {
     name: String,
     query: Option<String>,
     dataframe: DataFusionDataFrame,
+    shuffle_partitions: Option<u32>,
+    /// Estimated row counts for registered tables, keyed by table name.
+    /// Used by `krishiv_logical_plan` to annotate scan nodes with
+    /// `estimated_rows` so `BroadcastAutoRule` can fire.
+    table_row_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
 }
 
 impl SqlDataFrame {
-    fn new(name: impl Into<String>, dataframe: DataFusionDataFrame) -> Self {
+    fn new(
+        name: impl Into<String>,
+        dataframe: DataFusionDataFrame,
+        table_row_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    ) -> Self {
         Self {
             name: name.into(),
             query: None,
             dataframe,
+            shuffle_partitions: None,
+            table_row_counts,
         }
     }
 
     fn with_query(mut self, query: impl Into<String>) -> Self {
         self.query = Some(query.into());
+        self
+    }
+
+    fn with_shuffle_partitions(mut self, n: Option<u32>) -> Self {
+        self.shuffle_partitions = n;
         self
     }
 
@@ -1335,13 +1700,30 @@ impl SqlDataFrame {
     }
 
     /// Create a Krishiv logical plan wrapper for this DataFrame.
+    ///
+    /// Walks the DataFusion logical plan tree, creating Krishiv `PlanNode`
+    /// entries for each operator. Table-scan nodes are annotated with
+    /// `estimated_rows` from the engine's table-row-count registry, allowing
+    /// `BroadcastAutoRule` to identify small tables for broadcast join
+    /// promotion. The plan is then run through the logical optimizer before
+    /// being returned.
     pub fn krishiv_logical_plan(&self) -> LogicalPlan {
-        let label = self.dataframe.logical_plan().to_string();
-        LogicalPlan::new(self.name.clone(), ExecutionKind::Batch).with_node(PlanNode::new(
-            "datafusion-logical",
-            label,
-            ExecutionKind::Batch,
-        ))
+        let df_plan = self.dataframe.logical_plan();
+        let counts = self.table_row_counts.read().unwrap_or_else(|e| e.into_inner());
+        let mut counter = 0usize;
+        let (nodes, _root_id) = df_plan_to_krishiv_nodes(df_plan, &counts, &mut counter);
+
+        let mut plan = LogicalPlan::new(self.name.clone(), ExecutionKind::Batch);
+        for node in nodes {
+            plan = plan.with_node(node);
+        }
+
+        // Run the logical optimizer so BroadcastAutoRule fires on eligible scans.
+        let optimizer = krishiv_plan::optimizer::default_logical_optimizer();
+        optimizer
+            .optimize(plan)
+            .map(|result| result.plan)
+            .unwrap_or(plan)
     }
 
     /// Explain the logical plan without executing it.
@@ -1430,7 +1812,13 @@ impl KrishivDataFrameOps for SqlDataFrame {
         SqlDataFrame::explain_logical(self)
     }
     fn krishiv_logical_plan(&self) -> LogicalPlan {
-        SqlDataFrame::krishiv_logical_plan(self)
+        let label = self.dataframe.logical_plan().to_string();
+        let mut plan = LogicalPlan::new(self.name.clone(), ExecutionKind::Batch)
+            .with_node(PlanNode::new("datafusion-logical", label, ExecutionKind::Batch));
+        if let Some(n) = self.shuffle_partitions {
+            plan = plan.with_shuffle_partitions(Some(n));
+        }
+        plan
     }
     fn query(&self) -> Option<&str> {
         SqlDataFrame::query(self)

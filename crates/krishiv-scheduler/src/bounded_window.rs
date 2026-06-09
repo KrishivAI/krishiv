@@ -28,6 +28,13 @@ pub struct BoundedWindowOutcome {
     pub inline_record_batch_ipc: Vec<Vec<u8>>,
 }
 
+/// Default target bytes per bounded-window shard: 128 MiB.
+///
+/// Each shard processes roughly this much data.  The AQE `AutoPartitionRule`
+/// uses the same default so that batch jobs and bounded-window operations agree
+/// on partition sizing.  Shared canonical constant from `krishiv-common`.
+const TARGET_BYTES_PER_SHARD: u64 = krishiv_common::partition::TARGET_BYTES_PER_PARTITION;
+
 /// Execute a bounded window via the active coordinator and a registered executor.
 ///
 /// Input batches are delivered as `InlineIpc` task input partitions so the
@@ -48,6 +55,13 @@ pub async fn execute_bounded_window_coordinated(
         .ok_or_else(|| SchedulerError::InvalidJob {
             message: "bounded window input row count overflowed usize".into(),
         })?;
+
+    // Total data volume across all input batches.
+    let total_data_bytes: u64 = input_batches
+        .iter()
+        .map(|b| b.get_array_memory_size() as u64)
+        .sum();
+
     let (shard_limit, coordinator_id) = {
         let coord = coordinator.read().await;
         coord.ensure_active()?;
@@ -55,8 +69,12 @@ pub async fn execute_bounded_window_coordinated(
         if executor_count == 0 {
             return Err(SchedulerError::NoExecutors);
         }
+        // Compute shard count from data size, capped by available executors.
+        let data_based_shards = (total_data_bytes + TARGET_BYTES_PER_SHARD - 1)
+            / TARGET_BYTES_PER_SHARD;
+        let data_based_shards = data_based_shards.max(1) as usize;
         (
-            executor_count.min(input_row_count.max(1)),
+            executor_count.min(data_based_shards.min(input_row_count.max(1))),
             coord.coordinator_id().to_string(),
         )
     };

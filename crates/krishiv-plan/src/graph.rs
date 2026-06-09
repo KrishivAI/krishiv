@@ -129,6 +129,9 @@ pub fn lower_to_physical(logical: &LogicalPlan) -> Result<PhysicalPlan, PlanErro
     logical.validate()?;
 
     let mut physical = PhysicalPlan::new(logical.name(), logical.kind());
+    if let Some(n) = logical.shuffle_partitions() {
+        physical = physical.with_shuffle_partitions(Some(n));
+    }
     for node in logical.nodes() {
         let mut physical_node = PlanNode::new(
             physical_node_id(node.id()),

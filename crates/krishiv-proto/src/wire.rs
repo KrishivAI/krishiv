@@ -784,6 +784,11 @@ fn task_output_metadata_to_wire(value: &TaskOutputMetadata) -> v1::TaskOutputMet
         watermark_ms: value.watermark_ms().unwrap_or(0),
         has_watermark_ms: value.watermark_ms().is_some(),
         has_runtime_stats: value.runtime_stats().is_some(),
+        hot_key_reports: value
+            .hot_key_reports()
+            .iter()
+            .map(hot_key_report_to_wire)
+            .collect(),
     }
 }
 
@@ -845,6 +850,14 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
     }
     if value.has_watermark_ms {
         meta = meta.with_watermark_ms(value.watermark_ms);
+    }
+    if !value.hot_key_reports.is_empty() {
+        let reports = value
+            .hot_key_reports
+            .into_iter()
+            .map(hot_key_report_from_wire)
+            .collect::<WireResult<Vec<_>>>()?;
+        meta = meta.with_hot_key_reports(reports);
     }
     Ok(meta)
 }

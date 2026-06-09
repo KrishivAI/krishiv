@@ -253,6 +253,10 @@ impl JobRecord {
         task_inline_partitions: Option<
             &std::collections::HashMap<TaskId, Vec<krishiv_proto::InputPartition>>,
         >,
+        // When the coordinator has detected hot-key skew for this job, this
+        // override replaces `ShuffleWriteConfig.num_partitions` at launch time
+        // so newly-assigned shuffle-write tasks spread data more evenly.
+        skew_partition_override: Option<u32>,
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         let mut assignments = Vec::new();
         self.state = JobState::Running;
@@ -381,6 +385,26 @@ impl JobRecord {
                     }
                     if let Some(bytes) = self.spec.memory_limit_bytes() {
                         assignment = assignment.with_memory_limit_bytes(bytes);
+                    }
+                    // Propagate typed shuffle configs from the task spec to the
+                    // assignment. Without this the executor never sees the
+                    // ShuffleWriteConfig / ShuffleReadConfig attached at job
+                    // submission time — they stayed on the TaskSpec but were
+                    // never forwarded to ExecutorTaskAssignment.
+                    if let Some(write_cfg) = task.spec.shuffle_write() {
+                        let effective_num_partitions = skew_partition_override
+                            .map(|n| n as usize)
+                            .unwrap_or(write_cfg.num_partitions)
+                            .max(1);
+                        assignment = assignment.with_shuffle_write(
+                            krishiv_proto::ShuffleWriteConfig {
+                                num_partitions: effective_num_partitions,
+                                ..write_cfg.clone()
+                            },
+                        );
+                    }
+                    if let Some(read_cfg) = task.spec.shuffle_read() {
+                        assignment = assignment.with_shuffle_read(read_cfg.clone());
                     }
                     assignments.push(assignment);
                 }
@@ -1631,6 +1655,7 @@ mod exchange_stage_tests {
                 None,
                 Some(&input),
                 None,
+                None,
             )
             .unwrap();
 
@@ -1676,6 +1701,7 @@ mod exchange_stage_tests {
                 None,
                 None,
                 Some(&task_inputs),
+                None,
             )
             .unwrap();
         assert_eq!(assignments.len(), 2);

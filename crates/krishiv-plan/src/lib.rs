@@ -295,6 +295,23 @@ impl PlanNode {
         self
     }
 
+    /// Attach an exchange (repartition) node to the plan.
+    ///
+    /// This is a convenience wrapper around `with_partitioning` that creates a
+    /// `Hash` partitioning on the given key columns with `num_partitions`
+    /// buckets.  Used by the `DataFrame::repartition()` API.
+    #[must_use]
+    pub fn with_exchange(
+        self,
+        key_columns: impl IntoIterator<Item = impl Into<String>>,
+        num_partitions: u32,
+    ) -> Self {
+        self.with_partitioning(Partitioning::Hash {
+            keys: key_columns.into_iter().map(Into::into).collect(),
+            buckets: num_partitions,
+        })
+    }
+
     /// Set the estimated output row count for this node.
     #[must_use]
     pub fn with_estimated_rows(mut self, estimated_rows: Option<u64>) -> Self {
@@ -341,6 +358,11 @@ impl PlanNode {
         &self.partitioning
     }
 
+    /// Mutate the output partitioning strategy in-place.
+    pub fn set_partitioning(&mut self, partitioning: Partitioning) {
+        self.partitioning = partitioning;
+    }
+
     /// Whether this node is eligible for broadcast join optimisation.
     pub fn broadcast_eligible(&self) -> bool {
         self.broadcast_eligible
@@ -374,6 +396,10 @@ pub(crate) struct PlanCore {
     pub(crate) name: String,
     pub(crate) kind: ExecutionKind,
     pub(crate) nodes: Vec<PlanNode>,
+    /// Override for shuffle partition count (`SET shuffle.partitions = N`).
+    /// When `Some`, `AutoPartitionRule` uses this as the target bucket count
+    /// instead of computing from data size.
+    shuffle_partitions: Option<u32>,
 }
 
 impl PlanCore {
@@ -382,6 +408,7 @@ impl PlanCore {
             name: name.into(),
             kind,
             nodes: Vec::new(),
+            shuffle_partitions: None,
         }
     }
 
@@ -404,6 +431,19 @@ impl PlanCore {
 
     fn nodes(&self) -> &[PlanNode] {
         &self.nodes
+    }
+
+    fn nodes_mut(&mut self) -> &mut [PlanNode] {
+        &mut self.nodes
+    }
+
+    fn shuffle_partitions(&self) -> Option<u32> {
+        self.shuffle_partitions
+    }
+
+    fn with_shuffle_partitions(mut self, n: Option<u32>) -> Self {
+        self.shuffle_partitions = n;
+        self
     }
 }
 
@@ -462,6 +502,18 @@ impl LogicalPlan {
             self.core.nodes(),
         )
     }
+
+    /// Return the shuffle partition override, if set.
+    pub fn shuffle_partitions(&self) -> Option<u32> {
+        self.core.shuffle_partitions()
+    }
+
+    /// Set the shuffle partition override for this plan.
+    #[must_use]
+    pub fn with_shuffle_partitions(mut self, n: Option<u32>) -> Self {
+        self.core = self.core.with_shuffle_partitions(n);
+        self
+    }
 }
 
 /// Krishiv physical plan wrapper.
@@ -516,9 +568,29 @@ impl PhysicalPlan {
         self.core.kind()
     }
 
-    /// Plan nodes.
+    /// Plan nodes (read-only access).
     pub fn nodes(&self) -> &[PlanNode] {
         self.core.nodes()
+    }
+
+    /// Plan nodes (mutable access).
+    ///
+    /// Used by AQE rules such as `AutoPartitionRule` to adjust partition counts
+    /// on `Exchange` nodes without rebuilding the entire plan graph.
+    pub fn nodes_mut(&mut self) -> &mut [PlanNode] {
+        self.core.nodes_mut()
+    }
+
+    /// Return the shuffle partition override, if set.
+    pub fn shuffle_partitions(&self) -> Option<u32> {
+        self.core.shuffle_partitions()
+    }
+
+    /// Set the shuffle partition override for this plan.
+    #[must_use]
+    pub fn with_shuffle_partitions(mut self, n: Option<u32>) -> Self {
+        self.core = self.core.with_shuffle_partitions(n);
+        self
     }
 
     /// Validate node identifiers, input references, and graph acyclicity.

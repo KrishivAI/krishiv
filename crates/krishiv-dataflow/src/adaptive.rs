@@ -301,3 +301,158 @@ pub struct AdaptiveOverrideConfig {
     /// Disable coordinator-driven source throttling for all jobs.
     pub disable_source_throttling: bool,
 }
+
+// ── StreamingPartitionAdvisor ─────────────────────────────────────────────────
+
+/// Target bytes per streaming partition (128 MiB, same as batch default).
+const STREAMING_TARGET_BYTES_PER_PARTITION: u64 =
+    krishiv_common::partition::TARGET_BYTES_PER_PARTITION;
+
+/// EMA-based partition count advisor for streaming jobs.
+///
+/// Maintains an exponential moving average of observed batch byte sizes and
+/// recommends a bucket count derived from that estimate. This lets streaming
+/// jobs auto-adapt parallelism without user configuration:
+///
+/// - When batches are large the advisor increases bucket count so no single
+///   executor is overwhelmed.
+/// - When batches shrink (e.g., after a source slow-down) the advisor reduces
+///   bucket count to avoid unnecessary fan-out overhead.
+///
+/// The recommended count is always clamped to `[min_buckets, max_buckets]`.
+#[derive(Debug, Clone)]
+pub struct StreamingPartitionAdvisor {
+    /// Exponential moving average of bytes-per-batch.
+    ema_bytes: f64,
+    /// EMA smoothing factor α ∈ (0, 1]. Higher = more reactive.
+    alpha: f64,
+    current_buckets: u32,
+    min_buckets: u32,
+    max_buckets: u32,
+    observations: u64,
+}
+
+impl StreamingPartitionAdvisor {
+    /// Create an advisor.
+    ///
+    /// `initial_buckets` is the starting recommendation before any data is
+    /// observed. `alpha` controls how quickly the EMA reacts to new
+    /// observations; 0.2 is a reasonable default (5-batch lag).
+    pub fn new(initial_buckets: u32, min_buckets: u32, max_buckets: u32) -> Self {
+        let min = min_buckets.max(1);
+        let max = max_buckets.max(min);
+        Self {
+            ema_bytes: 0.0,
+            alpha: 0.2,
+            current_buckets: initial_buckets.clamp(min, max),
+            min_buckets: min,
+            max_buckets: max,
+            observations: 0,
+        }
+    }
+
+    /// Set the EMA smoothing factor (must be in `(0.0, 1.0]`).
+    #[must_use]
+    pub fn with_alpha(mut self, alpha: f64) -> Self {
+        self.alpha = alpha.clamp(f64::EPSILON, 1.0);
+        self
+    }
+
+    /// Record one batch observation and return the updated bucket recommendation.
+    ///
+    /// `batch_bytes` is the Arrow memory footprint of the batch
+    /// (`RecordBatch::get_array_memory_size()`).
+    pub fn observe_batch_bytes(&mut self, batch_bytes: u64) -> u32 {
+        if self.observations == 0 {
+            // Seed EMA with the first observation to avoid a zero-start bias.
+            self.ema_bytes = batch_bytes as f64;
+        } else {
+            self.ema_bytes =
+                self.alpha * batch_bytes as f64 + (1.0 - self.alpha) * self.ema_bytes;
+        }
+        self.observations += 1;
+
+        let target_f = (self.ema_bytes / STREAMING_TARGET_BYTES_PER_PARTITION as f64).ceil();
+        let target = (target_f as u32).max(1).clamp(self.min_buckets, self.max_buckets);
+        self.current_buckets = target;
+        target
+    }
+
+    /// Current bucket recommendation without recording a new observation.
+    pub fn current_buckets(&self) -> u32 {
+        self.current_buckets
+    }
+
+    /// Number of observations recorded so far.
+    pub fn observations(&self) -> u64 {
+        self.observations
+    }
+}
+
+#[cfg(test)]
+mod streaming_advisor_tests {
+    use super::*;
+
+    #[test]
+    fn advisor_starts_at_initial_buckets() {
+        let advisor = StreamingPartitionAdvisor::new(4, 1, 32);
+        assert_eq!(advisor.current_buckets(), 4);
+    }
+
+    #[test]
+    fn advisor_clamps_initial_to_range() {
+        let advisor = StreamingPartitionAdvisor::new(100, 1, 8);
+        assert_eq!(advisor.current_buckets(), 8);
+    }
+
+    #[test]
+    fn advisor_recommends_more_buckets_for_large_batches() {
+        let mut advisor = StreamingPartitionAdvisor::new(1, 1, 64);
+        // 512 MiB batch → should recommend 4 buckets (512/128)
+        let large_batch = 512 * 1024 * 1024u64;
+        let rec = advisor.observe_batch_bytes(large_batch);
+        assert!(rec >= 4, "expected >= 4 buckets for 512 MiB batch, got {rec}");
+    }
+
+    #[test]
+    fn advisor_stays_within_bounds() {
+        let mut advisor =
+            StreamingPartitionAdvisor::new(2, 2, 8).with_alpha(1.0);
+        // Gigantic batch: recommendation must not exceed max_buckets.
+        advisor.observe_batch_bytes(u64::MAX / 2);
+        assert_eq!(advisor.current_buckets(), 8);
+        // Tiny batch: recommendation must not go below min_buckets.
+        advisor.observe_batch_bytes(1);
+        assert_eq!(advisor.current_buckets(), 2);
+    }
+
+    #[test]
+    fn advisor_tracks_observations_count() {
+        let mut advisor = StreamingPartitionAdvisor::new(1, 1, 16);
+        assert_eq!(advisor.observations(), 0);
+        advisor.observe_batch_bytes(1024);
+        assert_eq!(advisor.observations(), 1);
+        advisor.observe_batch_bytes(2048);
+        assert_eq!(advisor.observations(), 2);
+    }
+
+    #[test]
+    fn advisor_ema_smooths_spikes() {
+        // After a spike followed by small batches, EMA should decay back down.
+        let mut advisor =
+            StreamingPartitionAdvisor::new(1, 1, 64).with_alpha(0.5);
+        let small = 1024u64;
+        let spike = 512 * 1024 * 1024u64;
+        advisor.observe_batch_bytes(spike);
+        let after_spike = advisor.current_buckets();
+        // Feed many small batches — EMA should drift back toward 1 bucket.
+        for _ in 0..20 {
+            advisor.observe_batch_bytes(small);
+        }
+        let after_recovery = advisor.current_buckets();
+        assert!(
+            after_recovery < after_spike,
+            "EMA should decay: after_spike={after_spike}, after_recovery={after_recovery}"
+        );
+    }
+}

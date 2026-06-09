@@ -244,12 +244,26 @@ fn execute_loop_fragment(
     let total_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
     let total_batches = output_batches.len();
     let column_count = output_batches.first().map(|b| b.num_columns()).unwrap_or(0);
-    Ok(ExecutorTaskOutput::streaming_window(
+    // Scan the window grouping key in output batches so the coordinator can
+    // detect skewed partitions in continuous streaming jobs.
+    let key_column = decode_window_execution_spec(window_spec_str)
+        .ok()
+        .map(|s| s.key_column)
+        .unwrap_or_default();
+    let hot_key_reports = build_streaming_hot_key_reports(
+        &output_batches,
+        &key_column,
+        assignment.job_id(),
+        assignment.stage_id(),
+    );
+    let mut output = ExecutorTaskOutput::streaming_window(
         total_rows,
         total_batches,
         column_count,
         output_batches,
-    ))
+    );
+    output.hot_key_reports = hot_key_reports;
+    Ok(output)
 }
 
 /// Execute a bounded streaming window fragment (tumbling, sliding, or session).
@@ -357,7 +371,14 @@ pub(crate) async fn execute_streaming_fragment(
     let inmem_batches = read_inmem_stream_batches(assignment.input_partitions());
     let job_id = assignment.job_id().as_str();
     if !inmem_batches.is_empty() {
-        return execute_streaming_with_batches(runner, job_id, inmem_batches, plan_spec).await;
+        return execute_streaming_with_batches(
+            runner,
+            assignment.job_id(),
+            assignment.stage_id(),
+            inmem_batches,
+            plan_spec,
+        )
+        .await;
     }
 
     let batches = parse_stream_kafka_partitions(assignment.input_partitions())?;
@@ -396,6 +417,12 @@ pub(crate) async fn execute_streaming_fragment(
         .map(|b| b.num_columns())
         .unwrap_or(0);
 
+    let hot_key_reports = build_streaming_hot_key_reports(
+        &collected_batches,
+        &plan_spec.key_column,
+        assignment.job_id(),
+        assignment.stage_id(),
+    );
     let mut output = ExecutorTaskOutput::streaming_window(
         total_rows,
         total_batches,
@@ -405,6 +432,7 @@ pub(crate) async fn execute_streaming_fragment(
     if let Some(wm) = observed_watermark_ms {
         output = output.with_watermark_ms(wm);
     }
+    output.hot_key_reports = hot_key_reports;
     Ok(output)
 }
 
@@ -432,12 +460,13 @@ fn read_inmem_stream_batches(
 /// Used by the InMemory partition fast path to skip stream-kafka ASCII parsing.
 async fn execute_streaming_with_batches(
     runner: &ExecutorTaskRunner,
-    job_id: &str,
+    job_id: &krishiv_proto::JobId,
+    stage_id: &krishiv_proto::StageId,
     batches: Vec<arrow::record_batch::RecordBatch>,
     spec: WindowExecutionSpec,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let observed_watermark_ms = compute_input_watermark(&batches, &spec);
-    let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
+    let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id.as_str()));
     let collected =
         execute_bounded_window(batches, &spec, job_state_dir.as_deref()).map_err(|e| {
             ExecutorError::LocalExecution {
@@ -447,12 +476,55 @@ async fn execute_streaming_with_batches(
     let total_rows: usize = collected.iter().map(|b| b.num_rows()).sum();
     let total_batches = collected.len();
     let column_count = collected.first().map(|b| b.num_columns()).unwrap_or(0);
+    let hot_key_reports =
+        build_streaming_hot_key_reports(&collected, &spec.key_column, job_id, stage_id);
     let mut output =
         ExecutorTaskOutput::streaming_window(total_rows, total_batches, column_count, collected);
     if let Some(wm) = observed_watermark_ms {
         output = output.with_watermark_ms(wm);
     }
+    output.hot_key_reports = hot_key_reports;
     Ok(output)
+}
+
+/// Build hot-key reports from output batches for coordinator-side skew detection.
+///
+/// Scans `key_column` across all batches using the SpaceSaving tracker and
+/// returns reports for keys whose heat score exceeds 0.10 (≥10 % of rows in
+/// the sample). An empty slice or a missing key column produces an empty Vec.
+fn build_streaming_hot_key_reports(
+    batches: &[arrow::record_batch::RecordBatch],
+    key_column: &str,
+    job_id: &krishiv_proto::JobId,
+    stage_id: &krishiv_proto::StageId,
+) -> Vec<krishiv_proto::HeartbeatHotKeyReport> {
+    use krishiv_dataflow::adaptive::HeavyHittersTracker;
+    let mut tracker = HeavyHittersTracker::new(64);
+    let key_idx = batches
+        .first()
+        .and_then(|b| b.schema().index_of(key_column).ok());
+    if let Some(kidx) = key_idx {
+        for batch in batches {
+            let col = batch.column(kidx);
+            for i in 0..col.len() {
+                if col.is_valid(i) {
+                    tracker.observe(format!("{:?}", col.slice(i, 1)));
+                }
+            }
+        }
+    }
+    tracker
+        .hot_keys(0.10)
+        .into_iter()
+        .map(|report| krishiv_proto::HeartbeatHotKeyReport {
+            key: report.key,
+            estimated_count: report.estimated_count,
+            max_error: report.max_error,
+            heat_score: report.heat_score,
+            job_id: job_id.clone(),
+            source_id: stage_id.to_string(),
+        })
+        .collect()
 }
 
 /// Compute the event-time watermark from input batches.

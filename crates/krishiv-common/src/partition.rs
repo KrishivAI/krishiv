@@ -17,6 +17,23 @@ use crate::hash::sha256_bytes_multi;
 /// protocol migration.
 const PARTITION_KEY_HASH_DOMAIN: &[u8] = b"krishiv.partition-key.v1\0";
 
+/// Default target bytes per partition (128 MiB).
+///
+/// Used by `AutoPartitionRule` and bounded-window shard calculation to decide
+/// how many partitions to create for a given data volume. Operators can override
+/// this via durability profile or explicit config.
+pub const TARGET_BYTES_PER_PARTITION: u64 = 128 * 1024 * 1024;
+
+/// Return the target bytes per partition for a given data volume estimate.
+///
+/// When `profile` is `Some`, the profile may supply an override. When `None`,
+/// the default [`TARGET_BYTES_PER_PARTITION`] (128 MiB) is returned.
+#[must_use]
+pub fn target_bytes_per_partition(_profile: Option<&str>) -> u64 {
+    // Future: look up profile override from durability profile config.
+    TARGET_BYTES_PER_PARTITION
+}
+
 /// A batch cannot be partitioned without violating keyed execution semantics.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid partitioning input: {message}")]

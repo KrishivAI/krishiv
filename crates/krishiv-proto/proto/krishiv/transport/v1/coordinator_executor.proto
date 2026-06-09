@@ -298,6 +298,8 @@ message TaskOutputMetadata {
   bool has_watermark_ms = 16;
   // True when runtime stats are present (allows zero-output tasks to carry stats).
   bool has_runtime_stats = 17;
+  // Hot-key reports from HeavyHittersTracker observed during shuffle write.
+  repeated HeartbeatHotKeyReport hot_key_reports = 18;
 }
 
 message TaskCancellationRequest {

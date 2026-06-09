@@ -275,6 +275,40 @@ The executor dispatches task fragments by prefix matching against the fragment n
 | SingleNode | RemoteClusterRequired | **Error** | — |
 | Distributed | *other* | **Error** | — |
 
+## Crate Requirements by Mode
+
+Whether a crate is compiled into the binary depends on Cargo features (set at build time). Whether it is actively needed depends on the runtime mode. The table below covers both dimensions.
+
+The default preset `local = [embedded, single-node]` compiles all core crates plus `krishiv-shuffle` and `krishiv-flight-sql`. To exclude those, use `cargo build --no-default-features --features embedded`.
+
+| Crate | Embedded | SingleNode | Distributed | Feature gate |
+|---|---|---|---|---|
+| `krishiv-common` | R | R | R | always compiled |
+| `krishiv-proto` | R | R | R | always compiled |
+| `krishiv-plan` | R | R | R | always compiled |
+| `krishiv-sql` | R | R | R | always compiled |
+| `krishiv-api` | R | R | R | always compiled |
+| `krishiv-runtime` | R | R | R | always compiled |
+| `krishiv-scheduler` | R | R | R | always compiled |
+| `krishiv-executor` | R | R | R | always compiled |
+| `krishiv-dataflow` | R | R | R | always compiled |
+| `krishiv-state` | R | R | R | always compiled |
+| `krishiv-connectors` | O | O | O | base always compiled; kafka/iceberg/delta gated |
+| `krishiv-ui` | O | O | O | always compiled; runtime-optional |
+| `krishiv-metrics` | O | O | O | always compiled; runtime-optional |
+| `krishiv-shuffle` | ✗ | R | R | `shuffle` feature |
+| `krishiv-flight-sql` | ✗ | O | R | `flight-sql` feature |
+| `krishiv-operator` | ✗ | ✗ | O | `k8s` feature |
+| `krishiv-ai` | — | — | — | not a dep of the CLI crate |
+
+**Legend:** R = required at runtime, O = optional at runtime (specific workloads), ✗ = excluded from binary by default features, — = unrelated.
+
+Notes:
+- Embedded mode with `--no-default-features --features embedded` produces a binary with only core crates (no shuffle, no Flight SQL, no operator).
+- SingleNode needs `krishiv-flight-sql` only for the `SingleNodeDaemon` placement (Flight SQL server). `LocalInProcess` placement works without it.
+- `krishiv-connectors` base crate provides Parquet, object-store, and lakehouse sources/sinks. Kafka, Iceberg, and Delta connectors are feature-gated and excluded from default features.
+- `krishiv-ai` (text embeddings, vector DB sinks) is a standalone crate; the CLI does not depend on it.
+
 ## Durability Profile Spec
 
 `DurabilityProfile` (`krishiv-common/src/durability.rs`) selects component backends:

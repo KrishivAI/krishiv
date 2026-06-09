@@ -222,6 +222,8 @@ pub struct ExecutorTaskOutput {
     /// a pipeline fan-out knows the global low watermark across all executor
     /// tasks and can safely emit late-data decisions.
     pub(crate) watermark_ms: Option<i64>,
+    /// Hot-key reports from `HeavyHittersTracker` observed during shuffle write.
+    pub(crate) hot_key_reports: Vec<krishiv_proto::HeartbeatHotKeyReport>,
 }
 
 impl ExecutorTaskOutput {
@@ -235,6 +237,7 @@ impl ExecutorTaskOutput {
             runtime_stats: None,
             record_batches: Vec::new(),
             watermark_ms: None,
+            hot_key_reports: Vec::new(),
         }
     }
 
@@ -253,6 +256,7 @@ impl ExecutorTaskOutput {
             runtime_stats: None,
             record_batches: Vec::new(),
             watermark_ms: None,
+            hot_key_reports: Vec::new(),
         }
     }
 
@@ -266,6 +270,7 @@ impl ExecutorTaskOutput {
             runtime_stats: None,
             record_batches: Vec::new(),
             watermark_ms: None,
+            hot_key_reports: Vec::new(),
         }
     }
 
@@ -282,6 +287,7 @@ impl ExecutorTaskOutput {
             runtime_stats: None,
             record_batches: Vec::new(),
             watermark_ms: None,
+            hot_key_reports: Vec::new(),
         }
     }
 
@@ -301,6 +307,7 @@ impl ExecutorTaskOutput {
             runtime_stats: None,
             record_batches,
             watermark_ms: None,
+            hot_key_reports: Vec::new(),
         }
     }
 
@@ -376,6 +383,9 @@ impl ExecutorTaskOutput {
         // across all executor tasks for downstream stage scheduling.
         if let Some(wm) = self.watermark_ms {
             meta = meta.with_watermark_ms(wm);
+        }
+        if !self.hot_key_reports.is_empty() {
+            meta = meta.with_hot_key_reports(self.hot_key_reports.clone());
         }
         meta
     }

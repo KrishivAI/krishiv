@@ -2,6 +2,65 @@
 
 use crate::key_group::{KeyGroupRange, key_group_ranges_for_parallelism};
 
+// ── RescaleChecksum ──────────────────────────────────────────────────────────
+
+/// Lightweight integrity checkpoint for a partition split or merge operation.
+///
+/// Inspired by the Netflix Planner/Splitter pattern: the coordinator computes
+/// a `RescaleChecksum` from the pre-split data and stores it. After the split,
+/// the executor computes the post-split checksum and the two must match before
+/// the operation is marked complete. This makes split operations idempotent and
+/// verifiable without shipping full record batches back to the coordinator.
+///
+/// The checksum is deliberately simple (row count + column count) so it can be
+/// computed in O(1) from metadata without reading batch payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RescaleChecksum {
+    /// Total row count across all input batches / shards.
+    pub total_rows: u64,
+    /// Number of columns (schema width). Used to catch schema divergence.
+    pub column_count: u32,
+    /// Parallelism before the rescale.
+    pub old_parallelism: u32,
+    /// Parallelism after the rescale.
+    pub new_parallelism: u32,
+}
+
+impl RescaleChecksum {
+    /// Create a checksum from aggregate statistics collected by the planner
+    /// before the split begins.
+    pub fn new(
+        total_rows: u64,
+        column_count: u32,
+        old_parallelism: u32,
+        new_parallelism: u32,
+    ) -> Self {
+        Self {
+            total_rows,
+            column_count,
+            old_parallelism,
+            new_parallelism,
+        }
+    }
+
+    /// Verify that the post-split shards are consistent with this pre-split
+    /// checksum.
+    ///
+    /// `post_shard_row_counts` must contain one entry per post-split shard.
+    /// Returns `true` when the split is valid (no rows lost or duplicated and
+    /// schema width is unchanged).
+    pub fn verify(
+        &self,
+        post_shard_row_counts: &[u64],
+        post_column_count: u32,
+    ) -> bool {
+        let post_total: u64 = post_shard_row_counts.iter().sum();
+        post_total == self.total_rows
+            && post_column_count == self.column_count
+            && post_shard_row_counts.len() == self.new_parallelism as usize
+    }
+}
+
 /// Computes key-group → task slot mapping when restoring with new parallelism.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyGroupRescaler {
@@ -246,5 +305,50 @@ mod tests {
             let range = rescaler.range_for_task(task).unwrap();
             assert!(range.contains(kg), "kg={kg} task={task} range={range:?}");
         }
+    }
+
+    // ── RescaleChecksum ───────────────────────────────────────────────────────
+
+    #[test]
+    fn checksum_verifies_matching_split() {
+        let pre = RescaleChecksum::new(1000, 5, 2, 4);
+        // 4 shards totalling 1000 rows, 5 columns
+        let counts = [250u64, 250, 250, 250];
+        assert!(pre.verify(&counts, 5));
+    }
+
+    #[test]
+    fn checksum_rejects_lost_rows() {
+        let pre = RescaleChecksum::new(1000, 5, 2, 4);
+        let counts = [200u64, 250, 250, 250]; // only 950 total
+        assert!(!pre.verify(&counts, 5));
+    }
+
+    #[test]
+    fn checksum_rejects_duplicated_rows() {
+        let pre = RescaleChecksum::new(1000, 5, 2, 4);
+        let counts = [300u64, 250, 250, 250]; // 1050 total
+        assert!(!pre.verify(&counts, 5));
+    }
+
+    #[test]
+    fn checksum_rejects_wrong_shard_count() {
+        let pre = RescaleChecksum::new(1000, 5, 2, 4);
+        let counts = [500u64, 500]; // only 2 shards, expected 4
+        assert!(!pre.verify(&counts, 5));
+    }
+
+    #[test]
+    fn checksum_rejects_schema_divergence() {
+        let pre = RescaleChecksum::new(1000, 5, 2, 4);
+        let counts = [250u64, 250, 250, 250];
+        assert!(!pre.verify(&counts, 6)); // column count changed
+    }
+
+    #[test]
+    fn checksum_zero_rows_splits_cleanly() {
+        let pre = RescaleChecksum::new(0, 3, 1, 2);
+        assert!(pre.verify(&[0, 0], 3));
+        assert!(!pre.verify(&[1, 0], 3));
     }
 }
