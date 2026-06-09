@@ -279,6 +279,9 @@ mod catalog_tests {
 
     #[test]
     fn schema_registry_config_rejects_unknown_format() {
+        // PyErr::to_string() calls into Python to format the exception, so the
+        // interpreter must be running before calling it.
+        pyo3::Python::initialize();
         let error = schema_registry_confluent("https://registry.example".into(), "yaml")
             .err()
             .unwrap();

@@ -208,7 +208,7 @@ impl Coordinator {
     /// value is used by `launch_assigned_task_assignments` to choose the number
     /// of tasks for the next cycle.  A new observation replaces the previous
     /// one — only the latest advisory matters.
-    pub(crate) fn record_streaming_advisory_buckets(&mut self, job_id: &JobId, buckets: u32) {
+    pub fn record_streaming_advisory_buckets(&mut self, job_id: &JobId, buckets: u32) {
         if buckets > 0 {
             self.streaming_advisory_partitions
                 .insert(job_id.clone(), buckets);
@@ -216,7 +216,7 @@ impl Coordinator {
     }
 
     /// Return the current advisory partition count for a streaming job, if any.
-    pub(crate) fn streaming_advisory_partitions(&self, job_id: &JobId) -> Option<u32> {
+    pub fn streaming_advisory_partitions(&self, job_id: &JobId) -> Option<u32> {
         self.streaming_advisory_partitions.get(job_id).copied()
     }
 

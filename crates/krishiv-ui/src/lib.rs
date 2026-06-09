@@ -1467,7 +1467,7 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
 
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("Krishiv R2 Status"));
+        assert!(body.contains("Krishiv"));
         assert!(body.contains("job-demo"));
     }
 

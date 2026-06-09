@@ -1730,9 +1730,11 @@ mod tests {
         };
         let handle = init(config).expect("init must succeed with InMemory exporter");
 
-        // Emit a span and close it so the simple span processor exports it.
+        // Emit a span directly via the provider-local tracer rather than the
+        // global one, which can be replaced by concurrent tests calling init().
         {
-            let tracer = opentelemetry::global::tracer("capture-test");
+            use opentelemetry::trace::TracerProvider as _;
+            let tracer = handle.tracer_provider.tracer("capture-test");
             let span = tracer.start("test-capture-span");
             drop(span);
         }

@@ -205,6 +205,16 @@ impl TableProvider for BoundedConnectorProvider {
         datafusion::logical_expr::TableType::Base
     }
 
+    fn statistics(&self) -> Option<datafusion::physical_plan::Statistics> {
+        use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::Statistics;
+        let row_count = self.registry.estimated_row_count(&self.config)?;
+        Some(Statistics {
+            num_rows: Precision::Inexact(row_count as usize),
+            ..Statistics::new_unknown(&self.schema)
+        })
+    }
+
     async fn scan(
         &self,
         state: &dyn datafusion::catalog::Session,
@@ -233,5 +243,46 @@ impl TableProvider for BoundedConnectorProvider {
 
         let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
         table.scan(state, projection, filters, limit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::*;
+
+    #[test]
+    fn bounded_connector_provider_statistics_returns_none_for_unknown_table() {
+        let registry = Arc::new(krishiv_connectors::ConnectorRegistry::new());
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let config = krishiv_connectors::ConnectorConfig::new("unknown", "parquet");
+        let provider = BoundedConnectorProvider { registry, config, schema };
+        assert!(
+            provider.statistics().is_none(),
+            "no path in config → estimated_row_count returns None → statistics returns None"
+        );
+    }
+
+    #[test]
+    fn extract_create_external_table_name_parses_table_name() {
+        assert_eq!(
+            super::super::extract_create_external_table_name(
+                "CREATE EXTERNAL TABLE my_table STORED AS PARQUET LOCATION 'data.parquet'"
+            ),
+            Some("my_table".to_string())
+        );
+        assert_eq!(
+            super::super::extract_create_external_table_name("SELECT * FROM foo"),
+            None
+        );
+        assert_eq!(
+            super::super::extract_create_external_table_name(
+                "CREATE OR REPLACE EXTERNAL TABLE orders STORED AS PARQUET LOCATION 'orders.parquet'"
+            ),
+            Some("orders".to_string())
+        );
     }
 }

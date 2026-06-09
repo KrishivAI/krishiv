@@ -38,6 +38,11 @@ mod tests;
 
 // Re-export the full public API at crate root for source compatibility.
 pub use backend::StateBackend;
+pub use checkpoint::{
+    CheckpointDurability, CheckpointError, CheckpointResult, CheckpointStorage,
+    EphemeralCheckpointStorage, LocalFsCheckpointStorage, ObjectStoreCheckpointStorage,
+    open_checkpoint_storage_from_uri,
+};
 pub use error::{StateError, StateResult};
 pub use fjall_backend::FjallStateBackend;
 pub use inspector::StateInspector;

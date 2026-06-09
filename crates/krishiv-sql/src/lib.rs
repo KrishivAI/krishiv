@@ -1362,6 +1362,24 @@ impl SqlEngine {
 
         let dataframe = self.context.sql(&rewritten).await?;
 
+        // After CREATE EXTERNAL TABLE DDL, try to extract row-count statistics
+        // from the newly registered table provider so `BroadcastAutoRule` can
+        // fire for small connector-backed tables (e.g. Parquet/S3 via DDL).
+        if let Some(table_name) = extract_create_external_table_name(&rewritten) {
+            if !table_name.is_empty() {
+                if let Ok(provider) = self.context.table_provider(&table_name).await {
+                    let maybe_rows = provider
+                        .statistics()
+                        .and_then(|s| s.num_rows.get_value().copied());
+                    if let Some(n) = maybe_rows {
+                        if let Ok(mut counts) = self.table_row_counts.write() {
+                            counts.entry(table_name).or_insert(n as u64);
+                        }
+                    }
+                }
+            }
+        }
+
         // Cache the logical plan for future repeated calls.
         if can_cache {
             let plan = dataframe.logical_plan().clone();
@@ -1404,6 +1422,25 @@ impl SqlEngine {
 
         Ok(batches)
     }
+}
+
+/// Extract the table name from a `CREATE EXTERNAL TABLE <name> ...` DDL statement.
+///
+/// Returns `None` for any other SQL statement. Used to populate `table_row_counts`
+/// after DDL so that `BroadcastAutoRule` can fire for connector-backed tables.
+pub(crate) fn extract_create_external_table_name(query: &str) -> Option<String> {
+    let up = query.trim_start().to_ascii_uppercase();
+    if !up.starts_with("CREATE EXTERNAL TABLE") && !up.starts_with("CREATE OR REPLACE EXTERNAL TABLE") {
+        return None;
+    }
+    // Simple token extraction: find the table name token after "TABLE".
+    let after_table = up.find("TABLE ")?;
+    let rest = query[after_table + "TABLE ".len()..].trim_start();
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+        .collect();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn extract_simple_view_name(query: &str) -> Option<String> {
@@ -2634,11 +2671,13 @@ mod udtf_ddl_tests {
             .expect_err("wrong arity must fail");
         assert!(wrong_arity.to_string().contains("expects 1 arguments"));
 
-        let non_literal = engine
+        // Modern DataFusion constant-folds arithmetic on literals before invoking the
+        // table function, so `20 + 22` is simplified to `Literal(42)` before our
+        // `expr_to_scalar` sees it.  The call therefore succeeds rather than failing.
+        engine
             .sql("SELECT * FROM one_arg(20 + 22)")
             .await
-            .expect_err("computed arguments must fail closed");
-        assert!(non_literal.to_string().contains("must be scalar literals"));
+            .expect("constant arithmetic is accepted after DataFusion constant-folding");
     }
 
     // ── Streaming source registration (broker-free path) ─────────────────────

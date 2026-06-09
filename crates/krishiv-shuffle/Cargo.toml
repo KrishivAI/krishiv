@@ -15,7 +15,7 @@ dashmap = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 bytes = { workspace = true }
-object_store = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
 parquet = { workspace = true }
 tokio = { workspace = true, features = ["fs", "net", "sync"] }
 tokio-stream = { workspace = true }
