@@ -446,6 +446,10 @@ impl Coordinator {
         // S4: Evict adaptive decision log entries for the completed job to
         // prevent unbounded HashMap growth on long-running coordinators.
         self.adaptive_decision_log.remove(job_id);
+        // S1: Evict any pending skew repartition override. Safety-net for jobs
+        // that finish before their next task-launch cycle consumes the entry.
+        self.skew_repartition_overrides.remove(job_id);
+        self.streaming_advisory_partitions.remove(job_id);
     }
 
     /// Convert and submit a Krishiv logical DAG through the R2 scheduler.

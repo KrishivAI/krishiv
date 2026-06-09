@@ -385,8 +385,9 @@ impl Coordinator {
         let task_window_parts = self.job_task_input_partitions.remove(job_id);
         // Check whether the coordinator has recorded a hot-key skew override
         // for this job. If so, pass it to the assignment builder so shuffle-write
-        // tasks launch with the corrected partition count.
-        let skew_override = self.skew_repartition_overrides.get(job_id).copied();
+        // tasks launch with the corrected partition count. Consume the entry so
+        // the override is a one-shot: subsequent batches resume normal partitioning.
+        let skew_override = self.skew_repartition_overrides.remove(job_id);
         let assignment_result = match self.find_job_mut(job_id) {
             Ok(mut job) => job.launch_assigned_task_assignments(
                 &executor_leases,

@@ -497,6 +497,16 @@ impl InProcessStreamingRuntime {
                                 Some(stage_watermark_ms.map_or(wm, |prev: i64| prev.max(wm)));
                         }
                     }
+                    // Forward the EMA-derived advisory partition count to the
+                    // coordinator so it can scale streaming task concurrency on
+                    // the next cycle without user configuration.
+                    if kind == ExecutorTaskOutputKind::StreamingWindow {
+                        if let Some(buckets) = report.output().advisory_buckets() {
+                            if let Ok(mut coord) = self.coordinator.lock() {
+                                coord.record_streaming_advisory_buckets(&job_id, buckets);
+                            }
+                        }
+                    }
                 }
 
                 // Drive a coordinator tick after each stage's tasks complete.

@@ -80,6 +80,14 @@ impl ConnectorRegistry {
         driver.validate(config)
     }
 
+    /// Return the estimated row count for a source without opening it.
+    /// Returns `None` if the driver does not support row count queries or the
+    /// path/config is invalid.
+    pub fn estimated_row_count(&self, config: &ConnectorConfig) -> Option<u64> {
+        let kind = ConnectorKind::parse(&config.kind).ok()?;
+        self.sources.get(&kind)?.estimated_row_count(config)
+    }
+
     pub fn open_source<'a>(
         &'a self,
         config: &'a ConnectorConfig,

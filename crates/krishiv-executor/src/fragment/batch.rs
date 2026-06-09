@@ -225,6 +225,7 @@ pub(crate) async fn execute_batch_fragment(
             cpu_nanos: sql_stats.cpu_nanos,
             memory_bytes: 0,
             spill_bytes: 0,
+            serialized_bytes: 0,
         };
         return Ok(
             ExecutorTaskOutput::sql(row_count, batches.len(), column_count)
@@ -390,10 +391,11 @@ async fn execute_shuffle_write_fragment(
             message: e.to_string(),
         })?;
 
-    let partitioner = HashPartitioner::new(key_column, num_partitions);
     let job_id = assignment.job_id().as_str();
     let stage_id = assignment.stage_id().as_str();
     let lease_token = assignment.lease_generation().as_u64();
+    let partitioner = HashPartitioner::new(key_column, num_partitions)
+        .with_seed(shuffle_seed_from_job_id(job_id));
 
     for p in 0..num_partitions {
         let id = PartitionId {
@@ -469,35 +471,12 @@ async fn execute_shuffle_write_fragment(
     }
 
     // Track heavy hitters (hot keys) during this shuffle write.
-    let hot_key_reports = {
-        use krishiv_dataflow::adaptive::HeavyHittersTracker;
-        let mut tracker = HeavyHittersTracker::new(64);
-        let key_idx = batches
-            .first()
-            .and_then(|b| b.schema().index_of(key_column).ok());
-        if let Some(kidx) = key_idx {
-            for batch in &batches {
-                let col = batch.column(kidx);
-                for i in 0..col.len() {
-                    if col.is_valid(i) {
-                        tracker.observe(format!("{:?}", col.slice(i, 1)));
-                    }
-                }
-            }
-        }
-        tracker
-            .hot_keys(0.10)
-            .into_iter()
-            .map(|report| krishiv_proto::HeartbeatHotKeyReport {
-                key: report.key,
-                estimated_count: report.estimated_count,
-                max_error: report.max_error,
-                heat_score: report.heat_score,
-                job_id: assignment.job_id().clone(),
-                source_id: stage_id.to_string(),
-            })
-            .collect::<Vec<_>>()
-    };
+    let hot_key_reports = build_hot_key_reports(
+        &batches,
+        key_column,
+        assignment.job_id(),
+        stage_id,
+    );
 
     let mut output = ExecutorTaskOutput::shuffle_write(total_rows, outputs);
     output.hot_key_reports = hot_key_reports;
@@ -556,7 +535,8 @@ async fn execute_inmem_shuffle_write(
             continue;
         }
         if let Some(key_col) = key_column {
-            let partitioner = HashPartitioner::new(key_col, num_partitions);
+            let partitioner = HashPartitioner::new(key_col, num_partitions)
+                .with_seed(shuffle_seed_from_job_id(job_id));
             let buckets =
                 partitioner
                     .partition(batch)
@@ -606,35 +586,12 @@ async fn execute_inmem_shuffle_write(
     }
 
     // Track heavy hitters (hot keys) during this in-memory shuffle write.
-    let hot_key_reports = {
-        use krishiv_dataflow::adaptive::HeavyHittersTracker;
-        let mut tracker = HeavyHittersTracker::new(64);
-        let key_idx = batches
-            .first()
-            .and_then(|b| b.schema().index_of(key_column.unwrap_or("")).ok());
-        if let Some(kidx) = key_idx {
-            for batch in &batches {
-                let col = batch.column(kidx);
-                for i in 0..col.len() {
-                    if col.is_valid(i) {
-                        tracker.observe(format!("{:?}", col.slice(i, 1)));
-                    }
-                }
-            }
-        }
-        tracker
-            .hot_keys(0.10)
-            .into_iter()
-            .map(|report| krishiv_proto::HeartbeatHotKeyReport {
-                key: report.key,
-                estimated_count: report.estimated_count,
-                max_error: report.max_error,
-                heat_score: report.heat_score,
-                job_id: assignment.job_id().clone(),
-                source_id: stage_id.to_string(),
-            })
-            .collect::<Vec<_>>()
-    };
+    let hot_key_reports = build_hot_key_reports(
+        &batches,
+        key_column.unwrap_or(""),
+        assignment.job_id(),
+        stage_id,
+    );
 
     let mut output = ExecutorTaskOutput::shuffle_write(total_rows, outputs);
     output.hot_key_reports = hot_key_reports;
@@ -1021,4 +978,105 @@ fn parse_memory_kafka_partition(
             "Kafka-to-Parquet pipeline requires one {MEMORY_KAFKA_PARTITION_PREFIX}<topic>:<partition>:<start_offset>:<records> input partition"
         ),
     })
+}
+
+/// Derive a stable u64 shuffle seed from a job ID string.
+///
+/// Using a per-job seed on `HashPartitioner` prevents adversarial or
+/// pathological key distributions from concentrating rows into one bucket
+/// across all jobs. The seed is deterministic for the same job ID so
+/// retried tasks produce identical partition assignments.
+fn shuffle_seed_from_job_id(job_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    job_id.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn build_hot_key_reports(
+    batches: &[arrow::record_batch::RecordBatch],
+    key_column: &str,
+    job_id: &krishiv_proto::JobId,
+    stage_id: &str,
+) -> Vec<krishiv_proto::HeartbeatHotKeyReport> {
+    use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray};
+    use arrow::datatypes::DataType;
+    use krishiv_dataflow::adaptive::HeavyHittersTracker;
+
+    let mut tracker = HeavyHittersTracker::new(64);
+    let key_idx = batches.first().and_then(|b| b.schema().index_of(key_column).ok());
+    if let Some(kidx) = key_idx {
+        for batch in batches {
+            let col = batch.column(kidx);
+            match col.data_type() {
+                DataType::Utf8 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_owned());
+                            }
+                        }
+                    }
+                }
+                DataType::LargeUtf8 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_owned());
+                            }
+                        }
+                    }
+                }
+                DataType::Utf8View => {
+                    if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_owned());
+                            }
+                        }
+                    }
+                }
+                DataType::Int32 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_string());
+                            }
+                        }
+                    }
+                }
+                DataType::Int64 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_string());
+                            }
+                        }
+                    }
+                }
+                DataType::Boolean => {
+                    if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    tracker
+        .hot_keys(0.10)
+        .into_iter()
+        .map(|report| krishiv_proto::HeartbeatHotKeyReport {
+            key: report.key,
+            estimated_count: report.estimated_count,
+            max_error: report.max_error,
+            heat_score: report.heat_score,
+            job_id: job_id.clone(),
+            source_id: stage_id.to_string(),
+        })
+        .collect()
 }

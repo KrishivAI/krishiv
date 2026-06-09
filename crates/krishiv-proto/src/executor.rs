@@ -118,6 +118,12 @@ pub struct TaskRuntimeStats {
     pub memory_bytes: u64,
     /// Bytes spilled to local disk.
     pub spill_bytes: u64,
+    /// Total bytes written to the shuffle store across all output partitions.
+    ///
+    /// Zero for non-shuffle tasks (SQL collect, streaming window). When
+    /// non-zero, AQE rules use this in preference to `memory_bytes` because
+    /// it reflects the actual wire/disk cost of the shuffle exchange.
+    pub serialized_bytes: u64,
 }
 
 /// Task output metadata reported when a task completes successfully.

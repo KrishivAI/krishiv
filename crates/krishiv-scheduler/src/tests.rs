@@ -4611,6 +4611,7 @@ mod scheduler_tests {
             cpu_nanos: 1_000_000,
             memory_bytes: 0,
             spill_bytes: 0,
+            serialized_bytes: 0,
         });
 
         let update = TaskStatusUpdate::new(

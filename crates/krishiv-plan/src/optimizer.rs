@@ -74,6 +74,15 @@ pub struct RuntimeStats {
     pub memory_bytes: u64,
     /// Bytes spilled to disk.
     pub spill_bytes: u64,
+    /// Actual bytes written to the shuffle store (Arrow IPC / Parquet on disk).
+    ///
+    /// When non-zero, AQE rules prefer this over `memory_bytes` for partition
+    /// sizing, because shuffle output is compressed/serialized and therefore a
+    /// more accurate proxy for network and disk cost. `memory_bytes` is the
+    /// peak in-memory footprint, which can be 2–4× larger than the wire size.
+    /// Zero means the value was not collected (older task builds or non-shuffle
+    /// tasks), and the rule falls back to `memory_bytes`.
+    pub serialized_bytes: u64,
 }
 
 // ── Optimizer traits ──────────────────────────────────────────────────────────
@@ -349,24 +358,46 @@ impl CoalesceRule {
 
     /// Compute coalesce advice from per-partition stats, without modifying the plan.
     ///
-    /// Groups consecutive partitions whose `memory_bytes < min_partition_bytes`
-    /// without allowing a group to exceed `target_partition_bytes`. Non-small
-    /// partitions are singleton groups.
+    /// Partitions are sorted by `memory_bytes` (ascending) before grouping so
+    /// that all small partitions cluster together regardless of their original
+    /// execution order. Without sorting, a large partition sitting between two
+    /// small ones would prevent them from coalescing (Spark's AQE sorts before
+    /// coalescing for the same reason). Each group of small partitions is
+    /// capped at `target_partition_bytes`. Large partitions are always singleton
+    /// groups.
     ///
-    /// Example: `[small, small, big, small]` → `[[0,1], [2], [3]]`
+    /// Each group contains the original partition indices (not sorted indices),
+    /// so callers can map groups back to the original execution order.
+    ///
+    /// Example: `[small(0), big(1), small(2)]` → `[[0,2], [1]]` (2 groups)
+    /// vs. the old consecutive-only approach: `[[0], [1], [2]]` (3 groups, no gain)
     pub fn advise(&self, stats: &[RuntimeStats]) -> CoalesceAdvice {
         if stats.is_empty() {
             return CoalesceAdvice { groups: Vec::new() };
         }
+
+        // Sort by effective_bytes ascending so small partitions cluster together.
+        // Prefer serialized_bytes over memory_bytes (same logic as in the loop
+        // below). Stable sort preserves original order among equal-size partitions.
+        let mut order: Vec<usize> = (0..stats.len()).collect();
+        order.sort_by_key(|&i| {
+            let s = &stats[i];
+            if s.serialized_bytes > 0 { s.serialized_bytes } else { s.memory_bytes }
+        });
 
         let mut groups: Vec<Vec<usize>> = Vec::new();
         let mut current_small: Vec<usize> = Vec::new();
         let mut current_small_bytes = 0u128;
         let target_bytes = u128::from(self.target_partition_bytes.max(1));
 
-        for (i, s) in stats.iter().enumerate() {
-            if s.memory_bytes < self.min_partition_bytes {
-                let partition_bytes = u128::from(s.memory_bytes);
+        for i in order {
+            let s = &stats[i];
+            // Prefer serialized_bytes over memory_bytes for the same reason as
+            // AutoPartitionRule: shuffle output is compressed and a better
+            // proxy for actual partition cost than peak in-memory footprint.
+            let effective_bytes = if s.serialized_bytes > 0 { s.serialized_bytes } else { s.memory_bytes };
+            if effective_bytes < self.min_partition_bytes {
+                let partition_bytes = u128::from(effective_bytes);
                 if !current_small.is_empty() && current_small_bytes + partition_bytes > target_bytes
                 {
                     groups.push(std::mem::take(&mut current_small));
@@ -526,11 +557,13 @@ impl AqeRule for CoalesceRule {
 /// `memory_bytes` to obtain the total stage output size, and computes a target
 /// partition count:
 ///
-/// `target = max(1, ceil(total_bytes / target_partition_bytes))`
+/// `target = clamp(1, max_buckets, ceil(total_bytes / target_partition_bytes))`
 ///
-/// The computed count is clamped to the existing bucket count so the rule only
-/// ever increases parallelism (a single execution sees monotonically non-decreasing
-/// bucket counts across AQE iterations).
+/// The target is applied unconditionally: the rule can both increase and
+/// decrease bucket counts. This matches Spark AQE's behavior — if early
+/// execution stages produced far less data than expected, the rule shrinks
+/// the downstream partition count to avoid over-parallelism (task scheduling
+/// overhead dominating actual work). The minimum floor is always 1.
 ///
 /// When stats are empty (first execution) or contain no measurable memory, the
 /// rule is a no-op and returns `None`.
@@ -580,8 +613,15 @@ impl AqeRule for AutoPartitionRule {
             return None;
         }
 
-        // Sum memory across all partitions to get total stage output size.
-        let total_bytes: u64 = stats.iter().map(|s| s.memory_bytes).sum();
+        // Sum the best available size metric across all partitions.
+        // Prefer serialized_bytes (shuffle wire size) over memory_bytes (peak
+        // in-memory) because shuffle output is compressed/serialized and thus
+        // a more accurate proxy for partition cost. Fall back to memory_bytes
+        // when serialized_bytes is zero (non-shuffle tasks or older executors).
+        let total_bytes: u64 = stats
+            .iter()
+            .map(|s| if s.serialized_bytes > 0 { s.serialized_bytes } else { s.memory_bytes })
+            .sum();
         if total_bytes == 0 {
             return None;
         }
@@ -609,14 +649,19 @@ impl AutoPartitionRule {
     }
 
     /// Stamp `target` bucket count onto all Hash/RoundRobin exchange nodes
-    /// whose current count is below `target`.  Returns `None` if no node
+    /// whose current count differs from `target`. Returns `None` if no node
     /// needed adjustment.
+    ///
+    /// Both increases and decreases are applied — if the observed data volume
+    /// implies fewer partitions than currently planned, the bucket count is
+    /// lowered to avoid over-parallelism (task scheduling overhead > useful
+    /// work). The caller guarantees `target >= 1`.
     fn stamp_target(&self, plan: PhysicalPlan, target: u32) -> Option<PhysicalPlan> {
         let mut changed = false;
         for node in plan.nodes() {
             match node.partitioning() {
                 Partitioning::Hash { buckets, .. } | Partitioning::RoundRobin { buckets, .. }
-                    if *buckets < target =>
+                    if *buckets != target =>
                 {
                     changed = true;
                 }
@@ -632,13 +677,13 @@ impl AutoPartitionRule {
         for node in plan.nodes_mut() {
             let old = node.partitioning().clone();
             match old {
-                Partitioning::Hash { ref keys, buckets } if buckets < target => {
+                Partitioning::Hash { ref keys, buckets } if buckets != target => {
                     node.set_partitioning(Partitioning::Hash {
                         keys: keys.clone(),
                         buckets: target,
                     });
                 }
-                Partitioning::RoundRobin { buckets } if buckets < target => {
+                Partitioning::RoundRobin { buckets } if buckets != target => {
                     node.set_partitioning(Partitioning::RoundRobin {
                         buckets: target,
                     });
@@ -1337,10 +1382,11 @@ mod tests {
     use crate::{ExecutionKind, FieldType, LogicalPlan, NodeOp, PhysicalPlan, PlanNode};
 
     use super::{
-        AqeOptimizer, AqeRule, CoalesceAdvice, CoalesceRule, Cost, Optimizer, OptimizerError,
-        OptimizerRule, RuntimeStats, SmallFilePlanner, SplitPlanAdvice, StreamingAqeGuard,
-        default_logical_optimizer,
+        AqeOptimizer, AqeRule, AutoPartitionRule, CoalesceAdvice, CoalesceRule, Cost, Optimizer,
+        OptimizerError, OptimizerRule, RuntimeStats, SmallFilePlanner, SplitPlanAdvice,
+        StreamingAqeGuard, default_logical_optimizer,
     };
+    use crate::Partitioning;
 
     fn empty_plan() -> LogicalPlan {
         LogicalPlan::new("test", ExecutionKind::Batch)
@@ -1708,10 +1754,11 @@ mod tests {
 
     #[test]
     fn coalesce_all_small_in_one_group() {
+        // After sort by memory_bytes: [2(50), 0(100), 1(200)] → all small → one group.
         let stats = make_stats_with_memory(&[100, 200, 50]);
         let rule = CoalesceRule::new(1000);
         let advice = rule.advise(&stats);
-        assert_eq!(advice.groups, vec![vec![0, 1, 2]]);
+        assert_eq!(advice.groups, vec![vec![2, 0, 1]]);
     }
 
     #[test]
@@ -1724,11 +1771,13 @@ mod tests {
 
     #[test]
     fn coalesce_mixed_groups_correctly() {
-        // [small, small, big, small] → [[0,1], [2], [3]]
+        // After sort: [0(100), 1(200), 3(300), 2(5000)].
+        // Smalls (100+200+300=600 ≤ 128 MiB target) coalesce into one group;
+        // big 2(5000) is a singleton. This is 2 groups vs the old 3.
         let stats = make_stats_with_memory(&[100, 200, 5000, 300]);
         let rule = CoalesceRule::new(1000);
         let advice = rule.advise(&stats);
-        assert_eq!(advice.groups, vec![vec![0, 1], vec![2], vec![3]]);
+        assert_eq!(advice.groups, vec![vec![0, 1, 3], vec![2]]);
     }
 
     #[test]
@@ -2313,12 +2362,14 @@ mod tests {
             cpu_nanos: 1_000_000,
             memory_bytes: 1024 * 1024,
             spill_bytes: 4096,
+            serialized_bytes: 512 * 1024,
         };
         assert_eq!(stats.input_rows, 1000);
         assert_eq!(stats.output_rows, 500);
         assert_eq!(stats.cpu_nanos, 1_000_000);
         assert_eq!(stats.memory_bytes, 1024 * 1024);
         assert_eq!(stats.spill_bytes, 4096);
+        assert_eq!(stats.serialized_bytes, 512 * 1024);
     }
 
     #[test]
@@ -2329,6 +2380,7 @@ mod tests {
             cpu_nanos: 100,
             memory_bytes: 200,
             spill_bytes: 0,
+            serialized_bytes: 0,
         };
         let b = RuntimeStats {
             input_rows: 10,
@@ -2336,6 +2388,7 @@ mod tests {
             cpu_nanos: 100,
             memory_bytes: 200,
             spill_bytes: 0,
+            serialized_bytes: 0,
         };
         let c = RuntimeStats {
             input_rows: 10,
@@ -2343,6 +2396,7 @@ mod tests {
             cpu_nanos: 100,
             memory_bytes: 999,
             spill_bytes: 0,
+            serialized_bytes: 0,
         };
         assert_eq!(a, b);
         assert_ne!(a, c);
@@ -2356,9 +2410,73 @@ mod tests {
             cpu_nanos: 99,
             memory_bytes: 88,
             spill_bytes: 77,
+            serialized_bytes: 66,
         };
         let cloned = original.clone();
         assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn auto_partition_rule_prefers_serialized_bytes_over_memory_bytes() {
+        // A plan with a Hash exchange at 4 buckets.
+        let plan = PhysicalPlan::new("p", ExecutionKind::Batch).with_node(
+            PlanNode::new("xchg", "exchange", ExecutionKind::Batch)
+                .with_partitioning(Partitioning::Hash {
+                    keys: vec!["k".into()],
+                    buckets: 4,
+                }),
+        );
+
+        // 200 MiB in memory but only 50 MiB serialized.
+        // With target=128 MiB:
+        //   serialized path: ceil(50/128) = 1 → target=1
+        //   memory path:     ceil(200/128) = 2 → target=2
+        // The rule must use serialized_bytes and produce 1 bucket.
+        let stats = vec![RuntimeStats {
+            memory_bytes: 200 * 1024 * 1024,
+            serialized_bytes: 50 * 1024 * 1024,
+            ..Default::default()
+        }];
+
+        let rule = AutoPartitionRule::new(64).with_target_partition_bytes(128 * 1024 * 1024);
+        let result = rule.apply(plan.clone(), &stats).expect("rule must fire");
+
+        let buckets = result
+            .nodes()
+            .iter()
+            .find_map(|n| {
+                if let Partitioning::Hash { buckets, .. } = n.partitioning() {
+                    Some(*buckets)
+                } else {
+                    None
+                }
+            })
+            .expect("exchange node");
+
+        assert_eq!(
+            buckets, 1,
+            "serialized_bytes=50 MiB / target=128 MiB → 1 bucket, not memory-driven 2"
+        );
+    }
+
+    #[test]
+    fn coalesce_rule_prefers_serialized_bytes_for_small_partition_detection() {
+        // Three partitions: small in memory but large when serialized (e.g.
+        // incompressible binary blobs). serialized_bytes must govern the
+        // "is small?" threshold, not memory_bytes.
+        let rule = CoalesceRule::new(100); // threshold = 100 bytes
+        let stats = vec![
+            // memory=50 (< 100), but serialized=500 (≥ 100) → big
+            RuntimeStats { memory_bytes: 50, serialized_bytes: 500, ..Default::default() },
+            // memory=50 (< 100), serialized=0 → fall back to memory → small
+            RuntimeStats { memory_bytes: 50, serialized_bytes: 0, ..Default::default() },
+        ];
+        let advice = rule.advise(&stats);
+        // Partition 0 must be a singleton (big by serialized_bytes).
+        // Partition 1 must be in its own group too (small — but only 1 partition,
+        // so no coalescing benefit). The groups should be [[1], [0]] after sort
+        // (sorted by effective_bytes: 0 → 50 via fallback, 500).
+        assert_eq!(advice.groups.len(), 2, "each partition in its own group");
     }
 
     // ── ThresholdSkewRule additional tests ──────────────────────────────────
@@ -2530,20 +2648,24 @@ mod tests {
 
     #[test]
     fn coalesce_rule_boundary_memory_one_less_than_threshold() {
+        // After sort: [0(999), 2(999), 1(1001)].
+        // Both 999-byte partitions are small (< 1000 threshold) and coalesce;
+        // 1001-byte partition is big and stays singleton.
         let stats = make_stats_with_memory(&[999, 1001, 999]);
         let rule = CoalesceRule::new(1000);
         let advice = rule.advise(&stats);
-        // [small(0), big(1), small(2)] → consecutive smalls not adjacent → 3 singleton groups
-        assert_eq!(advice.groups, vec![vec![0], vec![1], vec![2]]);
+        assert_eq!(advice.groups, vec![vec![0, 2], vec![1]]);
     }
 
     #[test]
     fn coalesce_rule_consecutive_smalls_grouped() {
+        // After sort: [0(100), 4(100), 1(200), 5(200), 2(300), 3(5000)].
+        // All five small partitions (100+100+200+200+300=900 bytes) fit under
+        // the 128 MiB target, so they coalesce into one group. 3(5000) is big.
         let stats = make_stats_with_memory(&[100, 200, 300, 5000, 100, 200]);
         let rule = CoalesceRule::new(1000);
         let advice = rule.advise(&stats);
-        // [small(0), small(1), small(2), big(3), small(4), small(5)]
-        assert_eq!(advice.groups, vec![vec![0, 1, 2], vec![3], vec![4, 5]]);
+        assert_eq!(advice.groups, vec![vec![0, 4, 1, 5, 2], vec![3]]);
     }
 
     #[test]

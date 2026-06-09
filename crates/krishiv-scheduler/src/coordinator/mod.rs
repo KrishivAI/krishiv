@@ -154,6 +154,15 @@ pub struct Coordinator {
     /// to resume (adaptive: only applies to the immediate next batch).
     pub(crate) skew_repartition_overrides: HashMap<JobId, u32>,
 
+    /// EMA-derived advisory partition counts for streaming jobs.
+    ///
+    /// Populated by `record_streaming_advisory_buckets` when a streaming task
+    /// output carries `advisory_buckets` from `StreamingPartitionAdvisor`.
+    /// The coordinator uses these values to scale the number of tasks it
+    /// assigns for the next streaming cycle. Entries are removed with
+    /// `evict_completed_job`.
+    pub(crate) streaming_advisory_partitions: HashMap<JobId, u32>,
+
     /// Notify channel for waking daemon tick and other waiters on state change.
     pub(crate) notify: Arc<Notify>,
 
@@ -701,6 +710,7 @@ impl Coordinator {
             job_task_input_partitions: HashMap::new(),
             continuous_input_cycles: HashSet::new(),
             skew_repartition_overrides: HashMap::new(),
+            streaming_advisory_partitions: HashMap::new(),
             notify: Arc::new(Notify::new()),
             job_coordinators: HashMap::new(),
         }

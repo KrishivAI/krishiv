@@ -224,6 +224,10 @@ pub struct ExecutorTaskOutput {
     pub(crate) watermark_ms: Option<i64>,
     /// Hot-key reports from `HeavyHittersTracker` observed during shuffle write.
     pub(crate) hot_key_reports: Vec<krishiv_proto::HeartbeatHotKeyReport>,
+    /// EMA-based partition bucket recommendation from `StreamingPartitionAdvisor`.
+    /// `None` for non-streaming tasks; `Some(n)` when the advisor has observed
+    /// enough data to suggest a bucket count for the next streaming cycle.
+    pub(crate) advisory_buckets: Option<u32>,
 }
 
 impl ExecutorTaskOutput {
@@ -238,6 +242,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            advisory_buckets: None,
         }
     }
 
@@ -257,6 +262,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            advisory_buckets: None,
         }
     }
 
@@ -271,6 +277,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            advisory_buckets: None,
         }
     }
 
@@ -288,6 +295,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            advisory_buckets: None,
         }
     }
 
@@ -308,6 +316,7 @@ impl ExecutorTaskOutput {
             record_batches,
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            advisory_buckets: None,
         }
     }
 
@@ -338,6 +347,18 @@ impl ExecutorTaskOutput {
     /// Maximum event-time watermark reached by this streaming window task, if any.
     pub fn watermark_ms(&self) -> Option<i64> {
         self.watermark_ms
+    }
+
+    /// Attach the EMA-derived partition bucket recommendation from
+    /// `StreamingPartitionAdvisor` for the next streaming cycle.
+    pub(crate) fn with_advisory_buckets(mut self, buckets: u32) -> Self {
+        self.advisory_buckets = Some(buckets);
+        self
+    }
+
+    /// EMA-based bucket count recommendation for the next streaming cycle, if any.
+    pub fn advisory_buckets(&self) -> Option<u32> {
+        self.advisory_buckets
     }
 
     /// Output kind.
@@ -674,6 +695,14 @@ pub struct ExecutorTaskRunner {
     /// clones must share the same stateful executor for a given job.
     pub(crate) loop_executors:
         Arc<DashMap<String, Arc<std::sync::Mutex<krishiv_dataflow::ContinuousWindowExecutor>>>>,
+    /// Per-job `StreamingPartitionAdvisor` instances (EMA-based bucket advisor).
+    ///
+    /// Keyed by job-id string. Accumulates the EMA of observed input-batch byte
+    /// sizes across streaming cycles and recommends a bucket count that tracks
+    /// actual data volume. All runner clones share the same advisor per job.
+    pub(crate) streaming_advisors: Arc<
+        DashMap<String, Arc<std::sync::Mutex<krishiv_dataflow::StreamingPartitionAdvisor>>>,
+    >,
     /// Live executor lease generation, shared with the heartbeat loop.
     /// Used to stamp checkpoint-fanout RPCs without round-tripping through
     /// the gRPC service (B10).  Defaults to `LeaseGeneration::initial()`.
@@ -769,6 +798,7 @@ impl ExecutorTaskRunner {
             running_attempts: None,
             continuous_drainer: None,
             loop_executors: Arc::new(DashMap::new()),
+            streaming_advisors: Arc::new(DashMap::new()),
             live_lease: crate::grpc_client::SharedLeaseGeneration::new(
                 krishiv_proto::LeaseGeneration::initial(),
             ),

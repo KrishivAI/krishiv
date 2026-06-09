@@ -34,6 +34,15 @@ pub fn target_bytes_per_partition(_profile: Option<&str>) -> u64 {
     TARGET_BYTES_PER_PARTITION
 }
 
+/// A shard index produced by the SHA-256 keyed-semantics partitioner.
+///
+/// Intentionally not `From<usize>` or `Into<usize>`: callers must name `.0`
+/// to extract the raw index. This makes it a compile-time error to use a
+/// `ShuffleBucket` (XxHash64 routing) where a `KeyedShard` is required, and
+/// vice versa — the two hash domains must never be aliased.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeyedShard(pub usize);
+
 /// A batch cannot be partitioned without violating keyed execution semantics.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid partitioning input: {message}")]
@@ -138,12 +147,14 @@ fn shard_index(
     array: &dyn Array,
     row: usize,
     shard_count: NonZeroUsize,
-) -> Result<usize, PartitionError> {
+) -> Result<KeyedShard, PartitionError> {
     let digest = digest_for_key(array, row)?;
     let hash = u64::from_le_bytes([
         digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
     ]);
-    Ok((u128::from(hash) % (shard_count.get() as u128)) as usize)
+    Ok(KeyedShard(
+        (u128::from(hash) % (shard_count.get() as u128)) as usize,
+    ))
 }
 
 /// Partition rows by a non-null typed key.
@@ -216,7 +227,7 @@ pub fn partition_record_batches_by_key(
                     "batch {batch_idx} has more rows than the Arrow gather index can represent"
                 ))
             })?;
-            row_indices[partition].push(row_idx);
+            row_indices[partition.0].push(row_idx);
         }
 
         for (shard_idx, indices) in row_indices.into_iter().enumerate() {
@@ -272,7 +283,7 @@ mod tests {
         let keys = StringArray::from(vec!["customer-42"]);
         assert_eq!(
             shard_index(&keys, 0, NonZeroUsize::new(17).unwrap()).unwrap(),
-            13
+            KeyedShard(13)
         );
     }
 

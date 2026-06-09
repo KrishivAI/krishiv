@@ -27,31 +27,40 @@ use crate::{
 /// a checkpoint re-opens the file and re-positions the reader by skipping the
 /// requested number of batches — the standard trade-off for sequential file
 /// formats that lack a random-access batch index.
+///
+/// The total row count is read from the Parquet file-metadata footer at open
+/// time so callers can populate `estimated_rows` on scan `PlanNode`s, enabling
+/// `BroadcastAutoRule` to fire for small Parquet tables without going through
+/// the DataFusion SQL path.
 pub struct ParquetSource {
     path: PathBuf,
     schema: SchemaRef,
+    /// Total row count from the Parquet footer, cached at open time.
+    estimated_row_count: Option<u64>,
     reader: Option<ParquetRecordBatchReader>,
     cursor: usize,
 }
 
 impl ParquetSource {
-    /// Open a Parquet file, validating it and reading its schema.
+    /// Open a Parquet file, validating it and reading its schema and row count.
     ///
     /// Batches are not read until [`Source::read_batch`] is called.
     pub fn open(path: impl AsRef<Path>) -> ConnectorResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let schema = Self::probe_schema(&path)?;
+        let (schema, estimated_row_count) = Self::probe_metadata(&path)?;
 
         Ok(Self {
             path,
             schema,
+            estimated_row_count,
             reader: None,
             cursor: 0,
         })
     }
 
-    /// Open the file and read just its Arrow schema, without building a batch reader.
-    fn probe_schema(path: &Path) -> ConnectorResult<SchemaRef> {
+    /// Open the file and read its Arrow schema and total row count from the
+    /// Parquet footer, without building a batch reader.
+    fn probe_metadata(path: &Path) -> ConnectorResult<(SchemaRef, Option<u64>)> {
         let file = File::open(path).map_err(|e| {
             ConnectorError::Parquet(format!("failed to open '{}': {e}", path.display()))
         })?;
@@ -61,7 +70,18 @@ impl ParquetSource {
                 path.display()
             ))
         })?;
-        Ok(builder.schema().clone())
+        let schema = builder.schema().clone();
+        let row_count = u64::try_from(builder.metadata().file_metadata().num_rows()).ok();
+        Ok((schema, row_count))
+    }
+
+    /// Return the total row count from the Parquet footer, as read at open time.
+    ///
+    /// Callers should populate `PlanNode::with_estimated_rows` with this value
+    /// so `BroadcastAutoRule` can fire for small Parquet tables on the direct
+    /// connector path (without going through the DataFusion SQL path).
+    pub fn row_count(&self) -> Option<u64> {
+        self.estimated_row_count
     }
 
     /// Open a fresh batch reader positioned at the start of the file.
@@ -300,6 +320,27 @@ mod tests {
             total_rows += batch.num_rows();
         }
         assert_eq!(total_rows, 3, "expected 3 rows total");
+    }
+
+    #[test]
+    fn parquet_source_row_count_matches_written_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rowcount.parquet");
+
+        let batch1 = make_batch(&[1, 2, 3], &["a", "b", "c"]);
+        let batch2 = make_batch(&[4, 5], &["d", "e"]);
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch1.schema(), None).unwrap();
+        writer.write(&batch1).unwrap();
+        writer.write(&batch2).unwrap();
+        writer.close().unwrap();
+
+        let source = ParquetSource::open(&path).unwrap();
+        assert_eq!(
+            source.row_count(),
+            Some(5),
+            "row_count must reflect total rows from Parquet footer"
+        );
     }
 
     #[test]

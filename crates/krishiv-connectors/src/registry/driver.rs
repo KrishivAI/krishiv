@@ -27,6 +27,13 @@ pub trait SourceDriver: Send + Sync {
         &'a self,
         config: &'a ConnectorConfig,
     ) -> Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSource>>> + Send + 'a>>;
+
+    /// Return the total row count for this source without fully opening it,
+    /// if the driver can cheaply determine it (e.g. Parquet footer metadata).
+    /// Returns `None` when not available or when reading fails.
+    fn estimated_row_count(&self, _config: &ConnectorConfig) -> Option<u64> {
+        None
+    }
 }
 
 /// Builds [`DynSink`] instances from validated [`ConnectorConfig`] values.

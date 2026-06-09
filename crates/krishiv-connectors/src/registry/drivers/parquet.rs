@@ -47,6 +47,11 @@ impl SourceDriver for ParquetSourceDriver {
             Ok(Box::new(source) as Box<dyn DynSource>)
         })
     }
+
+    fn estimated_row_count(&self, config: &ConnectorConfig) -> Option<u64> {
+        let path = require_path(config).ok()?;
+        ParquetSource::open(path).ok()?.row_count()
+    }
 }
 
 pub struct ParquetSinkDriver;

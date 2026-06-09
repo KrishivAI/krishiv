@@ -171,12 +171,53 @@ impl Coordinator {
                 // task batch. This spreads hot-key data evenly across all
                 // available executor slots rather than concentrating it on the
                 // bucket that hashes to the hot key.
-                let buckets = self.executors.list().len().max(2) as u32;
-                self.skew_repartition_overrides
-                    .insert(job_id.clone(), buckets);
+                //
+                // SAFETY: Never apply to streaming jobs. Streaming stages use
+                // keyed partitioning — every record for a given key must reach
+                // the same executor task for the lifetime of the job. Changing
+                // the partition scheme mid-stream would scatter state for the
+                // same key across multiple tasks, producing incorrect window
+                // aggregation results. For streaming hot keys the only safe
+                // mitigation is source throttling (already applied above).
+                let is_streaming = self
+                    .job_coordinators
+                    .get(&job_id)
+                    .map(|jc| jc.read_record().spec.kind() == JobKind::Streaming)
+                    .unwrap_or(false);
+                if !is_streaming {
+                    let buckets = self.executors.list().len().max(2) as u32;
+                    self.skew_repartition_overrides
+                        .insert(job_id.clone(), buckets);
+                } else {
+                    tracing::debug!(
+                        job_id = %job_id,
+                        key = %report.key,
+                        "hot-key repartition override skipped for streaming job \
+                         (keyed state must stay pinned to its assigned task)"
+                    );
+                }
             }
         }
         throttles
+    }
+
+    /// Record the EMA-derived advisory partition count for a streaming job.
+    ///
+    /// Called by the in-process runtime after each streaming task cycle to
+    /// propagate the `StreamingPartitionAdvisor` recommendation.  The stored
+    /// value is used by `launch_assigned_task_assignments` to choose the number
+    /// of tasks for the next cycle.  A new observation replaces the previous
+    /// one — only the latest advisory matters.
+    pub(crate) fn record_streaming_advisory_buckets(&mut self, job_id: &JobId, buckets: u32) {
+        if buckets > 0 {
+            self.streaming_advisory_partitions
+                .insert(job_id.clone(), buckets);
+        }
+    }
+
+    /// Return the current advisory partition count for a streaming job, if any.
+    pub(crate) fn streaming_advisory_partitions(&self, job_id: &JobId) -> Option<u32> {
+        self.streaming_advisory_partitions.get(job_id).copied()
     }
 
     /// Mark an executor lost and release its running task assignments for retry.

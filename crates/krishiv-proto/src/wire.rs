@@ -826,6 +826,10 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
         value.batch_count,
         value.column_count,
     );
+    // Derive serialized_bytes before moving shuffle_partitions into meta.
+    // This gives AQE rules the actual wire/disk cost of the shuffle exchange
+    // rather than peak in-memory footprint, which can be 2-4× larger.
+    let serialized_bytes: u64 = shuffle_partitions.iter().map(|p| p.size_bytes).sum();
     if !shuffle_partitions.is_empty() {
         meta = meta.with_shuffle_partitions(shuffle_partitions);
     }
@@ -846,6 +850,7 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
             cpu_nanos: value.cpu_nanos,
             memory_bytes: value.memory_bytes,
             spill_bytes: value.spill_bytes,
+            serialized_bytes,
         });
     }
     if value.has_watermark_ms {

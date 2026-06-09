@@ -402,6 +402,7 @@ pub(crate) async fn execute_streaming_fragment(
     // executing the window so we can attach it to the output and let the coordinator
     // track global low-watermark across all executor tasks.
     let observed_watermark_ms = compute_input_watermark(&batches, &plan_spec);
+    let advisory_buckets = advise_streaming_buckets(runner, job_id, &batches);
 
     let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
 
@@ -433,6 +434,7 @@ pub(crate) async fn execute_streaming_fragment(
         output = output.with_watermark_ms(wm);
     }
     output.hot_key_reports = hot_key_reports;
+    output = output.with_advisory_buckets(advisory_buckets);
     Ok(output)
 }
 
@@ -466,6 +468,11 @@ async fn execute_streaming_with_batches(
     spec: WindowExecutionSpec,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let observed_watermark_ms = compute_input_watermark(&batches, &spec);
+
+    // Observe total input bytes in the per-job StreamingPartitionAdvisor so
+    // the EMA tracks actual data volume across cycles.
+    let advisory_buckets = advise_streaming_buckets(runner, job_id.as_str(), &batches);
+
     let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id.as_str()));
     let collected =
         execute_bounded_window(batches, &spec, job_state_dir.as_deref()).map_err(|e| {
@@ -484,7 +491,41 @@ async fn execute_streaming_with_batches(
         output = output.with_watermark_ms(wm);
     }
     output.hot_key_reports = hot_key_reports;
+    output = output.with_advisory_buckets(advisory_buckets);
     Ok(output)
+}
+
+/// Observe `batches` in the per-job `StreamingPartitionAdvisor` and return the
+/// current EMA-derived bucket recommendation.
+///
+/// Creates the advisor on first call for a given job (initial=2, min=1, max=128).
+/// All runner clones share the same advisor instance so the EMA accumulates
+/// correctly across task cycles for the same job.
+fn advise_streaming_buckets(
+    runner: &ExecutorTaskRunner,
+    job_id: &str,
+    batches: &[arrow::record_batch::RecordBatch],
+) -> u32 {
+    use krishiv_dataflow::StreamingPartitionAdvisor;
+    let entry = runner
+        .streaming_advisors
+        .entry(job_id.to_owned())
+        .or_insert_with(|| {
+            Arc::new(std::sync::Mutex::new(StreamingPartitionAdvisor::new(
+                2, 1, 128,
+            )))
+        });
+    let advisor_arc = entry.value().clone();
+    drop(entry);
+
+    let total_bytes: u64 = batches
+        .iter()
+        .map(|b| b.get_array_memory_size() as u64)
+        .sum();
+    match advisor_arc.lock() {
+        Ok(mut advisor) => advisor.observe_batch_bytes(total_bytes),
+        Err(_) => 1,
+    }
 }
 
 /// Build hot-key reports from output batches for coordinator-side skew detection.
@@ -492,27 +533,99 @@ async fn execute_streaming_with_batches(
 /// Scans `key_column` across all batches using the SpaceSaving tracker and
 /// returns reports for keys whose heat score exceeds 0.10 (≥10 % of rows in
 /// the sample). An empty slice or a missing key column produces an empty Vec.
+///
+/// Each key value is rendered as a plain string using the column's concrete type
+/// (e.g. `"bot"` for Utf8, `"42"` for Int64). The previous `format!("{:?}",
+/// col.slice(i, 1))` approach emitted the full Arrow debug representation
+/// (`StringArray\n[\n  "bot",\n]`), which inflated memory usage ~20× and made
+/// hot-key report keys unreadable by downstream consumers.
 fn build_streaming_hot_key_reports(
     batches: &[arrow::record_batch::RecordBatch],
     key_column: &str,
     job_id: &krishiv_proto::JobId,
     stage_id: &krishiv_proto::StageId,
 ) -> Vec<krishiv_proto::HeartbeatHotKeyReport> {
+    use arrow::array::{
+        Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray,
+        StringViewArray,
+    };
+    use arrow::datatypes::DataType;
     use krishiv_dataflow::adaptive::HeavyHittersTracker;
+
     let mut tracker = HeavyHittersTracker::new(64);
+
     let key_idx = batches
         .first()
         .and_then(|b| b.schema().index_of(key_column).ok());
+
     if let Some(kidx) = key_idx {
         for batch in batches {
             let col = batch.column(kidx);
-            for i in 0..col.len() {
-                if col.is_valid(i) {
-                    tracker.observe(format!("{:?}", col.slice(i, 1)));
+            // Extract a plain string representation for each non-null row using
+            // the column's concrete Arrow type. This avoids the debug-format
+            // overhead and produces human-readable keys for coordinator logs.
+            match col.data_type() {
+                DataType::Utf8 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_owned());
+                            }
+                        }
+                    }
                 }
+                DataType::LargeUtf8 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_owned());
+                            }
+                        }
+                    }
+                }
+                DataType::Utf8View => {
+                    if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_owned());
+                            }
+                        }
+                    }
+                }
+                DataType::Int32 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_string());
+                            }
+                        }
+                    }
+                }
+                DataType::Int64 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_string());
+                            }
+                        }
+                    }
+                }
+                DataType::Boolean => {
+                    if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_string());
+                            }
+                        }
+                    }
+                }
+                // Unsupported key types are silently skipped — the tracker
+                // stays empty and the caller gets an empty report Vec.
+                _ => {}
             }
         }
     }
+
     tracker
         .hot_keys(0.10)
         .into_iter()
