@@ -524,7 +524,10 @@ fn advise_streaming_buckets(
         .sum();
     match advisor_arc.lock() {
         Ok(mut advisor) => advisor.observe_batch_bytes(total_bytes),
-        Err(_) => 1,
+        Err(_) => {
+            tracing::warn!(job_id = %job_id, "streaming partition advisor mutex poisoned; defaulting to 1 bucket");
+            1
+        }
     }
 }
 
@@ -644,27 +647,46 @@ fn build_streaming_hot_key_reports(
 ///
 /// Watermark = max(event_time_column) − watermark_lag_ms.
 /// Returns `None` if the event-time column is not found or the batches are empty.
+/// Supports Int64 (milliseconds) and Timestamp columns (all TimeUnit variants, converted to ms).
 fn compute_input_watermark(
     batches: &[arrow::record_batch::RecordBatch],
     spec: &WindowExecutionSpec,
 ) -> Option<i64> {
-    use arrow::array::{Array, Int64Array};
+    use arrow::array::{Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
+    use arrow::datatypes::{DataType, TimeUnit};
 
     let mut max_ts: Option<i64> = None;
     for batch in batches {
         let col_idx = batch.schema().index_of(&spec.event_time_column).ok()?;
-        let col = batch
-            .column(col_idx)
-            .as_any()
-            .downcast_ref::<Int64Array>()?;
-        for i in 0..col.len() {
-            if !col.is_null(i) {
-                let ts = col.value(i);
-                max_ts = Some(match max_ts {
-                    Some(prev) => prev.max(ts),
-                    None => ts,
-                });
+        let col = batch.column(col_idx);
+        let batch_max = match col.data_type() {
+            DataType::Int64 => {
+                let arr = col.as_any().downcast_ref::<Int64Array>()?;
+                (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i)).reduce(i64::max)
             }
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                let arr = col.as_any().downcast_ref::<TimestampSecondArray>()?;
+                (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i).saturating_mul(1_000)).reduce(i64::max)
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                let arr = col.as_any().downcast_ref::<TimestampMillisecondArray>()?;
+                (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i)).reduce(i64::max)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                let arr = col.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
+                (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i) / 1_000).reduce(i64::max)
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                let arr = col.as_any().downcast_ref::<TimestampNanosecondArray>()?;
+                (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i) / 1_000_000).reduce(i64::max)
+            }
+            _ => return None,
+        };
+        if let Some(ts) = batch_max {
+            max_ts = Some(match max_ts {
+                Some(prev) => prev.max(ts),
+                None => ts,
+            });
         }
     }
     max_ts.map(|ts| ts.saturating_sub(spec.watermark_lag_ms as i64))

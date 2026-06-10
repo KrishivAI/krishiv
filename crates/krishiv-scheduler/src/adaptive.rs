@@ -38,11 +38,29 @@ pub struct AdaptiveDecisionLog {
 }
 
 /// Manual override configuration for adaptive behaviors in the coordinator.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AdaptiveOverrideConfig {
     pub disable_hot_key_splitting: bool,
     pub disable_adaptive_repartition: bool,
     pub disable_source_throttling: bool,
+    /// Base ingestion rate (rows/s) used when computing hot-key throttle levels.
+    /// Defaults to 10,000. Set via `KRISHIV_HOT_KEY_BASE_ROWS_PER_SECOND` at startup
+    /// or override directly for tests.
+    pub hot_key_base_rows_per_second: u64,
+}
+
+impl Default for AdaptiveOverrideConfig {
+    fn default() -> Self {
+        Self {
+            disable_hot_key_splitting: false,
+            disable_adaptive_repartition: false,
+            disable_source_throttling: false,
+            hot_key_base_rows_per_second: std::env::var("KRISHIV_HOT_KEY_BASE_ROWS_PER_SECOND")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
+        }
+    }
 }
 
 /// A throttle command the coordinator sends back to an executor in the

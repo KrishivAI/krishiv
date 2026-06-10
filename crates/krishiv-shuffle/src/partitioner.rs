@@ -88,9 +88,9 @@ impl HashPartitioner {
     ///
     /// Typical usage:
     /// ```ignore
-    /// use std::hash::{Hash, Hasher};
-    /// let mut h = std::collections::hash_map::DefaultHasher::new();
-    /// job_id.hash(&mut h);
+    /// use std::hash::Hasher;
+    /// let mut h = twox_hash::XxHash64::with_seed(0);
+    /// h.write(job_id.as_bytes());
     /// let partitioner = HashPartitioner::new(key_col, buckets).with_seed(h.finish());
     /// ```
     #[must_use]

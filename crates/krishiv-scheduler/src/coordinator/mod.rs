@@ -15,7 +15,7 @@ use krishiv_proto::{
     TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState, TaskStatusResponse,
     TaskStatusUpdate, wire,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -103,7 +103,7 @@ pub struct Coordinator {
     pub(crate) queue_manager: Arc<dyn QueueManager>,
     /// Jobs that have just reached a terminal state and need shuffle GC.
     /// Drained by the coordinator binary's tick loop.
-    pub(crate) gc_ready_jobs: Vec<JobId>,
+    pub(crate) gc_ready_jobs: VecDeque<JobId>,
     /// Number of heartbeat ticks since the last coordinator restart.
     /// Used to implement `streaming_reattach_grace_ticks`: for this many ticks
     /// after `recover_from_store` is called, streaming-job executors are not
@@ -127,7 +127,7 @@ pub struct Coordinator {
     /// Sharded gRPC channel cache keyed by executor endpoint string.
     /// DashMap avoids a full TCP+TLS handshake per task push.
     pub(crate) executor_channels: Arc<DashMap<String, tonic::transport::Channel>>,
-    pub(crate) checkpoint_notify_sent: HashSet<(JobId, ExecutorId, u64)>,
+    pub(crate) checkpoint_notify_sent: indexmap::IndexSet<(JobId, ExecutorId, u64)>,
     /// (job_id, epoch) pairs for which a gRPC barrier round-trip was dispatched.
     pub(crate) barrier_dispatch_sent: HashSet<(JobId, u64)>,
     /// Aggregates LLM quota reports across executors (R17).
@@ -690,7 +690,7 @@ impl Coordinator {
             // KRISHIV_MAX_CONCURRENT_JOBS env var is honoured at daemon startup;
             // other limits require explicit CoordinatorConfig::with_queue_manager().
             queue_manager: Arc::new(QuotaQueueManager::with_default(quota_policy_from_env())),
-            gc_ready_jobs: Vec::new(),
+            gc_ready_jobs: VecDeque::new(),
             ticks_since_restart: u64::MAX,
             recovering: false,
             adaptive_decision_log: HashMap::new(),
@@ -698,7 +698,7 @@ impl Coordinator {
             streaming_task_index: HashMap::new(),
             streaming_job_task_index: HashMap::new(),
             executor_channels: Arc::new(DashMap::new()),
-            checkpoint_notify_sent: HashSet::new(),
+            checkpoint_notify_sent: indexmap::IndexSet::new(),
             barrier_dispatch_sent: HashSet::new(),
             llm_quota_aggregator: llm_quota::LlmQuotaAggregator::new(
                 config.llm_quota_requests_per_minute(),

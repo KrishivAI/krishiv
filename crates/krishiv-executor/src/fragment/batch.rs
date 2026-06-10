@@ -987,9 +987,9 @@ fn parse_memory_kafka_partition(
 /// across all jobs. The seed is deterministic for the same job ID so
 /// retried tasks produce identical partition assignments.
 fn shuffle_seed_from_job_id(job_id: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    job_id.hash(&mut hasher);
+    use std::hash::Hasher;
+    let mut hasher = twox_hash::XxHash64::with_seed(0);
+    hasher.write(job_id.as_bytes());
     hasher.finish()
 }
 

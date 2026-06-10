@@ -11,6 +11,7 @@
 //! directly — deferred to avoid a larger refactor.
 
 use std::collections::{HashMap, HashSet};
+use indexmap::IndexSet;
 use std::sync::Arc;
 
 use crate::checkpoint::{CheckpointCoordinator, PendingCommit};
@@ -79,7 +80,7 @@ impl ExecutorInner {
 #[derive(Clone, Debug)]
 pub struct CheckpointInner {
     pub coordinators: HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
-    pub notify_sent: HashSet<(krishiv_proto::JobId, ExecutorId, u64)>,
+    pub notify_sent: IndexSet<(krishiv_proto::JobId, ExecutorId, u64)>,
     pub barrier_sent: HashSet<(krishiv_proto::JobId, u64)>,
     /// Notify for checkpoint-related state changes (acks, epoch advances).
     pub notify: Arc<Notify>,
@@ -89,7 +90,7 @@ impl CheckpointInner {
     pub fn new() -> Self {
         Self {
             coordinators: HashMap::new(),
-            notify_sent: HashSet::new(),
+            notify_sent: IndexSet::new(),
             barrier_sent: HashSet::new(),
             notify: Arc::new(Notify::new()),
         }
@@ -97,7 +98,7 @@ impl CheckpointInner {
 
     pub fn from_parts(
         coordinators: HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
-        notify_sent: HashSet<(krishiv_proto::JobId, ExecutorId, u64)>,
+        notify_sent: IndexSet<(krishiv_proto::JobId, ExecutorId, u64)>,
         barrier_sent: HashSet<(krishiv_proto::JobId, u64)>,
     ) -> Self {
         Self {
@@ -213,7 +214,7 @@ pub(crate) fn sync_executor_to_inner(
 /// Synchronise checkpoint state FROM the Coordinator fields INTO the inner lock.
 pub(crate) fn sync_checkpoint_to_inner(
     src_coordinators: &HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
-    src_notify: &HashSet<(krishiv_proto::JobId, ExecutorId, u64)>,
+    src_notify: &IndexSet<(krishiv_proto::JobId, ExecutorId, u64)>,
     src_barrier: &HashSet<(krishiv_proto::JobId, u64)>,
     inner: &mut CheckpointInner,
 ) {

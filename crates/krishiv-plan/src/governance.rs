@@ -266,6 +266,9 @@ static GLOBAL_AUDIT_SINK: std::sync::OnceLock<Box<dyn AuditSink + Send + Sync>> 
 static AUDIT_DEDUP: std::sync::LazyLock<dashmap::DashMap<u64, u64>> =
     std::sync::LazyLock::new(dashmap::DashMap::new);
 const AUDIT_DEDUP_TTL_MS: u64 = 60_000;
+// Track last eviction time to avoid O(n) full-scan on every audit_log() call.
+static AUDIT_DEDUP_LAST_EVICTION_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Compute a stable 64-bit dedup key for an audit event.
 fn audit_dedup_key(principal: &str, action_name: &str, detail: &str) -> u64 {
@@ -380,8 +383,12 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Periodic eviction: remove entries older than 1 hour to prevent unbounded growth.
-    AUDIT_DEDUP.retain(|_, ts| now_ms.saturating_sub(*ts) < 3_600_000);
+    // Periodic eviction (at most every 10 s): remove entries older than 1 hour.
+    let last_evict = AUDIT_DEDUP_LAST_EVICTION_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last_evict) >= 10_000 {
+        AUDIT_DEDUP.retain(|_, ts| now_ms.saturating_sub(*ts) < 3_600_000);
+        AUDIT_DEDUP_LAST_EVICTION_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    }
 
     if let Some(entry) = AUDIT_DEDUP.get(&key)
         && now_ms.saturating_sub(*entry) < AUDIT_DEDUP_TTL_MS
@@ -400,10 +407,7 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
         principal: principal.to_string(),
         action: action_name.to_string(),
         resource: Some(detail.clone()),
-        timestamp_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64,
+        timestamp_ms: now_ms as i64,
         outcome,
     };
     get_audit_sink().record(&event);

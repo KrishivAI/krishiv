@@ -171,9 +171,9 @@ impl Coordinator {
         if !self.gc_ready_jobs.contains(job_id) {
             const MAX_GC_JOBS: usize = 1000;
             if self.gc_ready_jobs.len() >= MAX_GC_JOBS {
-                self.gc_ready_jobs.remove(0);
+                self.gc_ready_jobs.pop_front();
             }
-            self.gc_ready_jobs.push(job_id.clone());
+            self.gc_ready_jobs.push_back(job_id.clone());
         }
         self.checkpoint_coordinators.remove(job_id);
         self.job_inline_results.remove(job_id);
@@ -342,9 +342,9 @@ impl Coordinator {
         if is_terminal && !self.gc_ready_jobs.contains(&job_id) {
             const MAX_GC_JOBS: usize = 1000;
             if self.gc_ready_jobs.len() >= MAX_GC_JOBS {
-                self.gc_ready_jobs.remove(0);
+                self.gc_ready_jobs.pop_front();
             }
-            self.gc_ready_jobs.push(job_id.clone());
+            self.gc_ready_jobs.push_back(job_id.clone());
             self.checkpoint_coordinators.remove(&job_id);
             // Free inline input data (InlineIpc partitions for batch-sql and
             // bounded-window jobs) — executors have already consumed this by the
@@ -412,7 +412,7 @@ impl Coordinator {
     /// growth. Eviction happens here (not in `apply_task_update`) so that the job
     /// snapshot remains queryable until the GC cycle runs.
     pub fn take_gc_ready_jobs(&mut self) -> Vec<JobId> {
-        let jobs = std::mem::take(&mut self.gc_ready_jobs);
+        let jobs: Vec<JobId> = std::mem::take(&mut self.gc_ready_jobs).into_iter().collect();
         for job_id in &jobs {
             self.evict_completed_job(job_id);
         }

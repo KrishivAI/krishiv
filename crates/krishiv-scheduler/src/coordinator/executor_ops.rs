@@ -120,7 +120,7 @@ impl Coordinator {
         reports: &[HeartbeatHotKeyReport],
     ) -> Vec<crate::adaptive::ThrottleDecision> {
         const HOT_KEY_HEAT_THRESHOLD: f64 = 0.3;
-        const BASE_ROWS_PER_SECOND: u64 = 10_000;
+        let base_rows_per_second = self.adaptive_override.hot_key_base_rows_per_second;
 
         if reports.is_empty() {
             return Vec::new();
@@ -156,7 +156,7 @@ impl Coordinator {
                 // Clamp heat_score to [0, 1] to prevent invalid calculations from NaN or out-of-range values.
                 let heat = report.heat_score.clamp(0.0_f64, 1.0_f64);
                 // Throttle the source proportional to its heat score.
-                let reduced_rate = ((1.0 - heat) * BASE_ROWS_PER_SECOND as f64).max(1.0) as u64;
+                let reduced_rate = ((1.0 - heat) * base_rows_per_second as f64).max(1.0) as u64;
                 throttles.push(crate::adaptive::ThrottleDecision {
                     source_id: report.source_id.clone(),
                     rows_per_second: Some(reduced_rate),

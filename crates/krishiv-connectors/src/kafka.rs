@@ -88,7 +88,7 @@ impl crate::Offset for KafkaOffset {
 // ---------------------------------------------------------------------------
 
 /// Validated Kafka connector configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KafkaConfig {
     pub bootstrap_servers: String,
     pub topic: String,
@@ -104,6 +104,27 @@ pub struct KafkaConfig {
     pub sasl_mechanisms: Option<String>,
     pub enable_idempotence: Option<bool>,
     pub transactional_id: Option<String>,
+}
+
+impl std::fmt::Debug for KafkaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaConfig")
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("topic", &self.topic)
+            .field("group_id", &self.group_id)
+            .field("auto_commit_interval_ms", &self.auto_commit_interval_ms)
+            .field("security_protocol", &self.security_protocol)
+            .field("ssl_ca_location", &self.ssl_ca_location)
+            .field("ssl_certificate_location", &self.ssl_certificate_location)
+            .field("ssl_key_location", &self.ssl_key_location)
+            .field("ssl_key_password", &self.ssl_key_password.as_ref().map(|_| "<redacted>"))
+            .field("sasl_username", &self.sasl_username)
+            .field("sasl_password", &self.sasl_password.as_ref().map(|_| "<redacted>"))
+            .field("sasl_mechanisms", &self.sasl_mechanisms)
+            .field("enable_idempotence", &self.enable_idempotence)
+            .field("transactional_id", &self.transactional_id)
+            .finish()
+    }
 }
 
 impl KafkaConfig {

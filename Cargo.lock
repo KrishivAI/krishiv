@@ -4070,6 +4070,7 @@ dependencies = [
  "arrow",
  "axum 0.8.9",
  "base64 0.22.1",
+ "constant_time_eq 0.5.0",
  "dashmap",
  "krishiv-ai",
  "krishiv-common",
@@ -4091,6 +4092,7 @@ dependencies = [
  "tokio-stream",
  "tonic 0.14.6",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]
@@ -4266,6 +4268,7 @@ dependencies = [
  "dashmap",
  "etcd-client",
  "futures",
+ "indexmap 2.14.0",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-metrics",

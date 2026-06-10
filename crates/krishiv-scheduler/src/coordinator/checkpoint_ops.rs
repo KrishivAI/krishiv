@@ -418,7 +418,7 @@ impl Coordinator {
         &self,
     ) -> (
         std::collections::HashMap<JobId, CheckpointCoordinator>,
-        std::collections::HashSet<(JobId, ExecutorId, u64)>,
+        indexmap::IndexSet<(JobId, ExecutorId, u64)>,
         std::collections::HashSet<(JobId, u64)>,
     ) {
         (
@@ -460,10 +460,10 @@ impl Coordinator {
             });
             self.checkpoint_notify_sent.insert(key);
             while self.checkpoint_notify_sent.len() > MAX_CHECKPOINT_NOTIFY_ENTRIES {
-                let Some(oldest) = self.checkpoint_notify_sent.iter().next().cloned() else {
+                let Some(oldest) = self.checkpoint_notify_sent.get_index(0).cloned() else {
                     break;
                 };
-                self.checkpoint_notify_sent.remove(&oldest);
+                self.checkpoint_notify_sent.shift_remove(&oldest);
             }
         }
         out

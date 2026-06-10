@@ -101,6 +101,7 @@ qdrant-client = "1.16"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 
 constant_time_eq = "0.5"
+indexmap = "2"
 hex = "0.4"
 apache-avro = "0.17"
 chrono = { version = "0.4", features = ["serde"] }

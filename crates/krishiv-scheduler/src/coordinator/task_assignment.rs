@@ -72,8 +72,16 @@ where
     let mut stream =
         futures::stream::iter(futures).buffer_unordered(MAX_CONCURRENT_ASSIGNMENT_RPCS);
     let mut responses = Vec::new();
+    let mut first_err = None;
     while let Some(result) = stream.next().await {
-        responses.push(result?);
+        match result {
+            Ok(v) => responses.push(v),
+            Err(e) if first_err.is_none() => first_err = Some(e),
+            Err(_) => {}
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
     Ok(responses)
 }

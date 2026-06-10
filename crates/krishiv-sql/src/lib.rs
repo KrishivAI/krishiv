@@ -1429,18 +1429,12 @@ impl SqlEngine {
 /// Returns `None` for any other SQL statement. Used to populate `table_row_counts`
 /// after DDL so that `BroadcastAutoRule` can fire for connector-backed tables.
 pub(crate) fn extract_create_external_table_name(query: &str) -> Option<String> {
-    let up = query.trim_start().to_ascii_uppercase();
-    if !up.starts_with("CREATE EXTERNAL TABLE") && !up.starts_with("CREATE OR REPLACE EXTERNAL TABLE") {
-        return None;
+    use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+    let mut stmts = DFParser::parse_sql(query).ok()?;
+    match stmts.pop_front()? {
+        DFStatement::CreateExternalTable(create) => Some(create.name.to_string()),
+        _ => None,
     }
-    // Simple token extraction: find the table name token after "TABLE".
-    let after_table = up.find("TABLE ")?;
-    let rest = query[after_table + "TABLE ".len()..].trim_start();
-    let name: String = rest
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
-        .collect();
-    if name.is_empty() { None } else { Some(name) }
 }
 
 fn extract_simple_view_name(query: &str) -> Option<String> {

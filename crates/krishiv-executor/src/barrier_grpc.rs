@@ -13,7 +13,7 @@ use tonic::metadata::MetadataMap;
 use crate::barrier_transport::{
     SharedBarrierAckRegistry, SharedBarrierInjector, SharedKeyGroupRanges,
 };
-use crate::grpc::{ExecutorTaskAuthConfig, bearer_token_from_metadata, constant_time_eq};
+use crate::grpc::{ExecutorTaskAuthConfig, bearer_token_from_metadata};
 
 /// Serves barrier injection and returns acknowledgments after checkpoint completion.
 #[derive(Clone)]
@@ -84,7 +84,7 @@ impl ExecutorBarrierService {
             return Ok(());
         };
         match bearer_token_from_metadata(metadata) {
-            Some(actual) if constant_time_eq(actual.as_bytes(), expected.as_bytes()) => Ok(()),
+            Some(actual) if constant_time_eq::constant_time_eq(actual.as_bytes(), expected.as_bytes()) => Ok(()),
             Some(_) => Err(tonic::Status::unauthenticated(
                 "invalid barrier bearer token",
             )),

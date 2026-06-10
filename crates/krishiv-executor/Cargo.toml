@@ -12,7 +12,9 @@ kafka = ["krishiv-connectors/kafka"]
 arrow = { workspace = true }
 axum = { workspace = true }
 base64 = "0.22"
+constant_time_eq = { workspace = true }
 dashmap = { workspace = true }
+twox-hash = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
