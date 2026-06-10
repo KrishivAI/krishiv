@@ -5,6 +5,8 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{WindowExecutionSpec, WindowKind, encode_stream_fragment};
 
+use krishiv_scheduler::MetadataStore;
+
 use crate::RuntimeResult;
 use crate::in_process::InProcessStreamingRuntime;
 use crate::local_streaming::LocalWindowExecutionSpec;
@@ -94,6 +96,41 @@ impl InProcessCluster {
         Ok(Self {
             inner: Arc::new(InProcessStreamingRuntime::with_parquet_cache(cache)?),
         })
+    }
+
+    /// Read the most recently persisted snapshot for a continuous job from the store.
+    pub fn load_continuous_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Option<krishiv_scheduler::ContinuousSnapshot> {
+        self.inner.load_continuous_snapshot(job_id)
+    }
+
+    /// Attach a metadata store so that continuous job snapshots are persisted.
+    ///
+    /// Call before any `drain_continuous_job` calls to enable snapshot persistence
+    /// across session restarts.
+    pub fn attach_store(&self, store: impl MetadataStore + 'static) -> RuntimeResult<()> {
+        self.inner.attach_store(store)
+    }
+
+    /// Restore continuous jobs from previously persisted snapshots in the store.
+    ///
+    /// For each `(job_id, spec)` pair, if the coordinator's store contains a
+    /// snapshot for `job_id`, the job is registered with its saved window state
+    /// so the next drain resumes from where the previous session left off.
+    ///
+    /// Jobs with no stored snapshot or already registered in the registry are
+    /// skipped silently. Returns the count of actually restored jobs.
+    pub fn restore_continuous_jobs_from_store(
+        &self,
+        job_specs: &[(&str, &LocalWindowExecutionSpec)],
+    ) -> RuntimeResult<usize> {
+        let plan_specs: Vec<(&str, krishiv_plan::window::WindowExecutionSpec)> = job_specs
+            .iter()
+            .map(|(id, spec)| (*id, local_spec_to_plan_spec(spec)))
+            .collect();
+        self.inner.restore_continuous_jobs_from_store(&plan_specs)
     }
 
     /// Borrow the underlying streaming runtime (tests, advanced use).
@@ -635,5 +672,64 @@ mod tests {
         let cluster = InProcessCluster::new().unwrap();
         let rt = cluster.streaming_runtime();
         let _ = rt.coordinator_instance_id();
+    }
+
+    // ── Snapshot persistence (Phase 1.2) ─────────────────────────────────────
+
+    #[test]
+    fn cluster_attach_store_and_drain_persists_snapshot() {
+        use krishiv_scheduler::InMemoryMetadataStore;
+        let cluster = InProcessCluster::new().unwrap();
+        cluster.attach_store(InMemoryMetadataStore::default()).unwrap();
+
+        cluster
+            .register_continuous_job("snap-job", &tumbling_spec())
+            .unwrap();
+        cluster
+            .push_continuous_input("snap-job", vec![events_batch(&["a"], &[1_000])])
+            .unwrap();
+        let _ = cluster.drain_continuous_job("snap-job").unwrap();
+
+        assert!(
+            cluster.load_continuous_snapshot("snap-job").is_some(),
+            "drain must persist a snapshot to the attached store"
+        );
+    }
+
+    #[test]
+    fn cluster_restore_continuous_jobs_from_store() {
+        use krishiv_scheduler::{InMemoryMetadataStore, MetadataStore};
+
+        // Session 1: drain to generate a snapshot.
+        let c1 = InProcessCluster::new().unwrap();
+        c1.attach_store(InMemoryMetadataStore::default()).unwrap();
+        c1.register_continuous_job("restore-job", &tumbling_spec())
+            .unwrap();
+        c1.push_continuous_input(
+            "restore-job",
+            vec![events_batch(&["u1", "u2"], &[1_000, 11_000])],
+        )
+        .unwrap();
+        let _ = c1.drain_continuous_job("restore-job").unwrap();
+
+        // Extract snapshot from session 1 via the public API.
+        let snapshot = c1
+            .load_continuous_snapshot("restore-job")
+            .expect("drain must persist a snapshot to the store");
+
+        // Session 2: pre-populate a fresh store with the snapshot, then restore.
+        let mut store2 = InMemoryMetadataStore::default();
+        store2
+            .save_continuous_snapshot("restore-job", snapshot)
+            .unwrap();
+        let c2 = InProcessCluster::new().unwrap();
+        c2.attach_store(store2).unwrap();
+        let restored = c2
+            .restore_continuous_jobs_from_store(&[("restore-job", &tumbling_spec())])
+            .unwrap();
+        assert_eq!(restored, 1);
+        // The restored job must be drainable immediately (no new input → empty output).
+        let out = c2.drain_continuous_job("restore-job").unwrap();
+        assert!(out.is_empty());
     }
 }

@@ -1,7 +1,8 @@
 use crate::error::{SchedulerError, SchedulerResult};
 use crate::job::JobRecord;
 use crate::store::{
-    EventLogEvent, MetadataStore, PersistedEvent, PersistedExecutorDescriptor, PersistedJobRecord,
+    ContinuousSnapshot, EventLogEvent, MetadataStore, PersistedEvent, PersistedExecutorDescriptor,
+    PersistedJobRecord,
 };
 use krishiv_proto::{ExecutorDescriptor, ExecutorId};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -11,6 +12,7 @@ const EVENTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("events")
 const JOBS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
 const EXECUTORS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("executors");
 const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
+const CONTINUOUS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("continuous_snapshots");
 
 #[derive(Debug)]
 pub struct RedbMetadataStore {
@@ -18,6 +20,7 @@ pub struct RedbMetadataStore {
     events: Vec<EventLogEvent>,
     jobs: Vec<JobRecord>,
     executors: Vec<ExecutorDescriptor>,
+    continuous_snapshots: std::collections::HashMap<String, ContinuousSnapshot>,
 }
 
 impl RedbMetadataStore {
@@ -41,6 +44,7 @@ impl RedbMetadataStore {
             let _ = tx.open_table(JOBS_TABLE);
             let _ = tx.open_table(EXECUTORS_TABLE);
             let _ = tx.open_table(METADATA_TABLE);
+            let _ = tx.open_table(CONTINUOUS_TABLE);
         }
         tx.commit().map_err(|e| SchedulerError::Store {
             message: format!("failed to commit redb write tx: {e}"),
@@ -51,6 +55,7 @@ impl RedbMetadataStore {
             events,
             jobs,
             executors,
+            continuous_snapshots: std::collections::HashMap::new(),
         })
     }
 
@@ -72,6 +77,7 @@ impl RedbMetadataStore {
             let _ = tx.open_table(JOBS_TABLE);
             let _ = tx.open_table(EXECUTORS_TABLE);
             let _ = tx.open_table(METADATA_TABLE);
+            let _ = tx.open_table(CONTINUOUS_TABLE);
         }
         tx.commit().map_err(|e| SchedulerError::Store {
             message: format!("failed to commit redb tables tx: {e}"),
@@ -125,11 +131,25 @@ impl RedbMetadataStore {
             }
         }
 
+        let mut continuous_snapshots = std::collections::HashMap::new();
+        if let Ok(table) = rx.open_table(CONTINUOUS_TABLE) {
+            for result in table.iter().map_err(|e| SchedulerError::Store {
+                message: format!("failed to iterate redb continuous_snapshots: {e}"),
+            })? {
+                if let Ok((key, value)) = result {
+                    if let Ok(snapshot) = ContinuousSnapshot::decode(value.value()) {
+                        continuous_snapshots.insert(key.value().to_owned(), snapshot);
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             db,
             events,
             jobs,
             executors,
+            continuous_snapshots,
         })
     }
 }
@@ -268,6 +288,63 @@ impl MetadataStore for RedbMetadataStore {
         })?;
 
         self.executors.retain(|e| e.executor_id() != executor_id);
+        Ok(())
+    }
+
+    fn save_continuous_snapshot(
+        &mut self,
+        job_id: &str,
+        snapshot: ContinuousSnapshot,
+    ) -> SchedulerResult<()> {
+        let encoded = snapshot.encode();
+        let tx = self.db.begin_write().map_err(|e| SchedulerError::Store {
+            message: format!("failed to begin redb write tx for continuous snapshot: {e}"),
+        })?;
+        {
+            let mut table = tx
+                .open_table(CONTINUOUS_TABLE)
+                .map_err(|e| SchedulerError::Store {
+                    message: format!("failed to open redb continuous_snapshots table: {e}"),
+                })?;
+            table
+                .insert(job_id, encoded.as_slice())
+                .map_err(|e| SchedulerError::Store {
+                    message: format!(
+                        "failed to insert continuous snapshot for '{job_id}': {e}"
+                    ),
+                })?;
+        }
+        tx.commit().map_err(|e| SchedulerError::Store {
+            message: format!("failed to commit redb continuous snapshot tx: {e}"),
+        })?;
+        self.continuous_snapshots.insert(job_id.to_owned(), snapshot);
+        Ok(())
+    }
+
+    fn load_continuous_snapshot(&self, job_id: &str) -> Option<ContinuousSnapshot> {
+        self.continuous_snapshots.get(job_id).cloned()
+    }
+
+    fn remove_continuous_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
+        let tx = self.db.begin_write().map_err(|e| SchedulerError::Store {
+            message: format!("failed to begin redb write tx for continuous snapshot remove: {e}"),
+        })?;
+        {
+            let mut table = tx
+                .open_table(CONTINUOUS_TABLE)
+                .map_err(|e| SchedulerError::Store {
+                    message: format!("failed to open redb continuous_snapshots table: {e}"),
+                })?;
+            table
+                .remove(job_id)
+                .map_err(|e| SchedulerError::Store {
+                    message: format!("failed to remove continuous snapshot for '{job_id}': {e}"),
+                })?;
+        }
+        tx.commit().map_err(|e| SchedulerError::Store {
+            message: format!("failed to commit redb continuous snapshot remove tx: {e}"),
+        })?;
+        self.continuous_snapshots.remove(job_id);
         Ok(())
     }
 }

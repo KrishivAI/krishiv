@@ -126,6 +126,55 @@ pub enum EventLogEvent {
     JobCancelled { job_id: JobId },
 }
 
+/// Durable snapshot of a continuous streaming job's window operator state.
+///
+/// Persisted after each drain cycle so a restarted session can resume
+/// from where it left off without reprocessing already-aggregated events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuousSnapshot {
+    /// Opaque serialized window operator state (from `ContinuousWindowExecutor::snapshot`).
+    pub snapshot_bytes: Vec<u8>,
+    /// Most recent event-time watermark at snapshot time (ms since Unix epoch).
+    /// `i64::MIN` means no watermark has been observed yet.
+    pub watermark_ms: i64,
+}
+
+impl ContinuousSnapshot {
+    /// Encode as `watermark_ms:i64 LE | bytes_len:u32 LE | snapshot_bytes`.
+    pub fn encode(&self) -> Vec<u8> {
+        let len = self.snapshot_bytes.len() as u32;
+        let mut out = Vec::with_capacity(12 + self.snapshot_bytes.len());
+        out.extend_from_slice(&self.watermark_ms.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&self.snapshot_bytes);
+        out
+    }
+
+    /// Decode from bytes produced by [`encode`].
+    pub fn decode(bytes: &[u8]) -> SchedulerResult<Self> {
+        if bytes.len() < 12 {
+            return Err(SchedulerError::Store {
+                message: "ContinuousSnapshot decode: buffer too short".into(),
+            });
+        }
+        let watermark_ms = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        if bytes.len() != 12 + len {
+            return Err(SchedulerError::Store {
+                message: format!(
+                    "ContinuousSnapshot decode: expected {} bytes, got {}",
+                    12 + len,
+                    bytes.len()
+                ),
+            });
+        }
+        Ok(Self {
+            watermark_ms,
+            snapshot_bytes: bytes[12..].to_vec(),
+        })
+    }
+}
+
 pub trait MetadataStore: Send + Sync {
     fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()>;
     fn events(&self) -> &[EventLogEvent];
@@ -144,6 +193,22 @@ pub trait MetadataStore: Send + Sync {
 
     /// Remove a persisted executor descriptor (called on clean deregister).
     fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()>;
+
+    /// Persist the window operator state for a continuous streaming job (C9).
+    ///
+    /// Called after each drain cycle so a restarted session can restore the
+    /// window executor state without reprocessing already-committed data.
+    fn save_continuous_snapshot(
+        &mut self,
+        job_id: &str,
+        snapshot: ContinuousSnapshot,
+    ) -> SchedulerResult<()>;
+
+    /// Load the most recently persisted continuous job snapshot, if any.
+    fn load_continuous_snapshot(&self, job_id: &str) -> Option<ContinuousSnapshot>;
+
+    /// Remove the persisted snapshot for a continuous job (called on deregistration).
+    fn remove_continuous_snapshot(&mut self, job_id: &str) -> SchedulerResult<()>;
 }
 
 // ── InMemoryMetadataStore ─────────────────────────────────────────────────────
@@ -167,6 +232,7 @@ pub struct InMemoryMetadataStore {
     events_byte_size: u64,
     jobs: Vec<JobRecord>,
     executors: Vec<ExecutorDescriptor>,
+    continuous_snapshots: std::collections::HashMap<String, ContinuousSnapshot>,
     /// Number of events evicted by the ring buffer since the store was created.
     /// Exposed via [`InMemoryMetadataStore::evicted_event_count`] for tests and
     /// metrics.
@@ -180,6 +246,7 @@ impl Default for InMemoryMetadataStore {
             events_byte_size: 0,
             jobs: Vec::new(),
             executors: Vec::new(),
+            continuous_snapshots: std::collections::HashMap::new(),
             evicted_event_count: 0,
         }
     }
@@ -246,6 +313,24 @@ impl MetadataStore for InMemoryMetadataStore {
     }
     fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
         self.executors.retain(|d| d.executor_id() != executor_id);
+        Ok(())
+    }
+
+    fn save_continuous_snapshot(
+        &mut self,
+        job_id: &str,
+        snapshot: ContinuousSnapshot,
+    ) -> SchedulerResult<()> {
+        self.continuous_snapshots.insert(job_id.to_owned(), snapshot);
+        Ok(())
+    }
+
+    fn load_continuous_snapshot(&self, job_id: &str) -> Option<ContinuousSnapshot> {
+        self.continuous_snapshots.get(job_id).cloned()
+    }
+
+    fn remove_continuous_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
+        self.continuous_snapshots.remove(job_id);
         Ok(())
     }
 }
@@ -995,6 +1080,7 @@ pub(crate) fn encode_metadata_snapshot_with_executors(
 enum StoreCommand {
     AppendEvent(EventLogEvent),
     SaveJob(Box<JobRecord>),
+    SaveContinuousSnapshot { job_id: String, snapshot: ContinuousSnapshot },
     Flush(tokio::sync::oneshot::Sender<()>),
 }
 
@@ -1078,6 +1164,26 @@ impl NonBlockingStoreHandle {
                                     tracing::error!(
                                         error = %e,
                                         "NonBlockingStoreHandle: save_job failed"
+                                    );
+                                }
+                                in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                notify_done.notify_one();
+                            })
+                            .await
+                            .ok();
+                        }
+                        StoreCommand::SaveContinuousSnapshot { job_id, snapshot } => {
+                            in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let bg = std::sync::Arc::clone(&bg_store);
+                            let in_flight_done = std::sync::Arc::clone(&in_flight);
+                            let notify_done = std::sync::Arc::clone(&notify);
+                            tokio::task::spawn_blocking(move || {
+                                let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
+                                if let Err(e) = guard.save_continuous_snapshot(&job_id, snapshot) {
+                                    tracing::error!(
+                                        error = %e,
+                                        job_id = %job_id,
+                                        "NonBlockingStoreHandle: save_continuous_snapshot failed"
                                     );
                                 }
                                 in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1255,6 +1361,58 @@ impl NonBlockingStoreHandle {
                 "failed to remove executor descriptor from metadata store"
             );
         }
+    }
+
+    /// Enqueue a continuous job snapshot write (C9).
+    ///
+    /// Fire-and-forget via the async channel. When the channel is full or no
+    /// async runtime is available, the write happens synchronously. A dropped
+    /// snapshot is logged as a warning — the old snapshot remains in the store
+    /// so crash recovery falls back to a slightly earlier state, not a blank.
+    pub fn save_continuous_snapshot(&self, job_id: &str, snapshot: ContinuousSnapshot) {
+        let cmd = StoreCommand::SaveContinuousSnapshot {
+            job_id: job_id.to_owned(),
+            snapshot: snapshot.clone(),
+        };
+        match &self.tx {
+            Some(tx) => match tx.try_send(cmd) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    if self.fail_closed_writes {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            "NonBlockingStoreHandle: channel full; \
+                             performing synchronous save_continuous_snapshot"
+                        );
+                        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Err(e) = guard.save_continuous_snapshot(job_id, snapshot) {
+                            tracing::error!(error = %e, job_id = %job_id,
+                                "NonBlockingStoreHandle: save_continuous_snapshot failed (sync fallback)");
+                        }
+                    } else {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            "NonBlockingStoreHandle: save_continuous_snapshot dropped (channel full)"
+                        );
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::error!("NonBlockingStoreHandle: store background task dropped");
+                }
+            },
+            None => {
+                let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = guard.save_continuous_snapshot(job_id, snapshot) {
+                    tracing::error!(error = %e, job_id = %job_id,
+                        "NonBlockingStoreHandle: save_continuous_snapshot failed");
+                }
+            }
+        }
+    }
+
+    /// Load the most recently persisted continuous job snapshot (synchronous read).
+    pub fn load_continuous_snapshot(&self, job_id: &str) -> Option<ContinuousSnapshot> {
+        self.inner().load_continuous_snapshot(job_id)
     }
 
     /// Wait until all previously enqueued async writes have been processed.

@@ -111,7 +111,9 @@ pub use leadership::{LeaderElection, SingleNodeElection};
 pub use metrics::{SchedulerMetrics, scheduler_metrics};
 #[cfg(feature = "redb")]
 pub use redb_metadata::RedbMetadataStore;
-pub use store::{EventLogEvent, InMemoryMetadataStore, MetadataStore, NonBlockingStoreHandle};
+pub use store::{
+    ContinuousSnapshot, EventLogEvent, InMemoryMetadataStore, MetadataStore, NonBlockingStoreHandle,
+};
 pub use transport::CoordinatorExecutorTransport;
 
 #[cfg(test)]

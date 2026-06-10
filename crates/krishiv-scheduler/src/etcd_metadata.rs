@@ -3,7 +3,7 @@
 use etcd_client::Client;
 
 use crate::store::{
-    EventLogEvent, MetadataStore, decode_metadata_snapshot_with_executors,
+    ContinuousSnapshot, EventLogEvent, MetadataStore, decode_metadata_snapshot_with_executors,
     encode_metadata_snapshot_with_executors,
 };
 use crate::{JobRecord, SchedulerError, SchedulerResult};
@@ -173,6 +173,31 @@ impl MetadataStore for EtcdMetadataStore {
         self.executor_descriptors
             .retain(|e| e.executor_id() != executor_id);
         self.persist()
+    }
+
+    fn save_continuous_snapshot(
+        &mut self,
+        job_id: &str,
+        _snapshot: ContinuousSnapshot,
+    ) -> SchedulerResult<()> {
+        // Continuous window snapshots are too large for etcd's single-blob model
+        // (etcd default max value is 1.5 MiB; window state may exceed this for
+        // large key cardinalities). Operators using the etcd backend should persist
+        // continuous job state to an external object store and restore manually.
+        tracing::warn!(
+            job_id = %job_id,
+            "EtcdMetadataStore: continuous snapshot persistence is not supported; \
+             window state will not survive coordinator restart on this backend"
+        );
+        Ok(())
+    }
+
+    fn load_continuous_snapshot(&self, _job_id: &str) -> Option<ContinuousSnapshot> {
+        None
+    }
+
+    fn remove_continuous_snapshot(&mut self, _job_id: &str) -> SchedulerResult<()> {
+        Ok(())
     }
 }
 

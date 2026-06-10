@@ -361,6 +361,36 @@ impl ContinuousStreamRegistry {
         self.jobs.contains_key(job_id)
     }
 
+    /// C9: Serialize a job's window state to bytes AND return the current watermark.
+    ///
+    /// Returns `(snapshot_bytes, last_watermark_ms)`. Use this when persisting to
+    /// a `MetadataStore` so the watermark can be logged for diagnostics; the bytes
+    /// alone are sufficient for `register_job_from_snapshot` restore.
+    pub fn snapshot_job_with_watermark(&self, job_id: &str) -> RuntimeResult<(Vec<u8>, i64)> {
+        let entry = self
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| ContinuousStreamError::JobNotFound {
+                job_id: job_id.to_owned(),
+            })?;
+        let mut exec = entry
+            .executor
+            .lock()
+            .map_err(|_| ContinuousStreamError::LockPoisoned {
+                job_id: job_id.to_owned(),
+                component: "executor",
+                operation: "snapshot_with_watermark",
+            })?;
+        let watermark_ms = exec.last_watermark_ms();
+        let bytes = exec.snapshot().map_err(|error| {
+            ContinuousStreamError::Execution {
+                job_id: job_id.to_owned(),
+                message: format!("snapshot failed: {error}"),
+            }
+        })?;
+        Ok((bytes, watermark_ms))
+    }
+
     /// C9: Serialize a job's window state to bytes for cross-session persistence.
     ///
     /// Calls `checkpoint()` on the executor (writes to the in-memory backend),

@@ -16,7 +16,8 @@ use krishiv_proto::{
 };
 use krishiv_scheduler::coordinator_sharded::{CheckpointInner, ExecutorInner};
 use krishiv_scheduler::{
-    Coordinator, IN_PROCESS_TASK_ENDPOINT, InProcessCoordinatorBridge, SubmitOutcome,
+    ContinuousSnapshot, Coordinator, IN_PROCESS_TASK_ENDPOINT, InProcessCoordinatorBridge,
+    MetadataStore, SubmitOutcome,
 };
 use tokio::sync::RwLock;
 
@@ -320,12 +321,83 @@ impl InProcessStreamingRuntime {
     /// Drain a locally registered continuous streaming job and return newly
     /// emitted batches.
     ///
-    /// In-process runtimes always own and wire the same registry into their
-    /// executor runner. Draining it directly preserves typed not-found errors
-    /// and prevents an unknown job from entering the coordinator through an
-    /// underspecified legacy fragment.
+    /// After each successful drain, the window executor state is snapshotted
+    /// and queued to the coordinator's metadata store (if one is attached). The
+    /// persist is fire-and-forget and does not block the caller; a missing store
+    /// or a snapshot failure is silently ignored so drain is never degraded by
+    /// persistence failures.
     pub fn drain_continuous_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
-        self.continuous_registry.drain_job(job_id)
+        let batches = self.continuous_registry.drain_job(job_id)?;
+        // Snapshot and persist window state after each successful drain.
+        // Errors are swallowed: snapshot is best-effort and must not break drains.
+        if let Ok((snapshot_bytes, watermark_ms)) =
+            self.continuous_registry.snapshot_job_with_watermark(job_id)
+        {
+            if let Ok(coord) = self.coordinator.lock() {
+                coord.save_continuous_snapshot(
+                    job_id,
+                    ContinuousSnapshot { snapshot_bytes, watermark_ms },
+                );
+            }
+        }
+        Ok(batches)
+    }
+
+    /// Attach a metadata store so that continuous job snapshots are persisted.
+    ///
+    /// Call before any `drain_continuous_job` calls to enable snapshot persistence.
+    /// Safe to call on a running runtime; subsequent drains will use the new store.
+    pub fn attach_store(&self, store: impl MetadataStore + 'static) -> RuntimeResult<()> {
+        let mut coord = self.coordinator.lock().map_err(|_| RuntimeError::InvalidState {
+            message: "coordinator lock poisoned during attach_store".into(),
+        })?;
+        coord.attach_store(store);
+        Ok(())
+    }
+
+    /// Read the most recently persisted snapshot for a continuous job from the store.
+    ///
+    /// Returns `None` when no store is configured or no snapshot exists for `job_id`.
+    /// Useful for exporting snapshots for cross-session transfer or diagnostics.
+    pub fn load_continuous_snapshot(&self, job_id: &str) -> Option<ContinuousSnapshot> {
+        let coord = self.coordinator.lock().ok()?;
+        coord.load_continuous_snapshot(job_id)
+    }
+
+    /// Restore continuous jobs from previously persisted snapshots in the store.
+    ///
+    /// For each `(job_id, spec)` pair, if the coordinator's store contains a
+    /// snapshot for `job_id`, the job is registered via
+    /// [`ContinuousStreamRegistry::register_job_from_snapshot`] so the next
+    /// `push_input` / `drain_continuous_job` call resumes from the saved state.
+    ///
+    /// Jobs that have no snapshot in the store are silently skipped. Jobs that
+    /// are already registered in the registry are also skipped to avoid
+    /// double-registration errors.
+    ///
+    /// Returns the number of jobs actually restored.
+    pub fn restore_continuous_jobs_from_store(
+        &self,
+        job_specs: &[(&str, WindowExecutionSpec)],
+    ) -> RuntimeResult<usize> {
+        let coord = self.coordinator.lock().map_err(|_| RuntimeError::InvalidState {
+            message: "coordinator lock poisoned during restore_continuous_jobs_from_store".into(),
+        })?;
+        let mut restored = 0usize;
+        for (job_id, spec) in job_specs {
+            if self.continuous_registry.has_job(job_id) {
+                continue;
+            }
+            if let Some(snapshot) = coord.load_continuous_snapshot(job_id) {
+                self.continuous_registry.register_job_from_snapshot(
+                    *job_id,
+                    spec.clone(),
+                    &snapshot.snapshot_bytes,
+                )?;
+                restored += 1;
+            }
+        }
+        Ok(restored)
     }
 
     fn run_terminal_task(
@@ -856,6 +928,135 @@ mod tests {
                 .contains_key("events:/data/events.parquet"),
             "shared cache must be visible in the new session"
         );
+    }
+
+    // ── Snapshot persistence tests ────────────────────────────────────────────
+
+    #[test]
+    fn drain_continuous_job_persists_snapshot_to_store() {
+        use krishiv_scheduler::InMemoryMetadataStore;
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        runtime.attach_store(InMemoryMetadataStore::default()).unwrap();
+
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        runtime.register_continuous_job("events", spec).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000])) as _,
+            ],
+        )
+        .unwrap();
+        runtime.push_continuous_input("events", vec![batch]).unwrap();
+        let _ = runtime.drain_continuous_job("events").unwrap();
+
+        // After drain, the snapshot must have been written to the store.
+        // In sync-mode tests (no Tokio runtime → tx=None) the write is synchronous.
+        let snapshot = runtime.load_continuous_snapshot("events");
+        assert!(
+            snapshot.is_some(),
+            "drain_continuous_job must persist a snapshot to the attached store"
+        );
+    }
+
+    #[test]
+    fn restore_continuous_jobs_from_store_resumes_watermark() {
+        use krishiv_scheduler::{InMemoryMetadataStore, MetadataStore};
+        // Session 1: register job, push batches that cross a window, drain.
+        let rt1 = InProcessStreamingRuntime::new().unwrap();
+        rt1.attach_store(InMemoryMetadataStore::default()).unwrap();
+
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        rt1.register_continuous_job("job-a", spec.clone()).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let mk_batch = |ts: i64| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["u1"])) as _,
+                    Arc::new(Int64Array::from(vec![ts])) as _,
+                ],
+            )
+            .unwrap()
+        };
+        // ts=1_000 and ts=11_000 cross the first 10-second window boundary.
+        rt1.push_continuous_input("job-a", vec![mk_batch(1_000), mk_batch(11_000)])
+            .unwrap();
+        let _ = rt1.drain_continuous_job("job-a").unwrap();
+
+        // Extract the snapshot from session 1.
+        let snapshot = rt1
+            .load_continuous_snapshot("job-a")
+            .expect("drain must persist a snapshot");
+
+        // Session 2: pre-populate a fresh store with the snapshot, then restore.
+        let mut store2 = InMemoryMetadataStore::default();
+        store2.save_continuous_snapshot("job-a", snapshot).unwrap();
+        let rt2 = InProcessStreamingRuntime::new().unwrap();
+        rt2.attach_store(store2).unwrap();
+        let restored = rt2
+            .restore_continuous_jobs_from_store(&[("job-a", spec.clone())])
+            .unwrap();
+        assert_eq!(restored, 1, "exactly one job must be restored from the store");
+        assert!(
+            rt2.continuous_registry.has_job("job-a"),
+            "restored job must appear in the registry"
+        );
+    }
+
+    #[test]
+    fn restore_continuous_jobs_skips_jobs_without_snapshot() {
+        use krishiv_scheduler::InMemoryMetadataStore;
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        runtime.attach_store(InMemoryMetadataStore::default()).unwrap();
+
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        // No drain → no snapshot in the store.
+        let restored = runtime
+            .restore_continuous_jobs_from_store(&[("no-such-snapshot", spec)])
+            .unwrap();
+        assert_eq!(restored, 0, "job with no stored snapshot must not be restored");
+    }
+
+    #[test]
+    fn restore_continuous_jobs_skips_already_registered() {
+        use krishiv_scheduler::InMemoryMetadataStore;
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        runtime.attach_store(InMemoryMetadataStore::default()).unwrap();
+
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        runtime.register_continuous_job("j", spec.clone()).unwrap();
+
+        // Even if a snapshot were present the job is already registered.
+        let restored = runtime
+            .restore_continuous_jobs_from_store(&[("j", spec)])
+            .unwrap();
+        assert_eq!(restored, 0, "already-registered job must be skipped by restore");
+    }
+
+    #[test]
+    fn attach_store_then_drain_without_input_persists_empty_snapshot() {
+        use krishiv_scheduler::InMemoryMetadataStore;
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        runtime.attach_store(InMemoryMetadataStore::default()).unwrap();
+
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        runtime.register_continuous_job("empty-job", spec).unwrap();
+        // Drain with no input must not panic and must produce a snapshot.
+        let out = runtime.drain_continuous_job("empty-job").unwrap();
+        assert!(out.is_empty());
+        let snap = runtime.load_continuous_snapshot("empty-job");
+        assert!(snap.is_some(), "drain of empty job must still persist a snapshot");
     }
 
     #[test]

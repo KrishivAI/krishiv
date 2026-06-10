@@ -776,6 +776,42 @@ impl Coordinator {
         self
     }
 
+    /// Attach a metadata store to an already-constructed coordinator.
+    ///
+    /// Replaces any previously attached store. Used when the coordinator is
+    /// already wrapped in `Arc<Mutex<>>` and a builder chain is not possible
+    /// (e.g. in-process cluster tests and embedded runtimes).
+    pub fn attach_store(&mut self, store: impl MetadataStore + 'static) {
+        self.store = Some(NonBlockingStoreHandle::new(store));
+    }
+
+    /// Persist a continuous job snapshot via the attached metadata store.
+    ///
+    /// No-op when no store is configured (store = None). The call is
+    /// fire-and-forget: the snapshot is queued on the background write channel
+    /// and will not block the caller. Failures are logged by the background task.
+    pub fn save_continuous_snapshot(
+        &self,
+        job_id: &str,
+        snapshot: crate::store::ContinuousSnapshot,
+    ) {
+        if let Some(store) = &self.store {
+            store.save_continuous_snapshot(job_id, snapshot);
+        }
+    }
+
+    /// Load a previously persisted continuous job snapshot from the store.
+    ///
+    /// Returns `None` when no store is configured or when no snapshot exists
+    /// for `job_id`. The load is synchronous — it reads through to the
+    /// in-memory view maintained by `NonBlockingStoreHandle`.
+    pub fn load_continuous_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Option<crate::store::ContinuousSnapshot> {
+        self.store.as_ref()?.load_continuous_snapshot(job_id)
+    }
+
     /// Replace the default `InMemoryQueueManager` with a custom admission controller.
     ///
     /// R7.1 will use this to inject quota-aware and CRD-backed queue managers.

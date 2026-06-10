@@ -26,7 +26,42 @@ cargo test -p krishiv-executor --lib                                # 182 passed
 - `partition_offsets` stores last-received message offset; `all_current_offsets()` returns `offset+1` ("next to read"). After restore, pre-seeds `partition_offsets[p] = ko.offset - 1` so `checkpoint_offset()` is idempotent before the first post-restore read.
 
 ### Next
-- Phase 1.2: Persist bounded-window inline inputs + continuous-cycle state to MetadataStore (coordinator crash recovery).
+- Phase 1.3: Iceberg write/commit path using iceberg-rust 0.9 Transaction API.
+
+---
+
+## Phase 1.2: Continuous-cycle state persistence to MetadataStore (2026-06-10)
+
+### Done
+1. **`ContinuousSnapshot` struct** added to `crates/krishiv-scheduler/src/store.rs` — `{snapshot_bytes: Vec<u8>, watermark_ms: i64}` with binary encode/decode (`[watermark_ms i64 LE][bytes_len u32 LE][bytes]`).
+2. **`MetadataStore` trait extended** — 3 new methods: `save_continuous_snapshot`, `load_continuous_snapshot`, `remove_continuous_snapshot`.
+3. **`InMemoryMetadataStore`** — `HashMap<String, ContinuousSnapshot>` field; all 3 methods implemented.
+4. **`RedbMetadataStore`** — `CONTINUOUS_TABLE: TableDefinition<&str, &[u8]>` table; in-memory cache for synchronous reads; redb transactions for durable writes. Loaded from disk on `open()`.
+5. **`EtcdMetadataStore`** — no-op with `tracing::warn!` explaining the 1.5 MiB etcd value limit; operators must use an external object store for continuous state with the etcd backend.
+6. **`NonBlockingStoreHandle`** extended — fire-and-forget `save_continuous_snapshot` via bounded async channel; synchronous fallback when no Tokio runtime is active (tests); `load_continuous_snapshot` reads through to in-memory view.
+7. **`StoreCommand::SaveContinuousSnapshot`** added — background task handler calls `store.save_continuous_snapshot`.
+8. **`ContinuousStreamRegistry::snapshot_job_with_watermark`** — returns `(snapshot_bytes, watermark_ms)` by calling `exec.snapshot()` + `exec.last_watermark_ms()`.
+9. **`Coordinator` methods** — `attach_store` (post-construction store attachment), `save_continuous_snapshot` (fire-and-forget delegation), `load_continuous_snapshot` (synchronous read from in-memory view).
+10. **`InProcessStreamingRuntime::drain_continuous_job`** — auto-snapshots after each drain and persists via coordinator's store (no-op when no store attached; errors swallowed so drain is never degraded).
+11. **`InProcessStreamingRuntime::attach_store`** — attaches a `MetadataStore` to an already-constructed runtime; subsequent drains persist snapshots.
+12. **`InProcessStreamingRuntime::load_continuous_snapshot`** — public API to read persisted snapshots (used for cross-session snapshot transfer in tests).
+13. **`InProcessStreamingRuntime::restore_continuous_jobs_from_store`** — restores jobs from store using `register_job_from_snapshot`; skips jobs with no stored snapshot or already-registered jobs.
+14. **`InProcessCluster`** forwarding methods — `attach_store`, `load_continuous_snapshot`, `restore_continuous_jobs_from_store` (takes `&[(&str, &LocalWindowExecutionSpec)]`).
+15. **`ContinuousSnapshot` re-exported** at `krishiv_scheduler` crate root.
+
+### Validation
+```bash
+cargo check --workspace                                              # exit 0 (no errors)
+cargo test -p krishiv-scheduler --lib                               # 293 passed
+cargo test -p krishiv-runtime --lib                                 # 319 passed
+```
+
+### Architecture notes
+- **Snapshot-per-drain discipline**: every `drain_continuous_job` call snapshots immediately after the window executor completes. This gives the latest possible recovery point without requiring explicit user coordination.
+- **No-store is safe**: when `attach_store` is never called (default embedded mode), all snapshot calls are no-ops and drains proceed unaffected.
+- **Sync fallback**: `NonBlockingStoreHandle` detects the absence of a Tokio runtime at construction time (`tx = None`). In that mode, `save_continuous_snapshot` writes synchronously. This makes the behavior deterministic in unit tests without `#[tokio::test]`.
+- **Cross-session transfer pattern**: Session 1 attaches a store, drains (snapshot persisted); session 2 reads the snapshot via `load_continuous_snapshot`, pre-populates a new `InMemoryMetadataStore`, attaches it, calls `restore_continuous_jobs_from_store`. For production, replace `InMemoryMetadataStore` with `RedbMetadataStore` (same file path = automatic recovery).
+- **EtcdMetadataStore limitation**: etcd default 1.5 MiB value limit is insufficient for arbitrary window state. The no-op + warn design makes the limitation explicit rather than silently truncating state.
 
 ---
 
