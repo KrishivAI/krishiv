@@ -1,9 +1,11 @@
+pub mod count;
 pub mod session;
 pub mod sliding;
 pub mod state_persistence;
 pub mod state_tumbling;
 pub mod tumbling;
 
+pub use count::{CountWindowOperator, CountWindowSpec};
 pub use session::{SessionWindowOperator, SessionWindowSpec};
 pub use sliding::{SlidingWindowOperator, SlidingWindowSpec};
 pub use state_tumbling::{
@@ -263,6 +265,35 @@ impl MultiSourceWatermarkState {
     pub fn source_count(&self) -> usize {
         self.source_watermarks.len()
     }
+
+    /// E3.6 — Per-source watermark lag relative to the effective watermark.
+    ///
+    /// Returns a map of `source_id → lag_ms` where `lag_ms` is:
+    /// `effective_watermark_ms - source_watermark_ms`.
+    ///
+    /// A positive value means the source is behind the effective watermark.
+    /// A value of 0 means the source is at (or ahead of) the effective watermark.
+    /// Sources with watermark `i64::MIN` (never emitted) are reported with
+    /// `lag_ms = i64::MAX` to indicate they've not contributed any data yet.
+    pub fn per_source_lag_ms(&self) -> HashMap<String, i64> {
+        let effective = self.effective_watermark_ms();
+        self.source_watermarks
+            .iter()
+            .map(|(id, &wm)| {
+                let lag = if wm == i64::MIN {
+                    i64::MAX
+                } else {
+                    effective.saturating_sub(wm).max(0)
+                };
+                (id.clone(), lag)
+            })
+            .collect()
+    }
+
+    /// E3.6 — Returns a snapshot of all registered source watermarks.
+    pub fn source_watermarks(&self) -> HashMap<String, i64> {
+        self.source_watermarks.clone()
+    }
 }
 
 fn elapsed_ms() -> u64 {
@@ -509,5 +540,51 @@ mod watermark_tests {
             idle_wm,
             "idle policy must advance watermark for a source that has seen events"
         );
+    }
+
+    // ── E3.6: per-source lag metric tests ─────────────────────────────────────
+
+    #[test]
+    fn per_source_lag_returns_zero_when_all_sources_equal() {
+        let mut state = MultiSourceWatermarkState::new();
+        state.update("a", 1_000);
+        state.update("b", 1_000);
+        let lag = state.per_source_lag_ms();
+        assert_eq!(lag["a"], 0, "source at effective watermark should have lag 0");
+        assert_eq!(lag["b"], 0);
+    }
+
+    #[test]
+    fn per_source_lag_reports_lagging_source() {
+        let mut state = MultiSourceWatermarkState::new();
+        state.update("fast", 5_000);
+        state.update("slow", 2_000);
+        // effective = min = 2000
+        let lag = state.per_source_lag_ms();
+        // Both sources are at or ahead of effective watermark.
+        assert_eq!(lag["fast"], 0, "fast source should have 0 lag");
+        assert_eq!(lag["slow"], 0, "slow source IS the effective watermark");
+    }
+
+    #[test]
+    fn per_source_lag_max_for_never_seen_source() {
+        let mut state = MultiSourceWatermarkState::new();
+        state.register_source("never_seen");
+        state.update("active", 1_000);
+        let lag = state.per_source_lag_ms();
+        assert_eq!(
+            lag["never_seen"], i64::MAX,
+            "never-seen source should have i64::MAX lag"
+        );
+    }
+
+    #[test]
+    fn source_watermarks_snapshot_matches_internal_state() {
+        let mut state = MultiSourceWatermarkState::new();
+        state.update("a", 3_000);
+        state.update("b", 7_000);
+        let snap = state.source_watermarks();
+        assert_eq!(snap.get("a"), Some(&3_000));
+        assert_eq!(snap.get("b"), Some(&7_000));
     }
 }

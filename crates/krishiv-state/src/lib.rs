@@ -2,18 +2,12 @@
 
 //! Public facade for `krishiv-state`.
 //!
-//! Keyed state API, in-memory backend (R5.1), and durable redb backend (R5.2).
+//! Keyed state API with RocksDB backend for both ephemeral (tests/dev) and
+//! durable (file-backed) state storage.
 //!
 //! State must be accessed only within `process_batch` or
 //! `flush_triggered_windows` on the executor operator loop — never from
 //! timer callbacks.
-//!
-//! Backend summary:
-//! - `FjallStateBackend` — R5.1; state is lost on executor restart.
-//! - `FjallStateBackend` — R5.2; ACID-durable state backed by `redb`, a
-//!   pure-Rust embedded B-tree database.  Supports file-backed persistence and
-//!   an in-memory mode for tests.  All I/O is synchronous; callers must use
-//!   `spawn_blocking` when called from async tasks.
 
 // Declared here:
 pub mod checkpoint;
@@ -21,13 +15,17 @@ pub mod incremental;
 pub mod key_group;
 pub mod migration;
 
+pub mod incremental_checkpoint;
+pub mod queryable;
+pub mod savepoint;
+
 // Named modules
 pub mod backend;
 pub mod error;
-pub mod fjall_backend;
 pub mod inspector;
 pub mod namespace;
 pub mod processing_time;
+pub mod rocksdb_backend;
 pub mod snapshot;
 pub mod timer;
 pub mod ttl;
@@ -43,8 +41,11 @@ pub use checkpoint::{
     open_checkpoint_storage_from_uri,
 };
 pub use error::{StateError, StateResult};
-pub use fjall_backend::FjallStateBackend;
 pub use inspector::StateInspector;
+/// Primary state backend — RocksDB-backed LSM-tree, ephemeral or file-backed.
+pub use rocksdb_backend::RocksDbStateBackend;
+/// Legacy alias kept for source compatibility.
+pub type FjallStateBackend = RocksDbStateBackend;
 pub use krishiv_common::durability::{DurabilityProfile, StateDurability};
 pub use migration::{
     SharedStateMigrationRegistry, StateMigrationError, StateMigrationFn, StateMigrationRegistry,
@@ -56,3 +57,8 @@ pub use processing_time::{
 pub use snapshot::{SnapshotEntry, decode_snapshot_entries};
 pub use timer::{InMemoryTimerService, TimerKey, TimerService};
 pub use ttl::{TtlConfig, TtlStateBackend};
+pub use queryable::{QueryableStateHandle, QueryableStateStore};
+pub use incremental_checkpoint::{
+    EpochMetaFile, RocksDbIncrementalCheckpointer, SstEpochManifest, SstFileRef,
+};
+pub use savepoint::{SavepointCoordinator, SavepointMeta};

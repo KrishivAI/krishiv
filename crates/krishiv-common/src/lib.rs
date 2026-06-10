@@ -7,10 +7,12 @@
 //! - Identifier and path validation (`validate` module)
 
 pub mod async_util;
+pub mod backpressure;
 #[cfg(feature = "chaos")]
 pub mod chaos;
 pub mod durability;
 pub mod hash;
+pub mod memory_budget;
 pub mod panic_util;
 pub mod partition;
 pub mod production;
@@ -34,6 +36,8 @@ pub use production::{
     requires_file_backed_state, requires_http_auth, requires_manual_kafka_commit,
     resolve_durability_profile,
 };
+pub use backpressure::{BackpressureSignal, CreditGate};
+pub use memory_budget::MemoryBudget;
 pub use stream_quality::{StreamQualityHook, StreamQualityResult};
 
 #[cfg(test)]

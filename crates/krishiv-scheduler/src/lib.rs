@@ -40,6 +40,7 @@ pub mod in_process;
 pub mod job;
 pub mod job_coordinator;
 pub mod llm_quota;
+pub mod queryable_state_http;
 pub mod rpc_drain;
 pub mod store;
 pub mod transport;
@@ -85,8 +86,8 @@ pub use error::{SchedulerError, SchedulerResult, TaskUpdateOutcome};
 pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
 #[cfg(feature = "etcd")]
 pub use etcd_metadata::EtcdMetadataStore;
-#[cfg(feature = "redb")]
-mod redb_metadata;
+pub(crate) mod redb_metadata;
+pub(crate) mod rocksdb_metadata;
 pub use grpc::{
     CoordinatorExecutorGrpcService, CoordinatorExecutorTonicService,
     CoordinatorManagementGrpcService, coordinator_executor_grpc_server,
@@ -109,10 +110,13 @@ pub use job_coordinator::JobCoordinator;
 pub use krishiv_common::DurabilityProfile;
 pub use leadership::{LeaderElection, SingleNodeElection};
 pub use metrics::{SchedulerMetrics, scheduler_metrics};
-#[cfg(feature = "redb")]
 pub use redb_metadata::RedbMetadataStore;
+pub use rocksdb_metadata::RocksDbMetadataStore;
 pub use store::{
     ContinuousSnapshot, EventLogEvent, InMemoryMetadataStore, MetadataStore, NonBlockingStoreHandle,
+};
+pub use queryable_state_http::{
+    QueryStateResponse, decode_key_hex, encode_key_hex, queryable_state_router,
 };
 pub use transport::CoordinatorExecutorTransport;
 

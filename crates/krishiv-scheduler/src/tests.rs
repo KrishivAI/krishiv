@@ -607,11 +607,10 @@ mod scheduler_tests {
         );
     }
 
-    #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread")]
     async fn tonic_service_register_executor_persists_descriptor() {
         allow_anonymous_for_tests();
-        let store = crate::redb_metadata::RedbMetadataStore::in_memory().unwrap();
+        let store = crate::rocksdb_metadata::RocksDbMetadataStore::in_memory().unwrap();
         let shared = SharedCoordinator::new(
             Coordinator::active(CoordinatorId::try_new("coord-persist").unwrap()).with_store(store),
         );
@@ -2658,25 +2657,24 @@ mod scheduler_tests {
         assert_eq!(snap.job_id(), &job_id);
     }
 
-    #[cfg(feature = "redb")]
     #[test]
-    fn redb_metadata_store_recovers_after_reopen() {
+    fn rocksdb_metadata_store_recovers_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("metadata.json");
-        let job_id = JobId::try_new("job-json-recover").unwrap();
+        let path = dir.path().join("metadata.rocksdb");
+        let job_id = JobId::try_new("job-rocksdb-recover").unwrap();
 
         {
-            let store = crate::redb_metadata::RedbMetadataStore::open(&path).unwrap();
+            let store = crate::rocksdb_metadata::RocksDbMetadataStore::open(&path).unwrap();
             let mut coordinator =
-                Coordinator::active(CoordinatorId::try_new("coord-json-1").unwrap())
+                Coordinator::active(CoordinatorId::try_new("coord-rocksdb-1").unwrap())
                     .with_store(store);
-            let executor_id = ExecutorId::try_new("exec-json-1").unwrap();
+            let executor_id = ExecutorId::try_new("exec-rocksdb-1").unwrap();
             coordinator
-                .register_executor(ExecutorDescriptor::new(executor_id, "pod-json", 1))
+                .register_executor(ExecutorDescriptor::new(executor_id, "pod-rocksdb", 1))
                 .unwrap();
             coordinator
                 .submit_job(
-                    JobSpec::new(job_id.clone(), "json recovery", JobKind::Batch).with_stage(
+                    JobSpec::new(job_id.clone(), "rocksdb recovery", JobKind::Batch).with_stage(
                         StageSpec::new(StageId::try_new("stage-1").unwrap(), "stage").with_task(
                             TaskSpec::new(TaskId::try_new("task-1").unwrap(), "sql: select 1"),
                         ),
@@ -2685,9 +2683,10 @@ mod scheduler_tests {
                 .unwrap();
         }
 
-        let reopened = crate::redb_metadata::RedbMetadataStore::open(&path).unwrap();
+        let reopened = crate::rocksdb_metadata::RocksDbMetadataStore::open(&path).unwrap();
         assert_eq!(reopened.events().len(), 1);
-        let mut recovered = Coordinator::active(CoordinatorId::try_new("coord-json-2").unwrap());
+        let mut recovered =
+            Coordinator::active(CoordinatorId::try_new("coord-rocksdb-2").unwrap());
         recovered.recover_from_store(&reopened).unwrap();
         let snapshot = recovered.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.task_count(), 1);

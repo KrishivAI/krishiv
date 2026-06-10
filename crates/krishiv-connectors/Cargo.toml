@@ -32,7 +32,7 @@ schema-registry = [
 state = ["dep:krishiv-state"]
 
 # Lakehouse table formats (implementation in `crate::lakehouse`)
-lakehouse = ["dep:async-trait", "dep:chrono", "dep:redb", "dep:serde", "dep:url"]
+lakehouse = ["dep:async-trait", "dep:chrono", "dep:rocksdb", "dep:serde", "dep:tempfile", "dep:url"]
 iceberg = ["lakehouse", "dep:iceberg"]
 delta = ["lakehouse"]
 hudi = ["lakehouse"]
@@ -73,7 +73,8 @@ thiserror = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-proto = { path = "../krishiv-proto" }
 chrono = { workspace = true, optional = true }
-redb = { workspace = true, optional = true }
+rocksdb = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 url = { version = "2", optional = true }
 iceberg = { workspace = true, optional = true }
 krishiv-state = { path = "../krishiv-state", optional = true }

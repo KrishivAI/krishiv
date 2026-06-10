@@ -7,20 +7,21 @@ license.workspace = true
 
 [features]
 etcd = ["dep:etcd-client"]
-redb = ["dep:redb"]
 
 [dependencies]
 krishiv-common = { path = "../krishiv-common" }
 arrow = { workspace = true }
 axum = { workspace = true }
 base64 = "0.22"
+hex.workspace = true
 futures = { workspace = true }
 krishiv-state = { path = "../krishiv-state" }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-shuffle = { path = "../krishiv-shuffle" }
-redb = { workspace = true, optional = true }
+rocksdb = { workspace = true }
+tempfile = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

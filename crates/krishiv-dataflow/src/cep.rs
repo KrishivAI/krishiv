@@ -1,8 +1,10 @@
 //! CEP physical operator wrapper (R16 S2.3).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
+use krishiv_common::MemoryBudget;
 use krishiv_plan::cep::{CepKeyState, CompiledPattern, SequentialPatternMatcher};
 use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
 
@@ -23,6 +25,7 @@ pub struct CepOperator {
     /// Maximum number of distinct keys retained before evicting the
     /// least-recently-active one. See [`DEFAULT_MAX_CEP_KEYS`].
     max_keys: usize,
+    memory_budget: Option<Arc<MemoryBudget>>,
 }
 
 impl CepOperator {
@@ -33,6 +36,7 @@ impl CepOperator {
             states: HashMap::new(),
             last_barrier_epoch: 0,
             max_keys: DEFAULT_MAX_CEP_KEYS,
+            memory_budget: None,
         }
     }
 
@@ -40,6 +44,14 @@ impl CepOperator {
     /// memory before the least-recently-active key is evicted.
     pub fn with_max_keys(mut self, max_keys: usize) -> Self {
         self.max_keys = max_keys.max(1);
+        self
+    }
+
+    /// Attach a shared memory budget.  Each new key state reserves ~256 bytes;
+    /// released on key eviction.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<MemoryBudget>) -> Self {
+        self.memory_budget = Some(budget);
         self
     }
 
@@ -64,6 +76,26 @@ impl CepOperator {
         batch: RecordBatch,
         event_time_ms: i64,
     ) -> Vec<Vec<RecordBatch>> {
+        let is_new_key = !self.states.contains_key(&key);
+        if is_new_key {
+            if let Some(budget) = &self.memory_budget {
+                if !budget.try_reserve(256) {
+                    // Over budget: evict the stalest key and proceed rather than
+                    // returning an error (CEP process_batch is infallible).
+                    if let Some(stalest) = self
+                        .states
+                        .iter()
+                        .min_by_key(|(_, s)| s.last_event_ms)
+                        .map(|(k, _)| k.clone())
+                    {
+                        self.states.remove(&stalest);
+                        budget.release(256);
+                    }
+                    // Re-try the reservation after eviction.
+                    let _ = budget.try_reserve(256);
+                }
+            }
+        }
         let state = self.states.entry(key).or_default();
         let result = self
             .matcher
@@ -76,6 +108,9 @@ impl CepOperator {
                 .map(|(k, _)| k.clone())
         {
             self.states.remove(&stalest);
+            if let Some(budget) = &self.memory_budget {
+                budget.release(256);
+            }
         }
         result
     }

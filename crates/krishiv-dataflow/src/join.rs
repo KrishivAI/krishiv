@@ -8,6 +8,7 @@ use arrow::array::{
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use krishiv_common::MemoryBudget;
 
 use crate::{ExecError, ExecResult};
 
@@ -218,6 +219,10 @@ pub enum JoinKind {
     LeftSemi,
     /// Left anti join — emit left rows that have no match on the right.
     LeftAnti,
+    /// E2.3: Cartesian product — no join predicate.
+    Cross,
+    /// E2.3: Nested-loop join for non-equi predicates.
+    NestedLoop,
 }
 
 /// Composite multi-key for use with `HashJoin` when multiple key columns
@@ -245,6 +250,7 @@ pub struct HashJoin {
     left_keys: Vec<String>,
     right_keys: Vec<String>,
     kind: JoinKind,
+    memory_budget: Option<Arc<MemoryBudget>>,
 }
 
 impl HashJoin {
@@ -254,6 +260,7 @@ impl HashJoin {
             left_keys: vec![left_key.into()],
             right_keys: vec![right_key.into()],
             kind: JoinKind::Inner,
+            memory_budget: None,
         }
     }
 
@@ -263,6 +270,7 @@ impl HashJoin {
             left_keys,
             right_keys,
             kind: JoinKind::Inner,
+            memory_budget: None,
         }
     }
 
@@ -270,6 +278,13 @@ impl HashJoin {
     #[must_use]
     pub fn with_kind(mut self, kind: JoinKind) -> Self {
         self.kind = kind;
+        self
+    }
+
+    /// Attach a shared memory budget for build-side memory accounting.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<MemoryBudget>) -> Self {
+        self.memory_budget = Some(budget);
         self
     }
 
@@ -302,10 +317,21 @@ impl HashJoin {
         let left_key_indices = Self::key_indices(left, &self.left_keys)?;
         let right_key_indices = Self::key_indices(right, &self.right_keys)?;
 
-        // Build phase.
+        // Build phase — each key entry costs ~24 bytes (CompositeKey + Vec header + row index).
+        // Reserve from the memory budget before inserting so callers can detect OOM early.
+        const BYTES_PER_BUILD_ENTRY: u64 = 48;
         let mut build_map: HashMap<CompositeKey, Vec<u32>> =
             HashMap::with_capacity(right.num_rows());
         for row in 0..right.num_rows() {
+            if let Some(budget) = &self.memory_budget {
+                if !budget.try_reserve(BYTES_PER_BUILD_ENTRY) {
+                    return Err(ExecError::ResourceExhausted(format!(
+                        "hash join build side exceeded memory budget ({} bytes used, limit {} bytes)",
+                        budget.used_bytes(),
+                        budget.limit().unwrap_or(0),
+                    )));
+                }
+            }
             let key = Self::build_composite_key(right, &right_key_indices, row)?;
             build_map.entry(key).or_default().push(row as u32);
         }
@@ -676,6 +702,182 @@ fn build_composite_key_static(
     Ok(CompositeKey::new(keys?))
 }
 
+// ── SortMergeJoin (E2.1) ──────────────────────────────────────────────────────
+
+/// Sort-merge equi-join.
+///
+/// Both input batches must be sorted on their respective key columns in
+/// ascending order (ascending sort is the only invariant this operator
+/// enforces via `assert_sort_key_order` in debug builds).
+///
+/// Algorithm: standard two-pointer merge on sorted inputs.
+/// Supported join kinds: `Inner`, `LeftOuter`.
+pub struct SortMergeJoin {
+    left_keys: Vec<String>,
+    right_keys: Vec<String>,
+    kind: JoinKind,
+}
+
+impl SortMergeJoin {
+    /// Create a sort-merge inner join on a single key column.
+    pub fn new(left_key: impl Into<String>, right_key: impl Into<String>) -> Self {
+        Self {
+            left_keys: vec![left_key.into()],
+            right_keys: vec![right_key.into()],
+            kind: JoinKind::Inner,
+        }
+    }
+
+    /// Set the join kind (Inner or LeftOuter).
+    #[must_use]
+    pub fn with_kind(mut self, kind: JoinKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Perform the sort-merge join.
+    ///
+    /// Both batches must be sorted on their key columns. For multi-key joins
+    /// the first key column is used as the primary sort key.
+    pub fn join(&self, left: &RecordBatch, right: &RecordBatch) -> ExecResult<RecordBatch> {
+        if self.left_keys.is_empty() || self.right_keys.is_empty() {
+            return Err(ExecError::InvalidInput(
+                "sort-merge join requires at least one key column".into(),
+            ));
+        }
+        let out_schema = join_output_schema_multi(left, right, &self.right_keys);
+        let left_key_idx = left
+            .schema()
+            .index_of(&self.left_keys[0])
+            .map_err(|_| ExecError::ColumnNotFound(self.left_keys[0].clone()))?;
+        let right_key_idx = right
+            .schema()
+            .index_of(&self.right_keys[0])
+            .map_err(|_| ExecError::ColumnNotFound(self.right_keys[0].clone()))?;
+
+        let mut left_indices: Vec<u32> = Vec::new();
+        let mut right_indices: Vec<u32> = Vec::new();
+        let mut unmatched_left: Vec<u32> = Vec::new();
+
+        let mut li = 0usize;
+        let mut ri = 0usize;
+
+        while li < left.num_rows() && ri < right.num_rows() {
+            let lk = extract_agg_key(left, left_key_idx, li)?;
+            let rk = extract_agg_key(right, right_key_idx, ri)?;
+            match lk.cmp(&rk) {
+                std::cmp::Ordering::Less => {
+                    if matches!(self.kind, JoinKind::LeftOuter) {
+                        unmatched_left.push(li as u32);
+                    }
+                    li += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    ri += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    // Emit all right-side matches for this left key.
+                    let mut rj = ri;
+                    while rj < right.num_rows() {
+                        let rk2 = extract_agg_key(right, right_key_idx, rj)?;
+                        if lk.cmp(&rk2) != std::cmp::Ordering::Equal {
+                            break;
+                        }
+                        left_indices.push(li as u32);
+                        right_indices.push(rj as u32);
+                        rj += 1;
+                    }
+                    li += 1;
+                }
+            }
+        }
+        // Remaining left rows unmatched (LeftOuter).
+        if matches!(self.kind, JoinKind::LeftOuter) {
+            while li < left.num_rows() {
+                unmatched_left.push(li as u32);
+                li += 1;
+            }
+        }
+
+        if left_indices.is_empty() && unmatched_left.is_empty() {
+            return Ok(RecordBatch::new_empty(out_schema));
+        }
+        build_outer_join_batch(
+            left,
+            right,
+            &self.right_keys,
+            &left_indices,
+            &right_indices,
+            &unmatched_left,
+            out_schema,
+        )
+    }
+}
+
+// ── NestedLoopJoin (E2.3) ─────────────────────────────────────────────────────
+
+/// Nested-loop join — evaluates every pair of (left row, right row).
+///
+/// For `Cross` kind: emits the full cartesian product.
+/// For `NestedLoop` kind: same cartesian product (callers post-filter by
+/// predicate outside this operator since the predicate is SQL-evaluated).
+///
+/// Time complexity: O(n × m). Only appropriate for small inputs.
+pub struct NestedLoopJoin {
+    #[allow(dead_code)]
+    kind: JoinKind,
+}
+
+impl NestedLoopJoin {
+    /// Create a nested-loop join.
+    pub fn new(kind: JoinKind) -> Self {
+        Self { kind }
+    }
+
+    /// Perform the nested-loop join.  Returns all `(left_row, right_row)` pairs.
+    pub fn join(&self, left: &RecordBatch, right: &RecordBatch) -> ExecResult<RecordBatch> {
+        let total = left.num_rows() * right.num_rows();
+        if total == 0 {
+            let out_schema = join_output_schema_multi(left, right, &[]);
+            return Ok(RecordBatch::new_empty(out_schema));
+        }
+
+        let mut left_indices: Vec<u32> = Vec::with_capacity(total);
+        let mut right_indices: Vec<u32> = Vec::with_capacity(total);
+
+        for li in 0..left.num_rows() {
+            for ri in 0..right.num_rows() {
+                left_indices.push(li as u32);
+                right_indices.push(ri as u32);
+            }
+        }
+
+        // Build output: all left columns + all right columns (no key deduplication).
+        let left_idx_arr: ArrayRef = Arc::new(UInt32Array::from(left_indices));
+        let right_idx_arr: ArrayRef = Arc::new(UInt32Array::from(right_indices));
+
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for i in 0..left.num_columns() {
+            columns.push(
+                take(left.column(i), &left_idx_arr, None)
+                    .map_err(|e| ExecError::Arrow(e.to_string()))?,
+            );
+        }
+        for i in 0..right.num_columns() {
+            columns.push(
+                take(right.column(i), &right_idx_arr, None)
+                    .map_err(|e| ExecError::Arrow(e.to_string()))?,
+            );
+        }
+
+        let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| (**f).clone()).collect();
+        fields.extend(right.schema().fields().iter().map(|f| (**f).clone()));
+        let schema = Arc::new(Schema::new(fields));
+
+        RecordBatch::try_new(schema, columns).map_err(|e| ExecError::Arrow(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,5 +962,119 @@ mod tests {
         let row_err = extract_agg_key(&batch, 0, 1).unwrap_err();
         assert!(matches!(row_err, ExecError::InvalidInput(_)));
         assert!(row_err.to_string().contains("row index 1"));
+    }
+
+    // ── SortMergeJoin tests ───────────────────────────────────────────────────
+
+    fn smj_batches() -> (RecordBatch, RecordBatch) {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("lval", DataType::Int32, false),
+        ]));
+        let left = RecordBatch::try_new(
+            left_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 5])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 50])),
+            ],
+        )
+        .unwrap();
+
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("rval", DataType::Int32, false),
+        ]));
+        let right = RecordBatch::try_new(
+            right_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![2, 3, 4])),
+                Arc::new(Int32Array::from(vec![200, 300, 400])),
+            ],
+        )
+        .unwrap();
+
+        (left, right)
+    }
+
+    #[test]
+    fn sort_merge_join_inner_matches_only_common_keys() {
+        let (left, right) = smj_batches();
+        let join = SortMergeJoin::new("id", "id");
+        let result = join.join(&left, &right).unwrap();
+        // keys 2 and 3 match
+        assert_eq!(result.num_rows(), 2);
+        let ids = result.column_by_name("id").unwrap();
+        let id_arr = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+        let mut matched: Vec<i32> = (0..result.num_rows()).map(|i| id_arr.value(i)).collect();
+        matched.sort();
+        assert_eq!(matched, vec![2, 3]);
+    }
+
+    #[test]
+    fn sort_merge_join_left_outer_emits_all_left_rows() {
+        let (left, right) = smj_batches();
+        let join = SortMergeJoin::new("id", "id").with_kind(JoinKind::LeftOuter);
+        let result = join.join(&left, &right).unwrap();
+        // left has ids 1,2,3,5 → 4 rows (1 and 5 unmatched, 2 and 3 matched)
+        assert_eq!(result.num_rows(), 4);
+    }
+
+    #[test]
+    fn sort_merge_join_empty_right_returns_empty_inner() {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let left = RecordBatch::try_new(left_schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])
+            .unwrap();
+        let right_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let right =
+            RecordBatch::new_empty(right_schema);
+        let join = SortMergeJoin::new("id", "id");
+        let result = join.join(&left, &right).unwrap();
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    #[test]
+    fn sort_merge_join_duplicate_right_keys_expands_output() {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let left =
+            RecordBatch::try_new(left_schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+        let right_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let right = RecordBatch::try_new(
+            right_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 1, 1]))],
+        )
+        .unwrap();
+        let join = SortMergeJoin::new("id", "id");
+        let result = join.join(&left, &right).unwrap();
+        assert_eq!(result.num_rows(), 3, "one left row × 3 matching right rows");
+    }
+
+    // ── NestedLoopJoin tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn nested_loop_join_cross_produces_cartesian_product() {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let left =
+            RecordBatch::try_new(left_schema, vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+        let right_schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
+        let right = RecordBatch::try_new(
+            right_schema,
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+        let join = NestedLoopJoin::new(JoinKind::Cross);
+        let result = join.join(&left, &right).unwrap();
+        assert_eq!(result.num_rows(), 6, "2 × 3 = 6 rows");
+        assert_eq!(result.num_columns(), 2, "left col a + right col b");
+    }
+
+    #[test]
+    fn nested_loop_join_empty_input_returns_empty() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let left = RecordBatch::new_empty(schema.clone());
+        let right =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+        let join = NestedLoopJoin::new(JoinKind::Cross);
+        let result = join.join(&left, &right).unwrap();
+        assert_eq!(result.num_rows(), 0);
     }
 }

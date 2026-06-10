@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow::array::{BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use krishiv_common::MemoryBudget;
 use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
 
 use crate::aggregate::{AggExpr, AggFunction, AggState};
@@ -56,6 +57,7 @@ pub struct SessionWindowOperator {
     /// Output schema, fixed for the operator's lifetime; cached so closed
     /// sessions don't rebuild `Schema`/`Field` vectors per row.
     output_schema: Arc<Schema>,
+    memory_budget: Option<Arc<MemoryBudget>>,
 }
 
 fn build_session_output_schema(spec: &SessionWindowSpec) -> Arc<Schema> {
@@ -85,7 +87,16 @@ impl SessionWindowOperator {
             prev_watermark_ms: i64::MIN,
             late_events_dropped: 0,
             output_schema,
+            memory_budget: None,
         }
+    }
+
+    /// Attach a shared memory budget.  Each new session entry reserves ~128 bytes;
+    /// the reservation is released when the session closes.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<MemoryBudget>) -> Self {
+        self.memory_budget = Some(budget);
+        self
     }
 
     /// Number of open sessions.
@@ -270,6 +281,19 @@ impl SessionWindowOperator {
                     &s.agg,
                 )?);
             }
+            // Reserve memory for a new session entry (~128 bytes for key + state).
+            let is_new_entry = !self.sessions.contains_key(&key);
+            if is_new_entry {
+                if let Some(budget) = &self.memory_budget {
+                    if !budget.try_reserve(128) {
+                        return Err(ExecError::ResourceExhausted(format!(
+                            "session window exceeded memory budget ({} bytes used, limit {} bytes)",
+                            budget.used_bytes(),
+                            budget.limit().unwrap_or(0),
+                        )));
+                    }
+                }
+            }
             let session = self.sessions.entry(key).or_insert_with(|| SessionState {
                 session_start_ms: event_time_ms,
                 last_event_time_ms: event_time_ms,
@@ -309,6 +333,9 @@ impl SessionWindowOperator {
         let mut output = Vec::with_capacity(closed.len());
         for key in closed {
             if let Some(s) = self.sessions.remove(&key) {
+                if let Some(budget) = &self.memory_budget {
+                    budget.release(128);
+                }
                 output.push(self.build_output_batch(
                     &key,
                     s.session_start_ms,

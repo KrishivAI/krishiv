@@ -8,6 +8,7 @@ tmp/
 /.claude/worktrees/
 **/krishiv*.so
 /dist/docker/
+/vendor/
 
 
 

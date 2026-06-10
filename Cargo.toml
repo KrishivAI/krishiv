@@ -86,7 +86,7 @@ opentelemetry = { version = "0.32.0", features = ["trace"] }
 opentelemetry_sdk = { version = "0.32.0", features = ["trace"] }
 opentelemetry-stdout = { version = "0.32.0", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
-redb = "4.1.0"
+rocksdb = { version = "0.22", features = ["multi-threaded-cf"] }
 mockito = "1"
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
 webpki-root-certs = "1.0"
@@ -109,6 +109,10 @@ wiremock = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# Use local GCC-15-compatible patch of librocksdb-sys (adds -include cstdint flag).
+[patch.crates-io]
+librocksdb-sys = { path = "vendor/librocksdb-sys" }
 
 [profile.dev]
 split-debuginfo = "unpacked"

@@ -4,8 +4,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use krishiv_common::MemoryBudget;
 use krishiv_plan::udf::ResourceLimits;
 use krishiv_proto::{ExecutorTaskAssignment, TaskRuntimeStats};
+use std::sync::Arc;
 #[cfg(feature = "kafka")]
 use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDescriptor};
 
@@ -76,6 +78,7 @@ pub(crate) async fn execute_batch_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
     udf_limits: ResourceLimits,
+    #[allow(unused_variables)] memory_budget: Arc<MemoryBudget>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     let fragment = fragment_body.as_str();

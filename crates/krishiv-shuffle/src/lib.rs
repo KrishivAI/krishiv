@@ -17,10 +17,12 @@ pub mod metadata;
 pub mod object_store;
 pub mod orphan;
 pub mod partitioner;
+pub mod range_partitioner;
 pub mod path;
 pub mod shuffle_svc;
 pub mod storage_uri;
 pub mod store;
+pub mod spillable;
 pub mod tiered_store;
 
 /// Validate that an identifier (job_id, stage_id, etc.) is safe for use in a
@@ -49,8 +51,10 @@ pub use metadata::{PartitionState, ShuffleMetadata};
 pub use object_store::ObjectStoreShuffleStore;
 pub use orphan::{cleanup_orphans, scan_orphans};
 pub use partitioner::HashPartitioner;
+pub use range_partitioner::{RangeBound, RangePartitioner, RangeSampler};
 pub use path::ShufflePath;
 pub use storage_uri::open_shuffle_backend_from_uri;
+pub use spillable::SpillableShuffleBackend;
 pub use store::{PartitionId, ShuffleBackend, ShufflePartition, ShuffleStore, ShuffleStream};
 pub use tiered_store::TieredShuffleStore;
 

@@ -5,12 +5,10 @@ use std::sync::Mutex;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use rocksdb::{DB, IteratorMode, Options, WriteBatch};
 use serde::{Deserialize, Serialize};
 
 use super::LakehouseError;
-
-const DELTA_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("delta_log");
 
 /// Row-level change operation in a live table delta log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,173 +143,118 @@ impl DeltaStore for MemoryDeltaStore {
     }
 }
 
-/// redb-backed durable delta store for embedded / single-node live tables.
-pub struct RedbDeltaStore {
-    db: Database,
+/// RocksDB-backed durable delta store for embedded / single-node live tables.
+pub struct RocksDbDeltaStore {
+    db: DB,
     namespace: Vec<u8>,
+    seq: Mutex<u64>,
+    // Keep tempdir alive for ephemeral instances.
+    _tempdir: Option<tempfile::TempDir>,
 }
 
-impl RedbDeltaStore {
+/// Legacy alias so existing callers continue to compile.
+pub type RedbDeltaStore = RocksDbDeltaStore;
+
+impl RocksDbDeltaStore {
     pub fn open(
         path: impl AsRef<std::path::Path>,
         namespace: impl AsRef<[u8]>,
     ) -> Result<Self, LakehouseError> {
-        let db = Database::create(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-        let store = Self {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let ns = namespace.as_ref().to_vec();
+        let db = DB::open(&opts, path.as_ref()).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let seq = Self::load_max_seq(&db, &ns);
+        Ok(Self {
             db,
-            namespace: namespace.as_ref().to_vec(),
-        };
-        store
-            .db
-            .begin_write()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?
-            .open_table(DELTA_TABLE)
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        Ok(store)
+            namespace: ns,
+            seq: Mutex::new(seq),
+            _tempdir: None,
+        })
     }
 
     pub fn open_in_memory(namespace: impl AsRef<[u8]>) -> Result<Self, LakehouseError> {
-        let db = Database::builder()
-            .create_with_backend(redb::backends::InMemoryBackend::new())
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        let store = Self {
+        let dir = tempfile::tempdir().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let ns = namespace.as_ref().to_vec();
+        let db =
+            DB::open(&opts, dir.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        Ok(Self {
             db,
-            namespace: namespace.as_ref().to_vec(),
-        };
-        store.ensure_table()?;
-        Ok(store)
+            namespace: ns,
+            seq: Mutex::new(0),
+            _tempdir: Some(dir),
+        })
     }
 
-    fn key_for(&self, seq: u64) -> Vec<u8> {
-        let mut key = self.namespace.clone();
-        key.extend_from_slice(&seq.to_le_bytes());
-        key
-    }
-
-    fn ensure_table(&self) -> Result<(), LakehouseError> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        {
-            let _ = wtxn
-                .open_table(DELTA_TABLE)
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        }
-        wtxn.commit()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        Ok(())
-    }
-
-    fn next_seq(&self) -> Result<u64, LakehouseError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        let table = read
-            .open_table(DELTA_TABLE)
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    fn load_max_seq(db: &DB, prefix: &[u8]) -> u64 {
         let mut max = 0u64;
-        let prefix = self.namespace.as_slice();
-        for item in table
-            .iter()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?
-        {
-            let (k, _) = item.map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let k = k.value();
-            if k.len() >= prefix.len() + 8 && k.starts_with(prefix) {
-                let seq_bytes: [u8; 8] = k[k.len() - 8..]
-                    .try_into()
-                    .map_err(|_| LakehouseError::Io("failed to parse sequence bytes".into()))?;
-                max = max.max(u64::from_le_bytes(seq_bytes));
+        for item in db.iterator(IteratorMode::Start) {
+            let Ok((k, _)) = item else { continue };
+            if k.starts_with(prefix) && k.len() == prefix.len() + 8 {
+                let seq = u64::from_le_bytes(k[prefix.len()..].try_into().unwrap_or([0u8; 8]));
+                if seq >= max {
+                    max = seq + 1;
+                }
             }
         }
-        Ok(max + 1)
+        max
+    }
+
+    fn next_key(&self) -> Vec<u8> {
+        let mut seq = self.seq.lock().unwrap_or_else(|e| e.into_inner());
+        let id = *seq;
+        *seq += 1;
+        let mut key = self.namespace.clone();
+        key.extend_from_slice(&id.to_le_bytes());
+        key
     }
 }
 
-impl DeltaStore for RedbDeltaStore {
+impl DeltaStore for RocksDbDeltaStore {
     fn append(&self, batch: RecordBatch, op: DeltaOp) -> Result<(), LakehouseError> {
-        let seq = self.next_seq()?;
+        let key = self.next_key();
         let value = encode_entry(op, &batch)?;
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        {
-            let mut table = write
-                .open_table(DELTA_TABLE)
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
-            table
-                .insert(self.key_for(seq).as_slice(), value.as_slice())
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        }
-        write
-            .commit()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        Ok(())
+        self.db
+            .put(key, value)
+            .map_err(|e| LakehouseError::Io(e.to_string()))
     }
 
     fn scan(&self) -> Result<Vec<DeltaEntry>, LakehouseError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        let table = read
-            .open_table(DELTA_TABLE)
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let prefix = self.namespace.as_slice();
         let mut out = Vec::new();
-        for item in table
-            .iter()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?
-        {
+        for item in self.db.iterator(IteratorMode::From(
+            prefix,
+            rocksdb::Direction::Forward,
+        )) {
             let (k, v) = item.map_err(|e| LakehouseError::Io(e.to_string()))?;
-            if k.value().starts_with(prefix) {
-                out.push(decode_entry(v.value())?);
+            if !k.starts_with(prefix) {
+                break;
             }
+            out.push(decode_entry(&v)?);
         }
         Ok(out)
     }
 
     fn truncate(&self) -> Result<(), LakehouseError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        let table = read
-            .open_table(DELTA_TABLE)
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let prefix = self.namespace.as_slice();
-        let keys: Vec<Vec<u8>> = table
-            .iter()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?
-            .filter_map(|item| {
-                item.ok().and_then(|(k, _)| {
-                    let kv = k.value();
-                    if kv.starts_with(prefix) {
-                        Some(kv.to_vec())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        {
-            let mut table = write
-                .open_table(DELTA_TABLE)
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
-            for key in keys {
-                let _ = table.remove(key.as_slice());
+        let mut batch = WriteBatch::default();
+        for item in self.db.iterator(IteratorMode::From(
+            prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (k, _) = item.map_err(|e| LakehouseError::Io(e.to_string()))?;
+            if !k.starts_with(prefix) {
+                break;
             }
+            batch.delete(&*k);
         }
-        write
-            .commit()
+        self.db
+            .write(batch)
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let mut seq = self.seq.lock().unwrap_or_else(|e| e.into_inner());
+        *seq = 0;
         Ok(())
     }
 

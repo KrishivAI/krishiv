@@ -128,6 +128,10 @@ pub enum JoinType {
     Full,
     Semi,
     Anti,
+    /// Cartesian product — no join predicate (E2.3).
+    Cross,
+    /// Nested-loop join; used for non-equi predicates (E2.3).
+    NestedLoop,
 }
 
 /// Typed operator classification for a plan node.
@@ -176,6 +180,32 @@ pub enum NodeOp {
     StreamSource { source_id: String, bounded: bool },
     /// Operator state TTL for streaming nodes.
     StateTtl { ttl_ms: u64 },
+    /// E2.2: Globally-sorted output produced by a three-stage pipeline:
+    /// local sort → range-partition shuffle → merge-sort.  The executor
+    /// treats this as a batch pipeline that produces a single sorted partition.
+    GlobalSort {
+        /// Ordered list of `(column, ascending)` sort keys.
+        keys: Vec<(String, bool)>,
+    },
+    /// E2.2 / E2.4: Sort-merge join using pre-sorted, range-partitioned inputs.
+    SortMergeJoin {
+        join_type: JoinType,
+        /// Column names used as equi-join keys (must match sort order).
+        left_keys: Vec<String>,
+        right_keys: Vec<String>,
+    },
+    /// E3.2: Time-windowed join: buffer both streams in the window interval,
+    /// emit matched pairs when the window closes.
+    WindowJoin {
+        join_type: JoinType,
+        /// Column names used as equi-join keys.
+        left_keys: Vec<String>,
+        right_keys: Vec<String>,
+        /// Event-time column used to determine window membership.
+        time_column: String,
+        /// Window duration in milliseconds.
+        window_ms: u64,
+    },
     /// Operator not covered by the above variants.
     Other { description: String },
 }
@@ -217,6 +247,19 @@ pub enum Partitioning {
     },
     /// Broadcast — replicate to all downstream partitions.
     Broadcast,
+    /// E2.4: Range-based partitioning using sampled sort key boundaries.
+    ///
+    /// Rows whose sort key falls in `[boundaries[i-1], boundaries[i])` go to
+    /// partition `i`.  Used by `GlobalSort` / `SortMergeJoin` pipelines.
+    Range {
+        /// Sort key columns (each `(column, ascending)`).
+        keys: Vec<(String, bool)>,
+        /// Sampled boundary values (serialised as JSON strings).
+        /// There are `buckets - 1` boundaries for `buckets` output partitions.
+        boundaries: Vec<String>,
+        /// Number of output partitions.
+        buckets: u32,
+    },
 }
 
 impl fmt::Display for Partitioning {
@@ -228,6 +271,14 @@ impl fmt::Display for Partitioning {
             }
             Self::RoundRobin { buckets } => write!(f, "round-robin(buckets={})", buckets),
             Self::Broadcast => f.write_str("broadcast"),
+            Self::Range { keys, buckets, .. } => {
+                let key_str = keys
+                    .iter()
+                    .map(|(c, asc)| format!("{} {}", c, if *asc { "ASC" } else { "DESC" }))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "range({key_str}, buckets={buckets})")
+            }
         }
     }
 }

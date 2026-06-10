@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use krishiv_common::MemoryBudget;
 use krishiv_dataflow::ContinuousWindowExecutor;
 use krishiv_plan::udf::ResourceLimits;
 
@@ -271,6 +272,7 @@ pub(crate) async fn execute_streaming_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
     udf_limits: ResourceLimits,
+    #[allow(unused_variables)] memory_budget: Arc<MemoryBudget>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     let fragment = fragment_body.as_str();

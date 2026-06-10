@@ -1,10 +1,8 @@
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use redb::{ReadableDatabase, TableDefinition};
+use rocksdb::{DB, Options};
 use serde::{Deserialize, Serialize};
-
-const MEMO_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("memo");
 
 /// Default memo TTL: 7 days (P3-13).
 pub const DEFAULT_MEMO_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -38,9 +36,9 @@ impl MemoEntry {
     }
 }
 
-/// redb-backed memo store for incremental RAG re-indexing.
+/// RocksDB-backed memo store for incremental RAG re-indexing.
 pub struct MemoStore {
-    db: redb::Database,
+    db: DB,
     ttl_ms: u64,
 }
 
@@ -52,26 +50,19 @@ impl MemoStore {
 
     /// Open with a custom TTL in milliseconds (`0` disables expiry).
     pub fn open_with_ttl(path: impl AsRef<Path>, ttl_ms: u64) -> Result<Self, String> {
-        let db = redb::Database::create(path).map_err(|e| e.to_string())?;
-        let write = db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let _ = write.open_table(MEMO_TABLE).map_err(|e| e.to_string())?;
-        }
-        write.commit().map_err(|e| e.to_string())?;
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, path.as_ref()).map_err(|e| e.to_string())?;
         Ok(Self { db, ttl_ms })
     }
 
-    /// Lookup memo entry by key; evicts expired entries (P3-13).
+    /// Lookup memo entry by key; evicts expired entries on TTL.
     pub fn get(&self, key: &str) -> Result<Option<MemoEntry>, String> {
-        let read = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read.open_table(MEMO_TABLE).map_err(|e| e.to_string())?;
-        let value = table.get(key).map_err(|e| e.to_string())?;
-        let Some(value) = value else {
+        let Some(bytes) = self.db.get(key.as_bytes()).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        let entry: MemoEntry = serde_json::from_slice(value.value()).map_err(|e| e.to_string())?;
+        let entry: MemoEntry = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         if self.ttl_ms > 0 && now_ms().saturating_sub(entry.created_at_ms) > self.ttl_ms {
-            drop(read);
             self.delete(key)?;
             return Ok(None);
         }
@@ -83,32 +74,22 @@ impl MemoStore {
         let mut stored = entry.clone();
         stored.created_at_ms = now_ms();
         let bytes = serde_json::to_vec(&stored).map_err(|e| e.to_string())?;
-        let write = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write.open_table(MEMO_TABLE).map_err(|e| e.to_string())?;
-            table
-                .insert(key, bytes.as_slice())
-                .map_err(|e| e.to_string())?;
-        }
-        write.commit().map_err(|e| e.to_string())?;
-        Ok(())
+        self.db
+            .put(key.as_bytes(), bytes)
+            .map_err(|e| e.to_string())
     }
 
     fn delete(&self, key: &str) -> Result<(), String> {
-        let write = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write.open_table(MEMO_TABLE).map_err(|e| e.to_string())?;
-            let _ = table.remove(key).map_err(|e| e.to_string())?;
-        }
-        write.commit().map_err(|e| e.to_string())?;
-        Ok(())
+        self.db
+            .delete(key.as_bytes())
+            .map_err(|e| e.to_string())
     }
 
-    /// Benchmark lookup latency for `key_count` keys (Sprint 5 acceptance).
+    /// Benchmark lookup latency for `key_count` keys.
     pub fn bench_lookup_p99(key_count: usize) -> Result<u64, String> {
         let dir = std::env::temp_dir().join(format!("krishiv-memo-bench-{}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let store = Self::open(dir.join("memo.redb"))?;
+        let store = Self::open(dir.join("memo.rocksdb"))?;
         for i in 0..key_count {
             let key = format!("key-{i}");
             store.put(

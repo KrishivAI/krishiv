@@ -72,7 +72,7 @@ impl KubernetesControllerRuntime {
         }
 
         if let Some(path) = &config.metadata_path {
-            let store = krishiv_scheduler::RedbMetadataStore::open(path).map_err(|error| {
+            let store = krishiv_scheduler::RocksDbMetadataStore::open(path).map_err(|error| {
                 OperatorError::InvalidResource {
                     message: format!(
                         "failed to open metadata store at {}: {error}",

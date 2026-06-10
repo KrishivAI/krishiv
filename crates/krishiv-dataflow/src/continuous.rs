@@ -10,6 +10,7 @@ use crate::{
     StateBackedSessionWindowOperator, StateBackedSlidingWindowOperator,
     StateBackedTumblingWindowOperator, TumblingWindowSpec, WatermarkState,
 };
+use crate::window::{CountWindowOperator, CountWindowSpec};
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{WindowExecutionSpec, WindowKind, validate_window_execution_spec};
 
@@ -17,6 +18,7 @@ enum WindowOperatorState {
     Tumbling(Box<StateBackedTumblingWindowOperator>),
     Sliding(Box<StateBackedSlidingWindowOperator>),
     Session(Box<StateBackedSessionWindowOperator>),
+    Count(Box<CountWindowOperator>),
 }
 
 /// Tracks single- or multi-source watermark state for continuous execution.
@@ -126,6 +128,18 @@ fn build_operator(
             .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             Ok(WindowOperatorState::Session(Box::new(op)))
         }
+        WindowKind::Count { size, slide } => {
+            let count_spec = CountWindowSpec {
+                key_column: spec.key_column.clone(),
+                key_column_type: spec.key_column_type.clone(),
+                size,
+                slide,
+                agg_exprs: agg_exprs.to_vec(),
+            };
+            let op = CountWindowOperator::new(count_spec)
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            Ok(WindowOperatorState::Count(Box::new(op)))
+        }
     }
 }
 
@@ -139,6 +153,8 @@ impl WindowOperatorState {
             Self::Tumbling(op) => op.process_batch(batch, watermark_ms),
             Self::Sliding(op) => op.process_batch(batch, watermark_ms),
             Self::Session(op) => op.process_batch(batch, watermark_ms),
+            // Count windows are row-indexed, watermark is unused.
+            Self::Count(op) => op.process_batch(batch),
         }
     }
 
@@ -147,6 +163,7 @@ impl WindowOperatorState {
             Self::Tumbling(op) => op.purge_expired(),
             Self::Sliding(op) => op.purge_expired(),
             Self::Session(op) => op.purge_expired(),
+            Self::Count(_) => Ok(0), // no time-based eviction
         }
     }
 
@@ -155,6 +172,7 @@ impl WindowOperatorState {
             Self::Tumbling(op) => op.set_watermark(watermark_ms),
             Self::Sliding(op) => op.set_watermark(watermark_ms),
             Self::Session(op) => op.set_watermark(watermark_ms),
+            Self::Count(_) => {} // count windows have no time-watermark
         }
     }
 
@@ -164,6 +182,7 @@ impl WindowOperatorState {
             Self::Tumbling(op) => op.checkpoint(),
             Self::Sliding(op) => op.checkpoint(),
             Self::Session(op) => op.checkpoint(),
+            Self::Count(_) => Ok(()), // in-memory; no persistence
         }
     }
 
@@ -173,6 +192,7 @@ impl WindowOperatorState {
             Self::Tumbling(op) => op.snapshot_state_bytes(),
             Self::Sliding(op) => op.snapshot_state_bytes(),
             Self::Session(op) => op.snapshot_state_bytes(),
+            Self::Count(_) => Ok(vec![]), // no persistent state
         }
     }
 
@@ -182,6 +202,7 @@ impl WindowOperatorState {
             Self::Tumbling(op) => op.load_snapshot_bytes(bytes),
             Self::Sliding(op) => op.load_snapshot_bytes(bytes),
             Self::Session(op) => op.load_snapshot_bytes(bytes),
+            Self::Count(_) => Ok(()),
         }
     }
 }

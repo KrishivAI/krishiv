@@ -229,6 +229,11 @@ pub struct ExecutorTaskOutput {
     /// `None` for non-streaming tasks; `Some(n)` when the advisor has observed
     /// enough data to suggest a bucket count for the next streaming cycle.
     pub(crate) advisory_buckets: Option<u32>,
+    /// E1.3: Backpressure signal from downstream operators.  `None` means no
+    /// credit accounting was active (legacy / batch tasks); a signal value
+    /// lets the coordinator decide whether to schedule the next streaming cycle
+    /// immediately or wait for downstream to drain.
+    pub(crate) backpressure: krishiv_common::BackpressureSignal,
 }
 
 impl ExecutorTaskOutput {
@@ -244,6 +249,7 @@ impl ExecutorTaskOutput {
             watermark_ms: None,
             hot_key_reports: Vec::new(),
             advisory_buckets: None,
+            backpressure: krishiv_common::BackpressureSignal::None,
         }
     }
 
@@ -264,6 +270,7 @@ impl ExecutorTaskOutput {
             watermark_ms: None,
             hot_key_reports: Vec::new(),
             advisory_buckets: None,
+            backpressure: krishiv_common::BackpressureSignal::None,
         }
     }
 
@@ -279,6 +286,7 @@ impl ExecutorTaskOutput {
             watermark_ms: None,
             hot_key_reports: Vec::new(),
             advisory_buckets: None,
+            backpressure: krishiv_common::BackpressureSignal::None,
         }
     }
 
@@ -297,6 +305,7 @@ impl ExecutorTaskOutput {
             watermark_ms: None,
             hot_key_reports: Vec::new(),
             advisory_buckets: None,
+            backpressure: krishiv_common::BackpressureSignal::None,
         }
     }
 
@@ -318,6 +327,7 @@ impl ExecutorTaskOutput {
             watermark_ms: None,
             hot_key_reports: Vec::new(),
             advisory_buckets: None,
+            backpressure: krishiv_common::BackpressureSignal::None,
         }
     }
 
@@ -360,6 +370,17 @@ impl ExecutorTaskOutput {
     /// EMA-based bucket count recommendation for the next streaming cycle, if any.
     pub fn advisory_buckets(&self) -> Option<u32> {
         self.advisory_buckets
+    }
+
+    /// E1.3: Downstream backpressure signal observed during this task execution.
+    pub fn backpressure(&self) -> krishiv_common::BackpressureSignal {
+        self.backpressure
+    }
+
+    /// E1.3: Set the backpressure signal (called by streaming fragment executors).
+    pub(crate) fn with_backpressure(mut self, signal: krishiv_common::BackpressureSignal) -> Self {
+        self.backpressure = signal;
+        self
     }
 
     /// Output kind.
@@ -1060,6 +1081,8 @@ impl ExecutorTaskRunner {
             max_memory_bytes: assignment.memory_limit_bytes(),
             max_execution_time_ms: assignment.cpu_limit_nanos().map(|n| n / 1_000_000),
         };
+        // Shared memory budget for all operators within this task.
+        let memory_budget = krishiv_common::MemoryBudget::from_limit(assignment.memory_limit_bytes());
 
         let execute_result = match model {
             crate::ExecutionModel::Batch => {
@@ -1071,7 +1094,7 @@ impl ExecutorTaskRunner {
                     .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    execute_batch_fragment(self, &assignment, udf_limits),
+                    execute_batch_fragment(self, &assignment, udf_limits, memory_budget),
                 )
                 .await
                 {
@@ -1091,7 +1114,7 @@ impl ExecutorTaskRunner {
                     .unwrap_or(DEFAULT_STREAMING_TASK_TIMEOUT_SECS);
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    execute_streaming_fragment(self, &assignment, udf_limits.clone()),
+                    execute_streaming_fragment(self, &assignment, udf_limits.clone(), memory_budget),
                 )
                 .await
                 {
@@ -1181,7 +1204,7 @@ impl ExecutorTaskRunner {
         &self,
         assignment: &ExecutorTaskAssignment,
     ) -> ExecutorResult<ExecutorTaskOutput> {
-        execute_batch_fragment(self, assignment, ResourceLimits::default()).await
+        execute_batch_fragment(self, assignment, ResourceLimits::default(), krishiv_common::MemoryBudget::unlimited()).await
     }
 
     /// Execute a streaming (continuous) stage fragment.
@@ -1190,7 +1213,7 @@ impl ExecutorTaskRunner {
         &self,
         assignment: &ExecutorTaskAssignment,
     ) -> ExecutorResult<ExecutorTaskOutput> {
-        execute_streaming_fragment(self, assignment, ResourceLimits::default()).await
+        execute_streaming_fragment(self, assignment, ResourceLimits::default(), krishiv_common::MemoryBudget::unlimited()).await
     }
 
     pub(crate) async fn send_task_status<S>(

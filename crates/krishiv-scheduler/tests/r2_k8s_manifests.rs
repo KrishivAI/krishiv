@@ -343,7 +343,7 @@ fn deployment_conformance_k8s_kind_and_bare_metal_process_modes_are_declared() {
             "run_cluster_control_plane",
             "run_standalone_coordinator",
             "metadata_backend",
-            "RedbMetadataStore",
+            "RocksDbMetadataStore",
             "EtcdMetadataStore",
             "leader_backend",
             "serve_coordinator_executor_grpc_with_listener",

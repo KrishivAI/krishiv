@@ -10,6 +10,8 @@ pub enum WindowKind {
     Tumbling,
     Sliding,
     Session,
+    /// E3.1 — count-based window: closes every `size` rows, slides every `slide` rows.
+    Count { size: u64, slide: u64 },
 }
 
 /// Aggregate function in a streaming window plan.
@@ -131,6 +133,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
         WindowKind::Tumbling => (None, None),
         WindowKind::Sliding => (parsed.slide_ms, None),
         WindowKind::Session => (None, parsed.session_gap_ms),
+        WindowKind::Count { .. } => (None, None),
     };
     let spec = WindowExecutionSpec {
         key_column: parsed.key_col,
@@ -195,6 +198,23 @@ pub fn validate_window_execution_spec(spec: &WindowExecutionSpec) -> Result<(), 
                 )));
             }
             Some(_) => {}
+        }
+    }
+    if let WindowKind::Count { size, slide } = spec.window_kind {
+        if size == 0 {
+            return Err(PlanError::Validation(String::from(
+                "count window size must be greater than zero",
+            )));
+        }
+        if slide == 0 {
+            return Err(PlanError::Validation(String::from(
+                "count window slide must be greater than zero",
+            )));
+        }
+        if slide > size {
+            return Err(PlanError::Validation(String::from(
+                "count window slide must be ≤ size",
+            )));
         }
     }
     if spec.state_ttl_ms == Some(0) {
@@ -298,6 +318,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
         WindowKind::Tumbling => "stream:tw",
         WindowKind::Sliding => "stream:sw",
         WindowKind::Session => "stream:ses",
+        WindowKind::Count { .. } => "stream:cw",
     };
 
     let extra = match spec.window_kind {
@@ -307,6 +328,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
             ":gap={}",
             spec.session_gap_ms.unwrap_or(spec.window_size_ms)
         ),
+        WindowKind::Count { size, slide } => format!(":csize={size}:cslide={slide}"),
     };
 
     let ttl = spec
@@ -377,15 +399,17 @@ use crate::PlanError;
 
 /// Parse `stream:tw|sw|ses:...` fragment strings.
 pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, PlanError> {
-    let (window_kind, payload) = if let Some(p) = fragment.strip_prefix("stream:tw:") {
-        (WindowKind::Tumbling, p)
+    let (window_kind_tag, payload) = if let Some(p) = fragment.strip_prefix("stream:tw:") {
+        ("tw", p)
     } else if let Some(p) = fragment.strip_prefix("stream:sw:") {
-        (WindowKind::Sliding, p)
+        ("sw", p)
     } else if let Some(p) = fragment.strip_prefix("stream:ses:") {
-        (WindowKind::Session, p)
+        ("ses", p)
+    } else if let Some(p) = fragment.strip_prefix("stream:cw:") {
+        ("cw", p)
     } else {
         return Err(PlanError::Parse(format!(
-            "streaming fragment must start with stream:tw:, stream:sw:, or stream:ses:; got: {fragment}"
+            "streaming fragment must start with stream:tw:, stream:sw:, stream:ses:, or stream:cw:; got: {fragment}"
         )));
     };
 
@@ -400,6 +424,8 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
     let mut agg_col: Option<String> = None;
     let mut source_id_column: Option<String> = None;
     let mut source_watermark_lags: HashMap<String, u64> = HashMap::new();
+    let mut count_size: Option<u64> = None;
+    let mut count_slide: Option<u64> = None;
 
     for part in split_stream_fields(payload) {
         let part = part.trim();
@@ -447,6 +473,16 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
                         .parse::<u64>()
                         .map_err(|e| PlanError::Parse(format!("invalid ttl value '{v}': {e}")))?,
                 );
+            }
+            "csize" => {
+                count_size = Some(v.trim().parse::<u64>().map_err(|e| {
+                    PlanError::Parse(format!("invalid csize value '{v}': {e}"))
+                })?);
+            }
+            "cslide" => {
+                count_slide = Some(v.trim().parse::<u64>().map_err(|e| {
+                    PlanError::Parse(format!("invalid cslide value '{v}': {e}"))
+                })?);
             }
             "agg" => agg_kind = Some(v.trim().to_owned()),
             "col" => agg_col = Some(v.trim().to_owned()),
@@ -523,6 +559,21 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
         }
     };
 
+    let window_kind = match window_kind_tag {
+        "tw" => WindowKind::Tumbling,
+        "sw" => WindowKind::Sliding,
+        "ses" => WindowKind::Session,
+        "cw" => WindowKind::Count {
+            size: count_size.ok_or_else(|| {
+                PlanError::Parse(String::from("count-window fragment missing csize=<n>"))
+            })?,
+            slide: count_slide.ok_or_else(|| {
+                PlanError::Parse(String::from("count-window fragment missing cslide=<n>"))
+            })?,
+        },
+        _ => unreachable!("window_kind_tag is one of tw/sw/ses/cw"),
+    };
+
     Ok(ParsedStreamFragment {
         window_kind,
         key_col: key_col
@@ -552,6 +603,7 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
 
 const STREAM_FIELD_PREFIXES: &[&str] = &[
     "key=", "time=", "win=", "lag=", "slide=", "gap=", "ttl=", "agg=", "col=", "srcid=", "srcs=",
+    "csize=", "cslide=",
 ];
 
 /// Return `true` if the colon at byte position `idx` is escaped by an odd

@@ -5,7 +5,7 @@
 //! — no coordinator, no network, no config files.
 //!
 //! Run:
-//!   cargo run -p krishiv-rust-examples --bin embedded_partition_auto
+//!   cargo run -p krishiv-rust-examples --bin embedded2_partition_auto
 
 #![forbid(unsafe_code)]
 

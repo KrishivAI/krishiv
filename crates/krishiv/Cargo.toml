@@ -39,7 +39,7 @@ full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "delta"]
 
 # Deployment capability surfaces (gate optional dep families)
 embedded    = []                                                 # baseline; no optional deps
-single-node = ["flight-sql", "shuffle", "redb"]               # local daemon + Redb metadata
+single-node = ["flight-sql", "shuffle"]                        # local daemon + RocksDB metadata
 distributed = ["flight-sql", "shuffle", "etcd"]                 # remote cluster + etcd metadata
 bare-metal  = ["distributed"]                                    # alias: process-managed cluster
 cluster     = ["distributed"]                                    # alias: distributed
@@ -50,7 +50,6 @@ flight-sql = ["dep:krishiv-flight-sql"]
 shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
 kafka = ["krishiv-connectors/kafka"]
-redb = ["krishiv-scheduler/redb"]
 state = ["krishiv-connectors/state"]
 iceberg = ["krishiv-connectors/iceberg"]
 delta = ["krishiv-connectors/delta"]

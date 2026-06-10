@@ -184,18 +184,33 @@ pub fn execute_bounded_window(
             }
             output.extend(op.flush_closed_sessions(i64::MAX)?);
         }
+        WindowKind::Count { size, slide } => {
+            use crate::window::{CountWindowOperator, CountWindowSpec};
+            let count_spec = CountWindowSpec {
+                key_column,
+                key_column_type,
+                size,
+                slide,
+                agg_exprs: agg_exprs.clone(),
+            };
+            let mut op = CountWindowOperator::new(count_spec)
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            for batch in &input_batches {
+                output.extend(op.process_batch(batch)?);
+            }
+            output.extend(op.flush()?);
+        }
     }
 
     Ok(output)
 }
 
-/// Dispatches `process_batch`/`flush` across the three state-backed window
-/// operator kinds so the streaming-execution loop can be written once instead
-/// of three times (see roadmap: "3x duplicated window stream implementations").
+/// Dispatches `process_batch`/`flush` across window operator kinds.
 enum StreamingWindowOp {
     Tumbling(StateBackedTumblingWindowOperator),
     Sliding(StateBackedSlidingWindowOperator),
     Session(StateBackedSessionWindowOperator),
+    Count(crate::window::CountWindowOperator),
 }
 
 impl StreamingWindowOp {
@@ -208,6 +223,7 @@ impl StreamingWindowOp {
             Self::Tumbling(op) => op.process_batch(batch, watermark_ms),
             Self::Sliding(op) => op.process_batch(batch, watermark_ms),
             Self::Session(op) => op.process_batch(batch, watermark_ms),
+            Self::Count(op) => op.process_batch(batch),
         }
     }
 
@@ -216,6 +232,7 @@ impl StreamingWindowOp {
             Self::Tumbling(op) => op.flush_closed_windows(i64::MAX),
             Self::Sliding(op) => op.flush_closed_windows(i64::MAX),
             Self::Session(op) => op.flush_closed_sessions(i64::MAX),
+            Self::Count(op) => op.flush(),
         }
     }
 }
@@ -351,6 +368,19 @@ pub fn execute_streaming_window(
                 StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             StreamingWindowOp::Session(op)
+        }
+        WindowKind::Count { size, slide } => {
+            use crate::window::{CountWindowOperator, CountWindowSpec};
+            let count_spec = CountWindowSpec {
+                key_column,
+                key_column_type,
+                size,
+                slide,
+                agg_exprs,
+            };
+            let op = CountWindowOperator::new(count_spec)
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            StreamingWindowOp::Count(op)
         }
     };
 

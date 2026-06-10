@@ -27,8 +27,7 @@ use crate::{
     scheduler_metrics, serve_coordinator_executor_grpc_with_listener_and_tracker,
 };
 
-#[cfg(feature = "redb")]
-use crate::RedbMetadataStore;
+use crate::RocksDbMetadataStore;
 
 #[cfg(feature = "etcd")]
 use crate::{EtcdLeaseElection, EtcdMetadataStore};
@@ -183,30 +182,24 @@ pub fn build_shared_coordinator_sync(
                 "etcd metadata requires building krishiv-scheduler with feature `etcd`".into(),
             );
         }
-        #[cfg(feature = "redb")]
-        (Some("redb"), Some(path)) => {
-            let path = path.to_string_lossy();
-            let store = RedbMetadataStore::open(path.as_ref())
-                .map_err(|e| format!("redb store '{path}': {e}"))?;
+        // "rocksdb" is the canonical name; "redb" is accepted as a legacy alias.
+        (Some("rocksdb" | "redb"), Some(path)) => {
+            let store = RocksDbMetadataStore::open(path.as_ref())
+                .map_err(|e| format!("rocksdb store '{}': {e}", path.display()))?;
             coord
                 .recover_from_store(&store)
                 .map_err(|e| format!("coordinator recovery failed: {e}"))?;
             SharedCoordinator::new(attach_metadata_store(coord, store, config))
         }
-        #[cfg(feature = "redb")]
-        (Some("redb"), None) => {
-            return Err("--metadata-backend redb requires --metadata-path".into());
+        (Some("rocksdb" | "redb"), None) => {
+            return Err("--metadata-backend rocksdb requires --metadata-path".into());
         }
         (backend, Some(path)) => {
-            // A path was given but no backend was specified or the backend name
-            // is unknown. The only correct durable backends are redb and etcd;
-            // the JSON store is intentionally not available because it does not
-            // persist or recover job state correctly.
             let backend = backend.unwrap_or("(none)");
             return Err(format!(
                 "cannot use --metadata-path '{path}' with backend '{backend}'; \
                  for durable single-node storage use: \
-                 --metadata-backend redb (requires --features redb). \
+                 --metadata-backend rocksdb. \
                  For distributed HA use: --metadata-backend etcd (requires --features etcd).",
                 path = path.display(),
             )
@@ -214,7 +207,7 @@ pub fn build_shared_coordinator_sync(
         }
         (Some(unknown), _) => {
             return Err(format!(
-                "unknown --metadata-backend '{unknown}'; supported: memory, redb, etcd"
+                "unknown --metadata-backend '{unknown}'; supported: memory, rocksdb, etcd"
             )
             .into());
         }
@@ -787,21 +780,20 @@ fn validate_durability_profile_config(
     match config.durability_profile {
         DurabilityProfile::DevLocal => Ok(()),
         DurabilityProfile::SingleNodeDurable => {
-            // Only redb gives real crash-recovery for coordinator metadata.
-            // json was removed because it silently lost state on restart.
+            // Only rocksdb gives real crash-recovery for coordinator metadata.
             match config.metadata_backend.as_deref() {
-                Some("redb") => {}
+                Some("rocksdb" | "redb") => {}
                 Some(other) => {
                     return Err(format!(
-                        "single-node-durable requires --metadata-backend redb \
-                         (--features redb); got '{other}'"
+                        "single-node-durable requires --metadata-backend rocksdb; got '{other}'"
                     )
                     .into());
                 }
                 None => {
-                    return Err("single-node-durable requires --metadata-backend redb \
-                         (--features redb) and --metadata-path <path>"
-                        .into());
+                    return Err(
+                        "single-node-durable requires --metadata-backend rocksdb and --metadata-path <path>"
+                            .into(),
+                    );
                 }
             }
             if config.metadata_path.is_none() {
@@ -949,8 +941,8 @@ pub fn coordinator_daemon_help() -> &'static str {
        --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics /federation (optional)\n\
        --shuffle-dir <PATH>        Local shuffle store directory (optional)\n\
        --durability-profile <NAME> dev-local | single-node-durable | distributed-durable\n\
-       --metadata-backend <TYPE>   memory | redb | etcd\n\
-       --metadata-path <PATH>      Durable metadata path (required for redb)\n\
+       --metadata-backend <TYPE>   memory | rocksdb | etcd\n\
+       --metadata-path <PATH>      Durable metadata path (required for rocksdb)\n\
        --leader-backend <TYPE>     single (default) | etcd (clusterd HA; feature etcd)\n\
        --etcd-endpoints <HOSTS>    Comma-separated etcd URLs (KRISHIV_ETCD_ENDPOINTS)\n\
         --etcd-lease-key <KEY>      Leader key (default /krishiv/ccp/leader)\n\
@@ -1486,11 +1478,11 @@ mod parse_tests {
     }
 
     #[test]
-    fn daemon_help_lists_redb_metadata_backend() {
+    fn daemon_help_lists_rocksdb_metadata_backend() {
         let help = coordinator_daemon_help();
 
-        assert!(help.contains("memory | redb | etcd"));
-        assert!(!help.contains("memory | json | redb | etcd"));
+        assert!(help.contains("memory | rocksdb | etcd"));
+        assert!(!help.contains("memory | redb | etcd"));
         assert!(!help.contains("sqlite | etcd"));
     }
 
