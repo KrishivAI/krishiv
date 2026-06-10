@@ -197,8 +197,8 @@ fn build_tumbling_spec(
         .map(WatermarkSpec::lag_ms)
         .unwrap_or(0);
     let mut spec = LocalWindowExecutionSpec {
-            key_column: keyed.key_column.clone(),
-            key_column_type: String::from("utf8"),
+        key_column: keyed.key_column.clone(),
+        key_column_type: String::from("utf8"),
         event_time_column: event_time,
         watermark_lag_ms: lag,
         window_kind: LocalWindowKind::Tumbling,
@@ -368,7 +368,6 @@ impl SessionWindowedStream {
 
     /// Execute with custom aggregates.
     pub fn collect_with_aggs(&self, agg_exprs: Vec<AggExpr>) -> Result<Vec<StreamBatch>> {
-        ensure_alpha_api("session_window")?;
         let event_time = event_time_column_for_keyed(&self.keyed)?;
         let lag = self
             .keyed
@@ -376,8 +375,8 @@ impl SessionWindowedStream {
             .map(WatermarkSpec::lag_ms)
             .unwrap_or(0);
         let mut spec = LocalWindowExecutionSpec {
-                key_column: self.keyed.key_column.clone(),
-                key_column_type: String::from("utf8"),
+            key_column: self.keyed.key_column.clone(),
+            key_column_type: String::from("utf8"),
             event_time_column: event_time,
             watermark_lag_ms: lag,
             window_kind: LocalWindowKind::Session {
@@ -402,7 +401,6 @@ impl SlidingWindowedStream {
 
     /// Execute with custom aggregates.
     pub fn collect_with_aggs(&self, agg_exprs: Vec<AggExpr>) -> Result<Vec<StreamBatch>> {
-        ensure_alpha_api("sliding_window")?;
         let event_time = event_time_column_for_keyed(&self.keyed)?;
         let lag = self
             .keyed
@@ -410,8 +408,8 @@ impl SlidingWindowedStream {
             .map(WatermarkSpec::lag_ms)
             .unwrap_or(0);
         let mut spec = LocalWindowExecutionSpec {
-                key_column: self.keyed.key_column.clone(),
-                key_column_type: String::from("utf8"),
+            key_column: self.keyed.key_column.clone(),
+            key_column_type: String::from("utf8"),
             event_time_column: event_time,
             watermark_lag_ms: lag,
             window_kind: LocalWindowKind::Sliding {

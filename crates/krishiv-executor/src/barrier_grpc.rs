@@ -84,7 +84,11 @@ impl ExecutorBarrierService {
             return Ok(());
         };
         match bearer_token_from_metadata(metadata) {
-            Some(actual) if constant_time_eq::constant_time_eq(actual.as_bytes(), expected.as_bytes()) => Ok(()),
+            Some(actual)
+                if constant_time_eq::constant_time_eq(actual.as_bytes(), expected.as_bytes()) =>
+            {
+                Ok(())
+            }
             Some(_) => Err(tonic::Status::unauthenticated(
                 "invalid barrier bearer token",
             )),

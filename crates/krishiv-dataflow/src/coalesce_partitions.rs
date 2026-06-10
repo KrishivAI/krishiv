@@ -55,8 +55,7 @@ pub fn coalesce_partition_batches(
             let merged = if group.len() == 1 {
                 group[0].clone()
             } else {
-                concat_batches(&schema, group)
-                    .map_err(|e| ExecError::Arrow(e.to_string()))?
+                concat_batches(&schema, group).map_err(|e| ExecError::Arrow(e.to_string()))?
             };
             outputs.push(merged);
             group_start = i + 1;

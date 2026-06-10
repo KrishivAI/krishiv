@@ -152,19 +152,17 @@ impl CepOperator {
             restored.insert(key, state);
         }
         self.states = restored;
-        if let Some(epoch_bytes) = backend.get(namespace, b"cep:epoch")? {
-            if epoch_bytes.len() >= 8 {
-                self.last_barrier_epoch = u64::from_le_bytes([
-                    epoch_bytes[0],
-                    epoch_bytes[1],
-                    epoch_bytes[2],
-                    epoch_bytes[3],
-                    epoch_bytes[4],
-                    epoch_bytes[5],
-                    epoch_bytes[6],
-                    epoch_bytes[7],
-                ]);
-            }
+        if let Some(epoch_bytes) = backend.get(namespace, b"cep:epoch")? && epoch_bytes.len() >= 8 {
+            self.last_barrier_epoch = u64::from_le_bytes([
+                epoch_bytes[0],
+                epoch_bytes[1],
+                epoch_bytes[2],
+                epoch_bytes[3],
+                epoch_bytes[4],
+                epoch_bytes[5],
+                epoch_bytes[6],
+                epoch_bytes[7],
+            ]);
         }
         Ok(())
     }

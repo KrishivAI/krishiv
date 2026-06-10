@@ -361,10 +361,7 @@ impl ExecutionBackend for DistributedBackend {
             sql = %flight_client::plan_to_sql(plan),
             "DistributedBackend: submitting plan via Flight SQL"
         );
-        krishiv_common::async_util::block_on(flight_client::execute_remote_plan(
-            &self.pool,
-            plan,
-        ))?;
+        krishiv_common::async_util::block_on(flight_client::execute_remote_plan(&self.pool, plan))?;
         Ok(ExecutionReport::new(
             self.backend_name(),
             plan.name(),
@@ -583,8 +580,16 @@ mod tests {
     #[test]
     fn local_job_registry_upsert_replaces_existing() {
         let mut reg = LocalJobRegistry::default();
-        reg.upsert(JobStatus::new(JobId::try_new("j1").unwrap(), "v1", JobState::Pending));
-        reg.upsert(JobStatus::new(JobId::try_new("j1").unwrap(), "v2", JobState::Running));
+        reg.upsert(JobStatus::new(
+            JobId::try_new("j1").unwrap(),
+            "v1",
+            JobState::Pending,
+        ));
+        reg.upsert(JobStatus::new(
+            JobId::try_new("j1").unwrap(),
+            "v2",
+            JobState::Running,
+        ));
         assert_eq!(reg.list().len(), 1);
         assert_eq!(reg.list()[0].name(), "v2");
         assert_eq!(reg.list()[0].state(), JobState::Running);
@@ -593,8 +598,16 @@ mod tests {
     #[test]
     fn local_job_registry_snapshot() {
         let mut reg = LocalJobRegistry::default();
-        reg.upsert(JobStatus::new(JobId::try_new("j1").unwrap(), "a", JobState::Pending));
-        reg.upsert(JobStatus::new(JobId::try_new("j2").unwrap(), "b", JobState::Running));
+        reg.upsert(JobStatus::new(
+            JobId::try_new("j1").unwrap(),
+            "a",
+            JobState::Pending,
+        ));
+        reg.upsert(JobStatus::new(
+            JobId::try_new("j2").unwrap(),
+            "b",
+            JobState::Running,
+        ));
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 2);
     }
@@ -604,10 +617,17 @@ mod tests {
         let mut reg = LocalJobRegistry::default();
         let ids = ["alpha", "beta", "gamma", "delta"];
         for id in &ids {
-            reg.upsert(JobStatus::new(JobId::try_new(*id).unwrap(), *id, JobState::Pending));
+            reg.upsert(JobStatus::new(
+                JobId::try_new(*id).unwrap(),
+                *id,
+                JobState::Pending,
+            ));
         }
-        let listed: std::collections::HashSet<String> =
-            reg.list().iter().map(|s| s.id().as_str().to_owned()).collect();
+        let listed: std::collections::HashSet<String> = reg
+            .list()
+            .iter()
+            .map(|s| s.id().as_str().to_owned())
+            .collect();
         for id in &ids {
             assert!(listed.contains(*id), "missing job {id}");
         }
@@ -617,9 +637,21 @@ mod tests {
     #[test]
     fn local_job_registry_snapshot_ordering_independent() {
         let mut reg = LocalJobRegistry::default();
-        reg.upsert(JobStatus::new(JobId::try_new("x").unwrap(), "x", JobState::Pending));
-        reg.upsert(JobStatus::new(JobId::try_new("y").unwrap(), "y", JobState::Running));
-        reg.upsert(JobStatus::new(JobId::try_new("x").unwrap(), "x2", JobState::Succeeded));
+        reg.upsert(JobStatus::new(
+            JobId::try_new("x").unwrap(),
+            "x",
+            JobState::Pending,
+        ));
+        reg.upsert(JobStatus::new(
+            JobId::try_new("y").unwrap(),
+            "y",
+            JobState::Running,
+        ));
+        reg.upsert(JobStatus::new(
+            JobId::try_new("x").unwrap(),
+            "x2",
+            JobState::Succeeded,
+        ));
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 2);
         let names: std::collections::HashSet<String> =

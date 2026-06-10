@@ -476,9 +476,9 @@ mod executor_tests {
                 .await
                 .unwrap();
         let response = client
-            .assign_task(wire::executor_task_assignment_to_wire(demo_assignment(
-                "task-network-1",
-            )).unwrap())
+            .assign_task(
+                wire::executor_task_assignment_to_wire(demo_assignment("task-network-1")).unwrap(),
+            )
             .await
             .unwrap()
             .into_inner();
@@ -503,18 +503,19 @@ mod executor_tests {
 
         let err = wire::v1::executor_task_server::ExecutorTask::assign_task(
             &service,
-            tonic::Request::new(wire::executor_task_assignment_to_wire(demo_assignment(
-                "task-auth-missing",
-            )).unwrap()),
+            tonic::Request::new(
+                wire::executor_task_assignment_to_wire(demo_assignment("task-auth-missing"))
+                    .unwrap(),
+            ),
         )
         .await
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
         assert_eq!(inbox.len().unwrap(), 0);
 
-        let mut request = tonic::Request::new(wire::executor_task_assignment_to_wire(
-            demo_assignment("task-auth-ok"),
-        ).unwrap());
+        let mut request = tonic::Request::new(
+            wire::executor_task_assignment_to_wire(demo_assignment("task-auth-ok")).unwrap(),
+        );
         request.metadata_mut().insert(
             "authorization",
             tonic::metadata::MetadataValue::from_static("Bearer task-secret"),
@@ -539,9 +540,10 @@ mod executor_tests {
 
         let err = wire::v1::executor_task_server::ExecutorTask::assign_task(
             &service,
-            tonic::Request::new(wire::executor_task_assignment_to_wire(demo_assignment(
-                "task-auth-misconfigured",
-            )).unwrap()),
+            tonic::Request::new(
+                wire::executor_task_assignment_to_wire(demo_assignment("task-auth-misconfigured"))
+                    .unwrap(),
+            ),
         )
         .await
         .unwrap_err();
@@ -2374,8 +2376,8 @@ mod executor_tests {
         );
     }
 
-    use krishiv_state::checkpoint::{CheckpointStorage, LocalFsCheckpointStorage, snapshot_path};
     use krishiv_proto::InitiateCheckpointRequest;
+    use krishiv_state::checkpoint::{CheckpointStorage, LocalFsCheckpointStorage, snapshot_path};
     use krishiv_state::{FjallStateBackend, StateBackend};
 
     use crate::runner::TaskRunner;
@@ -2426,11 +2428,17 @@ mod executor_tests {
             })
         }
 
-        fn read_bytes(&self, _path: &str) -> krishiv_state::checkpoint::CheckpointResult<Option<Vec<u8>>> {
+        fn read_bytes(
+            &self,
+            _path: &str,
+        ) -> krishiv_state::checkpoint::CheckpointResult<Option<Vec<u8>>> {
             Ok(None)
         }
 
-        fn list_dir(&self, _prefix: &str) -> krishiv_state::checkpoint::CheckpointResult<Vec<String>> {
+        fn list_dir(
+            &self,
+            _prefix: &str,
+        ) -> krishiv_state::checkpoint::CheckpointResult<Vec<String>> {
             Ok(Vec::new())
         }
 
@@ -2518,8 +2526,16 @@ mod executor_tests {
         let task_id = TaskId::try_new("task-cp-offset").unwrap();
         let job_id = JobId::try_new("job-cp-offset").unwrap();
         let mut runner = TaskRunner::new(task_id.clone()).with_kafka_source_offsets(vec![
-            KafkaOffset { topic: "events".into(), partition: 0, offset: 42 },
-            KafkaOffset { topic: "events".into(), partition: 1, offset: 7 },
+            KafkaOffset {
+                topic: "events".into(),
+                partition: 0,
+                offset: 42,
+            },
+            KafkaOffset {
+                topic: "events".into(),
+                partition: 1,
+                offset: 7,
+            },
         ]);
         let backend = FjallStateBackend::ephemeral().unwrap();
 
@@ -3149,10 +3165,12 @@ mod executor_tests {
         use std::sync::Arc;
 
         // First drain: single event in [0, 10000).  Window not yet emitted.
-        let batch1 = krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![500_i64]);
+        let batch1 =
+            krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![500_i64]);
 
         // Second drain: event that advances watermark past 10000, closing the window.
-        let batch2 = krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![15_000_i64]);
+        let batch2 =
+            krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![15_000_i64]);
 
         // The runner is CLONED between drains to simulate a re-used runner; its
         // `loop_executors` Arc is shared so state survives.

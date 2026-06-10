@@ -17,8 +17,9 @@ use krishiv_sql::policy::PolicyEnforcingSqlEngine;
 
 /// A global capture sink. Tests filter events by unique principal name to
 /// avoid cross-test interference from parallel execution.
-static CAPTURED_EVENTS: std::sync::LazyLock<std::sync::Mutex<Vec<krishiv_plan::governance::AuditEvent>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+static CAPTURED_EVENTS: std::sync::LazyLock<
+    std::sync::Mutex<Vec<krishiv_plan::governance::AuditEvent>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 struct GlobalCaptureAuditSink;
 

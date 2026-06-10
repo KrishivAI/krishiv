@@ -375,10 +375,14 @@ impl CdcToLakehousePipeline {
             ));
         }
         if self.iceberg_catalog.trim().is_empty() {
-            return Err(ConnectorError::Cdc("iceberg_catalog must not be empty".into()));
+            return Err(ConnectorError::Cdc(
+                "iceberg_catalog must not be empty".into(),
+            ));
         }
         if self.iceberg_table.trim().is_empty() {
-            return Err(ConnectorError::Cdc("iceberg_table must not be empty".into()));
+            return Err(ConnectorError::Cdc(
+                "iceberg_table must not be empty".into(),
+            ));
         }
         if self.primary_key_columns.is_empty()
             || self
@@ -401,14 +405,18 @@ impl CdcToLakehousePipeline {
             ));
         }
         if self.batch_size == 0 {
-            return Err(ConnectorError::Cdc("batch_size must be greater than zero".into()));
+            return Err(ConnectorError::Cdc(
+                "batch_size must be greater than zero".into(),
+            ));
         }
         if self
             .schema_registry_url
             .as_deref()
             .is_some_and(|url| url.trim().is_empty())
         {
-            return Err(ConnectorError::Cdc("schema_registry_url must not be blank".into()));
+            return Err(ConnectorError::Cdc(
+                "schema_registry_url must not be blank".into(),
+            ));
         }
         #[cfg(not(feature = "schema-registry"))]
         if self.schema_registry_url.is_some() {
@@ -639,9 +647,7 @@ impl CdcToLakehousePipeline {
                         record.offset,
                     )
                     .map_err(|e| {
-                        ConnectorError::Cdc(format!(
-                            "Debezium parse error at batch index {i}: {e}"
-                        ))
+                        ConnectorError::Cdc(format!("Debezium parse error at batch index {i}: {e}"))
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -741,10 +747,9 @@ impl CdcSchemaEvolutionState {
                 batch.schema()
             }
         };
-        let normalized =
-            crate::schema_normalize::SchemaNormalizeOperator::new(merged.clone())
-                .normalize(&batch)
-                .map_err(|e| e.to_string())?;
+        let normalized = crate::schema_normalize::SchemaNormalizeOperator::new(merged.clone())
+            .normalize(&batch)
+            .map_err(|e| e.to_string())?;
         self.schema = Some(merged);
         Ok(normalized)
     }
@@ -1084,7 +1089,9 @@ impl KafkaCdcConfig {
     /// missing or inconsistent.
     pub fn validate(&self) -> Result<(), ConnectorError> {
         if self.bootstrap_servers.is_empty() {
-            return Err(ConnectorError::Cdc("bootstrap_servers must not be empty".into()));
+            return Err(ConnectorError::Cdc(
+                "bootstrap_servers must not be empty".into(),
+            ));
         }
         if self.group_id.is_empty() {
             return Err(ConnectorError::Cdc("group_id must not be empty".into()));
@@ -1489,7 +1496,8 @@ mod tests {
         .with_batch_size(0);
         let err = zero_batch.validate().unwrap_err();
         assert!(
-            err.to_string().contains("batch_size must be greater than zero"),
+            err.to_string()
+                .contains("batch_size must be greater than zero"),
             "unexpected error: {err}"
         );
 
@@ -1502,7 +1510,8 @@ mod tests {
         );
         let err = duplicate_keys.validate().unwrap_err();
         assert!(
-            err.to_string().contains("primary_key_columns must not contain duplicates"),
+            err.to_string()
+                .contains("primary_key_columns must not contain duplicates"),
             "unexpected error: {err}"
         );
     }
@@ -2078,6 +2087,9 @@ mod tests {
         );
         let result = pipeline.run().await;
         let err = result.expect_err("run() without durable sink must return Err");
-        assert!(err.to_string().contains("cannot prove downstream durability"));
+        assert!(
+            err.to_string()
+                .contains("cannot prove downstream durability")
+        );
     }
 }

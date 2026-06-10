@@ -14,7 +14,9 @@ use object_store::ObjectStore;
 use object_store::ObjectStoreExt as _;
 use object_store::path::Path as ObjectPath;
 
-use crate::checkpoint::{CheckpointError, CheckpointResult, CheckpointStorage, run_blocking_on_tokio};
+use crate::checkpoint::{
+    CheckpointError, CheckpointResult, CheckpointStorage, run_blocking_on_tokio,
+};
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(300);
 

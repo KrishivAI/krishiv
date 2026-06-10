@@ -105,9 +105,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use crate::lakehouse::{
-        IcebergTableRef, MemoryLakehouseTable, SchemaField, SchemaVersion,
-    };
+    use crate::lakehouse::{IcebergTableRef, MemoryLakehouseTable, SchemaField, SchemaVersion};
 
     use super::*;
 

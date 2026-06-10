@@ -199,8 +199,9 @@ mod tests {
     fn streaming_spec_from_window_node() {
         let spec = WindowExecutionSpec::tumbling("user_id", "ts", 60_000);
         let plan = PhysicalPlan::new("events", ExecutionKind::Streaming).with_node(
-            PlanNode::new("w", "win", ExecutionKind::Streaming)
-                .with_op(NodeOp::Window { spec: Box::new(spec) }),
+            PlanNode::new("w", "win", ExecutionKind::Streaming).with_op(NodeOp::Window {
+                spec: Box::new(spec),
+            }),
         );
         let local_spec = streaming_spec_from_plan(&plan).expect("spec");
         assert_eq!(local_spec.key_column, "user_id");

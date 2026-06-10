@@ -328,9 +328,10 @@ mod tests {
     /// joined thread's panic) rather than `block_in_place`.
     #[tokio::test]
     async fn run_blocking_converts_closure_panic_to_internal_status() {
-        let result: Result<i32, Status> = run_blocking(|| -> Result<i32, krishiv_runtime::RuntimeError> {
-            panic!("intentional panic from run_blocking test")
-        });
+        let result: Result<i32, Status> =
+            run_blocking(|| -> Result<i32, krishiv_runtime::RuntimeError> {
+                panic!("intentional panic from run_blocking test")
+            });
         let status = result.expect_err("a panicking closure must surface as an error");
         assert_eq!(status.code(), tonic::Code::Internal);
         assert!(

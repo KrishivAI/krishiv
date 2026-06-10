@@ -1,21 +1,20 @@
 //! Connector driver registry.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use super::descriptor::ConnectorDescriptor;
-use super::driver::{
-    OpenedTwoPhaseSink, SharedSinkDriver, SharedSourceDriver, SharedTwoPhaseSinkDriver,
-};
 #[cfg(feature = "vector-sinks")]
 use super::driver::SharedVectorSinkDriver;
+use super::driver::{
+    OpenSinkFuture, OpenSourceFuture, OpenTwoPhaseSinkFuture,
+    SharedSinkDriver, SharedSourceDriver, SharedTwoPhaseSinkDriver,
+};
+#[cfg(feature = "vector-sinks")]
+use super::driver::OpenVectorSinkFuture;
 use super::kind::{ConnectorKind, ConnectorRole};
 use crate::config::ConnectorConfig;
 use crate::error::{ConnectorError, ConnectorResult};
-use crate::sink::DynSink;
-use crate::source::DynSource;
 
 /// Registry of connector drivers keyed by [`ConnectorKind`] and role.
 #[derive(Default)]
@@ -63,20 +62,23 @@ impl ConnectorRegistry {
 
     pub fn validate_source(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
         let kind = ConnectorKind::parse(&config.kind)?;
-        let driver = self.sources.get(&kind).ok_or_else(|| ConnectorError::Config {
-            message: format!(
-                "no source driver registered for kind '{}'",
-                config.kind
-            ),
-        })?;
+        let driver = self
+            .sources
+            .get(&kind)
+            .ok_or_else(|| ConnectorError::Config {
+                message: format!("no source driver registered for kind '{}'", config.kind),
+            })?;
         driver.validate(config)
     }
 
     pub fn validate_sink(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
         let kind = ConnectorKind::parse(&config.kind)?;
-        let driver = self.sinks.get(&kind).ok_or_else(|| ConnectorError::Config {
-            message: format!("no sink driver registered for kind '{}'", config.kind),
-        })?;
+        let driver = self
+            .sinks
+            .get(&kind)
+            .ok_or_else(|| ConnectorError::Config {
+                message: format!("no sink driver registered for kind '{}'", config.kind),
+            })?;
         driver.validate(config)
     }
 
@@ -91,7 +93,7 @@ impl ConnectorRegistry {
     pub fn open_source<'a>(
         &'a self,
         config: &'a ConnectorConfig,
-    ) -> Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSource>>> + Send + 'a>> {
+    ) -> OpenSourceFuture<'a> {
         match self.lookup_source(config) {
             Ok(driver) => driver.open(config),
             Err(error) => Box::pin(async move { Err(error) }),
@@ -101,7 +103,7 @@ impl ConnectorRegistry {
     pub fn open_sink<'a>(
         &'a self,
         config: &'a ConnectorConfig,
-    ) -> Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSink>>> + Send + 'a>> {
+    ) -> OpenSinkFuture<'a> {
         match self.lookup_sink(config) {
             Ok(driver) => driver.open(config),
             Err(error) => Box::pin(async move { Err(error) }),
@@ -111,7 +113,7 @@ impl ConnectorRegistry {
     pub fn open_two_phase_sink<'a>(
         &'a self,
         config: &'a ConnectorConfig,
-    ) -> Pin<Box<dyn Future<Output = ConnectorResult<OpenedTwoPhaseSink>> + Send + 'a>> {
+    ) -> OpenTwoPhaseSinkFuture<'a> {
         match self.lookup_two_phase_sink(config) {
             Ok(driver) => driver.open(config),
             Err(error) => Box::pin(async move { Err(error) }),
@@ -122,11 +124,7 @@ impl ConnectorRegistry {
     pub fn open_vector_sink<'a>(
         &'a self,
         config: &'a ConnectorConfig,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = ConnectorResult<Arc<dyn crate::vector::VectorSink>>> + Send + 'a,
-        >,
-    > {
+    ) -> OpenVectorSinkFuture<'a> {
         match self.lookup_vector_sink(config) {
             Ok(driver) => driver.open(config),
             Err(error) => Box::pin(async move { Err(error) }),
@@ -135,12 +133,11 @@ impl ConnectorRegistry {
 
     fn lookup_source(&self, config: &ConnectorConfig) -> ConnectorResult<&SharedSourceDriver> {
         let kind = ConnectorKind::parse(&config.kind)?;
-        self.sources.get(&kind).ok_or_else(|| ConnectorError::Config {
-            message: format!(
-                "no source driver registered for kind '{}'",
-                config.kind
-            ),
-        })
+        self.sources
+            .get(&kind)
+            .ok_or_else(|| ConnectorError::Config {
+                message: format!("no source driver registered for kind '{}'", config.kind),
+            })
     }
 
     fn lookup_sink(&self, config: &ConnectorConfig) -> ConnectorResult<&SharedSinkDriver> {
@@ -155,14 +152,14 @@ impl ConnectorRegistry {
         config: &ConnectorConfig,
     ) -> ConnectorResult<&SharedTwoPhaseSinkDriver> {
         let kind = ConnectorKind::parse(&config.kind)?;
-        self.two_phase_sinks.get(&kind).ok_or_else(|| {
-            ConnectorError::Config {
+        self.two_phase_sinks
+            .get(&kind)
+            .ok_or_else(|| ConnectorError::Config {
                 message: format!(
                     "no two-phase sink driver registered for kind '{}'",
                     config.kind
                 ),
-            }
-        })
+            })
     }
 
     #[cfg(feature = "vector-sinks")]
@@ -171,14 +168,14 @@ impl ConnectorRegistry {
         config: &ConnectorConfig,
     ) -> ConnectorResult<&SharedVectorSinkDriver> {
         let kind = ConnectorKind::parse(&config.kind)?;
-        self.vector_sinks.get(&kind).ok_or_else(|| {
-            ConnectorError::Config {
+        self.vector_sinks
+            .get(&kind)
+            .ok_or_else(|| ConnectorError::Config {
                 message: format!(
                     "no vector sink driver registered for kind '{}'",
                     config.kind
                 ),
-            }
-        })
+            })
     }
 
     /// Return descriptors for all registered drivers.
@@ -196,11 +193,7 @@ impl ConnectorRegistry {
             .collect();
         #[cfg(feature = "vector-sinks")]
         {
-            out.extend(
-                self.vector_sinks
-                    .values()
-                    .map(|driver| driver.descriptor()),
-            );
+            out.extend(self.vector_sinks.values().map(|driver| driver.descriptor()));
         }
         out.sort_by(|left, right| {
             role_rank(left.role)
@@ -239,9 +232,7 @@ pub fn default_registry() -> ConnectorRegistry {
     registry.register_sink(Arc::new(super::drivers::ParquetSinkDriver));
     registry.register_source(Arc::new(super::drivers::S3SourceDriver));
     registry.register_sink(Arc::new(super::drivers::S3SinkDriver));
-    registry.register_two_phase_sink(Arc::new(
-        super::drivers::LocalParquetTwoPhaseSinkDriver,
-    ));
+    registry.register_two_phase_sink(Arc::new(super::drivers::LocalParquetTwoPhaseSinkDriver));
     #[cfg(feature = "kafka")]
     {
         registry.register_source(Arc::new(super::drivers::KafkaSourceDriver));

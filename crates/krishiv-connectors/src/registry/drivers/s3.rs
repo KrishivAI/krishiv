@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
 
 use crate::capabilities::ConnectorCapabilities;
 use crate::config::ConnectorConfig;
@@ -28,12 +28,12 @@ fn local_object_store(config: &ConnectorConfig) -> ConnectorResult<Arc<dyn Objec
         })?;
     let root = PathBuf::from(base);
     std::fs::create_dir_all(&root).map_err(ConnectorError::Io)?;
-    Ok(Arc::new(LocalFileSystem::new_with_prefix(root).map_err(|e| {
-        ConnectorError::ObjectStore {
+    Ok(Arc::new(LocalFileSystem::new_with_prefix(root).map_err(
+        |e| ConnectorError::ObjectStore {
             message: format!("failed to open local object store at '{base}': {e}"),
             status: None,
-        }
-    })?))
+        },
+    )?))
 }
 
 fn object_path(config: &ConnectorConfig) -> ConnectorResult<ObjectPath> {

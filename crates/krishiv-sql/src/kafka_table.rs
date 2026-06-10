@@ -161,4 +161,3 @@ pub fn create_kafka_streaming_table(
     let table = StreamingTable::try_new(schema, vec![partition])?;
     Ok(Arc::new(table))
 }
-

@@ -25,8 +25,8 @@ use arrow::compute::take;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use std::hash::Hasher;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Splits an Arrow `RecordBatch` into N buckets by hashing one key column.
 ///
@@ -321,7 +321,11 @@ mod tests {
         let batch = batch_with_nulls();
         let buckets = partitioner.partition(&batch).unwrap();
 
-        assert_eq!(buckets.len(), 4, "partition count must match requested buckets");
+        assert_eq!(
+            buckets.len(),
+            4,
+            "partition count must match requested buckets"
+        );
         assert_eq!(
             partitioner.null_key_count(),
             3,

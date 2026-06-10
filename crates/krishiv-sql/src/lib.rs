@@ -89,10 +89,8 @@ impl PlanCache {
     }
 
     fn insert(&mut self, key: String, plan: datafusion::logical_expr::LogicalPlan) {
-        if self.map.len() >= self.max {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
+        if self.map.len() >= self.max && let Some(oldest) = self.order.pop_front() {
+            self.map.remove(&oldest);
         }
         self.order.push_back(key.clone());
         self.map.insert(key, plan);
@@ -209,7 +207,9 @@ pub fn streaming_match_recognize_limit_from_env() -> usize {
 /// When `target_partitions > 1`, round-robin repartitioning is enabled so
 /// DataFusion can balance work across threads for hash-join build,
 /// aggregation spill, and parquet scan parallelism.
-fn build_single_node_session_config(target_partitions: NonZeroUsize) -> datafusion::prelude::SessionConfig {
+fn build_single_node_session_config(
+    target_partitions: NonZeroUsize,
+) -> datafusion::prelude::SessionConfig {
     let tp = target_partitions.get();
     let mut config = datafusion::prelude::SessionConfig::new()
         .with_target_partitions(tp)
@@ -291,7 +291,11 @@ impl SqlEngine {
     /// DataFusion `target_partitions` defaults to 1 (single-threaded local
     /// execution). Use [`SqlEngine::with_target_parallelism`] to override.
     pub fn new() -> Self {
-        match Self::build_local(None, WindowFnRegistration::Register, NonZeroUsize::new(1).unwrap()) {
+        match Self::build_local(
+            None,
+            WindowFnRegistration::Register,
+            NonZeroUsize::new(1).unwrap(),
+        ) {
             Ok(engine) => engine,
             Err(err) => {
                 tracing::warn!(
@@ -299,8 +303,12 @@ impl SqlEngine {
                     "SqlEngine::new: window helper UDF registration failed; \
                      window SQL functions will be unavailable, other queries are unaffected"
                 );
-                Self::build_local(None, WindowFnRegistration::Skip, NonZeroUsize::new(1).unwrap())
-                    .expect("SqlEngine::build_local with WindowFnRegistration::Skip is infallible")
+                Self::build_local(
+                    None,
+                    WindowFnRegistration::Skip,
+                    NonZeroUsize::new(1).unwrap(),
+                )
+                .expect("SqlEngine::build_local with WindowFnRegistration::Skip is infallible")
             }
         }
     }
@@ -310,7 +318,11 @@ impl SqlEngine {
     /// Callers that need to abort startup when window functions cannot be
     /// registered should use this constructor.
     pub fn try_new() -> SqlResult<Self> {
-        Self::build_local(None, WindowFnRegistration::Register, NonZeroUsize::new(1).unwrap())
+        Self::build_local(
+            None,
+            WindowFnRegistration::Register,
+            NonZeroUsize::new(1).unwrap(),
+        )
     }
 
     /// Create an engine whose `krishiv` catalog resolves tables registered in `InMemoryCatalog` (P0-10).
@@ -325,7 +337,11 @@ impl SqlEngine {
                 ),
             });
         }
-        Self::build_local(Some(catalog), WindowFnRegistration::Register, NonZeroUsize::new(1).unwrap())
+        Self::build_local(
+            Some(catalog),
+            WindowFnRegistration::Register,
+            NonZeroUsize::new(1).unwrap(),
+        )
     }
 
     /// Set the DataFusion `target_partitions` parallelism level for this engine.
@@ -346,7 +362,10 @@ impl SqlEngine {
 
     /// Return the current `shuffle.partitions` override, if set via `SET shuffle.partitions = N`.
     pub fn shuffle_partitions(&self) -> Option<u32> {
-        *self.shuffle_partitions.read().unwrap_or_else(|e| e.into_inner())
+        *self
+            .shuffle_partitions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Return access to the table row-count registry.
@@ -1024,14 +1043,12 @@ impl SqlEngine {
             .register_parquet(table_name, path, ParquetReadOptions::default())
             .await?;
         // Extract estimated row count from table provider statistics.
-        if let Ok(provider) = self.context.table_provider(table_name).await {
-            if let Some(stats) = provider.statistics() {
-                if let Some(n) = stats.num_rows.get_value() {
-                    if let Ok(mut counts) = self.table_row_counts.write() {
-                        counts.insert(table_name.to_string(), *n as u64);
-                    }
-                }
-            }
+        if let Ok(provider) = self.context.table_provider(table_name).await
+            && let Some(stats) = provider.statistics()
+            && let Some(n) = stats.num_rows.get_value()
+            && let Ok(mut counts) = self.table_row_counts.write()
+        {
+            counts.insert(table_name.to_string(), *n as u64);
         }
         if let Some(ref reg) = self.view_registry
             && let Ok(mut r) = reg.lock()
@@ -1097,10 +1114,8 @@ impl SqlEngine {
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
-        if total_rows > 0 {
-            if let Ok(mut counts) = self.table_row_counts.write() {
-                counts.insert(table_name.to_string(), total_rows as u64);
-            }
+        if total_rows > 0 && let Ok(mut counts) = self.table_row_counts.write() {
+            counts.insert(table_name.to_string(), total_rows as u64);
         }
         if let Some(ref reg) = self.view_registry
             && let Ok(mut r) = reg.lock()
@@ -1160,14 +1175,20 @@ impl SqlEngine {
         // ── Intercept SET shuffle.partitions = N ─────────────────────────────
         // Krishiv-specific session config; DataFusion does not know about it.
         let trimmed = query.trim();
-        if trimmed.to_ascii_uppercase().starts_with("SET SHUFFLE.PARTITIONS") {
+        if trimmed
+            .to_ascii_uppercase()
+            .starts_with("SET SHUFFLE.PARTITIONS")
+        {
             let value = trimmed.split('=').nth(1).map(|s| s.trim()).unwrap_or("");
             match value.parse::<u32>() {
                 Ok(n) if n > 0 => {
                     {
-                        let mut guard = self.shuffle_partitions.write().map_err(|e| {
-                            SqlError::DataFusion { message: e.to_string() }
-                        })?;
+                        let mut guard =
+                            self.shuffle_partitions
+                                .write()
+                                .map_err(|e| SqlError::DataFusion {
+                                    message: e.to_string(),
+                                })?;
                         *guard = Some(n);
                     }
                     let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
@@ -1179,9 +1200,12 @@ impl SqlEngine {
                 }
                 Ok(_) => {
                     {
-                        let mut guard = self.shuffle_partitions.write().map_err(|e| {
-                            SqlError::DataFusion { message: e.to_string() }
-                        })?;
+                        let mut guard =
+                            self.shuffle_partitions
+                                .write()
+                                .map_err(|e| SqlError::DataFusion {
+                                    message: e.to_string(),
+                                })?;
                         *guard = None;
                     }
                     let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
@@ -1276,20 +1300,18 @@ impl SqlEngine {
                 .context
                 .sql("SELECT * FROM _krishiv_merge_result")
                 .await?;
-            return Ok(SqlDataFrame::new(
-                "merge",
-                dataframe,
-                self.table_row_counts(),
-            )
-            .with_query(query));
+            return Ok(
+                SqlDataFrame::new("merge", dataframe, self.table_row_counts()).with_query(query),
+            );
         }
 
         // ── Intercept MATCH_RECOGNIZE ─────────────────────────────────────────
         // DataFusion does not parse MATCH_RECOGNIZE. Route it through the CEP
         // path: parse → run PatternMatcher on the source table → return results.
-        if query.to_ascii_uppercase().contains(" MATCH_RECOGNIZE ") {
-            if let Some(stmt) = cep_sql::parse_match_recognize(query)? {
-                let is_streaming = self.is_streaming_source(&stmt.source_table);
+        if query.to_ascii_uppercase().contains(" MATCH_RECOGNIZE ")
+            && let Some(stmt) = cep_sql::parse_match_recognize(query)?
+        {
+            let is_streaming = self.is_streaming_source(&stmt.source_table);
                 // For streaming sources collect a bounded window of recent events
                 // (capped at the configured limit) so the query terminates. The
                 // cap is configurable through `KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT`
@@ -1327,9 +1349,9 @@ impl SqlEngine {
                     .context
                     .sql("SELECT * FROM _krishiv_cep_result")
                     .await?;
-                return Ok(SqlDataFrame::new("cep", dataframe, self.table_row_counts())
-                    .with_query(query));
-            }
+                return Ok(
+                    SqlDataFrame::new("cep", dataframe, self.table_row_counts()).with_query(query)
+                );
         }
 
         let (rewritten, as_ofs) =
@@ -1343,7 +1365,11 @@ impl SqlEngine {
         // Single-lock design: lookup and insert share the same Mutex<PlanCache>,
         // eliminating the TOCTOU race of the previous DashMap + VecDeque approach.
         let can_cache = as_ofs.is_empty();
-        let shuffle_override = self.shuffle_partitions.read().map(|g| *g).unwrap_or_else(|e| *e.into_inner());
+        let shuffle_override = self
+            .shuffle_partitions
+            .read()
+            .map(|g| *g)
+            .unwrap_or_else(|e| *e.into_inner());
         if can_cache {
             // Scope the guard so it is dropped before any .await point.
             let cached_plan: Option<datafusion::logical_expr::LogicalPlan> = self
@@ -1354,9 +1380,11 @@ impl SqlEngine {
                 .cloned();
             if let Some(plan) = cached_plan {
                 let dataframe = self.context.execute_logical_plan(plan).await?;
-                return Ok(SqlDataFrame::new("sql-query", dataframe, self.table_row_counts())
-                    .with_query(rewritten)
-                    .with_shuffle_partitions(shuffle_override));
+                return Ok(
+                    SqlDataFrame::new("sql-query", dataframe, self.table_row_counts())
+                        .with_query(rewritten)
+                        .with_shuffle_partitions(shuffle_override),
+                );
             }
         }
 
@@ -1365,18 +1393,15 @@ impl SqlEngine {
         // After CREATE EXTERNAL TABLE DDL, try to extract row-count statistics
         // from the newly registered table provider so `BroadcastAutoRule` can
         // fire for small connector-backed tables (e.g. Parquet/S3 via DDL).
-        if let Some(table_name) = extract_create_external_table_name(&rewritten) {
-            if !table_name.is_empty() {
-                if let Ok(provider) = self.context.table_provider(&table_name).await {
-                    let maybe_rows = provider
-                        .statistics()
-                        .and_then(|s| s.num_rows.get_value().copied());
-                    if let Some(n) = maybe_rows {
-                        if let Ok(mut counts) = self.table_row_counts.write() {
-                            counts.entry(table_name).or_insert(n as u64);
-                        }
-                    }
-                }
+        if let Some(table_name) = extract_create_external_table_name(&rewritten)
+            && !table_name.is_empty()
+            && let Ok(provider) = self.context.table_provider(&table_name).await
+        {
+            let maybe_rows = provider
+                .statistics()
+                .and_then(|s| s.num_rows.get_value().copied());
+            if let Some(n) = maybe_rows && let Ok(mut counts) = self.table_row_counts.write() {
+                counts.entry(table_name).or_insert(n as u64);
             }
         }
 
@@ -1389,9 +1414,11 @@ impl SqlEngine {
             }
         }
 
-        Ok(SqlDataFrame::new("sql-query", dataframe, self.table_row_counts())
-            .with_query(rewritten)
-            .with_shuffle_partitions(shuffle_override))
+        Ok(
+            SqlDataFrame::new("sql-query", dataframe, self.table_row_counts())
+                .with_query(rewritten)
+                .with_shuffle_partitions(shuffle_override),
+        )
     }
 
     /// Execute `query` with materialized view cache lookup.
@@ -1543,8 +1570,7 @@ fn df_plan_to_krishiv_nodes(
             let (mut nodes, input_id) =
                 df_plan_to_krishiv_nodes(&agg.input, table_row_counts, counter);
             let id = format!("agg-{idx}");
-            let group_keys: Vec<String> =
-                agg.group_expr.iter().map(|e| e.to_string()).collect();
+            let group_keys: Vec<String> = agg.group_expr.iter().map(|e| e.to_string()).collect();
             nodes.push(
                 PlanNode::new(&id, "Aggregate", ExecutionKind::Batch)
                     .with_op(NodeOp::Aggregate { group_keys })
@@ -1584,7 +1610,14 @@ fn df_plan_to_krishiv_nodes(
             nodes.push(
                 PlanNode::new(&id, "Sort", ExecutionKind::Batch)
                     .with_op(NodeOp::Other {
-                        description: format!("Sort({})", sort.expr.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ")),
+                        description: format!(
+                            "Sort({})",
+                            sort.expr
+                                .iter()
+                                .map(|e| e.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
                     })
                     .with_inputs([input_id]),
             );
@@ -1668,8 +1701,8 @@ fn df_plan_to_krishiv_nodes(
 
         DfPlan::EmptyRelation(_) => {
             let id = format!("empty-{idx}");
-            let node = PlanNode::new(&id, "EmptyRelation", ExecutionKind::Batch)
-                .with_op(NodeOp::Other {
+            let node =
+                PlanNode::new(&id, "EmptyRelation", ExecutionKind::Batch).with_op(NodeOp::Other {
                     description: "EmptyRelation".to_string(),
                 });
             (vec![node], id)
@@ -1739,7 +1772,10 @@ impl SqlDataFrame {
     /// being returned.
     pub fn krishiv_logical_plan(&self) -> LogicalPlan {
         let df_plan = self.dataframe.logical_plan();
-        let counts = self.table_row_counts.read().unwrap_or_else(|e| e.into_inner());
+        let counts = self
+            .table_row_counts
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let mut counter = 0usize;
         let (nodes, _root_id) = df_plan_to_krishiv_nodes(df_plan, &counts, &mut counter);
 
@@ -1854,8 +1890,9 @@ impl KrishivDataFrameOps for SqlDataFrame {
     }
     fn krishiv_logical_plan(&self) -> LogicalPlan {
         let label = self.dataframe.logical_plan().to_string();
-        let mut plan = LogicalPlan::new(self.name.clone(), ExecutionKind::Batch)
-            .with_node(PlanNode::new("datafusion-logical", label, ExecutionKind::Batch));
+        let mut plan = LogicalPlan::new(self.name.clone(), ExecutionKind::Batch).with_node(
+            PlanNode::new("datafusion-logical", label, ExecutionKind::Batch),
+        );
         if let Some(n) = self.shuffle_partitions {
             plan = plan.with_shuffle_partitions(Some(n));
         }

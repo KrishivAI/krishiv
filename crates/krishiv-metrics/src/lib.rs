@@ -630,7 +630,9 @@ impl KrishivMetrics {
         out.push_str(&format!("krishiv_tasks_running {running}\n"));
 
         let executor_lost = self.executor_lost.load(Ordering::Relaxed);
-        out.push_str("# HELP krishiv_executor_lost_total Executors marked lost (heartbeat timeout)\n");
+        out.push_str(
+            "# HELP krishiv_executor_lost_total Executors marked lost (heartbeat timeout)\n",
+        );
         out.push_str("# TYPE krishiv_executor_lost_total counter\n");
         out.push_str(&format!("krishiv_executor_lost_total {executor_lost}\n"));
 

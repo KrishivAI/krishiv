@@ -219,10 +219,11 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
                 let keep_mask: BooleanArray = (0..batch.num_rows())
                     .map(|i| Some(result.accepted_indices.contains(&i)))
                     .collect();
-                filtered = arrow::compute::filter_record_batch(batch, &keep_mask)
-                    .map_err(|e| ConnectorError::Schema {
+                filtered = arrow::compute::filter_record_batch(batch, &keep_mask).map_err(|e| {
+                    ConnectorError::Schema {
                         message: e.to_string(),
-                    })?;
+                    }
+                })?;
                 &filtered
             }
         } else {
@@ -263,9 +264,9 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
         writer.write(batch).map_err(|e| {
             ConnectorError::Parquet(format!("parquet 2pc prepare: write error: {e}"))
         })?;
-        writer
-            .close()
-            .map_err(|e| ConnectorError::Parquet(format!("parquet 2pc prepare: close error: {e}")))?;
+        writer.close().map_err(|e| {
+            ConnectorError::Parquet(format!("parquet 2pc prepare: close error: {e}"))
+        })?;
 
         Ok(ParquetCommitHandle {
             epoch,

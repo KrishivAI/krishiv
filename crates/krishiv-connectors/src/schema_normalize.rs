@@ -61,10 +61,7 @@ impl SchemaNormalizeOperator {
                 .is_some()
             {
                 return Err(ConnectorError::Schema {
-                    message: format!(
-                        "source schema contains duplicate column {}",
-                        field.name()
-                    ),
+                    message: format!("source schema contains duplicate column {}", field.name()),
                 });
             }
         }
@@ -86,8 +83,9 @@ impl SchemaNormalizeOperator {
             };
             columns.push(value);
         }
-        RecordBatch::try_new(self.target.clone(), columns)
-            .map_err(|e| ConnectorError::Schema { message: e.to_string() })
+        RecordBatch::try_new(self.target.clone(), columns).map_err(|e| ConnectorError::Schema {
+            message: e.to_string(),
+        })
     }
 
     fn cast_column(col: &ArrayRef, target_field: &Field) -> ConnectorResult<ArrayRef> {

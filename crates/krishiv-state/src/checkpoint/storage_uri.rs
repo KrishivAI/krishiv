@@ -5,7 +5,9 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 
 use crate::checkpoint::ObjectStoreCheckpointStorage;
-use crate::checkpoint::{CheckpointError, CheckpointResult, CheckpointStorage, LocalFsCheckpointStorage};
+use crate::checkpoint::{
+    CheckpointError, CheckpointResult, CheckpointStorage, LocalFsCheckpointStorage,
+};
 
 /// Open checkpoint storage for a configured path or URI.
 ///

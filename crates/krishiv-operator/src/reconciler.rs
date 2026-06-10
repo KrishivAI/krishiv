@@ -131,20 +131,19 @@ impl KrishivJobReconciler {
             // If scheduler_job_id fails (e.g. empty name via admission bypass) we
             // still strip the finalizer so the resource is never permanently stuck
             // in Terminating.
-            if let Ok(job_id) = scheduler_job_id(resource) {
-                if let Err(error) = coordinator.cancel_job(&job_id) {
-                    // UnknownJob is expected when the coordinator restarted without
-                    // durable state; surface anything else so the operator does
-                    // not get stuck in Terminating.
-                    if !matches!(error, SchedulerError::UnknownJob { .. }) {
-                        tracing::warn!(
-                            job_id = %job_id,
-                            error = %error,
-                            "coordinator.cancel_job failed during finalizer cleanup; \
-                             CRD may stay in Terminating until next reconcile"
-                        );
-                    }
-                }
+            if let Ok(job_id) = scheduler_job_id(resource)
+                && let Err(error) = coordinator.cancel_job(&job_id)
+                && !matches!(error, SchedulerError::UnknownJob { .. })
+            {
+                // UnknownJob is expected when the coordinator restarted without
+                // durable state; surface anything else so the operator does
+                // not get stuck in Terminating.
+                tracing::warn!(
+                    job_id = %job_id,
+                    error = %error,
+                    "coordinator.cancel_job failed during finalizer cleanup; \
+                     CRD may stay in Terminating until next reconcile"
+                );
             }
             // Always report Cancelled so the final status patch reflects the
             // deletion intent, regardless of coordinator state.
@@ -168,20 +167,19 @@ impl KrishivJobReconciler {
         }
 
         if let Some(failure) = pod_failure {
-            if let Some(executor_id) = failure.executor_id.as_ref() {
-                if let Err(error) = coordinator.mark_executor_lost(executor_id) {
-                    // UnknownExecutor is expected when the scheduler has
-                    // never seen this executor; warn otherwise so a stale
-                    // pod does not silently linger in the cluster.
-                    if !matches!(error, SchedulerError::UnknownExecutor { .. }) {
-                        tracing::warn!(
-                            executor_id = %executor_id,
-                            error = %error,
-                            "coordinator.mark_executor_lost failed; \
-                             executor pod may keep running until next reconcile"
-                        );
-                    }
-                }
+            if let Some(executor_id) = failure.executor_id.as_ref()
+                && let Err(error) = coordinator.mark_executor_lost(executor_id)
+                && !matches!(error, SchedulerError::UnknownExecutor { .. })
+            {
+                // UnknownExecutor is expected when the scheduler has
+                // never seen this executor; warn otherwise so a stale
+                // pod does not silently linger in the cluster.
+                tracing::warn!(
+                    executor_id = %executor_id,
+                    error = %error,
+                    "coordinator.mark_executor_lost failed; \
+                     executor pod may keep running until next reconcile"
+                );
             }
             return Ok(ReconcileOutcome {
                 action: ReconcileAction::ExecutorPodLaunchFailed,

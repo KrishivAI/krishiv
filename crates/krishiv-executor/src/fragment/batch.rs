@@ -4,10 +4,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use krishiv_plan::udf::ResourceLimits;
 use krishiv_proto::{ExecutorTaskAssignment, TaskRuntimeStats};
 #[cfg(feature = "kafka")]
 use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDescriptor};
-use krishiv_plan::udf::ResourceLimits;
 
 use super::common::{
     parse_local_parquet_partitions, read_connector_parquet_partitions, read_inline_ipc_partitions,
@@ -129,13 +129,8 @@ pub(crate) async fn execute_batch_fragment(
     // R4a typed shuffle write: hash-partition SQL output and write to the in-memory store.
     if let Some(write_cfg) = assignment.shuffle_write() {
         if let Some(store) = &runner.inmem_shuffle {
-            return execute_inmem_shuffle_write(
-                assignment,
-                write_cfg,
-                store,
-                udf_limits.clone(),
-            )
-            .await;
+            return execute_inmem_shuffle_write(assignment, write_cfg, store, udf_limits.clone())
+                .await;
         } else {
             return Err(ExecutorError::InvalidAssignment {
                 message: String::from(
@@ -471,12 +466,8 @@ async fn execute_shuffle_write_fragment(
     }
 
     // Track heavy hitters (hot keys) during this shuffle write.
-    let hot_key_reports = build_hot_key_reports(
-        &batches,
-        key_column,
-        assignment.job_id(),
-        stage_id,
-    );
+    let hot_key_reports =
+        build_hot_key_reports(&batches, key_column, assignment.job_id(), stage_id);
 
     let mut output = ExecutorTaskOutput::shuffle_write(total_rows, outputs);
     output.hot_key_reports = hot_key_reports;
@@ -627,8 +618,7 @@ async fn execute_inmem_shuffle_read(
     let batch_count = batches.len();
     let column_count = batches.first().map_or(0, |b| b.num_columns());
 
-    Ok(ExecutorTaskOutput::sql(row_count, batch_count, column_count)
-        .with_record_batches(batches))
+    Ok(ExecutorTaskOutput::sql(row_count, batch_count, column_count).with_record_batches(batches))
 }
 
 #[cfg(feature = "kafka")]
@@ -999,12 +989,16 @@ fn build_hot_key_reports(
     job_id: &krishiv_proto::JobId,
     stage_id: &str,
 ) -> Vec<krishiv_proto::HeartbeatHotKeyReport> {
-    use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray};
+    use arrow::array::{
+        Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+    };
     use arrow::datatypes::DataType;
     use krishiv_dataflow::adaptive::HeavyHittersTracker;
 
     let mut tracker = HeavyHittersTracker::new(64);
-    let key_idx = batches.first().and_then(|b| b.schema().index_of(key_column).ok());
+    let key_idx = batches
+        .first()
+        .and_then(|b| b.schema().index_of(key_column).ok());
     if let Some(kidx) = key_idx {
         for batch in batches {
             let col = batch.column(kidx);

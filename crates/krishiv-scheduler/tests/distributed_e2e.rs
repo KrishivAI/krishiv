@@ -39,13 +39,17 @@ async fn in_process_batch_job_submits_with_plan_op_lowering() {
 
 #[test]
 fn in_process_streaming_window_lowers_to_stream_fragment() {
-    use krishiv_plan::window::WindowExecutionSpec;
     use krishiv_plan::encode_typed_task_fragment;
+    use krishiv_plan::window::WindowExecutionSpec;
     let spec = WindowExecutionSpec::tumbling("user_id", "ts", 1_000);
-    let node = PlanNode::new("w", "win", ExecutionKind::Streaming)
-        .with_op(NodeOp::Window { spec: Box::new(spec) });
+    let node = PlanNode::new("w", "win", ExecutionKind::Streaming).with_op(NodeOp::Window {
+        spec: Box::new(spec),
+    });
     let frag = encode_typed_task_fragment(&node).expect("encode");
-    assert!(frag.contains("stream:spec:v1:"), "expected lossless format, got: {frag}");
+    assert!(
+        frag.contains("stream:spec:v1:"),
+        "expected lossless format, got: {frag}"
+    );
     let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming).with_node(node);
     assert_eq!(plan.kind(), ExecutionKind::Streaming);
 }

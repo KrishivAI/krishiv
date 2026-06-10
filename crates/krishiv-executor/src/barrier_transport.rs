@@ -16,10 +16,12 @@ pub struct BarrierAckCompletion {
     pub key_group_range_end: u32,
 }
 
+type BarrierWaitersMap = DashMap<(String, u64), Vec<oneshot::Sender<BarrierAckCompletion>>>;
+
 /// Waits for barrier checkpoint completion before gRPC acks are sent.
 #[derive(Clone, Default)]
 pub struct SharedBarrierAckRegistry {
-    waiters: Arc<DashMap<(String, u64), Vec<oneshot::Sender<BarrierAckCompletion>>>>,
+    waiters: Arc<BarrierWaitersMap>,
 }
 
 impl SharedBarrierAckRegistry {
@@ -77,7 +79,6 @@ impl BarrierInjector {
         self.last_injected_epoch = next.epoch;
         Some(next)
     }
-
 }
 
 /// Abstraction over any barrier source so downstream operators can consume barriers

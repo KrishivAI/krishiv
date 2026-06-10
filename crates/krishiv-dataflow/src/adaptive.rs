@@ -367,13 +367,14 @@ impl StreamingPartitionAdvisor {
             // Seed EMA with the first observation to avoid a zero-start bias.
             self.ema_bytes = batch_bytes as f64;
         } else {
-            self.ema_bytes =
-                self.alpha * batch_bytes as f64 + (1.0 - self.alpha) * self.ema_bytes;
+            self.ema_bytes = self.alpha * batch_bytes as f64 + (1.0 - self.alpha) * self.ema_bytes;
         }
         self.observations += 1;
 
         let target_f = (self.ema_bytes / STREAMING_TARGET_BYTES_PER_PARTITION as f64).ceil();
-        let target = (target_f as u32).max(1).clamp(self.min_buckets, self.max_buckets);
+        let target = (target_f as u32)
+            .max(1)
+            .clamp(self.min_buckets, self.max_buckets);
         self.current_buckets = target;
         target
     }
@@ -411,13 +412,15 @@ mod streaming_advisor_tests {
         // 512 MiB batch → should recommend 4 buckets (512/128)
         let large_batch = 512 * 1024 * 1024u64;
         let rec = advisor.observe_batch_bytes(large_batch);
-        assert!(rec >= 4, "expected >= 4 buckets for 512 MiB batch, got {rec}");
+        assert!(
+            rec >= 4,
+            "expected >= 4 buckets for 512 MiB batch, got {rec}"
+        );
     }
 
     #[test]
     fn advisor_stays_within_bounds() {
-        let mut advisor =
-            StreamingPartitionAdvisor::new(2, 2, 8).with_alpha(1.0);
+        let mut advisor = StreamingPartitionAdvisor::new(2, 2, 8).with_alpha(1.0);
         // Gigantic batch: recommendation must not exceed max_buckets.
         advisor.observe_batch_bytes(u64::MAX / 2);
         assert_eq!(advisor.current_buckets(), 8);
@@ -439,8 +442,7 @@ mod streaming_advisor_tests {
     #[test]
     fn advisor_ema_smooths_spikes() {
         // After a spike followed by small batches, EMA should decay back down.
-        let mut advisor =
-            StreamingPartitionAdvisor::new(1, 1, 64).with_alpha(0.5);
+        let mut advisor = StreamingPartitionAdvisor::new(1, 1, 64).with_alpha(0.5);
         let small = 1024u64;
         let spike = 512 * 1024 * 1024u64;
         advisor.observe_batch_bytes(spike);

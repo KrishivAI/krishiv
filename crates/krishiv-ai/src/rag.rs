@@ -101,15 +101,17 @@ where
                 doc_ids.push(format!("{doc_id}:{chunk_index}"));
                 vectors.push(vector.clone());
                 payloads.push(payload);
-                self.memo.put(
-                    &memo_key(&hash, *chunk_index),
-                    &MemoEntry {
-                        content_hash: hash.clone(),
-                        embedding: vector.clone(),
-                        point_id,
-                        created_at_ms: crate::memo::now_ms(),
-                    },
-                ).map_err(RagError::Memo)?;
+                self.memo
+                    .put(
+                        &memo_key(&hash, *chunk_index),
+                        &MemoEntry {
+                            content_hash: hash.clone(),
+                            embedding: vector.clone(),
+                            point_id,
+                            created_at_ms: crate::memo::now_ms(),
+                        },
+                    )
+                    .map_err(RagError::Memo)?;
             }
             embedded += 1;
         }
@@ -167,8 +169,8 @@ mod tests {
     use super::*;
     use crate::chunk::RecursiveTextChunker;
     use crate::embed::HuggingFaceEmbeddingModel;
-    use crate::{EmbeddingDevice, EmbeddingModelRegistry, ModelKey};
     use crate::vector_sinks::InMemoryVectorSink;
+    use crate::{EmbeddingDevice, EmbeddingModelRegistry, ModelKey};
 
     struct CountingEmbedder {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,

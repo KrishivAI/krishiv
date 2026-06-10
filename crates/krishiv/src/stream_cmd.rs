@@ -221,7 +221,7 @@ fn parse_stream_submit(args: &[&str]) -> Result<StreamSubmitSpec, String> {
         job_id,
         window_label,
         window_spec: LocalWindowExecutionSpec {
-                key_column_type: String::from("utf8"),
+            key_column_type: String::from("utf8"),
             key_column,
             event_time_column,
             watermark_lag_ms,

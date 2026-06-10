@@ -188,8 +188,8 @@ impl VectorSink for PineconeSink {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::traits::VectorSink;
+    use super::*;
 
     #[tokio::test]
     async fn pinecone_upsert_retries_same_epoch() {

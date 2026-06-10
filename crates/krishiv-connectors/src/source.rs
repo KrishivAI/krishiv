@@ -96,7 +96,13 @@ pub trait DynSource: Send {
 
     fn read_batch_dyn(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = ConnectorResult<Option<arrow::record_batch::RecordBatch>>> + Send + '_>>;
+    ) -> Pin<
+        Box<
+            dyn Future<Output = ConnectorResult<Option<arrow::record_batch::RecordBatch>>>
+                + Send
+                + '_,
+        >,
+    >;
 
     fn current_offset_dyn(&self) -> Option<Box<dyn Any + Send>>;
 
@@ -110,8 +116,13 @@ impl<T: Source + Send> DynSource for T {
 
     fn read_batch_dyn(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = ConnectorResult<Option<arrow::record_batch::RecordBatch>>> + Send + '_>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = ConnectorResult<Option<arrow::record_batch::RecordBatch>>>
+                + Send
+                + '_,
+        >,
+    > {
         Box::pin(self.read_batch())
     }
 

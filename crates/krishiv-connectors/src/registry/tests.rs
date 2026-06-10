@@ -32,7 +32,8 @@ async fn default_registry_opens_parquet_source_and_sink() {
     }
 
     let registry = default_registry();
-    let source_config = ConnectorConfig::new("src", "parquet").with_property("path", path.display().to_string());
+    let source_config =
+        ConnectorConfig::new("src", "parquet").with_property("path", path.display().to_string());
     let mut source = registry.open_source(&source_config).await.unwrap();
     let batch = source.read_batch_dyn().await.unwrap().unwrap();
     assert_eq!(batch.num_rows(), 1);
@@ -47,7 +48,10 @@ async fn default_registry_opens_parquet_source_and_sink() {
 
 #[test]
 fn connector_kind_parse_is_case_insensitive() {
-    assert_eq!(ConnectorKind::parse("PARQUET").unwrap(), ConnectorKind::Parquet);
+    assert_eq!(
+        ConnectorKind::parse("PARQUET").unwrap(),
+        ConnectorKind::Parquet
+    );
     assert_eq!(ConnectorKind::parse("s3").unwrap(), ConnectorKind::S3);
 }
 

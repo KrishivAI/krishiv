@@ -140,8 +140,7 @@ impl crate::Offset for MultiKafkaOffset {
                     ),
                 });
             }
-            let item_len =
-                u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            let item_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             if pos + item_len > bytes.len() {
                 return Err(ConnectorError::Offset {
@@ -201,9 +200,15 @@ impl std::fmt::Debug for KafkaConfig {
             .field("ssl_ca_location", &self.ssl_ca_location)
             .field("ssl_certificate_location", &self.ssl_certificate_location)
             .field("ssl_key_location", &self.ssl_key_location)
-            .field("ssl_key_password", &self.ssl_key_password.as_ref().map(|_| "<redacted>"))
+            .field(
+                "ssl_key_password",
+                &self.ssl_key_password.as_ref().map(|_| "<redacted>"),
+            )
             .field("sasl_username", &self.sasl_username)
-            .field("sasl_password", &self.sasl_password.as_ref().map(|_| "<redacted>"))
+            .field(
+                "sasl_password",
+                &self.sasl_password.as_ref().map(|_| "<redacted>"),
+            )
             .field("sasl_mechanisms", &self.sasl_mechanisms)
             .field("enable_idempotence", &self.enable_idempotence)
             .field("transactional_id", &self.transactional_id)
@@ -972,7 +977,9 @@ impl RdkafkaKafkaSource {
 #[cfg(feature = "kafka")]
 impl Source for RdkafkaKafkaSource {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_unbounded().with_checkpoint()
+        ConnectorCapabilities::new()
+            .with_unbounded()
+            .with_checkpoint()
     }
 
     async fn read_batch(
@@ -1076,9 +1083,11 @@ impl CheckpointSource for RdkafkaKafkaSource {
                 })?;
         }
 
-        self.consumer.assign(&tpl).map_err(|e| ConnectorError::Offset {
-            message: format!("restore: rdkafka assign failed: {e}"),
-        })?;
+        self.consumer
+            .assign(&tpl)
+            .map_err(|e| ConnectorError::Offset {
+                message: format!("restore: rdkafka assign failed: {e}"),
+            })?;
 
         // Rebuild partition_offsets so that checkpoint_offset() is accurate
         // immediately after restore (before any new messages are read).
@@ -1196,9 +1205,21 @@ mod tests {
     #[test]
     fn multi_kafka_offset_multi_partition_roundtrip() {
         let original = MultiKafkaOffset::new(vec![
-            KafkaOffset { topic: "orders".into(), partition: 0, offset: 42 },
-            KafkaOffset { topic: "orders".into(), partition: 1, offset: 7 },
-            KafkaOffset { topic: "orders".into(), partition: 2, offset: 999 },
+            KafkaOffset {
+                topic: "orders".into(),
+                partition: 0,
+                offset: 42,
+            },
+            KafkaOffset {
+                topic: "orders".into(),
+                partition: 1,
+                offset: 7,
+            },
+            KafkaOffset {
+                topic: "orders".into(),
+                partition: 2,
+                offset: 999,
+            },
         ]);
         let encoded = crate::Offset::encode(&original);
         let decoded = MultiKafkaOffset::decode(&encoded).unwrap();
@@ -1214,8 +1235,7 @@ mod tests {
         }]);
         let mut encoded = crate::Offset::encode(&original);
         encoded.push(0xFF);
-        let err = MultiKafkaOffset::decode(&encoded)
-            .expect_err("trailing bytes must be rejected");
+        let err = MultiKafkaOffset::decode(&encoded).expect_err("trailing bytes must be rejected");
         assert!(matches!(err, ConnectorError::Offset { .. }));
     }
 
@@ -1229,8 +1249,8 @@ mod tests {
         let encoded = crate::Offset::encode(&original);
         // Truncate to just the count + partial entry length
         let truncated = &encoded[..6];
-        let err = MultiKafkaOffset::decode(truncated)
-            .expect_err("truncated entry must be rejected");
+        let err =
+            MultiKafkaOffset::decode(truncated).expect_err("truncated entry must be rejected");
         assert!(matches!(err, ConnectorError::Offset { .. }));
     }
 

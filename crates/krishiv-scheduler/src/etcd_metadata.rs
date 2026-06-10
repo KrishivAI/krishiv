@@ -87,7 +87,11 @@ impl EtcdMetadataStore {
                 "etcd metadata snapshot exceeds 1 MiB; etcd default limit is 1.5 MiB"
             );
         }
-        let mut client = self.client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let handle = tokio::task::spawn_blocking(move || {
             // Drive the async etcd put on a one-shot current-thread runtime
             // rather than on the parent runtime's handle. The etcd client

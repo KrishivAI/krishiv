@@ -66,7 +66,10 @@ pub enum ChunkerConfig {
 impl ChunkerConfig {
     pub fn validate(&self) -> Result<(), PlanError> {
         match self {
-            Self::RecursiveText { chunk_size, overlap } => {
+            Self::RecursiveText {
+                chunk_size,
+                overlap,
+            } => {
                 if *chunk_size == 0 {
                     return Err(PlanError::Validation(String::from(
                         "RecursiveText chunk_size must be greater than zero",
@@ -85,7 +88,10 @@ impl ChunkerConfig {
                     )));
                 }
             }
-            Self::TokenAware { max_tokens, tokenizer } => {
+            Self::TokenAware {
+                max_tokens,
+                tokenizer,
+            } => {
                 if *max_tokens == 0 {
                     return Err(PlanError::Validation(String::from(
                         "TokenAware max_tokens must be greater than zero",
@@ -143,7 +149,10 @@ pub struct VectorSinkPlanConfig {
 }
 
 impl VectorSinkPlanConfig {
-    pub fn new(sink_type: impl Into<String>, options: serde_json::Value) -> Result<Self, PlanError> {
+    pub fn new(
+        sink_type: impl Into<String>,
+        options: serde_json::Value,
+    ) -> Result<Self, PlanError> {
         let cfg = Self {
             sink_type: sink_type.into(),
             options,
@@ -173,12 +182,10 @@ pub enum RefreshPolicy {
 
 impl RefreshPolicy {
     pub fn validate(&self) -> Result<(), PlanError> {
-        if let Self::Schedule { cron } = self {
-            if cron.trim().is_empty() {
-                return Err(PlanError::Validation(String::from(
-                    "RefreshPolicy::Schedule cron expression must not be empty",
-                )));
-            }
+        if let Self::Schedule { cron } = self && cron.trim().is_empty() {
+            return Err(PlanError::Validation(String::from(
+                "RefreshPolicy::Schedule cron expression must not be empty",
+            )));
         }
         Ok(())
     }

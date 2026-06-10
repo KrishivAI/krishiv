@@ -70,10 +70,10 @@ fn configured_flight_api_key() -> Option<String> {
 }
 
 fn apply_flight_auth<T>(mut req: tonic::Request<T>) -> tonic::Request<T> {
-    if let Some(key) = configured_flight_api_key() {
-        if let Ok(value) = format!("Bearer {key}").parse() {
-            req.metadata_mut().insert("authorization", value);
-        }
+    if let Some(key) = configured_flight_api_key()
+        && let Ok(value) = format!("Bearer {key}").parse()
+    {
+        req.metadata_mut().insert("authorization", value);
     }
     req
 }
@@ -85,10 +85,10 @@ impl tonic::service::Interceptor for FlightAuthInterceptor {
         &mut self,
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
-        if let Some(key) = configured_flight_api_key() {
-            if let Ok(value) = format!("Bearer {key}").parse() {
-                request.metadata_mut().insert("authorization", value);
-            }
+        if let Some(key) = configured_flight_api_key()
+            && let Ok(value) = format!("Bearer {key}").parse()
+        {
+            request.metadata_mut().insert("authorization", value);
         }
         Ok(request)
     }
@@ -152,7 +152,9 @@ where
             Err(e) => return Err(e),
         }
     }
-    unreachable!("all transient retries exhaust the delay list and return early; non-transient errors return immediately")
+    unreachable!(
+        "all transient retries exhaust the delay list and return early; non-transient errors return immediately"
+    )
 }
 
 /// Map a physical plan to a SQL statement understood by the Krishiv Flight SQL service.
@@ -188,7 +190,6 @@ fn normalize_flight_endpoint(url: &str) -> RuntimeResult<String> {
         Ok(format!("http://{trimmed}"))
     }
 }
-
 
 async fn connect_flight_channel(endpoint: &str) -> RuntimeResult<Channel> {
     let ep = endpoint.to_string();
@@ -326,10 +327,10 @@ impl FlightClientPool {
             let ep = Endpoint::from_shared(endpoint_str)?;
             ep.connect_timeout(Duration::from_secs(2)).connect().await
         };
-        match tokio::time::timeout(Duration::from_secs(5), connect_fut).await {
-            Ok(Ok(_)) => true,
-            _ => false,
-        }
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), connect_fut).await,
+            Ok(Ok(_))
+        )
     }
 
     async fn update_endpoint_health(&self, endpoint: &str, is_healthy: bool) {
@@ -433,19 +434,15 @@ impl FlightClientPool {
         let len = health.len();
 
         // First try current endpoint if healthy
-        if let Some(h) = health.get(current_idx) {
-            if h.is_healthy {
-                return Ok(h.endpoint.clone());
-            }
+        if let Some(h) = health.get(current_idx) && h.is_healthy {
+            return Ok(h.endpoint.clone());
         }
 
         // Search for any healthy endpoint
         for i in 0..len {
             let idx = (current_idx + i) % len;
-            if let Some(h) = health.get(idx) {
-                if h.is_healthy {
-                    return Ok(h.endpoint.clone());
-                }
+            if let Some(h) = health.get(idx) && h.is_healthy {
+                return Ok(h.endpoint.clone());
             }
         }
 
@@ -583,10 +580,10 @@ impl std::fmt::Debug for FlightClientPool {
 impl Drop for FlightClientPool {
     fn drop(&mut self) {
         // Try to stop health checks - best effort
-        if let Ok(mut handle_guard) = self.health_check_handle.try_lock() {
-            if let Some(handle) = handle_guard.take() {
-                handle.abort();
-            }
+        if let Ok(mut handle_guard) = self.health_check_handle.try_lock()
+            && let Some(handle) = handle_guard.take()
+        {
+            handle.abort();
         }
     }
 }
@@ -597,7 +594,10 @@ impl Drop for FlightClientPool {
 /// `do_action`.  Falls back to the legacy SQL-comment protocol when the
 /// server does not understand the action type — preserves backward compat for
 /// older deployments.
-pub async fn execute_remote_plan(pool: &FlightClientPool, plan: &PhysicalPlan) -> RuntimeResult<()> {
+pub async fn execute_remote_plan(
+    pool: &FlightClientPool,
+    plan: &PhysicalPlan,
+) -> RuntimeResult<()> {
     use crate::flight_action::{ExecutePlanBody, KrishivFlightAction};
     let body = ExecutePlanBody::from_plan(plan)?;
     let action = KrishivFlightAction::ExecutePlan(body);
@@ -785,7 +785,6 @@ pub fn decode_ipc_response(body: &[u8]) -> RuntimeResult<Vec<arrow::record_batch
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| RuntimeError::transport(format!("ipc read response: {e}")))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -979,9 +978,9 @@ mod tests {
         n_ready: usize,
     ) -> impl futures::Stream<Item = arrow_flight::error::Result<RecordBatch>> + Unpin {
         let schema = Arc::new(Schema::new(Vec::<arrow::datatypes::Field>::new()));
-        let ready = futures::stream::iter((0..n_ready).map(move |_| {
-            Ok(RecordBatch::new_empty(Arc::clone(&schema)))
-        }));
+        let ready = futures::stream::iter(
+            (0..n_ready).map(move |_| Ok(RecordBatch::new_empty(Arc::clone(&schema)))),
+        );
         Box::pin(ready.chain(futures::stream::pending()))
     }
 
@@ -1158,11 +1157,10 @@ mod tests {
 
         let url = format!("http://{addr}");
         let pool = FlightClientPool::new(url).expect("pool");
-        let action = crate::flight_action::KrishivFlightAction::Explain(
-            crate::flight_action::ExplainBody {
+        let action =
+            crate::flight_action::KrishivFlightAction::Explain(crate::flight_action::ExplainBody {
                 sql: "SELECT 1".into(),
-            },
-        );
+            });
 
         let result = pool.do_action(&action).await;
         match result {
@@ -1180,9 +1178,9 @@ mod tests {
     #[tokio::test]
     async fn collect_flight_batches_drains_finite_stream_without_timeout() {
         let schema = Arc::new(Schema::new(Vec::<arrow::datatypes::Field>::new()));
-        let stream = Box::pin(futures::stream::iter((0..3).map(move |_| {
-            Ok(RecordBatch::new_empty(Arc::clone(&schema)))
-        })))
+        let stream = Box::pin(futures::stream::iter(
+            (0..3).map(move |_| Ok(RecordBatch::new_empty(Arc::clone(&schema)))),
+        ))
             as std::pin::Pin<
                 Box<dyn futures::Stream<Item = arrow_flight::error::Result<RecordBatch>>>,
             >;

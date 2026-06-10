@@ -52,10 +52,11 @@ impl SeenSet {
             krishiv_proto::AttemptId,
         ),
     ) -> bool {
-        if self.entries.len() >= self.max_entries && !self.entries.contains(&key) {
-            if let Some(oldest) = self.entries.iter().next().cloned() {
-                self.entries.remove(&oldest);
-            }
+        if self.entries.len() >= self.max_entries
+            && !self.entries.contains(&key)
+            && let Some(oldest) = self.entries.iter().next().cloned()
+        {
+            self.entries.remove(&oldest);
         }
         self.entries.insert(key)
     }

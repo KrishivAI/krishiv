@@ -6,19 +6,19 @@
 
 // Submodules with implementations
 #[cfg(feature = "lakehouse")]
-pub mod lakehouse;
-#[cfg(feature = "lakehouse")]
 pub mod cdc;
 #[cfg(all(feature = "lakehouse", feature = "kafka"))]
 pub mod cdc_router;
 pub mod feature_store;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+#[cfg(feature = "lakehouse")]
+pub mod lakehouse;
 pub mod parquet;
 pub mod s3;
+pub mod schema_normalize;
 #[cfg(feature = "schema-registry")]
 pub mod schema_registry;
-pub mod schema_normalize;
 pub mod transactional;
 #[cfg(feature = "kafka")]
 pub mod transactional_kafka;
@@ -65,16 +65,16 @@ pub use two_phase::{
     ParquetCommitHandle, TwoPhaseCommitSink,
 };
 
+#[cfg(all(feature = "vector-sinks", feature = "pgvector"))]
+pub use vector::PgvectorSink;
+#[cfg(all(feature = "vector-sinks", feature = "qdrant"))]
+pub use vector::QdrantSink;
 #[cfg(feature = "vector-sinks")]
 pub use vector::{
     EmbeddingBatch, InMemoryVectorSink, LanceDbSink, PayloadFilter, PayloadValue, PineconeSink,
     ScoredChunk, VectorSink, VectorSinkConfig, VectorSinkError, VectorSinkRegistry, WeaviateSink,
     point_id_from_doc_epoch, validate_identifier,
 };
-#[cfg(all(feature = "vector-sinks", feature = "pgvector"))]
-pub use vector::PgvectorSink;
-#[cfg(all(feature = "vector-sinks", feature = "qdrant"))]
-pub use vector::QdrantSink;
 
 pub use feature_store::{FeatureRow, FeatureStoreSink, InMemoryFeatureStream};
 

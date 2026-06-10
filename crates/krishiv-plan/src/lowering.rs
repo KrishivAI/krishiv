@@ -1,6 +1,6 @@
 //! Physical plan lowering: typed [`NodeOp`] → executor task fragments (ADR-DIST-04).
 
-use crate::window::{encode_window_execution_spec};
+use crate::window::encode_window_execution_spec;
 use crate::{NodeOp, PlanNode};
 use krishiv_common::validate::{is_safe_identifier, validate_safe_id};
 
@@ -13,17 +13,16 @@ const PLAN_OP_PREFIX: &str = "planop:";
 /// physical plan builder honour the flag set by the optimizer / user.
 pub fn encode_task_fragment(node: &PlanNode) -> String {
     // S2: Honour broadcast_eligible flag — override Hash Exchange → Broadcast.
-    if node.broadcast_eligible() {
-        if let Some(crate::NodeOp::Exchange {
+    if node.broadcast_eligible()
+        && let Some(crate::NodeOp::Exchange {
             partitioning: crate::Partitioning::Hash { .. } | crate::Partitioning::RoundRobin { .. },
         }) = node.op()
-        {
-            let broadcast_op = crate::NodeOp::Exchange {
-                partitioning: crate::Partitioning::Broadcast,
-            };
-            if let Ok(json) = serde_json::to_string(&broadcast_op) {
-                return format!("{PLAN_OP_PREFIX}{json}");
-            }
+    {
+        let broadcast_op = crate::NodeOp::Exchange {
+            partitioning: crate::Partitioning::Broadcast,
+        };
+        if let Ok(json) = serde_json::to_string(&broadcast_op) {
+            return format!("{PLAN_OP_PREFIX}{json}");
         }
     }
     if let Some(fragment) = node.op().and_then(node_op_to_fragment) {
@@ -92,12 +91,17 @@ mod tests {
     #[test]
     fn window_node_op_lowers_to_lossless_stream_fragment() {
         use crate::ExecutionKind;
-        use crate::window::{WindowExecutionSpec, WindowAgg};
+        use crate::window::{WindowAgg, WindowExecutionSpec};
         let spec = WindowExecutionSpec::tumbling("user_id", "ts", 5_000);
-        let node = PlanNode::new("w1", "window", ExecutionKind::Streaming)
-            .with_op(NodeOp::Window { spec: Box::new(spec) });
+        let node =
+            PlanNode::new("w1", "window", ExecutionKind::Streaming).with_op(NodeOp::Window {
+                spec: Box::new(spec),
+            });
         let frag = encode_task_fragment(&node);
-        assert!(frag.starts_with("stream:spec:v1:"), "expected lossless format, got: {frag}");
+        assert!(
+            frag.starts_with("stream:spec:v1:"),
+            "expected lossless format, got: {frag}"
+        );
         let _ = WindowAgg::count("count");
     }
 
@@ -147,7 +151,10 @@ mod tests {
     fn scan_includes_pushed_down_filters() {
         let node = PlanNode::new("scan", "scan", ExecutionKind::Batch).with_op(NodeOp::Scan {
             table: String::from("orders"),
-            filters: vec![String::from("amount > 100"), String::from("status = 'active'")],
+            filters: vec![
+                String::from("amount > 100"),
+                String::from("status = 'active'"),
+            ],
         });
         let frag = encode_task_fragment(&node);
         assert_eq!(

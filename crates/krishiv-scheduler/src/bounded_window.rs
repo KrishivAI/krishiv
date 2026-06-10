@@ -70,8 +70,7 @@ pub async fn execute_bounded_window_coordinated(
             return Err(SchedulerError::NoExecutors);
         }
         // Compute shard count from data size, capped by available executors.
-        let data_based_shards = (total_data_bytes + TARGET_BYTES_PER_SHARD - 1)
-            / TARGET_BYTES_PER_SHARD;
+        let data_based_shards = total_data_bytes.div_ceil(TARGET_BYTES_PER_SHARD);
         let data_based_shards = data_based_shards.max(1) as usize;
         (
             executor_count.min(data_based_shards.min(input_row_count.max(1))),

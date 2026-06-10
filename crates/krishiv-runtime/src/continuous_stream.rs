@@ -209,15 +209,15 @@ impl ContinuousStreamRegistry {
                 component: "input",
                 operation: "push_input",
             })?;
-        if let Some(expected_schema) = &input.schema {
-            if !schemas_structurally_equal(expected_schema, &incoming_schema) {
-                return Err(ContinuousStreamError::SchemaMismatch {
-                    job_id: job_id.to_owned(),
-                    expected: format!("{expected_schema:?}"),
-                    actual: format!("{incoming_schema:?}"),
-                }
-                .into());
+        if let Some(expected_schema) = &input.schema
+            && !schemas_structurally_equal(expected_schema, &incoming_schema)
+        {
+            return Err(ContinuousStreamError::SchemaMismatch {
+                job_id: job_id.to_owned(),
+                expected: format!("{expected_schema:?}"),
+                actual: format!("{incoming_schema:?}"),
             }
+            .into());
         }
         let current = input.batches.len();
         let attempted = batches.len();
@@ -382,12 +382,12 @@ impl ContinuousStreamRegistry {
                 operation: "snapshot_with_watermark",
             })?;
         let watermark_ms = exec.last_watermark_ms();
-        let bytes = exec.snapshot().map_err(|error| {
-            ContinuousStreamError::Execution {
+        let bytes = exec
+            .snapshot()
+            .map_err(|error| ContinuousStreamError::Execution {
                 job_id: job_id.to_owned(),
                 message: format!("snapshot failed: {error}"),
-            }
-        })?;
+            })?;
         Ok((bytes, watermark_ms))
     }
 
@@ -867,7 +867,10 @@ mod tests {
                 .push_input("j-capped-drain", vec![batch(i as i64 * 100)])
                 .unwrap();
         }
-        assert_eq!(registry.pending_batch_depth("j-capped-drain").unwrap(), total);
+        assert_eq!(
+            registry.pending_batch_depth("j-capped-drain").unwrap(),
+            total
+        );
 
         let _ = registry.drain_job("j-capped-drain").unwrap();
         assert_eq!(

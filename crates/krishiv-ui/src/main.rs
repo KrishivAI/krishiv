@@ -75,7 +75,12 @@ impl ServerConfig {
             }
         }
 
-        Ok(Self { addr, demo, with_sql, help })
+        Ok(Self {
+            addr,
+            demo,
+            with_sql,
+            help,
+        })
     }
 
     fn help() -> &'static str {

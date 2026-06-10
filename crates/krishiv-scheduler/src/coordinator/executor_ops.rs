@@ -272,7 +272,7 @@ impl Coordinator {
         let elapsed_ms = ticks.saturating_mul(self.config.tick_period_ms());
         let job_ids: Vec<JobId> = self.checkpoint_coordinators.keys().cloned().collect();
         for job_id in &job_ids {
-            let running = self.running_task_count_for_job(&job_id);
+            let running = self.running_task_count_for_job(job_id);
 
             // Capture the awaiting epoch BEFORE ticking so we can detect a
             // timeout-triggered abort (GAP-5).  An abort transitions the state
@@ -281,7 +281,7 @@ impl Coordinator {
             // aborted epoch so they don't accumulate forever and block future
             // checkpoint rounds.
             let pre_tick_awaiting: Option<u64> =
-                self.checkpoint_coordinators.get(&job_id).and_then(|c| {
+                self.checkpoint_coordinators.get(job_id).and_then(|c| {
                     if let CheckpointCoordinatorState::AwaitingAcks { epoch, .. } = &c.state {
                         Some(*epoch)
                     } else {
@@ -289,7 +289,7 @@ impl Coordinator {
                     }
                 });
 
-            if let Some(coord) = self.checkpoint_coordinators.get_mut(&job_id) {
+            if let Some(coord) = self.checkpoint_coordinators.get_mut(job_id) {
                 coord.set_expected_task_count(running);
                 coord.try_tick(elapsed_ms, self.config.checkpoint_ack_timeout_ms());
             }
@@ -306,7 +306,7 @@ impl Coordinator {
             if let Some(aborted_epoch) = pre_tick_awaiting {
                 let was_aborted = self
                     .checkpoint_coordinators
-                    .get(&job_id)
+                    .get(job_id)
                     .is_some_and(|c| matches!(c.state, CheckpointCoordinatorState::Failed { .. }));
                 if was_aborted {
                     self.checkpoint_notify_sent

@@ -8,17 +8,17 @@
 
 use std::fmt;
 
+pub mod cep;
+pub mod governance;
 mod graph;
 pub mod lowering;
+pub mod optimizer;
 pub mod r17;
 pub mod streaming;
 pub mod streaming_plan;
 pub mod task_fragment;
-pub mod window;
 pub mod udf;
-pub mod governance;
-pub mod optimizer;
-pub mod cep;
+pub mod window;
 pub use graph::lower_to_physical;
 pub use r17::{
     ChunkerConfig, DataSource, EmbedderConfig, FeatureDef, FeatureSchema, FeatureStore,
@@ -618,7 +618,14 @@ fn describe_plan(plan_type: &str, name: &str, kind: ExecutionKind, nodes: &[Plan
     }
 
     for node in nodes {
-        write!(output, "\n- {} [{}] {}", node.id(), node.kind(), node.label()).unwrap();
+        write!(
+            output,
+            "\n- {} [{}] {}",
+            node.id(),
+            node.kind(),
+            node.label()
+        )
+        .unwrap();
         if !node.inputs().is_empty() {
             write!(output, " <- {}", node.inputs().join(", ")).unwrap();
         }
@@ -978,9 +985,13 @@ mod tests {
     #[test]
     fn diff_plans_detects_changed_estimated_rows() {
         let mut before = PhysicalPlan::new("test", ExecutionKind::Batch);
-        before.add_node(PlanNode::new("n1", "label", ExecutionKind::Batch).with_estimated_rows(Some(100)));
+        before.add_node(
+            PlanNode::new("n1", "label", ExecutionKind::Batch).with_estimated_rows(Some(100)),
+        );
         let mut after = PhysicalPlan::new("test", ExecutionKind::Batch);
-        after.add_node(PlanNode::new("n1", "label", ExecutionKind::Batch).with_estimated_rows(Some(200)));
+        after.add_node(
+            PlanNode::new("n1", "label", ExecutionKind::Batch).with_estimated_rows(Some(200)),
+        );
         let diff = super::diff_plans(&before, &after);
         assert_eq!(diff.changed, vec!["n1"]);
     }
@@ -1002,10 +1013,12 @@ mod tests {
         let plan = LogicalPlan::new("dup-edges", ExecutionKind::Batch)
             .with_node(PlanNode::new("src", "source", ExecutionKind::Batch))
             .with_node(
-                PlanNode::new("n1", "node", ExecutionKind::Batch)
-                    .with_inputs(["src", "src"]),
+                PlanNode::new("n1", "node", ExecutionKind::Batch).with_inputs(["src", "src"]),
             );
         let err = plan.validate().expect_err("duplicate inputs must fail");
-        assert!(err.to_string().contains("duplicate input"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("duplicate input"),
+            "unexpected: {err}"
+        );
     }
 }

@@ -165,22 +165,14 @@ mod tests {
 
     #[test]
     fn temporal_join_spec_rejects_empty_time_cols() {
-        assert!(
-            TemporalJoinSpec::new("", "version_ts", vec!["k".into()], true).is_err()
-        );
-        assert!(
-            TemporalJoinSpec::new("event_ts", "", vec!["k".into()], true).is_err()
-        );
+        assert!(TemporalJoinSpec::new("", "version_ts", vec!["k".into()], true).is_err());
+        assert!(TemporalJoinSpec::new("event_ts", "", vec!["k".into()], true).is_err());
     }
 
     #[test]
     fn temporal_join_spec_rejects_empty_join_keys() {
-        assert!(
-            TemporalJoinSpec::new("event_ts", "version_ts", vec![], true).is_err()
-        );
-        assert!(
-            TemporalJoinSpec::new("event_ts", "version_ts", vec!["".into()], true).is_err()
-        );
+        assert!(TemporalJoinSpec::new("event_ts", "version_ts", vec![], true).is_err());
+        assert!(TemporalJoinSpec::new("event_ts", "version_ts", vec!["".into()], true).is_err());
     }
 
     #[test]
@@ -227,13 +219,8 @@ mod tests {
 
     #[test]
     fn streaming_types_serde_roundtrip() {
-        let temporal = TemporalJoinSpec::new(
-            "event_ts",
-            "version_ts",
-            vec!["user_id".into()],
-            false,
-        )
-        .unwrap();
+        let temporal =
+            TemporalJoinSpec::new("event_ts", "version_ts", vec!["user_id".into()], false).unwrap();
         let json = serde_json::to_string(&temporal).unwrap();
         let decoded: TemporalJoinSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(temporal, decoded);

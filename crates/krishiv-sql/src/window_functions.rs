@@ -101,21 +101,6 @@ fn make_hop_end() -> datafusion::logical_expr::ScalarUDF {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Extract an i64 value from a `ColumnarValue` argument (scalar or array).
-/// Returns `None` for SQL NULL.
-fn extract_scalar_i64(cv: &ColumnarValue) -> Result<Option<i64>, DataFusionError> {
-    use datafusion::scalar::ScalarValue;
-    match cv {
-        ColumnarValue::Scalar(ScalarValue::Int64(v)) => Ok(*v),
-        ColumnarValue::Scalar(other) => Err(DataFusionError::Internal(format!(
-            "window function expected Int64 scalar, got {other:?}"
-        ))),
-        ColumnarValue::Array(_) => Err(DataFusionError::Internal(
-            "expected scalar but got array".into(),
-        )),
-    }
-}
-
 fn cast_to_int64_array(args: &[ColumnarValue], idx: usize) -> Result<Int64Array, DataFusionError> {
     use datafusion::scalar::ScalarValue;
     match &args[idx] {

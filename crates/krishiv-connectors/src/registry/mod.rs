@@ -4,7 +4,7 @@ mod descriptor;
 mod driver;
 mod drivers;
 mod kind;
-mod registry;
+mod connector_registry;
 
 #[cfg(feature = "vector-sinks")]
 mod vector_drivers;
@@ -12,12 +12,13 @@ mod vector_drivers;
 #[cfg(test)]
 mod tests;
 
+pub use connector_registry::{ConnectorRegistry, default_registry};
 pub use descriptor::ConnectorDescriptor;
 pub use driver::{
-    OpenedTwoPhaseSink, SharedSinkDriver, SharedSourceDriver, SharedTwoPhaseSinkDriver, SinkDriver,
-    SourceDriver, TwoPhaseSinkDriver,
+    OpenSinkFuture, OpenSourceFuture, OpenTwoPhaseSinkFuture, OpenedTwoPhaseSink,
+    SharedSinkDriver, SharedSourceDriver, SharedTwoPhaseSinkDriver, SinkDriver, SourceDriver,
+    TwoPhaseSinkDriver,
 };
 #[cfg(feature = "vector-sinks")]
-pub use driver::{SharedVectorSinkDriver, VectorSinkDriver};
+pub use driver::{OpenVectorSinkFuture, SharedVectorSinkDriver, VectorSinkDriver};
 pub use kind::{ConnectorKind, ConnectorRole};
-pub use registry::{ConnectorRegistry, default_registry};

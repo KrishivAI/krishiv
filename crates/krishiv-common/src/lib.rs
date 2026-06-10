@@ -6,22 +6,23 @@
 //! - SHA-256 hashing (`hash` module)
 //! - Identifier and path validation (`validate` module)
 
-pub mod test_fixtures;
 pub mod async_util;
 #[cfg(feature = "chaos")]
 pub mod chaos;
 pub mod durability;
 pub mod hash;
+pub mod panic_util;
 pub mod partition;
 pub mod production;
 pub mod stream_quality;
+pub mod test_fixtures;
 pub mod validate;
 
 pub use durability::{
     CheckpointDurability, DurabilityProfile, DurabilityProfileParseError, DurabilityProfileSpec,
     MetadataDurability, ShuffleDurability, StateDurability,
 };
-pub use stream_quality::{StreamQualityHook, StreamQualityResult};
+pub use panic_util::panic_payload_to_string;
 pub use production::{
     ALLOW_ANONYMOUS_HTTP_ENV, ALLOW_LEGACY_FRAGMENTS_ENV, DURABILITY_PROFILE_ENV,
     NativeScalarUdfPolicy, PRODUCTION_ENV, allow_anonymous_http_override,
@@ -33,6 +34,7 @@ pub use production::{
     requires_file_backed_state, requires_http_auth, requires_manual_kafka_commit,
     resolve_durability_profile,
 };
+pub use stream_quality::{StreamQualityHook, StreamQualityResult};
 
 #[cfg(test)]
 mod tests {

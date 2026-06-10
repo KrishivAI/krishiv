@@ -104,10 +104,11 @@ impl krishiv_plan::udf::ScalarUdf for PythonScalarUdf {
                             None => None,
                         });
                     }
-                    let list =
-                        PyList::new(py, cells).map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                    let list = PyList::new(py, cells).map_err(|e| {
+                        krishiv_plan::udf::UdfError::Execution {
                             message: e.to_string(),
-                        })?;
+                        }
+                    })?;
                     list.into_any()
                 }};
             }
@@ -177,12 +178,11 @@ impl krishiv_plan::udf::ScalarUdf for PythonScalarUdf {
                 })?;
             }
 
-            let result =
-                self.callable
-                    .call1(py, (dict,))
-                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
-                        message: e.to_string(),
-                    })?;
+            let result = self.callable.call1(py, (dict,)).map_err(|e| {
+                krishiv_plan::udf::UdfError::Execution {
+                    message: e.to_string(),
+                }
+            })?;
 
             let nrows = batch.num_rows();
             match self.output_field.data_type() {

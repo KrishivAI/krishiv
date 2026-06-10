@@ -13,15 +13,6 @@ use datafusion::logical_expr::{Accumulator, ColumnarValue, Volatility, create_ud
 
 use krishiv_plan::udf::{DefaultSandboxedExecutor, ResourceLimits, SandboxedUdfExecutor};
 
-/// Register every scalar UDF in `registry` with the DataFusion session context.
-/// Uses unlimited (default) ResourceLimits for backward compatibility.
-pub fn sync_scalar_udfs(
-    ctx: &datafusion::prelude::SessionContext,
-    registry: &krishiv_plan::udf::UdfRegistry,
-) -> Result<(), DataFusionError> {
-    sync_scalar_udfs_with_limits(ctx, registry, ResourceLimits::default())
-}
-
 /// Register scalar UDFs with explicit ResourceLimits.
 /// Higher layers (JobSpec / scheduler / executor runner) supply real budgets
 /// from the job; DefaultSandboxedExecutor will enforce them at execution time.
@@ -412,13 +403,17 @@ fn expr_to_scalar(
         Expr::Literal(DfScalar::Float32(Some(v)), _) => {
             Ok(krishiv_plan::udf::ScalarValue::Float64(f64::from(*v)))
         }
-        Expr::Literal(DfScalar::Float64(Some(v)), _) => Ok(krishiv_plan::udf::ScalarValue::Float64(*v)),
+        Expr::Literal(DfScalar::Float64(Some(v)), _) => {
+            Ok(krishiv_plan::udf::ScalarValue::Float64(*v))
+        }
         Expr::Literal(DfScalar::Utf8(Some(v)), _)
         | Expr::Literal(DfScalar::Utf8View(Some(v)), _)
         | Expr::Literal(DfScalar::LargeUtf8(Some(v)), _) => {
             Ok(krishiv_plan::udf::ScalarValue::Utf8(v.clone()))
         }
-        Expr::Literal(DfScalar::Boolean(Some(v)), _) => Ok(krishiv_plan::udf::ScalarValue::Boolean(*v)),
+        Expr::Literal(DfScalar::Boolean(Some(v)), _) => {
+            Ok(krishiv_plan::udf::ScalarValue::Boolean(*v))
+        }
         Expr::Literal(DfScalar::Binary(Some(v)), _)
         | Expr::Literal(DfScalar::BinaryView(Some(v)), _)
         | Expr::Literal(DfScalar::LargeBinary(Some(v)), _)

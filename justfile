@@ -35,8 +35,11 @@ check-single-node:
     {{ cargo }} check -p krishiv --no-default-features --features single-node
 
 # Check bare-metal distributed mode (etcd metadata, no operator)
-check-distributed:
+check-bare-metal:
     {{ cargo }} check -p krishiv --no-default-features --features bare-metal
+
+# Alias kept for backwards compat with any local scripts
+check-distributed: check-bare-metal
 
 # Check k8s mode (distributed + operator CRD support)
 check-k8s:
@@ -182,3 +185,39 @@ lint:
 
 # Format then lint in one shot
 tidy: fmt lint
+
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+
+# Run all criterion benchmarks and emit Bencher-compatible JSON to stdout.
+# Pipe to tee to keep a local copy: just bench | tee bench-output.txt
+bench:
+    {{ cargo }} bench -p krishiv-bench \
+        --features "" \
+        -- --output-format bencher
+
+# Save a baseline under `.bench-baselines/<name>` using criterion's --save-baseline.
+# Usage: just bench-save main   (saves to .bench-baselines/main)
+bench-save name:
+    @mkdir -p .bench-baselines
+    {{ cargo }} bench -p krishiv-bench \
+        -- --save-baseline {{ name }}
+    @echo "✓ baseline '{{ name }}' saved"
+
+# Compare current performance against a saved baseline.
+# Usage: just bench-compare main
+bench-compare name:
+    {{ cargo }} bench -p krishiv-bench \
+        -- --baseline {{ name }}
+
+# ── Release ───────────────────────────────────────────────────────────────────
+
+# Bump the workspace version and tag a release.
+# Usage: VERSION=0.2.0 just release
+release version=env_var_or_default("VERSION", ""):
+    @if [ -z "{{ version }}" ]; then echo "ERROR: set VERSION env var"; exit 1; fi
+    sed -i 's/^version = ".*"/version = "{{ version }}"/' Cargo.toml
+    {{ cargo }} check --workspace --quiet
+    git add Cargo.toml Cargo.lock
+    git commit -m "chore: bump version to {{ version }}"
+    git tag -a "v{{ version }}" -m "Release v{{ version }}"
+    @echo "✓ tagged v{{ version }} — push with: git push && git push --tags"

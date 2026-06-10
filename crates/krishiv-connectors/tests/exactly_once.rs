@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use krishiv_connectors::cdc::{CdcEventSource, build_batch_from_events, parse_debezium_envelope};
 use krishiv_connectors::ConnectorError;
+use krishiv_connectors::cdc::{CdcEventSource, build_batch_from_events, parse_debezium_envelope};
 use krishiv_connectors::lakehouse::{
     IcebergScanOptions, IcebergTableRef, IcebergTwoPhaseCommit, LakehouseTable,
     MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable, SchemaField, SchemaVersion,
@@ -104,10 +104,7 @@ async fn exactly_once_ten_thousand_rows_after_crash() {
         rows_committed += batch.num_rows();
     }
 
-    let scanned = lake
-        .scan(&IcebergScanOptions::default())
-        .await
-        .unwrap();
+    let scanned = lake.scan(&IcebergScanOptions::default()).await.unwrap();
     let total: usize = scanned.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 10_000);
     assert_eq!(recovered_offsets.get("orders-0"), Some(&(6000)));

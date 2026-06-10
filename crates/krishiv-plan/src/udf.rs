@@ -1286,7 +1286,7 @@ impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
                 Ok(Ok(array)) => array,
                 Ok(Err(error)) => return Err(error),
                 Err(payload) => {
-                    let message = panic_message(&payload);
+                    let message = krishiv_common::panic_payload_to_string(&*payload);
                     return Err(UdfError::Panic(format!(
                         "UDF '{}' panicked during execution: {}",
                         udf.name(),
@@ -1334,16 +1334,6 @@ impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
         }
 
         Ok(result)
-    }
-}
-
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_owned()
     }
 }
 
@@ -1486,18 +1476,27 @@ mod memory_enforcement_tests {
     #[test]
     fn panic_message_extracts_str_payload() {
         let payload: Box<dyn std::any::Any + Send> = Box::new("static str payload");
-        assert_eq!(panic_message(&payload), "static str payload");
+        assert_eq!(
+            krishiv_common::panic_payload_to_string(&*payload),
+            "static str payload"
+        );
     }
 
     #[test]
     fn panic_message_extracts_string_payload() {
         let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("owned payload"));
-        assert_eq!(panic_message(&payload), "owned payload");
+        assert_eq!(
+            krishiv_common::panic_payload_to_string(&*payload),
+            "owned payload"
+        );
     }
 
     #[test]
     fn panic_message_falls_back_for_unknown_payloads() {
         let payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
-        assert_eq!(panic_message(&payload), "non-string panic payload");
+        assert_eq!(
+            krishiv_common::panic_payload_to_string(&*payload),
+            "non-string panic payload"
+        );
     }
 }

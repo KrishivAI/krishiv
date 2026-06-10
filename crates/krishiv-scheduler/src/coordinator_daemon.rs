@@ -20,8 +20,8 @@ use tokio::time::{Duration, interval};
 
 use crate::InMemoryMetadataStore;
 use crate::auth::configured_coordinator_bearer_token;
-use crate::store::MetadataStore;
 use crate::rpc_drain::InFlightTracker;
+use crate::store::MetadataStore;
 use crate::{
     ClusterControlPlane, Coordinator, LeaderElection, SharedCoordinator, SingleNodeLeader,
     scheduler_metrics, serve_coordinator_executor_grpc_with_listener_and_tracker,
@@ -315,14 +315,17 @@ pub async fn spawn_coordinator_sidecars(
                 // partition files for jobs that crashed before reaching terminal
                 // state and were never added to gc_ready_jobs (C4).
                 orphan_tick_count += 1;
-                if orphan_tick_count % 12 == 0 {
+                if orphan_tick_count.is_multiple_of(12) {
                     let active = gc_coordinator.read().await.active_job_ids();
                     let dir = orphan_shuffle_dir.clone();
                     let store2 = Arc::clone(&orphan_store);
                     tokio::task::spawn_blocking(move || {
                         match krishiv_shuffle::orphan::cleanup_orphans(&dir, &active) {
                             Ok(n) if n > 0 => {
-                                tracing::info!(removed = n, "shuffle orphan GC: removed orphaned partition files");
+                                tracing::info!(
+                                    removed = n,
+                                    "shuffle orphan GC: removed orphaned partition files"
+                                );
                             }
                             Ok(_) => {}
                             Err(e) => tracing::error!(error = %e, "shuffle orphan GC failed"),
@@ -592,7 +595,12 @@ async fn readyz(
             "coordinator is not active\n".to_owned(),
         ));
     }
-    let healthy_executors = c.executors().executors.values().filter(|e| e.state.can_accept_work()).count();
+    let healthy_executors = c
+        .executors()
+        .executors
+        .values()
+        .filter(|e| e.state.can_accept_work())
+        .count();
     if healthy_executors == 0 {
         return Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -856,13 +864,13 @@ fn validate_runtime_security_config(
             .into());
         }
     }
-    if config.durability_profile == DurabilityProfile::DistributedDurable {
-        if !executor_task_bearer_token_configured {
-            return Err(format!(
-                "distributed-durable requires non-empty {EXECUTOR_TASK_BEARER_TOKEN_ENV} so executor task-control gRPC is authenticated"
-            )
-            .into());
-        }
+    if config.durability_profile == DurabilityProfile::DistributedDurable
+        && !executor_task_bearer_token_configured
+    {
+        return Err(format!(
+            "distributed-durable requires non-empty {EXECUTOR_TASK_BEARER_TOKEN_ENV} so executor task-control gRPC is authenticated"
+        )
+        .into());
     }
     if config.http_addr.is_some()
         && http_auth_required(config)

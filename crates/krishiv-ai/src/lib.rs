@@ -27,8 +27,8 @@ pub use memo::{MemoEntry, MemoStore, memo_key};
 pub use rag::{RagError, RagIndexPipeline, RagIndexResult, RagQuery, RefreshPolicy};
 pub use vector_sinks::{
     EmbeddingBatch, InMemoryVectorSink, LanceDbSink, PayloadFilter, PayloadValue, PineconeSink,
-    ScoredChunk, VectorSink, VectorSinkConfig, VectorSinkError, VectorSinkRegistry,
-    WeaviateSink, point_id_from_doc_epoch, validate_identifier,
+    ScoredChunk, VectorSink, VectorSinkConfig, VectorSinkError, VectorSinkRegistry, WeaviateSink,
+    point_id_from_doc_epoch, validate_identifier,
 };
 
 #[cfg(feature = "fastembed-local")]

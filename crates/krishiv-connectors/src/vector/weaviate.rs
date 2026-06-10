@@ -186,8 +186,8 @@ impl VectorSink for WeaviateSink {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::traits::VectorSink;
+    use super::*;
 
     #[tokio::test]
     async fn weaviate_query_returns_results() {

@@ -391,10 +391,10 @@ impl HudiCowWriter {
             .sync_all()
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
         #[cfg(unix)]
-        if let Some(parent) = timeline_marker.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+        if let Some(parent) = timeline_marker.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
 
         Ok(HudiWriteResult {

@@ -7,11 +7,21 @@
 //! Query Execution) extension traits that operate on runtime statistics
 //! collected during stage execution.
 
-use std::any::Any;
-use std::collections::HashSet;
+mod auto_partition;
+mod broadcast;
+mod coalesce;
+mod predicate_pushdown;
+mod small_file;
+
+pub use auto_partition::AutoPartitionRule;
+pub use broadcast::{BroadcastAutoRule, DEFAULT_BROADCAST_THRESHOLD_ROWS};
+pub use coalesce::{CoalesceAdvice, CoalesceRule};
+pub use predicate_pushdown::PredicatePushdownRule;
+pub use small_file::{FileStats, SmallFilePlanner, SplitPlanAdvice};
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::{ExecutionKind, LogicalPlan, NodeOp, Partitioning, PhysicalPlan, PlanError, PlanNode};
+use crate::{ExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanError};
 
 /// Result type for logical and adaptive optimizer pipelines.
 pub type OptimizerResult<T> = Result<T, OptimizerError>;
@@ -93,6 +103,75 @@ pub trait CostModel: Send + Sync {
     fn estimate(&self, plan: &LogicalPlan) -> Cost;
 }
 
+/// Static, row-count-aware cost model for logical plans.
+///
+/// Walks every node in the plan and accumulates cost estimates based on
+/// operator type and the node's `estimated_rows` field.  When `estimated_rows`
+/// is `None` a conservative default of 10 000 rows is assumed.
+///
+/// ## Per-node coefficients
+///
+/// | Operator     | CPU (ns/row) | Memory (B/row) | Network (B/row) |
+/// |--------------|:------------:|:--------------:|:---------------:|
+/// | Scan         | 10           | 64             | 0               |
+/// | Filter       | 5            | 0              | 0               |
+/// | Project      | 2            | 0              | 0               |
+/// | Aggregate    | 50           | 200            | 0               |
+/// | Join         | 100          | 100            | 0               |
+/// | Exchange     | 20           | 0              | 200             |
+/// | Other/Window | 15           | 64             | 0               |
+///
+/// These figures are deliberately simple and tunable; their absolute values
+/// are less important than their relative ordering (Aggregate > Join > …).
+pub struct StaticCostModel;
+
+impl CostModel for StaticCostModel {
+    fn estimate(&self, plan: &LogicalPlan) -> Cost {
+        const DEFAULT_ROWS: u64 = 10_000;
+        let mut cpu_nanos: u64 = 0;
+        let mut memory_bytes: u64 = 0;
+        let mut network_bytes: u64 = 0;
+
+        for node in plan.nodes() {
+            let rows = node.estimated_rows().unwrap_or(DEFAULT_ROWS);
+            match node.op() {
+                Some(NodeOp::Scan { .. }) => {
+                    cpu_nanos = cpu_nanos.saturating_add(rows.saturating_mul(10));
+                    memory_bytes = memory_bytes.saturating_add(rows.saturating_mul(64));
+                }
+                Some(NodeOp::Filter { .. }) => {
+                    cpu_nanos = cpu_nanos.saturating_add(rows.saturating_mul(5));
+                }
+                Some(NodeOp::Project { .. }) => {
+                    cpu_nanos = cpu_nanos.saturating_add(rows.saturating_mul(2));
+                }
+                Some(NodeOp::Aggregate { .. }) => {
+                    cpu_nanos = cpu_nanos.saturating_add(rows.saturating_mul(50));
+                    memory_bytes = memory_bytes.saturating_add(rows.saturating_mul(200));
+                }
+                Some(NodeOp::Join { .. }) => {
+                    cpu_nanos = cpu_nanos.saturating_add(rows.saturating_mul(100));
+                    memory_bytes = memory_bytes.saturating_add(rows.saturating_mul(100));
+                }
+                Some(NodeOp::Exchange { .. }) => {
+                    cpu_nanos = cpu_nanos.saturating_add(rows.saturating_mul(20));
+                    network_bytes = network_bytes.saturating_add(rows.saturating_mul(200));
+                }
+                _ => {
+                    cpu_nanos = cpu_nanos.saturating_add(rows.saturating_mul(15));
+                    memory_bytes = memory_bytes.saturating_add(rows.saturating_mul(64));
+                }
+            }
+        }
+
+        Cost {
+            cpu_nanos,
+            memory_bytes,
+            network_bytes,
+        }
+    }
+}
+
 /// A rule that transforms a [`LogicalPlan`] into a (possibly better) one.
 ///
 /// P2.4: `apply` returns `Option<LogicalPlan>` — `None` means the plan is
@@ -121,8 +200,9 @@ pub trait AqeRule: Send + Sync {
     /// Apply the AQE rule given collected [`RuntimeStats`] for each stage.
     ///
     /// Return `Some(new_plan)` when the rule rewrites the plan, or `None` when
-    /// the plan is unchanged.
-    fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> Option<PhysicalPlan>;
+    /// the plan is unchanged.  The rule borrows the plan; clone it internally
+    /// only when a rewrite is needed so non-firing rules pay no clone cost.
+    fn apply(&self, plan: &PhysicalPlan, stats: &[RuntimeStats]) -> Option<PhysicalPlan>;
 }
 
 /// A rule that detects skewed (hot) partitions from [`RuntimeStats`].
@@ -203,7 +283,7 @@ impl Optimizer {
                     OptimizerError::RulePanicked {
                         optimizer: "logical",
                         rule: rule_name.clone(),
-                        message: panic_payload_message(payload),
+                        message: krishiv_common::panic_payload_to_string(&*payload),
                     }
                 })?;
             if let Some(new_plan) = outcome {
@@ -240,16 +320,6 @@ impl Optimizer {
 impl Default for Optimizer {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_string()
     }
 }
 
@@ -301,475 +371,6 @@ impl SkewRule for ThresholdSkewRule {
             .filter(|(_, s)| s.input_rows as f64 > self.threshold * median)
             .map(|(i, _)| i)
             .collect()
-    }
-}
-
-// ── CoalesceRule ──────────────────────────────────────────────────────────────
-
-/// Advice returned by the coalesce rule: which partition indices should be merged.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoalesceAdvice {
-    /// Groups of partition indices to merge. Each inner `Vec` is one merged partition.
-    pub groups: Vec<Vec<usize>>,
-}
-
-/// Merges partitions whose `memory_bytes` falls below `min_partition_bytes`.
-///
-/// When coalescing is beneficial (i.e. the advised group count is smaller than
-/// the current partition count), `apply` rewrites the physical plan by appending
-/// a [`NodeOp::CoalescePartitions`] node that signals downstream operators to
-/// merge the output into `target_partitions` partitions.
-pub struct CoalesceRule {
-    /// Partitions smaller than this threshold (bytes) are candidates for merging.
-    min_partition_bytes: u64,
-    /// Target size for each merged partition (bytes).
-    ///
-    /// Used to determine `target_partitions = ceil(total_bytes / target_partition_bytes)`
-    /// when inserting a `CoalescePartitions` node.  Default: 128 MiB.
-    target_partition_bytes: u64,
-}
-
-/// Default target partition size: 128 MiB.
-const DEFAULT_TARGET_PARTITION_BYTES: u64 = krishiv_common::partition::TARGET_BYTES_PER_PARTITION;
-
-impl CoalesceRule {
-    /// Create a new `CoalesceRule` with the given minimum partition byte threshold.
-    ///
-    /// Uses the default `target_partition_bytes` of 128 MiB.
-    pub fn new(min_partition_bytes: u64) -> Self {
-        Self {
-            min_partition_bytes,
-            target_partition_bytes: DEFAULT_TARGET_PARTITION_BYTES,
-        }
-    }
-
-    /// Set a custom `target_partition_bytes` (bytes per merged output partition).
-    #[must_use]
-    pub fn with_target_partition_bytes(mut self, target_partition_bytes: u64) -> Self {
-        self.target_partition_bytes = target_partition_bytes;
-        self
-    }
-
-    /// Return the configured `target_partition_bytes`.
-    pub fn target_partition_bytes(&self) -> u64 {
-        self.target_partition_bytes
-    }
-
-    /// Compute coalesce advice from per-partition stats, without modifying the plan.
-    ///
-    /// Partitions are sorted by `memory_bytes` (ascending) before grouping so
-    /// that all small partitions cluster together regardless of their original
-    /// execution order. Without sorting, a large partition sitting between two
-    /// small ones would prevent them from coalescing (Spark's AQE sorts before
-    /// coalescing for the same reason). Each group of small partitions is
-    /// capped at `target_partition_bytes`. Large partitions are always singleton
-    /// groups.
-    ///
-    /// Each group contains the original partition indices (not sorted indices),
-    /// so callers can map groups back to the original execution order.
-    ///
-    /// Example: `[small(0), big(1), small(2)]` → `[[0,2], [1]]` (2 groups)
-    /// vs. the old consecutive-only approach: `[[0], [1], [2]]` (3 groups, no gain)
-    pub fn advise(&self, stats: &[RuntimeStats]) -> CoalesceAdvice {
-        if stats.is_empty() {
-            return CoalesceAdvice { groups: Vec::new() };
-        }
-
-        // Sort by effective_bytes ascending so small partitions cluster together.
-        // Prefer serialized_bytes over memory_bytes (same logic as in the loop
-        // below). Stable sort preserves original order among equal-size partitions.
-        let mut order: Vec<usize> = (0..stats.len()).collect();
-        order.sort_by_key(|&i| {
-            let s = &stats[i];
-            if s.serialized_bytes > 0 { s.serialized_bytes } else { s.memory_bytes }
-        });
-
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-        let mut current_small: Vec<usize> = Vec::new();
-        let mut current_small_bytes = 0u128;
-        let target_bytes = u128::from(self.target_partition_bytes.max(1));
-
-        for i in order {
-            let s = &stats[i];
-            // Prefer serialized_bytes over memory_bytes for the same reason as
-            // AutoPartitionRule: shuffle output is compressed and a better
-            // proxy for actual partition cost than peak in-memory footprint.
-            let effective_bytes = if s.serialized_bytes > 0 { s.serialized_bytes } else { s.memory_bytes };
-            if effective_bytes < self.min_partition_bytes {
-                let partition_bytes = u128::from(effective_bytes);
-                if !current_small.is_empty() && current_small_bytes + partition_bytes > target_bytes
-                {
-                    groups.push(std::mem::take(&mut current_small));
-                    current_small_bytes = 0;
-                }
-                current_small.push(i);
-                current_small_bytes += partition_bytes;
-            } else {
-                if !current_small.is_empty() {
-                    groups.push(std::mem::take(&mut current_small));
-                    current_small_bytes = 0;
-                }
-                groups.push(vec![i]);
-            }
-        }
-        if !current_small.is_empty() {
-            groups.push(current_small);
-        }
-
-        CoalesceAdvice { groups }
-    }
-}
-
-impl AqeRule for CoalesceRule {
-    fn name(&self) -> &str {
-        "coalesce-small-partitions"
-    }
-
-    /// Compute coalesce advice and, when beneficial, rewrite the plan.
-    ///
-    /// When `advise()` produces fewer groups than the current partition count,
-    /// stamps `coalesced_partition_count` on the plan and appends a
-    /// [`NodeOp::CoalescePartitions`] node carrying the computed target count.
-    fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
-        if stats.is_empty() || StreamingAqeGuard::plan_is_streaming(&plan) {
-            return None;
-        }
-        let advice = self.advise(stats);
-        let original_count = stats.len();
-
-        if advice.groups.len() >= original_count || original_count == 0 {
-            return None;
-        }
-
-        let target_partitions = advice.groups.len().max(1);
-        if target_partitions >= original_count {
-            return None;
-        }
-
-        tracing::debug!(
-            rule = self.name(),
-            original_partitions = original_count,
-            coalesced_partitions = advice.groups.len(),
-            coalesce_groups = ?advice.groups,
-            target_partitions,
-            "CoalesceRule: {} partition(s) → {} group(s)",
-            original_count,
-            advice.groups.len(),
-        );
-
-        let referenced_ids = plan
-            .nodes()
-            .iter()
-            .flat_map(|node| node.inputs().iter().map(String::as_str))
-            .collect::<HashSet<_>>();
-        let terminal_indexes = plan
-            .nodes()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| (!referenced_ids.contains(node.id())).then_some(index))
-            .collect::<Vec<_>>();
-        if terminal_indexes.len() > 1 {
-            return None;
-        }
-
-        let label = format!("CoalescePartitions({original_count} → {target_partitions})");
-        let existing_coalesce_index = terminal_indexes.first().and_then(|&terminal_index| {
-            let terminal = &plan.nodes()[terminal_index];
-            if matches!(terminal.op(), Some(NodeOp::CoalescePartitions { .. })) {
-                return Some(terminal_index);
-            }
-            if matches!(terminal.op(), Some(NodeOp::Sink { .. })) && terminal.inputs().len() == 1 {
-                let input_id = &terminal.inputs()[0];
-                return plan.nodes().iter().position(|node| {
-                    node.id() == input_id
-                        && matches!(node.op(), Some(NodeOp::CoalescePartitions { .. }))
-                });
-            }
-            None
-        });
-        if let Some(existing_coalesce_index) = existing_coalesce_index {
-            let mut updated = PhysicalPlan::new(plan.name(), plan.kind());
-            for (index, node) in plan.nodes().iter().enumerate() {
-                let node = if index == existing_coalesce_index {
-                    node.clone()
-                        .with_label(label.clone())
-                        .with_op(NodeOp::CoalescePartitions { target_partitions })
-                } else {
-                    node.clone()
-                };
-                updated.add_node(node);
-            }
-            return Some(updated.with_coalesced_partition_count(target_partitions));
-        }
-
-        let existing_ids = plan
-            .nodes()
-            .iter()
-            .map(PlanNode::id)
-            .collect::<HashSet<_>>();
-        let mut suffix = 1usize;
-        let coalesce_id = loop {
-            let candidate = if suffix == 1 {
-                "aqe:coalesce".to_string()
-            } else {
-                format!("aqe:coalesce:{suffix}")
-            };
-            if !existing_ids.contains(candidate.as_str()) {
-                break candidate;
-            }
-            suffix = suffix.saturating_add(1);
-        };
-
-        let mut rewritten = PhysicalPlan::new(plan.name(), plan.kind());
-        let mut coalesce_inputs = Vec::new();
-        for (index, node) in plan.nodes().iter().enumerate() {
-            if terminal_indexes.first() == Some(&index)
-                && matches!(node.op(), Some(NodeOp::Sink { .. }))
-                && node.inputs().len() == 1
-            {
-                coalesce_inputs.extend(node.inputs().iter().cloned());
-                rewritten.add_node(node.clone().with_inputs([coalesce_id.clone()]));
-            } else {
-                rewritten.add_node(node.clone());
-            }
-        }
-        if coalesce_inputs.is_empty()
-            && let Some(&terminal_index) = terminal_indexes.first()
-        {
-            coalesce_inputs.push(plan.nodes()[terminal_index].id().to_string());
-        }
-        rewritten.add_node(
-            PlanNode::new(coalesce_id, label, plan.kind())
-                .with_inputs(coalesce_inputs)
-                .with_op(NodeOp::CoalescePartitions { target_partitions }),
-        );
-        Some(rewritten.with_coalesced_partition_count(target_partitions))
-    }
-}
-
-// ── AutoPartitionRule ───────────────────────────────────────────────────────────
-
-/// AQE rule that adjusts the bucket count of `Hash` and `RoundRobin` exchange
-/// nodes based on the observed data volume from the previous execution.
-///
-/// The rule reads `RuntimeStats` (one per DataFusion partition), sums
-/// `memory_bytes` to obtain the total stage output size, and computes a target
-/// partition count:
-///
-/// `target = clamp(1, max_buckets, ceil(total_bytes / target_partition_bytes))`
-///
-/// The target is applied unconditionally: the rule can both increase and
-/// decrease bucket counts. This matches Spark AQE's behavior — if early
-/// execution stages produced far less data than expected, the rule shrinks
-/// the downstream partition count to avoid over-parallelism (task scheduling
-/// overhead dominating actual work). The minimum floor is always 1.
-///
-/// When stats are empty (first execution) or contain no measurable memory, the
-/// rule is a no-op and returns `None`.
-pub struct AutoPartitionRule {
-    /// Desired bytes per partition.  Default: 128 MiB.
-    target_partition_bytes: u64,
-    /// Upper bound on the number of partitions.  Derived from
-    /// `target_partitions` in the session config so we never ask for more
-    /// parallelism than the runtime can supply.
-    max_buckets: u32,
-}
-
-impl AutoPartitionRule {
-    /// Create a new rule with the given max bucket count.
-    ///
-    /// Uses the default `target_partition_bytes` of 128 MiB.
-    pub fn new(max_buckets: u32) -> Self {
-        Self {
-            target_partition_bytes: DEFAULT_TARGET_PARTITION_BYTES,
-            max_buckets,
-        }
-    }
-
-    /// Set a custom `target_partition_bytes`.
-    #[must_use]
-    pub fn with_target_partition_bytes(mut self, bytes: u64) -> Self {
-        self.target_partition_bytes = bytes;
-        self
-    }
-}
-
-impl AqeRule for AutoPartitionRule {
-    fn name(&self) -> &str {
-        "auto-partition"
-    }
-
-    fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
-        // When an explicit shuffle_partitions override is set on the plan
-        // (via SET shuffle.partitions = N or SessionBuilder), use it as the
-        // target bucket count regardless of stats.  Stats may be empty on the
-        // first execution and that's fine — the override is a user intent.
-        if let Some(override_buckets) = plan.shuffle_partitions() {
-            return self.apply_override(plan, override_buckets);
-        }
-
-        if stats.is_empty() || StreamingAqeGuard::plan_is_streaming(&plan) {
-            return None;
-        }
-
-        // Sum the best available size metric across all partitions.
-        // Prefer serialized_bytes (shuffle wire size) over memory_bytes (peak
-        // in-memory) because shuffle output is compressed/serialized and thus
-        // a more accurate proxy for partition cost. Fall back to memory_bytes
-        // when serialized_bytes is zero (non-shuffle tasks or older executors).
-        let total_bytes: u64 = stats
-            .iter()
-            .map(|s| if s.serialized_bytes > 0 { s.serialized_bytes } else { s.memory_bytes })
-            .sum();
-        if total_bytes == 0 {
-            return None;
-        }
-
-        // Compute target partition count.
-        let target =
-            u64::from(self.max_buckets).min(
-                (total_bytes + self.target_partition_bytes - 1) / self.target_partition_bytes,
-            );
-        let target = target.max(1) as u32;
-
-        self.stamp_target(plan, target)
-    }
-}
-
-impl AutoPartitionRule {
-    /// Apply the rule with an explicit override bucket count.
-    /// Skips streaming plans, but does not require runtime stats.
-    fn apply_override(&self, plan: PhysicalPlan, target: u32) -> Option<PhysicalPlan> {
-        if StreamingAqeGuard::plan_is_streaming(&plan) {
-            return None;
-        }
-        let target = target.max(1);
-        self.stamp_target(plan, target)
-    }
-
-    /// Stamp `target` bucket count onto all Hash/RoundRobin exchange nodes
-    /// whose current count differs from `target`. Returns `None` if no node
-    /// needed adjustment.
-    ///
-    /// Both increases and decreases are applied — if the observed data volume
-    /// implies fewer partitions than currently planned, the bucket count is
-    /// lowered to avoid over-parallelism (task scheduling overhead > useful
-    /// work). The caller guarantees `target >= 1`.
-    fn stamp_target(&self, plan: PhysicalPlan, target: u32) -> Option<PhysicalPlan> {
-        let mut changed = false;
-        for node in plan.nodes() {
-            match node.partitioning() {
-                Partitioning::Hash { buckets, .. } | Partitioning::RoundRobin { buckets, .. }
-                    if *buckets != target =>
-                {
-                    changed = true;
-                }
-                _ => {}
-            }
-        }
-
-        if !changed {
-            return None;
-        }
-
-        let mut plan = plan;
-        for node in plan.nodes_mut() {
-            let old = node.partitioning().clone();
-            match old {
-                Partitioning::Hash { ref keys, buckets } if buckets != target => {
-                    node.set_partitioning(Partitioning::Hash {
-                        keys: keys.clone(),
-                        buckets: target,
-                    });
-                }
-                Partitioning::RoundRobin { buckets } if buckets != target => {
-                    node.set_partitioning(Partitioning::RoundRobin {
-                        buckets: target,
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        tracing::debug!(
-            rule = "auto-partition",
-            target,
-            "AutoPartitionRule applied"
-        );
-
-        Some(plan)
-    }
-}
-
-// ── SmallFilePlanner ──────────────────────────────────────────────────────────
-
-/// Per-file metadata used by [`SmallFilePlanner`].
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileStats {
-    pub path: String,
-    pub size_bytes: u64,
-}
-
-/// Advice produced by [`SmallFilePlanner`]: a list of scan groups where each
-/// group of file paths should be handled by a single executor task.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SplitPlanAdvice {
-    /// Each inner `Vec` is one task's worth of files.
-    pub task_groups: Vec<Vec<String>>,
-}
-
-/// Plans scan parallelism for a set of files.
-///
-/// When individual files are smaller than `target_bytes`, multiple files are
-/// grouped into a single task so each task processes roughly `target_bytes` of
-/// data. Files larger than `target_bytes` each get their own task (splitting
-/// within a file is not yet supported).
-pub struct SmallFilePlanner {
-    target_bytes: u64,
-}
-
-impl SmallFilePlanner {
-    /// Create a planner with the given target bytes per task.
-    pub fn new(target_bytes: u64) -> Self {
-        Self { target_bytes }
-    }
-
-    /// Produce a scan plan for the given file list.
-    ///
-    /// Files are grouped greedily: accumulate until the next file would push the
-    /// group over `target_bytes`, then start a new group. This ensures each
-    /// group is at most `target_bytes + max_single_file_bytes`.
-    pub fn plan(&self, files: &[FileStats]) -> SplitPlanAdvice {
-        if files.is_empty() {
-            return SplitPlanAdvice {
-                task_groups: Vec::new(),
-            };
-        }
-
-        let mut groups: Vec<Vec<String>> = Vec::new();
-        let mut current: Vec<String> = Vec::new();
-        let mut current_bytes = 0u128;
-        let target_bytes = u128::from(self.target_bytes);
-
-        for file in files {
-            let file_bytes = u128::from(file.size_bytes);
-            if !current.is_empty() && current_bytes + file_bytes > target_bytes {
-                groups.push(std::mem::take(&mut current));
-                current_bytes = 0;
-            }
-            current.push(file.path.clone());
-            current_bytes += file_bytes;
-        }
-        if !current.is_empty() {
-            groups.push(current);
-        }
-
-        SplitPlanAdvice {
-            task_groups: groups,
-        }
     }
 }
 
@@ -867,12 +468,13 @@ impl AqeOptimizer {
 
         for rule in &self.always_rules {
             let rule_name = rule.name().to_string();
-            let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(current.clone(), stats)))
-                .map_err(|payload| OptimizerError::RulePanicked {
+            let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(&current, stats))).map_err(
+                |payload| OptimizerError::RulePanicked {
                     optimizer: "AQE",
                     rule: rule_name.clone(),
-                    message: panic_payload_message(payload),
-                })?;
+                    message: krishiv_common::panic_payload_to_string(&*payload),
+                },
+            )?;
             if let Some(new_plan) = outcome {
                 if new_plan.name() != current.name() || new_plan.kind() != current.kind() {
                     return Err(OptimizerError::InvalidRuleOutput {
@@ -900,11 +502,11 @@ impl AqeOptimizer {
         if !input_is_streaming && !StreamingAqeGuard::plan_is_streaming(&current) {
             for rule in &self.guarded_rules {
                 let rule_name = rule.name().to_string();
-                let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(current.clone(), stats)))
+                let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(&current, stats)))
                     .map_err(|payload| OptimizerError::RulePanicked {
                         optimizer: "AQE",
                         rule: rule_name.clone(),
-                        message: panic_payload_message(payload),
+                        message: krishiv_common::panic_payload_to_string(&*payload),
                     })?;
                 if let Some(new_plan) = outcome {
                     if new_plan.name() != current.name() || new_plan.kind() != current.kind() {
@@ -941,424 +543,11 @@ impl Default for AqeOptimizer {
     }
 }
 
-// ── Logical optimizer rules ─────────────────────────────────────────────────
-
-/// Push `Filter` predicates down into `TableScan` nodes.
-///
-/// Walks the logical plan looking for `Filter` nodes and decomposes each
-/// filter's predicate into AND-conjuncts. Conjuncts that reference only
-/// columns present in one scan's output schema are pushed into that scan
-/// node's `filters` list. If all conjuncts are pushed the `Filter` node is
-/// removed; remaining cross-join conjuncts stay in place.
-///
-/// Two patterns are handled:
-/// - **Filter-above-Scan**: filter's direct input is a scan.
-/// - **Filter-above-Join**: filter sits above a join; each conjunct is tested
-///   against the left and right scan inputs independently and pushed as far
-///   down as it can go. Cross-join predicates (referencing both sides) remain
-///   in the filter.
-/// Default threshold for auto-broadcast: tables with estimated rows below
-/// this value are candidates for broadcast join.  ~1M rows ≈ 100 MiB at 100
-/// bytes/row.
-const DEFAULT_BROADCAST_THRESHOLD_ROWS: u64 = 1_000_000;
-
-/// Logical optimizer rule that marks small scan nodes as broadcast-eligible.
-///
-/// Scans the logical plan for `NodeOp::Scan` nodes whose `estimated_rows` is
-/// set and below the threshold.  Such nodes are annotated with
-/// `broadcast_eligible = true` so the lowering pass promotes their exchange
-/// to `Broadcast` partitioning.
-///
-/// The threshold is deliberately conservative (1M rows).  Without `estimated_rows`
-/// populated from source metadata (parquet footer, Kafka stats, etc.) the rule
-/// is a no-op.
-pub struct BroadcastAutoRule {
-    /// Max rows a table can have to be considered broadcast-eligible.
-    max_rows: u64,
-}
-
-impl BroadcastAutoRule {
-    /// Create a new rule with the given max row threshold.
-    pub fn new(max_rows: u64) -> Self {
-        Self { max_rows }
-    }
-}
-
-impl OptimizerRule for BroadcastAutoRule {
-    fn name(&self) -> &str {
-        "broadcast-auto"
-    }
-
-    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
-        let nodes = plan.nodes();
-        let mut changed = false;
-        let mut new_nodes: Vec<PlanNode> = Vec::with_capacity(nodes.len());
-
-        for node in nodes {
-            let is_small_scan = matches!(node.op(), Some(NodeOp::Scan { .. }))
-                && node.estimated_rows().map_or(false, |r| r <= self.max_rows);
-
-            if is_small_scan && !node.broadcast_eligible() {
-                changed = true;
-                new_nodes.push(node.clone().with_broadcast_eligible(true));
-            } else {
-                new_nodes.push(node.clone());
-            }
-        }
-
-        if !changed {
-            return None;
-        }
-
-        let mut new_plan = LogicalPlan::new(plan.name(), plan.kind());
-        for n in new_nodes {
-            new_plan = new_plan.with_node(n);
-        }
-        Some(new_plan)
-    }
-}
-
-pub struct PredicatePushdownRule;
-
-impl OptimizerRule for PredicatePushdownRule {
-    fn name(&self) -> &str {
-        "predicate-pushdown"
-    }
-
-    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
-        let nodes = plan.nodes().to_vec();
-        let id_to_idx: std::collections::HashMap<&str, usize> =
-            nodes.iter().enumerate().map(|(i, n)| (n.id(), i)).collect();
-
-        // Collect pushdown candidates: filter nodes whose input is a scan.
-        struct FilterPushdown {
-            filter_idx: usize,
-            scan_pushes: Vec<(usize, Vec<String>)>,
-            remaining: Vec<String>,
-        }
-
-        let mut pushdowns: Vec<FilterPushdown> = Vec::new();
-
-        for (i, node) in nodes.iter().enumerate() {
-            let predicate = match node.op() {
-                Some(NodeOp::Filter { predicate }) => predicate.clone(),
-                _ => continue,
-            };
-
-            // Collect all scan nodes reachable in one or two hops from this
-            // filter. One hop covers Filter-above-Scan; two hops covers
-            // Filter-above-Join-above-Scan so each side of the join can
-            // independently receive the conjuncts that belong to it.
-            let direct_inputs: Vec<usize> = node
-                .inputs()
-                .iter()
-                .filter_map(|input_id| id_to_idx.get(input_id.as_str()).copied())
-                .collect();
-
-            let mut scan_indices: Vec<usize> = direct_inputs
-                .iter()
-                .copied()
-                .filter(|&idx| matches!(nodes[idx].op(), Some(NodeOp::Scan { .. })))
-                .collect();
-
-            // Filter-above-Join: descend through join nodes to collect
-            // both left and right scan inputs for per-side pushdown.
-            for join_idx in direct_inputs.iter().copied().filter(|&idx| {
-                matches!(
-                    nodes[idx].op(),
-                    Some(NodeOp::Join {
-                        join_type: crate::JoinType::Inner
-                    })
-                )
-            }) {
-                for child_id in nodes[join_idx].inputs() {
-                    if let Some(&child_idx) = id_to_idx.get(child_id.as_str()) {
-                        if matches!(nodes[child_idx].op(), Some(NodeOp::Scan { .. })) {
-                            scan_indices.push(child_idx);
-                        }
-                    }
-                }
-            }
-            scan_indices.sort_unstable();
-            scan_indices.dedup();
-
-            if scan_indices.is_empty() {
-                continue;
-            }
-
-            // C5: Use sqlparser to split predicate conjuncts properly
-            // instead of naively splitting on the literal string " AND ".
-            let conjuncts = split_predicate_conjuncts(&predicate);
-
-            if conjuncts.is_empty() {
-                continue;
-            }
-
-            let scan_contracts = scan_indices
-                .iter()
-                .map(|&scan_idx| {
-                    let scan_node = &nodes[scan_idx];
-                    let columns = scan_node
-                        .output_schema()
-                        .fields()
-                        .iter()
-                        .map(|field| field.name())
-                        .collect::<Vec<_>>();
-                    let table = match scan_node.op() {
-                        Some(NodeOp::Scan { table, .. }) => table.as_str(),
-                        _ => "",
-                    };
-                    (scan_idx, table, columns)
-                })
-                .collect::<Vec<_>>();
-            let mut scan_pushes = std::collections::HashMap::<usize, Vec<String>>::new();
-            let mut remaining = Vec::new();
-
-            for conjunct in conjuncts {
-                let columns = extract_column_refs(&conjunct);
-                let matching_scans = scan_contracts
-                    .iter()
-                    .filter_map(|(scan_idx, table, scan_columns)| {
-                        (!columns.is_empty()
-                            && columns
-                                .iter()
-                                .all(|column| column_belongs_to_scan(column, table, scan_columns)))
-                        .then_some(*scan_idx)
-                    })
-                    .collect::<Vec<_>>();
-                if let [scan_idx] = matching_scans.as_slice() {
-                    scan_pushes.entry(*scan_idx).or_default().push(conjunct);
-                } else {
-                    remaining.push(conjunct);
-                }
-            }
-
-            if !scan_pushes.is_empty() {
-                let mut scan_pushes = scan_pushes.into_iter().collect::<Vec<_>>();
-                scan_pushes.sort_by_key(|(scan_idx, _)| *scan_idx);
-                pushdowns.push(FilterPushdown {
-                    filter_idx: i,
-                    scan_pushes,
-                    remaining,
-                });
-            }
-        }
-
-        if pushdowns.is_empty() {
-            return None;
-        }
-
-        let mut new_nodes = nodes.clone();
-        let mut to_remove: Vec<usize> = Vec::new();
-
-        for pd in &pushdowns {
-            for (scan_idx, pushable) in &pd.scan_pushes {
-                if let Some(NodeOp::Scan { table, filters }) = new_nodes[*scan_idx].op() {
-                    let mut new_filters = filters.clone();
-                    new_filters.extend(pushable.iter().cloned());
-                    new_nodes[*scan_idx] = new_nodes[*scan_idx].clone().with_op(NodeOp::Scan {
-                        table: table.clone(),
-                        filters: new_filters,
-                    });
-                }
-            }
-
-            if pd.remaining.is_empty() {
-                to_remove.push(pd.filter_idx);
-            } else {
-                new_nodes[pd.filter_idx] =
-                    new_nodes[pd.filter_idx].clone().with_op(NodeOp::Filter {
-                        predicate: pd.remaining.join(" AND "),
-                    });
-            }
-        }
-
-        // Remove filter nodes and rewire downstream node inputs.
-        for &idx in to_remove.iter().rev() {
-            let filter_id = new_nodes[idx].id().to_string();
-            let filter_inputs: Vec<String> = new_nodes[idx].inputs().to_vec();
-            new_nodes.remove(idx);
-
-            for node in &mut new_nodes {
-                let inputs: Vec<String> = node.inputs().to_vec();
-                if inputs.contains(&filter_id) {
-                    let new_inputs: Vec<String> = inputs
-                        .iter()
-                        .flat_map(|input| {
-                            if input == &filter_id {
-                                filter_inputs.clone()
-                            } else {
-                                vec![input.clone()]
-                            }
-                        })
-                        .collect();
-                    *node = node.clone().with_inputs(new_inputs);
-                }
-            }
-        }
-
-        let mut out = LogicalPlan::new(plan.name(), plan.kind());
-        for node in new_nodes {
-            out.add_node(node);
-        }
-        Some(out)
-    }
-}
-
-/// Extract likely column-name identifiers from a predicate expression string.
-///
-/// Skips string literals and function names, retaining unquoted and quoted
-/// identifier paths such as `column` and `table.column`.
-fn extract_column_refs(predicate: &str) -> Vec<String> {
-    const SQL_KEYWORDS: &[&str] = &[
-        "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "WHERE", "SELECT", "FROM", "AS",
-        "ON", "BETWEEN", "LIKE", "EXISTS", "HAVING", "GROUP", "ORDER", "BY", "ASC", "DESC",
-        "LIMIT", "OFFSET", "DISTINCT", "ALL", "ANY", "SOME", "CASE", "WHEN", "THEN", "ELSE", "END",
-        "CAST",
-    ];
-
-    let chars = predicate.char_indices().collect::<Vec<_>>();
-    let mut refs = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < chars.len() {
-        let (_, ch) = chars[cursor];
-        if ch == '\'' {
-            cursor += 1;
-            while cursor < chars.len() {
-                if chars[cursor].1 == '\'' {
-                    if cursor + 1 < chars.len() && chars[cursor + 1].1 == '\'' {
-                        cursor += 2;
-                        continue;
-                    }
-                    cursor += 1;
-                    break;
-                }
-                cursor += 1;
-            }
-            continue;
-        }
-        if ch == '"' || ch == '`' {
-            let quote = ch;
-            let start = chars[cursor].0 + ch.len_utf8();
-            cursor += 1;
-            while cursor < chars.len() && chars[cursor].1 != quote {
-                cursor += 1;
-            }
-            let end = chars
-                .get(cursor)
-                .map_or(predicate.len(), |(offset, _)| *offset);
-            if end > start {
-                refs.push(predicate[start..end].to_string());
-            }
-            cursor = cursor.saturating_add(1);
-            continue;
-        }
-        if ch.is_ascii_alphabetic() || ch == '_' {
-            let start = chars[cursor].0;
-            cursor += 1;
-            while cursor < chars.len()
-                && (chars[cursor].1.is_ascii_alphanumeric()
-                    || chars[cursor].1 == '_'
-                    || chars[cursor].1 == '.')
-            {
-                cursor += 1;
-            }
-            let end = chars
-                .get(cursor)
-                .map_or(predicate.len(), |(offset, _)| *offset);
-            let token = &predicate[start..end];
-            let next_non_whitespace = chars[cursor..]
-                .iter()
-                .find_map(|(_, next)| (!next.is_whitespace()).then_some(*next));
-            if next_non_whitespace != Some('(')
-                && !SQL_KEYWORDS.contains(&token.to_uppercase().as_str())
-                && !refs.iter().any(|existing| existing == token)
-            {
-                refs.push(token.to_string());
-            }
-            continue;
-        }
-        cursor += 1;
-    }
-    refs
-}
-
-/// C5: Split a SQL predicate string into conjuncts using sqlparser for correct
-/// AND splitting.  Respects quoted strings, nested expressions, etc.
-fn split_predicate_conjuncts(predicate: &str) -> Vec<String> {
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-
-    let dialect = GenericDialect {};
-    let expression = predicate
-        .strip_prefix("WHERE ")
-        .or_else(|| predicate.strip_prefix("where "))
-        .unwrap_or(predicate);
-    let statement = format!("SELECT * FROM __krishiv_predicate WHERE {expression}");
-    let Ok(mut stmts) = Parser::parse_sql(&dialect, &statement) else {
-        return Vec::new();
-    };
-    let Some(stmt) = stmts.pop() else {
-        return vec![predicate.to_string()];
-    };
-    // Extract the expression and split on top-level AND.
-    let sqlparser::ast::Statement::Query(query) = stmt else {
-        return vec![predicate.to_string()];
-    };
-    let Some(select_body) = query.body.as_select() else {
-        return vec![predicate.to_string()];
-    };
-    let Some(selection) = &select_body.selection else {
-        return vec![predicate.to_string()];
-    };
-    collect_binary_conjuncts(selection, "AND")
-}
-
-/// Recursively collect top-level conjuncts from a binary expression tree.
-fn collect_binary_conjuncts(expr: &sqlparser::ast::Expr, op: &str) -> Vec<String> {
-    match expr {
-        sqlparser::ast::Expr::BinaryOp {
-            left,
-            op: bin_op,
-            right,
-        } if bin_op.to_string().to_uppercase() == op => {
-            let mut left_conjuncts = collect_binary_conjuncts(left, op);
-            let right_conjuncts = collect_binary_conjuncts(right, op);
-            left_conjuncts.extend(right_conjuncts);
-            left_conjuncts
-        }
-        other => {
-            vec![other.to_string()]
-        }
-    }
-}
-
-/// Check whether `col` (possibly qualified like `"t.id"`) belongs to `scan_table`
-/// with the given column names.  C5: When a column reference has an explicit
-/// qualifier, require an exact case-insensitive table match. Aliases are not
-/// represented in `PlanNode`, so guessing them would permit unsafe pushdown.
-fn column_belongs_to_scan(col: &str, scan_table: &str, scan_columns: &[&str]) -> bool {
-    if let Some(dot_pos) = col.rfind('.') {
-        let qualifier = &col[..dot_pos];
-        let unqualified = &col[dot_pos + 1..];
-        if !qualifier.is_empty() {
-            let scan_lower = scan_table.to_ascii_lowercase();
-            let qual_lower = qualifier.to_ascii_lowercase();
-            if qual_lower == scan_lower {
-                return scan_columns.contains(&unqualified);
-            }
-            // Reject qualification that doesn't match this table at all.
-            return false;
-        }
-        return scan_columns.contains(&unqualified);
-    }
-    scan_columns.contains(&col)
-}
-
-/// Default logical optimizer with semantics-preserving rules enabled.
 pub fn default_logical_optimizer() -> Optimizer {
     let mut optimizer = Optimizer::new();
-    optimizer.add_rule(Box::new(BroadcastAutoRule::new(DEFAULT_BROADCAST_THRESHOLD_ROWS)));
+    optimizer.add_rule(Box::new(BroadcastAutoRule::new(
+        DEFAULT_BROADCAST_THRESHOLD_ROWS,
+    )));
     optimizer.add_rule(Box::new(PredicatePushdownRule));
     optimizer
 }
@@ -1798,7 +987,7 @@ mod tests {
             .collect();
         let plan = PhysicalPlan::new("test-plan", ExecutionKind::Batch);
         let rule = CoalesceRule::new(128 * 1024 * 1024); // 128 MiB
-        let result = rule.apply(plan, &stats).expect("coalesce should fire");
+        let result = rule.apply(&plan, &stats).expect("coalesce should fire");
         let coalesced = result
             .coalesced_partition_count()
             .expect("CoalesceRule must set coalesced_partition_count");
@@ -1820,7 +1009,7 @@ mod tests {
             .collect();
         let plan = PhysicalPlan::new("big-plan", ExecutionKind::Batch);
         let rule = CoalesceRule::new(128 * 1024 * 1024);
-        let result = rule.apply(plan, &stats);
+        let result = rule.apply(&plan, &stats);
         assert!(result.is_none(), "no coalescing should return None");
     }
 
@@ -1847,7 +1036,7 @@ mod tests {
         ];
         let rule = CoalesceRule::new(100).with_target_partition_bytes(100);
 
-        let first = rule.apply(plan, &stats).expect("first rewrite");
+        let first = rule.apply(&plan, &stats).expect("first rewrite");
         first.validate().expect("valid first rewrite");
         let coalesce = first
             .nodes()
@@ -1863,7 +1052,7 @@ mod tests {
         assert_eq!(sink.inputs(), &[coalesce.id()]);
         assert_eq!(first.coalesced_partition_count(), Some(1));
 
-        let second = rule.apply(first.clone(), &stats).expect("second rewrite");
+        let second = rule.apply(&first.clone(), &stats).expect("second rewrite");
         second.validate().expect("valid second rewrite");
         assert_eq!(second.nodes().len(), first.nodes().len());
         assert_eq!(
@@ -1890,7 +1079,7 @@ mod tests {
             },
         ];
 
-        assert!(CoalesceRule::new(100).apply(plan, &stats).is_none());
+        assert!(CoalesceRule::new(100).apply(&plan, &stats).is_none());
     }
 
     // ── SmallFilePlanner ──────────────────────────────────────────────────
@@ -2053,15 +1242,13 @@ mod tests {
             .with_target_partition_bytes(134_217_728); // target = 128 MiB
 
         let plan = PhysicalPlan::new("big-job", ExecutionKind::Batch);
-        let rewritten = AqeRule::apply(&rule, plan, &stats).expect("coalesce should fire");
+        let rewritten = AqeRule::apply(&rule, &plan, &stats).expect("coalesce should fire");
 
         // The plan must have had a CoalescePartitions node appended.
         let coalesce_node = rewritten
             .nodes()
             .iter()
-            .find(|n: &&crate::PlanNode| {
-                matches!(n.op(), Some(NodeOp::CoalescePartitions { .. }))
-            });
+            .find(|n: &&crate::PlanNode| matches!(n.op(), Some(NodeOp::CoalescePartitions { .. })));
 
         assert!(
             coalesce_node.is_some(),
@@ -2098,7 +1285,7 @@ mod tests {
         let rule = CoalesceRule::new(1_048_576); // min = 1 MiB
         let plan = PhysicalPlan::new("large-job", ExecutionKind::Batch);
         let _plan_clone = plan.clone();
-        let rewritten = AqeRule::apply(&rule, plan, &stats);
+        let rewritten = AqeRule::apply(&rule, &plan, &stats);
 
         // No coalescing: plan must be returned unchanged (None).
         assert!(
@@ -2420,11 +1607,12 @@ mod tests {
     fn auto_partition_rule_prefers_serialized_bytes_over_memory_bytes() {
         // A plan with a Hash exchange at 4 buckets.
         let plan = PhysicalPlan::new("p", ExecutionKind::Batch).with_node(
-            PlanNode::new("xchg", "exchange", ExecutionKind::Batch)
-                .with_partitioning(Partitioning::Hash {
+            PlanNode::new("xchg", "exchange", ExecutionKind::Batch).with_partitioning(
+                Partitioning::Hash {
                     keys: vec!["k".into()],
                     buckets: 4,
-                }),
+                },
+            ),
         );
 
         // 200 MiB in memory but only 50 MiB serialized.
@@ -2439,7 +1627,7 @@ mod tests {
         }];
 
         let rule = AutoPartitionRule::new(64).with_target_partition_bytes(128 * 1024 * 1024);
-        let result = rule.apply(plan.clone(), &stats).expect("rule must fire");
+        let result = rule.apply(&plan.clone(), &stats).expect("rule must fire");
 
         let buckets = result
             .nodes()
@@ -2467,9 +1655,17 @@ mod tests {
         let rule = CoalesceRule::new(100); // threshold = 100 bytes
         let stats = vec![
             // memory=50 (< 100), but serialized=500 (≥ 100) → big
-            RuntimeStats { memory_bytes: 50, serialized_bytes: 500, ..Default::default() },
+            RuntimeStats {
+                memory_bytes: 50,
+                serialized_bytes: 500,
+                ..Default::default()
+            },
             // memory=50 (< 100), serialized=0 → fall back to memory → small
-            RuntimeStats { memory_bytes: 50, serialized_bytes: 0, ..Default::default() },
+            RuntimeStats {
+                memory_bytes: 50,
+                serialized_bytes: 0,
+                ..Default::default()
+            },
         ];
         let advice = rule.advise(&stats);
         // Partition 0 must be a singleton (big by serialized_bytes).
@@ -2696,7 +1892,7 @@ mod tests {
     fn coalesce_rule_apply_empty_stats() {
         let rule = CoalesceRule::new(1000);
         let plan = PhysicalPlan::new("test", ExecutionKind::Batch);
-        let result = rule.apply(plan, &[]);
+        let result = rule.apply(&plan, &[]);
         assert!(result.is_none());
     }
 
@@ -2705,7 +1901,7 @@ mod tests {
         let stats = make_stats_with_memory(&[100]);
         let rule = CoalesceRule::new(1000);
         let plan = PhysicalPlan::new("test", ExecutionKind::Batch);
-        let result = rule.apply(plan, &stats);
+        let result = rule.apply(&plan, &stats);
         assert!(
             result.is_none(),
             "single partition should not trigger coalescing"
@@ -2717,7 +1913,7 @@ mod tests {
         let stats = make_stats_with_memory(&[100, 5000]);
         let rule = CoalesceRule::new(1000);
         let plan = PhysicalPlan::new("test", ExecutionKind::Batch);
-        let result = rule.apply(plan, &stats);
+        let result = rule.apply(&plan, &stats);
         assert!(
             result.is_none(),
             "2 groups from 2 partitions → no coalescing"
@@ -2729,7 +1925,7 @@ mod tests {
         let stats = make_stats_with_memory(&[100, 200]);
         let rule = CoalesceRule::new(1000);
         let plan = PhysicalPlan::new("test", ExecutionKind::Batch);
-        let result = rule.apply(plan, &stats);
+        let result = rule.apply(&plan, &stats);
         assert!(result.is_some(), "2 small partitions should coalesce");
         let result = result.unwrap();
         assert_eq!(result.coalesced_partition_count(), Some(1));
@@ -2741,7 +1937,7 @@ mod tests {
         let stats = make_stats_with_memory(&[100, 200, 300]);
         let rule = CoalesceRule::new(1000);
         let plan = PhysicalPlan::new("test", ExecutionKind::Batch);
-        let result = rule.apply(plan, &stats).unwrap();
+        let result = rule.apply(&plan, &stats).unwrap();
         let coalesce_node = result
             .nodes()
             .iter()
@@ -2757,7 +1953,7 @@ mod tests {
         let stats = make_stats_with_memory(&[5000, 6000]);
         let rule = CoalesceRule::new(1000);
         let plan = PhysicalPlan::new("test", ExecutionKind::Batch);
-        let result = rule.apply(plan, &stats);
+        let result = rule.apply(&plan, &stats);
         assert!(result.is_none());
     }
 
@@ -2970,9 +2166,12 @@ mod tests {
         fn name(&self) -> &str {
             "always-fire"
         }
-        fn apply(&self, plan: PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
+        fn apply(&self, plan: &PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
             let node_id = format!("extra-{}", plan.nodes().len());
-            Some(plan.with_node(PlanNode::new(node_id, "extra", ExecutionKind::Batch)))
+            Some(
+                plan.clone()
+                    .with_node(PlanNode::new(node_id, "extra", ExecutionKind::Batch)),
+            )
         }
     }
 
@@ -2982,7 +2181,7 @@ mod tests {
         fn name(&self) -> &str {
             "never-fire"
         }
-        fn apply(&self, _plan: PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
+        fn apply(&self, _plan: &PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
             None
         }
     }
@@ -3092,9 +2291,9 @@ mod tests {
                 "invalid-aqe"
             }
 
-            fn apply(&self, plan: PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
+            fn apply(&self, plan: &PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
                 Some(
-                    plan.with_node(
+                    plan.clone().with_node(
                         PlanNode::new("dangling", "dangling", ExecutionKind::Batch)
                             .with_inputs(["missing"]),
                     ),
@@ -3127,7 +2326,7 @@ mod tests {
                 "panicking-aqe"
             }
 
-            fn apply(&self, _plan: PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
+            fn apply(&self, _plan: &PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
                 panic!("aqe rule failed")
             }
         }
@@ -3348,10 +2547,8 @@ mod tests {
     fn predicate_pushdown_preserves_existing_scan_filters() {
         let plan = LogicalPlan::new("test", ExecutionKind::Batch)
             .with_node({
-                let schema = crate::PlanSchema::new(vec![crate::SchemaField::new(
-                    "a",
-                    FieldType::Int32,
-                )]);
+                let schema =
+                    crate::PlanSchema::new(vec![crate::SchemaField::new("a", FieldType::Int32)]);
                 PlanNode::new("s", "scan t", ExecutionKind::Batch)
                     .with_op(NodeOp::Scan {
                         table: "t".to_string(),
@@ -3733,5 +2930,84 @@ mod tests {
             PredicatePushdownRule.apply(&plan).is_none(),
             "pushing a post-join predicate through an outer join can change semantics"
         );
+    }
+
+    // ── StaticCostModel ───────────────────────────────────────────────────────
+
+    use super::StaticCostModel;
+    use crate::optimizer::CostModel;
+
+    #[test]
+    fn static_cost_model_empty_plan_is_zero() {
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch);
+        let cost = StaticCostModel.estimate(&plan);
+        assert_eq!(cost.cpu_nanos, 0);
+        assert_eq!(cost.memory_bytes, 0);
+        assert_eq!(cost.network_bytes, 0);
+    }
+
+    #[test]
+    fn static_cost_model_scan_uses_estimated_rows() {
+        let node = PlanNode::new("s1", "scan t", ExecutionKind::Batch)
+            .with_estimated_rows(Some(1_000))
+            .with_op(NodeOp::Scan {
+                table: "t".into(),
+                filters: vec![],
+            });
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch).with_node(node);
+        let cost = StaticCostModel.estimate(&plan);
+        assert_eq!(cost.cpu_nanos, 1_000 * 10);
+        assert_eq!(cost.memory_bytes, 1_000 * 64);
+        assert_eq!(cost.network_bytes, 0);
+    }
+
+    #[test]
+    fn static_cost_model_exchange_charges_network() {
+        let node = PlanNode::new("e1", "exchange", ExecutionKind::Batch)
+            .with_estimated_rows(Some(500))
+            .with_op(NodeOp::Exchange {
+                partitioning: crate::Partitioning::Hash {
+                    keys: vec!["id".into()],
+                    buckets: 4,
+                },
+            });
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch).with_node(node);
+        let cost = StaticCostModel.estimate(&plan);
+        assert_eq!(cost.network_bytes, 500 * 200);
+        assert_eq!(cost.memory_bytes, 0);
+    }
+
+    #[test]
+    fn static_cost_model_aggregate_uses_default_rows_when_unknown() {
+        let node = PlanNode::new("a1", "agg", ExecutionKind::Batch).with_op(NodeOp::Aggregate {
+            group_keys: vec!["k".into()],
+        });
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch).with_node(node);
+        let cost = StaticCostModel.estimate(&plan);
+        // default = 10_000 rows
+        assert_eq!(cost.cpu_nanos, 10_000 * 50);
+        assert_eq!(cost.memory_bytes, 10_000 * 200);
+    }
+
+    #[test]
+    fn static_cost_model_multi_node_plan_accumulates() {
+        let scan = PlanNode::new("s1", "scan t", ExecutionKind::Batch)
+            .with_estimated_rows(Some(1_000))
+            .with_op(NodeOp::Scan {
+                table: "t".into(),
+                filters: vec![],
+            });
+        let agg = PlanNode::new("a1", "agg", ExecutionKind::Batch)
+            .with_estimated_rows(Some(100))
+            .with_op(NodeOp::Aggregate {
+                group_keys: vec!["k".into()],
+            });
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan)
+            .with_node(agg);
+        let cost = StaticCostModel.estimate(&plan);
+        assert_eq!(cost.cpu_nanos, 1_000 * 10 + 100 * 50);
+        assert_eq!(cost.memory_bytes, 1_000 * 64 + 100 * 200);
+        assert_eq!(cost.network_bytes, 0);
     }
 }

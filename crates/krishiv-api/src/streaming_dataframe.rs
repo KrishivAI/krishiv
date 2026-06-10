@@ -17,8 +17,9 @@ use crate::dataframe::DataFrame;
 use crate::error::{KrishivError, Result};
 
 /// Alias for the inner stream error type used by the window runtime.
-type ExecStream =
-    Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, krishiv_dataflow::ExecError>> + Send>>;
+type ExecStream = Pin<
+    Box<dyn Stream<Item = std::result::Result<RecordBatch, krishiv_dataflow::ExecError>> + Send>,
+>;
 
 pub type KrishivStream =
     Pin<Box<dyn futures::stream::Stream<Item = std::result::Result<RecordBatch, String>> + Send>>;
@@ -246,8 +247,8 @@ impl StreamingDataFrame {
         };
 
         Ok(Some(LocalWindowExecutionSpec {
-                key_column,
-                key_column_type: String::from("utf8"),
+            key_column,
+            key_column_type: String::from("utf8"),
             event_time_column,
             watermark_lag_ms: self.watermark_lag_ms,
             window_kind,

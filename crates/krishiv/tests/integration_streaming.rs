@@ -295,7 +295,7 @@ async fn streaming_job_lifecycle_never_succeeds_while_running() {
     let session = Session::builder().build().expect("session build");
 
     let spec = LocalWindowExecutionSpec {
-                key_column_type: String::from("utf8"),
+        key_column_type: String::from("utf8"),
         key_column: "key".into(),
         event_time_column: "timestamp".into(),
         watermark_lag_ms: 0,
@@ -350,7 +350,7 @@ async fn stream_state_maintained_across_drain_cycles() {
     let session = Session::builder().build().expect("session build");
 
     let spec = LocalWindowExecutionSpec {
-                key_column_type: String::from("utf8"),
+        key_column_type: String::from("utf8"),
         key_column: "key".into(),
         event_time_column: "timestamp".into(),
         watermark_lag_ms: 0,

@@ -348,7 +348,7 @@ fn validate_grpc_auth_with_provider(
             let Some(principal) = provider.authenticate(subject) else {
                 return Err(tonic::Status::unauthenticated("invalid API key"));
             };
-            validate_principal_role(&principal, &required_role)
+            validate_principal_role(&principal, required_role)
         }
         AuthContext::Anonymous => Err(tonic::Status::unauthenticated("missing Bearer token")),
     }

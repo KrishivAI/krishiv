@@ -23,12 +23,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut batches = Vec::new();
     let mut rows_read = 0;
-    let mut sequence = 0;
-    while let Some(batch) = reader.next() {
+    for (sequence, batch) in (&mut reader).enumerate() {
         let batch = batch?;
         rows_read += batch.num_rows();
-        batches.push(StreamBatch::new(sequence, batch));
-        sequence += 1;
+        batches.push(StreamBatch::new(sequence as u64, batch));
         if rows_read >= 1_000_000 {
             break;
         }

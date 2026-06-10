@@ -320,7 +320,7 @@ pub(crate) async fn execute_streaming_fragment(
             {
                 crate::fragment::common::write_object_parquet_sink(
                     assignment.output_contract(),
-                    &[batch.clone()],
+                    std::slice::from_ref(&batch),
                 )
                 .await?;
             }
@@ -549,8 +549,7 @@ fn build_streaming_hot_key_reports(
     stage_id: &krishiv_proto::StageId,
 ) -> Vec<krishiv_proto::HeartbeatHotKeyReport> {
     use arrow::array::{
-        Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray,
-        StringViewArray,
+        Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
     };
     use arrow::datatypes::DataType;
     use krishiv_dataflow::adaptive::HeavyHittersTracker;
@@ -652,7 +651,10 @@ fn compute_input_watermark(
     batches: &[arrow::record_batch::RecordBatch],
     spec: &WindowExecutionSpec,
 ) -> Option<i64> {
-    use arrow::array::{Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
+    use arrow::array::{
+        Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
     use arrow::datatypes::{DataType, TimeUnit};
 
     let mut max_ts: Option<i64> = None;
@@ -662,23 +664,38 @@ fn compute_input_watermark(
         let batch_max = match col.data_type() {
             DataType::Int64 => {
                 let arr = col.as_any().downcast_ref::<Int64Array>()?;
-                (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i)).reduce(i64::max)
+                (0..arr.len())
+                    .filter(|&i| !arr.is_null(i))
+                    .map(|i| arr.value(i))
+                    .reduce(i64::max)
             }
             DataType::Timestamp(TimeUnit::Second, _) => {
                 let arr = col.as_any().downcast_ref::<TimestampSecondArray>()?;
-                (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i).saturating_mul(1_000)).reduce(i64::max)
+                (0..arr.len())
+                    .filter(|&i| !arr.is_null(i))
+                    .map(|i| arr.value(i).saturating_mul(1_000))
+                    .reduce(i64::max)
             }
             DataType::Timestamp(TimeUnit::Millisecond, _) => {
                 let arr = col.as_any().downcast_ref::<TimestampMillisecondArray>()?;
-                (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i)).reduce(i64::max)
+                (0..arr.len())
+                    .filter(|&i| !arr.is_null(i))
+                    .map(|i| arr.value(i))
+                    .reduce(i64::max)
             }
             DataType::Timestamp(TimeUnit::Microsecond, _) => {
                 let arr = col.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
-                (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i) / 1_000).reduce(i64::max)
+                (0..arr.len())
+                    .filter(|&i| !arr.is_null(i))
+                    .map(|i| arr.value(i) / 1_000)
+                    .reduce(i64::max)
             }
             DataType::Timestamp(TimeUnit::Nanosecond, _) => {
                 let arr = col.as_any().downcast_ref::<TimestampNanosecondArray>()?;
-                (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i) / 1_000_000).reduce(i64::max)
+                (0..arr.len())
+                    .filter(|&i| !arr.is_null(i))
+                    .map(|i| arr.value(i) / 1_000_000)
+                    .reduce(i64::max)
             }
             _ => return None,
         };

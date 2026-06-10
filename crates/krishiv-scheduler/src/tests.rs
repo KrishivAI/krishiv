@@ -2,10 +2,6 @@
 mod scheduler_tests {
     use std::sync::{Arc, Mutex, Once};
 
-    use krishiv_state::checkpoint::{
-        CheckpointMetadata, CheckpointStorage, IntegrityManifest, LocalFsCheckpointStorage,
-        list_valid_epochs, write_epoch_metadata, write_manifest,
-    };
     use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
     use krishiv_proto::{
         AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
@@ -14,6 +10,10 @@ mod scheduler_tests {
         JobState, LeaseGeneration, RegisterExecutorRequest, StageId, StageSpec, StreamingTaskState,
         TaskAttemptRef, TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest,
         TaskStatusResponse, TaskStatusUpdate, TransportDisposition, wire,
+    };
+    use krishiv_state::checkpoint::{
+        CheckpointMetadata, CheckpointStorage, IntegrityManifest, LocalFsCheckpointStorage,
+        list_valid_epochs, write_epoch_metadata, write_manifest,
     };
 
     use crate::{
@@ -393,9 +393,12 @@ mod scheduler_tests {
             .remove(0);
 
         let rendered_before = krishiv_metrics::global_metrics().render_prometheus();
-        let succeeded_before =
-            prometheus_counter_value(&rendered_before, r#"krishiv_tasks_total{status="succeeded"}"#);
-        let failed_before = prometheus_counter_value(&rendered_before, r#"krishiv_tasks_total{status="failed"}"#);
+        let succeeded_before = prometheus_counter_value(
+            &rendered_before,
+            r#"krishiv_tasks_total{status="succeeded"}"#,
+        );
+        let failed_before =
+            prometheus_counter_value(&rendered_before, r#"krishiv_tasks_total{status="failed"}"#);
 
         coordinator
             .apply_task_update(
@@ -425,9 +428,12 @@ mod scheduler_tests {
             .unwrap();
 
         let rendered_after = krishiv_metrics::global_metrics().render_prometheus();
-        let succeeded_after =
-            prometheus_counter_value(&rendered_after, r#"krishiv_tasks_total{status="succeeded"}"#);
-        let failed_after = prometheus_counter_value(&rendered_after, r#"krishiv_tasks_total{status="failed"}"#);
+        let succeeded_after = prometheus_counter_value(
+            &rendered_after,
+            r#"krishiv_tasks_total{status="succeeded"}"#,
+        );
+        let failed_after =
+            prometheus_counter_value(&rendered_after, r#"krishiv_tasks_total{status="failed"}"#);
 
         assert!(
             succeeded_after > succeeded_before,
@@ -3057,7 +3063,9 @@ mod scheduler_tests {
         assert!(!meta.is_savepoint);
 
         // Verify manifest exists and epoch validates.
-        assert!(krishiv_state::checkpoint::validate_epoch(storage.as_ref(), "job-ck-1", 1).unwrap());
+        assert!(
+            krishiv_state::checkpoint::validate_epoch(storage.as_ref(), "job-ck-1", 1).unwrap()
+        );
     }
 
     #[test]
@@ -4324,8 +4332,7 @@ mod scheduler_tests {
         let job_id = JobId::try_new("job-epoch-overflow").unwrap();
         let storage: Arc<dyn CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
-        let mut coord =
-            CheckpointCoordinator::new_for_test(job_id, storage, 1_000, 1);
+        let mut coord = CheckpointCoordinator::new_for_test(job_id, storage, 1_000, 1);
         // Manually push current_epoch to u64::MAX so the next checked_add overflows.
         coord.current_epoch = u64::MAX;
         let result = coord.initiate();

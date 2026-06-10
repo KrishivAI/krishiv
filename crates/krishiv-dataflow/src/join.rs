@@ -622,7 +622,7 @@ fn build_outer_join_batch(
     // Right columns: matched rows get their real index; unmatched rows get None
     // so Arrow's `take` produces null values rather than copying row 0.
     let mut right_idx_opt: Vec<Option<u32>> = right_indices.iter().map(|&r| Some(r)).collect();
-    right_idx_opt.extend(std::iter::repeat(None).take(unmatched_left.len()));
+    right_idx_opt.extend(std::iter::repeat_n(None, unmatched_left.len()));
     let right_idx_arr: ArrayRef = Arc::new(UInt32Array::from(right_idx_opt));
 
     // Right non-key columns must be nullable when there are unmatched left rows:

@@ -226,7 +226,7 @@ pub trait MetadataStore: Send + Sync {
 /// Eviction is O(n) per removed event (`Vec::remove(0)` shifts the tail) but
 /// is amortized O(1) per appended event because it only fires when the buffer
 /// is full (every ~[`MAX_EVENTS_LOG_BYTES`] / avg_event_size appends).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct InMemoryMetadataStore {
     events: Vec<EventLogEvent>,
     events_byte_size: u64,
@@ -239,18 +239,6 @@ pub struct InMemoryMetadataStore {
     evicted_event_count: u64,
 }
 
-impl Default for InMemoryMetadataStore {
-    fn default() -> Self {
-        Self {
-            events: Vec::new(),
-            events_byte_size: 0,
-            jobs: Vec::new(),
-            executors: Vec::new(),
-            continuous_snapshots: std::collections::HashMap::new(),
-            evicted_event_count: 0,
-        }
-    }
-}
 
 impl InMemoryMetadataStore {
     /// Number of oldest events evicted by the ring buffer to keep the events
@@ -321,7 +309,8 @@ impl MetadataStore for InMemoryMetadataStore {
         job_id: &str,
         snapshot: ContinuousSnapshot,
     ) -> SchedulerResult<()> {
-        self.continuous_snapshots.insert(job_id.to_owned(), snapshot);
+        self.continuous_snapshots
+            .insert(job_id.to_owned(), snapshot);
         Ok(())
     }
 
@@ -1080,7 +1069,10 @@ pub(crate) fn encode_metadata_snapshot_with_executors(
 enum StoreCommand {
     AppendEvent(EventLogEvent),
     SaveJob(Box<JobRecord>),
-    SaveContinuousSnapshot { job_id: String, snapshot: ContinuousSnapshot },
+    SaveContinuousSnapshot {
+        job_id: String,
+        snapshot: ContinuousSnapshot,
+    },
     Flush(tokio::sync::oneshot::Sender<()>),
 }
 

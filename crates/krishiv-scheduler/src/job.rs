@@ -396,12 +396,11 @@ impl JobRecord {
                             .map(|n| n as usize)
                             .unwrap_or(write_cfg.num_partitions)
                             .max(1);
-                        assignment = assignment.with_shuffle_write(
-                            krishiv_proto::ShuffleWriteConfig {
+                        assignment =
+                            assignment.with_shuffle_write(krishiv_proto::ShuffleWriteConfig {
                                 num_partitions: effective_num_partitions,
                                 ..write_cfg.clone()
-                            },
-                        );
+                            });
                     }
                     if let Some(read_cfg) = task.spec.shuffle_read() {
                         assignment = assignment.with_shuffle_read(read_cfg.clone());
@@ -1249,7 +1248,7 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
                         upstream_id
                     ),
                 });
-        }
+            }
         }
     }
     // Cycle detection in stage dependency graph using Kahn's algorithm.
@@ -1263,7 +1262,9 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
             .collect();
         let mut in_degree = vec![0usize; n];
         for stage in spec.stages() {
-            let idx = *stage_id_to_idx.get(stage.stage_id()).expect("stage just indexed");
+            let idx = *stage_id_to_idx
+                .get(stage.stage_id())
+                .expect("stage just indexed");
             in_degree[idx] = in_degree[idx].saturating_add(stage.upstream_stage_ids().len());
         }
         let mut queue: std::collections::VecDeque<usize> = in_degree
@@ -1330,23 +1331,19 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
             });
         }
     }
-    if let Some(interval) = spec.checkpoint_interval_ms() {
-        if interval == 0 {
-            return Err(SchedulerError::InvalidJob {
-                message: String::from(
-                    "checkpoint_interval_ms must be > 0; use None to disable checkpointing",
-                ),
-            });
-        }
+    if let Some(interval) = spec.checkpoint_interval_ms() && interval == 0 {
+        return Err(SchedulerError::InvalidJob {
+            message: String::from(
+                "checkpoint_interval_ms must be > 0; use None to disable checkpointing",
+            ),
+        });
     }
-    if let Some(path) = spec.checkpoint_storage_path() {
-        if path.is_empty() {
-            return Err(SchedulerError::InvalidJob {
-                message: String::from(
-                    "checkpoint_storage_path must not be empty when checkpoint_interval_ms is set",
-                ),
-            });
-        }
+    if let Some(path) = spec.checkpoint_storage_path() && path.is_empty() {
+        return Err(SchedulerError::InvalidJob {
+            message: String::from(
+                "checkpoint_storage_path must not be empty when checkpoint_interval_ms is set",
+            ),
+        });
     }
     let profile = krishiv_common::resolve_durability_profile();
     krishiv_plan::validate_job_fragments(spec, profile).map_err(|error| {

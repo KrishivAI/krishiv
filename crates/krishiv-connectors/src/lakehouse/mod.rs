@@ -6,12 +6,13 @@
 
 use arrow::record_batch::RecordBatch;
 
-pub mod connector_registry;
 mod as_of;
+pub mod connector_registry;
 mod delta;
 mod delta_lake;
 mod hudi;
 mod iceberg_fs;
+mod iceberg_native;
 mod local_delta;
 mod partition_spec;
 mod two_phase;
@@ -32,6 +33,8 @@ pub use hudi::{
     HudiWriteResult, write_hudi_cow_append, write_hudi_cow_fixture, write_hudi_cow_upsert,
 };
 pub use iceberg_fs::IcebergFsTable;
+#[cfg(feature = "iceberg")]
+pub use iceberg_native::IcebergNativeTwoPhaseCommit;
 pub use partition_spec::{PartitionField, PartitionSpecResolver, PartitionSpecVersion};
 pub use two_phase::{
     IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY, MemoryIcebergTwoPhaseCommit, StagedSnapshot,

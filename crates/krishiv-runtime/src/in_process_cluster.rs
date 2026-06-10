@@ -680,7 +680,9 @@ mod tests {
     fn cluster_attach_store_and_drain_persists_snapshot() {
         use krishiv_scheduler::InMemoryMetadataStore;
         let cluster = InProcessCluster::new().unwrap();
-        cluster.attach_store(InMemoryMetadataStore::default()).unwrap();
+        cluster
+            .attach_store(InMemoryMetadataStore::default())
+            .unwrap();
 
         cluster
             .register_continuous_job("snap-job", &tumbling_spec())

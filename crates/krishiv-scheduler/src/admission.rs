@@ -340,7 +340,7 @@ impl CrdQueueManager {
                     // Check reload interval to avoid thundering re-reads.
                     let can_reload = {
                         let last = self.last_modified.read().unwrap_or_else(|p| p.into_inner());
-                        last.map_or(true, |t| {
+                        last.is_none_or(|t| {
                             t.elapsed().unwrap_or(Duration::MAX) >= self.reload_interval
                         })
                     };

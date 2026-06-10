@@ -1,5 +1,8 @@
 //! Per-key sequential pattern matcher (R16 S2.2).
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use arrow::record_batch::RecordBatch;
 
 use crate::cep::pattern::CompiledPattern;
@@ -125,22 +128,27 @@ impl SequentialPatternMatcher {
 #[derive(Debug, Clone)]
 pub struct PartitionedCepMatcher<K>
 where
-    K: std::hash::Hash + Eq + Clone,
+    K: std::hash::Hash + Eq + Clone + Ord,
 {
     pattern: CompiledPattern,
     states: std::collections::HashMap<K, (SequentialPatternMatcher, CepKeyState)>,
     max_partitions: usize,
+    /// Min-heap of `(last_event_ms, key)` for O(log n) stalest-key eviction.
+    /// Entries may be stale (key removed or timestamp updated); check against
+    /// `states` before evicting.
+    eviction_heap: BinaryHeap<Reverse<(i64, K)>>,
 }
 
 impl<K> PartitionedCepMatcher<K>
 where
-    K: std::hash::Hash + Eq + Clone,
+    K: std::hash::Hash + Eq + Clone + Ord,
 {
     pub fn new(pattern: CompiledPattern) -> Self {
         Self {
             pattern: pattern.clone(),
             states: std::collections::HashMap::new(),
             max_partitions: 1024,
+            eviction_heap: BinaryHeap::new(),
         }
     }
 
@@ -151,7 +159,7 @@ where
         batch: RecordBatch,
         event_time_ms: i64,
     ) -> Vec<Vec<RecordBatch>> {
-        let entry = self.states.entry(key).or_insert_with(|| {
+        let entry = self.states.entry(key.clone()).or_insert_with(|| {
             (
                 SequentialPatternMatcher::new(self.pattern.clone()),
                 CepKeyState::default(),
@@ -160,16 +168,26 @@ where
         let result = entry
             .0
             .process_event(&mut entry.1, stage_name, batch, event_time_ms);
-        if self.states.len() > self.max_partitions
-            && let Some(stalest) = self
-                .states
-                .iter()
-                .min_by_key(|(_, (_, state))| state.last_event_ms)
-                .map(|(k, _)| k.clone())
-        {
-            self.states.remove(&stalest);
+
+        // Push the updated timestamp for this key onto the eviction heap.
+        self.eviction_heap.push(Reverse((event_time_ms, key)));
+
+        if self.states.len() > self.max_partitions {
+            self.evict_stalest();
         }
         result
+    }
+
+    /// Evict the stalest partition key in O(log n) using the eviction heap.
+    /// Skips heap entries that are stale (key no longer exists or its recorded
+    /// timestamp no longer matches the heap entry).
+    fn evict_stalest(&mut self) {
+        while let Some(Reverse((ts, k))) = self.eviction_heap.pop() {
+            if let Some((_, state)) = self.states.get(&k) && state.last_event_ms == ts {
+                self.states.remove(&k);
+                return;
+            }
+        }
     }
 
     /// Remove all keys whose most recent event time is strictly before
@@ -178,6 +196,7 @@ where
     pub fn evict_keys_before(&mut self, cutoff_ms: i64) {
         self.states
             .retain(|_, (_, state)| state.last_event_ms >= cutoff_ms);
+        // Heap entries for evicted keys will be skipped lazily on next eviction.
     }
 
     /// Number of currently tracked partition keys.

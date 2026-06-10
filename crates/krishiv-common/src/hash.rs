@@ -29,7 +29,9 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
 /// Useful for dedup maps where full 32-byte hashes are unnecessary.
 pub fn sha256_dedup_key(data: &[u8]) -> u64 {
     let hash = Sha256::digest(data);
-    u64::from_le_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]])
+    u64::from_le_bytes([
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+    ])
 }
 
 /// Incrementally hash multiple byte slices and return the hex-encoded digest.

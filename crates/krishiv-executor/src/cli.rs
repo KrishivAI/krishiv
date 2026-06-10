@@ -18,14 +18,13 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use dashmap::DashMap;
-use krishiv_state::checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use krishiv_common::durability::DurabilityProfile;
 use krishiv_proto::{InitiateCheckpointRequest, JobId, TaskAttemptRef};
 use krishiv_shuffle::{
     InMemoryShuffleStore, LocalDiskShuffleStore, ShuffleBackend, open_shuffle_backend_from_uri,
 };
 use krishiv_state::FjallStateBackend;
-use krishiv_plan::udf;
+use krishiv_state::checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tonic::transport::Server;
@@ -438,7 +437,8 @@ async fn heartbeat_loop(
                 runner_loop
                     .drain_pending_barriers(
                         Arc::clone(&backend) as Arc<dyn krishiv_state::StateBackend>,
-                        Arc::clone(&storage) as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
+                        Arc::clone(&storage)
+                            as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
                         coord.as_ref().clone(),
                     )
                     .await;

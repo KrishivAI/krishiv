@@ -120,4 +120,3 @@ pub use transport::CoordinatorExecutorTransport;
 mod tests;
 
 pub(crate) use grpc::status_from_scheduler_error;
-

@@ -74,8 +74,7 @@ pub struct ExecutorConfig {
     lease_generation: LeaseGeneration,
     task_endpoint: Option<String>,
     barrier_endpoint: Option<String>,
-    progress_buffer:
-        Option<Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>>>,
+    progress_buffer: Option<Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>>>,
 }
 
 impl ExecutorConfig {

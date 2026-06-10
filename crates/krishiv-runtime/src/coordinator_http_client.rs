@@ -43,7 +43,9 @@ fn coordinator_http_client() -> RuntimeResult<reqwest::Client> {
         // Per-request timeout caps individual HTTP calls.
         // The job-level poll loop enforces a separate deadline,
         // so this guards against TCP-level stalls within a single request.
-        .timeout(std::time::Duration::from_secs(COORDINATOR_HTTP_REQUEST_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(
+            COORDINATOR_HTTP_REQUEST_TIMEOUT_SECS,
+        ))
         .build()
         .map_err(|e| RuntimeError::transport(format!("HTTP client build failed: {e}")))?;
     *guard = Some(client.clone());
@@ -255,7 +257,8 @@ pub async fn execute_coordinator_batch_sql(
 
     // Step 2: poll until terminal state.
     let poll_url = format!("{base}/api/v1/batch-sql/{job_id}");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(BOUNDED_WINDOW_POLL_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(BOUNDED_WINDOW_POLL_TIMEOUT_SECS);
     poll_batch_sql_job(&client, &poll_url, &job_id, deadline).await
 }
 
@@ -309,7 +312,8 @@ pub async fn execute_coordinator_batch_sql_inline(
         .job_id;
 
     let poll_url = format!("{base}/api/v1/batch-sql/{job_id}");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(BOUNDED_WINDOW_POLL_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(BOUNDED_WINDOW_POLL_TIMEOUT_SECS);
     poll_batch_sql_job(&client, &poll_url, &job_id, deadline).await
 }
 

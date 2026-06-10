@@ -357,17 +357,30 @@ pub fn execute_streaming_window(
     Ok(stream_window_operator(input, spec, op))
 }
 
+/// Parameters for converting a legacy local window spec into a `WindowExecutionSpec`.
+pub struct LocalWindowParams {
+    pub key_column: String,
+    pub key_column_type: String,
+    pub event_time_column: String,
+    pub watermark_lag_ms: u64,
+    pub window_kind: LocalWindowKindBridge,
+    pub window_size_ms: u64,
+    pub agg_exprs: Vec<AggExpr>,
+    pub state_ttl_ms: Option<u64>,
+}
+
 /// Convert legacy runtime local spec fields into a plan `WindowExecutionSpec`.
-pub fn local_spec_to_window_execution(
-    key_column: String,
-    key_column_type: String,
-    event_time_column: String,
-    watermark_lag_ms: u64,
-    window_kind: LocalWindowKindBridge,
-    window_size_ms: u64,
-    agg_exprs: Vec<AggExpr>,
-    state_ttl_ms: Option<u64>,
-) -> WindowExecutionSpec {
+pub fn local_spec_to_window_execution(params: LocalWindowParams) -> WindowExecutionSpec {
+    let LocalWindowParams {
+        key_column,
+        key_column_type,
+        event_time_column,
+        watermark_lag_ms,
+        window_kind,
+        window_size_ms,
+        agg_exprs,
+        state_ttl_ms,
+    } = params;
     let (kind, slide_ms, session_gap_ms) = match window_kind {
         LocalWindowKindBridge::Tumbling => (WindowKind::Tumbling, None, None),
         LocalWindowKindBridge::Sliding { slide_ms } => (WindowKind::Sliding, Some(slide_ms), None),
@@ -424,16 +437,16 @@ mod tests {
 
     #[test]
     fn local_spec_to_window_execution_int32_key_type() {
-        let spec = local_spec_to_window_execution(
-            "user_id".into(),
-            "int32".into(),
-            "ts".into(),
-            0,
-            LocalWindowKindBridge::Tumbling,
-            5_000,
-            vec![],
-            None,
-        );
+        let spec = local_spec_to_window_execution(LocalWindowParams {
+            key_column: "user_id".into(),
+            key_column_type: "int32".into(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: LocalWindowKindBridge::Tumbling,
+            window_size_ms: 5_000,
+            agg_exprs: vec![],
+            state_ttl_ms: None,
+        });
         assert_eq!(spec.key_column_type, "int32");
         assert_eq!(spec.key_column, "user_id");
         assert_eq!(spec.window_size_ms, 5_000);

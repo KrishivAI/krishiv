@@ -132,7 +132,12 @@ impl TransactionalKafkaRegistry {
 
     pub fn fence_previous_epoch(&self, job_id: &str, partition_id: u32, previous_epoch: u64) {
         let id = transaction_id(job_id, partition_id, previous_epoch);
-        if let Some(sink) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+        if let Some(sink) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&id)
+        {
             sink.fence_zombie(previous_epoch);
         }
     }

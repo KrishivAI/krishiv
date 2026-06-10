@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
-use krishiv_state::checkpoint::{CheckpointStorage, snapshot_path};
+#[cfg(test)]
+use krishiv_plan::udf::ResourceLimits;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
     CoordinatorExecutorService, ExecutorTaskAssignment, FencingToken, InitiateCheckpointRequest,
@@ -18,7 +19,7 @@ use krishiv_proto::{
 };
 use krishiv_sql::SqlEngine;
 use krishiv_state::StateBackend;
-use krishiv_plan::udf::ResourceLimits;
+use krishiv_state::checkpoint::{CheckpointStorage, snapshot_path};
 
 use crate::{
     ExecutorAssignmentInbox, ExecutorError, ExecutorResult, SharedBarrierAckRegistry,
@@ -703,9 +704,8 @@ pub struct ExecutorTaskRunner {
     /// Keyed by job-id string. Accumulates the EMA of observed input-batch byte
     /// sizes across streaming cycles and recommends a bucket count that tracks
     /// actual data volume. All runner clones share the same advisor per job.
-    pub(crate) streaming_advisors: Arc<
-        DashMap<String, Arc<std::sync::Mutex<krishiv_dataflow::StreamingPartitionAdvisor>>>,
-    >,
+    pub(crate) streaming_advisors:
+        Arc<DashMap<String, Arc<std::sync::Mutex<krishiv_dataflow::StreamingPartitionAdvisor>>>>,
     /// Live executor lease generation, shared with the heartbeat loop.
     /// Used to stamp checkpoint-fanout RPCs without round-tripping through
     /// the gRPC service (B10).  Defaults to `LeaseGeneration::initial()`.
@@ -1047,9 +1047,8 @@ impl ExecutorTaskRunner {
             ));
         }
 
-        let model =
-            crate::ExecutionModel::from_plan_fragment(assignment.plan_fragment())
-                .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let model = crate::ExecutionModel::from_plan_fragment(assignment.plan_fragment())
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let fragment_body = crate::fragment::common::task_fragment_body(
             assignment.plan_fragment().description().trim(),
         )
@@ -1059,7 +1058,7 @@ impl ExecutorTaskRunner {
         // Build resource limits from assignment (propagated from job spec).
         let udf_limits = krishiv_plan::udf::ResourceLimits {
             max_memory_bytes: assignment.memory_limit_bytes(),
-            max_execution_time_ms: assignment.cpu_limit_nanos().map(|n| (n / 1_000_000) as u64),
+            max_execution_time_ms: assignment.cpu_limit_nanos().map(|n| n / 1_000_000),
         };
 
         let execute_result = match model {
@@ -1177,6 +1176,7 @@ impl ExecutorTaskRunner {
     ///
     /// All R1–R4 fragment kinds route through here.  The function collects
     /// output and returns it so the caller can report `TaskState::Succeeded`.
+    #[cfg(test)]
     pub(crate) async fn execute_batch_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
@@ -1185,6 +1185,7 @@ impl ExecutorTaskRunner {
     }
 
     /// Execute a streaming (continuous) stage fragment.
+    #[cfg(test)]
     pub(crate) async fn execute_streaming_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
@@ -1715,8 +1716,16 @@ mod runner_tests {
         use krishiv_connectors::kafka::KafkaOffset;
         let task_id = krishiv_proto::TaskId::try_new("task-1").unwrap();
         let offsets = vec![
-            KafkaOffset { topic: "events".into(), partition: 0, offset: 42 },
-            KafkaOffset { topic: "events".into(), partition: 1, offset: 7 },
+            KafkaOffset {
+                topic: "events".into(),
+                partition: 0,
+                offset: 42,
+            },
+            KafkaOffset {
+                topic: "events".into(),
+                partition: 1,
+                offset: 7,
+            },
         ];
         let runner = TaskRunner::new(task_id).with_kafka_source_offsets(offsets.clone());
         assert_eq!(runner.kafka_source_offsets, offsets);

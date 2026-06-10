@@ -1,10 +1,6 @@
 //! Coordinator state machine and shared handle.
 
 use dashmap::DashMap;
-use krishiv_state::checkpoint::{
-    CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
-    validate_epoch, validate_fencing_token_for_restore,
-};
 use krishiv_common::DurabilityProfile;
 use krishiv_plan::{LogicalPlan, PhysicalPlan};
 use krishiv_proto::{
@@ -15,6 +11,11 @@ use krishiv_proto::{
     TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState, TaskStatusResponse,
     TaskStatusUpdate, wire,
 };
+use krishiv_state::checkpoint::{
+    CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
+    validate_epoch, validate_fencing_token_for_restore,
+};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
@@ -406,7 +407,7 @@ impl SharedCoordinator {
                     id_pairs.push((priority, job_id.clone()));
                 }
             }
-            id_pairs.sort_by(|a, b| b.0.cmp(&a.0));
+            id_pairs.sort_by_key(|k| Reverse(k.0));
             id_pairs.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
         };
 
@@ -920,21 +921,21 @@ impl Coordinator {
                     if task.state() != krishiv_proto::TaskState::Running {
                         continue;
                     }
-                    if let Some(assigned_ms) = task.assigned_at_ms {
-                        if now_ms.saturating_sub(assigned_ms) > TASK_STALL_TIMEOUT_MS {
-                            tracing::warn!(
-                                task_id = %task.task_id(),
-                                stall_secs = now_ms.saturating_sub(assigned_ms) / 1000,
-                                "resetting stalled task (no progress for >30 min)"
-                            );
-                            task.state = krishiv_proto::TaskState::Failed;
-                            task.last_failure_reason = Some(format!(
-                                "task stalled: no progress for {} min",
-                                now_ms.saturating_sub(assigned_ms) / 60_000
-                            ));
-                            task.launch_in_flight = false;
-                            task.assigned_at_ms = None;
-                        }
+                    if let Some(assigned_ms) = task.assigned_at_ms
+                        && now_ms.saturating_sub(assigned_ms) > TASK_STALL_TIMEOUT_MS
+                    {
+                        tracing::warn!(
+                            task_id = %task.task_id(),
+                            stall_secs = now_ms.saturating_sub(assigned_ms) / 1000,
+                            "resetting stalled task (no progress for >30 min)"
+                        );
+                        task.state = krishiv_proto::TaskState::Failed;
+                        task.last_failure_reason = Some(format!(
+                            "task stalled: no progress for {} min",
+                            now_ms.saturating_sub(assigned_ms) / 60_000
+                        ));
+                        task.launch_in_flight = false;
+                        task.assigned_at_ms = None;
                     }
                 }
             }

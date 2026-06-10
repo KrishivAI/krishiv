@@ -14,9 +14,7 @@ use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion::physical_plan::ExecutionPlan;
-use krishiv_connectors::{
-    ConnectorConfig, ConnectorError, ConnectorRegistry, default_registry,
-};
+use krishiv_connectors::{ConnectorConfig, ConnectorError, ConnectorRegistry, default_registry};
 
 use crate::kafka_table::{KafkaPartitionStream, kafka_auto_commit_interval_ms, project_batch};
 
@@ -27,16 +25,16 @@ pub fn shared_connector_registry() -> Arc<ConnectorRegistry> {
 
 /// Register PARQUET, S3, and KAFKA DDL factories on a DataFusion table-factory map.
 pub fn register_connector_table_factories(
-    table_factories: &mut std::collections::HashMap<
-        String,
-        Arc<dyn TableProviderFactory>,
-    >,
+    table_factories: &mut std::collections::HashMap<String, Arc<dyn TableProviderFactory>>,
     streaming_sources: Arc<RwLock<HashSet<String>>>,
 ) {
     let registry = shared_connector_registry();
     table_factories.insert(
         "PARQUET".to_string(),
-        Arc::new(ConnectorTableFactory::bounded("parquet", Arc::clone(&registry))),
+        Arc::new(ConnectorTableFactory::bounded(
+            "parquet",
+            Arc::clone(&registry),
+        )),
     );
     table_factories.insert(
         "S3".to_string(),
@@ -140,7 +138,8 @@ impl TableProviderFactory for ConnectorTableFactory {
             .map_err(connector_error)?;
 
         if self.connector_kind == "kafka" {
-            return create_kafka_table_provider(cmd, &config, self.streaming_sources.as_ref()).await;
+            return create_kafka_table_provider(cmd, &config, self.streaming_sources.as_ref())
+                .await;
         }
 
         let schema: SchemaRef = cmd.schema.as_ref().inner().clone();
@@ -259,7 +258,11 @@ mod tests {
         let registry = Arc::new(krishiv_connectors::ConnectorRegistry::new());
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let config = krishiv_connectors::ConnectorConfig::new("unknown", "parquet");
-        let provider = BoundedConnectorProvider { registry, config, schema };
+        let provider = BoundedConnectorProvider {
+            registry,
+            config,
+            schema,
+        };
         assert!(
             provider.statistics().is_none(),
             "no path in config → estimated_row_count returns None → statistics returns None"

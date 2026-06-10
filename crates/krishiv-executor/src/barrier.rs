@@ -1,19 +1,26 @@
 //! Checkpoint barrier simulation (dev/test only): `BarrierSimulator` and `BarrierSnapshot`.
 
+#[cfg(test)]
 use std::collections::VecDeque;
+#[cfg(test)]
 use std::sync::Mutex;
 
+#[cfg(test)]
 use krishiv_proto::wire::v1::CheckpointBarrier;
 
+#[cfg(test)]
 use crate::barrier_transport::BarrierSource;
+#[cfg(test)]
 use crate::{ExecutorError, ExecutorResult};
 
+#[cfg(test)]
 const MAX_SIMULATED_SNAPSHOTS: usize = 1000;
 
 /// Checkpoint-barrier simulation for dev/test use.
 ///
 /// Production checkpointing uses [`crate::runner::TaskRunner::handle_initiate_checkpoint`]
 /// together with [`crate::BarrierInjector`] and the gRPC barrier service.
+#[cfg(test)]
 pub(crate) struct BarrierSimulator {
     last_committed_epoch: u64,
     simulated_snapshots: Vec<BarrierSnapshot>,
@@ -21,6 +28,7 @@ pub(crate) struct BarrierSimulator {
 }
 
 /// Metadata logged for each simulated checkpoint.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BarrierSnapshot {
     pub epoch: u64,
@@ -30,6 +38,7 @@ pub(crate) struct BarrierSnapshot {
     pub open_windows: usize,
 }
 
+#[cfg(test)]
 impl Default for BarrierSimulator {
     fn default() -> Self {
         Self {
@@ -40,6 +49,7 @@ impl Default for BarrierSimulator {
     }
 }
 
+#[cfg(test)]
 impl BarrierSource for BarrierSimulator {
     fn next_barrier(&self) -> Option<CheckpointBarrier> {
         self.pending
@@ -49,6 +59,7 @@ impl BarrierSource for BarrierSimulator {
     }
 }
 
+#[cfg(test)]
 impl BarrierSimulator {
     /// Create a new barrier simulator.
     pub fn new() -> Self {

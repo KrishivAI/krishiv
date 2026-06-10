@@ -272,6 +272,8 @@ mod tests {
         .unwrap();
         let err =
             encode_stream_kafka_partition("t", 0, 0, &batch, "key", "ts", Some("val")).unwrap_err();
-        assert!(err.to_string().contains("value column") && err.to_string().contains("must be Int64"));
+        assert!(
+            err.to_string().contains("value column") && err.to_string().contains("must be Int64")
+        );
     }
 }

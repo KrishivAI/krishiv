@@ -6,7 +6,7 @@ impl Coordinator {
         skip(self, spec),
         fields(
             job_id = %spec.job_id(),
-            namespace = spec.namespace_id().as_deref().unwrap_or("default"),
+            namespace = spec.namespace_id().unwrap_or("default"),
             job_kind = ?spec.kind(),
         )
     )]
@@ -412,7 +412,9 @@ impl Coordinator {
     /// growth. Eviction happens here (not in `apply_task_update`) so that the job
     /// snapshot remains queryable until the GC cycle runs.
     pub fn take_gc_ready_jobs(&mut self) -> Vec<JobId> {
-        let jobs: Vec<JobId> = std::mem::take(&mut self.gc_ready_jobs).into_iter().collect();
+        let jobs: Vec<JobId> = std::mem::take(&mut self.gc_ready_jobs)
+            .into_iter()
+            .collect();
         for job_id in &jobs {
             self.evict_completed_job(job_id);
         }

@@ -231,20 +231,20 @@ fn cluster_stop(args: &[&str]) -> CliResponse {
     };
     let mut warnings: Vec<String> = Vec::new();
     if let Ok(cfg) = ClusterConfig::load(&data_dir) {
-        if let Some(pid) = cfg.clusterd_pid {
-            if let Err(error) = Command::new("kill").arg(pid.to_string()).status() {
-                warnings.push(format!("kill clusterd pid {pid} failed: {error}"));
-            }
+        if let Some(pid) = cfg.clusterd_pid
+            && let Err(error) = Command::new("kill").arg(pid.to_string()).status()
+        {
+            warnings.push(format!("kill clusterd pid {pid} failed: {error}"));
         }
         for pid in cfg.executor_pids {
             if let Err(error) = Command::new("kill").arg(pid.to_string()).status() {
                 warnings.push(format!("kill executor pid {pid} failed: {error}"));
             }
         }
-        if let Some(pid) = cfg.ui_pid {
-            if let Err(error) = Command::new("kill").arg(pid.to_string()).status() {
-                warnings.push(format!("kill ui pid {pid} failed: {error}"));
-            }
+        if let Some(pid) = cfg.ui_pid
+            && let Err(error) = Command::new("kill").arg(pid.to_string()).status()
+        {
+            warnings.push(format!("kill ui pid {pid} failed: {error}"));
         }
         if let Err(error) = fs::remove_file(ClusterConfig::path(&data_dir)) {
             warnings.push(format!(

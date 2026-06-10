@@ -617,10 +617,11 @@ impl DeadLetterSink {
         let keep_mask: BooleanArray = (0..batch.num_rows())
             .map(|i| Some(result.accepted_indices.contains(&i)))
             .collect();
-        let accepted = arrow::compute::filter_record_batch(batch, &keep_mask)
-            .map_err(|e| ConnectorError::Schema {
+        let accepted = arrow::compute::filter_record_batch(batch, &keep_mask).map_err(|e| {
+            ConnectorError::Schema {
                 message: e.to_string(),
-            })?;
+            }
+        })?;
 
         // Forward rejected rows to the secondary (dead-letter) sink if present.
         if let Some(ref mut secondary) = self.secondary
@@ -629,9 +630,11 @@ impl DeadLetterSink {
             let reject_mask: BooleanArray = (0..batch.num_rows())
                 .map(|i| Some(!result.accepted_indices.contains(&i)))
                 .collect();
-            let rejected_batch = arrow::compute::filter_record_batch(batch, &reject_mask)
-                .map_err(|e| ConnectorError::Schema {
-                    message: e.to_string(),
+            let rejected_batch =
+                arrow::compute::filter_record_batch(batch, &reject_mask).map_err(|e| {
+                    ConnectorError::Schema {
+                        message: e.to_string(),
+                    }
                 })?;
 
             // Build _error column keyed by original row index so the error string

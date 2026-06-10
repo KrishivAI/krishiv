@@ -35,11 +35,6 @@ impl PolicyEnforcingSqlEngine {
         }
     }
 
-    #[doc(hidden)]
-    pub(crate) fn inner(&self) -> &SqlEngine {
-        &self.inner
-    }
-
     pub fn authenticate(&self, api_key: &str) -> SqlResult<Principal> {
         self.auth
             .authenticate(api_key)
@@ -534,7 +529,7 @@ mod tests {
         )
         .unwrap();
         engine
-            .inner()
+            .inner
             .register_record_batches("people", vec![batch])
             .await
             .unwrap();
@@ -567,7 +562,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap();
         engine
-            .inner()
+            .inner
             .register_record_batches("people", vec![batch])
             .await
             .unwrap();

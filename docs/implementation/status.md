@@ -1,5 +1,44 @@
 # Krishiv Implementation Status
 
+## Phase 5: Full quality gate (2026-06-10)
+
+### Done
+All 20 crates in the workspace now compile clean under `cargo clippy --workspace -- -D warnings` and all lib tests pass.
+
+**Clippy fixes applied across the workspace:**
+- `#[default]` on enum variants replacing manual `impl Default` (`krishiv-common`)
+- Removed needless `return` statements in match arms (`krishiv-proto`)
+- Unused imports removed (`krishiv-plan`, `krishiv-executor`, `krishiv-sql`)
+- `div_ceil()` replacing manual ceiling-division arithmetic (`krishiv-plan`, `krishiv-scheduler`)
+- `is_some_and()` / `is_none_or()` replacing `map_or(bool, ...)` idioms
+- `is_multiple_of()` replacing `% n == 0` (`krishiv-scheduler`)
+- `repeat_n()` replacing `repeat().take()` (`krishiv-dataflow`)
+- `std::slice::from_ref(&x)` replacing `&[x.clone()]` (`krishiv-executor`)
+- Let-chains (`if let ... && ...`) collapsing nested ifs throughout all crates
+- Type aliases for `Pin<Box<dyn Future/Stream<...>>>` complex return types (`krishiv-connectors`, `krishiv-executor`, `krishiv-runtime`)
+- Module inception fix: `registry/registry.rs` → `registry/connector_registry.rs` (`krishiv-connectors`)
+- `async fn` replacing `fn f() -> impl Future { async move { } }` (`krishiv-shuffle`)
+- Dead code removed: unused fields, methods, functions across `krishiv-sql`, `krishiv-ui`, `krishiv-api`
+- `sort_by_key(|k| Reverse(...))` replacing `sort_by(|a,b| b.cmp(&a))` (`krishiv-scheduler`)
+- `matches!()` macro replacing `match { T => true, _ => false }` (`krishiv-runtime`)
+- `.enumerate()` replacing explicit counter variables (`krishiv-bench`)
+- `#[cfg(test)]` gating on structs/methods used only in test code (`krishiv-executor`)
+- Test fix: `.inner()` method call → `.inner` field access in `krishiv-sql/src/policy.rs`
+
+### Validation
+```bash
+cargo clippy --workspace --exclude krishiv-python -- -D warnings   # Finished dev; 0 errors
+cargo test --workspace --lib --exclude krishiv-python               # 19 test suites, 0 failures
+# Suite totals: 52+152+60+58+304+227+182+42+71+46+407+65+319+297+116+248+276+19 = 2791 tests passed
+```
+
+### Next useful task
+```bash
+cargo test --workspace --exclude krishiv-python   # integration tests (slower, spawn processes)
+```
+
+---
+
 ## Phase 1.1: Broker-backed Kafka CheckpointSource — seek-based restore (2026-06-10)
 
 ### Done
@@ -62,6 +101,46 @@ cargo test -p krishiv-runtime --lib                                 # 319 passed
 - **Sync fallback**: `NonBlockingStoreHandle` detects the absence of a Tokio runtime at construction time (`tx = None`). In that mode, `save_continuous_snapshot` writes synchronously. This makes the behavior deterministic in unit tests without `#[tokio::test]`.
 - **Cross-session transfer pattern**: Session 1 attaches a store, drains (snapshot persisted); session 2 reads the snapshot via `load_continuous_snapshot`, pre-populates a new `InMemoryMetadataStore`, attaches it, calls `restore_continuous_jobs_from_store`. For production, replace `InMemoryMetadataStore` with `RedbMetadataStore` (same file path = automatic recovery).
 - **EtcdMetadataStore limitation**: etcd default 1.5 MiB value limit is insufficient for arbitrary window state. The no-op + warn design makes the limitation explicit rather than silently truncating state.
+
+---
+
+## Phase 4: Release engineering (2026-06-10)
+
+### Done
+1. **CI gate discrepancy fixed** — `justfile` had `check-distributed` but CI matrix used `just check-bare-metal`; added `check-bare-metal` recipe and kept `check-distributed` as an alias.
+2. **Benchmark CI workflow** — `.github/workflows/bench.yml` runs `cargo bench -p krishiv-bench` on every push/PR. On `main`, saves a criterion baseline to the CI cache; on PRs, restores the baseline and runs `bench-compare` for regression detection. Results uploaded as artifacts.
+3. **`bench` / `bench-save` / `bench-compare` / `release` justfile recipes** added.
+4. **Versioning policy** — `docs/RELEASE.md` documents the `MAJOR.MINOR.PATCH` policy, the release checklist, the CI gate matrix, and how to update baselines. `just release VERSION=x.y.z` automates the bump + tag.
+
+### Validation
+```bash
+just --list         # bench, bench-save, bench-compare, check-bare-metal, release all listed
+cargo check --workspace  # exit 0
+```
+
+### Next
+- Phase 5: Full quality gate — `cargo fmt --check`, `cargo test --workspace --lib`, `cargo clippy --workspace`.
+
+---
+
+## Phase 3: Structural debt in krishiv-plan (2026-06-10)
+
+### Done
+1. **AQE clone-per-rule fix** — `AqeRule::apply` now takes `&PhysicalPlan` instead of `PhysicalPlan`. Non-firing rules pay no clone cost. Rules that fire clone internally only when they know a rewrite is needed (`stamp_target`, coalesce path). `AqeOptimizer::apply` passes `&current` instead of `current.clone()`.
+2. **Panic helper unified** — `panic_payload_message` (optimizer.rs) and `panic_message` (udf.rs) removed. Canonical `panic_payload_to_string` added to `krishiv-common::panic_util` and re-exported. Both callers updated.
+3. **CEP O(n) eviction → O(log n)** — `PartitionedCepMatcher` now maintains a `BinaryHeap<Reverse<(i64, K)>>` min-heap alongside the state map. On each `process_event`, the updated `(timestamp, key)` is pushed to the heap. Eviction via `evict_stalest()` pops + lazy-skips stale entries. Added `K: Ord` bound. `evict_keys_before` unchanged (O(n) full scan is appropriate there).
+4. **AuditEvent job_id redaction** — `audit_log` now builds a `redacted` detail alongside the full `detail`. The full detail is used only for dedup-key hashing. `AuditEvent.resource` receives the redacted form where all `job_id` and `query_hash` values are replaced with their SHA-256-derived 16-hex-char fingerprint via `redact_id()`.
+5. **optimizer.rs split** — 3,872-line file split into 5 submodule files under `src/optimizer/`: `coalesce.rs`, `auto_partition.rs`, `small_file.rs`, `broadcast.rs`, `predicate_pushdown.rs`. Core traits, `Optimizer`, `AqeOptimizer`, `StreamingAqeGuard`, `StaticCostModel`, and tests remain in `optimizer.rs`. All types re-exported via `pub use` so the public API is unchanged.
+
+### Validation
+```bash
+cargo check --workspace                                              # exit 0
+cargo test -p krishiv-common --lib                                   # passes
+cargo test -p krishiv-plan --lib                                     # 407 passed
+```
+
+### Next
+- Phase 4: CI gate matrix, benchmark baselines, versioning policy.
 
 ---
 

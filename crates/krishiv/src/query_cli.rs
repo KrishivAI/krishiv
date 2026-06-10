@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use krishiv_api::{DataFrame, ExecutionMode, KrishivError, Session};
 use krishiv_common::async_util::block_on;
-use krishiv_plan::governance::{AuthProvider, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
+use krishiv_plan::governance::{
+    AuthProvider, PolicyHook, Principal, Role, StaticApiKeyAuthProvider,
+};
 
 use crate::cli::CliResponse;
 

@@ -8,13 +8,13 @@ use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_common::async_util::block_on;
 use krishiv_plan::governance::{AuthProvider, PolicyHook};
+use krishiv_plan::udf::{ScalarUdf, UdfRegistry};
 use krishiv_runtime::{
     BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobStatus,
     LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
 };
 use krishiv_sql::policy::PolicyEnforcingSqlEngine;
 use krishiv_sql::{ContinuousTableInput, SqlEngine};
-use krishiv_plan::udf::{ScalarUdf, UdfRegistry};
 
 use crate::dataframe::DataFrame;
 use crate::error::{KrishivError, Result};
@@ -496,7 +496,6 @@ impl SessionBuilder {
             registered_parquet: Arc::new(DashMap::new()),
             stream_jobs: Arc::new(DashMap::new()),
             unbounded_streams: Arc::new(DashMap::new()),
-            shuffle_partitions: self.shuffle_partitions,
         })
     }
 }
@@ -520,9 +519,6 @@ pub struct Session {
     registered_parquet: Arc<DashMap<String, PathBuf>>,
     stream_jobs: Arc<DashMap<String, LocalWindowExecutionSpec>>,
     unbounded_streams: Arc<DashMap<String, Arc<ContinuousTableInput>>>,
-    /// Optional override for the shuffle partition count.  When set,
-    /// `AutoPartitionRule` is bypassed for exchange nodes.
-    pub(crate) shuffle_partitions: Option<u32>,
 }
 
 impl fmt::Debug for Session {

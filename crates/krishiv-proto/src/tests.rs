@@ -757,8 +757,7 @@ mod wire_fuzz {
 
     fn arb_version() -> impl Strategy<Value = Option<v1::TransportVersion>> {
         prop::option::of(
-            (0u32..=5, 0u32..=5)
-                .prop_map(|(major, minor)| v1::TransportVersion { major, minor }),
+            (0u32..=5, 0u32..=5).prop_map(|(major, minor)| v1::TransportVersion { major, minor }),
         )
     }
 

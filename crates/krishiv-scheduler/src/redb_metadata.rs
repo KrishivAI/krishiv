@@ -88,58 +88,65 @@ impl RedbMetadataStore {
         })?;
 
         if let Ok(table) = rx.open_table(EVENTS_TABLE) {
-            for result in table.iter().map_err(|e| SchedulerError::Store {
-                message: format!("failed to iterate redb events: {e}"),
-            })? {
-                if let Ok((_, value)) = result {
-                    if let Ok(pe) = serde_json::from_slice::<PersistedEvent>(value.value()) {
-                        if let Ok(evt) = EventLogEvent::try_from(pe) {
-                            events.push(evt);
-                        }
-                    }
+            for (_, value) in table
+                .iter()
+                .map_err(|e| SchedulerError::Store {
+                    message: format!("failed to iterate redb events: {e}"),
+                })?
+                .flatten()
+            {
+                if let Ok(pe) = serde_json::from_slice::<PersistedEvent>(value.value())
+                    && let Ok(evt) = EventLogEvent::try_from(pe)
+                {
+                    events.push(evt);
                 }
             }
         }
 
         if let Ok(table) = rx.open_table(JOBS_TABLE) {
-            for result in table.iter().map_err(|e| SchedulerError::Store {
-                message: format!("failed to iterate redb jobs: {e}"),
-            })? {
-                if let Ok((_, value)) = result {
-                    if let Ok(pj) = serde_json::from_slice::<PersistedJobRecord>(value.value()) {
-                        if let Ok(job) = JobRecord::try_from(pj) {
-                            jobs.push(job);
-                        }
-                    }
+            for (_, value) in table
+                .iter()
+                .map_err(|e| SchedulerError::Store {
+                    message: format!("failed to iterate redb jobs: {e}"),
+                })?
+                .flatten()
+            {
+                if let Ok(pj) = serde_json::from_slice::<PersistedJobRecord>(value.value())
+                    && let Ok(job) = JobRecord::try_from(pj)
+                {
+                    jobs.push(job);
                 }
             }
         }
 
         if let Ok(table) = rx.open_table(EXECUTORS_TABLE) {
-            for result in table.iter().map_err(|e| SchedulerError::Store {
-                message: format!("failed to iterate redb executors: {e}"),
-            })? {
-                if let Ok((_, value)) = result {
-                    if let Ok(pe) =
-                        serde_json::from_slice::<PersistedExecutorDescriptor>(value.value())
-                    {
-                        if let Ok(ex) = ExecutorDescriptor::try_from(pe) {
-                            executors.push(ex);
-                        }
-                    }
+            for (_, value) in table
+                .iter()
+                .map_err(|e| SchedulerError::Store {
+                    message: format!("failed to iterate redb executors: {e}"),
+                })?
+                .flatten()
+            {
+                if let Ok(pe) =
+                    serde_json::from_slice::<PersistedExecutorDescriptor>(value.value())
+                    && let Ok(ex) = ExecutorDescriptor::try_from(pe)
+                {
+                    executors.push(ex);
                 }
             }
         }
 
         let mut continuous_snapshots = std::collections::HashMap::new();
         if let Ok(table) = rx.open_table(CONTINUOUS_TABLE) {
-            for result in table.iter().map_err(|e| SchedulerError::Store {
-                message: format!("failed to iterate redb continuous_snapshots: {e}"),
-            })? {
-                if let Ok((key, value)) = result {
-                    if let Ok(snapshot) = ContinuousSnapshot::decode(value.value()) {
-                        continuous_snapshots.insert(key.value().to_owned(), snapshot);
-                    }
+            for (key, value) in table
+                .iter()
+                .map_err(|e| SchedulerError::Store {
+                    message: format!("failed to iterate redb continuous_snapshots: {e}"),
+                })?
+                .flatten()
+            {
+                if let Ok(snapshot) = ContinuousSnapshot::decode(value.value()) {
+                    continuous_snapshots.insert(key.value().to_owned(), snapshot);
                 }
             }
         }
@@ -309,15 +316,14 @@ impl MetadataStore for RedbMetadataStore {
             table
                 .insert(job_id, encoded.as_slice())
                 .map_err(|e| SchedulerError::Store {
-                    message: format!(
-                        "failed to insert continuous snapshot for '{job_id}': {e}"
-                    ),
+                    message: format!("failed to insert continuous snapshot for '{job_id}': {e}"),
                 })?;
         }
         tx.commit().map_err(|e| SchedulerError::Store {
             message: format!("failed to commit redb continuous snapshot tx: {e}"),
         })?;
-        self.continuous_snapshots.insert(job_id.to_owned(), snapshot);
+        self.continuous_snapshots
+            .insert(job_id.to_owned(), snapshot);
         Ok(())
     }
 
@@ -335,11 +341,9 @@ impl MetadataStore for RedbMetadataStore {
                 .map_err(|e| SchedulerError::Store {
                     message: format!("failed to open redb continuous_snapshots table: {e}"),
                 })?;
-            table
-                .remove(job_id)
-                .map_err(|e| SchedulerError::Store {
-                    message: format!("failed to remove continuous snapshot for '{job_id}': {e}"),
-                })?;
+            table.remove(job_id).map_err(|e| SchedulerError::Store {
+                message: format!("failed to remove continuous snapshot for '{job_id}': {e}"),
+            })?;
         }
         tx.commit().map_err(|e| SchedulerError::Store {
             message: format!("failed to commit redb continuous snapshot remove tx: {e}"),

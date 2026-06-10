@@ -215,6 +215,9 @@ mod tests {
         let tracker = InFlightTracker::new();
         let _guard_count = tracker.enter();
         let drained = tracker.drain(Duration::from_millis(50)).await;
-        assert!(!drained, "drain must report timeout when calls remain active");
+        assert!(
+            !drained,
+            "drain must report timeout when calls remain active"
+        );
     }
 }

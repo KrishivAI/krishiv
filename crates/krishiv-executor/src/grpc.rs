@@ -80,7 +80,6 @@ impl ExecutorTaskAuthConfig {
         }
         Ok(())
     }
-
 }
 
 fn parse_bool_env(name: &str) -> bool {
@@ -246,7 +245,11 @@ impl ExecutorTaskGrpcService {
             return Ok(());
         };
         match bearer_token_from_metadata(metadata) {
-            Some(actual) if constant_time_eq::constant_time_eq(actual.as_bytes(), expected.as_bytes()) => Ok(()),
+            Some(actual)
+                if constant_time_eq::constant_time_eq(actual.as_bytes(), expected.as_bytes()) =>
+            {
+                Ok(())
+            }
             Some(_) => Err(tonic::Status::unauthenticated(
                 "invalid executor task bearer token",
             )),

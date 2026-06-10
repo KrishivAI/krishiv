@@ -203,7 +203,6 @@ impl CheckpointSource for ParquetSource {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // ParquetSink
 // ---------------------------------------------------------------------------
@@ -266,9 +265,9 @@ impl Sink for ParquetSink {
 
     async fn flush(&mut self) -> ConnectorResult<()> {
         if let Some(writer) = self.writer.take() {
-            writer
-                .close()
-                .map_err(|e| ConnectorError::Parquet(format!("failed to close Parquet writer: {e}")))?;
+            writer.close().map_err(|e| {
+                ConnectorError::Parquet(format!("failed to close Parquet writer: {e}"))
+            })?;
         }
         Ok(())
     }

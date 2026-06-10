@@ -696,10 +696,8 @@ impl KrishivFlightSqlService {
                 Ok(Vec::new())
             }
             A::BatchSql(body) => {
-                let mut sql = krishiv_runtime::flight_protocol::encode_batch_sql(
-                    &body.query,
-                    &body.tables,
-                );
+                let mut sql =
+                    krishiv_runtime::flight_protocol::encode_batch_sql(&body.query, &body.tables);
                 if body.is_streaming {
                     sql = format!("-- krishiv:streaming=true\n{sql}");
                 }
@@ -738,14 +736,17 @@ fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionE
 /// Build a gRPC `FlightServiceServer` wrapping `KrishivFlightSqlService`.
 ///
 /// **Beta API**: may change between minor releases.
-pub fn make_flight_sql_server(
-) -> Result<arrow_flight::flight_service_server::FlightServiceServer<KrishivFlightSqlService>, String> {
+pub fn make_flight_sql_server()
+-> Result<arrow_flight::flight_service_server::FlightServiceServer<KrishivFlightSqlService>, String>
+{
     let service = KrishivFlightSqlService::with_host(
-        FlightExecutionHost::from_env().map_err(|e| e.to_string())?
+        FlightExecutionHost::from_env().map_err(|e| e.to_string())?,
     );
-    Ok(arrow_flight::flight_service_server::FlightServiceServer::new(
-        configure_flight_auth_from_env(service)?
-    ))
+    Ok(
+        arrow_flight::flight_service_server::FlightServiceServer::new(
+            configure_flight_auth_from_env(service)?,
+        ),
+    )
 }
 
 /// Attach auth from `KRISHIV_API_KEYS` when configured; fail in production when absent.

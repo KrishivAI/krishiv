@@ -243,7 +243,12 @@ impl PyWindowedStream {
         // Python threads and async tasks can run without stalling.
         // pyo3 0.28 uses `detach` instead of the older `allow_threads`.
         py.detach(|| self.ensure_collected())?;
-        Ok(self.cached.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default())
+        Ok(self
+            .cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default())
     }
 
     pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

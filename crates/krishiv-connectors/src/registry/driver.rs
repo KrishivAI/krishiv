@@ -17,16 +17,24 @@ pub enum OpenedTwoPhaseSink {
     LocalParquet(LocalParquetTwoPhaseCommitSink),
 }
 
+pub type OpenSourceFuture<'a> =
+    Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSource>>> + Send + 'a>>;
+pub type OpenSinkFuture<'a> =
+    Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSink>>> + Send + 'a>>;
+pub type OpenTwoPhaseSinkFuture<'a> =
+    Pin<Box<dyn Future<Output = ConnectorResult<OpenedTwoPhaseSink>> + Send + 'a>>;
+#[cfg(feature = "vector-sinks")]
+pub type OpenVectorSinkFuture<'a> = Pin<
+    Box<dyn Future<Output = ConnectorResult<Arc<dyn crate::vector::VectorSink>>> + Send + 'a>,
+>;
+
 /// Builds [`DynSource`] instances from validated [`ConnectorConfig`] values.
 pub trait SourceDriver: Send + Sync {
     fn descriptor(&self) -> ConnectorDescriptor;
 
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()>;
 
-    fn open<'a>(
-        &'a self,
-        config: &'a ConnectorConfig,
-    ) -> Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSource>>> + Send + 'a>>;
+    fn open<'a>(&'a self, config: &'a ConnectorConfig) -> OpenSourceFuture<'a>;
 
     /// Return the total row count for this source without fully opening it,
     /// if the driver can cheaply determine it (e.g. Parquet footer metadata).
@@ -42,10 +50,7 @@ pub trait SinkDriver: Send + Sync {
 
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()>;
 
-    fn open<'a>(
-        &'a self,
-        config: &'a ConnectorConfig,
-    ) -> Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSink>>> + Send + 'a>>;
+    fn open<'a>(&'a self, config: &'a ConnectorConfig) -> OpenSinkFuture<'a>;
 }
 
 /// Builds exactly-once two-phase sink instances.
@@ -54,10 +59,7 @@ pub trait TwoPhaseSinkDriver: Send + Sync {
 
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()>;
 
-    fn open<'a>(
-        &'a self,
-        config: &'a ConnectorConfig,
-    ) -> Pin<Box<dyn Future<Output = ConnectorResult<OpenedTwoPhaseSink>> + Send + 'a>>;
+    fn open<'a>(&'a self, config: &'a ConnectorConfig) -> OpenTwoPhaseSinkFuture<'a>;
 }
 
 /// Builds vector-store sinks when the `vector-sinks` feature is enabled.
@@ -67,10 +69,7 @@ pub trait VectorSinkDriver: Send + Sync {
 
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()>;
 
-    fn open<'a>(
-        &'a self,
-        config: &'a ConnectorConfig,
-    ) -> Pin<Box<dyn Future<Output = ConnectorResult<Arc<dyn crate::vector::VectorSink>>> + Send + 'a>>;
+    fn open<'a>(&'a self, config: &'a ConnectorConfig) -> OpenVectorSinkFuture<'a>;
 }
 
 pub type SharedSourceDriver = Arc<dyn SourceDriver>;

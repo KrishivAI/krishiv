@@ -527,7 +527,11 @@ mod tests {
 
         let score_col = result.column(result.schema().index_of("score").unwrap());
         let scores = score_col.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(scores.value(0), 100, "matched row carries the joined table value");
+        assert_eq!(
+            scores.value(0),
+            100,
+            "matched row carries the joined table value"
+        );
         assert!(
             scores.is_null(1),
             "unmatched row must carry null table columns rather than being dropped"

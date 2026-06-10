@@ -7,6 +7,10 @@ use krishiv_plan::window::WindowExecutionSpec;
 use crate::RuntimeError;
 use crate::in_process_cluster::local_spec_to_plan_spec;
 
+type BatchStream = std::pin::Pin<
+    Box<dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_dataflow::ExecError>> + Send>,
+>;
+
 /// Window operator kind for local execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalWindowKind {
@@ -70,29 +74,24 @@ pub fn execute_windowed_stream(
     spec: &LocalWindowExecutionSpec,
 ) -> Result<Vec<RecordBatch>, RuntimeError> {
     let plan_spec = spec.to_plan_spec();
-    execute_bounded_window(input_batches, &plan_spec, None)
-        .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })
+    execute_bounded_window(input_batches, &plan_spec, None).map_err(|e| {
+        RuntimeError::InvalidState {
+            message: e.to_string(),
+        }
+    })
 }
 
 /// Run windowed aggregation lazily over an unbounded input stream.
 pub fn execute_streaming_window(
-    input: std::pin::Pin<
-        Box<
-            dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_dataflow::ExecError>> + Send,
-        >,
-    >,
+    input: BatchStream,
     spec: &LocalWindowExecutionSpec,
-) -> Result<
-    std::pin::Pin<
-        Box<
-            dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_dataflow::ExecError>> + Send,
-        >,
-    >,
-    RuntimeError,
-> {
+) -> Result<BatchStream, RuntimeError> {
     let plan_spec = spec.to_plan_spec();
-    krishiv_dataflow::execute_streaming_window(input, plan_spec, None)
-        .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })
+    krishiv_dataflow::execute_streaming_window(input, plan_spec, None).map_err(|e| {
+        RuntimeError::InvalidState {
+            message: e.to_string(),
+        }
+    })
 }
 
 #[cfg(test)]

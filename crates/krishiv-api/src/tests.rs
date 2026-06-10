@@ -9,7 +9,9 @@ use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 
-use krishiv_plan::governance::{MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
+use krishiv_plan::governance::{
+    MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider,
+};
 use krishiv_runtime::LocalWindowKind;
 
 use crate::error::KrishivError;
@@ -478,7 +480,8 @@ fn sliding_window_collect_via_unified_runtime() {
 #[test]
 fn session_window_collect_via_unified_runtime() {
     let session = Session::builder().build().unwrap();
-    let batch = krishiv_common::test_fixtures::make_test_user_ts_batch(vec!["a", "b"], vec![1_000, 8_000]);
+    let batch =
+        krishiv_common::test_fixtures::make_test_user_ts_batch(vec!["a", "b"], vec![1_000, 8_000]);
     let stream = session
         .memory_stream("events", vec![StreamBatch::new(0, batch)])
         .unwrap();

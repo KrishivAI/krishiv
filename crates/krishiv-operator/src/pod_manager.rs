@@ -192,7 +192,14 @@ impl PodLifecycleManager {
         idx: usize,
         job_id: &str,
     ) -> Pod {
-        build_executor_pod(resource, pod_name, executor_id, idx, job_id, &self.coordinator_endpoint)
+        build_executor_pod(
+            resource,
+            pod_name,
+            executor_id,
+            idx,
+            job_id,
+            &self.coordinator_endpoint,
+        )
     }
 }
 

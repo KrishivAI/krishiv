@@ -107,7 +107,10 @@ impl AttemptId {
     pub fn next(self) -> Self {
         let next = self.0.saturating_add(1);
         if next == u32::MAX {
-            tracing::warn!(current = self.0, "AttemptId saturated at u32::MAX; further retries cannot be distinguished");
+            tracing::warn!(
+                current = self.0,
+                "AttemptId saturated at u32::MAX; further retries cannot be distinguished"
+            );
         }
         Self(next)
     }

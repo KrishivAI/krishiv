@@ -181,10 +181,10 @@ impl DeltaObjectStoreReader {
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| LakehouseError::Io(e.to_string()))?;
             let name = meta.location.filename().unwrap_or("").to_string();
-            if name.ends_with(".json") {
-                if let Ok(v) = name.trim_end_matches(".json").parse::<u64>() {
-                    versions.push(v);
-                }
+            if name.ends_with(".json")
+                && let Ok(v) = name.trim_end_matches(".json").parse::<u64>()
+            {
+                versions.push(v);
             }
         }
         versions.sort_unstable();

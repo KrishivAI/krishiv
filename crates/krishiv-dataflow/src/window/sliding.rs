@@ -168,11 +168,7 @@ impl SlidingWindowOperator {
         };
         let mut starts = Vec::with_capacity(count.min(1024));
         let mut s = first;
-        loop {
-            let sum = match s.checked_add(size) {
-                Some(v) => v,
-                None => break,
-            };
+        while let Some(sum) = s.checked_add(size) {
             if sum <= event_time_ms {
                 break;
             }

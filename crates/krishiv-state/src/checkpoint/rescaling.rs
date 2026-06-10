@@ -49,11 +49,7 @@ impl RescaleChecksum {
     /// `post_shard_row_counts` must contain one entry per post-split shard.
     /// Returns `true` when the split is valid (no rows lost or duplicated and
     /// schema width is unchanged).
-    pub fn verify(
-        &self,
-        post_shard_row_counts: &[u64],
-        post_column_count: u32,
-    ) -> bool {
+    pub fn verify(&self, post_shard_row_counts: &[u64], post_column_count: u32) -> bool {
         let post_total: u64 = post_shard_row_counts.iter().sum();
         post_total == self.total_rows
             && post_column_count == self.column_count

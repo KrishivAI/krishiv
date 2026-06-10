@@ -96,17 +96,18 @@ pub fn validate_job_fragments(
         for task in stage.tasks() {
             let typed = TypedTaskFragment::decode_for_profile(task.description(), profile)?;
             // Validate window specs embedded in the fragment body.
-            if typed.body.starts_with(crate::window::WINDOW_EXECUTION_SPEC_PREFIX) {
-                crate::window::decode_window_execution_spec(&typed.body)?;
-            } else if typed.body.starts_with("stream:tw:")
+            if typed
+                .body
+                .starts_with(crate::window::WINDOW_EXECUTION_SPEC_PREFIX)
+                || typed.body.starts_with("stream:tw:")
                 || typed.body.starts_with("stream:sw:")
                 || typed.body.starts_with("stream:ses:")
             {
                 crate::window::decode_window_execution_spec(&typed.body)?;
-            } else if let Some(op) = crate::lowering::decode_task_fragment(&typed.body) {
-                if let NodeOp::Window { spec } = op {
-                    crate::window::validate_window_execution_spec(&spec)?;
-                }
+            } else if let Some(NodeOp::Window { spec }) =
+                crate::lowering::decode_task_fragment(&typed.body)
+            {
+                crate::window::validate_window_execution_spec(&spec)?;
             }
         }
     }
@@ -133,8 +134,9 @@ mod tests {
     fn round_trip_typed_fragment() {
         use crate::window::WindowExecutionSpec;
         let spec = WindowExecutionSpec::tumbling("user_id", "ts", 1_000);
-        let node = PlanNode::new("w", "win", ExecutionKind::Streaming)
-            .with_op(NodeOp::Window { spec: Box::new(spec) });
+        let node = PlanNode::new("w", "win", ExecutionKind::Streaming).with_op(NodeOp::Window {
+            spec: Box::new(spec),
+        });
         let encoded = encode_typed_task_fragment(&node).expect("encode");
         let decoded = TypedTaskFragment::decode_or_legacy(&encoded);
         assert_eq!(decoded.execution_kind, ExecutionKind::Streaming);

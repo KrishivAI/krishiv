@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use krishiv_proto::wire::v1::{BarrierKind, CheckpointBarrier};
-use krishiv_proto::{CheckpointAckRequest, CheckpointAckResponse, ExecutorId, FencingToken, JobId, TaskId};
+use krishiv_proto::{
+    CheckpointAckRequest, CheckpointAckResponse, ExecutorId, FencingToken, JobId, TaskId,
+};
 
 use crate::barrier_client::inject_barrier;
 use crate::barrier_tracker::CheckpointBarrierTracker;

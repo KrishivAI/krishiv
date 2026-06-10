@@ -16,10 +16,10 @@ use crate::dynamic::{
     patch_krishivjob_finalizer, patch_krishivjob_status, remove_krishivjob_finalizer,
 };
 use crate::error::{OperatorError, OperatorResult};
-use krishiv_scheduler::SchedulerError;
 use crate::pod_manager::PodLifecycleManager;
 use crate::reconciler::*;
 use crate::status::KrishivJobStatus;
+use krishiv_scheduler::SchedulerError;
 
 pub struct KubernetesControllerConfig {
     /// Namespace to watch. `None` watches all namespaces.
@@ -356,10 +356,9 @@ pub async fn reconcile_dynamic_object_with_runtime(
                         }
                     }
                 }
-                runtime.reconciler.ensure_dedicated_job_loop(
-                    job_id,
-                    resource.spec.dedicated_coordinator,
-                );
+                runtime
+                    .reconciler
+                    .ensure_dedicated_job_loop(job_id, resource.spec.dedicated_coordinator);
                 if resource.spec.dedicated_coordinator {
                     tracing::info!(
                         job_id = %job_id,

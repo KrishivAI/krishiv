@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use krishiv_state::checkpoint::CheckpointStorage;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointEpochInfo, CoordinatorExecutorService,
     CoordinatorManagementService, DeregisterExecutorRequest, DeregisterExecutorResponse,
@@ -13,6 +12,7 @@ use krishiv_proto::{
     TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
     TransportVersion, TriggerSavepointRequest, TriggerSavepointResponse, wire,
 };
+use krishiv_state::checkpoint::CheckpointStorage;
 
 use crate::auth::{extract_auth_context, validate_grpc_auth, validate_grpc_writer};
 use crate::checkpoint::CheckpointCoordinator;

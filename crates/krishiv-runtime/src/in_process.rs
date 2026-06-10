@@ -109,11 +109,19 @@ impl InProcessStreamingRuntime {
         // Each in-process cluster gets a process-unique coordinator and
         // executor id so multiple sessions sharing the same process do not
         // collide in metadata stores or audit logs (C1).
-        let coordinator_id = CoordinatorId::try_new(format!("in-process-coord-{suffix}"))
-            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
+        let coordinator_id =
+            CoordinatorId::try_new(format!("in-process-coord-{suffix}")).map_err(|e| {
+                RuntimeError::InvalidState {
+                    message: e.to_string(),
+                }
+            })?;
         let coordinator = Arc::new(Mutex::new(Coordinator::active(coordinator_id)));
-        let executor_id = ExecutorId::try_new(format!("in-process-exec-{suffix}"))
-            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
+        let executor_id =
+            ExecutorId::try_new(format!("in-process-exec-{suffix}")).map_err(|e| {
+                RuntimeError::InvalidState {
+                    message: e.to_string(),
+                }
+            })?;
         let descriptor = ExecutorDescriptor::new(executor_id.clone(), "localhost", 8)
             .with_task_endpoint(IN_PROCESS_TASK_ENDPOINT);
         {
@@ -122,7 +130,9 @@ impl InProcessStreamingRuntime {
             })?;
             coord
                 .register_executor(descriptor)
-                .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
+                .map_err(|e| RuntimeError::InvalidState {
+                    message: e.to_string(),
+                })?;
         }
         // Build sharded inner locks after registering the local executor so the
         // bridge starts from the same control-plane state as the coordinator.
@@ -177,8 +187,11 @@ impl InProcessStreamingRuntime {
     /// Per-cluster job id generator (C1) — replaces the legacy process-global counter.
     fn next_job_id(&self) -> RuntimeResult<JobId> {
         let n = self.job_counter.fetch_add(1, Ordering::Relaxed);
-        JobId::try_new(format!("in-process-{}-job-{n}", self.suffix))
-            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })
+        JobId::try_new(format!("in-process-{}-job-{n}", self.suffix)).map_err(|e| {
+            RuntimeError::InvalidState {
+                message: e.to_string(),
+            }
+        })
     }
 
     pub fn continuous_registry(&self) -> &ContinuousStreamRegistry {
@@ -213,7 +226,9 @@ impl InProcessStreamingRuntime {
         self.runner
             .sql_engine()
             .deregister_streaming_source(name)
-            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
+            .map_err(|e| RuntimeError::InvalidState {
+                message: e.to_string(),
+            })?;
         let prefix = format!("{name}:");
         self.runner
             .registered_parquet_cache()
@@ -226,7 +241,9 @@ impl InProcessStreamingRuntime {
         self.runner
             .sql_engine()
             .is_streaming_query(query)
-            .map_err(|e| RuntimeError::PlanRejected { reason: format!("sql parse error: {e}") })
+            .map_err(|e| RuntimeError::PlanRejected {
+                reason: format!("sql parse error: {e}"),
+            })
     }
 
     /// Execute batch SQL on the in-process executor via the coordinator. → executor (`sql:` fragment).
@@ -249,7 +266,10 @@ impl InProcessStreamingRuntime {
             // Skip tables already registered in a previous inline call to avoid
             // redundant DataFusion re-registration (file footer re-read).
             for table in &tables {
-                let canonical_path = table.path.canonicalize().unwrap_or_else(|_| table.path.clone());
+                let canonical_path = table
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| table.path.clone());
                 let cache_key = format!("{}:{}", table.table_name, canonical_path.display());
                 // Atomic check-and-insert via DashMap entry API prevents the TOCTOU
                 // race where two concurrent threads both see contains_key==false,
@@ -332,13 +352,15 @@ impl InProcessStreamingRuntime {
         // Errors are swallowed: snapshot is best-effort and must not break drains.
         if let Ok((snapshot_bytes, watermark_ms)) =
             self.continuous_registry.snapshot_job_with_watermark(job_id)
+            && let Ok(coord) = self.coordinator.lock()
         {
-            if let Ok(coord) = self.coordinator.lock() {
-                coord.save_continuous_snapshot(
-                    job_id,
-                    ContinuousSnapshot { snapshot_bytes, watermark_ms },
-                );
-            }
+            coord.save_continuous_snapshot(
+                job_id,
+                ContinuousSnapshot {
+                    snapshot_bytes,
+                    watermark_ms,
+                },
+            );
         }
         Ok(batches)
     }
@@ -348,9 +370,12 @@ impl InProcessStreamingRuntime {
     /// Call before any `drain_continuous_job` calls to enable snapshot persistence.
     /// Safe to call on a running runtime; subsequent drains will use the new store.
     pub fn attach_store(&self, store: impl MetadataStore + 'static) -> RuntimeResult<()> {
-        let mut coord = self.coordinator.lock().map_err(|_| RuntimeError::InvalidState {
-            message: "coordinator lock poisoned during attach_store".into(),
-        })?;
+        let mut coord = self
+            .coordinator
+            .lock()
+            .map_err(|_| RuntimeError::InvalidState {
+                message: "coordinator lock poisoned during attach_store".into(),
+            })?;
         coord.attach_store(store);
         Ok(())
     }
@@ -380,9 +405,13 @@ impl InProcessStreamingRuntime {
         &self,
         job_specs: &[(&str, WindowExecutionSpec)],
     ) -> RuntimeResult<usize> {
-        let coord = self.coordinator.lock().map_err(|_| RuntimeError::InvalidState {
-            message: "coordinator lock poisoned during restore_continuous_jobs_from_store".into(),
-        })?;
+        let coord = self
+            .coordinator
+            .lock()
+            .map_err(|_| RuntimeError::InvalidState {
+                message: "coordinator lock poisoned during restore_continuous_jobs_from_store"
+                    .into(),
+            })?;
         let mut restored = 0usize;
         for (job_id, spec) in job_specs {
             if self.continuous_registry.has_job(job_id) {
@@ -408,22 +437,31 @@ impl InProcessStreamingRuntime {
         stream_partitions: Vec<InputPartition>,
     ) -> RuntimeResult<Vec<RecordBatch>> {
         let job_id = self.next_job_id()?;
-        let task_id = TaskId::try_new("task-0")
-            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
-        let stage_id = StageId::try_new("stage-0")
-            .map_err(|e| RuntimeError::InvalidState { message: e.to_string() })?;
+        let task_id = TaskId::try_new("task-0").map_err(|e| RuntimeError::InvalidState {
+            message: e.to_string(),
+        })?;
+        let stage_id = StageId::try_new("stage-0").map_err(|e| RuntimeError::InvalidState {
+            message: e.to_string(),
+        })?;
         let job_spec = JobSpec::new(job_id.clone(), fragment.to_string(), kind).with_stage(
             StageSpec::new(stage_id, "stage-0")
                 .with_task(TaskSpec::new(task_id.clone(), fragment.to_string())),
         );
 
         {
-            let mut coord = self.coordinator.lock().map_err(|_| RuntimeError::InvalidState {
-                message: "coordinator lock poisoned during job submission".into(),
-            })?;
+            let mut coord = self
+                .coordinator
+                .lock()
+                .map_err(|_| RuntimeError::InvalidState {
+                    message: "coordinator lock poisoned during job submission".into(),
+                })?;
             match coord.submit_job(job_spec) {
                 Ok(SubmitOutcome::Accepted) | Ok(SubmitOutcome::Queued { .. }) => {}
-                Err(e) => return Err(RuntimeError::InvalidState { message: e.to_string() }),
+                Err(e) => {
+                    return Err(RuntimeError::InvalidState {
+                        message: e.to_string(),
+                    });
+                }
             }
         }
 
@@ -563,21 +601,18 @@ impl InProcessStreamingRuntime {
                     // G1: Collect watermark from streaming stages for the next stage.
                     // Skip i64::MIN (WATERMARK_UNSET) — it is the uninitialized sentinel
                     // returned by windows that have not yet processed any events (B3/A4).
-                    if let Some(wm) = report.output().watermark_ms() {
-                        if wm > WATERMARK_UNSET {
-                            stage_watermark_ms =
-                                Some(stage_watermark_ms.map_or(wm, |prev: i64| prev.max(wm)));
-                        }
+                    if let Some(wm) = report.output().watermark_ms() && wm > WATERMARK_UNSET {
+                        stage_watermark_ms =
+                            Some(stage_watermark_ms.map_or(wm, |prev: i64| prev.max(wm)));
                     }
                     // Forward the EMA-derived advisory partition count to the
                     // coordinator so it can scale streaming task concurrency on
                     // the next cycle without user configuration.
-                    if kind == ExecutorTaskOutputKind::StreamingWindow {
-                        if let Some(buckets) = report.output().advisory_buckets() {
-                            if let Ok(mut coord) = self.coordinator.lock() {
-                                coord.record_streaming_advisory_buckets(&job_id, buckets);
-                            }
-                        }
+                    if kind == ExecutorTaskOutputKind::StreamingWindow
+                        && let Some(buckets) = report.output().advisory_buckets()
+                        && let Ok(mut coord) = self.coordinator.lock()
+                    {
+                        coord.record_streaming_advisory_buckets(&job_id, buckets);
                     }
                 }
 
@@ -585,11 +620,12 @@ impl InProcessStreamingRuntime {
                 // This advances the state machine: marks the completed stage as
                 // Succeeded and makes the next stage's tasks eligible for assignment.
                 {
-                    let mut coord = self.coordinator.lock().map_err(|_| {
-                        RuntimeError::InvalidState {
-                            message: "coordinator lock poisoned during coordinator tick".into(),
-                        }
-                    })?;
+                    let mut coord =
+                        self.coordinator
+                            .lock()
+                            .map_err(|_| RuntimeError::InvalidState {
+                                message: "coordinator lock poisoned during coordinator tick".into(),
+                            })?;
                     let _ = coord.coordinator_tick();
                 }
             }
@@ -601,9 +637,12 @@ impl InProcessStreamingRuntime {
         // JobCoordinator entry growing unboundedly, and coordinator_tick would
         // iterate over all of them on every subsequent call.
         {
-            let mut coord = self.coordinator.lock().map_err(|_| RuntimeError::InvalidState {
-                message: "coordinator lock poisoned during job eviction".into(),
-            })?;
+            let mut coord = self
+                .coordinator
+                .lock()
+                .map_err(|_| RuntimeError::InvalidState {
+                    message: "coordinator lock poisoned during job eviction".into(),
+                })?;
             coord.evict_completed_job(&job_id);
         }
 
@@ -680,8 +719,10 @@ mod tests {
 
     #[test]
     fn in_process_windowed_stream_returns_batches() {
-        let batch =
-            krishiv_common::test_fixtures::make_test_user_ts_batch(vec!["a", "b"], vec![1_000, 5_000]);
+        let batch = krishiv_common::test_fixtures::make_test_user_ts_batch(
+            vec!["a", "b"],
+            vec![1_000, 5_000],
+        );
         let spec = LocalWindowExecutionSpec::new_test_tumbling("user_id", "ts", 10_000);
         let cluster = InProcessCluster::new().unwrap();
         let out = cluster
@@ -936,7 +977,9 @@ mod tests {
     fn drain_continuous_job_persists_snapshot_to_store() {
         use krishiv_scheduler::InMemoryMetadataStore;
         let runtime = InProcessStreamingRuntime::new().unwrap();
-        runtime.attach_store(InMemoryMetadataStore::default()).unwrap();
+        runtime
+            .attach_store(InMemoryMetadataStore::default())
+            .unwrap();
 
         let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
         runtime.register_continuous_job("events", spec).unwrap();
@@ -953,7 +996,9 @@ mod tests {
             ],
         )
         .unwrap();
-        runtime.push_continuous_input("events", vec![batch]).unwrap();
+        runtime
+            .push_continuous_input("events", vec![batch])
+            .unwrap();
         let _ = runtime.drain_continuous_job("events").unwrap();
 
         // After drain, the snapshot must have been written to the store.
@@ -1007,7 +1052,10 @@ mod tests {
         let restored = rt2
             .restore_continuous_jobs_from_store(&[("job-a", spec.clone())])
             .unwrap();
-        assert_eq!(restored, 1, "exactly one job must be restored from the store");
+        assert_eq!(
+            restored, 1,
+            "exactly one job must be restored from the store"
+        );
         assert!(
             rt2.continuous_registry.has_job("job-a"),
             "restored job must appear in the registry"
@@ -1018,21 +1066,28 @@ mod tests {
     fn restore_continuous_jobs_skips_jobs_without_snapshot() {
         use krishiv_scheduler::InMemoryMetadataStore;
         let runtime = InProcessStreamingRuntime::new().unwrap();
-        runtime.attach_store(InMemoryMetadataStore::default()).unwrap();
+        runtime
+            .attach_store(InMemoryMetadataStore::default())
+            .unwrap();
 
         let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
         // No drain → no snapshot in the store.
         let restored = runtime
             .restore_continuous_jobs_from_store(&[("no-such-snapshot", spec)])
             .unwrap();
-        assert_eq!(restored, 0, "job with no stored snapshot must not be restored");
+        assert_eq!(
+            restored, 0,
+            "job with no stored snapshot must not be restored"
+        );
     }
 
     #[test]
     fn restore_continuous_jobs_skips_already_registered() {
         use krishiv_scheduler::InMemoryMetadataStore;
         let runtime = InProcessStreamingRuntime::new().unwrap();
-        runtime.attach_store(InMemoryMetadataStore::default()).unwrap();
+        runtime
+            .attach_store(InMemoryMetadataStore::default())
+            .unwrap();
 
         let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
         runtime.register_continuous_job("j", spec.clone()).unwrap();
@@ -1041,14 +1096,19 @@ mod tests {
         let restored = runtime
             .restore_continuous_jobs_from_store(&[("j", spec)])
             .unwrap();
-        assert_eq!(restored, 0, "already-registered job must be skipped by restore");
+        assert_eq!(
+            restored, 0,
+            "already-registered job must be skipped by restore"
+        );
     }
 
     #[test]
     fn attach_store_then_drain_without_input_persists_empty_snapshot() {
         use krishiv_scheduler::InMemoryMetadataStore;
         let runtime = InProcessStreamingRuntime::new().unwrap();
-        runtime.attach_store(InMemoryMetadataStore::default()).unwrap();
+        runtime
+            .attach_store(InMemoryMetadataStore::default())
+            .unwrap();
 
         let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
         runtime.register_continuous_job("empty-job", spec).unwrap();
@@ -1056,7 +1116,10 @@ mod tests {
         let out = runtime.drain_continuous_job("empty-job").unwrap();
         assert!(out.is_empty());
         let snap = runtime.load_continuous_snapshot("empty-job");
-        assert!(snap.is_some(), "drain of empty job must still persist a snapshot");
+        assert!(
+            snap.is_some(),
+            "drain of empty job must still persist a snapshot"
+        );
     }
 
     #[test]

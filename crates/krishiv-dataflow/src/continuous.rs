@@ -298,14 +298,13 @@ impl ContinuousWindowExecutor {
                 .watermark
                 .multi
                 .is_stalled(std::time::Duration::from_secs(60))
+                && let Some(dur) = self.watermark.multi.stall_duration()
             {
-                if let Some(dur) = self.watermark.multi.stall_duration() {
-                    tracing::warn!(
-                        stall_secs = dur.as_secs(),
-                        "watermark has not advanced for {}s — check for idle or slow sources",
-                        dur.as_secs()
-                    );
-                }
+                tracing::warn!(
+                    stall_secs = dur.as_secs(),
+                    "watermark has not advanced for {}s — check for idle or slow sources",
+                    dur.as_secs()
+                );
             }
             // Keep the TTL backend's event-time reference current as the
             // watermark advances within this drain cycle.
@@ -319,12 +318,11 @@ impl ContinuousWindowExecutor {
         if let Some(hook) = self.quality_hook.as_mut() {
             let mut output = Vec::with_capacity(raw.len());
             for batch in raw {
-                let (accepted, rejected_count) = hook
-                    .filter(batch)
-                    .map_err(ExecError::Arrow)?;
+                let (accepted, rejected_count) = hook.filter(batch).map_err(ExecError::Arrow)?;
                 if rejected_count > 0 {
-                    self.rejected_rows_total =
-                        self.rejected_rows_total.saturating_add(rejected_count as u64);
+                    self.rejected_rows_total = self
+                        .rejected_rows_total
+                        .saturating_add(rejected_count as u64);
                     tracing::debug!(
                         rejected_count,
                         rejected_rows_total = self.rejected_rows_total,

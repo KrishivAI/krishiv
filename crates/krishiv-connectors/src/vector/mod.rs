@@ -1,4 +1,3 @@
-
 //! Vector store sinks for embedding upsert and nearest-neighbor query (R17).
 //!
 //! Lives in `krishiv-connectors` so vector sinks share the connector registry.

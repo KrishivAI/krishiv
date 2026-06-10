@@ -1,5 +1,11 @@
 use super::*;
 
+type CheckpointInnerParts = (
+    std::collections::HashMap<JobId, CheckpointCoordinator>,
+    indexmap::IndexSet<(JobId, ExecutorId, u64)>,
+    std::collections::HashSet<(JobId, u64)>,
+);
+
 /// Maximum entries in checkpoint_notify_sent before old entries are evicted.
 const MAX_CHECKPOINT_NOTIFY_ENTRIES: usize = 10_000;
 
@@ -312,27 +318,31 @@ impl Coordinator {
         }
 
         let storage = Self::open_checkpoint_storage(storage_path)?;
-        let valid_epochs = krishiv_state::checkpoint::list_valid_epochs(storage.as_ref(), job_id.as_str())
-            .map_err(|e| SchedulerError::InvalidJob {
-                message: format!("cannot list checkpoint epochs for job {job_id}: {e}"),
-            })?;
+        let valid_epochs =
+            krishiv_state::checkpoint::list_valid_epochs(storage.as_ref(), job_id.as_str())
+                .map_err(|e| SchedulerError::InvalidJob {
+                    message: format!("cannot list checkpoint epochs for job {job_id}: {e}"),
+                })?;
         for future_epoch in valid_epochs
             .into_iter()
             .filter(|candidate| *candidate > epoch)
         {
-            krishiv_state::checkpoint::delete_epoch(storage.as_ref(), job_id.as_str(), future_epoch)
-                .map_err(|e| SchedulerError::InvalidJob {
-                    message: format!(
-                        "cannot prune checkpoint epoch {future_epoch} after restoring job {job_id} \
+            krishiv_state::checkpoint::delete_epoch(
+                storage.as_ref(),
+                job_id.as_str(),
+                future_epoch,
+            )
+            .map_err(|e| SchedulerError::InvalidJob {
+                message: format!(
+                    "cannot prune checkpoint epoch {future_epoch} after restoring job {job_id} \
                          to epoch {epoch}: {e}"
-                    ),
-                })?;
+                ),
+            })?;
         }
-        krishiv_state::checkpoint::write_epoch_hint(storage.as_ref(), job_id.as_str(), epoch).map_err(
-            |e| SchedulerError::InvalidJob {
+        krishiv_state::checkpoint::write_epoch_hint(storage.as_ref(), job_id.as_str(), epoch)
+            .map_err(|e| SchedulerError::InvalidJob {
                 message: format!("cannot activate checkpoint epoch {epoch} for job {job_id}: {e}"),
-            },
-        )?;
+            })?;
 
         let coord = self.checkpoint_coordinators.get_mut(job_id).ok_or_else(|| {
             SchedulerError::InvalidJob {
@@ -414,13 +424,7 @@ impl Coordinator {
     }
 
     /// Snapshot checkpoint-owned state for initializing a sharded checkpoint inner.
-    pub fn checkpoint_inner_parts(
-        &self,
-    ) -> (
-        std::collections::HashMap<JobId, CheckpointCoordinator>,
-        indexmap::IndexSet<(JobId, ExecutorId, u64)>,
-        std::collections::HashSet<(JobId, u64)>,
-    ) {
+    pub fn checkpoint_inner_parts(&self) -> CheckpointInnerParts {
         (
             self.checkpoint_coordinators.clone(),
             self.checkpoint_notify_sent.clone(),

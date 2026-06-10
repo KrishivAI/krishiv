@@ -4,9 +4,10 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Named durability profile for a Krishiv deployment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DurabilityProfile {
     /// Developer/local mode. Fast startup; process-local state may be lost.
+    #[default]
     DevLocal,
     /// Single-host durable mode. Uses local durable files/databases.
     SingleNodeDurable,
@@ -66,11 +67,6 @@ impl DurabilityProfile {
     }
 }
 
-impl Default for DurabilityProfile {
-    fn default() -> Self {
-        Self::DevLocal
-    }
-}
 
 impl fmt::Display for DurabilityProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

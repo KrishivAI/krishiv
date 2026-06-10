@@ -20,11 +20,11 @@ use krishiv_proto::{
     ConnectorCapabilityFlags, CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId,
     ExecutorState, JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
 };
+use krishiv_scheduler::metrics::SchedulerMetrics;
 use krishiv_scheduler::{
     Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, NamespaceQuotaSnapshot,
     ResourceUsage, SchedulerError, SharedCoordinator, StabilityMetrics,
 };
-use krishiv_scheduler::metrics::SchedulerMetrics;
 use serde::{Deserialize, Serialize};
 
 /// Shared UI result alias.
@@ -153,7 +153,9 @@ fn resolve_ui_token() -> Option<String> {
     if krishiv_common::profile_requires_authenticated_ui(
         krishiv_common::resolve_durability_profile(),
     ) {
-        tracing::warn!("krishiv-ui: no UI token configured; denying all protected routes (production fail-closed)");
+        tracing::warn!(
+            "krishiv-ui: no UI token configured; denying all protected routes (production fail-closed)"
+        );
         return Some(String::new());
     }
     None
@@ -195,7 +197,10 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
         .route("/api/v1/sql", post(api_sql_execute))
         .route("/ui", get(ui_jobs))
         .route("/ui/jobs/{job_id}", get(ui_job_detail))
-        .route("/ui/jobs/{job_id}/checkpoints", get(ui_job_checkpoints_page))
+        .route(
+            "/ui/jobs/{job_id}/checkpoints",
+            get(ui_job_checkpoints_page),
+        )
         .route("/ui/executors/{executor_id}", get(ui_executor_detail))
         .route("/ui/submit", get(ui_submit))
         .route("/ui/health", get(ui_health))
@@ -238,7 +243,10 @@ pub fn embedded_router(state: UiState) -> Router {
         .route("/api/v1/sql", post(api_sql_execute))
         .route("/ui", get(ui_jobs))
         .route("/ui/jobs/{job_id}", get(ui_job_detail))
-        .route("/ui/jobs/{job_id}/checkpoints", get(ui_job_checkpoints_page))
+        .route(
+            "/ui/jobs/{job_id}/checkpoints",
+            get(ui_job_checkpoints_page),
+        )
         .route("/ui/executors/{executor_id}", get(ui_executor_detail))
         .route("/ui/submit", get(ui_submit))
         .route("/ui/health", get(ui_health))
@@ -262,11 +270,7 @@ pub fn embedded_router(state: UiState) -> Router {
 
 async fn require_bearer(request: axum::extract::Request, next: Next, expected: &str) -> Response {
     if expected.is_empty() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "authentication not configured",
-        )
-            .into_response();
+        return (StatusCode::UNAUTHORIZED, "authentication not configured").into_response();
     }
     let auth = request
         .headers()
@@ -547,8 +551,6 @@ pub struct CheckpointsView {
 #[derive(Template)]
 #[template(path = "jobs.html")]
 struct JobsTemplate {
-    coordinator_id: String,
-    coordinator_state: String,
     jobs: Vec<JobSummaryView>,
     executors: Vec<ExecutorView>,
 }
@@ -566,8 +568,6 @@ impl JobsTemplate {
 #[derive(Template)]
 #[template(path = "job.html")]
 struct JobTemplate {
-    coordinator_id: String,
-    coordinator_state: String,
     job: JobDetailView,
     executors: Vec<ExecutorView>,
 }
@@ -575,16 +575,12 @@ struct JobTemplate {
 #[derive(Template)]
 #[template(path = "executor.html")]
 struct ExecutorTemplate {
-    coordinator_id: String,
-    coordinator_state: String,
     executor: ExecutorView,
 }
 
 #[derive(Template)]
 #[template(path = "checkpoints.html")]
 struct CheckpointsTemplate {
-    coordinator_id: String,
-    coordinator_state: String,
     job_id: String,
     epochs: Vec<u64>,
     latest_epoch: Option<u64>,
@@ -598,31 +594,41 @@ impl CheckpointsTemplate {
 
 #[derive(Template)]
 #[template(path = "submit.html")]
-struct SubmitTemplate {
-    coordinator_id: String,
-    coordinator_state: String,
-}
+struct SubmitTemplate {}
 
 #[derive(Template)]
 #[template(path = "health.html")]
 struct HealthTemplate {
-    coordinator_id: String,
-    coordinator_state: String,
     executors: Vec<ExecutorView>,
     jobs: Vec<JobSummaryView>,
 }
 
 impl HealthTemplate {
     fn healthy_executors(&self) -> usize {
-        self.executors.iter().filter(|e| e.state == "healthy" || e.state == "active").count()
+        self.executors
+            .iter()
+            .filter(|e| e.state == "healthy" || e.state == "active")
+            .count()
     }
     fn lost_executors(&self) -> usize {
         self.executors.iter().filter(|e| e.state == "lost").count()
     }
     fn memory_used_pct(&self) -> f64 {
-        let used: u64 = self.executors.iter().filter_map(|e| e.memory_used_bytes).sum();
-        let limit: u64 = self.executors.iter().filter_map(|e| e.memory_limit_bytes).sum();
-        if limit > 0 { used as f64 / limit as f64 * 100.0 } else { 0.0 }
+        let used: u64 = self
+            .executors
+            .iter()
+            .filter_map(|e| e.memory_used_bytes)
+            .sum();
+        let limit: u64 = self
+            .executors
+            .iter()
+            .filter_map(|e| e.memory_limit_bytes)
+            .sum();
+        if limit > 0 {
+            used as f64 / limit as f64 * 100.0
+        } else {
+            0.0
+        }
     }
     fn memory_used_pct_int(&self) -> u64 {
         self.memory_used_pct() as u64
@@ -672,7 +678,10 @@ async fn healthz() -> &'static str {
 /// Prometheus-format metrics endpoint backed by live `StabilityMetrics`.
 async fn metrics(State(state): State<UiState>) -> impl IntoResponse {
     let coordinator = state.coordinator.read().await;
-    let mut cache = state.metrics_cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = state
+        .metrics_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
     let body = if now.duration_since(cache.1).as_secs() >= 1 || cache.0.is_empty() {
         let mut body = format_stability_metrics(&coordinator.stability_metrics());
@@ -797,22 +806,14 @@ async fn api_queues(State(state): State<UiState>) -> Result<Json<QueuesResponse>
     }))
 }
 
-async fn ui_submit(State(state): State<UiState>) -> Result<Html<String>, UiError> {
-    let coordinator = state.coordinator.read().await;
-    let snapshot = status_snapshot_inner(&coordinator);
-    let template = SubmitTemplate {
-        coordinator_id: snapshot.coordinator_id,
-        coordinator_state: snapshot.coordinator_state,
-    };
+async fn ui_submit(State(_state): State<UiState>) -> Result<Html<String>, UiError> {
+    let template = SubmitTemplate {};
     Ok(Html(template.render()?))
 }
 
 async fn ui_health(State(state): State<UiState>) -> Result<Html<String>, UiError> {
     let coordinator = state.coordinator.read().await;
-    let snapshot = status_snapshot_inner(&coordinator);
     let template = HealthTemplate {
-        coordinator_id: snapshot.coordinator_id,
-        coordinator_state: snapshot.coordinator_state,
         executors: coordinator
             .executor_snapshots()
             .iter()
@@ -832,11 +833,10 @@ async fn ui_metrics(State(state): State<UiState>) -> Result<Html<String>, UiErro
     let snapshot = status_snapshot_inner(&coordinator);
     let scheduler = krishiv_scheduler::metrics::scheduler_metrics();
     let stability = coordinator.stability_metrics();
-    let avg = if scheduler.tasks_assigned_total > 0 {
-        scheduler.task_assignment_duration_ms_sum / scheduler.tasks_assigned_total
-    } else {
-        0
-    };
+    let avg = scheduler
+        .task_assignment_duration_ms_sum
+        .checked_div(scheduler.tasks_assigned_total)
+        .unwrap_or(0);
     let template = MetricsTemplate {
         scheduler,
         stability,
@@ -857,7 +857,9 @@ async fn api_sql_execute(
             return Json(SqlQueryResponse {
                 columns: vec![],
                 rows: vec![],
-                error: Some("SQL engine not available. Start the UI with SQL support enabled.".to_string()),
+                error: Some(
+                    "SQL engine not available. Start the UI with SQL support enabled.".to_string(),
+                ),
                 row_count: 0,
                 elapsed_ms: 0,
             });
@@ -866,40 +868,34 @@ async fn api_sql_execute(
 
     let start = std::time::Instant::now();
     match engine.sql(&req.query).await {
-        Ok(df) => {
-            match df.collect().await {
-                Ok(batches) => {
-                    let (columns, rows) = extract_columns_and_rows(&batches);
-                    let elapsed = start.elapsed().as_millis() as u64;
-                    let row_count = rows.len();
-                    Json(SqlQueryResponse {
-                        columns,
-                        rows,
-                        error: None,
-                        row_count,
-                        elapsed_ms: elapsed,
-                    })
-                }
-                Err(e) => {
-                    Json(SqlQueryResponse {
-                        columns: vec![],
-                        rows: vec![],
-                        error: Some(format!("execution error: {e}")),
-                        row_count: 0,
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                    })
-                }
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                let (columns, rows) = extract_columns_and_rows(&batches);
+                let elapsed = start.elapsed().as_millis() as u64;
+                let row_count = rows.len();
+                Json(SqlQueryResponse {
+                    columns,
+                    rows,
+                    error: None,
+                    row_count,
+                    elapsed_ms: elapsed,
+                })
             }
-        }
-        Err(e) => {
-            Json(SqlQueryResponse {
+            Err(e) => Json(SqlQueryResponse {
                 columns: vec![],
                 rows: vec![],
-                error: Some(format!("sql error: {e}")),
+                error: Some(format!("execution error: {e}")),
                 row_count: 0,
                 elapsed_ms: start.elapsed().as_millis() as u64,
-            })
-        }
+            }),
+        },
+        Err(e) => Json(SqlQueryResponse {
+            columns: vec![],
+            rows: vec![],
+            error: Some(format!("sql error: {e}")),
+            row_count: 0,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }),
     }
 }
 
@@ -933,8 +929,6 @@ async fn ui_jobs(
         snapshot.jobs
     };
     let template = JobsTemplate {
-        coordinator_id: snapshot.coordinator_id,
-        coordinator_state: snapshot.coordinator_state,
         jobs,
         executors: snapshot.executors,
     };
@@ -947,8 +941,6 @@ async fn ui_job_detail(
 ) -> Result<Html<String>, UiError> {
     let snapshot = status_snapshot(&state).await?;
     let template = JobTemplate {
-        coordinator_id: snapshot.coordinator_id,
-        coordinator_state: snapshot.coordinator_state,
         job: job_detail(&state, &job_id).await?,
         executors: snapshot.executors,
     };
@@ -967,11 +959,8 @@ async fn ui_executor_detail(
     State(state): State<UiState>,
     Path(executor_id): Path<String>,
 ) -> Result<Html<String>, UiError> {
-    let snapshot = status_snapshot(&state).await?;
     let executor = api_executor_detail_inner(&state, &executor_id).await?;
     let template = ExecutorTemplate {
-        coordinator_id: snapshot.coordinator_id,
-        coordinator_state: snapshot.coordinator_state,
         executor,
     };
     Ok(Html(template.render()?))
@@ -982,14 +971,11 @@ async fn ui_job_checkpoints_page(
     Path(job_id): Path<String>,
 ) -> Result<Html<String>, UiError> {
     let coordinator = state.coordinator.read().await;
-    let snapshot = status_snapshot_inner(&coordinator);
     let jid = JobId::try_new(job_id.clone()).map_err(|e| UiError::Id(e.to_string()))?;
     coordinator.job_detail_snapshot(&jid)?;
     let epochs = coordinator.list_job_checkpoints(&jid)?;
     let latest_epoch = epochs.last().copied();
     let template = CheckpointsTemplate {
-        coordinator_id: snapshot.coordinator_id,
-        coordinator_state: snapshot.coordinator_state,
         job_id: job_id.clone(),
         epochs,
         latest_epoch,
@@ -1027,8 +1013,6 @@ async fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
 
 fn status_snapshot_inner(coordinator: &krishiv_scheduler::Coordinator) -> StatusView {
     StatusView {
-        coordinator_id: coordinator.coordinator_id().to_string(),
-        coordinator_state: coordinator.state().to_string(),
         jobs: coordinator
             .job_snapshots()
             .iter()
@@ -1045,22 +1029,20 @@ fn status_snapshot_inner(coordinator: &krishiv_scheduler::Coordinator) -> Status
 fn filter_jobs(jobs: Vec<JobSummaryView>, filter: &JobsFilter) -> Vec<JobSummaryView> {
     jobs.into_iter()
         .filter(|j| {
-            if let Some(ref state) = filter.state {
-                if !j.state.eq_ignore_ascii_case(state) {
-                    return false;
-                }
+            if let Some(ref state) = filter.state && !j.state.eq_ignore_ascii_case(state) {
+                return false;
             }
-            if let Some(ref kind) = filter.kind {
-                if !j.kind.eq_ignore_ascii_case(kind) {
-                    return false;
-                }
+            if let Some(ref kind) = filter.kind && !j.kind.eq_ignore_ascii_case(kind) {
+                return false;
             }
             true
         })
         .collect()
 }
 
-fn extract_columns_and_rows(batches: &[arrow::record_batch::RecordBatch]) -> (Vec<String>, Vec<Vec<serde_json::Value>>) {
+fn extract_columns_and_rows(
+    batches: &[arrow::record_batch::RecordBatch],
+) -> (Vec<String>, Vec<Vec<serde_json::Value>>) {
     if batches.is_empty() {
         return (vec![], vec![]);
     }
@@ -1093,23 +1075,86 @@ fn scalar_array_to_json(array: &dyn arrow::array::Array, idx: usize) -> serde_js
     use arrow::array::*;
     use arrow::datatypes::*;
     match array.data_type() {
-        DataType::Int8 => array.as_any().downcast_ref::<Int8Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
-        DataType::Int16 => array.as_any().downcast_ref::<Int16Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
-        DataType::Int32 => array.as_any().downcast_ref::<Int32Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
-        DataType::Int64 => array.as_any().downcast_ref::<Int64Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
-        DataType::UInt8 => array.as_any().downcast_ref::<UInt8Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
-        DataType::UInt16 => array.as_any().downcast_ref::<UInt16Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
-        DataType::UInt32 => array.as_any().downcast_ref::<UInt32Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
-        DataType::UInt64 => array.as_any().downcast_ref::<UInt64Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
-        DataType::Float32 => array.as_any().downcast_ref::<Float32Array>().map(|a| serde_json::Value::Number(serde_json::Number::from_f64(a.value(idx) as f64).unwrap_or(serde_json::Number::from(0)))).unwrap_or(serde_json::Value::Null),
-        DataType::Float64 => array.as_any().downcast_ref::<Float64Array>().map(|a| serde_json::Value::Number(serde_json::Number::from_f64(a.value(idx)).unwrap_or(serde_json::Number::from(0)))).unwrap_or(serde_json::Value::Null),
-        DataType::Boolean => array.as_any().downcast_ref::<BooleanArray>().map(|a| serde_json::Value::Bool(a.value(idx))).unwrap_or(serde_json::Value::Null),
-        DataType::Utf8 => array.as_any().downcast_ref::<StringArray>().map(|a| serde_json::Value::String(a.value(idx).to_string())).unwrap_or(serde_json::Value::Null),
-        DataType::LargeUtf8 => array.as_any().downcast_ref::<LargeStringArray>().map(|a| serde_json::Value::String(a.value(idx).to_string())).unwrap_or(serde_json::Value::Null),
-        DataType::Timestamp(_, _) => {
-            let v = array.as_any().downcast_ref::<TimestampSecondArray>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null);
-            v
-        }
+        DataType::Int8 => array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|a| serde_json::Value::Number(a.value(idx).into()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Int16 => array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|a| serde_json::Value::Number(a.value(idx).into()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|a| serde_json::Value::Number(a.value(idx).into()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Int64 => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| serde_json::Value::Number(a.value(idx).into()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::UInt8 => array
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .map(|a| serde_json::Value::Number(a.value(idx).into()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .map(|a| serde_json::Value::Number(a.value(idx).into()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|a| serde_json::Value::Number(a.value(idx).into()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::UInt64 => array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(|a| serde_json::Value::Number(a.value(idx).into()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Float32 => array
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|a| {
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(a.value(idx) as f64)
+                        .unwrap_or(serde_json::Number::from(0)),
+                )
+            })
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Float64 => array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|a| {
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(a.value(idx))
+                        .unwrap_or(serde_json::Number::from(0)),
+                )
+            })
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Boolean => array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|a| serde_json::Value::Bool(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Utf8 => array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| serde_json::Value::String(a.value(idx).to_string()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::LargeUtf8 => array
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| serde_json::Value::String(a.value(idx).to_string()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Timestamp(_, _) => array
+            .as_any()
+            .downcast_ref::<TimestampSecondArray>()
+            .map(|a| serde_json::Value::Number(a.value(idx).into()))
+            .unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::String(format!("{:?}", array.data_type())),
     }
 }
@@ -1124,8 +1169,6 @@ async fn job_detail(state: &UiState, job_id: &str) -> UiResult<JobDetailView> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatusView {
-    coordinator_id: String,
-    coordinator_state: String,
     jobs: Vec<JobSummaryView>,
     executors: Vec<ExecutorView>,
 }

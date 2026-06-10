@@ -1,0 +1,79 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  TMPDIR: .tmp
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev pkg-config cmake lld
+
+      - uses: taiki-e/install-action@just
+
+      - name: Run benchmarks (Bencher-format output)
+        run: |
+          mkdir -p .tmp
+          just bench | tee bench-output.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.sha }}
+          path: bench-output.txt
+          retention-days: 90
+
+      # On pushes to main, save a criterion baseline for future PR comparisons.
+      - name: Save baseline (main branch only)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: just bench-save main
+
+      - name: Cache criterion baselines (main branch only)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: bench-baseline-main-${{ github.sha }}
+
+      # On pull requests, restore the most recent main baseline and compare.
+      - name: Restore main baseline (PR only)
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: bench-baseline-main-
+          restore-keys: bench-baseline-main-
+
+      - name: Compare against main baseline (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          if [ -d target/criterion/main ]; then
+            just bench-compare main 2>&1 | tee bench-compare.txt || true
+          else
+            echo "No main baseline available yet — skipping comparison"
+          fi

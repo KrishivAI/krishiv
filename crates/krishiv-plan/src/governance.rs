@@ -270,6 +270,16 @@ const AUDIT_DEDUP_TTL_MS: u64 = 60_000;
 static AUDIT_DEDUP_LAST_EVICTION_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Redact an opaque identifier for audit log output.
+///
+/// Replaces the raw id with its first 8 hex chars derived from its SHA-256 so
+/// that internal job/query identifiers are not leaked verbatim to SIEM sinks
+/// while still allowing correlation within a single audit trail.
+fn redact_id(id: &str) -> String {
+    let h = krishiv_common::hash::sha256_dedup_key(id.as_bytes());
+    format!("{h:016x}")
+}
+
 /// Compute a stable 64-bit dedup key for an audit event.
 fn audit_dedup_key(principal: &str, action_name: &str, detail: &str) -> u64 {
     krishiv_common::hash::sha256_dedup_key(
@@ -312,20 +322,37 @@ fn get_audit_sink() -> &'static dyn AuditSink {
 /// - `action`: the audited action.
 /// - `outcome`: whether the action was permitted or denied.
 pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
-    let (action_name, detail): (&str, String) = match action {
-        AuditAction::QueryExecuted { query_hash } => {
-            ("query_executed", format!("hash={query_hash}"))
-        }
-        AuditAction::JobSubmitted { job_id } => ("job_submitted", format!("job_id={job_id}")),
-        AuditAction::JobCancelled { job_id } => ("job_cancelled", format!("job_id={job_id}")),
-        AuditAction::SavepointCreated { job_id } => {
-            ("savepoint_created", format!("job_id={job_id}"))
-        }
+    // `detail` uses raw IDs — kept for stable dedup-key hashing only.
+    // `redacted` uses hashed IDs — safe to emit to external SIEM sinks.
+    let (action_name, detail, redacted): (&str, String, String) = match action {
+        AuditAction::QueryExecuted { query_hash } => (
+            "query_executed",
+            format!("hash={query_hash}"),
+            format!("hash={}", redact_id(query_hash)),
+        ),
+        AuditAction::JobSubmitted { job_id } => (
+            "job_submitted",
+            format!("job_id={job_id}"),
+            format!("job_id={}", redact_id(job_id)),
+        ),
+        AuditAction::JobCancelled { job_id } => (
+            "job_cancelled",
+            format!("job_id={job_id}"),
+            format!("job_id={}", redact_id(job_id)),
+        ),
+        AuditAction::SavepointCreated { job_id } => (
+            "savepoint_created",
+            format!("job_id={job_id}"),
+            format!("job_id={}", redact_id(job_id)),
+        ),
         AuditAction::SavepointRestored { job_id, epoch } => (
             "savepoint_restored",
             format!("job_id={job_id} epoch={epoch}"),
+            format!("job_id={} epoch={epoch}", redact_id(job_id)),
         ),
-        AuditAction::AdminAction { description } => ("admin_action", description.clone()),
+        AuditAction::AdminAction { description } => {
+            ("admin_action", description.clone(), description.clone())
+        }
         AuditAction::TaskAssigned {
             job_id,
             stage_id,
@@ -335,6 +362,10 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
             "task_assigned",
             format!(
                 "job_id={job_id} stage_id={stage_id} task_id={task_id} executor_id={executor_id}"
+            ),
+            format!(
+                "job_id={} stage_id={stage_id} task_id={task_id} executor_id={executor_id}",
+                redact_id(job_id)
             ),
         ),
         AuditAction::TaskFailed {
@@ -347,6 +378,10 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
             format!(
                 "job_id={job_id} stage_id={stage_id} task_id={task_id} attempt_id={attempt_id}"
             ),
+            format!(
+                "job_id={} stage_id={stage_id} task_id={task_id} attempt_id={attempt_id}",
+                redact_id(job_id)
+            ),
         ),
         AuditAction::CheckpointCommitted {
             job_id,
@@ -355,6 +390,10 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
         } => (
             "checkpoint_committed",
             format!("job_id={job_id} epoch={epoch} fencing_token={fencing_token}"),
+            format!(
+                "job_id={} epoch={epoch} fencing_token={fencing_token}",
+                redact_id(job_id)
+            ),
         ),
         AuditAction::CheckpointAborted {
             job_id,
@@ -365,6 +404,10 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
             (
                 "checkpoint_aborted",
                 format!("job_id={job_id} epoch={epoch} reason={reason_str}"),
+                format!(
+                    "job_id={} epoch={epoch} reason={reason_str}",
+                    redact_id(job_id)
+                ),
             )
         }
         AuditAction::SinkCommitCompleted {
@@ -374,9 +417,14 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
         } => (
             "sink_commit_completed",
             format!("job_id={job_id} sink_id={sink_id} epoch={epoch}"),
+            format!(
+                "job_id={} sink_id={sink_id} epoch={epoch}",
+                redact_id(job_id)
+            ),
         ),
     };
 
+    // Dedup key uses the full (unredacted) detail for stable identity.
     let key = audit_dedup_key(principal, action_name, &detail);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -406,7 +454,7 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
     let event = AuditEvent {
         principal: principal.to_string(),
         action: action_name.to_string(),
-        resource: Some(detail.clone()),
+        resource: Some(redacted),
         timestamp_ms: now_ms as i64,
         outcome,
     };
@@ -537,7 +585,10 @@ impl HttpEmitter {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| EmitError::Transport(format!("reqwest client init failed: {e}")))?;
-        Ok(Self { endpoint: endpoint.into(), client })
+        Ok(Self {
+            endpoint: endpoint.into(),
+            client,
+        })
     }
 }
 
@@ -976,7 +1027,8 @@ mod tests {
             .create_async()
             .await;
 
-        let emitter = AsyncHttpEmitter::new(format!("{}/lineage", server.url()), 10).expect("emitter");
+        let emitter =
+            AsyncHttpEmitter::new(format!("{}/lineage", server.url()), 10).expect("emitter");
         let event = sample_run_event();
         assert!(emitter.emit(event).await.is_ok(), "Async emit must succeed");
 

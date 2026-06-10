@@ -264,14 +264,13 @@ fn unescape_compact_value(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(&next) = chars.peek() {
-                if next == ':' || next == '\\' {
-                    chars.next();
-                    result.push(next);
-                    continue;
-                }
-            }
+        if ch == '\\'
+            && let Some(&next) = chars.peek()
+            && (next == ':' || next == '\\')
+        {
+            chars.next();
+            result.push(next);
+            continue;
         }
         result.push(ch);
     }
@@ -303,10 +302,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
 
     let extra = match spec.window_kind {
         WindowKind::Tumbling => String::new(),
-        WindowKind::Sliding => format!(
-            ":slide={}",
-            spec.slide_ms.unwrap_or(spec.window_size_ms)
-        ),
+        WindowKind::Sliding => format!(":slide={}", spec.slide_ms.unwrap_or(spec.window_size_ms)),
         WindowKind::Session => format!(
             ":gap={}",
             spec.session_gap_ms.unwrap_or(spec.window_size_ms)
@@ -335,9 +331,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
         pairs.sort_by_key(|(k, _)| k.as_str());
         let encoded: Vec<String> = pairs
             .iter()
-            .map(|(id, lag)| {
-                format!("{}:{lag}", escape_compact_value(id))
-            })
+            .map(|(id, lag)| format!("{}:{lag}", escape_compact_value(id)))
             .collect();
         format!(":srcs={}", encoded.join(","))
     };
@@ -467,21 +461,15 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
                     // Split on the first non-escaped colon.
                     let split_idx = pair
                         .char_indices()
-                        .find(|(idx, ch)| {
-                            *ch == ':' && !is_escaped_colon(pair, *idx)
-                        })
+                        .find(|(idx, ch)| *ch == ':' && !is_escaped_colon(pair, *idx))
                         .map(|(idx, _)| idx);
                     let split_idx = split_idx.ok_or_else(|| {
-                        PlanError::Parse(format!(
-                            "srcs entry must be id:lag_ms; got '{pair}'"
-                        ))
+                        PlanError::Parse(format!("srcs entry must be id:lag_ms; got '{pair}'"))
                     })?;
                     let id = unescape_compact_value(&pair[..split_idx]);
                     let lag_str = &pair[split_idx + ':'.len_utf8()..];
                     let lag: u64 = lag_str.trim().parse().map_err(|e| {
-                        PlanError::Parse(format!(
-                            "invalid lag in srcs entry '{pair}': {e}"
-                        ))
+                        PlanError::Parse(format!("invalid lag in srcs entry '{pair}': {e}"))
                     })?;
                     source_watermark_lags.insert(id.trim().to_owned(), lag);
                 }

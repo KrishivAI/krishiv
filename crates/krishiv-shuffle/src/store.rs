@@ -97,61 +97,53 @@ pub enum ShuffleBackend {
 }
 
 impl ShuffleStore for ShuffleBackend {
-    fn register_partition_lease(
+    async fn register_partition_lease(
         &self,
         id: PartitionId,
         lease_token: u64,
-    ) -> impl Future<Output = ShuffleResult<()>> + Send {
-        async move {
-            match self {
-                Self::Local(s) => s.register_partition_lease(id, lease_token).await,
-                Self::InMemory(s) => s.register_partition_lease(id, lease_token).await,
-                Self::Tiered(s) => s.register_partition_lease(id, lease_token).await,
-                Self::Object(s) => s.register_partition_lease(id, lease_token).await,
-            }
+    ) -> ShuffleResult<()> {
+        match self {
+            Self::Local(s) => s.register_partition_lease(id, lease_token).await,
+            Self::InMemory(s) => s.register_partition_lease(id, lease_token).await,
+            Self::Tiered(s) => s.register_partition_lease(id, lease_token).await,
+            Self::Object(s) => s.register_partition_lease(id, lease_token).await,
         }
     }
 
-    fn write_partition(
+    async fn write_partition(
         &self,
         partition: ShufflePartition,
         lease_token: u64,
-    ) -> impl Future<Output = ShuffleResult<()>> + Send {
-        async move {
-            match self {
-                Self::Local(s) => s.write_partition(partition, lease_token).await,
-                Self::InMemory(s) => s.write_partition(partition, lease_token).await,
-                Self::Tiered(s) => s.write_partition(partition, lease_token).await,
-                Self::Object(s) => s.write_partition(partition, lease_token).await,
-            }
+    ) -> ShuffleResult<()> {
+        match self {
+            Self::Local(s) => s.write_partition(partition, lease_token).await,
+            Self::InMemory(s) => s.write_partition(partition, lease_token).await,
+            Self::Tiered(s) => s.write_partition(partition, lease_token).await,
+            Self::Object(s) => s.write_partition(partition, lease_token).await,
         }
     }
 
-    fn read_partition(
+    async fn read_partition(
         &self,
         id: &PartitionId,
-    ) -> impl Future<Output = ShuffleResult<Option<ShufflePartition>>> + Send {
-        async move {
-            match self {
-                Self::Local(s) => s.read_partition(id).await,
-                Self::InMemory(s) => s.read_partition(id).await,
-                Self::Tiered(s) => s.read_partition(id).await,
-                Self::Object(s) => s.read_partition(id).await,
-            }
+    ) -> ShuffleResult<Option<ShufflePartition>> {
+        match self {
+            Self::Local(s) => s.read_partition(id).await,
+            Self::InMemory(s) => s.read_partition(id).await,
+            Self::Tiered(s) => s.read_partition(id).await,
+            Self::Object(s) => s.read_partition(id).await,
         }
     }
 
-    fn stream_partition(
+    async fn stream_partition(
         &self,
         id: &PartitionId,
-    ) -> impl Future<Output = ShuffleResult<Option<ShuffleStream>>> + Send {
-        async move {
-            match self {
-                Self::Local(s) => s.stream_partition(id).await,
-                Self::InMemory(s) => s.stream_partition(id).await,
-                Self::Tiered(s) => s.stream_partition(id).await,
-                Self::Object(s) => s.stream_partition(id).await,
-            }
+    ) -> ShuffleResult<Option<ShuffleStream>> {
+        match self {
+            Self::Local(s) => s.stream_partition(id).await,
+            Self::InMemory(s) => s.stream_partition(id).await,
+            Self::Tiered(s) => s.stream_partition(id).await,
+            Self::Object(s) => s.stream_partition(id).await,
         }
     }
 

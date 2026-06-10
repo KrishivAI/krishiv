@@ -602,7 +602,6 @@ pub fn build_execution_runtime(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -843,7 +842,7 @@ mod tests {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = InProcessExecutionRuntime::embedded(cluster);
         let spec = crate::LocalWindowExecutionSpec {
-                key_column_type: String::from("utf8"),
+            key_column_type: String::from("utf8"),
             key_column: "k".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
@@ -1050,7 +1049,7 @@ mod tests {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = InProcessExecutionRuntime::embedded(cluster);
         let spec = crate::LocalWindowExecutionSpec {
-                key_column_type: String::from("utf8"),
+            key_column_type: String::from("utf8"),
             key_column: "k".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
@@ -1132,7 +1131,7 @@ mod tests {
         )
         .unwrap();
         let spec = crate::LocalWindowExecutionSpec {
-                key_column_type: String::from("utf8"),
+            key_column_type: String::from("utf8"),
             key_column: "k".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,

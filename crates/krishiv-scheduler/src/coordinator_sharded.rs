@@ -10,8 +10,8 @@
 //! methods that access executor/checkpoint state read from the inner locks
 //! directly — deferred to avoid a larger refactor.
 
-use std::collections::{HashMap, HashSet};
 use indexmap::IndexSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::checkpoint::{CheckpointCoordinator, PendingCommit};
@@ -77,7 +77,7 @@ impl ExecutorInner {
 }
 
 /// Checkpoint-facing state guarded by a dedicated `RwLock`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CheckpointInner {
     pub coordinators: HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
     pub notify_sent: IndexSet<(krishiv_proto::JobId, ExecutorId, u64)>,
@@ -88,12 +88,7 @@ pub struct CheckpointInner {
 
 impl CheckpointInner {
     pub fn new() -> Self {
-        Self {
-            coordinators: HashMap::new(),
-            notify_sent: IndexSet::new(),
-            barrier_sent: HashSet::new(),
-            notify: Arc::new(Notify::new()),
-        }
+        Self::default()
     }
 
     pub fn from_parts(
@@ -185,10 +180,10 @@ impl CheckpointInner {
     }
 }
 
-/// The sync helper functions below are transitional. Hot paths should prefer
-/// the bypass fast-path methods on SharedCoordinator that operate directly on
-/// the inner locks. The long-term goal is for ExecutorInner/CheckpointInner
-/// (plus Notify) to be the sole source of truth.
+// The sync helper functions below are transitional. Hot paths should prefer
+// the bypass fast-path methods on SharedCoordinator that operate directly on
+// the inner locks. The long-term goal is for ExecutorInner/CheckpointInner
+// (plus Notify) to be the sole source of truth.
 
 // ── Executor sync helpers (G3) ──────────────────────────────────────────────
 

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use krishiv_proto::{CheckpointAckRequest, FencingToken, JobId};
 use krishiv_state::checkpoint::{
     CheckpointMetadata, CheckpointResult, CheckpointStorage, IntegrityManifest,
     OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch, latest_valid_epoch_async,
@@ -9,7 +10,6 @@ use krishiv_state::checkpoint::{
     read_operator_snapshot_async, write_epoch_hint, write_epoch_hint_async, write_epoch_metadata,
     write_epoch_metadata_async, write_manifest, write_manifest_async,
 };
-use krishiv_proto::{CheckpointAckRequest, FencingToken, JobId};
 
 /// Commit data extracted from the checkpoint coordinator in preparation for
 /// async object-store writes.  Produced under the coordinator write lock,
@@ -140,9 +140,10 @@ impl CheckpointCoordinator {
                 self.job_id
             ));
         }
-        self.current_epoch = self.current_epoch.checked_add(1).ok_or_else(|| {
-            format!("checkpoint epoch overflowed for job {}", self.job_id)
-        })?;
+        self.current_epoch = self
+            .current_epoch
+            .checked_add(1)
+            .ok_or_else(|| format!("checkpoint epoch overflowed for job {}", self.job_id))?;
         self.elapsed_ms = 0;
         self.awaiting_elapsed_ms = 0;
         self.pending_acks.clear();
@@ -605,8 +606,8 @@ impl CheckpointCoordinator {
         // the current coordinator generation, preventing split-brain writes.
         krishiv_state::checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())
             .map_err(|e| krishiv_state::checkpoint::CheckpointError::Storage {
-                message: format!("fencing token mismatch for job {}: {e}", self.job_id),
-            })?;
+            message: format!("fencing token mismatch for job {}: {e}", self.job_id),
+        })?;
 
         // Build manifest: hash metadata.json + each snapshot file.
         let mut manifest = IntegrityManifest::new();
@@ -801,11 +802,11 @@ impl CheckpointCoordinator {
 mod tests {
     use std::sync::Arc;
 
-    use krishiv_state::checkpoint::{LocalFsCheckpointStorage, write_operator_snapshot};
     use krishiv_proto::{
-        CheckpointAckRequest, CheckpointSourceOffset, FencingToken, JobId, OperatorId,
-        PartitionId, TaskId,
+        CheckpointAckRequest, CheckpointSourceOffset, FencingToken, JobId, OperatorId, PartitionId,
+        TaskId,
     };
+    use krishiv_state::checkpoint::{LocalFsCheckpointStorage, write_operator_snapshot};
 
     use super::{CheckpointCoordinator, CheckpointCoordinatorState};
 
@@ -885,8 +886,8 @@ mod tests {
         assert!(done, "quorum of 1 should complete immediately");
 
         // The committed metadata must carry the correct fencing token.
-        let meta =
-            krishiv_state::checkpoint::read_epoch_metadata(storage.as_ref(), "job-fence", 1).unwrap();
+        let meta = krishiv_state::checkpoint::read_epoch_metadata(storage.as_ref(), "job-fence", 1)
+            .unwrap();
         assert_eq!(
             meta.unwrap().fencing_token,
             2,
@@ -928,11 +929,14 @@ mod tests {
         CheckpointCoordinator::commit_storage(commit).await.unwrap();
         coord.finalize_commit(1).unwrap();
 
-        let meta =
-            krishiv_state::checkpoint::read_epoch_metadata_async(storage.as_ref(), "job-async-ck", 1)
-                .await
-                .unwrap()
-                .expect("metadata");
+        let meta = krishiv_state::checkpoint::read_epoch_metadata_async(
+            storage.as_ref(),
+            "job-async-ck",
+            1,
+        )
+        .await
+        .unwrap()
+        .expect("metadata");
         assert_eq!(meta.epoch, 1);
         assert_eq!(
             coord.coordinator_state(),
@@ -1109,9 +1113,13 @@ mod tests {
 
         assert!(error.contains("missing"), "unexpected error: {error}");
         assert!(
-            krishiv_state::checkpoint::read_epoch_metadata(storage.as_ref(), "job-missing-snapshot", 1)
-                .unwrap()
-                .is_none(),
+            krishiv_state::checkpoint::read_epoch_metadata(
+                storage.as_ref(),
+                "job-missing-snapshot",
+                1
+            )
+            .unwrap()
+            .is_none(),
             "missing snapshot must fail before metadata is written"
         );
         assert!(

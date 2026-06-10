@@ -1,6 +1,7 @@
 //! Generated protobuf wire conversions.
 
 use crate::checkpoint::{CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset};
+use crate::executor::TraceContext;
 use crate::executor::{
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
     HeartbeatThrottleCommand, ShufflePartitionOutput, TaskOutputMetadata, TaskRuntimeStats,
@@ -10,7 +11,6 @@ use crate::ids::{
     TaskId, TransportVersion,
 };
 use crate::lifecycle::{ExecutorState, TaskState};
-use crate::executor::TraceContext;
 use crate::task::{
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment, InputPartition,
     InputPartitionDescriptor, KeyGroupRange, MemoryKafkaRecord, OutputContract,
@@ -56,7 +56,10 @@ fn trace_context_from_wire(traceparent: String, tracestate: String) -> Option<Tr
     if traceparent.is_empty() {
         None
     } else {
-        Some(TraceContext { traceparent, tracestate })
+        Some(TraceContext {
+            traceparent,
+            tracestate,
+        })
     }
 }
 
@@ -468,9 +471,7 @@ fn hot_key_report_from_wire(
     })
 }
 
-fn streaming_task_state_to_wire(
-    value: &crate::StreamingTaskState,
-) -> v1::StreamingTaskStateWire {
+fn streaming_task_state_to_wire(value: &crate::StreamingTaskState) -> v1::StreamingTaskStateWire {
     v1::StreamingTaskStateWire {
         task_id: value.task_id.as_str().to_owned(),
         watermark_ms: value.watermark_ms,
@@ -807,7 +808,9 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
         let ids_len = value.shuffle_partition_ids.len();
         let bytes_len = value.shuffle_partition_bytes.len();
         let endpoints_len = value.shuffle_flight_endpoints.len();
-        if (bytes_len > 0 && bytes_len != ids_len) || (endpoints_len > 0 && endpoints_len != ids_len) {
+        if (bytes_len > 0 && bytes_len != ids_len)
+            || (endpoints_len > 0 && endpoints_len != ids_len)
+        {
             return Err(WireError::new(format!(
                 "mismatched deprecated shuffle arrays: ids={ids_len} bytes={bytes_len} endpoints={endpoints_len}"
             )));
@@ -919,7 +922,9 @@ fn executor_descriptor_from_wire(value: v1::ExecutorDescriptor) -> WireResult<Ex
     Ok(descriptor)
 }
 
-fn shuffle_write_config_to_wire(value: &crate::io::ShuffleWriteConfig) -> v1::ShuffleWriteConfigWire {
+fn shuffle_write_config_to_wire(
+    value: &crate::io::ShuffleWriteConfig,
+) -> v1::ShuffleWriteConfigWire {
     v1::ShuffleWriteConfigWire {
         stage_id: value.stage_id.as_str().to_owned(),
         num_partitions: value.num_partitions as u64,
@@ -989,7 +994,10 @@ fn input_partition_to_wire(value: &InputPartition) -> WireResult<v1::InputPartit
     Ok(v1::InputPartition {
         partition_id: value.partition_id().to_owned(),
         description: value.description().to_owned(),
-        descriptor: value.descriptor().map(input_partition_descriptor_to_wire).transpose()?,
+        descriptor: value
+            .descriptor()
+            .map(input_partition_descriptor_to_wire)
+            .transpose()?,
     })
 }
 
@@ -1082,17 +1090,19 @@ fn input_partition_descriptor_to_wire(
         }),
         // InMemory is in-process only and must never reach the wire.
         InputPartitionDescriptor::InMemory { table_name, .. } => {
-            return Err(WireError::new(format!(
+            Err(WireError::new(format!(
                 "InputPartitionDescriptor::InMemory (table_name={table_name:?}) \
                  is in-process only and cannot be serialised to the wire; \
                  use InlineIpc for remote task assignments"
-            )));
+            )))
         }
-        InputPartitionDescriptor::WatermarkHint { watermark_ms } => Ok(v1::InputPartitionDescriptor {
-            kind: v1::InputPartitionDescriptorKind::WatermarkHint as i32,
-            watermark_ms: *watermark_ms,
-            ..Default::default()
-        }),
+        InputPartitionDescriptor::WatermarkHint { watermark_ms } => {
+            Ok(v1::InputPartitionDescriptor {
+                kind: v1::InputPartitionDescriptorKind::WatermarkHint as i32,
+                watermark_ms: *watermark_ms,
+                ..Default::default()
+            })
+        }
     }
 }
 
@@ -1453,8 +1463,7 @@ pub fn checkpoint_ack_request_from_wire(
         .source_offsets
         .into_iter()
         .map(|o| {
-            let partition_id =
-                PartitionId::try_new(o.partition_id).map_err(WireError::from_id)?;
+            let partition_id = PartitionId::try_new(o.partition_id).map_err(WireError::from_id)?;
             Ok(CheckpointSourceOffset {
                 partition_id,
                 offset: o.offset,

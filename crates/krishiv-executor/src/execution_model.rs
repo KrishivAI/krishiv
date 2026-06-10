@@ -29,7 +29,9 @@ impl ExecutionModel {
     /// Prefers the explicit `is_streaming` flag set by the scheduler. Falls back
     /// to description-based detection for fragments produced by older schedulers
     /// that do not populate the flag.
-    pub fn from_plan_fragment(fragment: &krishiv_proto::PlanFragment) -> crate::ExecutorResult<Self> {
+    pub fn from_plan_fragment(
+        fragment: &krishiv_proto::PlanFragment,
+    ) -> crate::ExecutorResult<Self> {
         if fragment.is_streaming() {
             return Ok(Self::Streaming);
         }

@@ -2,9 +2,9 @@
 
 use krishiv_common::async_util::block_on;
 use krishiv_scheduler::{
-    coordinator_daemon_help, job_coordinator_daemon_help, parse_coordinator_daemon_config,
-    parse_job_coordinator_daemon_config, run_clusterd_daemon, run_job_coordinator_daemon,
-    run_standalone_coordinator, SharedCoordinator,
+    SharedCoordinator, coordinator_daemon_help, job_coordinator_daemon_help,
+    parse_coordinator_daemon_config, parse_job_coordinator_daemon_config, run_clusterd_daemon,
+    run_job_coordinator_daemon, run_standalone_coordinator,
 };
 
 use crate::cli::CliResponse;
@@ -79,11 +79,11 @@ fn run_clusterd(args: &[String]) -> i32 {
     }
 }
 
-fn build_ui_http_factory() -> Option<Box<dyn FnOnce(SharedCoordinator) -> axum::Router<()> + Send>> {
+fn build_ui_http_factory() -> Option<Box<dyn FnOnce(SharedCoordinator) -> axum::Router<()> + Send>>
+{
     Some(Box::new(|shared: SharedCoordinator| {
         let engine = krishiv_sql::SqlEngine::new();
-        let ui_state = krishiv_ui::UiState::from_shared_coordinator(shared)
-            .with_sql_engine(engine);
+        let ui_state = krishiv_ui::UiState::from_shared_coordinator(shared).with_sql_engine(engine);
         krishiv_ui::embedded_router(ui_state)
     }))
 }

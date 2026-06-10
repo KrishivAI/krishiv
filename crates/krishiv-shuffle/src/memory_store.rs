@@ -248,13 +248,11 @@ impl ShuffleStore for InMemoryShuffleStore {
 
         {
             let leases = shuffle_read_lock(&self.lease_tokens)?;
-            if let Some(&expected) = leases.get(&key) {
-                if lease_token < expected {
-                    return Err(ShuffleError::StaleLeaseToken {
-                        expected,
-                        actual: lease_token,
-                    });
-                }
+            if let Some(&expected) = leases.get(&key) && lease_token < expected {
+                return Err(ShuffleError::StaleLeaseToken {
+                    expected,
+                    actual: lease_token,
+                });
             }
         }
 

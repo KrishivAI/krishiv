@@ -77,12 +77,12 @@ pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, HeavyHittersTracker,
     HotKeyReport, RateLimiter, SinkLatencyTracker, StreamingPartitionAdvisor, ThrottleCommand,
 };
-pub use coalesce_partitions::{CoalescePartitionsOperator, coalesce_partition_batches};
 pub use aggregate::{AggExpr, AggFunction, LocalAggregator};
+pub use coalesce_partitions::{CoalescePartitionsOperator, coalesce_partition_batches};
 pub use continuous::ContinuousWindowExecutor;
 pub use join::{BroadcastJoin, BuiltBroadcastJoin, HashJoin, StreamTableJoin};
 pub use operator_runtime::{
-    LocalWindowKindBridge, execute_bounded_window, execute_streaming_window,
+    LocalWindowKindBridge, LocalWindowParams, execute_bounded_window, execute_streaming_window,
     local_spec_to_window_execution,
 };
 pub use queue::{
