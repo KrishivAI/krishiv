@@ -1749,12 +1749,22 @@ impl SqlDataFrame {
         }
 
         // Run the logical optimizer so BroadcastAutoRule fires on eligible scans.
+        // An optimizer failure falls back to the unoptimized (still valid) plan;
+        // execution correctness does not depend on optimization, but the failure
+        // must be observable rather than silent.
         let optimizer = krishiv_plan::optimizer::default_logical_optimizer();
         let fallback = plan.clone();
-        optimizer
-            .optimize(plan)
-            .map(|result| result.plan)
-            .unwrap_or(fallback)
+        match optimizer.optimize(plan) {
+            Ok(result) => result.plan,
+            Err(error) => {
+                tracing::warn!(
+                    plan = %self.name,
+                    %error,
+                    "logical optimizer failed; using unoptimized plan"
+                );
+                fallback
+            }
+        }
     }
 
     /// Explain the logical plan without executing it.

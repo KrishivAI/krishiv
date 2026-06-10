@@ -58,8 +58,13 @@ SET shuffle.partitions = 8
 - `cargo check -p krishiv-sql -p krishiv-api -p krishiv-plan -p krishiv-scheduler` (clean)
 - `cargo test -p krishiv-plan --lib` (397 passed)
 
-### Remaining gap: Phase 3 (BroadcastAutoRule)
-`BroadcastAutoRule` checks `NodeOp::Scan` nodes with `estimated_rows` populated. No production code creates `NodeOp::Scan` nodes — the SQL path wraps DataFusion plans as a single opaque Krishiv node. Fixing this requires translating DataFusion physical plans into Krishiv `PlanNode` DAGs with scan/estimated_rows annotations.
+### Remaining gap: Phase 3 (BroadcastAutoRule) — CLOSED (stale claim corrected 2026-06-10)
+This gap no longer exists: `df_plan_to_krishiv_nodes` (`krishiv-sql/src/lib.rs`) translates
+DataFusion logical plans into typed Krishiv `PlanNode` DAGs (Scan/Project/Filter/Aggregate/
+Join/Sort/Repartition/Limit/Union), annotates scans with `estimated_rows` from the engine's
+table-row-count registry, and `krishiv_logical_plan()` runs `default_logical_optimizer()` so
+`BroadcastAutoRule` fires on eligible scans. Residual task: end-to-end test proving broadcast
+promotion through `krishiv_logical_plan()` on a small-table join.
 
 ---
 
