@@ -308,7 +308,7 @@ pub async fn spawn_coordinator_sidecars(
                 let job_ids = gc_coordinator.write().await.take_gc_ready_jobs();
                 for job_id in job_ids {
                     if let Err(e) = store.delete_job_partitions(job_id.as_str()).await {
-                        eprintln!("shuffle GC failed for job {job_id}: {e}");
+                        tracing::error!(job_id = %job_id, error = %e, "shuffle GC failed");
                     }
                 }
                 // Orphan scan every 60 s (every 12th 5-second tick) — removes
@@ -322,12 +322,10 @@ pub async fn spawn_coordinator_sidecars(
                     tokio::task::spawn_blocking(move || {
                         match krishiv_shuffle::orphan::cleanup_orphans(&dir, &active) {
                             Ok(n) if n > 0 => {
-                                eprintln!(
-                                    "shuffle orphan GC: removed {n} orphaned partition files"
-                                );
+                                tracing::info!(removed = n, "shuffle orphan GC: removed orphaned partition files");
                             }
                             Ok(_) => {}
-                            Err(e) => eprintln!("shuffle orphan GC failed: {e}"),
+                            Err(e) => tracing::error!(error = %e, "shuffle orphan GC failed"),
                         }
                         drop(store2); // keep Arc alive
                     });
@@ -339,10 +337,7 @@ pub async fn spawn_coordinator_sidecars(
     if let Some(http_addr) = config.http_addr {
         let http_coordinator = coordinator.clone();
         let http_listener = TcpListener::bind(http_addr).await?;
-        println!(
-            "Krishiv coordinator HTTP listening on {}",
-            http_listener.local_addr()?
-        );
+        tracing::info!(addr = %http_listener.local_addr()?, "Krishiv coordinator HTTP listening");
         let http_config = config.clone();
         tokio::spawn(async move {
             let router = coordinator_http_router(http_coordinator.clone(), &http_config);
@@ -986,11 +981,7 @@ pub async fn run_standalone_coordinator(
     // Standalone must spawn orchestration loops for task dispatch and heartbeat management.
     let _handles = coordinator.spawn_orchestration_loops();
     let listener = TcpListener::bind(config.grpc_addr).await?;
-    println!(
-        "Krishiv coordinator {} gRPC listening on {}",
-        config.coordinator_id,
-        listener.local_addr()?
-    );
+    tracing::info!(coordinator_id = %config.coordinator_id, addr = %listener.local_addr()?, "Krishiv coordinator gRPC listening");
 
     let in_flight = InFlightTracker::new();
     let grpc_serve = serve_coordinator_executor_grpc_with_listener_and_tracker(
@@ -1064,12 +1055,7 @@ pub async fn run_clusterd_daemon(
     ));
     spawn_coordinator_sidecars(&shared, &config, extra_http_factory).await?;
     let listener = TcpListener::bind(config.grpc_addr).await?;
-    println!(
-        "Krishiv clusterd (CCP) {} gRPC listening on {} (leader-backend={})",
-        config.coordinator_id,
-        listener.local_addr()?,
-        config.leader_backend,
-    );
+    tracing::info!(coordinator_id = %config.coordinator_id, addr = %listener.local_addr()?, leader_backend = %config.leader_backend, "Krishiv clusterd (CCP) gRPC listening");
     run_cluster_control_plane(ccp, listener).await
 }
 
@@ -1196,7 +1182,7 @@ pub async fn run_job_coordinator_daemon(
         }
         match submit.send().await {
             Ok(resp) if resp.status().is_success() => {
-                println!("Krishiv JCP: submitted job {job_id} to {base}");
+                tracing::info!(job_id = %job_id, base = %base, "Krishiv JCP: submitted job");
             }
             Ok(resp) => {
                 tracing::warn!(
@@ -1210,10 +1196,7 @@ pub async fn run_job_coordinator_daemon(
         }
     }
 
-    println!(
-        "Krishiv JCP watching job {job_id} on {base} (poll every {:?})",
-        jcp_config.poll_interval
-    );
+    tracing::info!(job_id = %job_id, base = %base, poll_interval = ?jcp_config.poll_interval, "Krishiv JCP watching job");
 
     let status_url = format!("{base}/federation/v1/jobs/{job_id}");
     loop {
@@ -1225,7 +1208,7 @@ pub async fn run_job_coordinator_daemon(
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<JcpJobStatusResponse>().await {
                     Ok(status) => {
-                        println!("Krishiv JCP: job {job_id} state={}", status.state);
+                        tracing::info!(job_id = %job_id, state = %status.state, "Krishiv JCP: job state");
                         let terminal =
                             matches!(status.state.as_str(), "Succeeded" | "Failed" | "Cancelled");
                         if terminal {

@@ -173,7 +173,20 @@ pub(crate) fn spawn_pipeline_stream(
     let (tx, rx) = tokio::sync::mpsc::channel(16);
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                // Runtime creation failed (OOM or OS limit) — send the error
+                // and let the receiver see it as a stream failure.
+                let tx2 = tx.clone();
+                let _ = futures::executor::block_on(tx2.send(Err(
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "failed to create tokio runtime for stream: {e}"
+                    )),
+                )));
+                return;
+            }
+        };
         rt.block_on(async move {
             let input_res = resolve_input_stream(&pipeline).await;
             let input_stream = match input_res {

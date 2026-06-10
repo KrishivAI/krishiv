@@ -143,23 +143,17 @@ fn resolve_ui_token() -> Option<String> {
                 if krishiv_common::profile_requires_authenticated_ui(
                     krishiv_common::resolve_durability_profile(),
                 ) {
-                    eprintln!(
-                        "krishiv-ui: KRISHIV_UI_TOKEN_FILE='{path}' could not be read: {e}; \
-                         denying all protected routes (production fail-closed)"
-                    );
+                    tracing::error!(path = %path, error = %e, "krishiv-ui: token file could not be read; denying all protected routes (production fail-closed)");
                     return Some(String::new());
                 }
-                eprintln!(
-                    "krishiv-ui: KRISHIV_UI_TOKEN_FILE='{path}' could not be read: {e}; \
-                     falling back to anonymous router"
-                );
+                tracing::warn!(path = %path, error = %e, "krishiv-ui: token file could not be read; falling back to anonymous router");
             }
         }
     }
     if krishiv_common::profile_requires_authenticated_ui(
         krishiv_common::resolve_durability_profile(),
     ) {
-        eprintln!("krishiv-ui: no UI token configured; denying all protected routes (production fail-closed)");
+        tracing::warn!("krishiv-ui: no UI token configured; denying all protected routes (production fail-closed)");
         return Some(String::new());
     }
     None

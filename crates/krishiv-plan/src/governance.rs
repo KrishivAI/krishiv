@@ -55,7 +55,17 @@ impl StaticApiKeyAuthProvider {
 
 impl AuthProvider for StaticApiKeyAuthProvider {
     fn authenticate(&self, api_key: &str) -> Option<Principal> {
-        self.keys.get(api_key).cloned()
+        use constant_time_eq::constant_time_eq;
+        let candidate = api_key.as_bytes();
+        // Iterate every entry without short-circuiting so elapsed time is
+        // independent of which key matched — prevents timing oracle attacks.
+        let mut result: Option<Principal> = None;
+        for (stored, principal) in &self.keys {
+            if constant_time_eq(stored.as_bytes(), candidate) {
+                result = Some(principal.clone());
+            }
+        }
+        result
     }
 }
 
@@ -1330,5 +1340,26 @@ mod tests {
         assert_eq!(allowed, AuditOutcome::Allowed);
         assert_eq!(denied, AuditOutcome::Denied);
         assert_ne!(allowed, denied);
+    }
+
+    // Regression test: authenticate must never short-circuit on a prefix match.
+    // A timing oracle would return Some(_) for "secret" when the stored key is
+    // "secretXXX" because the loop broke early on content equality. The
+    // constant_time_eq implementation always iterates every stored entry.
+    #[test]
+    fn authenticate_no_prefix_timing_oracle() {
+        let provider = StaticApiKeyAuthProvider::new([(
+            "secretXXX".to_string(),
+            "alice".to_string(),
+            Role::Reader,
+        )]);
+        // A key that is a prefix of the stored key must NOT authenticate.
+        assert!(provider.authenticate("secret").is_none());
+        // A key that is a suffix extension must NOT authenticate.
+        assert!(provider.authenticate("secretXXXextra").is_none());
+        // Only the exact key must authenticate.
+        assert!(provider.authenticate("secretXXX").is_some());
+        // Empty string must NOT authenticate.
+        assert!(provider.authenticate("").is_none());
     }
 }

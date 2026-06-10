@@ -14,7 +14,6 @@
 //!   pure-Rust embedded B-tree database.  Supports file-backed persistence and
 //!   an in-memory mode for tests.  All I/O is synchronous; callers must use
 //!   `spawn_blocking` when called from async tasks.
-//!   removed; use `FjallStateBackend` directly.
 
 // Declared here:
 pub mod checkpoint;

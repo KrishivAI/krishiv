@@ -33,7 +33,7 @@ pub async fn api_bounded_window(
     Json(body): Json<BoundedWindowRequest>,
 ) -> Result<Json<BoundedWindowResponse>, StatusCode> {
     let input_batches = decode_batches_b64(&body.input_batches_b64).map_err(|e| {
-        eprintln!("bounded-window: input decode failed: {e}");
+        tracing::error!(error = %e, "bounded-window: input decode failed");
         StatusCode::BAD_REQUEST
     })?;
 
@@ -41,7 +41,7 @@ pub async fn api_bounded_window(
         execute_bounded_window_coordinated(&coordinator, &body.topic, &body.spec, &input_batches)
             .await
             .map_err(|e| {
-                eprintln!("execute_bounded_window_coordinated failed: {:?}", e);
+                tracing::error!(error = ?e, "execute_bounded_window_coordinated failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 

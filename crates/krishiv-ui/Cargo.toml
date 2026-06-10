@@ -9,6 +9,7 @@ license.workspace = true
 askama.workspace = true
 axum.workspace = true
 thiserror = { workspace = true }
+tracing = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 futures.workspace = true

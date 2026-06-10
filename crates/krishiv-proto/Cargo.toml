@@ -13,6 +13,7 @@ prost-types = "0.14.3"
 serde = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tonic.workspace = true
+tracing = { workspace = true }
 tonic-prost.workspace = true
 
 [features]

@@ -761,7 +761,7 @@ fn configure_flight_auth_from_env(
             ) {
                 Err(message)
             } else {
-                eprintln!("krishiv-flight-sql: {message}; serving anonymously (dev only)");
+                tracing::warn!(target: "krishiv_flight_sql", "{message}; serving anonymously (dev only)");
                 Ok(service)
             }
         }
@@ -818,7 +818,7 @@ pub async fn run_flight_server_from_env() -> Result<(), Box<dyn std::error::Erro
 pub async fn run_flight_server(
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!("krishiv-flight-server listening on http://{addr}");
+    tracing::info!(addr = %addr, "krishiv-flight-server listening");
     let server = make_flight_sql_server()?;
     tonic::transport::Server::builder()
         .add_service(server)

@@ -70,6 +70,7 @@ mod imp {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn huggingface_model_loads_once_via_registry() {
         use crate::{EmbeddingModelRegistry, ModelKey};

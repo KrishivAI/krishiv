@@ -24,7 +24,7 @@ pub use llm::{
     LlmError, LlmRateLimiter, LlmResponse, LlmUdf, LlmUdfConfig, OpenAiLlmUdf, RateLimitConfig,
 };
 pub use memo::{MemoEntry, MemoStore, memo_key};
-pub use rag::{RagIndexPipeline, RagIndexResult, RagQuery, RefreshPolicy};
+pub use rag::{RagError, RagIndexPipeline, RagIndexResult, RagQuery, RefreshPolicy};
 pub use vector_sinks::{
     EmbeddingBatch, InMemoryVectorSink, LanceDbSink, PayloadFilter, PayloadValue, PineconeSink,
     ScoredChunk, VectorSink, VectorSinkConfig, VectorSinkError, VectorSinkRegistry,

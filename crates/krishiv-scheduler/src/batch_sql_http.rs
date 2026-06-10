@@ -40,7 +40,7 @@ pub async fn api_batch_sql_submit(
     let job_id = submit_batch_sql_job(&coordinator, &body.query, &body.tables, body.is_streaming)
         .await
         .map_err(|e| {
-            eprintln!("submit_batch_sql_job failed: {:?}", e);
+            tracing::error!(error = ?e, "submit_batch_sql_job failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(Json(BatchSqlSubmitResponse {

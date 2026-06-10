@@ -7,6 +7,17 @@ use crate::chunk::{Chunk, TextChunker};
 use crate::embed::EmbeddingModel;
 use crate::memo::{MemoEntry, MemoStore, memo_key};
 
+/// Structured error type for RAG operations.
+#[derive(Debug, thiserror::Error)]
+pub enum RagError {
+    #[error("embedding error: {0}")]
+    Embedding(String),
+    #[error("vector sink error: {0}")]
+    VectorSink(String),
+    #[error("memo store error: {0}")]
+    Memo(String),
+}
+
 /// RAG refresh policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshPolicy {
@@ -40,7 +51,7 @@ where
     pub async fn index_documents(
         &self,
         documents: &[(String, String)],
-    ) -> Result<RagIndexResult, String> {
+    ) -> Result<RagIndexResult, RagError> {
         let mut embedded = 0usize;
         let mut skipped = 0usize;
         let mut doc_ids = Vec::new();
@@ -57,7 +68,7 @@ where
             let mut chunk_indices = Vec::new();
             for chunk in &chunks {
                 let key = memo_key(&hash, chunk.chunk_index);
-                if let Some(entry) = self.memo.get(&key)?
+                if let Some(entry) = self.memo.get(&key).map_err(RagError::Memo)?
                     && entry.embedding.len() == self.embedder.embedding_dim()
                 {
                     skipped += 1;
@@ -73,7 +84,7 @@ where
                 .embedder
                 .embed_batch(&texts_to_embed)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| RagError::Embedding(e.to_string()))?;
             for ((chunk_index, vector), text) in chunk_indices
                 .iter()
                 .zip(embs.iter())
@@ -98,7 +109,7 @@ where
                         point_id,
                         created_at_ms: crate::memo::now_ms(),
                     },
-                )?;
+                ).map_err(RagError::Memo)?;
             }
             embedded += 1;
         }
@@ -108,7 +119,7 @@ where
             self.sink
                 .upsert_batch(&batch)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| RagError::VectorSink(e.to_string()))?;
         }
 
         Ok(RagIndexResult {
@@ -131,19 +142,19 @@ impl RagQuery {
         &self,
         query_text: &str,
         top_k: usize,
-    ) -> Result<Vec<crate::vector_sinks::ScoredChunk>, String> {
+    ) -> Result<Vec<crate::vector_sinks::ScoredChunk>, RagError> {
         let vector = self
             .embedder
             .embed_batch(&[query_text.to_string()])
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| RagError::Embedding(e.to_string()))?
             .into_iter()
             .next()
-            .ok_or_else(|| "empty embedding".to_string())?;
+            .ok_or_else(|| RagError::Embedding("empty embedding".to_string()))?;
         self.sink
             .query_nearest(&vector, top_k, None)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| RagError::VectorSink(e.to_string()))
     }
 }
 
