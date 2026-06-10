@@ -41,13 +41,16 @@ pub fn decode_task_fragment(fragment: &str) -> Option<NodeOp> {
 fn node_op_to_fragment(op: &NodeOp) -> Option<String> {
     match op {
         NodeOp::Window { spec } => encode_window_execution_spec(spec).ok(),
-        NodeOp::Scan { table, .. } => {
-            // Validate and quote the table identifier to prevent SQL injection
-            // through the fragment string. Double-quoted identifiers are the
-            // SQL- standard escape mechanism; embedded quotes are doubled.
+        NodeOp::Scan { table, filters } => {
             validate_safe_id(table, "scan table").ok()?;
             let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-            Some(format!("sql:SELECT * FROM {quoted}"))
+            let sql = if filters.is_empty() {
+                format!("SELECT * FROM {quoted}")
+            } else {
+                let where_clause = filters.join(" AND ");
+                format!("SELECT * FROM {quoted} WHERE {where_clause}")
+            };
+            Some(format!("sql:{sql}"))
         }
         NodeOp::Filter { .. } | NodeOp::Project { .. } | NodeOp::Aggregate { .. } => {
             serde_json::to_string(op)
@@ -138,6 +141,29 @@ mod tests {
         let frag = encode_task_fragment(&node);
         // Falls through to legacy_node_description because validation fails.
         assert!(frag.starts_with("scan [batch]"));
+    }
+
+    #[test]
+    fn scan_includes_pushed_down_filters() {
+        let node = PlanNode::new("scan", "scan", ExecutionKind::Batch).with_op(NodeOp::Scan {
+            table: String::from("orders"),
+            filters: vec![String::from("amount > 100"), String::from("status = 'active'")],
+        });
+        let frag = encode_task_fragment(&node);
+        assert_eq!(
+            frag,
+            "sql:SELECT * FROM \"orders\" WHERE amount > 100 AND status = 'active'"
+        );
+    }
+
+    #[test]
+    fn scan_with_single_filter() {
+        let node = PlanNode::new("scan", "scan", ExecutionKind::Batch).with_op(NodeOp::Scan {
+            table: String::from("users"),
+            filters: vec![String::from("age >= 18")],
+        });
+        let frag = encode_task_fragment(&node);
+        assert_eq!(frag, "sql:SELECT * FROM \"users\" WHERE age >= 18");
     }
 
     #[test]

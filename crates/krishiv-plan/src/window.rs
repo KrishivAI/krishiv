@@ -279,13 +279,21 @@ fn unescape_compact_value(s: &str) -> String {
 }
 
 /// Encode a window spec as an executor plan fragment description.
+///
+/// Single-aggregate specs use the compact text format for backward
+/// compatibility.  Multi-aggregate specs delegate to the lossless JSON
+/// format because the compact format's `:` field delimiter conflicts with
+/// agg parameter syntax (`agg=sum:col=amount`).
 pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
-    let aggs: Vec<String> = if spec.agg_exprs.is_empty() {
-        vec!["agg=count".to_string()]
+    if spec.agg_exprs.len() > 1 {
+        return encode_window_execution_spec(spec)
+            .expect("WindowExecutionSpec serialization is infallible");
+    }
+    let agg = if spec.agg_exprs.is_empty() {
+        "agg=count".to_string()
     } else {
-        spec.agg_exprs.iter().map(encode_agg).collect()
+        encode_agg(&spec.agg_exprs[0])
     };
-    let agg = aggs.join(";");
 
     let prefix = match spec.window_kind {
         WindowKind::Tumbling => "stream:tw",

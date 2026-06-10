@@ -1,5 +1,38 @@
 # Krishiv Implementation Status
 
+## krishiv-plan Full Audit: Round 2 (2026-06-10)
+
+Full audit of all 14 source files in `crates/krishiv-plan/src/` — identified 18+ findings across P0–P3. Three bugs fixed, remaining items noted.
+
+### Fixed
+1. **P0 — Multi-agg compact fragment broken** (`window.rs`): `encode_stream_fragment` joined multiple aggregates with `;` (e.g. `agg=count;agg=sum:col=amount`) but `parse_stream_fragment` only read a single `agg=`, causing "unknown streaming aggregate" errors. Fix: `encode_stream_fragment` now delegates to the lossless JSON format (`stream:spec:v1:...`) for multi-agg specs — the compact text format cannot represent them due to `:` delimiter conflicts with `agg=kind:col=value` syntax. Single-agg compact format unchanged.
+2. **P1 — Scan fragment silently drops pushed-down filters** (`lowering.rs`): `node_op_to_fragment` for `NodeOp::Scan` used `..` to ignore the `filters` field — predicates pushed by `PredicatePushdownRule` were lost. Fix: filters are now encoded as a `WHERE` clause in the `sql:SELECT * FROM "table" WHERE pred1 AND pred2` fragment.
+3. **P1 — CoalesceRule overflow returns silent `None`** (`optimizer.rs:521`): `suffix.checked_add(1)?` returned `None` on `usize` overflow, which the caller interpreted as "no change to the plan". Fix: replaced with `saturating_add(1)` so the suffix stays at `usize::MAX` instead of silently masking the overflow.
+
+### Remaining (not fixed this session)
+- **P1 — Optimizer clones plan per rule**: `AqeOptimizer::apply` clones the entire plan on each rule iteration (`current.clone()`). Acceptable for moderate plans but O(rules × plan_size).
+- **P2 — `optimizer.rs` at 3737 lines**: Should be split into separate rule files (Logical rules, AQE rules, cost model, test modules).
+- **P2 — Duplicate `panic_message` / `panic_payload_message`**: Nearly identical functions in `udf.rs` and `optimizer.rs`; should be unified in `krishiv-common`.
+- **P2 — `CostModel` trait with no production implementation**: Only used in `explain_sql_with_cost` with test mocks. Wire to a real cost function or deprecate.
+- **P3 — `PartitionedCepMatcher` eviction is O(n)** per insertion when over capacity.
+- **P3 — Global `OnceLock` for audit/lineage sinks** is inherently single-process.
+- **P3 — `AuditEvent.resource` includes job_ids/query_hashes in `detail`** — potential PII leakage.
+- **P3 — `encode_window_execution_spec` clones the entire spec** to normalize empty aggregates.
+
+### Validation
+```bash
+cargo test -p krishiv-plan --lib    # 400 passed (was 397 before audit)
+cargo test -p krishiv-runtime --lib  # passes
+```
+
+### Next useful commands
+```bash
+cargo clippy -p krishiv-plan --all-targets
+cargo test --workspace --lib --no-fail-fast --exclude krishiv-python
+```
+
+---
+
 ## Architectural gap closed: shuffle_partitions → AutoPartitionRule (2026-06-09)
 
 ### Done

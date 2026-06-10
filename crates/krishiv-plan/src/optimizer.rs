@@ -518,7 +518,7 @@ impl AqeRule for CoalesceRule {
             if !existing_ids.contains(candidate.as_str()) {
                 break candidate;
             }
-            suffix = suffix.checked_add(1)?;
+            suffix = suffix.saturating_add(1);
         };
 
         let mut rewritten = PhysicalPlan::new(plan.name(), plan.kind());
