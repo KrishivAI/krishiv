@@ -2512,10 +2512,15 @@ mod executor_tests {
 
     #[test]
     fn executor_checkpoint_ack_includes_source_offset() {
+        use krishiv_connectors::kafka::KafkaOffset;
+
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
         let task_id = TaskId::try_new("task-cp-offset").unwrap();
         let job_id = JobId::try_new("job-cp-offset").unwrap();
-        let mut runner = TaskRunner::new(task_id.clone()).with_kafka_offset(42);
+        let mut runner = TaskRunner::new(task_id.clone()).with_kafka_source_offsets(vec![
+            KafkaOffset { topic: "events".into(), partition: 0, offset: 42 },
+            KafkaOffset { topic: "events".into(), partition: 1, offset: 7 },
+        ]);
         let backend = FjallStateBackend::ephemeral().unwrap();
 
         let req = InitiateCheckpointRequest {
@@ -2526,8 +2531,9 @@ mod executor_tests {
         let ack = runner
             .handle_initiate_checkpoint(req, &backend, &storage)
             .unwrap();
-        assert_eq!(ack.source_offsets.len(), 1);
+        assert_eq!(ack.source_offsets.len(), 2);
         assert_eq!(ack.source_offsets[0].offset, 42);
+        assert_eq!(ack.source_offsets[1].offset, 7);
 
         let mut runner2 = TaskRunner::new(TaskId::try_new("task-cp-nooffset").unwrap());
         let req2 = InitiateCheckpointRequest {

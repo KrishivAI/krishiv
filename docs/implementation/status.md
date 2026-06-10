@@ -1,5 +1,35 @@
 # Krishiv Implementation Status
 
+## Phase 1.1: Broker-backed Kafka CheckpointSource — seek-based restore (2026-06-10)
+
+### Done
+1. **`MultiKafkaOffset` struct** added to `crates/krishiv-connectors/src/kafka.rs` — newtype over `Vec<KafkaOffset>` with length-prefixed binary encoding (u32 count + per-entry u32 item_len + KafkaOffset bytes). Handles 0..N partitions; encode/decode are inverse.
+2. **`CheckpointSource for RdkafkaKafkaSource`** — `checkpoint_offset()` returns current `partition_offsets` snapshot as `MultiKafkaOffset`; `restore_offset()` calls `consumer.assign(TopicPartitionList)` with `rdkafka::topic_partition_list::Offset::Offset(ko.offset)` to bypass group rebalance and seek directly to the stored position. Rebuilds `partition_offsets` so `checkpoint_offset()` is accurate immediately after restore, before new messages arrive.
+3. **`CheckpointSource for KafkaSource`** — wrapper delegates to inner `RdkafkaKafkaSource`.
+4. **Capabilities updated** — `RdkafkaKafkaSource::capabilities()` now returns `.with_unbounded().with_checkpoint()`.
+5. **`from_cdc_config` cfg gate fixed** — was `#[cfg(feature = "kafka")]`, now `#[cfg(all(feature = "kafka", feature = "lakehouse"))]` since `crate::cdc` is gated on `lakehouse`.
+6. **`TaskRunner` upgraded** — `kafka_source_offset: i64` (single-partition, sentinel `-1`) replaced with `kafka_source_offsets: Vec<KafkaOffset>` (multi-partition, empty = non-Kafka task). `handle_initiate_checkpoint` emits one `CheckpointSourceOffset` per partition with `partition_id = "kafka-{topic}-{partition}"`.
+7. **Tests updated** — `kafka_source_reports_unbounded_and_rewindable` now asserts `is_checkpoint_capable()` when kafka feature enabled; runner tests use `with_kafka_source_offsets(vec![...])` API; `executor_checkpoint_ack_includes_source_offset` tests two-partition offset propagation.
+8. **New tests** — `multi_kafka_offset_{empty,single,multi}_roundtrip`, `multi_kafka_offset_decode_rejects_{trailing_bytes,truncated_entry}`, `rdkafka_kafka_source_implements_checkpoint_source_trait`, `kafka_source_wrapper_implements_checkpoint_source_trait`, `task_runner_with_kafka_source_offsets`.
+
+### Validation
+```bash
+cargo check --workspace                                              # exit 0
+cargo test -p krishiv-connectors --lib                              # 58 passed
+cargo test -p krishiv-connectors --lib --features kafka             # 86 passed
+cargo test -p krishiv-executor --lib                                # 182 passed
+```
+
+### Architecture note
+- `subscribe()` is used on first consumer creation (group-managed partition assignment).
+- `assign()` is used on checkpoint restore — bypasses group coordinator, seeks each partition to the exact stored offset. This is the correct architectural boundary: subscribe for liveness, assign for deterministic recovery.
+- `partition_offsets` stores last-received message offset; `all_current_offsets()` returns `offset+1` ("next to read"). After restore, pre-seeds `partition_offsets[p] = ko.offset - 1` so `checkpoint_offset()` is idempotent before the first post-restore read.
+
+### Next
+- Phase 1.2: Persist bounded-window inline inputs + continuous-cycle state to MetadataStore (coordinator crash recovery).
+
+---
+
 ## krishiv-plan Full Audit: Round 2 (2026-06-10)
 
 Full audit of all 14 source files in `crates/krishiv-plan/src/` — identified 18+ findings across P0–P3. Three bugs fixed, remaining items noted.

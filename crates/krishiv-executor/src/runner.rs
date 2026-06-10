@@ -467,7 +467,7 @@ impl fmt::Debug for ShuffleContext {
 
 /// Per-task checkpoint state for executor-side checkpoint participation (R6).
 ///
-/// Tracks the last acked epoch, operator/task identity, and source offset so the
+/// Tracks the last acked epoch, operator/task identity, and source offsets so the
 /// executor can correctly handle `InitiateCheckpointRequest` messages.
 #[derive(Debug, Clone)]
 pub struct TaskRunner {
@@ -477,8 +477,8 @@ pub struct TaskRunner {
     pub operator_id: String,
     /// Task identifier.
     pub task_id: TaskId,
-    /// Last Kafka offset processed.  `-1` if this is not a Kafka source task.
-    pub kafka_source_offset: i64,
+    /// Per-partition Kafka source offsets for checkpoint. Empty for non-Kafka tasks.
+    pub kafka_source_offsets: Vec<krishiv_connectors::kafka::KafkaOffset>,
 }
 
 impl TaskRunner {
@@ -489,13 +489,16 @@ impl TaskRunner {
             last_acked_epoch: 0,
             operator_id,
             task_id,
-            kafka_source_offset: -1,
+            kafka_source_offsets: Vec::new(),
         }
     }
 
-    /// Set the Kafka source offset (for source tasks).
-    pub fn with_kafka_offset(mut self, offset: i64) -> Self {
-        self.kafka_source_offset = offset;
+    /// Set the per-partition Kafka source offsets (for Kafka source tasks).
+    pub fn with_kafka_source_offsets(
+        mut self,
+        offsets: Vec<krishiv_connectors::kafka::KafkaOffset>,
+    ) -> Self {
+        self.kafka_source_offsets = offsets;
         self
     }
 
@@ -589,19 +592,19 @@ impl TaskRunner {
             None
         };
 
-        // Build source offsets.
-        let source_offsets = if self.kafka_source_offset >= 0 {
-            vec![CheckpointSourceOffset {
+        // Build source offsets — one entry per assigned Kafka partition.
+        let source_offsets: Vec<CheckpointSourceOffset> = self
+            .kafka_source_offsets
+            .iter()
+            .map(|ko| CheckpointSourceOffset {
                 partition_id: krishiv_proto::PartitionId::try_new(format!(
-                    "kafka-{}",
-                    self.task_id.as_str()
+                    "kafka-{}-{}",
+                    ko.topic, ko.partition
                 ))
-                .expect("task_id is non-empty, so partition_id is non-empty"),
-                offset: self.kafka_source_offset,
-            }]
-        } else {
-            vec![]
-        };
+                .expect("topic and partition are non-empty, so partition_id is non-empty"),
+                offset: ko.offset,
+            })
+            .collect();
 
         self.last_acked_epoch = req.epoch;
 
@@ -1703,15 +1706,20 @@ mod runner_tests {
         let runner = TaskRunner::new(task_id.clone());
         assert_eq!(runner.task_id, task_id);
         assert_eq!(runner.last_acked_epoch, 0);
-        assert_eq!(runner.kafka_source_offset, -1);
+        assert!(runner.kafka_source_offsets.is_empty());
         assert!(runner.operator_id.starts_with("operator-"));
     }
 
     #[test]
-    fn task_runner_with_kafka_offset() {
+    fn task_runner_with_kafka_source_offsets() {
+        use krishiv_connectors::kafka::KafkaOffset;
         let task_id = krishiv_proto::TaskId::try_new("task-1").unwrap();
-        let runner = TaskRunner::new(task_id).with_kafka_offset(42);
-        assert_eq!(runner.kafka_source_offset, 42);
+        let offsets = vec![
+            KafkaOffset { topic: "events".into(), partition: 0, offset: 42 },
+            KafkaOffset { topic: "events".into(), partition: 1, offset: 7 },
+        ];
+        let runner = TaskRunner::new(task_id).with_kafka_source_offsets(offsets.clone());
+        assert_eq!(runner.kafka_source_offsets, offsets);
     }
 
     #[test]

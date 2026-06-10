@@ -84,6 +84,90 @@ impl crate::Offset for KafkaOffset {
 }
 
 // ---------------------------------------------------------------------------
+// MultiKafkaOffset
+// ---------------------------------------------------------------------------
+
+/// Multi-partition Kafka checkpoint: one [`KafkaOffset`] per assigned partition.
+///
+/// Encoding: `u32 count (LE) | for each entry: u32 item_len (LE) | KafkaOffset bytes`.
+/// The length-prefix per entry lets the decoder slice correctly without assuming
+/// a fixed size (topic length is variable).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MultiKafkaOffset {
+    pub offsets: Vec<KafkaOffset>,
+}
+
+impl MultiKafkaOffset {
+    /// Create from a list of per-partition offsets.
+    pub fn new(offsets: Vec<KafkaOffset>) -> Self {
+        Self { offsets }
+    }
+
+    /// True when no partitions have been checkpointed yet.
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+}
+
+impl crate::Offset for MultiKafkaOffset {
+    fn encode(&self) -> Vec<u8> {
+        let count = self.offsets.len() as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(&count.to_le_bytes());
+        for ko in &self.offsets {
+            let item_bytes = ko.encode();
+            let item_len = item_bytes.len() as u32;
+            out.extend_from_slice(&item_len.to_le_bytes());
+            out.extend_from_slice(&item_bytes);
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> ConnectorResult<Self> {
+        if bytes.len() < 4 {
+            return Err(ConnectorError::Offset {
+                message: "MultiKafkaOffset decode: buffer too short for count".into(),
+            });
+        }
+        let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let mut pos = 4usize;
+        let mut offsets = Vec::with_capacity(count);
+        for i in 0..count {
+            if pos + 4 > bytes.len() {
+                return Err(ConnectorError::Offset {
+                    message: format!(
+                        "MultiKafkaOffset decode: truncated before entry {i} length prefix"
+                    ),
+                });
+            }
+            let item_len =
+                u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + item_len > bytes.len() {
+                return Err(ConnectorError::Offset {
+                    message: format!(
+                        "MultiKafkaOffset decode: entry {i} claims {item_len} bytes but only {} remain",
+                        bytes.len() - pos
+                    ),
+                });
+            }
+            let ko = KafkaOffset::decode(&bytes[pos..pos + item_len])?;
+            pos += item_len;
+            offsets.push(ko);
+        }
+        if pos != bytes.len() {
+            return Err(ConnectorError::Offset {
+                message: format!(
+                    "MultiKafkaOffset decode: {} trailing bytes after {count} entries",
+                    bytes.len() - pos
+                ),
+            });
+        }
+        Ok(MultiKafkaOffset { offsets })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KafkaConfig
 // ---------------------------------------------------------------------------
 
@@ -263,6 +347,19 @@ impl Source for KafkaSource {
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
         self.inner.current_offset()
+    }
+}
+
+#[cfg(feature = "kafka")]
+impl CheckpointSource for KafkaSource {
+    type Offset = MultiKafkaOffset;
+
+    fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset> {
+        self.inner.checkpoint_offset()
+    }
+
+    fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()> {
+        self.inner.restore_offset(offset)
     }
 }
 
@@ -733,7 +830,7 @@ impl RdkafkaKafkaSource {
     }
 
     /// Create a source from a [`crate::cdc::KafkaCdcConfig`] (manual commit mode).
-    #[cfg(feature = "kafka")]
+    #[cfg(all(feature = "kafka", feature = "lakehouse"))]
     pub fn from_cdc_config(config: &crate::cdc::KafkaCdcConfig) -> Result<Self, String> {
         Self::new(
             &config.bootstrap_servers,
@@ -875,7 +972,7 @@ impl RdkafkaKafkaSource {
 #[cfg(feature = "kafka")]
 impl Source for RdkafkaKafkaSource {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_unbounded()
+        ConnectorCapabilities::new().with_unbounded().with_checkpoint()
     }
 
     async fn read_batch(
@@ -941,6 +1038,63 @@ impl Source for RdkafkaKafkaSource {
         } else {
             Some(Box::new(offsets) as Box<dyn std::any::Any + Send>)
         }
+    }
+}
+
+/// Broker-backed exactly-once checkpoint support via partition assignment + seek.
+///
+/// On restore, `consumer.assign()` bypasses the group rebalance protocol and
+/// seeks each partition directly to the stored offset, guaranteeing that the
+/// next `read_batch()` call returns the message at exactly that offset — no
+/// duplicates, no gaps.
+#[cfg(feature = "kafka")]
+impl CheckpointSource for RdkafkaKafkaSource {
+    type Offset = MultiKafkaOffset;
+
+    fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset> {
+        Ok(MultiKafkaOffset {
+            offsets: self.all_current_offsets(),
+        })
+    }
+
+    fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()> {
+        use rdkafka::consumer::Consumer;
+        use rdkafka::topic_partition_list::{Offset as RdOffset, TopicPartitionList};
+
+        if offset.offsets.is_empty() {
+            return Ok(());
+        }
+
+        let mut tpl = TopicPartitionList::new();
+        for ko in &offset.offsets {
+            tpl.add_partition_offset(&ko.topic, ko.partition, RdOffset::Offset(ko.offset))
+                .map_err(|e| ConnectorError::Offset {
+                    message: format!(
+                        "restore: failed to add partition {}/{} at offset {}: {e}",
+                        ko.topic, ko.partition, ko.offset
+                    ),
+                })?;
+        }
+
+        self.consumer.assign(&tpl).map_err(|e| ConnectorError::Offset {
+            message: format!("restore: rdkafka assign failed: {e}"),
+        })?;
+
+        // Rebuild partition_offsets so that checkpoint_offset() is accurate
+        // immediately after restore (before any new messages are read).
+        // partition_offsets stores the raw rdkafka message offset of the last
+        // received message. all_current_offsets() returns offset+1 ("next to read").
+        // ko.offset is "next to read", so last_received = ko.offset - 1.
+        self.partition_offsets.clear();
+        for ko in &offset.offsets {
+            if ko.offset > 0 {
+                self.partition_offsets.insert(ko.partition, ko.offset - 1);
+            }
+            // offset == 0 means start-of-partition; no message yet for this
+            // partition, so we leave it absent from partition_offsets.
+        }
+
+        Ok(())
     }
 }
 
@@ -1013,6 +1167,71 @@ mod tests {
             enable_idempotence: None,
             transactional_id: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // MultiKafkaOffset
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_kafka_offset_empty_roundtrip() {
+        let original = MultiKafkaOffset::default();
+        let encoded = crate::Offset::encode(&original);
+        let decoded = MultiKafkaOffset::decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn multi_kafka_offset_single_partition_roundtrip() {
+        let original = MultiKafkaOffset::new(vec![KafkaOffset {
+            topic: "events".into(),
+            partition: 0,
+            offset: 100,
+        }]);
+        let encoded = crate::Offset::encode(&original);
+        let decoded = MultiKafkaOffset::decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn multi_kafka_offset_multi_partition_roundtrip() {
+        let original = MultiKafkaOffset::new(vec![
+            KafkaOffset { topic: "orders".into(), partition: 0, offset: 42 },
+            KafkaOffset { topic: "orders".into(), partition: 1, offset: 7 },
+            KafkaOffset { topic: "orders".into(), partition: 2, offset: 999 },
+        ]);
+        let encoded = crate::Offset::encode(&original);
+        let decoded = MultiKafkaOffset::decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn multi_kafka_offset_decode_rejects_trailing_bytes() {
+        let original = MultiKafkaOffset::new(vec![KafkaOffset {
+            topic: "t".into(),
+            partition: 0,
+            offset: 1,
+        }]);
+        let mut encoded = crate::Offset::encode(&original);
+        encoded.push(0xFF);
+        let err = MultiKafkaOffset::decode(&encoded)
+            .expect_err("trailing bytes must be rejected");
+        assert!(matches!(err, ConnectorError::Offset { .. }));
+    }
+
+    #[test]
+    fn multi_kafka_offset_decode_rejects_truncated_entry() {
+        let original = MultiKafkaOffset::new(vec![KafkaOffset {
+            topic: "events".into(),
+            partition: 0,
+            offset: 5,
+        }]);
+        let encoded = crate::Offset::encode(&original);
+        // Truncate to just the count + partial entry length
+        let truncated = &encoded[..6];
+        let err = MultiKafkaOffset::decode(truncated)
+            .expect_err("truncated entry must be rejected");
+        assert!(matches!(err, ConnectorError::Offset { .. }));
     }
 
     // -----------------------------------------------------------------------
@@ -1097,10 +1316,13 @@ mod tests {
         assert!(!caps.is_bounded());
         assert!(!caps.is_transactional());
         assert!(!caps.is_idempotent());
+        #[cfg(feature = "kafka")]
         assert!(
-            !caps.is_checkpoint_capable(),
-            "broker Kafka must not claim checkpoint restore before seek is implemented"
+            caps.is_checkpoint_capable(),
+            "broker Kafka source must advertise checkpoint capability now that seek-based restore is implemented"
         );
+        #[cfg(not(feature = "kafka"))]
+        assert!(!caps.is_checkpoint_capable());
     }
 
     // -----------------------------------------------------------------------
@@ -1301,10 +1523,24 @@ mod tests {
     #[cfg(feature = "kafka")]
     #[test]
     fn rdkafka_kafka_source_implements_source_trait() {
-        // This is a compile-time assertion: if `RdkafkaKafkaSource` does not
-        // implement `Source` the test will not compile.
         fn assert_source<T: crate::Source>() {}
         assert_source::<super::RdkafkaKafkaSource>();
+    }
+
+    /// `RdkafkaKafkaSource` implements `CheckpointSource`.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn rdkafka_kafka_source_implements_checkpoint_source_trait() {
+        fn assert_checkpoint<T: crate::CheckpointSource>() {}
+        assert_checkpoint::<super::RdkafkaKafkaSource>();
+    }
+
+    /// `KafkaSource` (broker wrapper) implements `CheckpointSource`.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_source_wrapper_implements_checkpoint_source_trait() {
+        fn assert_checkpoint<T: crate::CheckpointSource>() {}
+        assert_checkpoint::<super::KafkaSource>();
     }
 
     #[tokio::test]
