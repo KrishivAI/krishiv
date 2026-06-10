@@ -7,7 +7,6 @@ use std::sync::Arc;
 use krishiv_common::MemoryBudget;
 use krishiv_plan::udf::ResourceLimits;
 use krishiv_proto::{ExecutorTaskAssignment, TaskRuntimeStats};
-use std::sync::Arc;
 #[cfg(feature = "kafka")]
 use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDescriptor};
 

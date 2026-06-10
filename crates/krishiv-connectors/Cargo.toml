@@ -17,6 +17,8 @@ default = ["parquet"]
 parquet = []
 s3 = []
 two-phase = ["parquet"]
+# E6.1: Avro file source and sink
+avro = ["dep:apache-avro"]
 
 # Streaming
 kafka = ["dep:rdkafka"]
@@ -52,6 +54,7 @@ pgvector = ["vector-sinks", "dep:sqlx"]
 local = ["parquet", "s3", "kafka", "two-phase"]
 full = [
     "local",
+    "avro",
     "lakehouse",
     "iceberg",
     "delta",
@@ -63,6 +66,16 @@ full = [
     "state",
 ]
 exactly-once-integration = ["lakehouse"]
+# E6.4: AWS Kinesis streaming source
+kinesis = ["dep:aws-sdk-kinesis", "dep:aws-config"]
+# E6.5: Apache Pulsar streaming source
+pulsar-source = ["dep:pulsar"]
+# E6.6: Elasticsearch/OpenSearch sink
+elasticsearch = ["dep:elasticsearch", "dep:url"]
+# E6.8: Apache Cassandra / ScyllaDB sink
+cassandra = ["dep:scylla"]
+# E6.7: Apache HBase connector
+hbase = ["dep:hbase-thrift", "dep:thrift"]
 
 [dependencies]
 arrow = { workspace = true }
@@ -97,6 +110,13 @@ prost = { workspace = true, optional = true }
 qdrant-client = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 twox-hash = { workspace = true, optional = true }
+aws-sdk-kinesis = { version = "1.108.0", optional = true }
+aws-config = { version = "1.8.18", optional = true }
+pulsar = { version = "6.8.0", optional = true }
+elasticsearch = { version = "9.1.0-alpha.1", optional = true }
+scylla = { version = "1.6.0", optional = true }
+hbase-thrift = { version = "1.2.0", optional = true }
+thrift = { version = "0.17", optional = true }
 
 [dev-dependencies]
 mockito = { workspace = true }

@@ -5,6 +5,19 @@
 //! User-facing source, sink, capabilities, transactional, and quality interfaces.
 
 // Submodules with implementations
+#[cfg(feature = "avro")]
+pub mod avro;
+pub mod csv_json;
+#[cfg(feature = "kinesis")]
+pub mod kinesis;
+#[cfg(feature = "pulsar-source")]
+pub mod pulsar_connector;
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch_sink;
+#[cfg(feature = "cassandra")]
+pub mod cassandra_sink;
+#[cfg(feature = "hbase")]
+pub mod hbase_connector;
 #[cfg(feature = "lakehouse")]
 pub mod cdc;
 #[cfg(all(feature = "lakehouse", feature = "kafka"))]

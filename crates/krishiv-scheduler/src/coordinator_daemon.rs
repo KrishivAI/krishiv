@@ -184,7 +184,7 @@ pub fn build_shared_coordinator_sync(
         }
         // "rocksdb" is the canonical name; "redb" is accepted as a legacy alias.
         (Some("rocksdb" | "redb"), Some(path)) => {
-            let store = RocksDbMetadataStore::open(path.as_ref())
+            let store = RocksDbMetadataStore::open(path.as_path())
                 .map_err(|e| format!("rocksdb store '{}': {e}", path.display()))?;
             coord
                 .recover_from_store(&store)
@@ -785,13 +785,13 @@ fn validate_durability_profile_config(
                 Some("rocksdb" | "redb") => {}
                 Some(other) => {
                     return Err(format!(
-                        "single-node-durable requires --metadata-backend rocksdb; got '{other}'"
+                        "single-node-durable requires --metadata-backend redb; got '{other}'"
                     )
                     .into());
                 }
                 None => {
                     return Err(
-                        "single-node-durable requires --metadata-backend rocksdb and --metadata-path <path>"
+                        "single-node-durable requires --metadata-backend redb and --metadata-path <path>"
                             .into(),
                     );
                 }

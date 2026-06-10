@@ -206,6 +206,33 @@ pub enum NodeOp {
         /// Window duration in milliseconds.
         window_ms: u64,
     },
+    /// E5.2: Expand an array-typed column into one row per element.
+    ///
+    /// Equivalent to `UNNEST(array_column)` in SQL or a LATERAL join over an
+    /// array.  The `output_column` name is used for the expanded element.
+    /// If `with_ordinality` is `true` an extra `ordinality` column (`u64`) is
+    /// appended with the 1-based position of each element.
+    Unnest {
+        array_column: String,
+        output_column: String,
+        with_ordinality: bool,
+    },
+    /// E5.3: Recursive CTE — iterative fixpoint execution.
+    ///
+    /// Executes `base_query` once to seed the accumulator, then repeatedly
+    /// executes `recursive_query` (which may reference the CTE name) and unions
+    /// the new rows into the accumulator until either no new rows are produced
+    /// (fixpoint) or `max_iterations` is reached.
+    RecursiveCte {
+        /// CTE name visible inside `recursive_query`.
+        name: String,
+        /// The non-recursive seed query.
+        base_query: String,
+        /// The recursive query that may reference `name`.
+        recursive_query: String,
+        /// Hard cap on iterations to prevent infinite loops.
+        max_iterations: u32,
+    },
     /// Operator not covered by the above variants.
     Other { description: String },
 }

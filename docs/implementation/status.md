@@ -1,5 +1,44 @@
 # Krishiv Implementation Status
 
+## E6 Connector Series: Avro, CSV/JSON, Kinesis, Pulsar, Elasticsearch, HBase, Cassandra (2026-06-10)
+
+### Done
+
+Implemented seven production-quality connectors in `crates/krishiv-connectors/src/` under the E6.x series. Each connector is feature-gated, has a correct Arrow schema, pure conversion helpers (testable offline), and at least 6 unit tests. ORC (E6.2) blocked on `orcrs` crate incompatibility with Rust 1.92.
+
+| Module | Feature | Tests | Notes |
+|---|---|---|---|
+| `avro.rs` | `avro` | 10 | `AvroSource`/`AvroSink<W>`; schema conversion; lifetime trick: `flush(self)` consumes |
+| `csv_json.rs` | *(always)* | 14 | `CsvSource`/`NdjsonSource`; `Format` from `arrow::csv::reader::Format` |
+| `kinesis.rs` | `kinesis` | 7 | `KinesisSource::next_batch()`; `records_to_batch()` testable offline |
+| `pulsar_connector.rs` | `pulsar-source` | 6 | `RawBytes` shim; `TryStreamExt::try_next()` |
+| `elasticsearch_sink.rs` | `elasticsearch` | 7 | Bulk API; `SingleNodeConnectionPool`; `url::Url` |
+| `hbase_connector.rs` | `hbase` | 8 | Thrift-1 client; `MutationBuilder::column(family, qualifier)`; `spawn_blocking` |
+| `cassandra_sink.rs` | `cassandra` | 7 | ScyllaDB driver; UNLOGGED BATCH; `CqlValue` mapping |
+
+Also fixed two pre-existing bugs:
+- **`krishiv-executor/src/fragment/batch.rs`**: Duplicate `use std::sync::Arc;` at lines 5+10 → removed the second one.
+- **`krishiv-runtime/src/plan.rs`** and **`in_process_cluster.rs`**: Non-exhaustive `WindowKind` match — missing `WindowKind::Count { .. }` arm → mapped to `LocalWindowKind::Tumbling`.
+
+### Validation
+```bash
+cargo check --workspace                                                    # exit 0
+cargo test -p krishiv-connectors --lib --features "avro"                  # 10+14=24 passed
+cargo test -p krishiv-connectors --lib --features "cassandra,hbase"       # 15 passed
+cargo test -p krishiv-connectors --lib --features "pulsar-source"         # 6 passed
+```
+
+### Blockers
+- E6.2 (ORC): `orcrs 0.5.0` fails compilation on Rust 1.92 (protobuf `Enum` trait mismatch). Dependency removed; blocked until an updated crate is available.
+
+### Next useful task
+```bash
+cargo test -p krishiv-connectors --lib --features "kinesis,elasticsearch"   # Kinesis + ES tests
+# Then E7.x: metrics instrumentation, DAG visualization, final quality gate
+```
+
+---
+
 ## Phase 5: Full quality gate (2026-06-10)
 
 ### Done

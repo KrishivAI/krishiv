@@ -5,7 +5,7 @@ use crate::store::{
     PersistedJobRecord,
 };
 use krishiv_proto::{ExecutorDescriptor, ExecutorId};
-use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch};
+use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 use std::path::Path;
 
 const CF_EVENTS: &str = "events";
@@ -44,12 +44,14 @@ impl RocksDbMetadataStore {
     /// Create an ephemeral in-memory store backed by a temp directory.
     pub fn in_memory() -> SchedulerResult<Self> {
         let dir = tempfile::tempdir().map_err(|e| Self::store_err(e))?;
-        Self::open_at(dir.path(), Some(dir))
+        let path = dir.path().to_path_buf();
+        Self::open_at(&path, Some(dir))
     }
 
     /// Open or create a durable store at `path`.
     pub fn open(path: impl AsRef<Path>) -> SchedulerResult<Self> {
-        Self::open_at(path.as_ref(), None)
+        let p: &Path = path.as_ref();
+        Self::open_at(p, None)
     }
 
     fn open_at(
@@ -72,7 +74,7 @@ impl RocksDbMetadataStore {
         // Load events
         {
             let cf = db.cf_handle(CF_EVENTS).ok_or_else(|| Self::store_err("missing events CF"))?;
-            let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
             for item in iter {
                 let (k, v) = item.map_err(|e| Self::store_err(e))?;
                 let id = u64::from_le_bytes(
@@ -92,7 +94,7 @@ impl RocksDbMetadataStore {
         // Load jobs
         {
             let cf = db.cf_handle(CF_JOBS).ok_or_else(|| Self::store_err("missing jobs CF"))?;
-            let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
             for item in iter {
                 let (_, v) = item.map_err(|e| Self::store_err(e))?;
                 if let Ok(pj) = serde_json::from_slice::<PersistedJobRecord>(&v)
@@ -108,7 +110,7 @@ impl RocksDbMetadataStore {
             let cf = db
                 .cf_handle(CF_EXECUTORS)
                 .ok_or_else(|| Self::store_err("missing executors CF"))?;
-            let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
             for item in iter {
                 let (_, v) = item.map_err(|e| Self::store_err(e))?;
                 if let Ok(pe) = serde_json::from_slice::<PersistedExecutorDescriptor>(&v)
@@ -124,7 +126,7 @@ impl RocksDbMetadataStore {
             let cf = db
                 .cf_handle(CF_CONTINUOUS)
                 .ok_or_else(|| Self::store_err("missing continuous_snapshots CF"))?;
-            let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
             for item in iter {
                 let (k, v) = item.map_err(|e| Self::store_err(e))?;
                 let key = String::from_utf8_lossy(&k).into_owned();
@@ -155,7 +157,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .ok_or_else(|| Self::store_err("missing events CF"))?;
         let id = self.next_event_id;
         self.db
-            .put_cf(cf, id.to_le_bytes(), bytes)
+            .put_cf(&cf, id.to_le_bytes(), bytes)
             .map_err(|e| Self::store_err(e))?;
         self.next_event_id += 1;
         self.events.push(event);
@@ -174,7 +176,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .cf_handle(CF_JOBS)
             .ok_or_else(|| Self::store_err("missing jobs CF"))?;
         self.db
-            .put_cf(cf, record.job_id().as_str(), bytes)
+            .put_cf(&cf, record.job_id().as_str(), bytes)
             .map_err(|e| Self::store_err(e))?;
         if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
             *existing = record.clone();
@@ -196,7 +198,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .cf_handle(CF_EXECUTORS)
             .ok_or_else(|| Self::store_err("missing executors CF"))?;
         self.db
-            .put_cf(cf, descriptor.executor_id().as_str(), bytes)
+            .put_cf(&cf, descriptor.executor_id().as_str(), bytes)
             .map_err(|e| Self::store_err(e))?;
         if let Some(existing) = self
             .executors
@@ -220,7 +222,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .cf_handle(CF_EXECUTORS)
             .ok_or_else(|| Self::store_err("missing executors CF"))?;
         self.db
-            .delete_cf(cf, executor_id.as_str())
+            .delete_cf(&cf, executor_id.as_str())
             .map_err(|e| Self::store_err(e))?;
         self.executors.retain(|e| e.executor_id() != executor_id);
         Ok(())
@@ -237,7 +239,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .cf_handle(CF_CONTINUOUS)
             .ok_or_else(|| Self::store_err("missing continuous_snapshots CF"))?;
         self.db
-            .put_cf(cf, job_id, encoded)
+            .put_cf(&cf, job_id, encoded)
             .map_err(|e| Self::store_err(e))?;
         self.continuous_snapshots
             .insert(job_id.to_owned(), snapshot);
@@ -254,7 +256,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .cf_handle(CF_CONTINUOUS)
             .ok_or_else(|| Self::store_err("missing continuous_snapshots CF"))?;
         self.db
-            .delete_cf(cf, job_id)
+            .delete_cf(&cf, job_id)
             .map_err(|e| Self::store_err(e))?;
         self.continuous_snapshots.remove(job_id);
         Ok(())

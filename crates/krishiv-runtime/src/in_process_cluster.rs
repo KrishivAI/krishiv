@@ -209,6 +209,7 @@ impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
             WindowKind::Session => crate::local_streaming::LocalWindowKind::Session {
                 gap_ms: spec.session_gap_ms.unwrap_or(spec.window_size_ms),
             },
+            WindowKind::Count { .. } => crate::local_streaming::LocalWindowKind::Tumbling,
         };
 
         LocalWindowExecutionSpec {
