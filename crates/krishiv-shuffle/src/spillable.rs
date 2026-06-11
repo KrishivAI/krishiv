@@ -48,10 +48,10 @@ impl SpillableShuffleBackend {
 
         let spill_store = Arc::new(
             LocalDiskShuffleStore::new(&spill_dir).map_err(|e| {
-                ShuffleError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to open spill store at '{}': {e}", spill_dir.display()),
-                ))
+                ShuffleError::Io(std::io::Error::other(format!(
+                    "failed to open spill store at '{}': {e}",
+                    spill_dir.display()
+                )))
             })?,
         );
 
@@ -90,21 +90,31 @@ impl ShuffleStore for SpillableShuffleBackend {
         partition: ShufflePartition,
         lease_token: u64,
     ) -> ShuffleResult<()> {
-        // Account for this partition in the shared budget; the inner store
-        // will handle spilling to disk if the internal byte cap is hit.
+        // Reserve budget before writing; release it if the write fails so the
+        // counter never drifts above actual in-flight data.
         let bytes = crate::compression::partition_memory_bytes(&partition);
         self.budget.try_reserve(bytes as u64);
-        self.inner.write_partition(partition, lease_token).await
+        let result = self.inner.write_partition(partition, lease_token).await;
+        if result.is_err() {
+            self.budget.release(bytes as u64);
+        }
+        result
     }
 
     async fn read_partition(
         &self,
         id: &PartitionId,
     ) -> ShuffleResult<Option<ShufflePartition>> {
+        // Only release budget for partitions served from in-memory storage.
+        // Spilled partitions were never accounted in this budget counter, so
+        // releasing for them would underflow the counter.
+        let was_in_memory = self.inner.is_partition_in_memory(id).await;
         let result = self.inner.read_partition(id).await?;
-        if let Some(ref p) = result {
-            let bytes = crate::compression::partition_memory_bytes(p);
-            self.budget.release(bytes as u64);
+        if was_in_memory {
+            if let Some(ref p) = result {
+                let bytes = crate::compression::partition_memory_bytes(p);
+                self.budget.release(bytes as u64);
+            }
         }
         Ok(result)
     }
@@ -119,9 +129,6 @@ impl ShuffleStore for SpillableShuffleBackend {
     }
 }
 
-/// Convenience: key type for looking up a partition in the budget accounting.
-#[allow(dead_code)]
-type BudgetKey = PartitionKey;
 
 #[cfg(test)]
 mod tests {

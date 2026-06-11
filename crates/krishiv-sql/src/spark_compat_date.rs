@@ -23,7 +23,7 @@ fn civil_from_days(z: i32) -> (i32, i32, i32) {
 pub fn register_spark_date_udfs(
     ctx: &SessionContext,
 ) -> Result<(), datafusion::error::DataFusionError> {
-    for (name, part) in [("year", 0i32), ("month", 1), ("day", 2), ("quarter", 1)] {
+    for (name, part) in [("year", 0i32), ("month", 1), ("day", 2), ("quarter", 3)] {
         let part_idx = part;
         let udf = create_udf(
             name,

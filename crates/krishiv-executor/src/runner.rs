@@ -378,6 +378,7 @@ impl ExecutorTaskOutput {
     }
 
     /// E1.3: Set the backpressure signal (called by streaming fragment executors).
+    #[allow(dead_code)]
     pub(crate) fn with_backpressure(mut self, signal: krishiv_common::BackpressureSignal) -> Self {
         self.backpressure = signal;
         self

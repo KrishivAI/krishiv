@@ -77,11 +77,14 @@ impl CepOperator {
         event_time_ms: i64,
     ) -> Vec<Vec<RecordBatch>> {
         let is_new_key = !self.states.contains_key(&key);
-        if is_new_key {
+        // Track whether we successfully reserved budget for this new key.
+        // This guards against releasing budget that was never reserved — which
+        // can happen when budget eviction frees one slot but the retry still fails
+        // because another thread consumed the freed bytes concurrently.
+        let budget_reserved = if is_new_key {
             if let Some(budget) = &self.memory_budget {
                 if !budget.try_reserve(256) {
-                    // Over budget: evict the stalest key and proceed rather than
-                    // returning an error (CEP process_batch is infallible).
+                    // Over budget: evict the stalest key and retry once.
                     if let Some(stalest) = self
                         .states
                         .iter()
@@ -91,15 +94,24 @@ impl CepOperator {
                         self.states.remove(&stalest);
                         budget.release(256);
                     }
-                    // Re-try the reservation after eviction.
-                    let _ = budget.try_reserve(256);
+                    budget.try_reserve(256)
+                } else {
+                    true
                 }
+            } else {
+                true
             }
-        }
+        } else {
+            false // existing key: no new reservation
+        };
+        // Capture key identity before it is moved into the entry API.
+        let inserted_key = key.clone();
         let state = self.states.entry(key).or_default();
         let result = self
             .matcher
             .process_event(state, stage_name, batch, event_time_ms);
+        // Enforce max_keys limit. Only release budget if the evicted slot had been
+        // successfully reserved, to avoid releasing bytes that were never charged.
         if self.states.len() > self.max_keys
             && let Some(stalest) = self
                 .states
@@ -107,9 +119,15 @@ impl CepOperator {
                 .min_by_key(|(_, state)| state.last_event_ms)
                 .map(|(k, _)| k.clone())
         {
+            // If we're evicting the key that was just inserted AND its reservation
+            // failed, do not release (it was never charged).  For any other key we
+            // can safely release because it was reserved at insertion time.
+            let evicting_new_unreserved = stalest == inserted_key && !budget_reserved;
             self.states.remove(&stalest);
-            if let Some(budget) = &self.memory_budget {
-                budget.release(256);
+            if !evicting_new_unreserved {
+                if let Some(budget) = &self.memory_budget {
+                    budget.release(256);
+                }
             }
         }
         result

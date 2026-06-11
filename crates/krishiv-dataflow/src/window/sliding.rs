@@ -239,7 +239,7 @@ impl SlidingWindowOperator {
         let mut closed: Vec<(String, i64)> = self
             .accumulators
             .keys()
-            .filter(|(_, ws)| ws + size <= watermark_ms)
+            .filter(|(_, ws)| ws.saturating_add(size) <= watermark_ms)
             .cloned()
             .collect();
         if closed.is_empty() {

@@ -51,7 +51,6 @@ pub struct CountWindowSpec {
 /// folding the contributions of the current window's rows.
 struct RowContrib {
     agg: AggState,
-    global_row: u64,
 }
 
 /// Per-key state held between batches.
@@ -114,7 +113,7 @@ impl CountWindowOperator {
             // Compute the single-row contribution and push it.
             let mut contrib = AggState::new(&self.spec.agg_exprs);
             contrib.update(&self.spec.agg_exprs, batch, row)?;
-            state.buf.push_back(RowContrib { agg: contrib, global_row });
+            state.buf.push_back(RowContrib { agg: contrib });
 
             // If the buffer has reached `size`, emit this window then slide.
             while state.buf.len() >= self.spec.size as usize {

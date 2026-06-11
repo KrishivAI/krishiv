@@ -303,10 +303,9 @@ fn unescape_compact_value(s: &str) -> String {
 /// compatibility.  Multi-aggregate specs delegate to the lossless JSON
 /// format because the compact format's `:` field delimiter conflicts with
 /// agg parameter syntax (`agg=sum:col=amount`).
-pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
+pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> Result<String, PlanError> {
     if spec.agg_exprs.len() > 1 {
-        return encode_window_execution_spec(spec)
-            .expect("WindowExecutionSpec serialization is infallible");
+        return encode_window_execution_spec(spec);
     }
     let agg = if spec.agg_exprs.is_empty() {
         "agg=count".to_string()
@@ -358,13 +357,13 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
         format!(":srcs={}", encoded.join(","))
     };
 
-    format!(
+    Ok(format!(
         "{prefix}:key={}:time={}:win={}:lag={}:{agg}{extra}{ttl}{srcid}{srcs}",
         escape_compact_value(&spec.key_column),
         escape_compact_value(&spec.event_time_column),
         spec.window_size_ms,
         spec.watermark_lag_ms,
-    )
+    ))
 }
 
 fn encode_agg(agg: &WindowAgg) -> String {
@@ -668,7 +667,7 @@ mod tests {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         };
-        let frag = encode_stream_fragment(&spec);
+        let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse");
         assert_eq!(parsed.window_kind, WindowKind::Tumbling);
         assert_eq!(parsed.window_ms, 60_000);
@@ -766,7 +765,7 @@ mod tests {
             source_id_column: Some("source_id".into()),
         };
 
-        let fragment = encode_stream_fragment(&spec);
+        let fragment = encode_stream_fragment(&spec).unwrap();
         assert!(
             fragment.contains("srcs=orders:1000,payments:2500"),
             "multi-source encoding should remain deterministic: {fragment}"
@@ -814,7 +813,7 @@ mod tests {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         };
-        let frag = encode_stream_fragment(&spec);
+        let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse escaped fragment");
         assert_eq!(parsed.key_col, "ns:user_id");
         assert_eq!(parsed.time_col, "ts:ms");
@@ -836,7 +835,7 @@ mod tests {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         };
-        let frag = encode_stream_fragment(&spec);
+        let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse escaped backslash");
         assert_eq!(parsed.key_col, "path\\to");
     }
@@ -859,7 +858,7 @@ mod tests {
             source_watermark_lags,
             source_id_column: Some("src:col".into()),
         };
-        let frag = encode_stream_fragment(&spec);
+        let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse escaped multi-source");
         assert_eq!(parsed.source_id_column.as_deref(), Some("src:col"));
         assert_eq!(parsed.source_watermark_lags.get("ns:orders"), Some(&1_000));

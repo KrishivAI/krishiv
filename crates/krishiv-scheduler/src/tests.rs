@@ -2106,7 +2106,7 @@ mod scheduler_tests {
         coordinator.recover_from_store(&store).unwrap();
 
         // Executor sends its first post-restart heartbeat carrying streaming state.
-        let reported_watermark_ms: u64 = 12_000;
+        let reported_watermark_ms: i64 = 12_000;
         let reported_offset = b"kafka-partition-0:offset-42".to_vec();
         let heartbeat = ExecutorHeartbeat::new(executor_id.clone(), ExecutorState::Healthy)
             .with_lease_generation(lease)
@@ -2127,7 +2127,7 @@ mod scheduler_tests {
         let task = &detail.stages()[0].tasks()[0];
         assert_eq!(
             task.last_watermark_ms(),
-            Some(reported_watermark_ms as i64),
+            Some(reported_watermark_ms),
             "task watermark must be updated from heartbeat"
         );
         assert_eq!(

@@ -271,7 +271,7 @@ impl SessionWindowOperator {
             }
             let key = extract_agg_key(batch, key_idx, row)?.to_string();
             if let Some(existing) = self.sessions.get(&key)
-                && event_time_ms > existing.last_event_time_ms.saturating_add(gap)
+                && event_time_ms >= existing.last_event_time_ms.saturating_add(gap)
                 && let Some(s) = self.sessions.remove(&key)
             {
                 output.push(self.build_output_batch(
@@ -283,16 +283,15 @@ impl SessionWindowOperator {
             }
             // Reserve memory for a new session entry (~128 bytes for key + state).
             let is_new_entry = !self.sessions.contains_key(&key);
-            if is_new_entry {
-                if let Some(budget) = &self.memory_budget {
-                    if !budget.try_reserve(128) {
-                        return Err(ExecError::ResourceExhausted(format!(
-                            "session window exceeded memory budget ({} bytes used, limit {} bytes)",
-                            budget.used_bytes(),
-                            budget.limit().unwrap_or(0),
-                        )));
-                    }
-                }
+            if is_new_entry
+                && let Some(budget) = &self.memory_budget
+                && !budget.try_reserve(128)
+            {
+                return Err(ExecError::ResourceExhausted(format!(
+                    "session window exceeded memory budget ({} bytes used, limit {} bytes)",
+                    budget.used_bytes(),
+                    budget.limit().unwrap_or(0),
+                )));
             }
             let session = self.sessions.entry(key).or_insert_with(|| SessionState {
                 session_start_ms: event_time_ms,

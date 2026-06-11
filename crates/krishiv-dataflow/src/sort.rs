@@ -99,11 +99,17 @@ impl SortedBatchMerger {
 
     /// Merge `inputs` (each already sorted by `keys`) into one sorted batch.
     pub fn merge(&self, inputs: &[RecordBatch]) -> ExecResult<RecordBatch> {
-        let inputs: Vec<&RecordBatch> = inputs.iter().filter(|b| b.num_rows() > 0).collect();
-        if inputs.is_empty() {
-            // Return an empty batch with the schema of the first non-empty input if available.
-            return Err(ExecError::InvalidInput("merge: no non-empty input batches".into()));
+        let non_empty: Vec<&RecordBatch> = inputs.iter().filter(|b| b.num_rows() > 0).collect();
+        if non_empty.is_empty() {
+            // All inputs have zero rows — return an empty batch using the schema of
+            // the first input. If there are no inputs at all, we cannot infer a schema.
+            let schema = inputs
+                .first()
+                .map(|b| b.schema())
+                .ok_or_else(|| ExecError::InvalidInput("merge: no input batches".into()))?;
+            return Ok(RecordBatch::new_empty(schema));
         }
+        let inputs = non_empty;
         if inputs.len() == 1 {
             return Ok((*inputs[0]).clone());
         }

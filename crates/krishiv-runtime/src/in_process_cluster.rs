@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_plan::window::{WindowExecutionSpec, WindowKind, encode_stream_fragment};
+use krishiv_plan::{PlanError, window::{WindowExecutionSpec, WindowKind, encode_stream_fragment}};
 
 use krishiv_scheduler::MetadataStore;
 
@@ -248,7 +248,7 @@ impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
         }
     }
 }
-pub fn fragment_from_local_spec(spec: &LocalWindowExecutionSpec) -> String {
+pub fn fragment_from_local_spec(spec: &LocalWindowExecutionSpec) -> Result<String, PlanError> {
     encode_stream_fragment(&local_spec_to_plan_spec(spec))
 }
 
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn fragment_from_local_spec_returns_nonempty() {
-        let fragment = fragment_from_local_spec(&tumbling_spec());
+        let fragment = fragment_from_local_spec(&tumbling_spec()).unwrap();
         assert!(!fragment.is_empty());
         assert!(fragment.contains("stream:tw"));
     }
@@ -642,7 +642,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
-        let fragment = fragment_from_local_spec(&spec);
+        let fragment = fragment_from_local_spec(&spec).unwrap();
         assert!(fragment.contains("stream:sw"));
     }
 
@@ -660,7 +660,7 @@ mod tests {
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
-        let fragment = fragment_from_local_spec(&spec);
+        let fragment = fragment_from_local_spec(&spec).unwrap();
         assert!(fragment.contains("stream:ses"));
     }
 

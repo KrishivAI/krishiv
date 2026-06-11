@@ -475,7 +475,7 @@ pub struct StreamingTaskState {
     /// Task this state belongs to.
     pub task_id: TaskId,
     /// Current event-time watermark in milliseconds since epoch.
-    pub watermark_ms: u64,
+    pub watermark_ms: i64,
     /// Last committed source offset for this task's input partition.
     /// Encoded as a byte string whose interpretation is connector-specific.
     pub source_offset: Vec<u8>,
@@ -483,7 +483,7 @@ pub struct StreamingTaskState {
 
 impl StreamingTaskState {
     /// Create a streaming task state report.
-    pub fn new(task_id: TaskId, watermark_ms: u64, source_offset: Vec<u8>) -> Self {
+    pub fn new(task_id: TaskId, watermark_ms: i64, source_offset: Vec<u8>) -> Self {
         Self {
             task_id,
             watermark_ms,

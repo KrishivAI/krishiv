@@ -5347,6 +5347,7 @@ dependencies = [
  "axum 0.8.9",
  "blake3",
  "bytes",
+ "constant_time_eq 0.5.0",
  "dashmap",
  "futures",
  "krishiv-common",

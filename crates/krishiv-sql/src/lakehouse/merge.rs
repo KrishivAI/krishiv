@@ -121,7 +121,7 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
         });
     };
 
-    Ok(vec![merge_result_batch(metrics)])
+    Ok(vec![merge_result_batch(metrics)?])
 }
 
 /// **Dry-run** merge for Iceberg in-memory tables.
@@ -230,15 +230,13 @@ async fn dry_run_merge(
     })
 }
 
-fn merge_result_batch(result: krishiv_connectors::lakehouse::MergeDeltaResult) -> RecordBatch {
-    merge_metrics_batch(
-        result.rows_inserted,
-        result.rows_updated,
-        result.rows_deleted,
-    )
+fn merge_result_batch(
+    result: krishiv_connectors::lakehouse::MergeDeltaResult,
+) -> SqlResult<RecordBatch> {
+    merge_metrics_batch(result.rows_inserted, result.rows_updated, result.rows_deleted)
 }
 
-fn merge_metrics_batch(inserted: u64, updated: u64, deleted: u64) -> RecordBatch {
+fn merge_metrics_batch(inserted: u64, updated: u64, deleted: u64) -> SqlResult<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("rows_inserted", DataType::Int64, false),
         Field::new("rows_updated", DataType::Int64, false),
@@ -252,7 +250,7 @@ fn merge_metrics_batch(inserted: u64, updated: u64, deleted: u64) -> RecordBatch
             Arc::new(Int64Array::from(vec![deleted as i64])),
         ],
     )
-    .expect("valid merge metrics batch")
+    .map_err(|e| SqlError::DataFusion { message: format!("merge metrics batch: {e}") })
 }
 
 #[cfg(test)]

@@ -144,12 +144,18 @@ pub fn allows_unbounded_shuffle_store(profile: DurabilityProfile) -> bool {
 
 /// Whether remote Flight SQL-comment fallbacks are permitted (dev-local only).
 pub fn allows_remote_sql_comment_fallback() -> bool {
-    allow_legacy_task_fragments(resolve_durability_profile())
+    allow_legacy_task_fragments(cached_durability_profile())
 }
 
 /// Whether alpha / placeholder public APIs may be invoked.
 pub fn allows_alpha_api() -> bool {
-    resolve_durability_profile() == DurabilityProfile::DevLocal && !is_production_mode()
+    cached_durability_profile() == DurabilityProfile::DevLocal && !is_production_mode()
+}
+
+/// Process-wide cached durability profile (env var read once).
+fn cached_durability_profile() -> DurabilityProfile {
+    static CACHED: OnceLock<DurabilityProfile> = OnceLock::new();
+    *CACHED.get_or_init(resolve_durability_profile)
 }
 
 /// Opt-in escape hatch for native scalar UDF execution under durable profiles.

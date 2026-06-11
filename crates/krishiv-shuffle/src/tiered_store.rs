@@ -49,9 +49,12 @@ impl ShuffleStore for TieredShuffleStore {
     }
 
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
-        // First try local disk.
-        if let Ok(Some(part)) = self.local.read_partition(id).await {
-            return Ok(Some(part));
+        // Try local disk first. Only fall through on a clean miss (Ok(None));
+        // propagate real errors rather than silently falling back to remote
+        // and potentially returning corrupt data to the caller.
+        match self.local.read_partition(id).await? {
+            Some(part) => return Ok(Some(part)),
+            None => {}
         }
 
         // Local miss after executor restart or eviction; fall back to the
@@ -64,9 +67,10 @@ impl ShuffleStore for TieredShuffleStore {
     }
 
     async fn stream_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShuffleStream>> {
-        // First try local disk.
-        if let Ok(Some(stream)) = self.local.stream_partition(id).await {
-            return Ok(Some(stream));
+        // Same fall-through policy as read_partition: only on clean miss.
+        match self.local.stream_partition(id).await? {
+            Some(stream) => return Ok(Some(stream)),
+            None => {}
         }
 
         tracing::info!(
@@ -77,7 +81,15 @@ impl ShuffleStore for TieredShuffleStore {
     }
 
     async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()> {
-        let _ = self.local.delete_job_partitions(job_id).await;
+        // Best-effort local delete; log failures but don't let them mask the
+        // remote delete result. Orphan scanner will reclaim any leftovers.
+        if let Err(e) = self.local.delete_job_partitions(job_id).await {
+            tracing::warn!(
+                job_id,
+                error = %e,
+                "TieredShuffleStore: local partition delete failed; remote delete proceeding"
+            );
+        }
         self.remote.delete_job_partitions(job_id).await
     }
 }

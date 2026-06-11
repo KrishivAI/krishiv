@@ -12,12 +12,14 @@ use sha2::{Digest, Sha256};
 /// assert_eq!(hash.len(), 64);
 /// assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
 /// ```
+#[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     format!("{hash:x}")
 }
 
 /// Compute the raw SHA-256 digest of `data` as a `[u8; 32]`.
+#[must_use]
 pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     let hash = Sha256::digest(data);
     hash.into()
@@ -27,6 +29,7 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
 /// `u64` (little-endian).
 ///
 /// Useful for dedup maps where full 32-byte hashes are unnecessary.
+#[must_use]
 pub fn sha256_dedup_key(data: &[u8]) -> u64 {
     let hash = Sha256::digest(data);
     u64::from_le_bytes([
@@ -41,6 +44,7 @@ pub fn sha256_dedup_key(data: &[u8]) -> u64 {
 /// let h2 = krishiv_common::hash::sha256_hex_multi(&[b"abc"]);
 /// assert_eq!(h1, h2);
 /// ```
+#[must_use]
 pub fn sha256_hex_multi(inputs: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     for input in inputs {
@@ -50,6 +54,7 @@ pub fn sha256_hex_multi(inputs: &[&[u8]]) -> String {
 }
 
 /// Incrementally hash multiple byte slices and return the raw `[u8; 32]`.
+#[must_use]
 pub fn sha256_bytes_multi(inputs: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for input in inputs {

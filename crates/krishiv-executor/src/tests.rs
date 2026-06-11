@@ -2335,7 +2335,7 @@ mod executor_tests {
             coordinator.recover_from_store(&store).unwrap();
         }
 
-        let reported_watermark_ms: u64 = 7_500;
+        let reported_watermark_ms: i64 = 7_500;
         let reported_offset = b"events:0:offset-99".to_vec();
         {
             let heartbeat = ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy)
@@ -2353,7 +2353,7 @@ mod executor_tests {
         let task = &detail.stages()[0].tasks()[0];
         assert_eq!(
             task.last_watermark_ms(),
-            Some(reported_watermark_ms as i64),
+            Some(reported_watermark_ms),
             "coordinator must record executor-reported watermark on re-attach"
         );
         assert_eq!(

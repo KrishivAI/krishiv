@@ -97,10 +97,17 @@ impl TumblingWindowOperator {
     }
 
     fn window_start(event_time_ms: i64, window_size_ms: u64) -> i64 {
+        // validate_spec ensures window_size_ms <= i64::MAX, so this cast is safe.
         let size = window_size_ms as i64;
         let q = event_time_ms / size;
         let r = event_time_ms % size;
-        if r < 0 { (q - 1) * size } else { q * size }
+        // Use saturating_mul to avoid panic in debug and wrapping in release for
+        // very large negative timestamps combined with large window sizes.
+        if r < 0 {
+            q.saturating_sub(1).saturating_mul(size)
+        } else {
+            q.saturating_mul(size)
+        }
     }
 
     /// Attach a late-event handler that receives each dropped late event.

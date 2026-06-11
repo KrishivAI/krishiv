@@ -432,10 +432,19 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
         .as_millis() as u64;
 
     // Periodic eviction (at most every 10 s): remove entries older than 1 hour.
-    let last_evict = AUDIT_DEDUP_LAST_EVICTION_MS.load(std::sync::atomic::Ordering::Relaxed);
-    if now_ms.saturating_sub(last_evict) >= 10_000 {
+    // compare_exchange ensures only one thread performs the (non-atomic) retain.
+    let last_evict = AUDIT_DEDUP_LAST_EVICTION_MS.load(std::sync::atomic::Ordering::Acquire);
+    if now_ms.saturating_sub(last_evict) >= 10_000
+        && AUDIT_DEDUP_LAST_EVICTION_MS
+            .compare_exchange(
+                last_evict,
+                now_ms,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
         AUDIT_DEDUP.retain(|_, ts| now_ms.saturating_sub(*ts) < 3_600_000);
-        AUDIT_DEDUP_LAST_EVICTION_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     if let Some(entry) = AUDIT_DEDUP.get(&key)

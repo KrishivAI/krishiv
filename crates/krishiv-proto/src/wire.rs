@@ -474,7 +474,8 @@ fn hot_key_report_from_wire(
 fn streaming_task_state_to_wire(value: &crate::StreamingTaskState) -> v1::StreamingTaskStateWire {
     v1::StreamingTaskStateWire {
         task_id: value.task_id.as_str().to_owned(),
-        watermark_ms: value.watermark_ms,
+        // Proto field is uint64; cast preserves bit pattern for negative sentinel values.
+        watermark_ms: value.watermark_ms as u64,
         source_offset: value.source_offset.clone(),
     }
 }
@@ -485,7 +486,8 @@ fn streaming_task_state_from_wire(
     let task_id = TaskId::try_new(value.task_id).map_err(WireError::from_id)?;
     Ok(crate::StreamingTaskState::new(
         task_id,
-        value.watermark_ms,
+        // Proto field is uint64; cast preserves bit pattern for negative sentinel values.
+        value.watermark_ms as i64,
         value.source_offset,
     ))
 }
@@ -611,10 +613,10 @@ pub fn executor_task_assignment_from_wire(
         assignment = assignment.with_task_timeout_secs(value.task_timeout_secs);
     }
     if value.has_key_group_range {
-        assignment = assignment.with_key_group_range(KeyGroupRange::new(
-            value.key_group_range_start,
-            value.key_group_range_end,
-        ));
+        assignment = assignment.with_key_group_range(
+            KeyGroupRange::try_new(value.key_group_range_start, value.key_group_range_end)
+                .map_err(WireError::from_id)?,
+        );
     }
     if value.cpu_limit_nanos > 0 {
         assignment = assignment.with_cpu_limit_nanos(value.cpu_limit_nanos);
@@ -1179,6 +1181,9 @@ fn input_partition_descriptor_from_wire(
         }
         v1::InputPartitionDescriptorKind::InlineIpc => {
             require_non_empty(&value.table_name, "inline ipc table name")?;
+            if value.ipc_bytes.is_empty() {
+                return Err(WireError::new("inline ipc bytes cannot be empty"));
+            }
             Ok(InputPartitionDescriptor::InlineIpc {
                 table_name: value.table_name,
                 ipc_bytes: value.ipc_bytes,
@@ -1645,6 +1650,9 @@ pub fn restore_job_request_to_wire(
 pub fn restore_job_request_from_wire(
     value: v1::RestoreJobRequest,
 ) -> WireResult<crate::management::RestoreJobRequest> {
+    if value.epoch == 0 {
+        return Err(WireError::new("restore job request: epoch must be > 0"));
+    }
     Ok(crate::management::RestoreJobRequest {
         job_id: JobId::try_new(value.job_id).map_err(WireError::from_id)?,
         epoch: value.epoch,

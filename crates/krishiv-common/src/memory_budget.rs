@@ -77,9 +77,11 @@ impl MemoryBudget {
 
     /// Release previously reserved `bytes`. Saturates at zero on underflow.
     pub fn release(&self, bytes: u64) {
-        let prev = self.used_bytes.load(Ordering::Relaxed);
-        let new_val = prev.saturating_sub(bytes);
-        self.used_bytes.store(new_val, Ordering::Relaxed);
+        let _ = self.used_bytes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some(cur.saturating_sub(bytes)),
+        );
     }
 
     /// Remaining bytes before the limit is hit, or `None` for unlimited.

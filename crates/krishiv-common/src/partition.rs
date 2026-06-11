@@ -162,6 +162,7 @@ fn shard_index(
 /// Every batch must contain `key_column` with the same supported data type.
 /// Each input row is assigned exactly once, preserving its schema and relative
 /// order within the source batch.
+#[must_use = "partitioned batches are discarded if the return value is ignored"]
 pub fn partition_record_batches_by_key(
     batches: &[RecordBatch],
     key_column: &str,

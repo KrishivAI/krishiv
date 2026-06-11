@@ -54,6 +54,15 @@ pub type SqlResult<T> = Result<T, SqlError>;
 pub type SqlStream =
     std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<RecordBatch, String>> + Send>>;
 
+/// Global counter for unique ephemeral table names, preventing concurrent
+/// MERGE/CEP queries from overwriting each other's result tables.
+static EPHEMERAL_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_ephemeral_name(prefix: &str) -> String {
+    let id = EPHEMERAL_TABLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("__{prefix}_{id}")
+}
+
 // ── Plan cache (single-lock, race-free) ──────────────────────────────────────
 
 /// Whether the [`SqlEngine`] internal builder should attempt to register the

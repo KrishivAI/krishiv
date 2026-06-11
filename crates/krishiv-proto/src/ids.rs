@@ -105,14 +105,14 @@ impl AttemptId {
 
     /// Next monotonic attempt id.
     pub fn next(self) -> Self {
-        let next = self.0.saturating_add(1);
-        if next == u32::MAX {
+        if self.0 == u32::MAX {
             tracing::warn!(
                 current = self.0,
-                "AttemptId saturated at u32::MAX; further retries cannot be distinguished"
+                "AttemptId already saturated at u32::MAX; further retries cannot be distinguished"
             );
+            return self;
         }
-        Self(next)
+        Self(self.0 + 1)
     }
 
     /// Numeric attempt id.
@@ -147,7 +147,14 @@ impl LeaseGeneration {
 
     /// Next monotonic lease generation.
     pub fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+        if self.0 == u64::MAX {
+            tracing::warn!(
+                current = self.0,
+                "LeaseGeneration saturated at u64::MAX; executor registration cannot advance"
+            );
+            return self;
+        }
+        Self(self.0 + 1)
     }
 
     /// Numeric lease generation.
@@ -180,7 +187,14 @@ impl FencingToken {
         Self(1)
     }
     pub fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+        if self.0 == u64::MAX {
+            tracing::warn!(
+                current = self.0,
+                "FencingToken saturated at u64::MAX; checkpoint epoch cannot advance"
+            );
+            return self;
+        }
+        Self(self.0 + 1)
     }
     pub fn as_u64(self) -> u64 {
         self.0

@@ -41,7 +41,6 @@ pub enum RangeBound {
 impl RangeBound {
     fn from_i32(v: i32) -> Self { Self::Int32(v) }
     fn from_i64(v: i64) -> Self { Self::Int64(v) }
-    fn from_str(v: &str) -> Self { Self::Utf8(v.to_owned()) }
 }
 
 // ── Sampler ───────────────────────────────────────────────────────────────────
@@ -69,14 +68,16 @@ impl RangeSampler {
         let idx = batch
             .schema()
             .index_of(key_column)
-            .map_err(|e| ShuffleError::InvalidPartitionCount { buckets: 0 })?;
+            .map_err(|_e| ShuffleError::InvalidPartitionCount { buckets: 0 })?;
         let col = batch.column(idx);
         let step = (1.0 / self.sample_fraction).ceil() as usize;
         let step = step.max(1);
 
         match col.data_type() {
             DataType::Int32 => {
-                let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
+                let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    ShuffleError::TypeMismatch { expected: "Int32 downcast failed".into() }
+                })?;
                 for row in (0..batch.num_rows()).step_by(step) {
                     if !arr.is_null(row) {
                         self.i32_samples.push(arr.value(row));
@@ -84,7 +85,9 @@ impl RangeSampler {
                 }
             }
             DataType::Int64 => {
-                let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    ShuffleError::TypeMismatch { expected: "Int64 downcast failed".into() }
+                })?;
                 for row in (0..batch.num_rows()).step_by(step) {
                     if !arr.is_null(row) {
                         self.i64_samples.push(arr.value(row));
@@ -92,7 +95,9 @@ impl RangeSampler {
                 }
             }
             DataType::Utf8 => {
-                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                    ShuffleError::TypeMismatch { expected: "Utf8 downcast failed".into() }
+                })?;
                 for row in (0..batch.num_rows()).step_by(step) {
                     if !arr.is_null(row) {
                         self.str_samples.push(arr.value(row).to_owned());
@@ -157,7 +162,7 @@ fn pick_boundaries<T: Clone, F: Fn(T) -> RangeBound>(
 }
 
 fn pick_boundaries_str(sorted: &[String], num_boundaries: usize) -> Vec<RangeBound> {
-    pick_boundaries(sorted, num_boundaries, |s| RangeBound::Utf8(s))
+    pick_boundaries(sorted, num_boundaries, RangeBound::Utf8)
 }
 
 // ── RangePartitioner ─────────────────────────────────────────────────────────
@@ -200,7 +205,9 @@ impl RangePartitioner {
 
         match col.data_type() {
             DataType::Int32 => {
-                let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
+                let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    ShuffleError::TypeMismatch { expected: "Int32 downcast failed".into() }
+                })?;
                 for row in 0..batch.num_rows() {
                     let bucket = if arr.is_null(row) {
                         0
@@ -211,7 +218,9 @@ impl RangePartitioner {
                 }
             }
             DataType::Int64 => {
-                let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    ShuffleError::TypeMismatch { expected: "Int64 downcast failed".into() }
+                })?;
                 for row in 0..batch.num_rows() {
                     let bucket = if arr.is_null(row) {
                         0
@@ -222,7 +231,9 @@ impl RangePartitioner {
                 }
             }
             DataType::Utf8 => {
-                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                    ShuffleError::TypeMismatch { expected: "Utf8 downcast failed".into() }
+                })?;
                 for row in 0..batch.num_rows() {
                     let bucket = if arr.is_null(row) {
                         0
@@ -267,10 +278,10 @@ impl RangePartitioner {
 
     fn bucket_for_i32(&self, v: i32) -> usize {
         for (i, b) in self.boundaries.iter().enumerate() {
-            if let RangeBound::Int32(bound) = b {
-                if v < *bound {
-                    return i;
-                }
+            if let RangeBound::Int32(bound) = b
+                && v < *bound
+            {
+                return i;
             }
         }
         (self.buckets - 1) as usize
@@ -278,10 +289,10 @@ impl RangePartitioner {
 
     fn bucket_for_i64(&self, v: i64) -> usize {
         for (i, b) in self.boundaries.iter().enumerate() {
-            if let RangeBound::Int64(bound) = b {
-                if v < *bound {
-                    return i;
-                }
+            if let RangeBound::Int64(bound) = b
+                && v < *bound
+            {
+                return i;
             }
         }
         (self.buckets - 1) as usize
@@ -289,10 +300,10 @@ impl RangePartitioner {
 
     fn bucket_for_str(&self, v: &str) -> usize {
         for (i, b) in self.boundaries.iter().enumerate() {
-            if let RangeBound::Utf8(bound) = b {
-                if v < bound.as_str() {
-                    return i;
-                }
+            if let RangeBound::Utf8(bound) = b
+                && v < bound.as_str()
+            {
+                return i;
             }
         }
         (self.buckets - 1) as usize

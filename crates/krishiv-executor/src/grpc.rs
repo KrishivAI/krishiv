@@ -220,7 +220,7 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         // process them through the window executor.
         self.continuous_inputs
             .entry(job_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .extend(batches);
 
         Ok(tonic::Response::new(TaskStatusResponse::new(

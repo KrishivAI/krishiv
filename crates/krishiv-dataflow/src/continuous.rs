@@ -380,6 +380,16 @@ impl ContinuousWindowExecutor {
             return self.drain(input_batches);
         }
 
+        // Eagerly purge TTL-expired entries BEFORE taking the snapshot so that
+        // the snapshot captures post-purge state. If we took the snapshot first
+        // and purge_expired ran inside drain(), a rollback would restore pre-purge
+        // state while the state backend retained its post-purge writes — leaving
+        // the in-memory and backend views inconsistent.
+        if self.last_watermark_ms != i64::MIN {
+            self.operator.set_watermark(self.last_watermark_ms);
+        }
+        self.operator.purge_expired()?;
+
         let state_snapshot = self.snapshot()?;
         let watermark_snapshot = self.watermark.clone();
         let last_watermark_snapshot = self.last_watermark_ms;

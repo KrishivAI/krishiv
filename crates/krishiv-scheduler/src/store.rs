@@ -1034,7 +1034,7 @@ pub(crate) fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
 }
 
 /// Serialize coordinator metadata for etcd or other blob stores.
-#[cfg(feature = "etcd")]
+#[cfg(all(feature = "etcd", test))]
 pub(crate) fn encode_metadata_snapshot(
     events: &[EventLogEvent],
     jobs: &[JobRecord],
@@ -1420,7 +1420,7 @@ impl NonBlockingStoreHandle {
 }
 
 /// Restore coordinator metadata from a serialized snapshot blob.
-#[cfg(feature = "etcd")]
+#[cfg(all(feature = "etcd", test))]
 pub(crate) fn decode_metadata_snapshot(
     bytes: &[u8],
 ) -> SchedulerResult<(Vec<EventLogEvent>, Vec<JobRecord>)> {

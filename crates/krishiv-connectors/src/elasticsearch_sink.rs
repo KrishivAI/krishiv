@@ -152,9 +152,9 @@ pub fn batch_to_json_docs(batch: &RecordBatch) -> Vec<Map<String, JsonValue>> {
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let col = batch.column(col_idx);
         let name = field.name().clone();
-        for row in 0..n {
+        for (row, map) in rows.iter_mut().enumerate() {
             let val = arrow_scalar_to_json(col.as_ref(), row);
-            rows[row].insert(name.clone(), val);
+            map.insert(name.clone(), val);
         }
     }
     rows
@@ -201,10 +201,10 @@ fn arrow_scalar_to_json(col: &dyn Array, row: usize) -> JsonValue {
 
 fn extract_id(batch: &RecordBatch, col_idx: usize, row: usize) -> String {
     let col = batch.column(col_idx);
-    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-        if !arr.is_null(row) {
-            return arr.value(row).to_owned();
-        }
+    if let Some(arr) = col.as_any().downcast_ref::<StringArray>()
+        && !arr.is_null(row)
+    {
+        return arr.value(row).to_owned();
     }
     row.to_string()
 }

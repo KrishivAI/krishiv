@@ -323,14 +323,14 @@ impl HashJoin {
         let mut build_map: HashMap<CompositeKey, Vec<u32>> =
             HashMap::with_capacity(right.num_rows());
         for row in 0..right.num_rows() {
-            if let Some(budget) = &self.memory_budget {
-                if !budget.try_reserve(BYTES_PER_BUILD_ENTRY) {
-                    return Err(ExecError::ResourceExhausted(format!(
-                        "hash join build side exceeded memory budget ({} bytes used, limit {} bytes)",
-                        budget.used_bytes(),
-                        budget.limit().unwrap_or(0),
-                    )));
-                }
+            if let Some(budget) = &self.memory_budget
+                && !budget.try_reserve(BYTES_PER_BUILD_ENTRY)
+            {
+                return Err(ExecError::ResourceExhausted(format!(
+                    "hash join build side exceeded memory budget ({} bytes used, limit {} bytes)",
+                    budget.used_bytes(),
+                    budget.limit().unwrap_or(0),
+                )));
             }
             let key = Self::build_composite_key(right, &right_key_indices, row)?;
             build_map.entry(key).or_default().push(row as u32);

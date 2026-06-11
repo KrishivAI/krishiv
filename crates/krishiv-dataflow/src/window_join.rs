@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, UInt32Array};
 use arrow::compute::take;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::join::{AggKey, extract_agg_key};
@@ -112,10 +112,14 @@ impl WindowJoin {
             let key = extract_agg_key(batch, key_idx, row)?;
             let key_str = key.to_string();
             let event_ms = time_arr.value(row);
-            let window_start = window_start_for(event_ms, self.spec.window_ms as i64);
+            let window_start = window_start_for(
+                event_ms,
+                i64::try_from(self.spec.window_ms).unwrap_or(i64::MAX),
+            );
 
             // Advance watermark.
-            let new_wm = event_ms - self.spec.watermark_lag_ms as i64;
+            let lag = i64::try_from(self.spec.watermark_lag_ms).unwrap_or(i64::MAX);
+            let new_wm = event_ms.saturating_sub(lag);
             if new_wm > self.watermark_ms {
                 self.watermark_ms = new_wm;
             }
@@ -144,13 +148,13 @@ impl WindowJoin {
         let window_ms = self.spec.window_ms as i64;
         let mut closed_keys: Vec<(String, i64)> = Vec::new();
 
-        for (k, _) in &self.left_buf {
+        for k in self.left_buf.keys() {
             let window_end = k.1 + window_ms;
             if window_end <= wm {
                 closed_keys.push(k.clone());
             }
         }
-        for (k, _) in &self.right_buf {
+        for k in self.right_buf.keys() {
             let window_end = k.1 + window_ms;
             if window_end <= wm && !closed_keys.contains(k) {
                 closed_keys.push(k.clone());

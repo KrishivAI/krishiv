@@ -206,7 +206,7 @@ pub fn validate_no_streaming_subqueries(
 
 fn extract_table_names_from_query(query: &Query) -> HashSet<String> {
     let mut names = HashSet::new();
-    visit_relations(query, |relation| {
+    let _ = visit_relations(query, |relation| {
         names.insert(relation.to_string().to_lowercase());
         std::ops::ControlFlow::<()>::Continue(())
     });

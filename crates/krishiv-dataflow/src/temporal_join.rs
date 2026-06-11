@@ -171,8 +171,16 @@ impl TemporalJoinOperator {
                         row_cols.push(arrow::array::new_null_array(dt, 1));
                     }
                     output_columns.push(row_cols);
+                } else {
+                    // Table schema is not yet known (no table side data has arrived).
+                    // This stream row is dropped rather than emitted with unknown-width
+                    // null columns. In a left outer join this is a data loss risk;
+                    // operators should buffer the stream side until the table schema
+                    // is available. Log so this condition is observable.
+                    tracing::warn!(
+                        "temporal_join: left-outer row dropped — table schema unknown (no table data seen yet)"
+                    );
                 }
-                // If no schema available, skip this row (no table data seen yet).
             }
         }
 
@@ -218,16 +226,23 @@ fn build_join_key(batch: &RecordBatch, key_indices: &[usize], row: usize) -> Str
 }
 
 fn format_column_value(array: &dyn Array, row: usize) -> String {
+    // Tag every value with a type prefix so SQL NULLs and the string "NULL"
+    // cannot produce the same join key.  Each variant uses a single-byte ASCII
+    // control character that cannot appear in normal string data:
+    //   \x00  = SQL NULL
+    //   I<n>  = Int64 n
+    //   S<s>  = Utf8 string s
+    //   ?     = unsupported type (cannot match any real value)
     if array.is_null(row) {
-        return "NULL".to_owned();
+        return "\x00".to_owned();
     }
     if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
-        return arr.value(row).to_string();
+        return format!("I{}", arr.value(row));
     }
     if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-        return arr.value(row).to_owned();
+        return format!("S{}", arr.value(row));
     }
-    "<unsupported_type>".to_owned()
+    "?".to_owned()
 }
 
 fn slice_column(array: &ArrayRef, offset: usize, length: usize) -> ArrayRef {

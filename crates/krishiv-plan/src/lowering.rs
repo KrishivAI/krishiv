@@ -46,6 +46,14 @@ fn node_op_to_fragment(op: &NodeOp) -> Option<String> {
             let sql = if filters.is_empty() {
                 format!("SELECT * FROM {quoted}")
             } else {
+                // Reject filter expressions that contain SQL comment sequences or
+                // statement terminators — these cannot appear in a valid predicate
+                // and are the primary injection vectors.
+                for f in filters.iter() {
+                    if f.contains("--") || f.contains("/*") || f.contains(';') {
+                        return None;
+                    }
+                }
                 let where_clause = filters.join(" AND ");
                 format!("SELECT * FROM {quoted} WHERE {where_clause}")
             };

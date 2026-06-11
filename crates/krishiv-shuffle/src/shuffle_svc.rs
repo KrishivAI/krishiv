@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::{LocalDiskShuffleStore, PartitionId, ShuffleCompression, ShuffleStore};
 use axum::Router;
+use constant_time_eq::constant_time_eq;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -66,7 +67,7 @@ pub(crate) async fn read_partition(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let expected = format!("Bearer {token}");
-        if auth_header != expected {
+        if !constant_time_eq(auth_header.as_bytes(), expected.as_bytes()) {
             return Err(StatusCode::UNAUTHORIZED);
         }
     }

@@ -22,12 +22,8 @@
 //! the "naïve" fixpoint strategy, suitable for transitive-closure and
 //! tree-traversal queries on bounded datasets.
 
-use std::collections::HashSet;
-
 use arrow::record_batch::RecordBatch;
-use datafusion::sql::sqlparser::ast::{
-    Cte, Query, SetExpr, SetOperator, SetQuantifier, Statement, With,
-};
+use datafusion::sql::sqlparser::ast::{Query, SetExpr, SetOperator, SetQuantifier, Statement};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 

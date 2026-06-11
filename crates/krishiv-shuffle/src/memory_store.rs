@@ -113,6 +113,18 @@ impl InMemoryShuffleStore {
         self
     }
 
+    /// Returns `true` if the partition is currently held in memory (not spilled).
+    ///
+    /// Used by budget-aware wrappers to decide whether to credit back budget
+    /// when a partition is consumed by a read.
+    pub async fn is_partition_in_memory(&self, id: &PartitionId) -> bool {
+        let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+        let Ok(spilled) = shuffle_read_lock(&self.spilled) else {
+            return false;
+        };
+        !spilled.contains(&key)
+    }
+
     async fn ensure_memory_capacity_locked(
         &self,
         incoming_key: &PartitionKey,

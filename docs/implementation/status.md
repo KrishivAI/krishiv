@@ -1777,3 +1777,54 @@ cargo test -p krishiv-connectors --features lakehouse --lib -- iceberg
 
 Next useful command: `cargo test --workspace --lib` (requires system libpython3.12 for
 krishiv-python; exclude it if unavailable).
+
+---
+
+## Full-workspace bug sweep — all 411 files (2026-06-10)
+
+Ran `cargo clippy --workspace --exclude krishiv-python -- -D warnings` across all 411 Rust
+source files in 20 crates. Fixed every error; zero warnings promoted to errors remain.
+
+### Fixes applied
+
+| File | Error | Fix |
+|---|---|---|
+| `krishiv-common/src/backpressure.rs` | `impl Default` can be derived | Added `#[derive(Default)]` + `#[default]` on `None` variant; removed manual impl |
+| `krishiv-shuffle/src/range_partitioner.rs` | Unused var `e`; dead fn `from_str`; redundant closure; 3× collapsible-if | `_e`; removed `from_str`; `RangeBound::Utf8` as fn ptr; let-chain rewrites |
+| `krishiv-shuffle/src/spillable.rs` | `std::io::Error::new(Other, …)` → `std::io::Error::other` | Used `Error::other(…)` |
+| `krishiv-connectors/src/registry/drivers/lakehouse.rs` | `fn flush → impl Future` should be `async fn` | Changed to `async fn flush` |
+| `krishiv-dataflow/src/lookup_join.rs` | Unused imports `BooleanArray`, `Float64Array`, `Int32Array`, `Int64Array`, `StringArray` | Removed from top-level; added `StringArray` to test module's own import |
+| `krishiv-dataflow/src/window_join.rs` | Unused import `DataType`; `for (k, _) in map` should iterate keys | Removed import; `map.keys()` |
+| `krishiv-dataflow/src/window/count.rs` | Field `global_row` in `RowContrib` never read | Removed field and its initialiser |
+| `krishiv-dataflow/src/cep.rs` | 2× collapsible-if | Let-chain rewrite |
+| `krishiv-dataflow/src/join.rs` | Collapsible-if (budget check) | Let-chain rewrite |
+| `krishiv-dataflow/src/window/session.rs` | 2× collapsible-if (budget check) | Let-chain rewrite |
+| `krishiv-sql/src/recursive_cte.rs` | Unused imports `HashSet`, `Cte`, `With` | Removed |
+| `krishiv-sql/src/subquery.rs` | Unused `ControlFlow` return value | `let _ =` |
+| `krishiv-scheduler/src/rocksdb_metadata.rs` | 15× redundant closure `\|e\| Self::store_err(e)` | `Self::store_err` direct function reference |
+| `krishiv-executor/src/cli.rs` | Unused import `executor_task_grpc_server_with_continuous` | Removed |
+| `krishiv-executor/src/runner.rs` | `with_backpressure` never used | `#[allow(dead_code)]` (intentionally kept for future use) |
+| `krishiv-executor/src/grpc.rs` | `or_insert_with(Vec::new)` should be `or_default()` | Used `or_default()` |
+
+### Validation
+```
+cargo clippy --workspace --exclude krishiv-python -- -D warnings   # 0 errors
+cargo test --workspace --lib --exclude krishiv-python               # 19 suites, 0 failures
+```
+
+## Bug sweep — loop pass 2 (2026-06-10)
+
+Second pass adding feature-gated code paths to the sweep. Two more bugs found and fixed.
+
+| File | Error | Fix |
+|---|---|---|
+| `krishiv-connectors/src/elasticsearch_sink.rs` | `for row in 0..n` index loop; collapsible-if in `extract_id` | `iter_mut().enumerate()`; let-chain rewrite |
+| `krishiv-scheduler/src/store.rs` | `encode_metadata_snapshot` / `decode_metadata_snapshot` dead (only used in `#[cfg(test)]` blocks) | Changed `#[cfg(feature = "etcd")]` → `#[cfg(all(feature = "etcd", test))]` |
+
+### Validation
+```
+cargo clippy --workspace --exclude krishiv-python -- -D warnings                                                              # 0 errors
+cargo clippy -p krishiv-connectors --features "lakehouse,kafka,avro,cassandra,hbase,elasticsearch,pulsar-source,kinesis" -- -D warnings  # 0 errors
+cargo clippy -p krishiv-scheduler --features etcd -- -D warnings                                                             # 0 errors
+cargo test --workspace --lib --exclude krishiv-python                                                                         # 19 suites, 3085 tests, 0 failures
+```

@@ -331,8 +331,8 @@ impl crate::sink::Sink for HudiSink {
         }
     }
 
-    fn flush(&mut self) -> impl Future<Output = ConnectorResult<()>> + Send {
-        async move { Ok(()) }
+    async fn flush(&mut self) -> ConnectorResult<()> {
+        Ok(())
     }
 }
 

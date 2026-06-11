@@ -15,9 +15,10 @@ use std::sync::Arc;
 ///
 /// Carried in [`ExecutorTaskOutput`] so the coordinator knows whether to
 /// schedule more work (or wait) at the upstream edge of this operator.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum BackpressureSignal {
     /// Downstream is keeping up — no flow control needed.
+    #[default]
     None,
     /// Downstream is partially full; slow down to `fraction` × current rate.
     Throttle {
@@ -59,11 +60,6 @@ impl BackpressureSignal {
     }
 }
 
-impl Default for BackpressureSignal {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 /// Shared credit gate between a producer and consumer operator.
 ///
