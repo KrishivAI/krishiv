@@ -437,10 +437,17 @@ impl SessionBuilder {
 
         let placement = match self.mode {
             ExecutionMode::Embedded => ExecutionPlacement::LocalInProcess,
-            ExecutionMode::SingleNode if self.coordinator_url.is_some() && remote_execution => {
+            ExecutionMode::SingleNode if self.coordinator_url.is_some() => {
                 ExecutionPlacement::SingleNodeDaemon
             }
-            ExecutionMode::SingleNode => ExecutionPlacement::LocalInProcess,
+            ExecutionMode::SingleNode => {
+                return Err(KrishivError::InvalidConfig {
+                    message: "SingleNode mode requires a coordinator Flight URL. \
+                              Call with_coordinator() or set a coordinator URL. \
+                              For in-process execution, use Embedded mode."
+                        .into(),
+                });
+            }
             ExecutionMode::Distributed if remote_execution => {
                 ExecutionPlacement::RemoteClusterRequired
             }

@@ -80,14 +80,10 @@ impl PySession {
 
     #[classmethod]
     pub fn local(_cls: &Bound<'_, PyType>) -> PyResult<Self> {
-        krishiv_api::SessionBuilder::new()
-            .with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
-            .build()
-            .map(|s| Self {
-                inner: Arc::new(s),
-                state_migrations: SharedStateMigrationRegistry::new(),
-            })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        // `local()` means "run locally without a daemon" — that is Embedded mode.
+        // SingleNode mode now requires a coordinator Flight URL (daemon connection).
+        // Users who want to connect to a local daemon should use Session.connect(url).
+        build_embedded_session()
     }
 
     #[classmethod]
@@ -164,7 +160,8 @@ impl PySession {
             .with_auth(auth)
             .with_policy(policy_hook);
         builder = match mode {
-            "local" | "single-node" => {
+            "local" => builder, // "local" means embedded (in-process); no mode change needed
+            "single-node" => {
                 builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
             }
             "distributed" => builder.with_execution_mode(krishiv_api::ExecutionMode::Distributed),
@@ -529,12 +526,16 @@ mod tests {
     }
 
     #[test]
-    fn session_builder_single_node_mode() {
-        let session = SessionBuilder::new()
+    fn session_builder_single_node_without_coordinator_errors() {
+        // SingleNode now requires a coordinator URL; use Embedded for in-process.
+        let err = SessionBuilder::new()
             .with_execution_mode(ExecutionMode::SingleNode)
             .build()
-            .expect("single-node session");
-        assert_eq!(session.mode(), ExecutionMode::SingleNode);
+            .expect_err("SingleNode without coordinator must fail");
+        assert!(
+            err.to_string().contains("coordinator Flight URL"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

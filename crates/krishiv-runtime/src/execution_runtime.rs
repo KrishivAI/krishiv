@@ -1,4 +1,4 @@
-//! Unified execution runtime across Embedded, SingleNode, and Distributed modes.
+//! Unified execution runtime across Embedded (in-process), SingleNode (local daemon), and Distributed modes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,10 +9,7 @@ use krishiv_plan::PhysicalPlan;
 use crate::in_process::BatchSqlTable;
 use crate::in_process_cluster::InProcessCluster;
 use crate::local_streaming::LocalWindowExecutionSpec;
-use crate::{
-    EmbeddedBackend, ExecutionBackend, ExecutionReport, RuntimeError, RuntimeResult,
-    SingleNodeBackend,
-};
+use crate::{EmbeddedBackend, ExecutionBackend, ExecutionReport, RuntimeError, RuntimeResult};
 
 /// Local cluster connection endpoints for SingleNode / Distributed clients.
 #[derive(Debug, Clone, Default)]
@@ -183,7 +180,7 @@ fn tables_to_batch_sql(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> 
         .collect()
 }
 
-/// In-process cluster runtime for Embedded and auto-start SingleNode.
+/// In-process cluster runtime for Embedded mode.
 ///
 /// Neither backend carries per-call state, so a `Mutex<...>` is unnecessary —
 /// removing it eliminates the serialization point that previously blocked
@@ -197,13 +194,6 @@ impl InProcessExecutionRuntime {
     pub fn embedded(cluster: Arc<InProcessCluster>) -> Self {
         Self {
             mode: RuntimeMode::Embedded,
-            cluster,
-        }
-    }
-
-    pub fn single_node(cluster: Arc<InProcessCluster>) -> Self {
-        Self {
-            mode: RuntimeMode::SingleNode,
             cluster,
         }
     }
@@ -224,12 +214,8 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
                 let backend = EmbeddedBackend::default();
                 backend.execute(plan)
             }
-            RuntimeMode::SingleNode => {
-                let sn = SingleNodeBackend;
-                sn.execute(plan)
-            }
-            RuntimeMode::Distributed => Err(RuntimeError::unsupported(
-                "in-process runtime does not serve distributed mode",
+            RuntimeMode::SingleNode | RuntimeMode::Distributed => Err(RuntimeError::unsupported(
+                "in-process runtime does not serve distributed or single-node daemon mode",
             )),
         }
     }
@@ -577,9 +563,10 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
 
 /// Build the appropriate runtime for a session configuration.
 ///
-/// `in_process_cluster` is required for Embedded and SingleNode with
-/// `LocalInProcess` placement. It is ignored (but can be `None`) for
-/// SingleNodeDaemon and Distributed placements.
+/// `in_process_cluster` is required for Embedded mode.
+/// For SingleNode mode, only `SingleNodeDaemon` placement is supported
+/// (requires a `coordinator_flight_url`). `in_process_cluster` is ignored
+/// (but can be `None`) for SingleNodeDaemon and Distributed placements.
 pub fn build_execution_runtime(
     mode: RuntimeMode,
     in_process_cluster: Option<Arc<InProcessCluster>>,
@@ -593,12 +580,6 @@ pub fn build_execution_runtime(
                 RuntimeError::unsupported("Embedded mode requires an InProcessCluster")
             })?;
             Ok(Arc::new(InProcessExecutionRuntime::embedded(cluster)))
-        }
-        (RuntimeMode::SingleNode, ExecutionPlacement::LocalInProcess) => {
-            let cluster = in_process_cluster.ok_or_else(|| {
-                RuntimeError::unsupported("SingleNode LocalInProcess requires an InProcessCluster")
-            })?;
-            Ok(Arc::new(InProcessExecutionRuntime::single_node(cluster)))
         }
         (RuntimeMode::SingleNode, ExecutionPlacement::SingleNodeDaemon) => {
             let url = coordinator_flight_url.ok_or_else(|| {
@@ -629,11 +610,10 @@ pub fn build_execution_runtime(
         (RuntimeMode::Embedded, _) => Err(RuntimeError::unsupported(
             "Embedded mode only supports LocalInProcess placement",
         )),
-        (RuntimeMode::SingleNode, ExecutionPlacement::RemoteClusterRequired) => {
-            Err(RuntimeError::unsupported(
-                "SingleNode mode cannot use RemoteClusterRequired placement; use Distributed mode",
-            ))
-        }
+        (RuntimeMode::SingleNode, _) => Err(RuntimeError::unsupported(
+            "SingleNode mode requires SingleNodeDaemon placement with a coordinator Flight URL; \
+             for in-process execution use Embedded mode",
+        )),
         (RuntimeMode::Distributed, _) => Err(RuntimeError::unsupported(
             "Distributed mode cannot use local fallback; use RemoteClusterRequired placement",
         )),
@@ -754,6 +734,13 @@ mod tests {
                 Some(cluster.clone()),
                 Some("http://127.0.0.1:50051".to_owned()),
             ),
+            // SingleNode with LocalInProcess is no longer valid — must use Embedded mode
+            (
+                RuntimeMode::SingleNode,
+                ExecutionPlacement::LocalInProcess,
+                Some(cluster.clone()),
+                None,
+            ),
             (
                 RuntimeMode::SingleNode,
                 ExecutionPlacement::RemoteClusterRequired,
@@ -832,13 +819,6 @@ mod tests {
     }
 
     #[test]
-    fn single_node_runtime_mode() {
-        let cluster = Arc::new(InProcessCluster::new().unwrap());
-        let rt = InProcessExecutionRuntime::single_node(cluster);
-        assert_eq!(rt.mode(), RuntimeMode::SingleNode);
-    }
-
-    #[test]
     fn embedded_runtime_accepts_plan() {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = InProcessExecutionRuntime::embedded(cluster);
@@ -846,16 +826,6 @@ mod tests {
         let report = rt.accept_plan(&plan).unwrap();
         assert!(report.accepted());
         assert_eq!(report.backend(), "embedded");
-    }
-
-    #[test]
-    fn single_node_runtime_accepts_plan() {
-        let cluster = Arc::new(InProcessCluster::new().unwrap());
-        let rt = InProcessExecutionRuntime::single_node(cluster);
-        let plan = PhysicalPlan::new("test-plan", ExecutionKind::Batch);
-        let report = rt.accept_plan(&plan).unwrap();
-        assert!(report.accepted());
-        assert_eq!(report.backend(), "single-node");
     }
 
     #[test]
@@ -935,22 +905,6 @@ mod tests {
         .expect("embedded runtime");
         assert_eq!(rt.mode(), RuntimeMode::Embedded);
         assert_eq!(rt.placement(), ExecutionPlacement::LocalInProcess);
-    }
-
-    #[test]
-    fn build_runtime_single_node_no_flight_url() {
-        let cluster = Arc::new(InProcessCluster::new().unwrap());
-        let rt = build_execution_runtime(
-            RuntimeMode::SingleNode,
-            Some(cluster),
-            None,
-            None,
-            ExecutionPlacement::LocalInProcess,
-        )
-        .expect("single-node runtime");
-        assert_eq!(rt.mode(), RuntimeMode::SingleNode);
-        assert_eq!(rt.placement(), ExecutionPlacement::LocalInProcess);
-        assert!(rt.flight_url().is_none());
     }
 
     #[test]
@@ -1152,40 +1106,6 @@ mod tests {
         assert_eq!(rt.coordinator_grpc_url(), Some("http://custom:9090"));
     }
 
-    #[test]
-    fn single_node_runtime_collect_bounded_window() {
-        let cluster = Arc::new(InProcessCluster::new().unwrap());
-        let rt = InProcessExecutionRuntime::single_node(cluster);
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Utf8, false),
-            arrow::datatypes::Field::new("ts", arrow::datatypes::DataType::Int64, false),
-        ]));
-        let batch = arrow::record_batch::RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(arrow::array::StringArray::from(vec!["a"])) as _,
-                Arc::new(arrow::array::Int64Array::from(vec![1_000])) as _,
-            ],
-        )
-        .unwrap();
-        let spec = crate::LocalWindowExecutionSpec {
-            key_column_type: String::from("utf8"),
-            key_column: "k".into(),
-            event_time_column: "ts".into(),
-            watermark_lag_ms: 0,
-            window_kind: crate::LocalWindowKind::Tumbling,
-            window_size_ms: 10_000,
-            agg_exprs: crate::LocalWindowExecutionSpec::default_count_agg(),
-            state_ttl_ms: None,
-            source_watermark_lags: std::collections::HashMap::new(),
-            source_id_column: None,
-        };
-        let out = rt
-            .collect_bounded_window("events", vec![batch], &spec)
-            .unwrap();
-        assert!(!out.is_empty());
-    }
-
     // ── is_server_unimplemented guard ─────────────────────────────────────────
 
     use super::is_server_unimplemented;
@@ -1271,17 +1191,6 @@ mod tests {
             .accept_plan(&plan)
             .expect("embedded accept_plan should delegate streaming plans");
         assert_eq!(report.backend(), "single-node"); // Embedded mode delegates to SingleNode
-    }
-
-    #[test]
-    fn in_process_single_node_accepts_streaming_plan() {
-        let cluster = Arc::new(InProcessCluster::new().unwrap());
-        let rt = InProcessExecutionRuntime::single_node(cluster);
-        let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming);
-        let report = rt
-            .accept_plan(&plan)
-            .expect("single-node accept_plan should handle streaming plans");
-        assert_eq!(report.backend(), "single-node");
     }
 
     // ── G1: typed BatchSql action carries is_streaming flag ──────────────────
