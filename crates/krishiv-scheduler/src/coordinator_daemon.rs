@@ -361,9 +361,6 @@ pub fn coordinator_http_router(
     coordinator: SharedCoordinator,
     config: &CoordinatorDaemonConfig,
 ) -> Router {
-    use crate::federation_http::{
-        federation_cancel_job, federation_job_status, federation_submit_job,
-    };
     use crate::http_auth::{require_coordinator_bearer, resolve_http_bearer_tokens};
     use axum::middleware;
 
@@ -404,12 +401,6 @@ pub fn coordinator_http_router(
             post(crate::continuous_stream_http::api_continuous_drain),
         )
         .route("/api/v1/jobs/{job_id}/diagnose", get(api_job_diagnose))
-        .route("/federation/v1/jobs", post(federation_submit_job))
-        .route("/federation/v1/jobs/{job_id}", get(federation_job_status))
-        .route(
-            "/federation/v1/jobs/{job_id}/cancel",
-            post(federation_cancel_job),
-        )
         .with_state(coordinator.clone());
 
     let protected = if http_auth_required(config) {

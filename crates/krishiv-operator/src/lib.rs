@@ -38,9 +38,7 @@ pub use lease::K8sLeaseElection;
 pub use pod_failure::{ExecutorPodLaunchFailure, detect_executor_pod_launch_failure};
 #[cfg(feature = "k8s")]
 pub use pod_manager::{PodLifecycleManager, build_executor_pod_template};
-pub use queue_manager::{
-    CrdQueueManager, KrishivQueue, KrishivQueueSpec, KrishivQueueStatus, QUEUE_KIND,
-};
+pub use queue_manager::{KrishivQueue, KrishivQueueSpec, KrishivQueueStatus, QUEUE_KIND};
 #[cfg(test)]
 pub use reconciler::demo_coordinator;
 pub use reconciler::{

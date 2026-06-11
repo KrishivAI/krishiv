@@ -18,10 +18,10 @@ mod scheduler_tests {
 
     use crate::{
         AdaptiveDecisionKind, AdaptiveOverrideConfig, CheckpointCoordinator,
-        CheckpointCoordinatorState, ConfigFileQueueManager, Coordinator, CoordinatorConfig,
+        CheckpointCoordinatorState, Coordinator, CoordinatorConfig,
         CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry, InMemoryQueueManager,
         InProcessCoordinatorBridge, LeaderElection, MetadataStore, NamespaceQuotaSnapshot,
-        QueueManager, QuotaPolicy, QuotaQueueManager, SchedulerError, SharedCoordinator,
+        QueueManager, SchedulerError, SharedCoordinator,
         SingleNodeElection, StaticScheduler, SubmitOutcome, TaskUpdateOutcome,
         job_spec_from_logical_plan, job_spec_from_physical_plan,
         serve_coordinator_executor_grpc_with_listener,
@@ -4355,173 +4355,6 @@ mod scheduler_tests {
         assert_eq!(qm.admit(&spec, &quota), SubmitOutcome::Accepted);
     }
 
-    // ── R7.1 Resource governance tests ───────────────────────────────────────
-
-    #[test]
-    fn quota_queue_manager_admits_within_limits() {
-        let qm = QuotaQueueManager::with_default(QuotaPolicy {
-            cpu_nanos_limit: Some(1_000_000_000),
-            memory_bytes_limit: Some(512 * 1024 * 1024),
-            max_concurrent_jobs: Some(5),
-        });
-        let spec = demo_job()
-            .with_cpu_limit_nanos(100_000_000)
-            .with_memory_limit_bytes(64 * 1024 * 1024);
-        let quota = NamespaceQuotaSnapshot {
-            active_job_count: 2,
-            cpu_nanos_reserved: 200_000_000,
-            memory_bytes_reserved: 128 * 1024 * 1024,
-            ..Default::default()
-        };
-        assert_eq!(qm.admit(&spec, &quota), SubmitOutcome::Accepted);
-    }
-
-    #[test]
-    fn quota_queue_manager_queues_when_cpu_limit_exceeded() {
-        let qm = QuotaQueueManager::with_default(QuotaPolicy {
-            cpu_nanos_limit: Some(1_000_000_000),
-            memory_bytes_limit: None,
-            max_concurrent_jobs: None,
-        });
-        let spec = demo_job().with_cpu_limit_nanos(600_000_000);
-        let quota = NamespaceQuotaSnapshot {
-            cpu_nanos_reserved: 500_000_000,
-            ..Default::default()
-        };
-        assert_eq!(
-            qm.admit(&spec, &quota),
-            SubmitOutcome::Queued { position: 0 }
-        );
-    }
-
-    #[test]
-    fn quota_queue_manager_queues_when_memory_limit_exceeded() {
-        let qm = QuotaQueueManager::with_default(QuotaPolicy {
-            cpu_nanos_limit: None,
-            memory_bytes_limit: Some(512 * 1024 * 1024),
-            max_concurrent_jobs: None,
-        });
-        let spec = demo_job().with_memory_limit_bytes(300 * 1024 * 1024);
-        let quota = NamespaceQuotaSnapshot {
-            memory_bytes_reserved: 300 * 1024 * 1024,
-            ..Default::default()
-        };
-        assert_eq!(
-            qm.admit(&spec, &quota),
-            SubmitOutcome::Queued { position: 0 }
-        );
-    }
-
-    #[test]
-    fn quota_queue_manager_queues_when_job_count_exceeded() {
-        let qm = QuotaQueueManager::with_default(QuotaPolicy {
-            cpu_nanos_limit: None,
-            memory_bytes_limit: None,
-            max_concurrent_jobs: Some(2),
-        });
-        let spec = demo_job();
-        let quota = NamespaceQuotaSnapshot {
-            active_job_count: 2,
-            ..Default::default()
-        };
-        assert!(matches!(
-            qm.admit(&spec, &quota),
-            SubmitOutcome::Queued { .. }
-        ));
-    }
-
-    #[test]
-    fn quota_queue_manager_uses_namespace_policy() {
-        use std::collections::HashMap;
-        let mut ns_policies = HashMap::new();
-        ns_policies.insert(
-            "analytics".to_owned(),
-            QuotaPolicy {
-                cpu_nanos_limit: None,
-                memory_bytes_limit: None,
-                max_concurrent_jobs: Some(1),
-            },
-        );
-        let qm = QuotaQueueManager::new(QuotaPolicy::default(), ns_policies);
-
-        let spec_ns = demo_job().with_namespace("analytics");
-        let spec_default = demo_job();
-        let quota_full = NamespaceQuotaSnapshot {
-            namespace_id: Some("analytics".to_owned()),
-            active_job_count: 1,
-            ..Default::default()
-        };
-        let quota_empty = NamespaceQuotaSnapshot {
-            namespace_id: Some("analytics".to_owned()),
-            active_job_count: 0,
-            ..Default::default()
-        };
-        // Analytics namespace is full.
-        assert!(matches!(
-            qm.admit(&spec_ns, &quota_full),
-            SubmitOutcome::Queued { .. }
-        ));
-        // Default namespace has no limit — admits.
-        assert_eq!(
-            qm.admit(&spec_default, &quota_full),
-            SubmitOutcome::Accepted
-        );
-        // Analytics namespace has capacity — admits.
-        assert_eq!(qm.admit(&spec_ns, &quota_empty), SubmitOutcome::Accepted);
-    }
-
-    #[test]
-    fn config_file_queue_manager_admits_from_in_memory_config() {
-        use std::collections::HashMap;
-        let qm = ConfigFileQueueManager::from_config(
-            QuotaPolicy {
-                max_concurrent_jobs: Some(3),
-                ..Default::default()
-            },
-            HashMap::new(),
-        );
-        let spec = demo_job();
-        let quota_ok = NamespaceQuotaSnapshot {
-            active_job_count: 2,
-            ..Default::default()
-        };
-        let quota_full = NamespaceQuotaSnapshot {
-            active_job_count: 3,
-            ..Default::default()
-        };
-        assert_eq!(qm.admit(&spec, &quota_ok), SubmitOutcome::Accepted);
-        assert!(matches!(
-            qm.admit(&spec, &quota_full),
-            SubmitOutcome::Queued { .. }
-        ));
-    }
-
-    #[test]
-    fn config_file_queue_manager_loads_from_json_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queues.json");
-        std::fs::write(
-            &path,
-            r#"{"default":{"max_concurrent_jobs":1},"namespaces":{}}"#,
-        )
-        .unwrap();
-        let qm = ConfigFileQueueManager::from_path(&path).unwrap();
-        let spec = demo_job();
-        let quota_ok = NamespaceQuotaSnapshot {
-            active_job_count: 0,
-            ..Default::default()
-        };
-        let quota_full = NamespaceQuotaSnapshot {
-            active_job_count: 1,
-            ..Default::default()
-        };
-        assert_eq!(qm.admit(&spec, &quota_ok), SubmitOutcome::Accepted);
-        assert!(matches!(
-            qm.admit(&spec, &quota_full),
-            SubmitOutcome::Queued { .. }
-        ));
-    }
-
     #[test]
     fn namespace_quota_snapshot_sums_active_jobs() {
         let coordinator_id = CoordinatorId::try_new("coord-quota").unwrap();
@@ -4554,30 +4387,6 @@ mod scheduler_tests {
 
         let snap_other = coordinator.namespace_quota_snapshot(Some("team-b"));
         assert_eq!(snap_other.active_job_count, 0);
-    }
-
-    #[test]
-    fn coordinator_queues_job_when_quota_exceeded() {
-        let coordinator_id = CoordinatorId::try_new("coord-qe").unwrap();
-        let mut coordinator = Coordinator::active(coordinator_id).with_queue_manager(
-            QuotaQueueManager::with_default(QuotaPolicy {
-                max_concurrent_jobs: Some(1),
-                ..Default::default()
-            }),
-        );
-        let executor_id = ExecutorId::try_new("exec-qe").unwrap();
-        coordinator
-            .register_executor(ExecutorDescriptor::new(executor_id, "host", 2))
-            .unwrap();
-
-        let job_id_a = JobId::try_new("qe-a").unwrap();
-        let job_id_b = JobId::try_new("qe-b").unwrap();
-
-        coordinator.submit_job(single_task_job(job_id_a)).unwrap();
-
-        // Second job exceeds the 1-job concurrent limit.
-        let outcome = coordinator.submit_job(single_task_job(job_id_b)).unwrap();
-        assert!(matches!(outcome, SubmitOutcome::Queued { .. }));
     }
 
     #[test]
@@ -4736,7 +4545,6 @@ mod scheduler_tests {
             !effects.source_throttles.is_empty(),
             "source throttle must be issued when heat_score >= threshold"
         );
-        assert!(effects.llm_throttles.is_empty());
 
         let log = coordinator.adaptive_decision_log(&job_id);
         assert_eq!(log.len(), 1);
@@ -6762,33 +6570,6 @@ mod scheduler_tests {
             TaskState::Failed,
             "task must be permanently Failed after {MAX_LOSSES} consecutive executor losses"
         );
-    }
-
-    // ── Admission quota: saturating_add at boundary ────────────────────────────
-
-    #[test]
-    fn quota_saturating_add_at_u64_max_does_not_panic() {
-        // QuotaQueueManager must not overflow (panic) when existing reservations
-        // are near u64::MAX. saturating_add prevents wrapping.
-        // With cpu_nanos_limit = u64::MAX and reserved = u64::MAX, adding any
-        // nonzero request saturates to u64::MAX which equals the limit, so the
-        // job may be admitted or queued depending on the comparison (> vs >=).
-        // What matters: no panic.
-        let qm = QuotaQueueManager::with_default(QuotaPolicy {
-            cpu_nanos_limit: Some(u64::MAX),
-            memory_bytes_limit: Some(u64::MAX),
-            max_concurrent_jobs: None,
-        });
-        let spec = demo_job()
-            .with_cpu_limit_nanos(u64::MAX)
-            .with_memory_limit_bytes(u64::MAX);
-        let quota = NamespaceQuotaSnapshot {
-            cpu_nanos_reserved: u64::MAX,
-            memory_bytes_reserved: u64::MAX,
-            ..Default::default()
-        };
-        // Must not panic regardless of Accepted/Queued outcome.
-        let _outcome = qm.admit(&spec, &quota);
     }
 
     // ── etcd: simulation-mode tests (no live etcd required) ─────────────────

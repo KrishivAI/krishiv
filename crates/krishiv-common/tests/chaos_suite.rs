@@ -50,32 +50,20 @@ async fn dead_letter_sink_fail_action_returns_error() {
     );
 }
 
-/// Policy hook denies table access for a principal without permission.
+/// Policy hook denies table access.
 #[test]
 fn policy_hook_denies_table_access() {
-    use krishiv_plan::governance::{MaskingRule, PolicyHook, Principal, Role};
+    use krishiv_plan::governance::PolicyHook;
 
     struct DenyAllPolicy;
     impl PolicyHook for DenyAllPolicy {
-        fn check_table_access(&self, _p: &Principal, _table: &str) -> bool {
+        fn check_table_access(&self, _table: &str) -> bool {
             false
-        }
-        fn column_masking_rule(
-            &self,
-            _p: &Principal,
-            _table: &str,
-            _col: &str,
-        ) -> Option<MaskingRule> {
-            None
         }
     }
 
     let policy = DenyAllPolicy;
-    let principal = Principal {
-        subject: "attacker".into(),
-        role: Role::Reader,
-    };
-    assert!(!policy.check_table_access(&principal, "secret_table"));
+    assert!(!policy.check_table_access("secret_table"));
 }
 
 /// Fault injector cycles deterministically through its fault list.

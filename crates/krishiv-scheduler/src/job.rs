@@ -229,17 +229,6 @@ impl JobRecord {
                 {
                     task.assigned_executor = Some(assignment.executor_id().clone());
                     task.state = TaskState::Assigned;
-
-                    krishiv_plan::governance::audit_log(
-                        "scheduler",
-                        &krishiv_plan::governance::AuditAction::TaskAssigned {
-                            job_id: job_id_str.clone(),
-                            stage_id: stage_id_str.clone(),
-                            task_id: task.task_id().to_string(),
-                            executor_id: assignment.executor_id().to_string(),
-                        },
-                        krishiv_plan::governance::AuditOutcome::Allowed,
-                    );
                 }
             }
         }

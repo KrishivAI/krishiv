@@ -57,7 +57,6 @@ pub mod adaptive;
 pub mod aggregate;
 pub mod barrier_align;
 pub mod cep;
-pub mod chunk;
 pub mod coalesce_partitions;
 pub mod continuous;
 pub mod interval_join;
@@ -77,8 +76,6 @@ pub mod temporal_join;
 mod watermark_e2e;
 pub mod watermark_util;
 pub mod window;
-
-pub use chunk::ChunkOperator;
 
 pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, HeavyHittersTracker,

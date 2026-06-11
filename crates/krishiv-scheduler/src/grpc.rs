@@ -166,9 +166,6 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         if !request.hot_key_reports().is_empty() {
             heartbeat = heartbeat.with_hot_key_reports(request.hot_key_reports().to_vec());
         }
-        if !request.llm_quota_reports().is_empty() {
-            heartbeat = heartbeat.with_llm_quota_reports(request.llm_quota_reports().to_vec());
-        }
         if !request.streaming_progress().is_empty() {
             heartbeat = heartbeat.with_streaming_progress(request.streaming_progress().to_vec());
         }
@@ -190,9 +187,6 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                         })
                         .collect();
                     resp = resp.with_throttle_commands(wire_cmds);
-                }
-                if !effects.llm_throttles.is_empty() {
-                    resp = resp.with_llm_throttles(effects.llm_throttles);
                 }
                 if !effects.checkpoint_commands.is_empty() {
                     resp = resp.with_checkpoint_commands(effects.checkpoint_commands);

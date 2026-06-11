@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use krishiv_api::StreamBatch;
-use krishiv_plan::governance::{Role, RoleBasedPolicyHook, StaticApiKeyAuthProvider};
+use krishiv_plan::governance::{AllowAllPolicyHook, StaticApiKeyAuthProvider};
 use krishiv_state::SharedStateMigrationRegistry;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -141,26 +141,22 @@ impl PySession {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Session with API-key auth and policy for [`Self::sql_as`].
+    /// Session with API-key auth and optional table-access policy.
     #[classmethod]
-    #[pyo3(signature = (api_keys, *, policy = "role_based", mode = "embedded"))]
+    #[pyo3(signature = (api_keys, *, policy = "allow_all", mode = "embedded"))]
     pub fn with_policy(
         _cls: &Bound<'_, PyType>,
-        api_keys: Vec<(String, String, String)>,
+        api_keys: Vec<(String, String)>,
         policy: &str,
         mode: &str,
     ) -> PyResult<Self> {
-        let auth_entries = api_keys
-            .into_iter()
-            .map(|(key, subject, role)| Ok((key, subject, parse_role(&role)?)))
-            .collect::<PyResult<Vec<_>>>()?;
-        let auth = Arc::new(StaticApiKeyAuthProvider::new(auth_entries));
+        let keys: std::collections::HashMap<String, String> = api_keys.into_iter().collect();
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(keys));
         let policy_hook: Arc<dyn krishiv_plan::governance::PolicyHook> = match policy {
-            "allow_all" | "noop" => Arc::new(krishiv_plan::governance::NoOpPolicyHook),
-            "role_based" => Arc::new(RoleBasedPolicyHook),
+            "allow_all" | "noop" | "role_based" => Arc::new(AllowAllPolicyHook),
             other => {
                 return Err(PyRuntimeError::new_err(format!(
-                    "unknown policy '{other}'; use allow_all or role_based"
+                    "unknown policy '{other}'; use allow_all"
                 )));
             }
         };
@@ -208,19 +204,6 @@ impl PySession {
             block_on_async(async move {
                 inner
                     .sql_async(&query)
-                    .await
-                    .map(|df| PyDataFrame { inner: df })
-            })
-            .map_err(map_krishiv_error)
-        })
-    }
-
-    pub fn sql_as(&self, py: Python<'_>, api_key: String, query: String) -> PyResult<PyDataFrame> {
-        let inner = self.inner.clone();
-        py.detach(move || {
-            block_on_async(async move {
-                inner
-                    .sql_as(&api_key, &query)
                     .await
                     .map(|df| PyDataFrame { inner: df })
             })
@@ -565,13 +548,3 @@ mod tests {
     }
 }
 
-fn parse_role(role: &str) -> PyResult<Role> {
-    match role.to_lowercase().as_str() {
-        "admin" => Ok(Role::Admin),
-        "writer" => Ok(Role::Writer),
-        "reader" => Ok(Role::Reader),
-        other => Err(PyRuntimeError::new_err(format!(
-            "unknown role '{other}'; use admin, writer, or reader"
-        ))),
-    }
-}

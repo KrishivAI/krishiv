@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use krishiv_proto::{InitiateCheckpointCommand, JobId, LeaseGeneration, LlmThrottleCommand};
+use krishiv_proto::{InitiateCheckpointCommand, JobId, LeaseGeneration};
 
 // ── R7.2 Adaptive governance types ───────────────────────────────────────────
 
@@ -80,8 +80,6 @@ pub struct ThrottleDecision {
 pub struct ExecutorHeartbeatEffects {
     /// Source-operator throttle directives (R7.2).
     pub source_throttles: Vec<ThrottleDecision>,
-    /// LLM UDF throttle directives (R17).
-    pub llm_throttles: Vec<LlmThrottleCommand>,
     pub checkpoint_commands: Vec<InitiateCheckpointCommand>,
     pub lease_generation: LeaseGeneration,
 }

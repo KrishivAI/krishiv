@@ -34,7 +34,7 @@ pub mod subquery;
 pub mod unnest_sql;
 mod lakehouse;
 pub mod live_table;
-pub mod policy;
+
 pub mod streaming;
 mod udf;
 mod window_functions;
@@ -43,7 +43,7 @@ pub use cep_sql::{
     MatchRecognizeStatement, execute_streaming_match_recognize, parse_match_recognize,
 };
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
-pub use policy::PolicyEnforcingSqlEngine;
+
 pub use streaming::{ContinuousInputError, ContinuousTableInput};
 
 /// SQL result alias.
@@ -245,7 +245,6 @@ pub struct SqlEngine {
     context: SessionContext,
     target_parallelism: NonZeroUsize,
     krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
-    view_registry: Option<std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>>,
     udf_registry: Option<std::sync::Arc<std::sync::RwLock<krishiv_plan::udf::UdfRegistry>>>,
     /// Table names registered as unbounded streaming sources.
     /// Wrapped in `Arc<RwLock<>>` so that Session clones share the same set.
@@ -458,7 +457,6 @@ impl SqlEngine {
             context,
             target_parallelism: target_partitions,
             krishiv_catalog,
-            view_registry: None,
             udf_registry: None,
             streaming_sources,
             streaming_registration: Arc::new(Mutex::new(())),
@@ -1025,16 +1023,6 @@ impl SqlEngine {
         Ok(())
     }
 
-    /// Attach a [`MaterializedViewRegistry`] so the engine tracks view staleness.
-    #[must_use]
-    pub fn with_view_registry(
-        mut self,
-        registry: std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>,
-    ) -> Self {
-        self.view_registry = Some(registry);
-        self
-    }
-
     /// Register a local Parquet path as a table.
     pub async fn register_parquet(
         &self,
@@ -1067,11 +1055,6 @@ impl SqlEngine {
             && let Ok(mut counts) = self.table_row_counts.write()
         {
             counts.insert(table_name.to_string(), *n as u64);
-        }
-        if let Some(ref reg) = self.view_registry
-            && let Ok(mut r) = reg.lock()
-        {
-            r.mark_table_committed();
         }
         self.invalidate_plan_cache();
         Ok(())
@@ -1134,11 +1117,6 @@ impl SqlEngine {
             })?;
         if total_rows > 0 && let Ok(mut counts) = self.table_row_counts.write() {
             counts.insert(table_name.to_string(), total_rows as u64);
-        }
-        if let Some(ref reg) = self.view_registry
-            && let Ok(mut r) = reg.lock()
-        {
-            r.mark_table_committed();
         }
         self.invalidate_plan_cache();
         Ok(())
@@ -1469,34 +1447,6 @@ impl SqlEngine {
         )
     }
 
-    /// Execute `query` with materialized view cache lookup.
-    ///
-    /// If the query targets a registered, fresh view, returns cached batches directly.
-    /// Otherwise executes normally and caches the result for `OnCommit` views.
-    pub async fn sql_with_view_cache(&self, query: impl AsRef<str>) -> SqlResult<Vec<RecordBatch>> {
-        let q = query.as_ref().trim();
-        let view_name_candidate = extract_simple_view_name(q);
-
-        if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate)
-            && let Ok(r) = reg.lock()
-            && let Some(cached) = r.get_if_fresh(name)
-        {
-            return Ok(cached.clone());
-        }
-
-        let df = self.sql(q).await?;
-        let batches = df.collect().await?;
-
-        if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate)
-            && let Ok(mut r) = reg.lock()
-            && let Some(def) = r.definition(name).cloned()
-            && def.refresh_policy == RefreshPolicy::OnCommit
-        {
-            r.set_cached(name, batches.clone());
-        }
-
-        Ok(batches)
-    }
 }
 
 /// Extract the table name from a `CREATE EXTERNAL TABLE <name> ...` DDL statement.
@@ -1510,25 +1460,6 @@ pub(crate) fn extract_create_external_table_name(query: &str) -> Option<String> 
         DFStatement::CreateExternalTable(create) => Some(create.name.to_string()),
         _ => None,
     }
-}
-
-fn extract_simple_view_name(query: &str) -> Option<String> {
-    use std::ops::ControlFlow;
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, query).ok()?;
-    let mut result = None;
-    for stmt in &statements {
-        let _ = visit_relations(stmt, |relation| {
-            if result.is_none() {
-                result = Some(relation.to_string());
-            }
-            ControlFlow::Break(())
-        });
-        if result.is_some() {
-            break;
-        }
-    }
-    result
 }
 
 /// Engine-agnostic interface over a prepared query result.
@@ -2249,270 +2180,6 @@ pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
             message: error.to_string(),
         })?
         .to_string())
-}
-
-// ─── Materialized Views Baseline ─────────────────────────────────────────────
-
-/// Materialized view refresh policy.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RefreshPolicy {
-    /// Refresh whenever the backing table(s) receive a write commit.
-    OnCommit,
-    /// Only refresh when explicitly triggered by `MaterializedViewRegistry::refresh()`.
-    Manual,
-}
-
-/// Declaration of a named materialized view.
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct MaterializedViewDefinition {
-    /// Unique view name.
-    pub name: String,
-    /// SQL SELECT query that defines the view.
-    pub query: String,
-    /// Refresh policy.
-    pub refresh_policy: RefreshPolicy,
-    /// Partition columns for storage keying (empty = unpartitioned).
-    pub partition_columns: Vec<String>,
-}
-
-impl MaterializedViewDefinition {
-    /// Create a new view definition with OnCommit refresh and no partitioning.
-    pub fn new(name: impl Into<String>, query: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            query: query.into(),
-            refresh_policy: RefreshPolicy::OnCommit,
-            partition_columns: Vec::new(),
-        }
-    }
-
-    /// Set the refresh policy.
-    #[must_use]
-    pub fn with_refresh_policy(mut self, policy: RefreshPolicy) -> Self {
-        self.refresh_policy = policy;
-        self
-    }
-
-    /// Set partition columns.
-    #[must_use]
-    pub fn with_partition_columns(mut self, cols: Vec<String>) -> Self {
-        self.partition_columns = cols;
-        self
-    }
-}
-
-/// In-memory registry for materialized view definitions and their cached results.
-///
-/// **Alpha (R10)**: In-memory only. View state is not persisted and resets on process restart.
-/// In production, results would be persisted to `RedbStateBackend`.
-#[derive(Debug, Default)]
-pub struct MaterializedViewRegistry {
-    definitions: HashMap<String, MaterializedViewDefinition>,
-    /// Cached results keyed by view name → serialized batch (Arrow IPC).
-    cache: HashMap<String, Vec<RecordBatch>>,
-    /// Current write LSN — incremented on each `mark_table_committed()` call.
-    current_lsn: u64,
-    /// LSN at which each view was last refreshed.
-    view_lsn: HashMap<String, u64>,
-}
-
-impl MaterializedViewRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register a materialized view definition.
-    pub fn register(&mut self, def: MaterializedViewDefinition) {
-        self.definitions.insert(def.name.clone(), def);
-    }
-
-    /// Mark a table as having received a commit. Increments the current LSN.
-    /// All OnCommit views are now stale.
-    pub fn mark_table_committed(&mut self) {
-        self.current_lsn += 1;
-    }
-
-    /// Returns true if the view is stale (backing table committed after last refresh,
-    /// or the view has never been cached / is not registered).
-    pub fn is_stale(&self, view_name: &str) -> bool {
-        // Unregistered or never-cached views are always considered stale.
-        if !self.view_lsn.contains_key(view_name) {
-            return true;
-        }
-        let last_refresh = self.view_lsn.get(view_name).copied().unwrap_or(0);
-        last_refresh < self.current_lsn
-    }
-
-    /// Store refreshed results for a view.
-    pub fn set_cached(&mut self, view_name: &str, batches: Vec<RecordBatch>) {
-        self.cache.insert(view_name.to_string(), batches);
-        self.view_lsn
-            .insert(view_name.to_string(), self.current_lsn);
-    }
-
-    /// Get cached results if the view is fresh.
-    pub fn get_if_fresh(&self, view_name: &str) -> Option<&Vec<RecordBatch>> {
-        if self.is_stale(view_name) {
-            None
-        } else {
-            self.cache.get(view_name)
-        }
-    }
-
-    /// Get the view definition, if registered.
-    pub fn definition(&self, view_name: &str) -> Option<&MaterializedViewDefinition> {
-        self.definitions.get(view_name)
-    }
-}
-
-#[cfg(test)]
-mod matview_tests {
-    use super::*;
-
-    #[test]
-    fn fresh_view_returns_cached_results() {
-        let mut reg = MaterializedViewRegistry::new();
-        reg.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
-        let batch = vec![]; // empty batch for test
-        reg.set_cached("v1", batch.clone());
-        assert!(reg.get_if_fresh("v1").is_some());
-    }
-
-    #[test]
-    fn committed_table_marks_view_stale() {
-        let mut reg = MaterializedViewRegistry::new();
-        reg.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
-        reg.set_cached("v1", vec![]);
-        assert!(!reg.is_stale("v1"));
-        reg.mark_table_committed();
-        assert!(reg.is_stale("v1"));
-        assert!(reg.get_if_fresh("v1").is_none());
-    }
-
-    #[test]
-    fn refresh_after_commit_restores_freshness() {
-        let mut reg = MaterializedViewRegistry::new();
-        reg.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
-        reg.set_cached("v1", vec![]);
-        reg.mark_table_committed();
-        assert!(reg.is_stale("v1"));
-        reg.set_cached("v1", vec![]); // refresh
-        assert!(!reg.is_stale("v1"));
-    }
-
-    #[test]
-    fn unregistered_view_is_stale() {
-        let reg = MaterializedViewRegistry::new();
-        assert!(reg.is_stale("nonexistent"));
-    }
-
-    #[test]
-    fn definition_builder_sets_fields() {
-        let def = MaterializedViewDefinition::new("sales_summary", "SELECT SUM(amount) FROM sales")
-            .with_refresh_policy(RefreshPolicy::Manual)
-            .with_partition_columns(vec!["region".into()]);
-        assert_eq!(def.name, "sales_summary");
-        assert_eq!(def.refresh_policy, RefreshPolicy::Manual);
-        assert_eq!(def.partition_columns, vec!["region".to_string()]);
-    }
-}
-
-#[cfg(test)]
-mod view_cache_tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-
-    #[tokio::test]
-    async fn engine_marks_table_committed_after_register() {
-        let registry = Arc::new(Mutex::new(MaterializedViewRegistry::new()));
-        {
-            let mut r = registry.lock().unwrap();
-            r.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
-            r.set_cached("v1", vec![]);
-        }
-        assert!(!registry.lock().unwrap().is_stale("v1"));
-
-        let engine = SqlEngine::new().with_view_registry(registry.clone());
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
-        ]));
-        let col = arrow::array::Int64Array::from(vec![1i64]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
-        engine
-            .register_record_batches("t1", vec![batch])
-            .await
-            .unwrap();
-
-        assert!(
-            registry.lock().unwrap().is_stale("v1"),
-            "commit must mark view stale"
-        );
-    }
-
-    #[tokio::test]
-    async fn sql_with_view_cache_returns_fresh_cache() {
-        let registry = Arc::new(Mutex::new(MaterializedViewRegistry::new()));
-        let expected_batch = {
-            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
-            ]));
-            let col = arrow::array::Int64Array::from(vec![99i64]);
-            RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap()
-        };
-        {
-            let mut r = registry.lock().unwrap();
-            r.register(
-                MaterializedViewDefinition::new("summary", "SELECT 99 AS v")
-                    .with_refresh_policy(RefreshPolicy::OnCommit),
-            );
-            r.set_cached("summary", vec![expected_batch.clone()]);
-        }
-
-        let engine = SqlEngine::new().with_view_registry(registry.clone());
-        let batches = engine
-            .sql_with_view_cache("SELECT * FROM summary")
-            .await
-            .unwrap();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 1);
-    }
-
-    #[tokio::test]
-    async fn register_record_batches_overwrites_existing_table() {
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-        ]));
-        let first = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2]))],
-        )
-        .unwrap();
-        let second = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(arrow::array::Int64Array::from(vec![3, 4, 5]))],
-        )
-        .unwrap();
-
-        let engine = SqlEngine::new();
-        engine
-            .register_record_batches("inventory", vec![first])
-            .await
-            .unwrap();
-        engine
-            .register_record_batches("inventory", vec![second])
-            .await
-            .unwrap();
-
-        let dataframe = engine
-            .sql("SELECT count(*) AS n FROM inventory")
-            .await
-            .unwrap();
-        let collected = dataframe.collect().await.unwrap();
-        let rows: usize = collected.iter().map(|batch| batch.num_rows()).sum();
-        assert_eq!(rows, 1);
-    }
 }
 
 #[cfg(test)]

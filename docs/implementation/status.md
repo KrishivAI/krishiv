@@ -1,5 +1,51 @@
 # Krishiv Implementation Status
 
+## Platform-layer cleanup: remove AI/ML/enterprise features (2026-06-11)
+
+### Done
+
+Removed all platform-layer features (AI/ML, enterprise governance, RAG pipelines, policy enforcement, LLM integration, federation, quota management) from the OSS compute engine. The engine now contains only what belongs in a compute engine like Spark/Flink.
+
+**Deleted files:**
+- `crates/krishiv-python/src/ai.rs` — PyRecursiveTextChunker, PySentenceChunker, PyTokenAwareChunker, PyMarkdownSectionChunker, rag_index, rag_query
+- `crates/krishiv-connectors/src/certification.rs` — CertificationSuite harness
+- `crates/krishiv-connectors/src/feature_store.rs` — FeatureStore
+- `crates/krishiv-dataflow/src/chunk.rs` — ChunkOperator
+- `crates/krishiv-executor/src/llm_throttle.rs` — LlmThrottleCommand handling
+- `crates/krishiv-scheduler/src/federation_http.rs` — federation_submit/cancel/status_job
+- `crates/krishiv-scheduler/src/llm_quota.rs` — LlmQuotaAggregator
+
+**Key governance simplifications:**
+- `PolicyHook` trait: single `check_table_access(&self, table_name: &str) -> bool` (no Principal/Role)
+- `AuthProvider` trait: returns `Option<String>` (subject string, not Principal)
+- `StaticApiKeyAuthProvider::new()` takes `HashMap<String, String>` (no Role)
+- `AllowAllPolicyHook` replaces NoOpPolicyHook/RoleBasedPolicyHook
+- `InMemoryQueueManager` replaces QuotaQueueManager/ConfigFileQueueManager
+- Removed: Principal, Role, MaskingRule, AuditAction, AuditOutcome, RunEventType, OpenLineage events
+
+**CertificationSuite removed from all test files:**
+- `crates/krishiv-connectors/src/tests.rs`
+- `crates/krishiv-connectors/src/parquet.rs`
+- `crates/krishiv-connectors/src/kafka.rs`
+- `crates/krishiv-connectors/src/s3.rs`
+- `crates/krishiv-connectors/src/two_phase_parquet_s3.rs`
+
+### Validation
+```bash
+cargo test --workspace --lib --exclude krishiv-python
+# 19 test suites, 0 failures across all crates
+```
+
+### Blockers
+None.
+
+### Next useful task
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+---
+
 ## Write API + Join/Union/Describe/FillNull (2026-06-11)
 
 ### Done

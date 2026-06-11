@@ -25,7 +25,7 @@ use tokio::sync::{Notify, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, ExecutorHeartbeatEffects,
 };
-use crate::admission::{QueueManager, QuotaPolicy, QuotaQueueManager};
+use crate::admission::{InMemoryQueueManager, QueueManager};
 use crate::barrier_dispatch::drive_barrier_dispatches;
 use crate::checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 use crate::config::CoordinatorConfig;
@@ -37,7 +37,6 @@ use crate::job::{
     SlotAwareScheduler, StabilityMetrics, SubmitOutcome, job_spec_from_logical_plan,
     job_spec_from_physical_plan, validate_job,
 };
-use crate::llm_quota;
 use crate::metrics::{
     CHECKPOINT_EPOCHS_TOTAL, JOBS_SUBMITTED_TOTAL, TASKS_ASSIGNED_TOTAL, record_checkpoint_epoch,
 };
@@ -131,8 +130,6 @@ pub struct Coordinator {
     pub(crate) checkpoint_notify_sent: indexmap::IndexSet<(JobId, ExecutorId, u64)>,
     /// (job_id, epoch) pairs for which a gRPC barrier round-trip was dispatched.
     pub(crate) barrier_dispatch_sent: HashSet<(JobId, u64)>,
-    /// Aggregates LLM quota reports across executors (R17).
-    pub(crate) llm_quota_aggregator: llm_quota::LlmQuotaAggregator,
     /// Inline Arrow IPC result batches keyed by job id (terminal SQL/window collect).
     pub(crate) job_inline_results: HashMap<JobId, Vec<Vec<u8>>>,
     /// Parquet tables registered for coordinated `batch-sql` jobs.
@@ -646,22 +643,6 @@ impl Drop for OrchestratorHandles {
     }
 }
 
-/// Build a `QuotaPolicy` from environment variables.
-///
-/// Reads `KRISHIV_MAX_CONCURRENT_JOBS` (integer) and returns an all-unlimited
-/// policy when the variable is absent or invalid.  This is called once at
-/// coordinator construction so all limits are static for the lifetime of the
-/// process; operators must restart to pick up new env var values.
-fn quota_policy_from_env() -> QuotaPolicy {
-    let max_jobs = std::env::var("KRISHIV_MAX_CONCURRENT_JOBS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok());
-    QuotaPolicy {
-        max_concurrent_jobs: max_jobs,
-        ..QuotaPolicy::default()
-    }
-}
-
 impl Coordinator {
     /// Create an active coordinator.
     pub fn active(coordinator_id: CoordinatorId) -> Self {
@@ -685,12 +666,7 @@ impl Coordinator {
             ),
             store: None,
             checkpoint_coordinators: HashMap::new(),
-            // Default to QuotaQueueManager with all-unlimited policy — identical
-            // admission behaviour to InMemoryQueueManager but allows operators to
-            // set real limits via with_queue_manager() without a code change.
-            // KRISHIV_MAX_CONCURRENT_JOBS env var is honoured at daemon startup;
-            // other limits require explicit CoordinatorConfig::with_queue_manager().
-            queue_manager: Arc::new(QuotaQueueManager::with_default(quota_policy_from_env())),
+            queue_manager: Arc::new(InMemoryQueueManager),
             gc_ready_jobs: VecDeque::new(),
             ticks_since_restart: u64::MAX,
             recovering: false,
@@ -701,10 +677,6 @@ impl Coordinator {
             executor_channels: Arc::new(DashMap::new()),
             checkpoint_notify_sent: indexmap::IndexSet::new(),
             barrier_dispatch_sent: HashSet::new(),
-            llm_quota_aggregator: llm_quota::LlmQuotaAggregator::new(
-                config.llm_quota_requests_per_minute(),
-                config.llm_quota_tokens_per_minute(),
-            ),
             job_inline_results: HashMap::new(),
             batch_sql_job_tables: HashMap::new(),
             job_input_partitions: HashMap::new(),

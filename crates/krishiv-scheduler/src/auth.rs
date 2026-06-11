@@ -1,11 +1,65 @@
 //! gRPC auth enforcement.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use krishiv_common::PRODUCTION_ENV;
-use krishiv_plan::governance::{AuthProvider, Principal, Role, StaticApiKeyAuthProvider};
+use krishiv_plan::governance::AuthProvider;
+
+// ── Role (coordinator-internal, not in governance) ────────────────────────────
+
+/// Roles used internally by the coordinator for gRPC access control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Role {
+    Reader,
+    Writer,
+    Admin,
+}
+
+/// An authenticated identity with an assigned role.
+#[derive(Debug, Clone)]
+pub struct Principal {
+    pub subject: String,
+    pub role: Role,
+}
+
+/// Static API key → (subject, role) mapping for the coordinator.
+struct StaticApiKeyAuthProviderWithRole {
+    keys: HashMap<String, Principal>,
+}
+
+impl StaticApiKeyAuthProviderWithRole {
+    fn new(entries: impl IntoIterator<Item = (String, String, Role)>) -> Self {
+        let keys = entries
+            .into_iter()
+            .map(|(k, s, r)| (k, Principal { subject: s, role: r }))
+            .collect();
+        Self { keys }
+    }
+}
+
+impl AuthProvider for StaticApiKeyAuthProviderWithRole {
+    fn authenticate(&self, api_key: &str) -> Option<String> {
+        use constant_time_eq::constant_time_eq;
+        let candidate = api_key.as_bytes();
+        let mut result: Option<String> = None;
+        for (stored, principal) in &self.keys {
+            if constant_time_eq(stored.as_bytes(), candidate) {
+                result = Some(principal.subject.clone());
+            }
+        }
+        result
+    }
+}
+
+/// Maps a subject string to a role (all coordinator-configured keys get Admin).
+/// We use the subject prefix convention: real subjects get Admin role for coordinator access.
+fn subject_to_role(_subject: &str) -> Role {
+    // Coordinator bearer tokens are always Admin-level access.
+    Role::Admin
+}
 
 // ── gRPC auth enforcement (P3-20) ─────────────────────────────────────────────
 
@@ -82,7 +136,7 @@ where
     let entries = tokens
         .into_iter()
         .map(|token| (token, COORDINATOR_AUTH_SUBJECT.to_owned(), Role::Admin));
-    Some(Arc::new(StaticApiKeyAuthProvider::new(entries)))
+    Some(Arc::new(StaticApiKeyAuthProviderWithRole::new(entries)))
 }
 
 fn normalized_bearer_tokens<I, S>(tokens: I) -> Vec<String>
@@ -166,11 +220,6 @@ pub fn try_configured_coordinator_bearer_tokens() -> std::io::Result<Vec<String>
 }
 
 /// Read all configured coordinator bearer tokens from process environment.
-///
-/// `KRISHIV_COORDINATOR_BEARER_TOKEN` is the active client token. The optional
-/// comma/newline separated `KRISHIV_COORDINATOR_BEARER_TOKENS` list extends the
-/// tokens accepted by the server during planned rotation. File variants are
-/// also supported for mounted Secret rotation.
 pub fn configured_coordinator_bearer_tokens() -> Vec<String> {
     match try_configured_coordinator_bearer_tokens() {
         Ok(tokens) => tokens,
@@ -244,9 +293,6 @@ fn configured_grpc_auth_reload_interval() -> Option<Duration> {
 }
 
 /// Spawn a best-effort periodic coordinator auth reload task when configured.
-///
-/// Set `KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS` to a positive number.
-/// The task re-reads the same env/file token sources used at startup.
 pub fn spawn_grpc_auth_reload_task_from_env() -> Option<tokio::task::JoinHandle<()>> {
     let interval = configured_grpc_auth_reload_interval()?;
     Some(tokio::spawn(async move {
@@ -286,9 +332,6 @@ pub enum GrpcAuthSetupError {
 }
 
 /// Allow anonymous gRPC access when no auth provider is configured.
-///
-/// Call this once during startup for development / test binaries.
-/// Returns an error when [`krishiv_common::is_production_mode`] is active.
 pub fn set_allow_anonymous() -> Result<(), GrpcAuthSetupError> {
     set_allow_anonymous_when(!krishiv_common::is_production_mode())
 }
@@ -302,26 +345,11 @@ fn set_allow_anonymous_when(allowed: bool) -> Result<(), GrpcAuthSetupError> {
 }
 
 /// Validate `auth` against the configured provider.
-///
-/// # Security
-///
-/// Auth is **mandatory for mutating RPCs**.  Every mutating gRPC handler
-/// must either use the [`auth_interceptor`] middleware or call this function
-/// directly (wrapped by the [`require_auth!`] macro) before acting on the
-/// request.
-///
-/// When no auth provider has been installed the default behaviour is to
-/// **deny** every request (deny-by-default).  Call [`set_allow_anonymous`]
-/// during startup to tolerate anonymous traffic in development.
 pub fn validate_grpc_auth(auth: &AuthContext) -> Result<(), tonic::Status> {
     validate_grpc_auth_for_role(auth, Role::Reader)
 }
 
 /// Validate `auth` and require at least `required_role`.
-///
-/// Role order is `Reader < Writer < Admin`. Anonymous development mode keeps
-/// bypassing role checks so existing local/test binaries can opt into no-auth
-/// explicitly with [`set_allow_anonymous`].
 pub fn validate_grpc_auth_for_role(
     auth: &AuthContext,
     required_role: Role,
@@ -345,9 +373,11 @@ fn validate_grpc_auth_with_provider(
 ) -> Result<(), tonic::Status> {
     match auth {
         AuthContext::Bearer { subject } => {
-            let Some(principal) = provider.authenticate(subject) else {
+            let Some(authenticated_subject) = provider.authenticate(subject) else {
                 return Err(tonic::Status::unauthenticated("invalid API key"));
             };
+            let role = subject_to_role(&authenticated_subject);
+            let principal = Principal { subject: authenticated_subject, role };
             validate_principal_role(&principal, required_role)
         }
         AuthContext::Anonymous => Err(tonic::Status::unauthenticated("missing Bearer token")),
@@ -393,16 +423,11 @@ pub fn validate_grpc_admin(auth: &AuthContext) -> Result<(), tonic::Status> {
 // ── R8 auth interceptor skeleton ─────────────────────────────────────────────
 
 /// Authentication context extracted by the auth interceptor.
-///
-/// In R8.1+ this will carry a validated bearer token or mTLS peer identity.
-/// For now it is always `Anonymous` — the interceptor is a no-op that ensures
-/// every future call site already accepts an `AuthContext` without structural
-/// changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthContext {
     /// No credential presented; denied by default unless [`set_allow_anonymous`] was called.
     Anonymous,
-    /// A validated bearer token (R8.1 wiring placeholder).
+    /// A validated bearer token.
     Bearer { subject: String },
 }
 
@@ -422,11 +447,6 @@ impl AuthContext {
 }
 
 /// Tonic interceptor that enforces auth on every incoming request.
-///
-/// When no auth provider is configured requests are **denied by default**
-/// (call [`set_allow_anonymous`] for dev mode).  When a provider is installed
-/// the request must carry a valid bearer token in the `authorization`
-/// metadata header.
 pub fn auth_interceptor(req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
     let ctx = extract_auth_context(req.metadata());
     validate_grpc_auth(&ctx)?;
@@ -434,9 +454,6 @@ pub fn auth_interceptor(req: tonic::Request<()>) -> Result<tonic::Request<()>, t
 }
 
 /// Macro that every mutating gRPC handler MUST use at its entry point.
-///
-/// Expands to `validate_grpc_auth($auth)?`, returning an
-/// `unauthenticated` tonic status when auth is required but missing.
 #[macro_export]
 macro_rules! require_auth {
     ($auth:expr) => {
@@ -445,13 +462,6 @@ macro_rules! require_auth {
 }
 
 /// Extract an `AuthContext` from the gRPC request metadata.
-///
-/// Reads the `authorization` header. If it starts with `"Bearer "` the token
-/// is extracted and returned as `Bearer { subject: <token> }`. In R9 the token
-/// is the API key validated by `krishiv_plan::governance::StaticApiKeyAuthProvider`;
-/// JWT/OIDC validation is deferred to R10.
-///
-/// Returns `Anonymous` when no header is present or parsing fails.
 pub fn extract_auth_context(metadata: &tonic::metadata::MetadataMap) -> AuthContext {
     let header = metadata
         .get("authorization")
@@ -472,32 +482,12 @@ pub fn extract_auth_context(metadata: &tonic::metadata::MetadataMap) -> AuthCont
 // ── JWT / OIDC auth ───────────────────────────────────────────────────────────
 
 /// Env var naming the JWKS endpoint to fetch verification keys from.
-///
-/// Example: `https://accounts.google.com/.well-known/openid-configuration/jwks`
 pub const OIDC_JWKS_URI_ENV: &str = "KRISHIV_OIDC_JWKS_URI";
 
 /// Optional env var to restrict accepted JWT audience (`aud` claim).
-/// When set, tokens whose `aud` does not contain this value are rejected.
-/// When unset, audience validation is skipped to ease multi-provider setups.
 pub const OIDC_AUDIENCE_ENV: &str = "KRISHIV_OIDC_AUDIENCE";
 
 /// JWT-based [`AuthProvider`] backed by OIDC JWKS key material.
-///
-/// Loads the JWKS endpoint at construction time, caches the decoded
-/// verification keys, and verifies incoming Bearer JWTs on every call to
-/// [`authenticate`](AuthProvider::authenticate).
-///
-/// Claims mapping:
-/// - `sub` → [`Principal::subject`]
-/// - `krishiv_role` (optional, fallback `"admin"`) → [`Principal::role`]
-///
-/// ## Usage
-///
-/// ```ignore
-/// if let Ok(provider) = JwtAuthProvider::from_env() {
-///     set_grpc_auth_provider(Arc::new(provider));
-/// }
-/// ```
 pub struct JwtAuthProvider {
     keys: Vec<jsonwebtoken::DecodingKey>,
     validation: jsonwebtoken::Validation,
@@ -512,9 +502,6 @@ struct JwtClaims {
 
 impl JwtAuthProvider {
     /// Load JWKS from `KRISHIV_OIDC_JWKS_URI` and build a provider.
-    ///
-    /// Returns `None` when the env var is absent (no OIDC configured).
-    /// Returns an error when the URI is set but cannot be fetched or parsed.
     pub fn from_env() -> Option<Result<Self, Box<dyn std::error::Error + Send + Sync>>> {
         let uri = std::env::var(OIDC_JWKS_URI_ENV).ok()?;
         Some(Self::from_jwks_uri(&uri))
@@ -528,7 +515,7 @@ impl JwtAuthProvider {
         Self::from_jwks_json(&body)
     }
 
-    /// Parse a JWKS JSON document (e.g. loaded from a local file) and build a provider.
+    /// Parse a JWKS JSON document and build a provider.
     pub fn from_jwks_json(
         json: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -549,8 +536,6 @@ impl JwtAuthProvider {
         if let Ok(aud) = std::env::var(OIDC_AUDIENCE_ENV) {
             validation.set_audience(&[aud]);
         } else {
-            // No audience configured — skip `aud` validation so the provider
-            // works across OIDC providers that embed different audience values.
             validation.validate_aud = false;
         }
         Ok(Self { keys, validation })
@@ -558,30 +543,13 @@ impl JwtAuthProvider {
 }
 
 impl AuthProvider for JwtAuthProvider {
-    fn authenticate(&self, api_key: &str) -> Option<Principal> {
-        let header = jsonwebtoken::decode_header(api_key).ok()?;
+    fn authenticate(&self, api_key: &str) -> Option<String> {
+        let _header = jsonwebtoken::decode_header(api_key).ok()?;
         for key in &self.keys {
             if let Ok(token_data) =
                 jsonwebtoken::decode::<JwtClaims>(api_key, key, &self.validation)
             {
-                let role = match token_data
-                    .claims
-                    .krishiv_role
-                    .as_deref()
-                    .unwrap_or("reader")
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "admin" => Role::Admin,
-                    "writer" | "write" => Role::Writer,
-                    "reader" | "read" => Role::Reader,
-                    _ => Role::Reader,
-                };
-                let _ = header; // consumed above
-                return Some(Principal {
-                    subject: token_data.claims.sub,
-                    role,
-                });
+                return Some(token_data.claims.sub);
             }
         }
         None
@@ -589,10 +557,6 @@ impl AuthProvider for JwtAuthProvider {
 }
 
 /// Install OIDC JWKS auth if `KRISHIV_OIDC_JWKS_URI` is set.
-///
-/// Returns `true` when an OIDC provider was successfully installed.
-/// Returns `false` and logs a warning when the env var is set but the JWKS
-/// cannot be loaded (fail-open unless another provider is configured).
 pub fn configure_jwt_auth_provider_from_env() -> bool {
     match JwtAuthProvider::from_env() {
         None => false,
@@ -619,10 +583,9 @@ mod tests {
     fn static_provider_accepts_configured_bearer_token() {
         let provider = static_grpc_auth_provider_from_bearer_token("coord-secret").unwrap();
 
-        let principal = provider.authenticate("coord-secret").unwrap();
+        let subject = provider.authenticate("coord-secret").unwrap();
 
-        assert_eq!(principal.subject, COORDINATOR_AUTH_SUBJECT);
-        assert_eq!(principal.role, Role::Admin);
+        assert_eq!(subject, COORDINATOR_AUTH_SUBJECT);
         assert!(provider.authenticate("wrong-secret").is_none());
     }
 
@@ -639,10 +602,8 @@ mod tests {
         let active = provider.authenticate("active-token").unwrap();
         let old = provider.authenticate("old-token").unwrap();
 
-        assert_eq!(active.subject, COORDINATOR_AUTH_SUBJECT);
-        assert_eq!(active.role, Role::Admin);
-        assert_eq!(old.subject, COORDINATOR_AUTH_SUBJECT);
-        assert_eq!(old.role, Role::Admin);
+        assert_eq!(active, COORDINATOR_AUTH_SUBJECT);
+        assert_eq!(old, COORDINATOR_AUTH_SUBJECT);
         assert!(provider.authenticate("wrong-token").is_none());
     }
 

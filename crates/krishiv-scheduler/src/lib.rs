@@ -34,12 +34,10 @@ pub mod cluster_control;
 pub mod continuous_stream_http;
 pub mod coordinator_daemon;
 pub mod coordinator_sharded;
-pub mod federation_http;
 pub mod heartbeat;
 pub mod in_process;
 pub mod job;
 pub mod job_coordinator;
-pub mod llm_quota;
 pub mod queryable_state_http;
 pub mod rpc_drain;
 pub mod store;
@@ -50,10 +48,7 @@ pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, ExecutorHeartbeatEffects,
     ThrottleDecision,
 };
-pub use admission::{
-    ConfigFileQueueManager, CrdQueueManager, InMemoryQueueManager, QueueManager, QuotaPolicy,
-    QuotaQueueManager,
-};
+pub use admission::{InMemoryQueueManager, QueueManager};
 pub use auth::{
     AuthContext, COORDINATOR_AUTH_RELOAD_INTERVAL_SECS_ENV, COORDINATOR_BEARER_TOKEN_ENV,
     COORDINATOR_BEARER_TOKEN_FILE_ENV, COORDINATOR_BEARER_TOKENS_ENV,
