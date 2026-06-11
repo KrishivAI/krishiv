@@ -30,6 +30,9 @@ base64 = "0.22"
 parquet = { workspace = true }
 webpki-root-certs = { workspace = true }
 
+[features]
+kafka = []
+
 [dev-dependencies]
 krishiv-flight-sql = { path = "../krishiv-flight-sql" }
 tokio = { workspace = true }

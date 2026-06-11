@@ -26,6 +26,9 @@ uuid = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 
+[features]
+kafka = ["krishiv-runtime/kafka", "krishiv-api/kafka"]
+
 [dev-dependencies]
 futures = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }

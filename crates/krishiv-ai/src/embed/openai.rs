@@ -26,21 +26,23 @@ impl EmbeddingRateLimiter {
     }
 
     pub async fn acquire(&mut self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        if let Some(last) = self.last_refill_ms {
-            let elapsed = now.saturating_sub(last);
-            let refill = (elapsed as f64 / 60_000.0) * self.requests_per_minute as f64;
-            self.tokens = (self.tokens + refill).min(self.requests_per_minute as f64);
-        }
-        self.last_refill_ms = Some(now);
-        while self.tokens < 1.0 {
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if let Some(last) = self.last_refill_ms {
+                let elapsed = now.saturating_sub(last);
+                let refill = (elapsed as f64 / 60_000.0) * self.requests_per_minute as f64;
+                self.tokens = (self.tokens + refill).min(self.requests_per_minute as f64);
+            }
+            self.last_refill_ms = Some(now);
+            if self.tokens >= 1.0 {
+                self.tokens -= 1.0;
+                return;
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
-            self.tokens = self.requests_per_minute as f64;
         }
-        self.tokens -= 1.0;
     }
 }
 

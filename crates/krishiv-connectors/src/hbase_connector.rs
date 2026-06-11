@@ -130,7 +130,9 @@ impl HBaseSink {
         let client = Arc::clone(&self.client);
 
         tokio::task::spawn_blocking(move || {
-            let mut guard = client.lock().unwrap();
+            let mut guard = client
+                .lock()
+                .map_err(|_| ConnectorError::Io(std::io::Error::other("hbase client mutex poisoned")))?;
             guard
                 .mutate_rows(table_bytes, row_mutations, Default::default())
                 .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))
@@ -231,43 +233,50 @@ pub fn arrow_cell_to_bytes(col: &dyn Array, row: usize) -> Option<Vec<u8>> {
     }
     let s = match col.data_type() {
         DataType::Boolean => {
-            let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-            arr.value(row).to_string()
+            col.as_any().downcast_ref::<BooleanArray>()
+                .map(|arr| arr.value(row).to_string())
+                .unwrap_or_default()
         }
         DataType::Int8 => {
-            let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
-            arr.value(row).to_string()
+            col.as_any().downcast_ref::<Int8Array>()
+                .map(|arr| arr.value(row).to_string())
+                .unwrap_or_default()
         }
         DataType::Int16 => {
-            let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
-            arr.value(row).to_string()
+            col.as_any().downcast_ref::<Int16Array>()
+                .map(|arr| arr.value(row).to_string())
+                .unwrap_or_default()
         }
         DataType::Int32 => {
-            let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-            arr.value(row).to_string()
+            col.as_any().downcast_ref::<Int32Array>()
+                .map(|arr| arr.value(row).to_string())
+                .unwrap_or_default()
         }
         DataType::Int64 => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-            arr.value(row).to_string()
+            col.as_any().downcast_ref::<Int64Array>()
+                .map(|arr| arr.value(row).to_string())
+                .unwrap_or_default()
         }
         DataType::Float32 => {
-            let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-            arr.value(row).to_string()
+            col.as_any().downcast_ref::<Float32Array>()
+                .map(|arr| arr.value(row).to_string())
+                .unwrap_or_default()
         }
         DataType::Float64 => {
-            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-            arr.value(row).to_string()
+            col.as_any().downcast_ref::<Float64Array>()
+                .map(|arr| arr.value(row).to_string())
+                .unwrap_or_default()
         }
         DataType::Utf8 => {
-            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-            arr.value(row).to_owned()
+            col.as_any().downcast_ref::<StringArray>()
+                .map(|arr| arr.value(row).to_owned())
+                .unwrap_or_default()
         }
         DataType::Binary => {
-            let arr = col
+            return col
                 .as_any()
                 .downcast_ref::<arrow::array::BinaryArray>()
-                .unwrap();
-            return Some(arr.value(row).to_vec());
+                .map(|arr| arr.value(row).to_vec());
         }
         _ => format!("{:?}", col.data_type()),
     };

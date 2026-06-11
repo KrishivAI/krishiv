@@ -350,18 +350,30 @@ impl InProcessStreamingRuntime {
     pub fn drain_continuous_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
         let batches = self.continuous_registry.drain_job(job_id)?;
         // Snapshot and persist window state after each successful drain.
-        // Errors are swallowed: snapshot is best-effort and must not break drains.
+        // Snapshot errors are swallowed: a job with no window state yet returns
+        // an error on the first drain; that is expected and must not block drains.
+        // Lock-poison is unexpected and logged at WARN so operators know the
+        // coordinator is degraded without breaking the drain path.
         if let Ok((snapshot_bytes, watermark_ms)) =
             self.continuous_registry.snapshot_job_with_watermark(job_id)
-            && let Ok(coord) = self.coordinator.lock()
         {
-            coord.save_continuous_snapshot(
-                job_id,
-                ContinuousSnapshot {
-                    snapshot_bytes,
-                    watermark_ms,
-                },
-            );
+            match self.coordinator.lock() {
+                Ok(coord) => {
+                    coord.save_continuous_snapshot(
+                        job_id,
+                        ContinuousSnapshot {
+                            snapshot_bytes,
+                            watermark_ms,
+                        },
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        job_id,
+                        "coordinator mutex poisoned; continuous job snapshot not persisted"
+                    );
+                }
+            }
         }
         Ok(batches)
     }
@@ -548,19 +560,29 @@ impl InProcessStreamingRuntime {
                 if let Some(wm) = stage_watermark_ms.take() {
                     // Only inject if the next stage is a streaming fragment; batch
                     // stages ignore the hint (O6). Guard against empty assignments (G5).
+                    // Use starts_with instead of contains to avoid matching "stream:"
+                    // inside a SQL string predicate.
                     let next_is_streaming = assignments
                         .first()
-                        .map(|a| a.plan_fragment().description().contains("stream:"))
+                        .map(|a| a.plan_fragment().description().starts_with("stream:"))
                         .unwrap_or(false);
                     if next_is_streaming && !assignments.is_empty() {
                         let hint = InputPartition::new("watermark-hint", String::new())
                             .with_descriptor(InputPartitionDescriptor::WatermarkHint {
                                 watermark_ms: wm,
                             });
-                        let first = assignments.remove(0);
-                        let mut new_parts = vec![hint];
-                        new_parts.extend(first.input_partitions().to_vec());
-                        assignments.insert(0, first.with_input_partitions(new_parts));
+                        // Inject the watermark hint into ALL tasks in this stage, not
+                        // just the first. Tasks 1..N previously started at WATERMARK_UNSET
+                        // (i64::MIN), causing inconsistent late-data suppression within
+                        // a multi-task streaming stage.
+                        assignments = assignments
+                            .into_iter()
+                            .map(|a| {
+                                let mut new_parts = vec![hint.clone()];
+                                new_parts.extend(a.input_partitions().to_vec());
+                                a.with_input_partitions(new_parts)
+                            })
+                            .collect();
                     } else {
                         // Restore for the next iteration when assignments arrive.
                         stage_watermark_ms = Some(wm);
@@ -673,6 +695,12 @@ impl InProcessStreamingRuntime {
     /// Stable identity for session-scoped coordinator reuse tests.
     pub fn coordinator_instance_id(&self) -> usize {
         Arc::as_ptr(&self.coordinator) as usize
+    }
+
+    /// Borrow the runner's SQL engine (for Kafka / streaming source registration
+    /// forwarded from the Flight server).
+    pub fn runner_sql_engine(&self) -> &krishiv_sql::SqlEngine {
+        self.runner.sql_engine()
     }
 
     pub fn execute_windowed_local(

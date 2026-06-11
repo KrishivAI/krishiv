@@ -137,6 +137,7 @@ pub(crate) fn shared_embedded_runtime() -> Result<Arc<dyn ExecutionRuntime>> {
     })
 }
 
+
 fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {
     match mode {
         ExecutionMode::Embedded => RuntimeMode::Embedded,
@@ -378,34 +379,34 @@ impl SessionBuilder {
         if let (Some(flight_url), Some(grpc_url)) =
             (&self.coordinator_url, &self.local_cluster_grpc)
         {
-            fn extract_host(url: &str) -> Option<String> {
-                // Cheap host extraction without a full URL parser dependency:
-                // strip scheme, split on '/', take the host:port part.
+            fn extract_authority(url: &str) -> Option<String> {
+                // Extract host:port (the full authority) without pulling in a URL
+                // parser. Comparing host:port prevents same-host / different-port
+                // collisions where two separate coordinator processes on the same
+                // machine would silently pass a hostname-only check.
                 let after_scheme = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
-                let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
-                // Strip port if present (we only compare hostnames).
-                Some(host_port.split(':').next().unwrap_or(host_port).to_string())
+                let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+                Some(authority.to_string())
             }
-            let flight_host = extract_host(flight_url);
-            let grpc_host = extract_host(grpc_url);
-            if flight_host.is_some() && grpc_host.is_some() && flight_host != grpc_host {
+            let flight_authority = extract_authority(flight_url);
+            let grpc_authority = extract_authority(grpc_url);
+            if flight_authority.is_some()
+                && grpc_authority.is_some()
+                && flight_authority != grpc_authority
+            {
                 return Err(KrishivError::unsupported(format!(
-                    "coordinator Flight URL host ('{}') and gRPC URL host ('{}') must match; \
-                     both must point to the same coordinator process",
-                    flight_host.unwrap_or_default(),
-                    grpc_host.unwrap_or_default(),
+                    "coordinator Flight URL authority ('{}') and gRPC URL authority ('{}') must \
+                     match; both must point to the same coordinator process",
+                    flight_authority.unwrap_or_default(),
+                    grpc_authority.unwrap_or_default(),
                 )));
             }
         }
 
         let udf_registry = Arc::new(RwLock::new(UdfRegistry::new()));
         let parallelism = self.target_parallelism.unwrap_or_else(|| {
-            if matches!(self.mode, ExecutionMode::Embedded) {
-                std::num::NonZeroUsize::new(1).unwrap()
-            } else {
-                std::thread::available_parallelism()
-                    .unwrap_or(std::num::NonZeroUsize::new(1).unwrap())
-            }
+            std::thread::available_parallelism()
+                .unwrap_or(std::num::NonZeroUsize::new(1).unwrap())
         });
         let sql_engine = SqlEngine::new()
             .with_target_parallelism(parallelism)
@@ -886,9 +887,32 @@ impl Session {
         topic: impl Into<String>,
         group_id: impl Into<String>,
     ) -> Result<()> {
+        let bootstrap_servers = bootstrap_servers.into();
+        let topic = topic.into();
+        let group_id = group_id.into();
         self.sql_engine
-            .register_kafka_source(name, schema, bootstrap_servers, topic, group_id)
-            .map_err(KrishivError::from)
+            .register_kafka_source(
+                name,
+                Arc::clone(&schema),
+                &bootstrap_servers,
+                &topic,
+                &group_id,
+            )
+            .map_err(KrishivError::from)?;
+        // In distributed mode, forward the registration to the remote coordinator
+        // so the remote SQL engine can plan streaming queries over Kafka topics.
+        if self.runtime.uses_remote() {
+            let schema_ipc_b64 = krishiv_runtime::encode_schema_ipc_b64(&schema)
+                .map_err(|e| KrishivError::Runtime {
+                    message: e.to_string(),
+                })?;
+            self.runtime
+                .register_kafka_source(name, &schema_ipc_b64, &bootstrap_servers, &topic, &group_id)
+                .map_err(|e| KrishivError::Runtime {
+                    message: e.to_string(),
+                })?;
+        }
+        Ok(())
     }
 
     /// Asynchronously register a local Parquet path as a SQL table.

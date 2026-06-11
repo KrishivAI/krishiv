@@ -40,6 +40,7 @@ pub mod tags {
     pub const EXPLAIN: &str = "explain";
     pub const EXECUTE_PLAN: &str = "execute_plan";
     pub const BATCH_SQL: &str = "batch_sql";
+    pub const REGISTER_KAFKA_SOURCE: &str = "register_kafka_source";
 }
 
 /// Build a stable action type for a tag — `format!("krishiv.v1.{tag}")`.
@@ -184,6 +185,20 @@ pub struct BatchSqlBody {
     pub is_streaming: bool,
 }
 
+/// Register a Kafka topic as a streaming SQL table on the remote coordinator.
+///
+/// Sent by `Session::register_kafka_source` in distributed mode so the remote
+/// executor has the same Kafka source registration as the client's local SQL engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterKafkaSourceBody {
+    pub name: String,
+    /// JSON-encoded Arrow schema (IPC schema bytes, base64-encoded).
+    pub schema_ipc_b64: String,
+    pub bootstrap_servers: String,
+    pub topic: String,
+    pub group_id: String,
+}
+
 /// Typed Flight `DoAction` payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind")]
@@ -196,6 +211,7 @@ pub enum KrishivFlightAction {
     Explain(ExplainBody),
     ExecutePlan(ExecutePlanBody),
     BatchSql(BatchSqlBody),
+    RegisterKafkaSource(RegisterKafkaSourceBody),
 }
 
 impl KrishivFlightAction {
@@ -210,6 +226,7 @@ impl KrishivFlightAction {
             Self::Explain(_) => tags::EXPLAIN,
             Self::ExecutePlan(_) => tags::EXECUTE_PLAN,
             Self::BatchSql(_) => tags::BATCH_SQL,
+            Self::RegisterKafkaSource(_) => tags::REGISTER_KAFKA_SOURCE,
         };
         action_type(tag)
     }
@@ -247,6 +264,33 @@ pub fn encode_batches(batches: &[RecordBatch]) -> RuntimeResult<String> {
             .map_err(|e| RuntimeError::transport(format!("ipc finish failed: {e}")))?;
     }
     Ok(BASE64.encode(buffer))
+}
+
+/// Encode an Arrow schema as base64 IPC bytes for use in [`RegisterKafkaSourceBody`].
+pub fn encode_schema_ipc_b64(schema: &arrow::datatypes::Schema) -> RuntimeResult<String> {
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, schema)
+            .map_err(|e| RuntimeError::transport(format!("schema ipc encode: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| RuntimeError::transport(format!("schema ipc finish: {e}")))?;
+    }
+    Ok(BASE64.encode(buffer))
+}
+
+/// Decode an Arrow schema from base64 IPC bytes produced by [`encode_schema_ipc_b64`].
+pub fn decode_schema_ipc_b64(encoded: &str) -> RuntimeResult<arrow::datatypes::SchemaRef> {
+    if encoded.is_empty() {
+        return Err(RuntimeError::transport("empty schema IPC bytes"));
+    }
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|e| RuntimeError::transport(format!("invalid schema b64: {e}")))?;
+    let cursor = Cursor::new(bytes);
+    let reader = StreamReader::try_new(cursor, None)
+        .map_err(|e| RuntimeError::transport(format!("schema ipc decode: {e}")))?;
+    Ok(reader.schema())
 }
 
 /// Decode batches from a string previously produced by [`encode_batches`].

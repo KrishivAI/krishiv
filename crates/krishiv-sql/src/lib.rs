@@ -34,8 +34,6 @@ pub mod unnest_sql;
 mod lakehouse;
 pub mod live_table;
 pub mod policy;
-pub mod spark_compat;
-pub mod spark_compat_date;
 pub mod streaming;
 mod udf;
 mod window_functions;

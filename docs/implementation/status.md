@@ -41,14 +41,23 @@ Systematic 12-dimension analysis of all 411 source files across 20 crates. All P
 28. `krishiv-sql/src/create_function_ddl.rs` — Regex recompiled per call → `static LazyLock<Regex>`
 29. `krishiv-sql/src/subquery.rs` — Case-sensitive streaming table name comparison → lowercase set
 
+**Session 2 additional fixes (2026-06-11):**
+30. `krishiv-ai/src/embed/openai.rs` — `EmbeddingRateLimiter::acquire` sleep loop reset tokens to full capacity instead of doing a time-proportional refill; fixed by refilling from elapsed time on each iteration
+31. `krishiv-connectors/src/avro.rs` — Arrow downcast `.unwrap()` in `arrow_scalar_to_avro` → `.map(...).unwrap_or(AvroValue::Null)` for each matched type
+32. `krishiv-connectors/src/cassandra_sink.rs` — Arrow downcast `.unwrap()` in `arrow_scalar_to_cql` → `?` on `downcast_ref` (returns `None` on mismatch)
+33. `krishiv-connectors/src/hbase_connector.rs` — (a) `Mutex::lock().unwrap()` in `write_batch` → `map_err`; (b) Arrow downcast `.unwrap()` in `arrow_cell_to_bytes` → `.map(...).unwrap_or_default()`
+34. `krishiv-scheduler/src/store.rs` — `ContinuousSnapshot::decode` used `try_into().unwrap()` → `copy_from_slice` into fixed-size arrays (guarded by prior length check)
+35. `krishiv-sql/src/udf.rs` — Dead import `BinaryArray` removed
+
 ### Validation
 ```bash
-cargo check --workspace          # 0 errors
+cargo check --workspace          # 0 errors, 2 pre-existing warnings
 cargo test -p krishiv-scheduler --lib  # 304 passed
 cargo test -p krishiv-executor --lib   # all passed
 cargo test -p krishiv-sql --lib        # all passed
 cargo test -p krishiv-state --lib      # all passed
 cargo test -p krishiv-plan --lib       # all passed
+cargo test -p krishiv-ai --lib         # 152 passed (session 2)
 ```
 
 ### Blockers

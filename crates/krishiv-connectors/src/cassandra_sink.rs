@@ -143,42 +143,42 @@ pub fn arrow_scalar_to_cql(
         return None;
     }
     let val = match dt {
-        DataType::Boolean => {
-            let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-            CqlValue::Boolean(arr.value(row))
-        }
-        DataType::Int8 => {
-            let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
-            CqlValue::TinyInt(arr.value(row))
-        }
-        DataType::Int16 => {
-            let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
-            CqlValue::SmallInt(arr.value(row))
-        }
-        DataType::Int32 => {
-            let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-            CqlValue::Int(arr.value(row))
-        }
-        DataType::Int64 => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-            CqlValue::BigInt(arr.value(row))
-        }
-        DataType::Float32 => {
-            let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-            CqlValue::Float(arr.value(row))
-        }
-        DataType::Float64 => {
-            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-            CqlValue::Double(arr.value(row))
-        }
-        DataType::Utf8 => {
-            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-            CqlValue::Text(arr.value(row).to_owned())
-        }
-        DataType::Binary => {
-            let arr = col.as_any().downcast_ref::<arrow::array::BinaryArray>().unwrap();
-            CqlValue::Blob(arr.value(row).to_vec())
-        }
+        DataType::Boolean => col
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|arr| CqlValue::Boolean(arr.value(row)))?,
+        DataType::Int8 => col
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|arr| CqlValue::TinyInt(arr.value(row)))?,
+        DataType::Int16 => col
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|arr| CqlValue::SmallInt(arr.value(row)))?,
+        DataType::Int32 => col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|arr| CqlValue::Int(arr.value(row)))?,
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|arr| CqlValue::BigInt(arr.value(row)))?,
+        DataType::Float32 => col
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|arr| CqlValue::Float(arr.value(row)))?,
+        DataType::Float64 => col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|arr| CqlValue::Double(arr.value(row)))?,
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|arr| CqlValue::Text(arr.value(row).to_owned()))?,
+        DataType::Binary => col
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .map(|arr| CqlValue::Blob(arr.value(row).to_vec()))?,
         _ => CqlValue::Text(format!("{dt:?}")),
     };
     Some(val)

@@ -442,12 +442,16 @@ async fn heartbeat_loop(
     let effective_slots = slots.max(1);
     let storage_for_tasks = Arc::clone(&checkpoint_storage);
     let backend_for_tasks = Arc::clone(&state_backend);
+    // Share a single wakeup notifier across all slots so any push wakes exactly
+    // one waiting slot (notify_one) without requiring per-slot channels.
+    let slot_wakeup = Arc::clone(runner.inbox().wakeup());
     for slot_idx in 0..effective_slots {
         let runner_loop = Arc::clone(&runner);
         let coord = Arc::clone(&coord_service);
         let storage = Arc::clone(&storage_for_tasks);
         let backend = Arc::clone(&backend_for_tasks);
         let shutdown_flag = Arc::clone(&shutdown);
+        let wakeup = Arc::clone(&slot_wakeup);
         tokio::spawn(async move {
             loop {
                 if shutdown_flag.load(Ordering::Acquire) {
@@ -469,7 +473,13 @@ async fn heartbeat_loop(
                 match runner_loop.run_next_with(coord.as_ref()).await {
                     Ok(Some(_report)) => {}
                     Ok(None) => {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        // Wait for a push notification or a 1-second fallback so
+                        // the loop can detect shutdown or stale state without
+                        // burning CPU on a 50 ms unconditional sleep.
+                        tokio::select! {
+                            _ = wakeup.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(slot = slot_idx, error = %e, "task runner error");

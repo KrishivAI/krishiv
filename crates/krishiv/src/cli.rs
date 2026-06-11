@@ -128,7 +128,6 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["savepoint", "--help"] | ["savepoint", "-h"] => CliResponse::ok(savepoint_help()),
         ["restore", "--help"] | ["restore", "-h"] => CliResponse::ok(restore_help()),
         ["checkpoints", "--help"] | ["checkpoints", "-h"] => CliResponse::ok(checkpoints_help()),
-        ["compat", "--help"] | ["compat", "-h"] => CliResponse::ok(compat_help()),
         ["local"] | ["local", "--help"] | ["local", "-h"] => {
             CliResponse::ok(crate::local_cluster::local_help())
         }
@@ -142,7 +141,6 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["help", "savepoint"] => CliResponse::ok(savepoint_help()),
         ["help", "restore"] => CliResponse::ok(restore_help()),
         ["help", "checkpoints"] => CliResponse::ok(checkpoints_help()),
-        ["help", "compat"] => CliResponse::ok(compat_help()),
         ["help", "local"] => CliResponse::ok(crate::local_cluster::local_help()),
         ["help", "daemons"] | ["help", "daemon"] => crate::daemon_cmd::help_daemons(),
         ["local", rest @ ..] => crate::local_cluster::run_local(rest),
@@ -156,20 +154,6 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
             format!(
                 "daemon commands must run via the krishiv binary entrypoint\n\n{}",
                 crate::daemon_cmd::daemons_help()
-            ),
-            2,
-        ),
-        ["compat", "analyze", rest @ ..] => run_compat_analyze(rest),
-        ["compat"] => CliResponse::ok(compat_help()),
-        ["compat", sub, ..] => CliResponse::err(
-            format!(
-                "compat: unknown subcommand '{sub}'\n\n\
-                 Available subcommands:\n\
-                   analyze   Analyze a PySpark script for migration compatibility\n\n\
-                 Planned (not yet available):\n\
-                   convert   Automatically rewrite PySpark scripts to Krishiv API\n\
-                   report    Generate a full HTML migration report\n\n\
-                 Run 'krishiv compat --help' for usage.\n"
             ),
             2,
         ),
@@ -206,9 +190,8 @@ pub fn main_help() -> String {
            state        Inspect streaming operator state metadata (R5.2)\n\
            savepoint    Trigger a savepoint on a running streaming job (R6)\n\
            restore      Restore a streaming job from a checkpoint or savepoint (R6)\n\
-           checkpoints  List checkpoints for a streaming job (R6)\n\
-           compat       PySpark migration compatibility tools (R15)\n\
-           local        Start/stop/status a Spark-like local cluster\n\
+            checkpoints  List checkpoints for a streaming job (R6)\n\
+            local        Start/stop/status a Spark-like local cluster\n\
            cluster      Start/stop/status bare-metal clusterd + executors\n",
     );
     help.push_str(&crate::daemon_cmd::daemon_help_section());
@@ -220,62 +203,6 @@ pub fn main_help() -> String {
            -h, --help               Show help\n",
     );
     help
-}
-
-pub fn compat_help() -> String {
-    String::from(
-        "PySpark migration compatibility analyzer.\n\
-         \n\
-         Usage:\n\
-           krishiv compat analyze <file.py> [--format text|json] [--output <file>]\n",
-    )
-}
-
-fn run_compat_analyze(args: &[&str]) -> CliResponse {
-    use std::path::PathBuf;
-    let mut path = None;
-    let mut format = "text";
-    let mut output = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i] {
-            "--format" if i + 1 < args.len() => {
-                format = args[i + 1];
-                i += 2;
-            }
-            "--output" | "-o" if i + 1 < args.len() => {
-                output = Some(PathBuf::from(args[i + 1]));
-                i += 2;
-            }
-            flag if flag.starts_with('-') => {
-                return CliResponse::err(format!("unknown flag: {flag}"), 2);
-            }
-            file => {
-                path = Some(PathBuf::from(file));
-                i += 1;
-            }
-        }
-    }
-    let Some(path) = path else {
-        return CliResponse::err(format!("missing file\n\n{}", compat_help()), 2);
-    };
-    let report = match crate::compat::analyze_file(&path) {
-        Ok(r) => r,
-        Err(e) => return CliResponse::err(e, 1),
-    };
-    let body = if format == "json" {
-        serde_json::to_string_pretty(&report).unwrap_or_else(|e| e.to_string())
-    } else {
-        crate::compat::format_report_text(&report)
-    };
-    if let Some(out_path) = output {
-        if let Err(e) = std::fs::write(&out_path, &body) {
-            return CliResponse::err(format!("write {}: {e}", out_path.display()), 1);
-        }
-        CliResponse::ok(format!("wrote report to {}\n", out_path.display()))
-    } else {
-        CliResponse::ok(body)
-    }
 }
 
 pub fn submit_help() -> String {

@@ -149,6 +149,23 @@ pub trait ExecutionRuntime: Send + Sync {
     fn coordinator_grpc_url(&self) -> Option<&str> {
         None
     }
+
+    /// Forward a Kafka source registration to the remote coordinator.
+    ///
+    /// The default no-op is appropriate for in-process runtimes where the caller
+    /// has already registered the source on the local `SqlEngine`.
+    /// Remote runtimes override this to send a `RegisterKafkaSource` Flight action.
+    #[cfg(feature = "kafka")]
+    fn register_kafka_source(
+        &self,
+        _name: &str,
+        _schema_ipc_b64: &str,
+        _bootstrap_servers: &str,
+        _topic: &str,
+        _group_id: &str,
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
 }
 
 fn tables_to_batch_sql(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> {
@@ -534,6 +551,27 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
 
     fn coordinator_grpc_url(&self) -> Option<&str> {
         self.coordinator_grpc_url.as_deref()
+    }
+
+    #[cfg(feature = "kafka")]
+    fn register_kafka_source(
+        &self,
+        name: &str,
+        schema_ipc_b64: &str,
+        bootstrap_servers: &str,
+        topic: &str,
+        group_id: &str,
+    ) -> RuntimeResult<()> {
+        use crate::flight_action::{KrishivFlightAction, RegisterKafkaSourceBody};
+        use krishiv_common::async_util::block_on;
+        let action = KrishivFlightAction::RegisterKafkaSource(RegisterKafkaSourceBody {
+            name: name.to_owned(),
+            schema_ipc_b64: schema_ipc_b64.to_owned(),
+            bootstrap_servers: bootstrap_servers.to_owned(),
+            topic: topic.to_owned(),
+            group_id: group_id.to_owned(),
+        });
+        block_on(async { self.pool.do_action(&action).await.map(|_| ()) })
     }
 }
 

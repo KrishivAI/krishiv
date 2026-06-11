@@ -80,6 +80,25 @@ impl InProcessCluster {
         self.inner.deregister_streaming_source(name)
     }
 
+    /// Register a Kafka topic as a streaming SQL table on the cluster's SQL engine.
+    ///
+    /// Used by the Flight server to forward `RegisterKafkaSource` actions from
+    /// distributed-mode clients so remote query planning can reference the Kafka source.
+    #[cfg(feature = "kafka")]
+    pub fn register_kafka_source(
+        &self,
+        name: &str,
+        schema: arrow::datatypes::SchemaRef,
+        bootstrap_servers: &str,
+        topic: &str,
+        group_id: &str,
+    ) -> RuntimeResult<()> {
+        self.inner
+            .runner_sql_engine()
+            .register_kafka_source(name, schema, bootstrap_servers, topic, group_id)
+            .map_err(|e| crate::RuntimeError::transport(e.to_string()))
+    }
+
     /// Expose the parquet-cache handle so it can be shared with new sessions.
     ///
     /// Pass the returned `Arc` to [`InProcessStreamingRuntime::with_parquet_cache`]

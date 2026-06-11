@@ -114,7 +114,6 @@ pub use stream_handle::StreamHandle;
 
 #[doc(hidden)]
 pub mod cli;
-pub mod compat;
 #[doc(hidden)]
 pub mod daemon_cmd;
 #[doc(hidden)]

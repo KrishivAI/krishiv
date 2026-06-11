@@ -1,1 +1,0 @@
-"""Krishiv compatibility namespaces."""

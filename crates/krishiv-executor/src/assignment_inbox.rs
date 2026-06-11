@@ -1,6 +1,8 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
+use tokio::sync::Notify;
+
 use crate::{ExecutorError, ExecutorResult};
 use krishiv_proto::ExecutorTaskAssignment;
 
@@ -80,6 +82,9 @@ pub struct ExecutorAssignmentInbox {
     seen: Arc<RwLock<SeenSet>>,
     /// None = unbounded (legacy / test default). Some(n) = hard limit.
     max_capacity: Option<usize>,
+    /// Notified whenever a new assignment is enqueued so executor slot loops
+    /// can await work instead of sleeping unconditionally for 50 ms.
+    wakeup: Arc<Notify>,
 }
 
 impl Default for ExecutorAssignmentInbox {
@@ -101,6 +106,7 @@ impl ExecutorAssignmentInbox {
             cancelled_tasks: Arc::new(RwLock::new(BTreeSet::new())),
             seen: Arc::new(RwLock::new(SeenSet::new(MAX_SEEN_ENTRIES))),
             max_capacity: None,
+            wakeup: Arc::new(Notify::new()),
         }
     }
 
@@ -112,7 +118,14 @@ impl ExecutorAssignmentInbox {
             cancelled_tasks: Arc::new(RwLock::new(BTreeSet::new())),
             seen: Arc::new(RwLock::new(SeenSet::new(MAX_SEEN_ENTRIES))),
             max_capacity: Some(max),
+            wakeup: Arc::new(Notify::new()),
         }
+    }
+
+    /// Returns a reference to the wakeup notifier so executor slot loops can
+    /// `await` new work instead of polling with an unconditional sleep.
+    pub fn wakeup(&self) -> &Arc<Notify> {
+        &self.wakeup
     }
 
     /// Current configured capacity (None = unbounded).
@@ -178,6 +191,10 @@ impl ExecutorAssignmentInbox {
         }
 
         q.push_back(assignment);
+        // Drop the queue lock before notifying so any woken task can acquire it.
+        drop(q);
+        drop(seen);
+        self.wakeup.notify_one();
         Ok(AssignmentPushOutcome::Enqueued)
     }
 

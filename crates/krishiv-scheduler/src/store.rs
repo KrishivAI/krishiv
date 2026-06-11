@@ -163,8 +163,12 @@ impl ContinuousSnapshot {
                 message: "ContinuousSnapshot decode: buffer too short".into(),
             });
         }
-        let watermark_ms = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let mut watermark_buf = [0u8; 8];
+        watermark_buf.copy_from_slice(&bytes[0..8]);
+        let watermark_ms = i64::from_le_bytes(watermark_buf);
+        let mut len_buf = [0u8; 4];
+        len_buf.copy_from_slice(&bytes[8..12]);
+        let len = u32::from_le_bytes(len_buf) as usize;
         if bytes.len() != 12 + len {
             return Err(SchedulerError::Store {
                 message: format!(

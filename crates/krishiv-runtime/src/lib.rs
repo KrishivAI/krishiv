@@ -35,8 +35,9 @@ pub use execution_runtime::{
 };
 pub use flight_action::{
     BoundedWindowBody, ContinuousDrainBody, ContinuousPushBody, ContinuousRegisterBody,
-    ExplainBody, KrishivFlightAction, RegisterParquetBody, action_type, decode_batches,
-    encode_batches, strip_action_type, tags as action_tags,
+    ExplainBody, KrishivFlightAction, RegisterKafkaSourceBody, RegisterParquetBody, action_type,
+    decode_batches, decode_schema_ipc_b64, encode_batches, encode_schema_ipc_b64,
+    strip_action_type, tags as action_tags,
 };
 pub use in_process::{BatchSqlTable, InProcessStreamingRuntime, execute_windowed_in_process};
 pub use in_process_cluster::{InProcessCluster, fragment_from_local_spec, plan_spec_to_local};

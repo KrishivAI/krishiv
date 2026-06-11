@@ -303,66 +303,51 @@ fn arrow_scalar_to_avro(col: &dyn arrow::array::Array, row: usize, nullable: boo
     } else {
         match col.data_type() {
             DataType::Null => AvroValue::Null,
-            DataType::Boolean => {
-                let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-                AvroValue::Boolean(arr.value(row))
-            }
-            DataType::Int8 => {
-                let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
-                AvroValue::Int(arr.value(row) as i32)
-            }
-            DataType::Int16 => {
-                let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
-                AvroValue::Int(arr.value(row) as i32)
-            }
-            DataType::Int32 => {
-                let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-                AvroValue::Int(arr.value(row))
-            }
-            DataType::Int64 => {
-                let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                AvroValue::Long(arr.value(row))
-            }
-            DataType::UInt8 => {
-                let arr = col.as_any().downcast_ref::<UInt8Array>().unwrap();
-                AvroValue::Int(arr.value(row) as i32)
-            }
-            DataType::UInt16 => {
-                let arr = col.as_any().downcast_ref::<UInt16Array>().unwrap();
-                AvroValue::Int(arr.value(row) as i32)
-            }
-            DataType::UInt32 => {
-                let arr = col.as_any().downcast_ref::<UInt32Array>().unwrap();
-                AvroValue::Long(arr.value(row) as i64)
-            }
-            DataType::UInt64 => {
-                let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
-                AvroValue::Long(arr.value(row) as i64)
-            }
-            DataType::Float32 => {
-                let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-                AvroValue::Float(arr.value(row))
-            }
-            DataType::Float64 => {
-                let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                AvroValue::Double(arr.value(row))
-            }
-            DataType::Utf8 => {
-                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-                AvroValue::String(arr.value(row).to_owned())
-            }
-            DataType::LargeUtf8 => {
-                let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                AvroValue::String(arr.value(row).to_owned())
-            }
-            DataType::Binary => {
-                let arr = col.as_any().downcast_ref::<BinaryArray>().unwrap();
-                AvroValue::Bytes(arr.value(row).to_vec())
-            }
-            DataType::LargeBinary => {
-                let arr = col.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-                AvroValue::Bytes(arr.value(row).to_vec())
-            }
+            DataType::Boolean => col.as_any().downcast_ref::<BooleanArray>()
+                .map(|arr| AvroValue::Boolean(arr.value(row)))
+                .unwrap_or(AvroValue::Null),
+            DataType::Int8 => col.as_any().downcast_ref::<Int8Array>()
+                .map(|arr| AvroValue::Int(arr.value(row) as i32))
+                .unwrap_or(AvroValue::Null),
+            DataType::Int16 => col.as_any().downcast_ref::<Int16Array>()
+                .map(|arr| AvroValue::Int(arr.value(row) as i32))
+                .unwrap_or(AvroValue::Null),
+            DataType::Int32 => col.as_any().downcast_ref::<Int32Array>()
+                .map(|arr| AvroValue::Int(arr.value(row)))
+                .unwrap_or(AvroValue::Null),
+            DataType::Int64 => col.as_any().downcast_ref::<Int64Array>()
+                .map(|arr| AvroValue::Long(arr.value(row)))
+                .unwrap_or(AvroValue::Null),
+            DataType::UInt8 => col.as_any().downcast_ref::<UInt8Array>()
+                .map(|arr| AvroValue::Int(arr.value(row) as i32))
+                .unwrap_or(AvroValue::Null),
+            DataType::UInt16 => col.as_any().downcast_ref::<UInt16Array>()
+                .map(|arr| AvroValue::Int(arr.value(row) as i32))
+                .unwrap_or(AvroValue::Null),
+            DataType::UInt32 => col.as_any().downcast_ref::<UInt32Array>()
+                .map(|arr| AvroValue::Long(arr.value(row) as i64))
+                .unwrap_or(AvroValue::Null),
+            DataType::UInt64 => col.as_any().downcast_ref::<UInt64Array>()
+                .map(|arr| AvroValue::Long(arr.value(row) as i64))
+                .unwrap_or(AvroValue::Null),
+            DataType::Float32 => col.as_any().downcast_ref::<Float32Array>()
+                .map(|arr| AvroValue::Float(arr.value(row)))
+                .unwrap_or(AvroValue::Null),
+            DataType::Float64 => col.as_any().downcast_ref::<Float64Array>()
+                .map(|arr| AvroValue::Double(arr.value(row)))
+                .unwrap_or(AvroValue::Null),
+            DataType::Utf8 => col.as_any().downcast_ref::<StringArray>()
+                .map(|arr| AvroValue::String(arr.value(row).to_owned()))
+                .unwrap_or(AvroValue::Null),
+            DataType::LargeUtf8 => col.as_any().downcast_ref::<LargeStringArray>()
+                .map(|arr| AvroValue::String(arr.value(row).to_owned()))
+                .unwrap_or(AvroValue::Null),
+            DataType::Binary => col.as_any().downcast_ref::<BinaryArray>()
+                .map(|arr| AvroValue::Bytes(arr.value(row).to_vec()))
+                .unwrap_or(AvroValue::Null),
+            DataType::LargeBinary => col.as_any().downcast_ref::<LargeBinaryArray>()
+                .map(|arr| AvroValue::Bytes(arr.value(row).to_vec()))
+                .unwrap_or(AvroValue::Null),
             _ => AvroValue::String(format!("{:?}", col.data_type())),
         }
     };

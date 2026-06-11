@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, BinaryArray, RecordBatchOptions};
+use arrow::array::{Array, RecordBatchOptions};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableFunctionImpl;
