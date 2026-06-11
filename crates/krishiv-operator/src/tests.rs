@@ -7,7 +7,7 @@ mod operator_tests {
 
     use crate::pod_manager::build_executor_pod;
     use crate::{
-        BootstrapExecutor, ConditionStatus, CrdQueueManager, EXECUTOR_ID_LABEL,
+        BootstrapExecutor, ConditionStatus, EXECUTOR_ID_LABEL,
         ExecutorPodLaunchFailure, FIELD_MANAGER, FINALIZER, K8sLeaseElection, KrishivJobMode,
         KrishivJobPhase, KrishivJobReconciler, KrishivJobResource, KrishivJobSpec,
         KrishivJobStatus, KrishivQueue, KrishivQueueSpec, KrishivQueueStatus,
@@ -691,78 +691,6 @@ mod operator_tests {
         );
         let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
         assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Pending);
-    }
-
-    // ── R7.1 CrdQueueManager tests ───────────────────────────────────────────
-
-    use krishiv_scheduler::{NamespaceQuotaSnapshot, QueueManager, SubmitOutcome};
-
-    fn make_queue(namespace: &str, max_jobs: usize) -> KrishivQueue {
-        KrishivQueue {
-            spec: KrishivQueueSpec {
-                namespace: namespace.to_owned(),
-                cpu_nanos_limit: None,
-                memory_bytes_limit: None,
-                max_concurrent_jobs: Some(max_jobs),
-                priority: 128,
-            },
-            status: KrishivQueueStatus::default(),
-        }
-    }
-
-    #[test]
-    fn crd_queue_manager_admits_within_limit() {
-        let mgr = CrdQueueManager::from_queues([make_queue("team-a", 3)]);
-        let spec = JobId::try_new("j").unwrap();
-        let job_spec = krishiv_proto::JobSpec::new(spec, "test", krishiv_proto::JobKind::Batch)
-            .with_namespace("team-a");
-        let quota = NamespaceQuotaSnapshot {
-            namespace_id: Some("team-a".to_owned()),
-            active_job_count: 2,
-            ..Default::default()
-        };
-        assert_eq!(mgr.admit(&job_spec, &quota), SubmitOutcome::Accepted);
-    }
-
-    #[test]
-    fn crd_queue_manager_queues_when_namespace_limit_reached() {
-        let mgr = CrdQueueManager::from_queues([make_queue("team-b", 1)]);
-        let job_spec = krishiv_proto::JobSpec::new(
-            JobId::try_new("j2").unwrap(),
-            "test",
-            krishiv_proto::JobKind::Batch,
-        )
-        .with_namespace("team-b");
-        let quota = NamespaceQuotaSnapshot {
-            namespace_id: Some("team-b".to_owned()),
-            active_job_count: 1,
-            ..Default::default()
-        };
-        assert!(matches!(
-            mgr.admit(&job_spec, &quota),
-            SubmitOutcome::Queued { .. }
-        ));
-    }
-
-    #[test]
-    fn crd_queue_manager_admits_unknown_namespace_with_default_policy() {
-        let mgr = CrdQueueManager::from_queues([make_queue("team-c", 1)]);
-        let job_spec = krishiv_proto::JobSpec::new(
-            JobId::try_new("j3").unwrap(),
-            "test",
-            krishiv_proto::JobKind::Batch,
-        );
-        // No namespace set — default policy has no limits.
-        let quota = NamespaceQuotaSnapshot::default();
-        assert_eq!(mgr.admit(&job_spec, &quota), SubmitOutcome::Accepted);
-    }
-
-    #[test]
-    fn krishiv_queue_derives_correct_quota_policy() {
-        let q = make_queue("eng", 5);
-        let policy = q.quota_policy();
-        assert_eq!(policy.max_concurrent_jobs, Some(5));
-        assert!(policy.cpu_nanos_limit.is_none());
     }
 
     // ── K8sLeaseElection simulation mode (no client) ─────────────────────

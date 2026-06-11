@@ -16,7 +16,6 @@ pub mod execution_model;
 pub(crate) mod fragment;
 pub mod grpc;
 pub mod grpc_client;
-pub mod llm_throttle;
 pub mod runner;
 pub mod source_throttle;
 pub mod transport;

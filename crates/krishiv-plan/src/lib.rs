@@ -20,10 +20,7 @@ pub mod task_fragment;
 pub mod udf;
 pub mod window;
 pub use graph::lower_to_physical;
-pub use r17::{
-    ChunkerConfig, DataSource, EmbedderConfig, FeatureDef, FeatureSchema, FeatureStore,
-    RagIndexSpec, RefreshPolicy, VectorSinkPlanConfig,
-};
+pub use r17::VectorSinkPlanConfig;
 pub use task_fragment::{
     TypedTaskFragment, encode_typed_task_fragment, execution_kind_from_fragment,
     task_body_for_profile, validate_job_fragments,

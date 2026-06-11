@@ -75,221 +75,7 @@ mod connector_tests {
     }
 
     // -----------------------------------------------------------------------
-    // CertificationSuite: source with no capabilities
-    // -----------------------------------------------------------------------
-
-    struct NullSource;
-
-    impl Source for NullSource {
-        fn capabilities(&self) -> ConnectorCapabilities {
-            ConnectorCapabilities::new() // all false
-        }
-
-        async fn read_batch(
-            &mut self,
-        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
-            Ok(None)
-        }
-
-        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
-            None
-        }
-    }
-
-    #[test]
-    fn certification_suite_rejects_source_with_no_capabilities() {
-        let source = NullSource;
-        let result = CertificationSuite::run_source_capabilities_test(&source);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ConnectorError::Unsupported { .. } => {}
-            other => panic!("expected Unsupported, got: {other}"),
-        }
-    }
-
-    struct ModeLessSource;
-
-    impl Source for ModeLessSource {
-        fn capabilities(&self) -> ConnectorCapabilities {
-            ConnectorCapabilities::new().with_rewindable()
-        }
-
-        async fn read_batch(
-            &mut self,
-        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
-            Ok(None)
-        }
-
-        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
-            Some(Box::new(0usize))
-        }
-    }
-
-    #[test]
-    fn certification_suite_rejects_source_without_boundedness_mode() {
-        let source = ModeLessSource;
-        let error = CertificationSuite::run_source_capabilities_test(&source)
-            .expect_err("source must declare bounded or unbounded");
-        assert!(
-            matches!(error, ConnectorError::CertificationFailed { .. }),
-            "unexpected error: {error}"
-        );
-    }
-
-    struct BrokenRewindSource {
-        cursor: usize,
-    }
-
-    impl Source for BrokenRewindSource {
-        fn capabilities(&self) -> ConnectorCapabilities {
-            ConnectorCapabilities::new()
-                .with_bounded()
-                .with_rewindable()
-        }
-
-        async fn read_batch(
-            &mut self,
-        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
-            if self.cursor > 0 {
-                return Ok(None);
-            }
-            self.cursor += 1;
-            Ok(Some(arrow::record_batch::RecordBatch::new_empty(Arc::new(
-                Schema::empty(),
-            ))))
-        }
-
-        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
-            Some(Box::new(self.cursor))
-        }
-    }
-
-    #[tokio::test]
-    async fn certification_rewind_test_detects_default_noop_reset() {
-        let mut source = BrokenRewindSource { cursor: 0 };
-        let error = CertificationSuite::run_rewind_test::<usize>(&mut source)
-            .await
-            .expect_err("default no-op reset must fail certification");
-        assert!(
-            error.to_string().contains("did not restore initial offset"),
-            "unexpected error: {error}"
-        );
-    }
-
-    struct BrokenCheckpointSource {
-        cursor: usize,
-    }
-
-    impl Source for BrokenCheckpointSource {
-        fn capabilities(&self) -> ConnectorCapabilities {
-            ConnectorCapabilities::new()
-                .with_bounded()
-                .with_checkpoint()
-        }
-
-        async fn read_batch(
-            &mut self,
-        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
-            if self.cursor > 0 {
-                return Ok(None);
-            }
-            self.cursor += 1;
-            Ok(Some(arrow::record_batch::RecordBatch::new_empty(Arc::new(
-                Schema::empty(),
-            ))))
-        }
-
-        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
-            Some(Box::new(ParquetOffset {
-                batch_index: self.cursor,
-            }))
-        }
-    }
-
-    impl CheckpointSource for BrokenCheckpointSource {
-        type Offset = ParquetOffset;
-
-        fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset> {
-            Ok(ParquetOffset {
-                batch_index: self.cursor,
-            })
-        }
-
-        fn restore_offset(&mut self, _offset: &Self::Offset) -> ConnectorResult<()> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn checkpoint_certification_detects_noop_restore() {
-        let mut source = BrokenCheckpointSource { cursor: 0 };
-        let error = CertificationSuite::run_checkpoint_restore_test(&mut source)
-            .await
-            .expect_err("checkpoint restore must change the source position");
-        assert!(
-            error.to_string().contains("did not recover initial offset"),
-            "unexpected error: {error}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // CertificationSuite: bounded exhaustion test
-    // -----------------------------------------------------------------------
-
-    struct ThreeBatchSource {
-        count: usize,
-    }
-
-    impl Source for ThreeBatchSource {
-        fn capabilities(&self) -> ConnectorCapabilities {
-            ConnectorCapabilities::new().with_bounded()
-        }
-
-        async fn read_batch(
-            &mut self,
-        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
-            if self.count < 3 {
-                self.count += 1;
-                Ok(Some(arrow::record_batch::RecordBatch::new_empty(
-                    std::sync::Arc::new(arrow::datatypes::Schema::empty()),
-                )))
-            } else {
-                Ok(None)
-            }
-        }
-
-        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
-            None
-        }
-    }
-
-    struct UnboundedSource;
-
-    impl Source for UnboundedSource {
-        fn capabilities(&self) -> ConnectorCapabilities {
-            ConnectorCapabilities::new().with_unbounded()
-        }
-
-        async fn read_batch(
-            &mut self,
-        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
-            Ok(None)
-        }
-
-        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
-            None
-        }
-    }
-
-    #[tokio::test]
-    async fn certification_exhaustion_test_passes_for_bounded_source() {
-        let mut source = ThreeBatchSource { count: 0 };
-        let result = CertificationSuite::run_bounded_exhaustion_test(&mut source).await;
-        assert!(result.is_ok(), "bounded source exhaustion test should pass");
-    }
-
-    // -----------------------------------------------------------------------
-    // ParquetOffset + AtLeastOnceSinkContract + CertificationSuite offset test
+    // ParquetOffset encode/decode
     // -----------------------------------------------------------------------
 
     #[test]
@@ -312,24 +98,6 @@ mod connector_tests {
     #[test]
     fn at_least_once_contract_exists() {
         let _ = AtLeastOnceSinkContract;
-    }
-
-    #[test]
-    fn certification_offset_round_trip_passes_for_parquet_offset() {
-        let offset = ParquetOffset { batch_index: 7 };
-        CertificationSuite::run_offset_round_trip_test(offset).unwrap();
-    }
-
-    #[tokio::test]
-    async fn certification_exhaustion_test_rejects_unbounded_source() {
-        let mut source = UnboundedSource;
-        let err = CertificationSuite::run_bounded_exhaustion_test(&mut source)
-            .await
-            .unwrap_err();
-        match err {
-            ConnectorError::Unsupported { .. } => {}
-            other => panic!("expected Unsupported, got: {other}"),
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -503,17 +271,6 @@ mod connector_tests {
     }
 
     #[test]
-    fn certification_rejects_two_phase_sink_without_transactional_capability() {
-        let sink = DishonestTwoPhaseSink;
-        let error = CertificationSuite::run_two_phase_commit_capabilities_test(&sink)
-            .expect_err("2PC certification must inspect the actual sink capabilities");
-        assert!(
-            matches!(error, ConnectorError::CertificationFailed { .. }),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
     fn two_phase_commit_sink_prepare_commit_roundtrip() {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
@@ -533,22 +290,6 @@ mod connector_tests {
         assert_eq!(sink.staged_count(), 0);
         assert_eq!(sink.committed().len(), 1);
         assert_eq!(sink.committed()[0].0, 1); // epoch
-    }
-
-    #[test]
-    fn in_memory_two_phase_commit_lifecycle_is_retry_safe() {
-        let batch = make_int32_batch(vec![1, 2, 3]);
-        let mut sink = InMemoryTwoPhaseCommitSink::new();
-
-        CertificationSuite::run_two_phase_commit_lifecycle_test(&mut sink, 9, &batch)
-            .expect("in-memory 2PC sink must tolerate coordinator decision retries");
-
-        assert_eq!(sink.staged_count(), 0);
-        assert_eq!(
-            sink.committed().len(),
-            1,
-            "repeated commit must not duplicate output"
-        );
     }
 
     #[test]

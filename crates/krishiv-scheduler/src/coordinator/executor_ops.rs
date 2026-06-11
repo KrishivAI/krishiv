@@ -68,7 +68,6 @@ impl Coordinator {
         let fallback_lease = heartbeat.lease_generation();
         let streaming_states: Vec<StreamingTaskState> = heartbeat.streaming_task_states().to_vec();
         let hot_key_reports = heartbeat.hot_key_reports().to_vec();
-        let llm_reports = heartbeat.llm_quota_reports().to_vec();
         let streaming_progress: Vec<StreamingProgressReport> =
             heartbeat.streaming_progress().to_vec();
         self.executors.heartbeat(heartbeat)?;
@@ -78,14 +77,10 @@ impl Coordinator {
         }
         // R7.2 Group D: process hot-key reports and record adaptive decisions.
         let source_throttles = self.process_hot_key_reports(&hot_key_reports);
-        if !llm_reports.is_empty() {
-            self.llm_quota_aggregator.ingest(&llm_reports);
-        }
         // Record streaming progress for observability (watermark, throughput, state size).
         for report in &streaming_progress {
             self.record_streaming_progress(report);
         }
-        let llm_throttles = self.llm_quota_aggregator.evaluate_and_reset();
         let checkpoint_commands = self.pending_initiate_checkpoints_for_executor(&executor_id);
         let lease_generation = self
             .executors
@@ -97,7 +92,6 @@ impl Coordinator {
 
         Ok(ExecutorHeartbeatEffects {
             source_throttles,
-            llm_throttles,
             checkpoint_commands,
             lease_generation,
         })

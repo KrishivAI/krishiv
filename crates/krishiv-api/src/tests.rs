@@ -9,9 +9,6 @@ use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 
-use krishiv_plan::governance::{
-    MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider,
-};
 use krishiv_runtime::LocalWindowKind;
 
 use crate::error::KrishivError;
@@ -34,37 +31,6 @@ async fn block_on_does_not_panic_inside_tokio_runtime() {
         result.is_ok(),
         "block_on panicked inside Tokio runtime: {result:?}"
     );
-}
-
-// ── P0.1: SessionBuilder::build uses a single shared SqlEngine ───────────
-
-#[tokio::test]
-async fn session_builder_policy_engine_shares_sql_engine_context() {
-    let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
-        "key-ptr".into(),
-        "alice".into(),
-        Role::Reader,
-    )]));
-    let session = SessionBuilder::new()
-        .with_auth(auth)
-        .with_policy(Arc::new(AllowAllPolicy))
-        .build()
-        .unwrap();
-
-    let temp = tempdir().unwrap();
-    let parquet_path = temp.path().join("people.parquet");
-    write_people_parquet(&parquet_path);
-    session
-        .register_parquet_async("people", &parquet_path)
-        .await
-        .unwrap();
-
-    let df = session
-        .sql_as("key-ptr", "SELECT count(*) AS n FROM people")
-        .await
-        .expect("policy engine should see tables registered on the shared sql_engine");
-    let result = df.collect_async().await.unwrap();
-    assert_eq!(result.row_count(), 1);
 }
 
 #[test]
@@ -593,108 +559,6 @@ fn write_people_parquet(path: &std::path::Path) {
     writer
         .close()
         .unwrap_or_else(|error| panic!("unexpected parquet close error: {error}"));
-}
-
-// ── sql_as tests ─────────────────────────────────────────────────────────────
-
-struct AllowAllPolicy;
-impl PolicyHook for AllowAllPolicy {
-    fn check_table_access(&self, _p: &Principal, _table: &str) -> bool {
-        true
-    }
-    fn column_masking_rule(&self, _p: &Principal, _table: &str, _col: &str) -> Option<MaskingRule> {
-        None
-    }
-}
-
-#[tokio::test]
-async fn session_sql_as_with_valid_key_executes_query() {
-    let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
-        "key123".into(),
-        "alice".into(),
-        Role::Reader,
-    )]));
-    let session = SessionBuilder::new()
-        .with_auth(auth)
-        .with_policy(Arc::new(AllowAllPolicy))
-        .build()
-        .unwrap();
-    let df = session.sql_as("key123", "SELECT 42 AS v").await.unwrap();
-    let result = df.collect_async().await.unwrap();
-    assert_eq!(result.row_count(), 1);
-}
-
-#[tokio::test]
-async fn session_sql_as_with_invalid_key_returns_access_denied() {
-    let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
-        "key123".into(),
-        "alice".into(),
-        Role::Reader,
-    )]));
-    let session = SessionBuilder::new()
-        .with_auth(auth)
-        .with_policy(Arc::new(AllowAllPolicy))
-        .build()
-        .unwrap();
-    let result = session.sql_as("wrong_key", "SELECT 1").await;
-    assert!(matches!(result, Err(KrishivError::AccessDenied { .. })));
-}
-
-#[tokio::test]
-async fn session_without_policy_sql_as_returns_access_denied() {
-    let session = SessionBuilder::new().build().unwrap();
-    let result = session.sql_as("any_key", "SELECT 1").await;
-    assert!(matches!(result, Err(KrishivError::AccessDenied { .. })));
-}
-
-#[tokio::test]
-async fn session_sql_as_can_read_registered_session_tables() {
-    let temp = tempdir().unwrap();
-    let parquet_path = temp.path().join("people.parquet");
-    write_people_parquet(&parquet_path);
-    let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
-        "key123".into(),
-        "alice".into(),
-        Role::Reader,
-    )]));
-    let session = SessionBuilder::new()
-        .with_auth(auth)
-        .with_policy(Arc::new(AllowAllPolicy))
-        .build()
-        .unwrap();
-
-    session
-        .register_parquet_async("people", &parquet_path)
-        .await
-        .unwrap();
-    let df = session
-        .sql_as("key123", "SELECT city FROM people ORDER BY city")
-        .await
-        .unwrap();
-    let result = df.collect_async().await.unwrap();
-
-    assert_eq!(result.row_count(), 3);
-}
-
-// ── GAP-RT-05: sql() / sql_async() fail-closed when policy engine is set ───
-
-#[tokio::test(flavor = "multi_thread")]
-async fn session_sql_async_fails_when_policy_configured() {
-    let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
-        "key-rt05".into(),
-        "alice".into(),
-        Role::Reader,
-    )]));
-    let session = SessionBuilder::new()
-        .with_auth(auth)
-        .with_policy(Arc::new(AllowAllPolicy))
-        .build()
-        .unwrap();
-    let result = session.sql("SELECT 1");
-    assert!(
-        matches!(result, Err(KrishivError::AccessDenied { .. })),
-        "expected AccessDenied but got: {result:?}"
-    );
 }
 
 // ── S6.1: SessionBuilder::with_coordinator ────────────────────────────────

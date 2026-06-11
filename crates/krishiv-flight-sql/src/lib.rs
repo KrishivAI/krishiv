@@ -25,11 +25,7 @@ use prost::Message as _; // brings encode_to_vec() into scope
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
-use krishiv_plan::governance::{
-    AuthProvider, MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider,
-};
-use krishiv_sql::SqlEngine;
-use krishiv_sql::policy::PolicyEnforcingSqlEngine;
+use krishiv_plan::governance::{AuthProvider, PolicyHook, StaticApiKeyAuthProvider};
 
 pub use host::FlightExecutionHost;
 
@@ -39,8 +35,6 @@ pub struct KrishivFlightSqlService {
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
     host: FlightExecutionHost,
-    /// Shared SQL engine for policy enforcement — created once during construction.
-    sql_engine: Arc<SqlEngine>,
     /// LRU cache of opaque handle (UUID string) → SQL text for prepared statements.
     prepared_statements: Arc<tokio::sync::Mutex<lru::LruCache<String, String>>>,
 }
@@ -67,7 +61,6 @@ impl KrishivFlightSqlService {
             auth: None,
             policy: None,
             host: FlightExecutionHost::from_env()?,
-            sql_engine: Arc::new(SqlEngine::new()),
             prepared_statements: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
                 PREPARED_STMT_CAPACITY,
             ))),
@@ -80,7 +73,6 @@ impl KrishivFlightSqlService {
             auth: None,
             policy: None,
             host,
-            sql_engine: Arc::new(SqlEngine::new()),
             prepared_statements: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
                 PREPARED_STMT_CAPACITY,
             ))),
@@ -98,22 +90,10 @@ impl KrishivFlightSqlService {
 
     /// Attach a [`PolicyHook`] to this service.
     ///
-    /// When set, column-masking rules are applied to every result batch before
-    /// it is streamed to the client.
+    /// When set, table access is checked against the policy for every query.
     pub fn with_policy(mut self, policy: Arc<dyn PolicyHook>) -> Self {
         self.policy = Some(policy);
         self
-    }
-
-    fn policy_engine(&self) -> Option<PolicyEnforcingSqlEngine> {
-        match (&self.auth, &self.policy) {
-            (Some(auth), Some(policy)) => Some(PolicyEnforcingSqlEngine::new(
-                (*self.sql_engine).clone(),
-                auth.clone(),
-                policy.clone(),
-            )),
-            _ => None,
-        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -132,11 +112,11 @@ impl KrishivFlightSqlService {
 
     /// Validate the `authorization: Bearer <token>` header.
     ///
-    /// Returns `Ok(Some(principal))` when auth is configured and the token is
+    /// Returns `Ok(Some(subject))` when auth is configured and the token is
     /// valid, `Ok(None)` when no [`AuthProvider`] is attached, and
     /// `Err(Status::unauthenticated(...))` when the token is missing or invalid.
     #[allow(clippy::result_large_err)]
-    fn authenticate_request<B>(&self, req: &Request<B>) -> Result<Option<Principal>, Status> {
+    fn authenticate_request<B>(&self, req: &Request<B>) -> Result<Option<String>, Status> {
         let Some(auth) = &self.auth else {
             if krishiv_common::profile_requires_authenticated_flight(
                 krishiv_common::resolve_durability_profile(),
@@ -159,98 +139,41 @@ impl KrishivFlightSqlService {
             .ok_or_else(|| Status::unauthenticated("invalid API key"))
     }
 
-    /// Apply column-masking rules (if a policy is configured) to a list of batches.
+    /// Check table-level access policy if configured.
     ///
-    /// The `table_name` is used as the table context for the masking hook.
-    fn apply_policy_masking(
-        &self,
-        principal: &Option<Principal>,
-        table_name: &str,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>, Status> {
-        let (Some(policy), Some(principal)) = (self.policy.as_deref(), principal.as_ref()) else {
-            return Ok(batches);
+    /// Extracts the table name from a simple `SELECT ... FROM <table>` pattern.
+    /// When no policy is configured, all access is allowed.
+    #[allow(clippy::result_large_err)]
+    fn check_table_access(&self, query: &str) -> Result<(), Status> {
+        let Some(policy) = &self.policy else {
+            return Ok(());
         };
-        batches
-            .into_iter()
-            .map(|batch| mask_batch(&batch, principal, table_name, policy))
-            .collect()
+        // Simple heuristic: extract table name after FROM keyword.
+        if let Some(table_name) = extract_from_table(query) {
+            if !policy.check_table_access(&table_name) {
+                return Err(Status::permission_denied(format!(
+                    "access denied to table: {table_name}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
-/// Apply column-masking rules from `policy` to a single [`RecordBatch`].
-fn mask_batch(
-    batch: &RecordBatch,
-    principal: &Principal,
-    table_name: &str,
-    policy: &dyn PolicyHook,
-) -> Result<RecordBatch, Status> {
-    use arrow::array::{Array, ArrayRef, StringArray, new_null_array};
-    use arrow::datatypes::{DataType, Field};
-    use arrow::util::display::{ArrayFormatter, FormatOptions};
-
-    let schema = batch.schema();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-    let mut fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
-
-    for (i, field) in schema.fields().iter().enumerate() {
-        let col = batch.column(i);
-        match policy.column_masking_rule(principal, table_name, field.name()) {
-            None => {
-                fields.push(field.as_ref().clone());
-                columns.push(col.clone());
-            }
-            Some(MaskingRule::Nullify) => {
-                fields.push(field.as_ref().clone());
-                columns.push(new_null_array(col.data_type(), batch.num_rows()));
-            }
-            Some(MaskingRule::Redact) => {
-                // P0.14 fix: For string (Utf8/LargeUtf8) columns, replace non-null
-                // values with the literal "REDACTED" string while preserving the
-                // Utf8 type.  For all other data types, emit a fully-null array of
-                // the ORIGINAL type so that the schema is not corrupted.
-                match col.data_type() {
-                    DataType::Utf8 | DataType::LargeUtf8 => {
-                        let redacted: StringArray = (0..batch.num_rows())
-                            .map(|row| {
-                                if col.is_null(row) {
-                                    None
-                                } else {
-                                    Some("REDACTED")
-                                }
-                            })
-                            .collect();
-                        fields.push(Field::new(field.name().clone(), DataType::Utf8, true));
-                        columns.push(Arc::new(redacted));
-                    }
-                    _ => {
-                        // Non-string column: preserve original type, nullify all values.
-                        fields.push(field.as_ref().clone());
-                        columns.push(new_null_array(col.data_type(), batch.num_rows()));
-                    }
-                }
-            }
-            Some(MaskingRule::Hash) => {
-                let options = FormatOptions::default();
-                let formatter = ArrayFormatter::try_new(col.as_ref(), &options)
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                let hashed: StringArray = (0..batch.num_rows())
-                    .map(|row| {
-                        if col.is_null(row) {
-                            return None;
-                        }
-                        let val = formatter.value(row).to_string();
-                        Some(krishiv_common::hash::sha256_hex(val.as_bytes()))
-                    })
-                    .collect();
-                fields.push(Field::new(field.name().clone(), DataType::Utf8, true));
-                columns.push(Arc::new(hashed));
-            }
-        }
+/// Simple heuristic to extract the table name from `FROM <table>` in a query.
+fn extract_from_table(query: &str) -> Option<String> {
+    let upper = query.to_uppercase();
+    let from_pos = upper.find(" FROM ")?;
+    let rest = query[from_pos + 6..].trim_start();
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ';' || c == ')')
+        .unwrap_or(rest.len());
+    let table = rest[..end].trim().to_string();
+    if table.is_empty() {
+        None
+    } else {
+        Some(table)
     }
-
-    let output_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-    RecordBatch::try_new(output_schema, columns).map_err(|e| Status::internal(e.to_string()))
 }
 
 #[tonic::async_trait]
@@ -331,48 +254,19 @@ impl FlightSqlService for KrishivFlightSqlService {
         }
 
         // Authenticate if an auth provider is configured.
-        let token = self.bearer_token(&request)?;
-        let principal = self.authenticate_request(&request)?;
+        self.authenticate_request(&request)?;
 
         let query = std::str::from_utf8(&ticket.statement_handle)
             .map_err(|e| Status::invalid_argument(format!("invalid query encoding: {e}")))?;
 
-        let batches = if let Some(engine) = self.policy_engine() {
-            let token = token
-                .as_deref()
-                .ok_or_else(|| Status::unauthenticated("missing Bearer token"))?;
-            let auth_principal = engine
-                .authenticate(token)
-                .map_err(|e| Status::permission_denied(e.to_string()))?;
-            let prepared = engine
-                .prepare_authorized_query(&auth_principal, query)
-                .map_err(|e| match e {
-                    krishiv_sql::SqlError::AccessDenied { reason } => {
-                        Status::permission_denied(reason)
-                    }
-                    other => Status::internal(other.to_string()),
-                })?;
-            let raw = self
-                .host
-                .execute_sql(&prepared)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            engine
-                .mask_result_batches(&auth_principal, query, raw)
-                .map_err(|e| match e {
-                    krishiv_sql::SqlError::AccessDenied { reason } => {
-                        Status::permission_denied(reason)
-                    }
-                    other => Status::internal(other.to_string()),
-                })?
-        } else {
-            let raw = self
-                .host
-                .execute_sql(query)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            self.apply_policy_masking(&principal, query, raw)?
-        };
+        // Check table access if a policy is configured.
+        self.check_table_access(query)?;
+
+        let batches = self
+            .host
+            .execute_sql(query)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         let schema: Arc<Schema> = if batches.is_empty() {
             Arc::new(Schema::empty())
@@ -806,34 +700,26 @@ fn auth_provider_from_env() -> Result<Option<Arc<dyn AuthProvider>>, String> {
         ) =>
         {
             return Err(String::from(
-                "KRISHIV_API_KEYS is required under durable profiles (format: key1=user:reader,...)",
+                "KRISHIV_API_KEYS is required under durable profiles (format: key1=user,...)",
             ));
         }
         _ => return Ok(None),
     };
-    let mut entries = Vec::new();
+    let mut map = std::collections::HashMap::new();
     for part in raw.split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        let (key, rest) = part
+        let (key, subject) = part
             .split_once('=')
             .ok_or_else(|| format!("invalid KRISHIV_API_KEYS entry: {part}"))?;
-        let (subject, role_str) = rest.split_once(':').ok_or_else(|| {
-            format!("invalid KRISHIV_API_KEYS entry (need key=user:role): {part}")
-        })?;
-        let role = match role_str.trim().to_ascii_lowercase().as_str() {
-            "reader" => Role::Reader,
-            "writer" | "admin" => Role::Admin,
-            other => return Err(format!("unsupported role in KRISHIV_API_KEYS: {other}")),
-        };
-        entries.push((key.trim().to_owned(), subject.trim().to_owned(), role));
+        map.insert(key.trim().to_owned(), subject.trim().to_owned());
     }
-    if entries.is_empty() {
+    if map.is_empty() {
         return Err(String::from("KRISHIV_API_KEYS must list at least one key"));
     }
-    Ok(Some(Arc::new(StaticApiKeyAuthProvider::new(entries))))
+    Ok(Some(Arc::new(StaticApiKeyAuthProvider::new(map))))
 }
 
 /// Run the Arrow Flight SQL server (env `KRISHIV_FLIGHT_ADDR`, default `127.0.0.1:50051`).
@@ -861,15 +747,13 @@ pub async fn run_flight_server(
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use krishiv_plan::governance::{MaskingRule, PolicyHook, Role, StaticApiKeyAuthProvider};
+    use krishiv_plan::governance::{AllowAllPolicyHook, PolicyHook, StaticApiKeyAuthProvider};
     use tonic::metadata::MetadataValue;
 
     fn make_auth_service() -> KrishivFlightSqlService {
-        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
-            "secret-key".to_string(),
-            "alice".to_string(),
-            Role::Reader,
-        )]));
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("secret-key".to_string(), "alice".to_string());
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(keys));
         KrishivFlightSqlService::new()
             .expect("flight host")
             .with_auth(auth)
@@ -878,17 +762,8 @@ mod tests {
     struct DenySecretPolicy;
 
     impl PolicyHook for DenySecretPolicy {
-        fn check_table_access(&self, _principal: &Principal, table_name: &str) -> bool {
+        fn check_table_access(&self, table_name: &str) -> bool {
             table_name != "secret"
-        }
-
-        fn column_masking_rule(
-            &self,
-            _principal: &Principal,
-            _table_name: &str,
-            _column_name: &str,
-        ) -> Option<MaskingRule> {
-            None
         }
     }
 
@@ -1375,7 +1250,6 @@ mod tests {
     async fn p0_13_check_table_access_allow_path() {
         // When the policy allows the table, the query should succeed.
         let svc = make_auth_policy_service();
-        // "allowed_table" is not "secret", so DenySecretPolicy allows it.
         // SELECT 42 has no FROM clause so it always succeeds regardless of policy.
         let ticket = TicketStatementQuery {
             statement_handle: b"SELECT 42 AS v".to_vec().into(),
@@ -1410,298 +1284,6 @@ mod tests {
         );
     }
 
-    // ── P0.14 — MaskingRule::Redact schema preservation ───────────────────────
-
-    struct RedactAllPolicy;
-
-    impl PolicyHook for RedactAllPolicy {
-        fn check_table_access(&self, _p: &Principal, _t: &str) -> bool {
-            true
-        }
-        fn column_masking_rule(&self, _p: &Principal, _t: &str, _c: &str) -> Option<MaskingRule> {
-            Some(MaskingRule::Redact)
-        }
-    }
-
-    fn make_principal() -> Principal {
-        Principal {
-            subject: "tester".into(),
-            role: Role::Reader,
-        }
-    }
-
-    #[test]
-    fn p0_14_redact_int64_preserves_schema() {
-        use arrow::array::Int64Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "amount",
-            DataType::Int64,
-            true,
-        )]));
-        let col = Arc::new(Int64Array::from(vec![Some(100i64), None, Some(200i64)]));
-        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
-
-        let principal = make_principal();
-        let policy = RedactAllPolicy;
-        let result = mask_batch(&batch, &principal, "payments", &policy).unwrap();
-
-        // Schema must NOT be corrupted — type must remain Int64.
-        assert_eq!(
-            result.schema().field(0).data_type(),
-            &DataType::Int64,
-            "Redact on Int64 must preserve Int64 type, not convert to Utf8"
-        );
-        // All values must be null (the column is fully nullified).
-        for i in 0..result.num_rows() {
-            assert!(
-                result.column(0).is_null(i),
-                "row {i} must be null after Redact on non-string column"
-            );
-        }
-    }
-
-    #[test]
-    fn p0_14_redact_float64_preserves_schema() {
-        use arrow::array::Float64Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "score",
-            DataType::Float64,
-            true,
-        )]));
-        let col = Arc::new(Float64Array::from(vec![Some(1.5f64), Some(2.5f64)]));
-        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
-
-        let principal = make_principal();
-        let policy = RedactAllPolicy;
-        let result = mask_batch(&batch, &principal, "scores", &policy).unwrap();
-
-        assert_eq!(
-            result.schema().field(0).data_type(),
-            &DataType::Float64,
-            "Redact on Float64 must preserve Float64 type"
-        );
-        for i in 0..result.num_rows() {
-            assert!(result.column(0).is_null(i));
-        }
-    }
-
-    #[test]
-    fn p0_14_redact_utf8_produces_redacted_string() {
-        use arrow::array::{Array, StringArray};
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
-        let col = Arc::new(StringArray::from(vec![Some("Alice"), None, Some("Bob")]));
-        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
-
-        let principal = make_principal();
-        let policy = RedactAllPolicy;
-        let result = mask_batch(&batch, &principal, "users", &policy).unwrap();
-
-        assert_eq!(result.schema().field(0).data_type(), &DataType::Utf8);
-
-        let arr = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-
-        // Non-null original values become "REDACTED".
-        assert_eq!(arr.value(0), "REDACTED");
-        // Null original values stay null.
-        assert!(arr.is_null(1));
-        assert_eq!(arr.value(2), "REDACTED");
-    }
-
-    // ── MaskingRule::Nullify tests ──────────────────────────────────────────
-
-    struct NullifyAllPolicy;
-
-    impl PolicyHook for NullifyAllPolicy {
-        fn check_table_access(&self, _p: &Principal, _t: &str) -> bool {
-            true
-        }
-        fn column_masking_rule(&self, _p: &Principal, _t: &str, _c: &str) -> Option<MaskingRule> {
-            Some(MaskingRule::Nullify)
-        }
-    }
-
-    #[test]
-    fn nullify_int64_produces_all_nulls() {
-        use arrow::array::{Array, Int64Array};
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "amount",
-            DataType::Int64,
-            true,
-        )]));
-        let col = Arc::new(Int64Array::from(vec![Some(100i64), Some(200i64)]));
-        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
-
-        let principal = make_principal();
-        let policy = NullifyAllPolicy;
-        let result = mask_batch(&batch, &principal, "payments", &policy).unwrap();
-
-        assert_eq!(
-            result.schema().field(0).data_type(),
-            &DataType::Int64,
-            "Nullify must preserve Int64 type"
-        );
-        for i in 0..result.num_rows() {
-            assert!(result.column(0).is_null(i));
-        }
-    }
-
-    #[test]
-    fn nullify_utf8_produces_all_nulls() {
-        use arrow::array::{Array, StringArray};
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
-        let col = Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")]));
-        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
-
-        let principal = make_principal();
-        let policy = NullifyAllPolicy;
-        let result = mask_batch(&batch, &principal, "users", &policy).unwrap();
-
-        assert_eq!(result.schema().field(0).data_type(), &DataType::Utf8);
-        let arr = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert!(arr.is_null(0));
-        assert!(arr.is_null(1));
-    }
-
-    // ── MaskingRule::Hash tests ─────────────────────────────────────────────
-
-    struct HashAllPolicy;
-
-    impl PolicyHook for HashAllPolicy {
-        fn check_table_access(&self, _p: &Principal, _t: &str) -> bool {
-            true
-        }
-        fn column_masking_rule(&self, _p: &Principal, _t: &str, _c: &str) -> Option<MaskingRule> {
-            Some(MaskingRule::Hash)
-        }
-    }
-
-    #[test]
-    fn hash_utf8_produces_sha256_hex() {
-        use arrow::array::{Array, StringArray};
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
-        let col = Arc::new(StringArray::from(vec![Some("Alice"), None]));
-        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
-
-        let principal = make_principal();
-        let policy = HashAllPolicy;
-        let result = mask_batch(&batch, &principal, "users", &policy).unwrap();
-
-        // Hash output is Utf8
-        assert_eq!(result.schema().field(0).data_type(), &DataType::Utf8);
-        let arr = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-
-        // Non-null value is hashed
-        let hash = arr.value(0);
-        assert_eq!(hash.len(), 64, "SHA-256 hex is 64 chars");
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
-
-        // Null stays null
-        assert!(arr.is_null(1));
-    }
-
-    // ── Selective masking tests ─────────────────────────────────────────────
-
-    struct SelectivePolicy;
-
-    impl PolicyHook for SelectivePolicy {
-        fn check_table_access(&self, _p: &Principal, _t: &str) -> bool {
-            true
-        }
-        fn column_masking_rule(
-            &self,
-            _p: &Principal,
-            _t: &str,
-            column_name: &str,
-        ) -> Option<MaskingRule> {
-            if column_name == "secret" {
-                Some(MaskingRule::Redact)
-            } else {
-                None
-            }
-        }
-    }
-
-    #[test]
-    fn selective_masking_only_affects_target_column() {
-        use arrow::array::{Array, Int64Array, StringArray};
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("secret", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(vec![Some(1i64), Some(2i64)]))
-                    as Arc<dyn arrow::array::Array>,
-                Arc::new(StringArray::from(vec![Some("classified"), Some("public")])),
-            ],
-        )
-        .unwrap();
-
-        let principal = make_principal();
-        let policy = SelectivePolicy;
-        let result = mask_batch(&batch, &principal, "table", &policy).unwrap();
-
-        // id column is untouched
-        let id_arr = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(id_arr.value(0), 1);
-        assert_eq!(id_arr.value(1), 2);
-
-        // secret column is redacted
-        let secret_arr = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(secret_arr.value(0), "REDACTED");
-        assert_eq!(secret_arr.value(1), "REDACTED");
-    }
-
-    // ── Empty batch masking ─────────────────────────────────────────────────
-
-    #[test]
-    fn mask_empty_batch_returns_empty() {
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, true)]));
-        let batch = RecordBatch::new_empty(schema);
-
-        let principal = make_principal();
-        let policy = RedactAllPolicy;
-        let result = mask_batch(&batch, &principal, "table", &policy).unwrap();
-        assert_eq!(result.num_rows(), 0);
-    }
-
     // ── Service Debug format ────────────────────────────────────────────────
 
     #[test]
@@ -1715,11 +1297,9 @@ mod tests {
 
     #[test]
     fn service_with_auth_debug_shows_true() {
-        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
-            "key".to_string(),
-            "user".to_string(),
-            Role::Reader,
-        )]));
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("key".to_string(), "user".to_string());
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(keys));
         let svc = KrishivFlightSqlService::new()
             .expect("flight host")
             .with_auth(auth);
@@ -1748,5 +1328,15 @@ mod tests {
         let host =
             FlightExecutionHost::with_coordinator_http(Some("http://coord:8080".into())).unwrap();
         assert_eq!(host.coordinator_http_url(), Some("http://coord:8080"));
+    }
+
+    // ── AllowAllPolicyHook test ─────────────────────────────────────────────
+
+    #[test]
+    fn allow_all_policy_hook_allows_all_tables() {
+        let hook = AllowAllPolicyHook;
+        assert!(hook.check_table_access("any_table"));
+        assert!(hook.check_table_access("secret_table"));
+        assert!(hook.check_table_access("internal_data"));
     }
 }

@@ -22,7 +22,6 @@ pub mod hbase_connector;
 pub mod cdc;
 #[cfg(all(feature = "lakehouse", feature = "kafka"))]
 pub mod cdc_router;
-pub mod feature_store;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 #[cfg(feature = "lakehouse")]
@@ -40,7 +39,6 @@ pub mod two_phase_parquet_s3;
 
 // Module facades
 pub mod capabilities;
-pub mod certification;
 pub mod config;
 pub mod error;
 pub mod offset;
@@ -58,7 +56,6 @@ mod tests;
 
 // Root re-exports for perfect compatibility
 pub use capabilities::ConnectorCapabilities;
-pub use certification::CertificationSuite;
 pub use config::ConnectorConfig;
 pub use error::{ConnectorError, ConnectorResult};
 pub use offset::{CommitHandle, Offset, OffsetCommitter, ParquetOffset};
@@ -89,7 +86,6 @@ pub use vector::{
     point_id_from_doc_epoch, validate_identifier,
 };
 
-pub use feature_store::{FeatureRow, FeatureStoreSink, InMemoryFeatureStream};
 
 #[cfg(all(feature = "state", feature = "lakehouse"))]
 pub use cdc::CdcOffsetTracker;

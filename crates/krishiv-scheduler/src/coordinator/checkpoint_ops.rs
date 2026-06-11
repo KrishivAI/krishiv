@@ -133,15 +133,6 @@ impl Coordinator {
             }
         };
 
-        if res.is_ok() {
-            krishiv_plan::governance::audit_log(
-                "scheduler",
-                &krishiv_plan::governance::AuditAction::SavepointCreated {
-                    job_id: job_id.to_string(),
-                },
-                krishiv_plan::governance::AuditOutcome::Allowed,
-            );
-        }
         res
     }
 
@@ -360,15 +351,6 @@ impl Coordinator {
             .retain(|(jid, _, _)| jid != job_id);
         self.barrier_dispatch_sent.retain(|(jid, _)| jid != job_id);
         self.notify.notify_waiters();
-
-        krishiv_plan::governance::audit_log(
-            "scheduler",
-            &krishiv_plan::governance::AuditAction::SavepointRestored {
-                job_id: job_id.to_string(),
-                epoch,
-            },
-            krishiv_plan::governance::AuditOutcome::Allowed,
-        );
 
         Ok(metadata)
     }

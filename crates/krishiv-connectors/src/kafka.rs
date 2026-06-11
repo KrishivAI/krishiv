@@ -1492,30 +1492,6 @@ mod tests {
             }
         );
         assert!(source.read_batch().await.unwrap().is_none());
-
-        let mut rewind_source = InMemoryKafkaSource::new("events", 2, 10, vec![batch]);
-        crate::CertificationSuite::run_rewind_test::<KafkaOffset>(&mut rewind_source)
-            .await
-            .expect("in-memory Kafka source must restore cursor and starting offset");
-    }
-
-    #[tokio::test]
-    async fn in_memory_kafka_source_restores_typed_checkpoint_offsets() {
-        use arrow::array::Int32Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use std::sync::Arc;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-        let first =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
-                .unwrap();
-        let second =
-            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![3, 4, 5]))]).unwrap();
-        let mut source = InMemoryKafkaSource::new("events", 2, 10, vec![first, second]);
-
-        crate::CertificationSuite::run_checkpoint_restore_test(&mut source)
-            .await
-            .expect("in-memory Kafka source must restore exact batch boundaries");
     }
 
     #[test]

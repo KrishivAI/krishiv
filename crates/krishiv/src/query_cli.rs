@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use krishiv_api::{DataFrame, ExecutionMode, KrishivError, Session};
 use krishiv_common::async_util::block_on;
-use krishiv_plan::governance::{
-    AuthProvider, PolicyHook, Principal, Role, StaticApiKeyAuthProvider,
-};
+use krishiv_plan::governance::{AllowAllPolicyHook, AuthProvider, StaticApiKeyAuthProvider};
 
 use crate::cli::CliResponse;
 
@@ -164,7 +162,7 @@ pub fn build_session(command: &QueryCommand) -> Result<Session, String> {
         let auth = auth_from_env()?;
         builder = builder
             .with_auth(auth)
-            .with_policy(Arc::new(CliAllowAllPolicy));
+            .with_policy(Arc::new(AllowAllPolicyHook));
     }
     let session = builder.build().map_err(|e| e.to_string())?;
     for (table, path) in &command.parquet_tables {
@@ -214,9 +212,6 @@ async fn query_dataframe(
     session: &Session,
     command: &QueryCommand,
 ) -> Result<DataFrame, KrishivError> {
-    if let Some(key) = &command.api_key {
-        return session.sql_as(key, &command.query).await;
-    }
     match command.execution {
         QueryExecution::Default => session.sql_async(&command.query).await,
         QueryExecution::Local => session.execute_local_async(&command.query).await,
@@ -227,54 +222,24 @@ async fn query_dataframe(
 fn auth_from_env() -> Result<Arc<dyn AuthProvider>, String> {
     let raw = std::env::var("KRISHIV_API_KEYS").map_err(|_| {
         String::from(
-            "KRISHIV_API_KEYS is required for --api-key (format: key1=user:reader,key2=svc:admin)",
+            "KRISHIV_API_KEYS is required for --api-key (format: key1=user,key2=svc)",
         )
     })?;
-    let mut entries = Vec::new();
+    let mut map = std::collections::HashMap::new();
     for part in raw.split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        let (key, rest) = part
+        let (key, subject) = part
             .split_once('=')
             .ok_or_else(|| format!("invalid KRISHIV_API_KEYS entry: {part}"))?;
-        let (subject, role_name) = rest.split_once(':').ok_or_else(|| {
-            format!("invalid KRISHIV_API_KEYS entry (need key=user:role): {part}")
-        })?;
-        let role = parse_role(role_name.trim())?;
-        entries.push((key.trim().to_string(), subject.trim().to_string(), role));
+        map.insert(key.trim().to_string(), subject.trim().to_string());
     }
-    if entries.is_empty() {
+    if map.is_empty() {
         return Err(String::from("KRISHIV_API_KEYS must list at least one key"));
     }
-    Ok(Arc::new(StaticApiKeyAuthProvider::new(entries)))
-}
-
-fn parse_role(value: &str) -> Result<Role, String> {
-    match value {
-        "admin" => Ok(Role::Admin),
-        "writer" => Ok(Role::Writer),
-        "reader" => Ok(Role::Reader),
-        other => Err(format!("unsupported role in KRISHIV_API_KEYS: {other}")),
-    }
-}
-
-struct CliAllowAllPolicy;
-
-impl PolicyHook for CliAllowAllPolicy {
-    fn check_table_access(&self, _principal: &Principal, _table: &str) -> bool {
-        true
-    }
-
-    fn column_masking_rule(
-        &self,
-        _principal: &Principal,
-        _table: &str,
-        _column: &str,
-    ) -> Option<krishiv_plan::governance::MaskingRule> {
-        None
-    }
+    Ok(Arc::new(StaticApiKeyAuthProvider::new(map)))
 }
 
 fn parse_mode(value: &str) -> Result<ExecutionMode, String> {

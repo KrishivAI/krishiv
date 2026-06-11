@@ -263,11 +263,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parquet_2pc_lifecycle_is_retry_safe() {
-        let dir = tempdir().unwrap();
-        let mut sink = TwoPhaseParquetSink::new(dir.path(), 7);
-        crate::CertificationSuite::run_two_phase_commit_lifecycle_test(&mut sink, 7, &batch())
-            .expect("Parquet 2PC sink must tolerate coordinator decision retries");
-    }
 }

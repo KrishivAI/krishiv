@@ -14,7 +14,6 @@ use krishiv_runtime::{
     BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobStatus,
     LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
 };
-use krishiv_sql::policy::PolicyEnforcingSqlEngine;
 use krishiv_sql::{ContinuousTableInput, SqlEngine};
 
 use crate::dataframe::DataFrame;
@@ -413,14 +412,6 @@ impl SessionBuilder {
             .with_target_parallelism(parallelism)
             .with_udf_registry(Arc::clone(&udf_registry))
             .with_shuffle_partitions(self.shuffle_partitions);
-        let policy_engine = match (self.auth, self.policy) {
-            (Some(auth), Some(policy)) => Some(PolicyEnforcingSqlEngine::new(
-                sql_engine.clone(),
-                auth,
-                policy,
-            )),
-            _ => None,
-        };
         let local_cluster = match self.in_process_cluster {
             Some(cluster) => cluster,
             None => Arc::new(InProcessCluster::new().map_err(|e| KrishivError::Runtime {
@@ -485,7 +476,6 @@ impl SessionBuilder {
             mode: self.mode,
             deployment_target,
             sql_engine,
-            policy_engine,
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: self.coordinator_url,
@@ -508,7 +498,6 @@ pub struct Session {
     mode: ExecutionMode,
     deployment_target: DeploymentTarget,
     sql_engine: SqlEngine,
-    policy_engine: Option<PolicyEnforcingSqlEngine>,
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
     pub(crate) coordinator_url: Option<String>,
@@ -528,13 +517,6 @@ impl fmt::Debug for Session {
         f.debug_struct("Session")
             .field("mode", &self.mode)
             .field("sql_engine", &self.sql_engine)
-            .field(
-                "policy_engine",
-                &self
-                    .policy_engine
-                    .as_ref()
-                    .map(|_| "<PolicyEnforcingSqlEngine>"),
-            )
             .finish_non_exhaustive()
     }
 }
@@ -956,11 +938,6 @@ impl Session {
 
     /// Asynchronously create a DataFrame from a SQL query.
     pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
-        if self.policy_engine.is_some() {
-            return Err(KrishivError::AccessDenied {
-                reason: "session has a policy engine configured; use sql_as() to execute SQL with an authenticated principal".into(),
-            });
-        }
         let query = query.as_ref().to_owned();
         let sql_dataframe = self.sql_engine.sql(&query).await?;
         Ok(self.dataframe_from_sql(sql_dataframe))
@@ -979,20 +956,16 @@ impl Session {
     /// session mode. Returns a DataFrame with pre-collected results so that
     /// `.collect()` returns immediately without remote routing.
     pub async fn execute_local_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
-        if self.policy_engine.is_some() {
-            return Err(KrishivError::AccessDenied {
-                reason:
-                    "session has a policy engine configured; use sql_as() for authorized execution"
-                        .into(),
-            });
-        }
-        let batches = self
+        let sql_df = self
             .sql_engine
-            .sql_with_view_cache(query.as_ref())
+            .sql(query.as_ref())
             .await
             .map_err(|e| KrishivError::Runtime {
                 message: e.to_string(),
             })?;
+        let batches = sql_df.collect().await.map_err(|e| KrishivError::Runtime {
+            message: e.to_string(),
+        })?;
         Ok(DataFrame::from_batches(
             self.mode,
             batches,
@@ -1038,57 +1011,6 @@ impl Session {
         Ok(DataFrame::from_batches(
             self.mode,
             batches,
-            self.jobs.clone(),
-            self.next_job_id.clone(),
-            self.runtime.clone(),
-            self.registered_parquet.clone(),
-        ))
-    }
-
-    /// Execute SQL authenticated as the principal identified by `api_key`.
-    ///
-    /// Applies the configured [`PolicyHook`]: denies access to prohibited tables
-    /// and masks columns per the masking rules before returning results.
-    /// Returns [`KrishivError::AccessDenied`] if the session has no policy engine or
-    /// if authentication fails.
-    pub async fn sql_as(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame> {
-        let engine = self
-            .policy_engine
-            .as_ref()
-            .ok_or_else(|| KrishivError::AccessDenied {
-                reason: "session was not built with an AuthProvider and PolicyHook".into(),
-            })?;
-        let principal = engine
-            .authenticate(api_key)
-            .map_err(|e| KrishivError::AccessDenied {
-                reason: e.to_string(),
-            })?;
-        let query_str = query.as_ref();
-        let effective_sql = engine
-            .prepare_authorized_query(&principal, query_str)
-            .map_err(KrishivError::from)?;
-        let tables = self
-            .registered_parquet
-            .iter()
-            .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
-            .collect::<Vec<_>>();
-        let is_streaming = self
-            .sql_engine
-            .is_streaming_query(&effective_sql)
-            .unwrap_or(false);
-        let batches = runtime_collect_batch_sql(
-            Arc::clone(&self.runtime),
-            &effective_sql,
-            &tables,
-            is_streaming,
-        )
-        .await?;
-        let masked = engine
-            .mask_result_batches(&principal, query_str, batches)
-            .map_err(KrishivError::from)?;
-        Ok(DataFrame::from_batches(
-            self.mode,
-            masked,
             self.jobs.clone(),
             self.next_job_id.clone(),
             self.runtime.clone(),

@@ -433,15 +433,6 @@ mod tests {
             "data must match after reset"
         );
 
-        let mut certified_source = ParquetSource::open(&path).unwrap();
-        crate::CertificationSuite::run_rewind_test::<crate::ParquetOffset>(&mut certified_source)
-            .await
-            .expect("ParquetSource must satisfy generic rewind certification");
-
-        let mut checkpoint_source = ParquetSource::open(&path).unwrap();
-        crate::CertificationSuite::run_checkpoint_restore_test(&mut checkpoint_source)
-            .await
-            .expect("ParquetSource must restore typed checkpoint offsets");
     }
 
     #[test]

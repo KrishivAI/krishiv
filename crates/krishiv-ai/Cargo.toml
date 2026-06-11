@@ -6,41 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-# CI uses `--no-default-features`; enable `fastembed-local` for HuggingFace + rag_index tests (needs C++ / libstdc++ for ONNX).
 default = []
-fastembed-local = ["dep:fastembed"]
-tiktoken = ["dep:tiktoken-rs"]
-# Vector sink backends now live in `krishiv-connectors::vector`.
+# Vector sink backends live in `krishiv-connectors::vector`.
 vector-sinks = ["krishiv-connectors/vector-sinks"]
 qdrant = ["vector-sinks", "krishiv-connectors/qdrant"]
 pgvector = ["vector-sinks", "krishiv-connectors/pgvector"]
 
 [dependencies]
-arrow = { workspace = true }
-async-trait = { workspace = true }
-dashmap = { workspace = true }
-thiserror = { workspace = true }
-fastembed = { workspace = true, optional = true }
-hex = { workspace = true }
-krishiv-common = { path = "../krishiv-common" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["vector-sinks"] }
-krishiv-plan = { path = "../krishiv-plan" }
-parquet = { workspace = true }
-rocksdb = { workspace = true }
-reqwest = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-twox-hash = { workspace = true }
-futures = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
-tracing = { workspace = true }
-tiktoken-rs = { version = "0.6", optional = true }
-
-[dev-dependencies]
-mockito = { workspace = true }
-tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

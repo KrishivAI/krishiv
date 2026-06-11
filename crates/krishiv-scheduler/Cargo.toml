@@ -20,6 +20,7 @@ krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-shuffle = { path = "../krishiv-shuffle" }
+constant_time_eq = { workspace = true }
 rocksdb = { workspace = true }
 tempfile = { workspace = true }
 jsonwebtoken = { workspace = true }

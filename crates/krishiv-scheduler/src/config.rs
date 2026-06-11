@@ -32,10 +32,6 @@ pub struct CoordinatorConfig {
     /// Maximum wall-clock time a checkpoint epoch may wait for executor acks
     /// before the coordinator aborts it and allows the next epoch to proceed.
     checkpoint_ack_timeout_ms: u64,
-    /// Job-level LLM request quota per minute (R17).
-    llm_quota_requests_per_minute: u32,
-    /// Job-level LLM token quota per minute (R17).
-    llm_quota_tokens_per_minute: u64,
 
     /// Consecutive task failures after which an executor is avoided by the
     /// basic circuit breaker (PRR Immediate + Short term).
@@ -60,36 +56,9 @@ impl CoordinatorConfig {
             streaming_reattach_grace_ticks: 5,
             tick_period_ms: 1_000,
             checkpoint_ack_timeout_ms: 30_000,
-            llm_quota_requests_per_minute: 100,
-            llm_quota_tokens_per_minute: 10_000,
             circuit_breaker_failure_threshold: 5,
             inline_partition_limit_bytes: 3 * 1024 * 1024,
         }
-    }
-
-    /// Override job-level LLM request quota (R17).
-    ///
-    /// # Panics
-    ///
-    /// Configures per-minute LLM quota limits. Zero values are clamped to 1
-    /// with a warning — LLM quota enforcement requires positive limits.
-    #[must_use]
-    pub fn with_llm_quota(mut self, requests_per_minute: u32, tokens_per_minute: u64) -> Self {
-        let rpm = if requests_per_minute == 0 {
-            tracing::warn!("llm_quota_requests_per_minute is zero, clamping to 1");
-            1
-        } else {
-            requests_per_minute
-        };
-        let tpm = if tokens_per_minute == 0 {
-            tracing::warn!("llm_quota_tokens_per_minute is zero, clamping to 1");
-            1
-        } else {
-            tokens_per_minute
-        };
-        self.llm_quota_requests_per_minute = rpm;
-        self.llm_quota_tokens_per_minute = tpm;
-        self
     }
 
     /// Set the memory threshold above which executors are skipped for placement.
@@ -146,16 +115,6 @@ impl CoordinatorConfig {
 
     pub fn checkpoint_ack_timeout_ms(&self) -> u64 {
         self.checkpoint_ack_timeout_ms
-    }
-
-    /// Job-level LLM request quota per minute (R17).
-    pub fn llm_quota_requests_per_minute(&self) -> u32 {
-        self.llm_quota_requests_per_minute
-    }
-
-    /// Job-level LLM token quota per minute (R17).
-    pub fn llm_quota_tokens_per_minute(&self) -> u64 {
-        self.llm_quota_tokens_per_minute
     }
 
     /// Consecutive failures threshold for the basic circuit breaker.

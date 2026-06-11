@@ -102,7 +102,7 @@ fastembed = "4.9"
 qdrant-client = "1.16"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 
-constant_time_eq = "0.5"
+constant_time_eq = "0.3"
 indexmap = "2"
 hex = "0.4"
 apache-avro = "0.17"
@@ -112,9 +112,6 @@ wiremock = "0.6"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
-# Use local GCC-15-compatible patch of librocksdb-sys (adds -include cstdint flag).
-[patch.crates-io]
-librocksdb-sys = { path = "vendor/librocksdb-sys" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
