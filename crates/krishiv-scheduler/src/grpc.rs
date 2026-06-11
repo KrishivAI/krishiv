@@ -467,27 +467,49 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "inspect_state");
         let req = request.into_inner();
-        // Collect snapshot paths for the requested operator from the checkpoint coordinator.
-        let checkpoint_inner = self.coordinator.checkpoint_inner.read().await;
-        let snapshots = checkpoint_inner
-            .coordinators
-            .get(&req.job_id)
-            .map(|coord| {
-                coord
-                    .pending_acks
-                    .values()
-                    .filter(|ack| {
-                        req.operator_id.is_empty() || ack.operator_id.as_str() == req.operator_id
-                    })
-                    .filter_map(|ack| {
-                        ack.snapshot_path.as_ref().map(|path| StateSnapshotInfo {
-                            task_id: ack.task_id.as_str().to_owned(),
-                            snapshot_path: path.clone(),
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // Read historical snapshots from durable checkpoint storage so that
+        // the response includes snapshots from completed (already-acked) epochs,
+        // not just the in-flight pending_acks map.
+        let storage_opt = {
+            let checkpoint_inner = self.coordinator.checkpoint_inner.read().await;
+            checkpoint_inner
+                .coordinators
+                .get(&req.job_id)
+                .map(|coord| Arc::clone(&coord.storage))
+        };
+        let Some(storage) = storage_opt else {
+            return Ok(tonic::Response::new(InspectStateResponse {
+                snapshots: vec![],
+            }));
+        };
+        let epochs = krishiv_state::checkpoint::list_valid_epochs_async(
+            storage.as_ref(),
+            req.job_id.as_str(),
+        )
+        .await
+        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+
+        let mut snapshots = Vec::new();
+        for epoch in epochs.into_iter().rev().take(20) {
+            let Some(meta) = krishiv_state::checkpoint::read_epoch_metadata_async(
+                storage.as_ref(),
+                req.job_id.as_str(),
+                epoch,
+            )
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?
+            else {
+                continue;
+            };
+            for snap in &meta.operator_snapshots {
+                if req.operator_id.is_empty() || snap.operator_id == req.operator_id {
+                    snapshots.push(StateSnapshotInfo {
+                        task_id: snap.task_id.clone(),
+                        snapshot_path: snap.snapshot_path.clone(),
+                    });
+                }
+            }
+        }
         Ok(tonic::Response::new(InspectStateResponse { snapshots }))
     }
 }
@@ -780,6 +802,36 @@ fn trace_and_auth_interceptor(
     crate::auth::auth_interceptor(req)
 }
 
+/// Read `KRISHIV_TLS_CERT`, `KRISHIV_TLS_KEY`, and optionally `KRISHIV_CA_CERT`
+/// to produce a [`tonic::transport::ServerTlsConfig`].
+///
+/// Returns `Ok(None)` when the env vars are absent (plaintext mode).
+/// Returns an error when only one of cert/key is set, or when a file cannot be read.
+pub fn server_tls_config_from_env(
+) -> Result<Option<tonic::transport::ServerTlsConfig>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let cert_path = std::env::var("KRISHIV_TLS_CERT").ok();
+    let key_path = std::env::var("KRISHIV_TLS_KEY").ok();
+    match (cert_path, key_path) {
+        (Some(cert), Some(key)) => {
+            let cert_pem = std::fs::read(&cert)
+                .map_err(|e| format!("KRISHIV_TLS_CERT: cannot read {cert}: {e}"))?;
+            let key_pem = std::fs::read(&key)
+                .map_err(|e| format!("KRISHIV_TLS_KEY: cannot read {key}: {e}"))?;
+            let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+            let mut tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+            if let Ok(ca_path) = std::env::var("KRISHIV_CA_CERT") {
+                let ca_pem = std::fs::read(&ca_path)
+                    .map_err(|e| format!("KRISHIV_CA_CERT: cannot read {ca_path}: {e}"))?;
+                tls = tls.client_ca_root(tonic::transport::Certificate::from_pem(ca_pem));
+            }
+            Ok(Some(tls))
+        }
+        (None, None) => Ok(None),
+        _ => Err("KRISHIV_TLS_CERT and KRISHIV_TLS_KEY must both be set or both unset".into()),
+    }
+}
+
 /// Serve the coordinator/executor gRPC API on an already-bound listener.
 ///
 /// Equivalent to [`serve_coordinator_executor_grpc_with_listener_and_tracker`]
@@ -794,6 +846,7 @@ pub async fn serve_coordinator_executor_grpc_with_listener(
         listener,
         coordinator,
         crate::rpc_drain::InFlightTracker::new(),
+        None,
     )
     .await
 }
@@ -801,13 +854,23 @@ pub async fn serve_coordinator_executor_grpc_with_listener(
 /// Serve the coordinator/executor gRPC API, reporting every in-flight call
 /// into `tracker` so the caller can drain outstanding RPCs before demoting
 /// the coordinator (R11) instead of relying on a fixed sleep.
+///
+/// Pass `tls_config = Some(...)` to enable mutual-TLS.  Use
+/// [`server_tls_config_from_env`] to load TLS material from the standard
+/// `KRISHIV_TLS_CERT` / `KRISHIV_TLS_KEY` / `KRISHIV_CA_CERT` env vars.
 pub async fn serve_coordinator_executor_grpc_with_listener_and_tracker(
     listener: tokio::net::TcpListener,
     coordinator: SharedCoordinator,
     tracker: crate::rpc_drain::InFlightTracker,
+    tls_config: Option<tonic::transport::ServerTlsConfig>,
 ) -> Result<(), tonic::transport::Error> {
     let coordinator_for_management = coordinator.clone();
-    tonic::transport::Server::builder()
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = tls_config {
+        builder = builder.tls_config(tls)?;
+    }
+    builder
+        .layer(krishiv_metrics::grpc::GrpcDurationLayer)
         .layer(crate::rpc_drain::InFlightLayer::new(tracker))
         .add_service(tonic::service::interceptor::InterceptedService::new(
             coordinator_executor_grpc_server(coordinator),

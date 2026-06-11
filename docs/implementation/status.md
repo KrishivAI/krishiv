@@ -1731,3 +1731,49 @@ Implemented cross-cutting production hardening across Waves 0–3 (merged via PR
 - Re-exported `DurabilityProfile` from `krishiv-common` and `krishiv-scheduler`.
 
 ---
+
+## 12-Gap Feature Implementation (2026-06-10)
+
+Resumed prior-session work implementing all remaining feature gaps.
+
+### Gap #10 — CEP streaming executor path
+
+- Added `serde::{Serialize, Deserialize}` derives to `PatternStage` and `CompiledPattern`
+  in `krishiv-plan/src/cep/pattern.rs`.
+- Added `NodeOp::Cep { key_column, event_time_column, stage_column }` variant to
+  `krishiv-plan/src/lib.rs`.
+- Added `STREAM_CEP_PREFIX = "stream:cep:"` constant and `encode_cep_fragment()`
+  helper to `krishiv-plan/src/cep/mod.rs` so callers build fragments without
+  depending on the executor.
+- Added `CepFragmentSpec` (serde::Deserialize) and `execute_cep_fragment()` to
+  `krishiv-executor/src/fragment/streaming.rs`:
+  - Reads input batches via the same priority order as the loop path
+    (continuous_drainer → continuous_inputs → InMemory → InlineIpc).
+  - Iterates rows row-by-row, extracts key/event_time/stage_name.
+  - Routes each row to `PartitionedCepMatcher::<String>::process_event`.
+  - Concatenates each completed match's stage batches with `arrow::compute::concat_batches`.
+  - Emits match batches as `ExecutorTaskOutput::streaming_window`.
+- Dispatch added in `execute_streaming_fragment` before `stream:loop:`.
+- Added `serde` dep to `krishiv-executor/Cargo.toml`.
+
+### Gap #12 — Iceberg end-to-end test
+
+Added two `#[tokio::test]` cases in
+`krishiv-connectors/src/registry/drivers/lakehouse.rs` (feature-gated `lakehouse`):
+
+- `iceberg_sink_insert_then_source_select`: writes 5 rows in 2 batches through
+  `IcebergSinkDriver`, reads back through `IcebergSourceDriver`, asserts 5 rows and
+  correct id values.
+- `iceberg_two_commits_both_visible`: makes two separate flush commits and asserts
+  both are visible in a subsequent full scan.
+
+### Validation
+
+```
+cargo check --workspace            # zero errors
+cargo test -p krishiv-connectors --features lakehouse --lib -- iceberg
+# 17 passed (2 new driver e2e tests + 15 existing iceberg_fs tests)
+```
+
+Next useful command: `cargo test --workspace --lib` (requires system libpython3.12 for
+krishiv-python; exclude it if unavailable).

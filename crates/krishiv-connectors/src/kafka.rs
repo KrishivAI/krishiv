@@ -754,6 +754,7 @@ impl OffsetCommitter<KafkaOffset> for InMemoryKafkaOffsetCommitter {
 pub struct RdkafkaKafkaSource {
     consumer: std::sync::Arc<rdkafka::consumer::StreamConsumer>,
     topic: String,
+    group_id: String,
     /// Timeout per poll attempt in milliseconds.
     poll_timeout_ms: u64,
     /// Latest offset read per partition — tracks all partitions, not just the last one.
@@ -829,6 +830,7 @@ impl RdkafkaKafkaSource {
         Ok(Self {
             consumer: std::sync::Arc::new(consumer),
             topic,
+            group_id: group_id.as_ref().to_string(),
             poll_timeout_ms: 100,
             partition_offsets: std::collections::HashMap::new(),
         })
@@ -1031,6 +1033,25 @@ impl Source for RdkafkaKafkaSource {
                 };
 
                 let batch = Self::payload_to_batch(payload)?;
+                // Record per-partition consumer lag (high_watermark - current_offset).
+                let partition = msg.partition();
+                let current = msg.offset();
+                let topic = self.topic.clone();
+                let group_id = self.group_id.clone();
+                let consumer = std::sync::Arc::clone(&self.consumer);
+                tokio::task::spawn_blocking(move || {
+                    use rdkafka::consumer::Consumer;
+                    if let Ok((_, high)) = consumer.fetch_watermarks(
+                        &topic,
+                        partition,
+                        std::time::Duration::from_millis(50),
+                    ) {
+                        let lag = high.saturating_sub(current + 1);
+                        let source_id = format!("{topic}:{partition}");
+                        krishiv_metrics::global_metrics()
+                            .set_source_offset_lag(&group_id, &source_id, lag);
+                    }
+                });
                 Ok(Some(batch))
             }
         }

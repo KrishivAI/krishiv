@@ -61,6 +61,25 @@ type InterceptedCoordinatorClient =
         >,
     >;
 
+/// Build a [`tonic::transport::ClientTlsConfig`] from env vars.
+///
+/// When `KRISHIV_CA_CERT` is set the PEM is loaded as the trusted CA bundle,
+/// which enables verification of the coordinator's server certificate.
+/// When the env var is absent the function returns `None` (plaintext).
+///
+/// Panics with a clear message when the CA cert file cannot be read —
+/// this is a fatal start-up misconfiguration.
+fn client_tls_config_from_env() -> Option<tonic::transport::ClientTlsConfig> {
+    if let Ok(ca_path) = std::env::var("KRISHIV_CA_CERT") {
+        let ca_pem = std::fs::read(&ca_path).unwrap_or_else(|e| {
+            panic!("KRISHIV_CA_CERT: cannot read '{ca_path}': {e}")
+        });
+        let ca = tonic::transport::Certificate::from_pem(ca_pem);
+        return Some(tonic::transport::ClientTlsConfig::new().ca_certificate(ca));
+    }
+    None
+}
+
 fn configured_coordinator_bearer_token() -> Option<String> {
     std::env::var(COORDINATOR_BEARER_TOKEN_ENV)
         .ok()
@@ -134,14 +153,16 @@ impl CoordinatorGrpcPool {
             return Ok(client.clone());
         }
         // Connect while holding the lock — prevents concurrent duplicate connects.
-        let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())?
+        let mut endpoint = tonic::transport::Endpoint::from_shared(self.endpoint.clone())?
             .connect_timeout(std::time::Duration::from_secs(10))
             .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
             .http2_keep_alive_interval(std::time::Duration::from_secs(15))
             .keep_alive_timeout(std::time::Duration::from_secs(20))
-            .keep_alive_while_idle(true)
-            .connect()
-            .await?;
+            .keep_alive_while_idle(true);
+        if let Some(tls) = client_tls_config_from_env() {
+            endpoint = endpoint.tls_config(tls)?;
+        }
+        let channel = endpoint.connect().await?;
         let client =
             wire::v1::coordinator_executor_client::CoordinatorExecutorClient::with_interceptor(
                 channel,

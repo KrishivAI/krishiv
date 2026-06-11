@@ -10,6 +10,9 @@ async-trait = { workspace = true }
 arrow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+dashmap = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
@@ -17,9 +20,9 @@ krishiv-state = { path = "../krishiv-state" }
 krishiv-dataflow = { path = "../krishiv-dataflow" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse", "hudi"] }
 krishiv-sql = { path = "../krishiv-sql" }
-dashmap = { workspace = true }
-tokio = { workspace = true }
-futures.workspace = true
+
+[features]
+kafka = ["krishiv-connectors/kafka"]
 
 [dev-dependencies]
 krishiv-common = { path = "../krishiv-common" }

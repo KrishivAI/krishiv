@@ -32,7 +32,7 @@ futures.workspace = true
 [features]
 default = []
 extension-module = ["pyo3/extension-module"]
-kafka = ["krishiv-connectors/kafka"]
+kafka = ["krishiv-connectors/kafka", "krishiv-api/kafka"]
 iceberg = ["krishiv-connectors/iceberg"]
 ai = ["dep:krishiv-ai", "krishiv-ai/fastembed-local"]
 vector-sinks = ["ai", "krishiv-ai/vector-sinks"]

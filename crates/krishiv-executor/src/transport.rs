@@ -14,7 +14,10 @@ use krishiv_proto::{
     TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion, wire,
 };
 
-use crate::grpc::executor_task_grpc_server;
+use crate::grpc::{
+    SharedContinuousInputs, SharedLoopExecutors, executor_task_grpc_server,
+    executor_task_grpc_server_with_continuous,
+};
 use crate::{ExecutorAssignmentInbox, ExecutorError, ExecutorResult, ExecutorTransportResult};
 
 /// Network transport error raised by the executor gRPC client.
@@ -624,6 +627,27 @@ pub async fn serve_executor_task_grpc_with_listener(
     tonic::transport::Server::builder()
         .add_service(tonic::service::interceptor::InterceptedService::new(
             executor_task_grpc_server(inbox),
+            krishiv_metrics::grpc::extract_trace_context,
+        ))
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+        .await
+}
+
+/// Serve the executor task-assignment gRPC API sharing continuous state with a runner.
+///
+/// Use this variant in the executor CLI to share `loop_executors` and
+/// `continuous_inputs` with the `ExecutorTaskRunner` so that distributed
+/// `push_continuous_input` / `drain_continuous_output` RPCs operate on the
+/// same window executor state as `execute_loop_fragment`.
+pub async fn serve_executor_task_grpc_with_listener_and_continuous(
+    listener: tokio::net::TcpListener,
+    inbox: ExecutorAssignmentInbox,
+    loop_executors: SharedLoopExecutors,
+    continuous_inputs: SharedContinuousInputs,
+) -> Result<(), tonic::transport::Error> {
+    tonic::transport::Server::builder()
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            executor_task_grpc_server_with_continuous(inbox, loop_executors, continuous_inputs),
             krishiv_metrics::grpc::extract_trace_context,
         ))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))

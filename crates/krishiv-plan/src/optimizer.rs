@@ -425,15 +425,30 @@ pub struct AqeOptimizer {
     always_rules: Vec<Box<dyn AqeRule>>,
     /// Rules that are skipped for streaming plans.
     guarded_rules: Vec<Box<dyn AqeRule>>,
+    /// Cost model for cold-start estimation when `RuntimeStats` are absent.
+    ///
+    /// When `stats` passed to `apply` is empty (first execution cycle), the
+    /// optimizer uses this model to estimate memory cost from the logical plan
+    /// and synthesises a single `RuntimeStats` entry so that `AutoPartitionRule`
+    /// can propose an initial partition count rather than defaulting to the plan's
+    /// current value.  Defaults to [`StaticCostModel`].
+    cost_model: std::sync::Arc<dyn CostModel>,
 }
 
 impl AqeOptimizer {
-    /// Create an empty AQE optimizer.
+    /// Create an empty AQE optimizer backed by [`StaticCostModel`].
     pub fn new() -> Self {
         Self {
             always_rules: Vec::new(),
             guarded_rules: Vec::new(),
+            cost_model: std::sync::Arc::new(StaticCostModel),
         }
+    }
+
+    /// Replace the default cost model with a custom implementation.
+    pub fn with_cost_model(mut self, model: std::sync::Arc<dyn CostModel>) -> Self {
+        self.cost_model = model;
+        self
     }
 
     /// Add a rule that always runs, including on streaming plans.
@@ -451,6 +466,10 @@ impl AqeOptimizer {
 
     /// Apply all applicable rules given per-stage runtime statistics.
     ///
+    /// When `stats` is empty the cost model is used to synthesise a single
+    /// `RuntimeStats` entry (from the logical plan cost estimate) so that rules
+    /// that need size information can still make a first-pass decision.
+    ///
     /// Returns the (possibly rewritten) plan and the names of rules that fired.
     pub fn apply(
         &self,
@@ -466,9 +485,36 @@ impl AqeOptimizer {
         let mut current = plan;
         let mut applied = Vec::new();
 
+        // When no runtime stats are available (cold start), synthesise a single
+        // RuntimeStats entry from the cost model estimate so rules that need
+        // size information can propose an initial partition count.
+        //
+        // PhysicalPlan does not carry a back-reference to the original
+        // LogicalPlan, but its PlanNodes expose the same `estimated_rows()`
+        // and `op()` accessors that StaticCostModel uses.  We build a
+        // ephemeral LogicalPlan that mirrors the physical nodes so the cost
+        // model can walk them without requiring a separate logical plan to be
+        // threaded through the call stack.
+        let cost_synthesised_stats: Vec<RuntimeStats>;
+        let effective_stats = if stats.is_empty() && !input_is_streaming {
+            let mut lplan = crate::LogicalPlan::new(current.name(), current.kind());
+            for node in current.nodes() {
+                lplan.add_node(node.clone());
+            }
+            let cost = self.cost_model.estimate(&lplan);
+            cost_synthesised_stats = vec![RuntimeStats {
+                memory_bytes: cost.memory_bytes,
+                cpu_nanos: cost.cpu_nanos,
+                ..Default::default()
+            }];
+            &cost_synthesised_stats[..]
+        } else {
+            stats
+        };
+
         for rule in &self.always_rules {
             let rule_name = rule.name().to_string();
-            let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(&current, stats))).map_err(
+            let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(&current, effective_stats))).map_err(
                 |payload| OptimizerError::RulePanicked {
                     optimizer: "AQE",
                     rule: rule_name.clone(),
@@ -502,7 +548,7 @@ impl AqeOptimizer {
         if !input_is_streaming && !StreamingAqeGuard::plan_is_streaming(&current) {
             for rule in &self.guarded_rules {
                 let rule_name = rule.name().to_string();
-                let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(&current, stats)))
+                let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(&current, effective_stats)))
                     .map_err(|payload| OptimizerError::RulePanicked {
                         optimizer: "AQE",
                         rule: rule_name.clone(),

@@ -57,7 +57,8 @@ pub use admission::{
 pub use auth::{
     AuthContext, COORDINATOR_AUTH_RELOAD_INTERVAL_SECS_ENV, COORDINATOR_BEARER_TOKEN_ENV,
     COORDINATOR_BEARER_TOKEN_FILE_ENV, COORDINATOR_BEARER_TOKENS_ENV,
-    COORDINATOR_BEARER_TOKENS_FILE_ENV, configure_grpc_auth_provider_from_env,
+    COORDINATOR_BEARER_TOKENS_FILE_ENV, JwtAuthProvider, OIDC_JWKS_URI_ENV,
+    configure_grpc_auth_provider_from_env, configure_jwt_auth_provider_from_env,
     configured_coordinator_bearer_token, configured_coordinator_bearer_tokens,
     coordinator_bearer_auth_configured, extract_auth_context, reload_grpc_auth_provider_from_env,
     set_allow_anonymous, set_grpc_auth_provider, spawn_grpc_auth_reload_task_from_env,
@@ -92,7 +93,7 @@ pub use grpc::{
     CoordinatorExecutorGrpcService, CoordinatorExecutorTonicService,
     CoordinatorManagementGrpcService, coordinator_executor_grpc_server,
     coordinator_management_grpc_server, serve_coordinator_executor_grpc_with_listener,
-    serve_coordinator_executor_grpc_with_listener_and_tracker,
+    serve_coordinator_executor_grpc_with_listener_and_tracker, server_tls_config_from_env,
 };
 pub use heartbeat::{
     ExecutorHealthSnapshot, ExecutorHeartbeatAge, ExecutorRecord, ExecutorRegistry,

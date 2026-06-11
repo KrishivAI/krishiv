@@ -22,14 +22,14 @@ pub enum CepCompileError {
 }
 
 /// One stage in a linear CEP pattern.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PatternStage {
     pub name: String,
     pub max_gap_ms: Option<u64>,
 }
 
 /// Compiled linear pattern.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompiledPattern {
     pub stages: Vec<PatternStage>,
     pub window_ms: u64,

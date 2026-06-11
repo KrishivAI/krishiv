@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::grpc::executor_task_grpc_server_with_continuous;
 use crate::grpc_client::SharedLeaseGeneration;
 use crate::{
     ExecutorAssignmentInbox, ExecutorBarrierService, ExecutorConfig, ExecutorRuntime,
     ExecutorTaskAuthConfig, ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierAckRegistry,
     SharedBarrierInjector, SharedKeyGroupRanges, ShuffleContext, executor_barrier_grpc_server,
-    serve_executor_task_grpc_with_listener,
 };
 use axum::Router;
 use axum::http::header::CONTENT_TYPE;
@@ -268,11 +268,27 @@ async fn heartbeat_loop(
         shared_lease.clone(),
     ));
 
+    // Create shared continuous-streaming state upfront so that both the gRPC
+    // task server and the task runner operate on the same loop_executors and
+    // continuous_inputs maps (distributed push_continuous_input path).
+    let shared_loop_executors = Arc::new(DashMap::new());
+    let shared_continuous_inputs: Arc<DashMap<String, Vec<arrow::record_batch::RecordBatch>>> =
+        Arc::new(DashMap::new());
+
     // Now spawn the task and barrier servers.  No more re-registers required.
     if let Some(listener) = task_listener {
         let server_inbox = inbox.clone();
+        let grpc_loop_executors = Arc::clone(&shared_loop_executors);
+        let grpc_continuous_inputs = Arc::clone(&shared_continuous_inputs);
         tokio::spawn(async move {
-            let _ = serve_executor_task_grpc_with_listener(listener, server_inbox).await;
+            use crate::transport::serve_executor_task_grpc_with_listener_and_continuous;
+            let _ = serve_executor_task_grpc_with_listener_and_continuous(
+                listener,
+                server_inbox,
+                grpc_loop_executors,
+                grpc_continuous_inputs,
+            )
+            .await;
         });
     }
     let barrier_injector: SharedBarrierInjector = Default::default();
@@ -320,7 +336,9 @@ async fn heartbeat_loop(
         .with_barrier_ack_registry(barrier_ack_registry)
         .with_key_group_ranges(key_group_ranges)
         .with_running_attempts(running_attempts)
-        .with_udf_limits(krishiv_plan::udf::ResourceLimits::default());
+        .with_udf_limits(krishiv_plan::udf::ResourceLimits::default())
+        .with_shared_loop_executors(shared_loop_executors)
+        .with_shared_continuous_inputs(shared_continuous_inputs);
     // Wire durable state dir so stream:loop: window operators use file-backed state.
     if let Some(ref dir) = state_dir {
         runner_builder = runner_builder.with_state_dir(dir.clone());

@@ -720,6 +720,12 @@ pub struct ExecutorTaskRunner {
     /// clones must share the same stateful executor for a given job.
     pub(crate) loop_executors:
         Arc<DashMap<String, Arc<std::sync::Mutex<krishiv_dataflow::ContinuousWindowExecutor>>>>,
+    /// Per-job pending input batches for distributed `push_continuous_input` gRPC.
+    ///
+    /// The gRPC service appends decoded batches here; `execute_loop_fragment` drains
+    /// them (as a fallback when `continuous_drainer` is absent) so the same executor
+    /// state is shared with the network path.
+    pub(crate) continuous_inputs: Arc<DashMap<String, Vec<RecordBatch>>>,
     /// Per-job `StreamingPartitionAdvisor` instances (EMA-based bucket advisor).
     ///
     /// Keyed by job-id string. Accumulates the EMA of observed input-batch byte
@@ -822,6 +828,7 @@ impl ExecutorTaskRunner {
             running_attempts: None,
             continuous_drainer: None,
             loop_executors: Arc::new(DashMap::new()),
+            continuous_inputs: Arc::new(DashMap::new()),
             streaming_advisors: Arc::new(DashMap::new()),
             live_lease: crate::grpc_client::SharedLeaseGeneration::new(
                 krishiv_proto::LeaseGeneration::initial(),
@@ -859,6 +866,40 @@ impl ExecutorTaskRunner {
     /// Access the shared SQL engine.
     pub fn sql_engine(&self) -> &Arc<SqlEngine> {
         &self.sql_engine
+    }
+
+    /// Shared loop executor map for wiring with the gRPC service.
+    pub fn shared_loop_executors(
+        &self,
+    ) -> Arc<DashMap<String, Arc<std::sync::Mutex<krishiv_dataflow::ContinuousWindowExecutor>>>>
+    {
+        Arc::clone(&self.loop_executors)
+    }
+
+    /// Shared continuous input buffer for wiring with the gRPC service.
+    pub fn shared_continuous_inputs(&self) -> Arc<DashMap<String, Vec<RecordBatch>>> {
+        Arc::clone(&self.continuous_inputs)
+    }
+
+    /// Replace the loop executor map with a pre-allocated shared instance.
+    ///
+    /// Use this builder method in the executor CLI to ensure the gRPC service
+    /// and the task runner share the same `ContinuousWindowExecutor` instances.
+    pub fn with_shared_loop_executors(
+        mut self,
+        executors: Arc<DashMap<String, Arc<std::sync::Mutex<krishiv_dataflow::ContinuousWindowExecutor>>>>,
+    ) -> Self {
+        self.loop_executors = executors;
+        self
+    }
+
+    /// Replace the continuous inputs map with a pre-allocated shared instance.
+    pub fn with_shared_continuous_inputs(
+        mut self,
+        inputs: Arc<DashMap<String, Vec<RecordBatch>>>,
+    ) -> Self {
+        self.continuous_inputs = inputs;
+        self
     }
 
     /// Access the registered-parquet cache (keyed by `"table_name:path"`).

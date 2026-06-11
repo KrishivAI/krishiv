@@ -75,10 +75,12 @@ prost-build = "0.14.3"
 protoc-bin-vendored = "3.2.0"
 tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1.18", features = ["net"] }
-tonic = { version = "0.14.6", features = ["transport"] }
+tonic = { version = "0.14.6", features = ["transport", "tls-ring"] }
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tower = "0.5.3"
+http = "1"
+jsonwebtoken = "9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tracing-opentelemetry = "0.33.0"
@@ -88,7 +90,7 @@ opentelemetry-stdout = { version = "0.32.0", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 rocksdb = { version = "0.22", features = ["multi-threaded-cf"] }
 mockito = "1"
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls", "blocking"] }
 webpki-root-certs = "1.0"
 uuid = { version = "1", features = ["v4"] }
 lz4_flex = "0.11"

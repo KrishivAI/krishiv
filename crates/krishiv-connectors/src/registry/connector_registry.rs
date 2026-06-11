@@ -238,6 +238,15 @@ pub fn default_registry() -> ConnectorRegistry {
         registry.register_source(Arc::new(super::drivers::KafkaSourceDriver));
         registry.register_sink(Arc::new(super::drivers::KafkaSinkDriver));
     }
+    #[cfg(feature = "lakehouse")]
+    {
+        registry.register_source(Arc::new(super::drivers::IcebergSourceDriver));
+        registry.register_sink(Arc::new(super::drivers::IcebergSinkDriver));
+        registry.register_source(Arc::new(super::drivers::DeltaSourceDriver));
+        registry.register_sink(Arc::new(super::drivers::DeltaSinkDriver));
+        registry.register_source(Arc::new(super::drivers::HudiSourceDriver));
+        registry.register_sink(Arc::new(super::drivers::HudiSinkDriver));
+    }
     #[cfg(feature = "vector-sinks")]
     {
         super::vector_drivers::register_builtin_vector_drivers(&mut registry);

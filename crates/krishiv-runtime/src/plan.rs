@@ -71,9 +71,7 @@ pub fn streaming_spec_from_plan(
                     WindowKind::Session => LocalWindowKind::Session {
                         gap_ms: spec.session_gap_ms.unwrap_or(spec.window_size_ms),
                     },
-                    // Count-based windows use a tumbling layout at the streaming layer;
-                    // the row-count boundary is enforced by the plan validator.
-                    WindowKind::Count { .. } => LocalWindowKind::Tumbling,
+                    WindowKind::Count { size, slide } => LocalWindowKind::Count { size, slide },
                 });
             }
             NodeOp::StateTtl { ttl_ms } => state_ttl_ms = Some(*ttl_ms),

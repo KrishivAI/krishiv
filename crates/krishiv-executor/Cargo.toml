@@ -26,6 +26,7 @@ krishiv-shuffle = { path = "../krishiv-shuffle" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-state = { path = "../krishiv-state" }
 object_store = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "signal", "sync"] }
 tokio-stream.workspace = true

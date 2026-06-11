@@ -22,6 +22,7 @@ krishiv-proto = { path = "../krishiv-proto" }
 krishiv-shuffle = { path = "../krishiv-shuffle" }
 rocksdb = { workspace = true }
 tempfile = { workspace = true }
+jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

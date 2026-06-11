@@ -1,4 +1,6 @@
-//! tonic interceptors for W3C `traceparent` and `tracestate` propagation.
+//! tonic interceptors for W3C `traceparent` and `tracestate` propagation, and
+//! a tower [`GrpcDurationLayer`] that calls
+//! [`KrishivMetrics::observe_grpc_duration`] for every completed RPC.
 //!
 //! # Client side
 //!
@@ -17,8 +19,13 @@
 //!     .await?;
 //! ```
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use opentelemetry::propagation::{Extractor, TextMapPropagator};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
+use tower::{Layer, Service};
 
 /// Tonic client interceptor: reads `current_traceparent()` and `current_tracestate()`
 /// and inserts them as `"traceparent"` and `"tracestate"` metadata keys on every
@@ -82,6 +89,63 @@ pub fn extract_trace_context(req: tonic::Request<()>) -> Result<tonic::Request<(
     let parent_cx = propagator.extract(&MetadataExtractor(req.metadata()));
     parent_cx.attach();
     Ok(req)
+}
+
+// ── GrpcDurationLayer ────────────────────────────────────────────────────────
+
+/// Tower layer that records per-RPC call duration via
+/// [`crate::global_metrics().observe_grpc_duration`].
+///
+/// The gRPC method path is extracted from `http::Request::uri().path()`.
+/// Apply as:
+///
+/// ```ignore
+/// tonic::transport::Server::builder()
+///     .layer(krishiv_metrics::grpc::GrpcDurationLayer)
+///     .add_service(...)
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GrpcDurationLayer;
+
+impl<S> Layer<S> for GrpcDurationLayer {
+    type Service = GrpcDurationService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        GrpcDurationService { inner }
+    }
+}
+
+/// Service wrapper produced by [`GrpcDurationLayer`].
+#[derive(Clone, Debug)]
+pub struct GrpcDurationService<S> {
+    inner: S,
+}
+
+impl<S, B> Service<http::Request<B>> for GrpcDurationService<S>
+where
+    S: Service<http::Request<B>> + Send + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        let path = req.uri().path().to_string();
+        let start = std::time::Instant::now();
+        let fut = self.inner.call(req);
+        Box::pin(async move {
+            let result = fut.await;
+            let elapsed = start.elapsed().as_secs_f64();
+            crate::global_metrics().observe_grpc_duration(&path, elapsed);
+            result
+        })
+    }
 }
 
 #[cfg(test)]

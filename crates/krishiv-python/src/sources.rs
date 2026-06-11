@@ -56,8 +56,10 @@ pub fn read_parquet(
 /// **Feature gate**: Requires `pip install krishiv[kafka]` or building with `--features kafka`.
 /// Without the feature, raises `ConnectorError` immediately.
 ///
-/// **Alpha (with feature)**: With the `kafka` feature, returns a `Stream` descriptor.
-/// The `schema` and `group_id` parameters are accepted but currently ignored.
+/// With the `kafka` feature, registers the Kafka topic as a SQL streaming table and
+/// returns a `Stream` descriptor. The `schema` describes the expected Arrow schema for
+/// deserialized records (uses a single `value: Utf8` field when `None`). The `group_id`
+/// sets the Kafka consumer group (defaults to `"krishiv-default"` when `None`).
 /// The returned stream has no watermark set — call `.with_watermark(column, lag_ms)`
 /// before windowing.
 pub fn read_kafka(
@@ -67,19 +69,34 @@ pub fn read_kafka(
     schema: Option<&Bound<'_, PyType>>,
     group_id: Option<String>,
 ) -> PyResult<PyStream> {
-    let _ = (schema, group_id);
     #[cfg(not(feature = "kafka"))]
     {
-        let _ = (session, &topic, &bootstrap_servers);
+        let _ = (session, &topic, &bootstrap_servers, schema, group_id);
         Err(ConnectorError::new_err(
             "Kafka support requires building with the `kafka` feature (pip install krishiv[kafka])",
         ))
     }
     #[cfg(feature = "kafka")]
     {
+        use crate::schema::PySchema;
+        use std::sync::Arc;
+        use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+
+        let arrow_schema: SchemaRef = if let Some(cls) = schema {
+            PySchema::arrow_schema_from_class(cls)?
+        } else {
+            Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]))
+        };
+        let gid = group_id.unwrap_or_else(|| "krishiv-default".to_string());
+        // Register the topic as a SQL streaming table so `SELECT * FROM "{topic}"`
+        // works through the standard stream execution path.
+        session
+            .inner
+            .register_kafka_source(&topic, arrow_schema, &bootstrap_servers, &topic, gid)
+            .map_err(crate::errors::map_krishiv_error)?;
         Ok(PyStream::from_pipeline(
             session.inner.clone(),
-            format!("kafka:{topic}:{bootstrap_servers}"),
+            format!("SELECT * FROM \"{topic}\""),
             String::new(),
             0,
         ))

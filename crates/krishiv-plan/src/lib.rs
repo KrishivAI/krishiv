@@ -233,6 +233,17 @@ pub enum NodeOp {
         /// Hard cap on iterations to prevent infinite loops.
         max_iterations: u32,
     },
+    /// CEP sequential pattern match on a keyed stream.
+    ///
+    /// `stage_column` names the column whose string value identifies which
+    /// pattern stage each row belongs to.  The executor groups rows by
+    /// `key_column`, routes each row to `PartitionedCepMatcher::process_event`
+    /// with the row's stage name, and emits concatenated match batches.
+    Cep {
+        key_column: String,
+        event_time_column: String,
+        stage_column: String,
+    },
     /// Operator not covered by the above variants.
     Other { description: String },
 }

@@ -156,6 +156,9 @@ impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
             crate::local_streaming::LocalWindowKind::Session { gap_ms } => {
                 (WindowKind::Session, None, Some(*gap_ms))
             }
+            crate::local_streaming::LocalWindowKind::Count { size, slide } => {
+                (WindowKind::Count { size: *size, slide: *slide }, None, None)
+            }
         };
 
         WindowExecutionSpec {
@@ -209,7 +212,9 @@ impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
             WindowKind::Session => crate::local_streaming::LocalWindowKind::Session {
                 gap_ms: spec.session_gap_ms.unwrap_or(spec.window_size_ms),
             },
-            WindowKind::Count { .. } => crate::local_streaming::LocalWindowKind::Tumbling,
+            WindowKind::Count { size, slide } => {
+                crate::local_streaming::LocalWindowKind::Count { size, slide }
+            }
         };
 
         LocalWindowExecutionSpec {

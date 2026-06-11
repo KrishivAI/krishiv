@@ -27,7 +27,7 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightDescriptor, FlightInfo, HandshakeRequest,
     HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -157,12 +157,70 @@ impl FlightService for ShuffleFlightService {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented(
-            "shuffle service does not accept client-side puts; \
-             executors write to their local store directly",
-        ))
+        use arrow_flight::decode::FlightRecordBatchStream;
+
+        let mut stream = request.into_inner();
+
+        // The first FlightData message carries the FlightDescriptor with the
+        // partition ticket and optional lease token.
+        let first = stream
+            .message()
+            .await
+            .map_err(|e| Status::invalid_argument(format!("reading first message: {e}")))?
+            .ok_or_else(|| Status::invalid_argument("do_put stream was empty"))?;
+
+        let descriptor = first
+            .flight_descriptor
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("first FlightData must carry a FlightDescriptor"))?;
+
+        if descriptor.path.is_empty() {
+            return Err(Status::invalid_argument(
+                "FlightDescriptor.path[0] must be the partition ticket '<job>/<stage>/<partition>'",
+            ));
+        }
+        let (job_id, stage_id, partition) = parse_ticket(descriptor.path[0].as_bytes())?;
+        let lease_token: u64 = descriptor
+            .path
+            .get(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1);
+
+        let id = PartitionId { job_id, stage_id, partition };
+
+        // Re-assemble a stream that starts with the first (schema) message.
+        let schema_msg = futures::stream::once(async move {
+            Ok::<FlightData, arrow_flight::error::FlightError>(first)
+        });
+        let rest = stream.map_err(|e: tonic::Status| {
+            arrow_flight::error::FlightError::from_external_error(Box::new(e))
+        });
+        let combined = schema_msg.chain(rest);
+
+        let decoder = FlightRecordBatchStream::new_from_flight_data(combined);
+        let batches: Vec<RecordBatch> = decoder
+            .map_err(|e| Status::internal(format!("flight decode: {e}")))
+            .try_collect()
+            .await?;
+
+        // Schema comes from the decoded stream; if empty, use the batch schema.
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| arrow::datatypes::SchemaRef::new(arrow::datatypes::Schema::empty()));
+
+        let partition = crate::ShufflePartition { id, schema, batches };
+        self.store
+            .write_partition(partition, lease_token)
+            .await
+            .map_err(|e| Status::internal(format!("write_partition: {e}")))?;
+
+        // Return an empty PutResult stream — the write has been committed.
+        let (tx, rx) = mpsc::channel::<Result<PutResult, Status>>(1);
+        drop(tx);
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx)) as Self::DoPutStream))
     }
 
     async fn do_action(
@@ -270,6 +328,69 @@ impl FlightShuffleClient {
             .try_collect()
             .await?;
         Ok(batches)
+    }
+
+    /// Push a shuffle partition to a remote shuffle Flight server.
+    ///
+    /// `endpoint` accepts either `<host>:<port>` or a full `http://…` URL.
+    /// `lease_token` must match or exceed the current lease generation for the
+    /// partition (use `1` for the first write to an unregistered partition).
+    pub async fn push(
+        endpoint: impl Into<String>,
+        job_id: &str,
+        stage_id: &str,
+        partition_id: u32,
+        batches: Vec<RecordBatch>,
+        lease_token: u64,
+    ) -> io::Result<()> {
+        let raw = endpoint.into();
+        let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+            raw
+        } else {
+            format!("http://{raw}")
+        };
+
+        let channel = tonic::transport::Endpoint::from_shared(url)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+            .connect()
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
+
+        let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+
+        let ticket_text = format!("{job_id}/{stage_id}/{partition_id}");
+        let descriptor = FlightDescriptor {
+            r#type: arrow_flight::flight_descriptor::DescriptorType::Path as i32,
+            path: vec![ticket_text, lease_token.to_string()],
+            ..Default::default()
+        };
+
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| arrow::datatypes::SchemaRef::new(arrow::datatypes::Schema::empty()));
+
+        let batch_stream = futures::stream::iter(
+            batches.into_iter().map(Ok::<_, arrow_flight::error::FlightError>),
+        );
+        let encoder = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .with_flight_descriptor(Some(descriptor))
+            .with_options(IpcWriteOptions::default())
+            .build(batch_stream);
+        // do_put requires a plain Stream<Item=FlightData>; collect encoder output
+        // (already in memory) to satisfy the bound.
+        let flight_data: Vec<FlightData> = encoder
+            .try_collect()
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        client
+            .do_put(Request::new(futures::stream::iter(flight_data)))
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        Ok(())
     }
 }
 

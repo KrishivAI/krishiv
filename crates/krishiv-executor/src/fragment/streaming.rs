@@ -15,6 +15,9 @@ use krishiv_proto::ExecutorTaskAssignment;
 
 const STREAM_KAFKA_PARTITION_PREFIX: &str = "stream-kafka:";
 
+/// Fragment prefix for CEP sequential pattern execution — re-exported from `krishiv_plan`.
+const STREAM_CEP_PREFIX: &str = krishiv_plan::cep::STREAM_CEP_PREFIX;
+
 /// Fragment prefix for continuous window loop execution (GAP-6).
 ///
 /// Format: `stream:loop:<job_id>|<window_fragment>` where `<window_fragment>`
@@ -151,6 +154,180 @@ fn parse_stream_kafka_partitions(
     Ok(batches)
 }
 
+/// Wire format for a `stream:cep:` task fragment.
+#[derive(serde::Deserialize)]
+struct CepFragmentSpec {
+    key_column: String,
+    event_time_column: String,
+    stage_column: String,
+    pattern: krishiv_plan::cep::CompiledPattern,
+}
+
+/// Execute a `stream:cep:` fragment using [`PartitionedCepMatcher`] (GAP-10).
+///
+/// Reads input batches from the assignment, routes each row to the appropriate
+/// per-key matcher using the stage identified by `stage_column`, then collects
+/// and returns all completed pattern matches as concatenated `RecordBatch`es.
+fn execute_cep_fragment(
+    runner: &ExecutorTaskRunner,
+    assignment: &ExecutorTaskAssignment,
+    fragment: &str,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use arrow::array::{Array, Int64Array, StringArray};
+    use krishiv_plan::cep::PartitionedCepMatcher;
+
+    let payload = fragment
+        .strip_prefix(STREAM_CEP_PREFIX)
+        .ok_or_else(|| ExecutorError::InvalidAssignment {
+            message: format!(
+                "execute_cep_fragment called with wrong prefix; expected '{STREAM_CEP_PREFIX}', \
+                 got: {fragment}"
+            ),
+        })?;
+
+    let spec: CepFragmentSpec =
+        serde_json::from_str(payload).map_err(|e| ExecutorError::InvalidAssignment {
+            message: format!("stream:cep invalid JSON spec: {e}"),
+        })?;
+
+    let job_id = assignment.job_id().as_str();
+
+    // Collect input batches using the same priority order as the loop path.
+    let input_batches: Vec<arrow::record_batch::RecordBatch> =
+        if let Some(drainer) = runner.continuous_drainer.as_ref() {
+            drainer
+                .drain_job(job_id)
+                .map_err(|message| ExecutorError::LocalExecution { message })?
+        } else if let Some((_, pushed)) = runner.continuous_inputs.remove(job_id) {
+            pushed
+        } else {
+            let inmem = read_inmem_stream_batches(assignment.input_partitions());
+            if !inmem.is_empty() {
+                inmem
+            } else {
+                crate::fragment::common::read_inline_ipc_partitions(
+                    assignment.input_partitions(),
+                )?
+                .into_iter()
+                .flat_map(|(_, batches)| batches)
+                .collect()
+            }
+        };
+
+    let mut matcher = PartitionedCepMatcher::<String>::new(spec.pattern);
+    let mut matched_batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+
+    for batch in &input_batches {
+        let schema = batch.schema();
+
+        let key_idx =
+            schema
+                .index_of(&spec.key_column)
+                .map_err(|_| ExecutorError::InvalidAssignment {
+                    message: format!(
+                        "stream:cep key_column '{}' not found in schema",
+                        spec.key_column
+                    ),
+                })?;
+        let time_idx = schema.index_of(&spec.event_time_column).map_err(|_| {
+            ExecutorError::InvalidAssignment {
+                message: format!(
+                    "stream:cep event_time_column '{}' not found in schema",
+                    spec.event_time_column
+                ),
+            }
+        })?;
+        let stage_idx =
+            schema
+                .index_of(&spec.stage_column)
+                .map_err(|_| ExecutorError::InvalidAssignment {
+                    message: format!(
+                        "stream:cep stage_column '{}' not found in schema",
+                        spec.stage_column
+                    ),
+                })?;
+
+        let key_col =
+            batch
+                .column(key_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| ExecutorError::InvalidAssignment {
+                    message: format!(
+                        "stream:cep key_column '{}' must be Utf8",
+                        spec.key_column
+                    ),
+                })?;
+        let time_col =
+            batch
+                .column(time_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| ExecutorError::InvalidAssignment {
+                    message: format!(
+                        "stream:cep event_time_column '{}' must be Int64",
+                        spec.event_time_column
+                    ),
+                })?;
+        let stage_col =
+            batch
+                .column(stage_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| ExecutorError::InvalidAssignment {
+                    message: format!(
+                        "stream:cep stage_column '{}' must be Utf8",
+                        spec.stage_column
+                    ),
+                })?;
+
+        for row in 0..batch.num_rows() {
+            if key_col.is_null(row) || time_col.is_null(row) || stage_col.is_null(row) {
+                continue;
+            }
+            let key = key_col.value(row).to_owned();
+            let event_time_ms = time_col.value(row);
+            let stage_name = stage_col.value(row).to_owned();
+
+            let row_batch = batch.slice(row, 1);
+            let matches = matcher.process_event(key, &stage_name, row_batch, event_time_ms);
+
+            for stage_batches in matches {
+                // stage_batches is Vec<RecordBatch>, one per matched stage.
+                // Concatenate into a single batch representing one full match.
+                if stage_batches.is_empty() {
+                    continue;
+                }
+                let merged = arrow::compute::concat_batches(
+                    &stage_batches[0].schema(),
+                    &stage_batches,
+                )
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("stream:cep concat match stages: {e}"),
+                })?;
+                matched_batches.push(merged);
+            }
+        }
+    }
+
+    let total_rows: usize = matched_batches.iter().map(|b| b.num_rows()).sum();
+    let total_batches = matched_batches.len();
+    let column_count = matched_batches.first().map(|b| b.num_columns()).unwrap_or(0);
+
+    krishiv_metrics::global_metrics().set_streaming_rows(
+        job_id,
+        assignment.task_id().as_str(),
+        total_rows as u64,
+    );
+
+    Ok(ExecutorTaskOutput::streaming_window(
+        total_rows,
+        total_batches,
+        column_count,
+        matched_batches,
+    ))
+}
+
 /// Execute a `stream:loop:` fragment using `ContinuousWindowExecutor` (GAP-6).
 ///
 /// Creates or reuses a per-job stateful executor stored in
@@ -219,6 +396,9 @@ fn execute_loop_fragment(
         drainer
             .drain_job(job_id)
             .map_err(|message| ExecutorError::LocalExecution { message })?
+    } else if let Some((_, pushed)) = runner.continuous_inputs.remove(job_id) {
+        // Distributed path: consume batches that arrived via push_continuous_input gRPC.
+        pushed
     } else {
         crate::fragment::common::read_inline_ipc_partitions(assignment.input_partitions())?
             .into_iter()
@@ -339,6 +519,12 @@ pub(crate) async fn execute_streaming_fragment(
         ));
     }
 
+    // GAP-10: stream:cep: fragments use PartitionedCepMatcher for sequential
+    // pattern matching over keyed event streams.
+    if fragment.starts_with(STREAM_CEP_PREFIX) {
+        return execute_cep_fragment(runner, assignment, fragment);
+    }
+
     // GAP-6: stream:loop: fragments use a stateful ContinuousWindowExecutor
     // shared across drain cycles via runner.loop_executors.
     if fragment.starts_with(STREAM_LOOP_PREFIX) {
@@ -419,6 +605,12 @@ pub(crate) async fn execute_streaming_fragment(
         .first()
         .map(|b| b.num_columns())
         .unwrap_or(0);
+
+    krishiv_metrics::global_metrics().set_streaming_rows(
+        job_id,
+        assignment.task_id().as_str(),
+        total_rows as u64,
+    );
 
     let hot_key_reports = build_streaming_hot_key_reports(
         &collected_batches,

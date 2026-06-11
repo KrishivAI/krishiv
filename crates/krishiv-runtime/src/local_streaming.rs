@@ -17,6 +17,8 @@ pub enum LocalWindowKind {
     Tumbling,
     Sliding { slide_ms: u64 },
     Session { gap_ms: u64 },
+    /// Row-count based window: fires every `slide` rows, covers last `size` rows.
+    Count { size: u64, slide: u64 },
 }
 
 /// Specification for executing a keyed, windowed stream in-process.

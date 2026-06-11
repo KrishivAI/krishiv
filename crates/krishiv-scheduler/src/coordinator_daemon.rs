@@ -25,6 +25,7 @@ use crate::store::MetadataStore;
 use crate::{
     ClusterControlPlane, Coordinator, LeaderElection, SharedCoordinator, SingleNodeLeader,
     scheduler_metrics, serve_coordinator_executor_grpc_with_listener_and_tracker,
+    server_tls_config_from_env,
 };
 
 use crate::RocksDbMetadataStore;
@@ -227,10 +228,13 @@ pub async fn run_cluster_control_plane(
 
     let coordinator = ccp.shared_coordinator().clone();
     let in_flight = InFlightTracker::new();
+    let tls_config = server_tls_config_from_env()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let grpc_serve = serve_coordinator_executor_grpc_with_listener_and_tracker(
         listener,
         coordinator.clone(),
         in_flight.clone(),
+        tls_config,
     );
 
     tokio::select! {
@@ -897,10 +901,13 @@ fn configure_coordinator_grpc_auth(config: &CoordinatorDaemonConfig) -> bool {
             tracing::error!("{error}");
             return false;
         }
-        false
-    } else {
-        crate::auth::configure_grpc_auth_provider_from_env()
+        return false;
     }
+    // OIDC/JWKS JWT auth takes precedence over static bearer tokens.
+    if crate::auth::configure_jwt_auth_provider_from_env() {
+        return true;
+    }
+    crate::auth::configure_grpc_auth_provider_from_env()
 }
 
 fn parse_etcd_endpoints_env() -> Vec<String> {
@@ -984,10 +991,13 @@ pub async fn run_standalone_coordinator(
     tracing::info!(coordinator_id = %config.coordinator_id, addr = %listener.local_addr()?, "Krishiv coordinator gRPC listening");
 
     let in_flight = InFlightTracker::new();
+    let tls_config = server_tls_config_from_env()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let grpc_serve = serve_coordinator_executor_grpc_with_listener_and_tracker(
         listener,
         coordinator.clone(),
         in_flight.clone(),
+        tls_config,
     );
 
     tokio::select! {

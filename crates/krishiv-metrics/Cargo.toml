@@ -10,6 +10,8 @@ name = "krishiv_metrics"
 path = "src/lib.rs"
 
 [dependencies]
+http = { workspace = true }
+tower = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 opentelemetry-stdout = { workspace = true }

@@ -469,6 +469,140 @@ pub fn extract_auth_context(metadata: &tonic::metadata::MetadataMap) -> AuthCont
     AuthContext::Anonymous
 }
 
+// ── JWT / OIDC auth ───────────────────────────────────────────────────────────
+
+/// Env var naming the JWKS endpoint to fetch verification keys from.
+///
+/// Example: `https://accounts.google.com/.well-known/openid-configuration/jwks`
+pub const OIDC_JWKS_URI_ENV: &str = "KRISHIV_OIDC_JWKS_URI";
+
+/// JWT-based [`AuthProvider`] backed by OIDC JWKS key material.
+///
+/// Loads the JWKS endpoint at construction time, caches the decoded
+/// verification keys, and verifies incoming Bearer JWTs on every call to
+/// [`authenticate`](AuthProvider::authenticate).
+///
+/// Claims mapping:
+/// - `sub` → [`Principal::subject`]
+/// - `krishiv_role` (optional, fallback `"admin"`) → [`Principal::role`]
+///
+/// ## Usage
+///
+/// ```ignore
+/// if let Ok(provider) = JwtAuthProvider::from_env() {
+///     set_grpc_auth_provider(Arc::new(provider));
+/// }
+/// ```
+pub struct JwtAuthProvider {
+    keys: Vec<jsonwebtoken::DecodingKey>,
+    validation: jsonwebtoken::Validation,
+}
+
+#[derive(serde::Deserialize)]
+struct JwtClaims {
+    sub: String,
+    #[serde(default)]
+    krishiv_role: Option<String>,
+}
+
+impl JwtAuthProvider {
+    /// Load JWKS from `KRISHIV_OIDC_JWKS_URI` and build a provider.
+    ///
+    /// Returns `None` when the env var is absent (no OIDC configured).
+    /// Returns an error when the URI is set but cannot be fetched or parsed.
+    pub fn from_env() -> Option<Result<Self, Box<dyn std::error::Error + Send + Sync>>> {
+        let uri = std::env::var(OIDC_JWKS_URI_ENV).ok()?;
+        Some(Self::from_jwks_uri(&uri))
+    }
+
+    /// Fetch a JWKS endpoint and build a provider.
+    pub fn from_jwks_uri(
+        uri: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let body = reqwest::blocking::get(uri)?.text()?;
+        Self::from_jwks_json(&body)
+    }
+
+    /// Parse a JWKS JSON document (e.g. loaded from a local file) and build a provider.
+    pub fn from_jwks_json(
+        json: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_str(json)?;
+        let mut keys = Vec::new();
+        for jwk in &jwks.keys {
+            match jsonwebtoken::DecodingKey::from_jwk(jwk) {
+                Ok(key) => keys.push(key),
+                Err(e) => {
+                    tracing::warn!(error = %e, "skipping undecodable JWK");
+                }
+            }
+        }
+        if keys.is_empty() {
+            return Err("JWKS contained no usable verification keys".into());
+        }
+        let mut validation = jsonwebtoken::Validation::default();
+        // Disable audience and issuer validation so the provider works
+        // across OIDC providers without extra configuration.  Callers that
+        // need stricter validation should set the claims themselves.
+        validation.validate_aud = false;
+        Ok(Self { keys, validation })
+    }
+}
+
+impl AuthProvider for JwtAuthProvider {
+    fn authenticate(&self, api_key: &str) -> Option<Principal> {
+        let header = jsonwebtoken::decode_header(api_key).ok()?;
+        for key in &self.keys {
+            if let Ok(token_data) =
+                jsonwebtoken::decode::<JwtClaims>(api_key, key, &self.validation)
+            {
+                let role = match token_data
+                    .claims
+                    .krishiv_role
+                    .as_deref()
+                    .unwrap_or("admin")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "admin" => Role::Admin,
+                    "writer" | "write" => Role::Writer,
+                    "reader" | "read" => Role::Reader,
+                    _ => Role::Reader,
+                };
+                let _ = header; // consumed above
+                return Some(Principal {
+                    subject: token_data.claims.sub,
+                    role,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// Install OIDC JWKS auth if `KRISHIV_OIDC_JWKS_URI` is set.
+///
+/// Returns `true` when an OIDC provider was successfully installed.
+/// Returns `false` and logs a warning when the env var is set but the JWKS
+/// cannot be loaded (fail-open unless another provider is configured).
+pub fn configure_jwt_auth_provider_from_env() -> bool {
+    match JwtAuthProvider::from_env() {
+        None => false,
+        Some(Ok(provider)) => {
+            tracing::info!("OIDC JWKS JWT auth provider installed");
+            set_grpc_auth_provider(Arc::new(provider));
+            true
+        }
+        Some(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                "failed to load OIDC JWKS; JWT auth provider not installed"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

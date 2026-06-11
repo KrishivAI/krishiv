@@ -871,6 +871,26 @@ impl Session {
             .map_err(KrishivError::from)
     }
 
+    /// Register a Kafka topic as a streaming SQL table.
+    ///
+    /// After registration, the table is queryable as `SELECT * FROM "{name}"`.
+    /// The `schema` describes the expected Arrow schema for deserialized records.
+    /// Pass `group_id` to set the Kafka consumer group (defaults to `"krishiv-default"`
+    /// when empty).
+    #[cfg(feature = "kafka")]
+    pub fn register_kafka_source(
+        &self,
+        name: &str,
+        schema: arrow::datatypes::SchemaRef,
+        bootstrap_servers: impl Into<String>,
+        topic: impl Into<String>,
+        group_id: impl Into<String>,
+    ) -> Result<()> {
+        self.sql_engine
+            .register_kafka_source(name, schema, bootstrap_servers, topic, group_id)
+            .map_err(KrishivError::from)
+    }
+
     /// Asynchronously register a local Parquet path as a SQL table.
     pub async fn register_parquet_async(
         &self,
