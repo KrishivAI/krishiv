@@ -20,6 +20,7 @@ krishiv-state = { path = "../krishiv-state" }
 krishiv-dataflow = { path = "../krishiv-dataflow" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse", "hudi"] }
 krishiv-sql = { path = "../krishiv-sql" }
+parquet = { workspace = true }
 
 [features]
 kafka = ["krishiv-connectors/kafka"]
@@ -28,7 +29,6 @@ kafka = ["krishiv-connectors/kafka"]
 krishiv-common = { path = "../krishiv-common" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-flight-sql = { path = "../krishiv-flight-sql" }
-parquet = { workspace = true }
 tempfile = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }

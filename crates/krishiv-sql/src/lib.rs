@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use catalog::{InMemoryCatalog, datafusion_bridge::DataFusionCatalogBridge};
@@ -1143,6 +1144,34 @@ impl SqlEngine {
         Ok(())
     }
 
+    /// Create a DataFrame by reading a local CSV path directly.
+    pub async fn read_csv(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame> {
+        let path = path.as_ref().to_string_lossy().into_owned();
+        let dataframe = self
+            .context
+            .read_csv(path, datafusion::prelude::CsvReadOptions::new())
+            .await?;
+        Ok(SqlDataFrame::new(
+            "csv-read",
+            dataframe,
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        ))
+    }
+
+    /// Create a DataFrame by reading a local JSON/NDJSON path directly.
+    pub async fn read_json(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame> {
+        let path = path.as_ref().to_string_lossy().into_owned();
+        let dataframe = self
+            .context
+            .read_json(path, datafusion::prelude::JsonReadOptions::default())
+            .await?;
+        Ok(SqlDataFrame::new(
+            "json-read",
+            dataframe,
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        ))
+    }
+
     /// Read a local Delta table directory into a DataFrame.
     pub async fn read_delta(
         &self,
@@ -1524,6 +1553,59 @@ pub trait KrishivDataFrameOps: Send + Sync {
     fn query(&self) -> Option<&str>;
     /// Execute and return a record batch stream.
     async fn execute_stream(&self) -> SqlResult<SqlStream>;
+
+    // ── DataFrame transforms (lazy) ─────────────────────────────────────────
+
+    /// Return the Arrow schema of this DataFrame.
+    fn schema(&self) -> SchemaRef;
+
+    /// Select columns by name.
+    async fn select(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Filter rows by a SQL predicate expression.
+    async fn filter(&self, predicate: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Limit the number of rows.
+    async fn limit(&self, n: usize) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Remove duplicate rows.
+    async fn distinct(&self) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Sort by columns with optional descending flags.
+    async fn sort(&self, columns: &[&str], descending: &[bool]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Assign an alias (table name) to this DataFrame.
+    async fn alias(&self, alias: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Drop columns by name.
+    async fn drop_columns(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Rename a column from `old` to `new`.
+    async fn rename_column(&self, old: &str, new: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Add or replace a column with a computed expression.
+    async fn with_column(&self, name: &str, expr: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Return the underlying concrete type for downcasting.
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Compute summary statistics (delegates to DataFusion's `describe`).
+    async fn describe(&self) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Fill null values in `column` with the literal SQL `value`.
+    async fn fill_null(&self, column: &str, value: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Join with another DataFrame using a join type and equi-join keys.
+    async fn join(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+        how: &str,
+        left_on: &[&str],
+        right_on: &[&str],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Union this DataFrame with another (UNION ALL semantics).
+    async fn union(&self, right: &dyn KrishivDataFrameOps) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 }
 
 /// Recursively walk a DataFusion `LogicalPlan` and produce Krishiv `PlanNode`
@@ -1781,6 +1863,19 @@ impl SqlDataFrame {
         self.query.as_deref()
     }
 
+    /// Return a new `SqlDataFrame` with the given DataFusion DataFrame,
+    /// preserving the rest of this instance's state.  The new name suffix
+    /// helps distinguish transform steps in logical-plan descriptions.
+    fn with_new_dataframe(&self, df: DataFusionDataFrame, tag: &str) -> Self {
+        Self {
+            name: format!("{}-{}", self.name, tag),
+            query: None,
+            dataframe: df,
+            shuffle_partitions: self.shuffle_partitions,
+            table_row_counts: self.table_row_counts.clone(),
+        }
+    }
+
     /// Create a Krishiv logical plan wrapper for this DataFrame.
     ///
     /// Walks the DataFusion logical plan tree, creating Krishiv `PlanNode`
@@ -1922,6 +2017,140 @@ impl KrishivDataFrameOps for SqlDataFrame {
     }
     async fn execute_stream(&self) -> SqlResult<SqlStream> {
         SqlDataFrame::execute_stream(self).await
+    }
+
+    // ── DataFrame transforms ────────────────────────────────────────────────
+
+    fn schema(&self) -> SchemaRef {
+        SchemaRef::from(self.dataframe.schema().clone())
+    }
+
+    async fn select(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let df = self.dataframe.clone().select_columns(columns)?;
+        Ok(Box::new(self.with_new_dataframe(df, "select")))
+    }
+
+    async fn filter(&self, predicate: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let expr = self.dataframe.parse_sql_expr(predicate)?;
+        let df = self.dataframe.clone().filter(expr)?;
+        Ok(Box::new(self.with_new_dataframe(df, "filter")))
+    }
+
+    async fn limit(&self, n: usize) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let df = self.dataframe.clone().limit(0, Some(n))?;
+        Ok(Box::new(self.with_new_dataframe(df, "limit")))
+    }
+
+    async fn distinct(&self) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let df = self.dataframe.clone().distinct()?;
+        Ok(Box::new(self.with_new_dataframe(df, "distinct")))
+    }
+
+    async fn sort(&self, columns: &[&str], descending: &[bool]) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        use datafusion::logical_expr::SortExpr;
+        let exprs: Vec<SortExpr> = columns
+            .iter()
+            .zip(descending.iter())
+            .map(|(col_name, desc)| datafusion::logical_expr::col(*col_name).sort(!desc, *desc))
+            .collect();
+        let df = self.dataframe.clone().sort(exprs)?;
+        Ok(Box::new(self.with_new_dataframe(df, "sort")))
+    }
+
+    async fn alias(&self, alias: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let df = self.dataframe.clone().alias(alias)?;
+        Ok(Box::new(self.with_new_dataframe(df, "alias")))
+    }
+
+    async fn drop_columns(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let df = self.dataframe.clone().drop_columns(columns)?;
+        Ok(Box::new(self.with_new_dataframe(df, "drop")))
+    }
+
+    async fn rename_column(&self, old: &str, new: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let df = self.dataframe.clone().with_column_renamed(old, new)?;
+        Ok(Box::new(self.with_new_dataframe(df, "rename")))
+    }
+
+    async fn with_column(&self, name: &str, expr: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let parsed = self.dataframe.parse_sql_expr(expr)?;
+        let df = self.dataframe.clone().with_column(name, parsed)?;
+        Ok(Box::new(self.with_new_dataframe(df, "with_column")))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    async fn describe(&self) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let df = self.dataframe.clone().describe().await?;
+        Ok(Box::new(self.with_new_dataframe(df, "describe")))
+    }
+
+    async fn fill_null(&self, column: &str, value: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let expr = format!("COALESCE({column}, {value})");
+        let parsed = self.dataframe.parse_sql_expr(&expr)?;
+        let df = self.dataframe.clone().with_column(column, parsed)?;
+        Ok(Box::new(self.with_new_dataframe(df, "fill_null")))
+    }
+
+    async fn join(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+        how: &str,
+        left_on: &[&str],
+        right_on: &[&str],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let right_sql = right
+            .as_any()
+            .downcast_ref::<SqlDataFrame>()
+            .ok_or_else(|| SqlError::DataFusion {
+                message: "right DataFrame must be SqlDataFrame for join".into(),
+            })?;
+        use datafusion::common::JoinType;
+        let join_type = match how.to_lowercase().as_str() {
+            "inner" => JoinType::Inner,
+            "left" => JoinType::Left,
+            "right" => JoinType::Right,
+            "full" | "outer" => JoinType::Full,
+            "leftsemi" | "left_semi" => JoinType::LeftSemi,
+            "rightsemi" | "right_semi" => JoinType::RightSemi,
+            "leftanti" | "left_anti" => JoinType::LeftAnti,
+            "rightanti" | "right_anti" => JoinType::RightAnti,
+            _ => {
+                return Err(SqlError::DataFusion {
+                    message: format!("unsupported join type: {how}"),
+                })
+            }
+        };
+        let df = self
+            .dataframe
+            .clone()
+            .join(
+                right_sql.dataframe.clone(),
+                join_type,
+                left_on,
+                right_on,
+                None,
+            )?;
+        Ok(Box::new(self.with_new_dataframe(df, "join")))
+    }
+
+    async fn union(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let right_sql = right
+            .as_any()
+            .downcast_ref::<SqlDataFrame>()
+            .ok_or_else(|| SqlError::DataFusion {
+                message: "right DataFrame must be SqlDataFrame for union".into(),
+            })?;
+        let df = self
+            .dataframe
+            .clone()
+            .union(right_sql.dataframe.clone())?;
+        Ok(Box::new(self.with_new_dataframe(df, "union")))
     }
 }
 

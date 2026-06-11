@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arrow::array::Array;
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
@@ -390,6 +392,398 @@ impl DataFrame {
     fn update_job(&self, id: &JobId, name: &str, state: JobState) {
         let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
         jobs.upsert(JobStatus::new(id.clone(), name, state));
+    }
+
+    /// Clone this `DataFrame` without the SQL ops handle, preserving
+    /// all runtime state and pre-collected data.
+    fn clone_no_ops(&self) -> Self {
+        DataFrame {
+            logical_plan: self.logical_plan.clone(),
+            sql_dataframe: None,
+            sql_query: self.sql_query.clone(),
+            pre_collected: self.pre_collected.clone(),
+            mode: self.mode,
+            jobs: self.jobs.clone(),
+            next_job_id: self.next_job_id.clone(),
+            _coordinator_url: self._coordinator_url.clone(),
+            runtime: self.runtime.clone(),
+            registered_parquet: self.registered_parquet.clone(),
+            force_local: self.force_local,
+        }
+    }
+
+    /// Create a new `DataFrame` from a new inner ops object, preserving
+    /// runtime state from `self`.
+    fn with_new_ops(&self, new_ops: Box<dyn KrishivDataFrameOps>) -> Self {
+        let ops: Arc<dyn KrishivDataFrameOps> = Arc::from(new_ops);
+        let logical_plan = ops.krishiv_logical_plan();
+        DataFrame {
+            logical_plan,
+            sql_dataframe: Some(ops),
+            sql_query: None,
+            pre_collected: None,
+            mode: self.mode,
+            jobs: self.jobs.clone(),
+            next_job_id: self.next_job_id.clone(),
+            _coordinator_url: self._coordinator_url.clone(),
+            runtime: self.runtime.clone(),
+            registered_parquet: self.registered_parquet.clone(),
+            force_local: self.force_local,
+        }
+    }
+
+    // ── DataFrame transforms (lazy) ─────────────────────────────────────────
+
+    /// Return the Arrow schema of this DataFrame.
+    pub fn schema(&self) -> Result<SchemaRef> {
+        match (&self.sql_dataframe, &self.pre_collected) {
+            (Some(df), _) => Ok(df.schema()),
+            (_, Some(batches)) => {
+                if let Some(batch) = batches.first() {
+                    Ok(batch.schema())
+                } else {
+                    Err(KrishivError::unsupported(
+                        "cannot get schema from empty pre-collected DataFrame",
+                    ))
+                }
+            }
+            (None, None) => Err(KrishivError::unsupported(
+                "cannot get schema from logical-only DataFrame",
+            )),
+        }
+    }
+
+    /// Select columns by name.
+    pub fn select(&self, columns: &[&str]) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.select(columns))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => {
+                let msg = if self.pre_collected.is_some() {
+                    "select on pre-collected DataFrame is not yet supported; collect() first"
+                } else {
+                    "select requires an SQL-backed DataFrame"
+                };
+                Err(KrishivError::unsupported(msg))
+            }
+        }
+    }
+
+    /// Filter rows by a SQL predicate expression.
+    pub fn filter(&self, predicate: &str) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.filter(predicate))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "filter requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Alias for [`filter`].
+    pub fn r#where(&self, predicate: &str) -> Result<DataFrame> {
+        self.filter(predicate)
+    }
+
+    /// Limit the number of rows.
+    pub fn limit(&self, n: usize) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.limit(n))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "limit requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Remove duplicate rows.
+    pub fn distinct(&self) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.distinct())?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "distinct requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Sort by columns with ascending direction.
+    pub fn order_by(&self, columns: &[&str]) -> Result<DataFrame> {
+        let descending: Vec<bool> = vec![false; columns.len()];
+        self.sort(columns, &descending)
+    }
+
+    /// Sort by columns with explicit direction.
+    pub fn sort(&self, columns: &[&str], descending: &[bool]) -> Result<DataFrame> {
+        if columns.len() != descending.len() {
+            return Err(KrishivError::InvalidConfig {
+                message: "columns and descending must have the same length".into(),
+            });
+        }
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops =
+                    krishiv_common::async_util::block_on(df.sort(columns, descending))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "sort requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Assign an alias (table name) to this DataFrame.
+    pub fn alias(&self, alias: &str) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.alias(alias))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Ok(DataFrame {
+                ..self.clone_no_ops()
+            }),
+        }
+    }
+
+    /// Drop columns by name.
+    pub fn drop(&self, columns: &[&str]) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.drop_columns(columns))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "drop requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Rename a column.
+    pub fn rename(&self, old: &str, new: &str) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.rename_column(old, new))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "rename requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Add or replace a column with a computed expression (SQL-based).
+    pub fn with_column(&self, name: &str, expr: &str) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.with_column(name, expr))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "with_column requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Fill null values in a column with a literal value (uses COALESCE).
+    pub fn fill_null(&self, column: &str, value: &str) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops =
+                    krishiv_common::async_util::block_on(df.fill_null(column, value))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "fill_null requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Join with another DataFrame using equi-join keys.
+    ///
+    /// Both DataFrames must be SQL-backed (created via `sql()` or `read_parquet()`).
+    /// Supported join types: inner, left, right, full/outer, left_semi, right_semi,
+    /// left_anti, right_anti.
+    pub fn join(
+        &self,
+        right: &DataFrame,
+        how: &str,
+        left_on: &[&str],
+        right_on: &[&str],
+    ) -> Result<DataFrame> {
+        match (&self.sql_dataframe, &right.sql_dataframe) {
+            (Some(left), Some(right)) => {
+                let new_ops = krishiv_common::async_util::block_on(
+                    left.join(right.as_ref(), how, left_on, right_on),
+                )?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            _ => Err(KrishivError::unsupported(
+                "join requires both DataFrames to be SQL-backed",
+            )),
+        }
+    }
+
+    /// Union this DataFrame with another (UNION ALL semantics).
+    ///
+    /// Both DataFrames must be SQL-backed and have the same number of columns
+    /// with compatible types.
+    pub fn union(&self, right: &DataFrame) -> Result<DataFrame> {
+        match (&self.sql_dataframe, &right.sql_dataframe) {
+            (Some(left), Some(right)) => {
+                let new_ops =
+                    krishiv_common::async_util::block_on(left.union(right.as_ref()))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            _ => Err(KrishivError::unsupported(
+                "union requires both DataFrames to be SQL-backed",
+            )),
+        }
+    }
+
+    /// Print the first `num_rows` rows of this DataFrame to stdout.
+    pub fn show(&self, num_rows: usize) -> Result<String> {
+        let batches = krishiv_common::async_util::block_on({
+            let df = self.clone();
+            async move {
+                if let Some(batches) = &df.pre_collected {
+                    return Ok(batches.clone());
+                }
+                if let Some(ops) = &df.sql_dataframe {
+                    return ops.collect().await.map_err(Into::into);
+                }
+                Err(KrishivError::unsupported(
+                    "show requires an executable DataFrame",
+                ))
+            }
+        })?;
+        let display: Vec<_> = batches
+            .iter()
+            .flat_map(|b| (0..b.num_rows()).map(|i| b.slice(i, 1)))
+            .take(num_rows)
+            .collect();
+        let schema = batches.first().map(|b| b.schema());
+        let combined = if !display.is_empty() {
+            let schema = schema.unwrap();
+            let arrays: Vec<_> = (0..schema.fields().len())
+                .map(|col_idx| {
+                    let chunks: Vec<&dyn Array> = display
+                        .iter()
+                        .map(|b| b.column(col_idx).as_ref())
+                        .collect();
+                    arrow::compute::concat(&chunks).unwrap()
+                })
+                .collect();
+            vec![RecordBatch::try_new(schema, arrays).unwrap()]
+        } else {
+            vec![]
+        };
+        let text = arrow::util::pretty::pretty_format_batches(&combined)
+            .map_err(|e| KrishivError::Runtime {
+                message: e.to_string(),
+            })?;
+        Ok(text.to_string())
+    }
+
+    /// Return a DataFrame with summary statistics (count, null_count, mean, std, min, max, median).
+    pub fn describe(&self) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.describe())?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "describe requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    // ── Write API ────────────────────────────────────────────────────────────
+
+    /// Write the result of this DataFrame to a Parquet file.
+    pub fn write_parquet(&self, path: &str) -> Result<()> {
+        use std::fs::File;
+        use std::path::Path;
+
+        let result = krishiv_common::async_util::block_on(self.collect_async())?;
+        let batches = result.into_batches();
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let schema = batches[0].schema();
+        let file = File::create(Path::new(path)).map_err(|e| KrishivError::Runtime {
+            message: format!("failed to create parquet file '{path}': {e}"),
+        })?;
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, schema, None).map_err(|e| {
+                KrishivError::Runtime {
+                    message: format!("failed to create parquet writer: {e}"),
+                }
+            })?;
+        for batch in &batches {
+            writer.write(batch).map_err(|e| KrishivError::Runtime {
+                message: format!("failed to write parquet batch: {e}"),
+            })?;
+        }
+        writer.close().map_err(|e| KrishivError::Runtime {
+            message: format!("failed to close parquet writer: {e}"),
+        })?;
+        Ok(())
+    }
+
+    /// Write the result of this DataFrame to a CSV file.
+    pub fn write_csv(&self, path: &str) -> Result<()> {
+        use std::fs::File;
+        use std::path::Path;
+
+        let result = krishiv_common::async_util::block_on(self.collect_async())?;
+        let batches = result.into_batches();
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let file = File::create(Path::new(path)).map_err(|e| KrishivError::Runtime {
+            message: format!("failed to create csv file '{path}': {e}"),
+        })?;
+        let mut writer = arrow::csv::Writer::new(file);
+        for batch in &batches {
+            writer.write(batch).map_err(|e| KrishivError::Runtime {
+                message: format!("failed to write csv batch: {e}"),
+            })?;
+        }
+        let _ = writer.into_inner();
+        Ok(())
+    }
+
+    /// Write the result of this DataFrame to a JSON file (line-delimited JSON / NDJSON).
+    pub fn write_json(&self, path: &str) -> Result<()> {
+        use std::fs::File;
+        use std::path::Path;
+
+        let result = krishiv_common::async_util::block_on(self.collect_async())?;
+        let batches = result.into_batches();
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let file = File::create(Path::new(path)).map_err(|e| KrishivError::Runtime {
+            message: format!("failed to create json file '{path}': {e}"),
+        })?;
+        let mut writer = arrow::json::LineDelimitedWriter::new(file);
+        for batch in &batches {
+            writer.write(batch).map_err(|e| KrishivError::Runtime {
+                message: format!("failed to write json batch: {e}"),
+            })?;
+        }
+        writer.finish().map_err(|e| KrishivError::Runtime {
+            message: format!("failed to finalize json: {e}"),
+        })?;
+        Ok(())
     }
 
     /// Insert a hash-based exchange node into the logical plan. When backed

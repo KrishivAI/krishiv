@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 
+use arrow::array::Array;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
@@ -1278,6 +1279,100 @@ impl Session {
             self.state_ttl.map(|c| c.ttl_ms()),
             self.runtime.clone(),
         ))
+    }
+
+    // ── Catalog API ──────────────────────────────────────────────────────────
+
+    /// List registered table names.
+    pub fn list_tables(&self) -> Result<Vec<String>> {
+        let df = self.sql("SHOW TABLES")?;
+        let batches = krishiv_common::async_util::block_on(df.collect_async())?.into_batches();
+        let mut tables = Vec::new();
+        for batch in &batches {
+            let idx = batch
+                .schema()
+                .index_of("TableName")
+                .or_else(|_| batch.schema().index_of("table_name"))
+                .map_err(|_| KrishivError::Runtime {
+                    message: "SHOW TABLES result missing table_name column".into(),
+                })?;
+            let col = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .ok_or_else(|| KrishivError::Runtime {
+                    message: "SHOW TABLES table_name is not a string column".into(),
+                })?;
+            for i in 0..col.len() {
+                if let Some(name) = col.value(i).strip_prefix("_krishiv_parquet_") {
+                    tables.push(name.to_string());
+                } else {
+                    tables.push(col.value(i).to_string());
+                }
+            }
+        }
+        tables.sort();
+        tables.dedup();
+        Ok(tables)
+    }
+
+    /// Check if a table exists in the session.
+    pub fn table_exists(&self, name: &str) -> Result<bool> {
+        let names = self.list_tables()?;
+        Ok(names.iter().any(|n| n == name || format!("_krishiv_parquet_{name}") == *n))
+    }
+
+    /// Create a SQL view in the current session.
+    pub fn create_view(&self, name: &str, query: &str) -> Result<()> {
+        let sql = format!("CREATE VIEW {name} AS {query}");
+        let df = self.sql(&sql)?;
+        // CREATE VIEW returns no rows; we just need to execute it.
+        let _ = krishiv_common::async_util::block_on(df.collect_async())?;
+        Ok(())
+    }
+
+    /// Drop a table or view from the session.
+    pub fn drop_table(&self, name: &str) -> Result<()> {
+        let sql = format!("DROP TABLE {name}");
+        let df = self.sql(&sql)?;
+        let _ = krishiv_common::async_util::block_on(df.collect_async())?;
+        Ok(())
+    }
+
+    // ── File read API ────────────────────────────────────────────────────────
+
+    /// Create a DataFrame by reading a local CSV file.
+    pub fn read_csv(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
+        let path = path.as_ref().to_path_buf();
+        krishiv_common::async_util::block_on(self.read_csv_async(path))
+    }
+
+    /// Asynchronously create a DataFrame by reading a local CSV file.
+    pub async fn read_csv_async(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
+        let path = path.as_ref();
+        let sql_dataframe = self
+            .sql_engine
+            .read_csv(path)
+            .await
+            .map_err(KrishivError::from)?;
+        Ok(self.dataframe_from_sql(sql_dataframe))
+    }
+
+    /// Create a DataFrame by reading a local JSON/NDJSON file.
+    pub fn read_json(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
+        let path = path.as_ref().to_path_buf();
+        krishiv_common::async_util::block_on(self.read_json_async(path))
+    }
+
+    /// Asynchronously create a DataFrame by reading a local JSON/NDJSON file.
+    pub async fn read_json_async(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
+        let path = path.as_ref();
+        let sql_dataframe = self
+            .sql_engine
+            .read_json(path)
+            .await
+            .map_err(KrishivError::from)?;
+        Ok(self.dataframe_from_sql(sql_dataframe))
     }
 }
 

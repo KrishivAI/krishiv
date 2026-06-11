@@ -708,6 +708,23 @@ impl KrishivFlightSqlService {
                     .map_err(KrishivActionError::Status)?;
                 encode_batches_ipc(&batches)
             }
+            #[cfg(feature = "kafka")]
+            A::RegisterKafkaSource(body) => {
+                self.host
+                    .register_kafka_source(
+                        &body.name,
+                        &body.schema_ipc_b64,
+                        &body.bootstrap_servers,
+                        &body.topic,
+                        &body.group_id,
+                    )
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                Ok(Vec::new())
+            }
+            #[cfg(not(feature = "kafka"))]
+            A::RegisterKafkaSource(_) => Err(KrishivActionError::Other(
+                "Kafka support not enabled; rebuild with --features kafka".into(),
+            )),
         }
     }
 }

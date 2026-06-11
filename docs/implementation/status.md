@@ -1,5 +1,39 @@
 # Krishiv Implementation Status
 
+## Write API + Join/Union/Describe/FillNull (2026-06-11)
+
+### Done
+
+1. **Write API** — `DataFrame::write_parquet(path)` (uses `parquet::arrow::ArrowWriter`), `DataFrame::write_csv(path)` (uses `arrow::csv::Writer`), `DataFrame::write_json(path)` (uses `arrow::json::LineDelimitedWriter`). All collect then write. Requires `parquet` dependency in `krishiv-api`.
+
+2. **Join** — Added `join` to `KrishivDataFrameOps` trait + `SqlDataFrame` impl using DataFusion's `DataFrame::join()`. Supports inner, left, right, full/outer, left_semi, right_semi, left_anti, right_anti. API `DataFrame::join(right, how, left_on, right_on)` uses `as_any()` downcast to access underlying DataFusion DataFrames.
+
+3. **Union** — Added `union` to trait + `SqlDataFrame` impl via DataFusion `DataFrame::union()` (UNION ALL). API `DataFrame::union(right)` with same downcast pattern.
+
+4. **Describe** — Added `describe` to trait + `SqlDataFrame` impl via `DataFrame::describe().await`. Returns a new DataFrame with summary statistics (count, null_count, mean, std, min, max, median).
+
+5. **FillNull** — Added `fill_null` to trait + `SqlDataFrame` impl using `COALESCE(column, value)` expression with `with_column`. API `DataFrame::fill_null(column, value)`.
+
+6. **Dependency fix** — Added `csv`, `json` features to workspace arrow dep; moved `parquet` from dev-dependencies to main deps in `krishiv-api/Cargo.toml`.
+
+### Validation
+```bash
+cargo check -p krishiv-sql -p krishiv-api  # clean
+cargo check --tests -p krishiv-api         # tests compile clean
+cargo test -p krishiv-sql --lib            # 288 passed
+```
+
+### Next
+- Add `explain` format options (verbose/analyze mode)
+- Add `drop_null`, `sample`, `cross_join`
+- Add `fill_null` with column-list API (vectorised fill)
+- Add typed column references (expression builders) as alternative to string exprs
+- Add checkpoint/savepoint API for streaming
+- Add streaming SQL primitives (CTAS with streaming sources)
+- Add config API (set/get session properties)
+
+---
+
 ## Full Workspace Security & Correctness Audit (2026-06-11)
 
 ### Done

@@ -52,7 +52,7 @@ rust-version = "1.92"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "58.3.0", features = ["prettyprint", "ipc_compression"] }
+arrow = { version = "58.3.0", features = ["prettyprint", "ipc_compression", "csv", "json"] }
 arrow-flight = { version = "58.3.0", features = ["flight-sql-experimental"] }
 pyo3 = { version = "0.28.3" }
 iceberg = "0.9.1"
