@@ -78,9 +78,15 @@ impl TemporalJoinOperator {
     }
 
     /// Register or update a table version for a specific join key.
+    ///
+    /// `join_key` must be the same string value that appears in the join key
+    /// column(s) of stream batches. Internally the key is formatted with the
+    /// same type-prefixed encoding used by `build_join_key` (Utf8 → `"S{val}"`),
+    /// so lookups during `join()` are consistent.
     pub fn upsert_version(&mut self, join_key: &str, version_ms: i64, batch: RecordBatch) {
+        let formatted_key = format!("S{join_key}");
         self.keyed_state
-            .entry(join_key.to_owned())
+            .entry(formatted_key)
             .or_insert_with(|| VersionedTableState::new(self.lookback_ms))
             .upsert_version(version_ms, batch);
     }

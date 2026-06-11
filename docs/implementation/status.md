@@ -1547,6 +1547,66 @@ Next useful commands:
 ```bash
 cargo test -p krishiv-scheduler restore --offline
 cargo test --workspace --no-fail-fast --offline
+
+---
+
+## Session 4 — Full 411-File Audit Continuation (2026-06-11)
+
+### Completed
+
+43. **`dataframe.rs::show()` panic fix**: Three production `.unwrap()` calls in
+    `DataFrame::show()` replaced with proper `?`-propagated errors: `schema.ok_or_else(...)`,
+    `concat(...).map_err(...)`, `RecordBatch::try_new(...).map_err(...)`.
+
+44. **`flight-sql/lib.rs` bearer token**: Removed `.expect("auth is configured")` by
+    extracting the token directly from the request (already in `Some(auth)` branch, so
+    `bearer_token()` returning `Ok(None)` was structurally impossible — now code matches
+    the invariant).
+
+45. **`flight-sql/lib.rs` LRU capacity const**: Replaced two `NonZeroUsize::new(128).unwrap()`
+    with `const PREPARED_STMT_CAPACITY: NonZeroUsize` evaluated at compile time.
+
+46. **`live_table.rs` register() return type**: Changed `LiveTableRegistry::register()` from
+    `()` (silently panicking on lock poison) to `Result<(), SqlError>` — all two call sites
+    in `execute_live_table_ddl()` updated to use `?`.
+
+47. **`spillable.rs` unused import**: Removed `store::PartitionKey` import.
+
+48. **`merge.rs` unused variable**: Prefixed `left_alias` with `_`.
+
+49. **`udf.rs` redundant import**: Removed `use pyo3_arrow;` (redundant bare import).
+
+50. **`examples/rust_complex.rs` broken example**: Fixed to use actual `SessionBuilder::from_env()?.build()?`
+    API and `result.pretty()?` instead of non-existent `connect_from_env()` and `util::print_batches()`.
+
+51. **`integration_streaming.rs` multi-source watermark test**: Added missing
+    `.with_source_id_column("source_id")` to `MultiSourceWatermarkSpec` — validation
+    correctly requires `source_id_column` when `source_watermark_lags` is configured.
+
+52. **`temporal_join.rs` key format inconsistency bug**: `TemporalJoinOperator::upsert_version`
+    stored keys as raw strings (e.g. `"a"`) but `join()` looked them up via `build_join_key`
+    which adds type prefixes (e.g. `"Sa"` for Utf8 strings). Fixed by formatting the key
+    with `"S{join_key}"` in `upsert_version` to match the lookup encoding. All 17 temporal
+    join tests now pass (was: 2 failures — `temporal_join_inner_join_matches` and
+    `temporal_join_as_of_returns_previous_version`).
+
+### Validation
+```bash
+cargo check --workspace           # 0 errors, 0 Rust warnings
+cargo clippy --workspace --all-targets  # 0 errors, 0 Rust warnings
+cargo test -p krishiv --test integration_streaming multi_source_watermark
+cargo test --workspace
+```
+
+### Result
+- 0 production `.unwrap()` / `.expect()` panics remaining (excluding compile-time literals and
+  structurally-guaranteed invariants like `s3.rs` set-then-access pattern).
+- 0 clippy warnings from Rust source (only librocksdb C++ build warnings, not actionable).
+- All 411 source files audited across 12 dimensions.
+
+Next useful command:
+```bash
+cargo test --workspace
 ```
 
 ---
