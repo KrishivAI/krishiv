@@ -99,6 +99,7 @@ impl KrishivJobReconciler {
             return;
         }
         let Ok(mut guard) = self.dedicated_loops.lock() else {
+            tracing::warn!(job_id = %job_id, "dedicated_loops mutex poisoned; skipping dedup insert");
             return;
         };
         guard.insert(job_id.clone());

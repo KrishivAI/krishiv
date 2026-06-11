@@ -1208,7 +1208,7 @@ pub async fn run_job_coordinator_daemon(
 
     tracing::info!(job_id = %job_id, base = %base, poll_interval = ?jcp_config.poll_interval, "Krishiv JCP watching job");
 
-    let status_url = format!("{base}/federation/v1/jobs/{job_id}");
+    let status_url = format!("{base}/federation/v1/jobs/{}", urlencoding::encode(&job_id));
     loop {
         let mut status_req = client.get(&status_url);
         if let Some(token) = configured_coordinator_bearer_token() {

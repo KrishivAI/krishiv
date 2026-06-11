@@ -61,28 +61,25 @@ impl LiveTableRegistry {
             .expect("LiveTableRegistry write lock poisoned");
     }
 
-    pub fn remove_table(&self, name: &str) -> bool {
-        let mut tables = self
-            .tables
-            .write()
-            .expect("LiveTableRegistry write lock poisoned");
-        tables.remove(name).is_some()
+    pub fn remove_table(&self, name: &str) -> SqlResult<bool> {
+        let mut tables = self.tables.write().map_err(|_| SqlError::DataFusion {
+            message: "live table registry lock poisoned".into(),
+        })?;
+        Ok(tables.remove(name).is_some())
     }
 
-    pub fn contains(&self, name: &str) -> bool {
-        let tables = self
-            .tables
-            .read()
-            .expect("LiveTableRegistry read lock poisoned");
-        tables.contains_key(name)
+    pub fn contains(&self, name: &str) -> SqlResult<bool> {
+        let tables = self.tables.read().map_err(|_| SqlError::DataFusion {
+            message: "live table registry lock poisoned".into(),
+        })?;
+        Ok(tables.contains_key(name))
     }
 
-    pub fn query(&self, name: &str) -> Option<String> {
-        let tables = self
-            .tables
-            .read()
-            .expect("LiveTableRegistry read lock poisoned");
-        tables.get(name).cloned()
+    pub fn query(&self, name: &str) -> SqlResult<Option<String>> {
+        let tables = self.tables.read().map_err(|_| SqlError::DataFusion {
+            message: "live table registry lock poisoned".into(),
+        })?;
+        Ok(tables.get(name).cloned())
     }
 }
 
@@ -213,10 +210,10 @@ pub fn execute_live_table_ddl(
             registry.register(name.clone(), query.clone());
         }
         LiveTableStatement::Drop { name } => {
-            registry.remove_table(name);
+            registry.remove_table(name)?;
         }
         LiveTableStatement::Refresh { name } => {
-            let Some(query) = registry.query(name) else {
+            let Some(query) = registry.query(name)? else {
                 return Err(SqlError::Unsupported {
                     feature: format!("REFRESH LIVE TABLE {name}: table is not registered"),
                 });
@@ -271,9 +268,9 @@ mod tests {
     fn registry_register_and_drop() {
         let reg = LiveTableRegistry::new();
         reg.register("v", "SELECT 1");
-        assert!(reg.contains("v"));
-        reg.remove_table("v");
-        assert!(!reg.contains("v"));
+        assert!(reg.contains("v").unwrap());
+        reg.remove_table("v").unwrap();
+        assert!(!reg.contains("v").unwrap());
     }
 
     // ── execute_live_table_ddl integration ────────────────────────────────────
@@ -291,11 +288,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            registry.contains("summary"),
+            registry.contains("summary").unwrap(),
             "registry must contain the created live table"
         );
         assert_eq!(
-            registry.query("summary"),
+            registry.query("summary").unwrap(),
             Some("SELECT id, SUM(val) FROM events GROUP BY id".to_string()),
             "registry must store the backing query"
         );
@@ -310,11 +307,11 @@ mod tests {
     fn execute_live_table_ddl_drop_removes_from_registry() {
         let registry = LiveTableRegistry::new();
         execute_live_table_ddl(&registry, "CREATE LIVE TABLE to_drop AS SELECT 1 AS n").unwrap();
-        assert!(registry.contains("to_drop"));
+        assert!(registry.contains("to_drop").unwrap());
 
         execute_live_table_ddl(&registry, "DROP LIVE TABLE to_drop").unwrap();
         assert!(
-            !registry.contains("to_drop"),
+            !registry.contains("to_drop").unwrap(),
             "dropped table must be removed from registry"
         );
     }

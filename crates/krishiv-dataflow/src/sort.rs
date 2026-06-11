@@ -209,24 +209,33 @@ fn scalar_at(arr: &dyn arrow::array::Array, row: usize) -> ExecResult<ScalarVal>
     if arr.is_null(row) {
         return Ok(ScalarVal::Null);
     }
+    let downcast_err = |dt: &DataType| {
+        ExecError::Arrow(format!("sort: downcast failed for type {dt}"))
+    };
     match arr.data_type() {
         DataType::Int32 => Ok(ScalarVal::Int32(
-            arr.as_any().downcast_ref::<Int32Array>().unwrap().value(row),
+            arr.as_any().downcast_ref::<Int32Array>()
+                .ok_or_else(|| downcast_err(&DataType::Int32))?.value(row),
         )),
         DataType::Int64 => Ok(ScalarVal::Int64(
-            arr.as_any().downcast_ref::<Int64Array>().unwrap().value(row),
+            arr.as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| downcast_err(&DataType::Int64))?.value(row),
         )),
         DataType::Float64 => Ok(ScalarVal::Float64(
-            arr.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
+            arr.as_any().downcast_ref::<Float64Array>()
+                .ok_or_else(|| downcast_err(&DataType::Float64))?.value(row),
         )),
         DataType::Utf8 => Ok(ScalarVal::Utf8(
-            arr.as_any().downcast_ref::<StringArray>().unwrap().value(row).to_owned(),
+            arr.as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| downcast_err(&DataType::Utf8))?.value(row).to_owned(),
         )),
         DataType::Boolean => Ok(ScalarVal::Bool(
-            arr.as_any().downcast_ref::<BooleanArray>().unwrap().value(row),
+            arr.as_any().downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err(&DataType::Boolean))?.value(row),
         )),
         DataType::UInt32 => Ok(ScalarVal::UInt32(
-            arr.as_any().downcast_ref::<UInt32Array>().unwrap().value(row),
+            arr.as_any().downcast_ref::<UInt32Array>()
+                .ok_or_else(|| downcast_err(&DataType::UInt32))?.value(row),
         )),
         dt => Err(ExecError::UnsupportedType(format!("sort: unsupported type {dt}"))),
     }
@@ -287,14 +296,17 @@ fn scatter_column(
 ) -> ExecResult<ArrayRef> {
     use arrow::array::*;
     macro_rules! scatter_prim {
-        ($ty:ty, $build:ty, $cast:path) => {{
+        ($ty:ty, $build:ty, $cast:path, $dt:expr) => {{
             let mut b = <$build>::with_capacity(total);
             for &(bi, ri) in order {
                 let arr = inputs[bi].column(col_idx);
                 if arr.is_null(ri) {
                     b.append_null();
                 } else {
-                    b.append_value($cast(arr.as_any().downcast_ref::<$ty>().unwrap().value(ri)));
+                    let typed = arr.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+                        ExecError::Arrow(format!("sort scatter: downcast failed for type {}", $dt))
+                    })?;
+                    b.append_value($cast(typed.value(ri)));
                 }
             }
             Arc::new(b.finish()) as ArrayRef
@@ -302,11 +314,11 @@ fn scatter_column(
     }
 
     let result: ArrayRef = match dt {
-        DataType::Int32 => scatter_prim!(Int32Array, Int32Builder, std::convert::identity),
-        DataType::Int64 => scatter_prim!(Int64Array, Int64Builder, std::convert::identity),
-        DataType::Float64 => scatter_prim!(Float64Array, Float64Builder, std::convert::identity),
-        DataType::UInt32 => scatter_prim!(UInt32Array, UInt32Builder, std::convert::identity),
-        DataType::Boolean => scatter_prim!(BooleanArray, BooleanBuilder, std::convert::identity),
+        DataType::Int32 => scatter_prim!(Int32Array, Int32Builder, std::convert::identity, "Int32"),
+        DataType::Int64 => scatter_prim!(Int64Array, Int64Builder, std::convert::identity, "Int64"),
+        DataType::Float64 => scatter_prim!(Float64Array, Float64Builder, std::convert::identity, "Float64"),
+        DataType::UInt32 => scatter_prim!(UInt32Array, UInt32Builder, std::convert::identity, "UInt32"),
+        DataType::Boolean => scatter_prim!(BooleanArray, BooleanBuilder, std::convert::identity, "Boolean"),
         DataType::Utf8 => {
             let mut b = StringBuilder::with_capacity(total, total * 8);
             for &(bi, ri) in order {
@@ -314,7 +326,10 @@ fn scatter_column(
                 if arr.is_null(ri) {
                     b.append_null();
                 } else {
-                    b.append_value(arr.as_any().downcast_ref::<StringArray>().unwrap().value(ri));
+                    let typed = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                        ExecError::Arrow("sort scatter: downcast failed for type Utf8".to_string())
+                    })?;
+                    b.append_value(typed.value(ri));
                 }
             }
             Arc::new(b.finish()) as ArrayRef

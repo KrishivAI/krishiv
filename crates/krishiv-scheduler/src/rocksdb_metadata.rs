@@ -233,7 +233,7 @@ impl MetadataStore for RocksDbMetadataStore {
         job_id: &str,
         snapshot: ContinuousSnapshot,
     ) -> SchedulerResult<()> {
-        let encoded = snapshot.encode();
+        let encoded = snapshot.encode()?;
         let cf = self
             .db
             .cf_handle(CF_CONTINUOUS)

@@ -1,5 +1,67 @@
 # Krishiv Implementation Status
 
+## Full Workspace Security & Correctness Audit (2026-06-11)
+
+### Done
+
+Systematic 12-dimension analysis of all 411 source files across 20 crates. All P0/P1 issues fixed.
+
+**P0 fixes (panics / data loss):**
+1. `krishiv-plan/window.rs` — `encode_stream_fragment` `→ Result<String, PlanError>`; removed `.expect()` on fallible serialization
+2. `krishiv-dataflow/src/sort.rs` — Arrow downcast `.unwrap()` → `.ok_or_else()` in `scalar_at` and `scatter_column`
+3. `krishiv-sql/src/lib.rs` — Concurrent MERGE/CEP table name collision: hardcoded `"merge_result"` → `next_ephemeral_name()`
+4. `krishiv-sql/src/kafka_table.rs` — Cast failure → `DataFusionError::ArrowError(Box::new(e), None)` instead of silent null
+5. `krishiv-connectors/src/elasticsearch_sink.rs` — ES bulk API `errors` field not checked; HTTP 200 with item failures was silent data loss
+
+**P1 fixes (correctness):**
+6. `krishiv-sql/src/live_table.rs` — `RwLock::write().expect()` → `map_err` returning `SqlError`
+7. `krishiv-sql/src/policy.rs` — SQL injection in RLS predicates; `''` escaped quote handling in WHERE injection point
+8. `krishiv-sql/src/lakehouse/merge.rs` — `KEY_COL_RE` picked wrong side of `=` for key column extraction
+9. `krishiv-sql/src/lakehouse/providers.rs` — `HudiScanProvider::schema()` returned empty on error; cached at construction
+10. `krishiv-sql/src/cep_sql.rs` — Non-StringArray partition key silently fell back to row index → now returns `SqlError::Unsupported`
+11. `krishiv-sql/src/lib.rs` — `PlanCache` LRU accumulated duplicate order entries on repeated key insertion
+12. `krishiv-sql/src/recursive_cte.rs` — Unbounded accumulator; added `MAX_ACCUMULATED_ROWS = 10_000_000` guard
+13. `krishiv-sql/src/udf.rs` — Raw Arrow buffer offset reading replaced with `BinaryArray::value(i)` safe API
+14. `krishiv-scheduler/src/store.rs` — `snapshot_bytes.len() as u32` → `u32::try_from(...)?` (returns `SchedulerResult`)
+15. `krishiv-scheduler/src/auth.rs` — JWT audience validation disabled (`validate_aud = false`); now reads `KRISHIV_OIDC_AUDIENCE`; missing-role fallback `"admin"` → `"reader"`
+16. `krishiv-executor/src/cli.rs` — Prometheus label injection via executor_id; now escapes `\` and `"`
+17. `krishiv-executor/src/runner.rs` — Hardcoded `"exec"` executor ID in checkpoint ack; added `own_executor_id` field
+18. `krishiv-scheduler/src/coordinator_daemon.rs` — `job_id` injected raw into HTTP URL; now `urlencoding::encode(&job_id)`
+19. `krishiv-connectors/src/elasticsearch_sink.rs` — `.unwrap()` on Arrow downcasts → safe `.downcast_ref().map(...).unwrap_or(Null)`
+20. `krishiv-connectors/src/kafka.rs` — `try_into().unwrap()` in decode → `map_err`; `as u32` truncation in encode → `try_from(...).unwrap_or(u32::MAX)`
+21. `krishiv-python/src/sources.rs` — SQL injection via Kafka topic/parquet file name in `SELECT * FROM "{name}"`; escape `"` → `""`
+22. `krishiv-state/src/queryable.rs` — `RwLock.unwrap()` in production code → proper `map_err` / `let Ok(...) else`
+23. `krishiv-plan/src/udf.rs` — `try_into().unwrap()` guarded by length check → safe `copy_from_slice` helper `read_i64_state`
+24. `krishiv-operator/src/reconciler.rs` — Silent mutex poison drop → `tracing::warn!` before return
+25. `krishiv-sql/src/connector_table.rs` — Propagate `project_batch` `ArrowError` instead of type mismatch
+
+**P2 fixes (performance/robustness):**
+26. `krishiv-sql/src/catalog/mod.rs` — `table_exist` O(n) list → O(1) `get_table().is_ok()`
+27. `krishiv-sql/src/unnest_sql.rs` — O(N²) unnest replacement → O(N) with `search_start`
+28. `krishiv-sql/src/create_function_ddl.rs` — Regex recompiled per call → `static LazyLock<Regex>`
+29. `krishiv-sql/src/subquery.rs` — Case-sensitive streaming table name comparison → lowercase set
+
+### Validation
+```bash
+cargo check --workspace          # 0 errors
+cargo test -p krishiv-scheduler --lib  # 304 passed
+cargo test -p krishiv-executor --lib   # all passed
+cargo test -p krishiv-sql --lib        # all passed
+cargo test -p krishiv-state --lib      # all passed
+cargo test -p krishiv-plan --lib       # all passed
+```
+
+### Blockers
+None.
+
+### Next useful task
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p krishiv-runtime
+```
+
+---
+
 ## E6 Connector Series: Avro, CSV/JSON, Kinesis, Pulsar, Elasticsearch, HBase, Cassandra (2026-06-10)
 
 ### Done

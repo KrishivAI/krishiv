@@ -172,6 +172,11 @@ pub fn validate_no_streaming_subqueries(
         return Ok(());
     }
 
+    // Normalize to lowercase for case-insensitive matching against the SQL
+    // identifier names produced by extract_table_names_from_query.
+    let lower_tables: HashSet<String> =
+        streaming_tables.iter().map(|s| s.to_lowercase()).collect();
+
     let dialect = GenericDialect {};
     let stmts = match Parser::parse_sql(&dialect, sql) {
         Ok(s) => s,
@@ -188,7 +193,7 @@ pub fn validate_no_streaming_subqueries(
                 for s in &inner_stmts {
                     if let Statement::Query(iq) = s {
                         let names = extract_table_names_from_query(iq);
-                        if names.iter().any(|t| streaming_tables.contains(t)) {
+                        if names.iter().any(|t| lower_tables.contains(t)) {
                             return Err(SqlError::Unsupported {
                                 feature: "correlated subquery over a streaming (unbounded) table \
                                           is not supported; use a streaming join or MATCH_RECOGNIZE \

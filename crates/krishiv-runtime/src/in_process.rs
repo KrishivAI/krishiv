@@ -164,6 +164,7 @@ impl InProcessStreamingRuntime {
         let drainer = Arc::new(RegistryDrainer(Arc::clone(&registry)));
         let runner = Arc::new(
             ExecutorTaskRunner::new(inbox.clone())
+                .with_executor_id(executor_id.clone())
                 .with_continuous_drainer(drainer)
                 .with_shared_parquet_cache(parquet_cache),
         );

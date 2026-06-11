@@ -33,7 +33,7 @@ impl crate::Offset for KafkaOffset {
     /// Encode as: `topic_len:u32 LE | topic_bytes | partition:i32 LE | offset:i64 LE`.
     fn encode(&self) -> Vec<u8> {
         let topic_bytes = self.topic.as_bytes();
-        let topic_len = topic_bytes.len() as u32;
+        let topic_len = u32::try_from(topic_bytes.len()).unwrap_or(u32::MAX);
         let mut out = Vec::with_capacity(4 + topic_bytes.len() + 4 + 8);
         out.extend_from_slice(&topic_len.to_le_bytes());
         out.extend_from_slice(topic_bytes);
@@ -48,7 +48,9 @@ impl crate::Offset for KafkaOffset {
                 message: "KafkaOffset decode: buffer too short for topic_len".into(),
             });
         }
-        let topic_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let topic_len = u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| ConnectorError::Offset {
+            message: "KafkaOffset decode: slice length mismatch for topic_len".into(),
+        })?) as usize;
         let topic_end = 4usize
             .checked_add(topic_len)
             .ok_or_else(|| ConnectorError::Offset {
@@ -72,9 +74,21 @@ impl crate::Offset for KafkaOffset {
                 message: format!("KafkaOffset decode: invalid UTF-8 in topic: {e}"),
             })?
             .to_string();
-        let partition = i32::from_le_bytes(bytes[topic_end..topic_end + 4].try_into().unwrap());
+        let partition = i32::from_le_bytes(
+            bytes[topic_end..topic_end + 4]
+                .try_into()
+                .map_err(|_| ConnectorError::Offset {
+                    message: "KafkaOffset decode: slice length mismatch for partition".into(),
+                })?,
+        );
         let offset_start = topic_end + 4;
-        let offset = i64::from_le_bytes(bytes[offset_start..offset_start + 8].try_into().unwrap());
+        let offset = i64::from_le_bytes(
+            bytes[offset_start..offset_start + 8]
+                .try_into()
+                .map_err(|_| ConnectorError::Offset {
+                    message: "KafkaOffset decode: slice length mismatch for offset".into(),
+                })?,
+        );
         Ok(KafkaOffset {
             topic,
             partition,
@@ -111,12 +125,12 @@ impl MultiKafkaOffset {
 
 impl crate::Offset for MultiKafkaOffset {
     fn encode(&self) -> Vec<u8> {
-        let count = self.offsets.len() as u32;
+        let count = u32::try_from(self.offsets.len()).unwrap_or(u32::MAX);
         let mut out = Vec::new();
         out.extend_from_slice(&count.to_le_bytes());
         for ko in &self.offsets {
             let item_bytes = ko.encode();
-            let item_len = item_bytes.len() as u32;
+            let item_len = u32::try_from(item_bytes.len()).unwrap_or(u32::MAX);
             out.extend_from_slice(&item_len.to_le_bytes());
             out.extend_from_slice(&item_bytes);
         }
@@ -129,7 +143,13 @@ impl crate::Offset for MultiKafkaOffset {
                 message: "MultiKafkaOffset decode: buffer too short for count".into(),
             });
         }
-        let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(
+            bytes[0..4]
+                .try_into()
+                .map_err(|_| ConnectorError::Offset {
+                    message: "MultiKafkaOffset decode: slice length mismatch for count".into(),
+                })?,
+        ) as usize;
         let mut pos = 4usize;
         let mut offsets = Vec::with_capacity(count);
         for i in 0..count {
@@ -140,7 +160,15 @@ impl crate::Offset for MultiKafkaOffset {
                     ),
                 });
             }
-            let item_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            let item_len = u32::from_le_bytes(
+                bytes[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| ConnectorError::Offset {
+                        message: format!(
+                            "MultiKafkaOffset decode: slice length mismatch for entry {i} length"
+                        ),
+                    })?,
+            ) as usize;
             pos += 4;
             if pos + item_len > bytes.len() {
                 return Err(ConnectorError::Offset {

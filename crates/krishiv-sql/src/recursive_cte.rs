@@ -166,6 +166,10 @@ where
     E: FnMut(&str) -> SqlResult<Vec<RecordBatch>>,
     R: FnMut(&str, &[RecordBatch]) -> SqlResult<()>,
 {
+    // Hard row cap to prevent divergent recursive CTEs from consuming unbounded
+    // memory while appearing to respect max_iterations.
+    const MAX_ACCUMULATED_ROWS: usize = 10_000_000;
+
     // Seed: execute the base query.
     let base_batches = execute_fn(&stmt.base_query)?;
     let mut accumulator = base_batches;
@@ -177,6 +181,15 @@ where
         if iterations >= stmt.max_iterations {
             hit_limit = true;
             break;
+        }
+
+        let acc_rows: usize = accumulator.iter().map(|b| b.num_rows()).sum();
+        if acc_rows >= MAX_ACCUMULATED_ROWS {
+            return Err(SqlError::Unsupported {
+                feature: format!(
+                    "WITH RECURSIVE: accumulated row count ({acc_rows}) exceeded limit of {MAX_ACCUMULATED_ROWS}"
+                ),
+            });
         }
 
         // Register the current accumulator so the recursive branch can reference it.

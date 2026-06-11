@@ -186,9 +186,18 @@ fn apply_row_predicates(
     table_names: &[String],
     policy: &dyn PolicyHook,
 ) -> String {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
     let preds: Vec<String> = table_names
         .iter()
         .filter_map(|t| policy.row_predicate(principal, t))
+        .filter(|pred| {
+            // Validate that the predicate is a well-formed SQL expression to
+            // guard against SQL injection from misconfigured policy stores.
+            let probe = format!("SELECT 1 WHERE {pred}");
+            Parser::parse_sql(&GenericDialect {}, &probe).is_ok()
+        })
         .collect();
     if preds.is_empty() || !is_select_query(query) {
         return query.to_string();
@@ -248,7 +257,14 @@ fn find_where_injection_point(query: &str) -> Option<(String, String)> {
         match chars[i] {
             '(' if !in_single_quote && !in_double_quote => depth += 1,
             ')' if !in_single_quote && !in_double_quote => depth -= 1,
-            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            '\'' if !in_double_quote => {
+                if in_single_quote && chars.get(i + 1) == Some(&'\'') {
+                    // SQL escaped quote ('') inside a string — skip both chars.
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = !in_single_quote;
+            }
             '"' if !in_single_quote => in_double_quote = !in_double_quote,
             _ => {}
         }

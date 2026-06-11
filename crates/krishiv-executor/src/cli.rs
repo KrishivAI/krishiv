@@ -106,14 +106,19 @@ fn executor_http_router(executor_id: String, slots: usize) -> Router {
 }
 
 async fn executor_metrics(executor_id: String, slots: usize) -> impl IntoResponse {
+    // Sanitize the label value: Prometheus text format uses `"` as the label
+    // value delimiter, so any embedded quote or backslash must be escaped.
+    // A malicious executor_id like `"} 0\nexec{x="` would otherwise inject
+    // extra metric lines into the scrape output.
+    let safe_id = executor_id.replace('\\', "\\\\").replace('"', "\\\"");
     let body = format!(
         "\
 # HELP krishiv_executor_up Executor process is running
 # TYPE krishiv_executor_up gauge
-krishiv_executor_up{{executor_id=\"{executor_id}\"}} 1
+krishiv_executor_up{{executor_id=\"{safe_id}\"}} 1
 # HELP krishiv_executor_slots_total Total task slots configured
 # TYPE krishiv_executor_slots_total gauge
-krishiv_executor_slots_total{{executor_id=\"{executor_id}\"}} {slots}
+krishiv_executor_slots_total{{executor_id=\"{safe_id}\"}} {slots}
 "
     );
     (
@@ -335,6 +340,7 @@ async fn heartbeat_loop(
         .with_barrier_ack_registry(barrier_ack_registry)
         .with_key_group_ranges(key_group_ranges)
         .with_running_attempts(running_attempts)
+        .with_executor_id(runtime.config().executor_id().clone())
         .with_udf_limits(krishiv_plan::udf::ResourceLimits::default())
         .with_shared_loop_executors(shared_loop_executors)
         .with_shared_continuous_inputs(shared_continuous_inputs);

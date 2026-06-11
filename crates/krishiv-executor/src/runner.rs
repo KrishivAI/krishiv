@@ -781,6 +781,11 @@ pub struct ExecutorTaskRunner {
     /// and distributed-durable profiles). Each continuous job gets a sub-directory
     /// `<state_dir>/<job_id>/`. `None` → ephemeral (dev-local) state.
     pub(crate) state_dir: Option<std::path::PathBuf>,
+
+    /// This executor's own ID, used when synthesising checkpoint-ack assignments
+    /// so the coordinator can correlate them with the registered executor.
+    /// `None` in unit-test runners where no real executor identity is needed.
+    pub(crate) own_executor_id: Option<krishiv_proto::ExecutorId>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -844,6 +849,7 @@ impl ExecutorTaskRunner {
             progress_callback: Arc::new(NoOpProgressCallback),
             registered_parquet_cache: Arc::new(DashMap::new()),
             state_dir: None,
+            own_executor_id: None,
         }
     }
 
@@ -961,6 +967,13 @@ impl ExecutorTaskRunner {
         running_attempts: Arc<DashMap<String, TaskAttemptRef>>,
     ) -> Self {
         self.running_attempts = Some(running_attempts);
+        self
+    }
+
+    /// Set the executor's own identity so checkpoint-ack RPCs carry the real
+    /// executor ID rather than a synthetic placeholder.
+    pub fn with_executor_id(mut self, id: krishiv_proto::ExecutorId) -> Self {
+        self.own_executor_id = Some(id);
         self
     }
 
@@ -1455,9 +1468,10 @@ impl ExecutorTaskRunner {
             let task_id = attempt.task_id().clone();
             let stage_id = attempt.stage_id().clone();
             let attempt_id = attempt.attempt_id();
-            // Get the real executor ID from a synthesised assignment for the ack path.
-            let executor_id = krishiv_proto::ExecutorId::try_new("exec")
-                .map_err(|e| tonic::Status::internal(e.to_string()))?;
+            let executor_id = self
+                .own_executor_id
+                .clone()
+                .ok_or_else(|| tonic::Status::internal("executor id not set on runner"))?;
             let ids = TaskAttemptRef::new(req.job_id.clone(), stage_id, task_id, attempt_id);
             let assignment = ExecutorTaskAssignment::new(
                 ids,

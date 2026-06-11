@@ -13,9 +13,11 @@ use datafusion::prelude::SessionContext;
 use crate::SqlError;
 use crate::SqlResult;
 
-/// Match the ON-clause equality pattern and extract the column name.
-static KEY_COL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:(?:\w+|`[^`]+`)\.)?(\w+)\s*=").unwrap());
+/// Match `alias.col = alias.col` in the ON clause, capturing alias and col for both sides.
+static KEY_COL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)((?:\w+|`[^`]+`))\.((?:\w+|`[^`]+`))\s*=\s*((?:\w+|`[^`]+`))\.((?:\w+|`[^`]+`))")
+        .unwrap()
+});
 
 static MERGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -70,15 +72,27 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
         });
     }
 
-    let merge_key = KEY_COL_RE
+    let merge_key: String = KEY_COL_RE
         .captures(on_clause)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim_matches('`'))
         .ok_or_else(|| SqlError::Unsupported {
             feature:
-                "MERGE ON clause must contain a column equality (e.g. target.col = source.col)"
+                "MERGE ON clause must contain a qualified column equality (e.g. target.col = source.col)"
                     .into(),
+        })
+        .map(|caps| {
+            let left_alias = caps[1].trim_matches('`');
+            let left_col = caps[2].trim_matches('`');
+            let right_alias = caps[3].trim_matches('`');
+            let right_col = caps[4].trim_matches('`');
+            // Pick the side whose alias does NOT match the source table to get the target col.
+            let source_lower = source_table.to_lowercase();
+            if right_alias.to_lowercase() == source_lower {
+                left_col.to_string()
+            } else {
+                right_col.to_string()
+            }
         })?;
+    let merge_key = merge_key.as_str();
 
     let source_df = ctx
         .table(&source_table)
@@ -286,14 +300,25 @@ mod tests {
     fn merge_key_column_extraction() {
         let on = "target.id = source.id";
         let caps = KEY_COL_RE.captures(on).unwrap();
-        assert_eq!(caps.get(1).map(|m| m.as_str()), Some("id"));
+        // caps: (left_alias, left_col, right_alias, right_col)
+        assert_eq!(caps.get(1).map(|m| m.as_str()), Some("target"));
+        assert_eq!(caps.get(2).map(|m| m.as_str()), Some("id"));
+    }
+
+    #[test]
+    fn merge_key_column_extraction_reversed() {
+        // ON clause written source.col = target.col — must still extract target col.
+        let on = "source.id = target.id";
+        let caps = KEY_COL_RE.captures(on).unwrap();
+        assert_eq!(caps.get(1).map(|m| m.as_str()), Some("source"));
+        assert_eq!(caps.get(3).map(|m| m.as_str()), Some("target"));
     }
 
     #[test]
     fn merge_key_extracts_first_column_from_compound() {
         let on = "target.id = source.id AND target.date = source.date";
         let caps = KEY_COL_RE.captures(on).unwrap();
-        assert_eq!(caps.get(1).map(|m| m.as_str()), Some("id"));
+        assert_eq!(caps.get(2).map(|m| m.as_str()), Some("id"));
     }
 
     /// C9 regression: iceberg in-memory merge must return correct metrics

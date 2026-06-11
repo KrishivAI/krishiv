@@ -141,13 +141,19 @@ pub struct ContinuousSnapshot {
 
 impl ContinuousSnapshot {
     /// Encode as `watermark_ms:i64 LE | bytes_len:u32 LE | snapshot_bytes`.
-    pub fn encode(&self) -> Vec<u8> {
-        let len = self.snapshot_bytes.len() as u32;
+    pub fn encode(&self) -> SchedulerResult<Vec<u8>> {
+        let len = u32::try_from(self.snapshot_bytes.len()).map_err(|_| SchedulerError::Store {
+            message: format!(
+                "ContinuousSnapshot encode: snapshot too large ({} bytes, max {})",
+                self.snapshot_bytes.len(),
+                u32::MAX,
+            ),
+        })?;
         let mut out = Vec::with_capacity(12 + self.snapshot_bytes.len());
         out.extend_from_slice(&self.watermark_ms.to_le_bytes());
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&self.snapshot_bytes);
-        out
+        Ok(out)
     }
 
     /// Decode from bytes produced by [`encode`].

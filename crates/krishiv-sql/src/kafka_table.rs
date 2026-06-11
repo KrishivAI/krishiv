@@ -79,8 +79,11 @@ impl PartitionStream for KafkaPartitionStream {
                         // Empty batch (tombstone / non-UTF-8 skip) — keep polling.
                     }
                     Ok(Some(batch)) => {
-                        let projected = project_batch(&batch, &schema);
-                        if tx.send(Ok(projected)).await.is_err() {
+                        let send_result = match project_batch(&batch, &schema) {
+                            Ok(projected) => tx.send(Ok(projected)).await,
+                            Err(e) => tx.send(Err(DataFusionError::ArrowError(Box::new(e), None))).await,
+                        };
+                        if send_result.is_err() {
                             break; // receiver dropped — query cancelled
                         }
                         if manual_commit {
@@ -112,36 +115,28 @@ impl PartitionStream for KafkaPartitionStream {
 ///
 /// Missing columns → typed null arrays.
 /// Cast failures → null arrays with a tracing warning (no silent data loss).
-pub(crate) fn project_batch(batch: &RecordBatch, schema: &SchemaRef) -> RecordBatch {
+pub(crate) fn project_batch(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+) -> Result<RecordBatch, arrow::error::ArrowError> {
     let mut cols = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
         let col = if let Ok(idx) = batch.schema().index_of(field.name()) {
             let src = batch.column(idx);
-            match arrow::compute::cast(src, field.data_type()) {
-                Ok(casted) => casted,
-                Err(e) => {
-                    tracing::warn!(
-                        field = field.name(),
-                        from_type = %src.data_type(),
-                        to_type = %field.data_type(),
-                        error = %e,
-                        "Kafka column cast failed; filling with nulls to preserve row count"
-                    );
-                    arrow::array::new_null_array(field.data_type(), batch.num_rows())
-                }
-            }
+            arrow::compute::cast(src, field.data_type()).map_err(|e| {
+                arrow::error::ArrowError::CastError(format!(
+                    "Kafka column '{}': cast from {} to {} failed: {e}",
+                    field.name(),
+                    src.data_type(),
+                    field.data_type(),
+                ))
+            })?
         } else {
             arrow::array::new_null_array(field.data_type(), batch.num_rows())
         };
         cols.push(col);
     }
-    match RecordBatch::try_new(schema.clone(), cols) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!("Kafka project_batch: RecordBatch construction failed: {e}");
-            RecordBatch::new_empty(schema.clone())
-        }
-    }
+    RecordBatch::try_new(schema.clone(), cols)
 }
 
 /// Build a DataFusion `StreamingTable` backed by a live Kafka/Redpanda topic.

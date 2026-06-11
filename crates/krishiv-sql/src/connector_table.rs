@@ -235,7 +235,8 @@ impl TableProvider for BoundedConnectorProvider {
                 .map_err(connector_error)?
                 .map(|batch| project_batch(&batch, &self.schema));
             match batch {
-                Some(batch) => batches.push(batch),
+                Some(Ok(batch)) => batches.push(batch),
+                Some(Err(e)) => return Err(DataFusionError::ArrowError(Box::new(e), None)),
                 None => break,
             }
         }

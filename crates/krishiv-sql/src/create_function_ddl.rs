@@ -16,6 +16,14 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use regex::Regex;
+use std::sync::LazyLock;
+
+static CREATE_FUNCTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(\w+)\s*\(([^)]*)\)\s*RETURNS\s+TABLE\s*\(([^)]*)\)(?:\s+LANGUAGE\s+(\w+))?(?:\s+AS\s+'((?:[^']|'')*)')?\s*;?\s*$",
+    )
+    .expect("CREATE FUNCTION regex is valid")
+});
 
 use krishiv_plan::udf::{ScalarValue, TableUdf, UdfError};
 
@@ -79,12 +87,7 @@ pub fn parse_create_function(sql: &str) -> Result<CreateFunctionDdl, String> {
     //   RETURNS TABLE ( <col_defs> )
     //   [LANGUAGE <lang>]
     //   [AS '<body>']
-    let re = Regex::new(
-        r"(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(\w+)\s*\(([^)]*)\)\s*RETURNS\s+TABLE\s*\(([^)]*)\)(?:\s+LANGUAGE\s+(\w+))?(?:\s+AS\s+'((?:[^']|'')*)')?\s*;?\s*$",
-    )
-    .map_err(|e| format!("internal regex error: {e}"))?;
-
-    let caps = re
+    let caps = CREATE_FUNCTION_RE
         .captures(sql)
         .ok_or_else(|| "SQL does not match CREATE FUNCTION … RETURNS TABLE pattern".to_string())?;
 

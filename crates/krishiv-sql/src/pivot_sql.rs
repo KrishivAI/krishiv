@@ -245,9 +245,13 @@ pub fn rewrite_unpivot(sql: &str) -> SqlResult<String> {
 
     let mut branches = Vec::with_capacity(unpivot.in_columns.len());
     for col in &unpivot.in_columns {
+        // Double-quote identifiers to handle reserved words and special characters.
+        let col_quoted = col.replace('"', "\"\"");
+        let name_col_quoted = unpivot.name_column.replace('"', "\"\"");
+        let val_col_quoted = unpivot.value_column.replace('"', "\"\"");
         branches.push(format!(
-            "SELECT '{}' AS {}, {} AS {} FROM {}",
-            col, unpivot.name_column, col, unpivot.value_column, from_clause,
+            "SELECT '{}' AS \"{}\", \"{}\" AS \"{}\" FROM {}",
+            col.replace('\'', "''"), name_col_quoted, col_quoted, val_col_quoted, from_clause,
         ));
     }
 

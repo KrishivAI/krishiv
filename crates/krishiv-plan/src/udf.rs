@@ -308,6 +308,17 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
+    /// Read an i64 from an 8-byte little-endian AggState, returning 0 for empty/corrupt state.
+    fn read_i64_state(state: &AggState) -> i64 {
+        if state.data.len() == 8 {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&state.data[..8]);
+            i64::from_le_bytes(buf)
+        } else {
+            0
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Mock aggregate UDF
     // -----------------------------------------------------------------------
@@ -352,11 +363,7 @@ mod tests {
                     message: "expected Int64".into(),
                 })?;
 
-            let mut current: i64 = if state.data.len() == 8 {
-                i64::from_le_bytes(state.data[..8].try_into().unwrap())
-            } else {
-                0
-            };
+            let mut current: i64 = read_i64_state(&state);
 
             for v in col.iter().flatten() {
                 current += v;
@@ -366,27 +373,12 @@ mod tests {
         }
 
         fn finalize(&self, state: AggState) -> Result<ScalarValue, UdfError> {
-            if state.data.len() == 8 {
-                let v = i64::from_le_bytes(state.data[..8].try_into().unwrap());
-                Ok(ScalarValue::Int64(v))
-            } else {
-                Ok(ScalarValue::Int64(0))
-            }
+            Ok(ScalarValue::Int64(read_i64_state(&state)))
         }
 
         fn merge(&self, a: AggState, b: AggState) -> Result<AggState, UdfError> {
-            let va: i64 = if a.data.len() == 8 {
-                i64::from_le_bytes(a.data[..8].try_into().unwrap())
-            } else {
-                0
-            };
-            let vb: i64 = if b.data.len() == 8 {
-                i64::from_le_bytes(b.data[..8].try_into().unwrap())
-            } else {
-                0
-            };
             Ok(AggState {
-                data: (va + vb).to_le_bytes().to_vec(),
+                data: (read_i64_state(&a) + read_i64_state(&b)).to_le_bytes().to_vec(),
             })
         }
     }

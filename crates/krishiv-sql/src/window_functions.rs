@@ -145,6 +145,9 @@ fn apply2(
     // Array path.
     let a_arr = cast_to_int64_array(std::slice::from_ref(lhs), 0)?;
     let b_arr = cast_to_int64_array(std::slice::from_ref(rhs), 0)?;
+    if a_arr.is_empty() || b_arr.is_empty() {
+        return Ok(ColumnarValue::Array(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef));
+    }
     if a_arr.len() != 1 && b_arr.len() != 1 && a_arr.len() != b_arr.len() {
         return Err(DataFusionError::Internal(format!(
             "window function: incompatible array lengths {} and {}",
@@ -202,6 +205,9 @@ fn apply3(
     let a_arr = cast_to_int64_array(std::slice::from_ref(a), 0)?;
     let b_arr = cast_to_int64_array(std::slice::from_ref(b), 0)?;
     let c_arr = cast_to_int64_array(std::slice::from_ref(c), 0)?;
+    if a_arr.is_empty() || b_arr.is_empty() || c_arr.is_empty() {
+        return Ok(ColumnarValue::Array(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef));
+    }
     let max_len = a_arr.len().max(b_arr.len()).max(c_arr.len());
     for (name, len) in [("a", a_arr.len()), ("b", b_arr.len()), ("c", c_arr.len())] {
         if len != 1 && len != max_len {

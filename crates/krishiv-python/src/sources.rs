@@ -30,8 +30,9 @@ pub fn read_parquet(
         session
             .register_parquet(&table_name, &path)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let escaped = table_name.replace('"', "\"\"");
         let df = session
-            .sql(format!("SELECT * FROM \"{table_name}\""))
+            .sql(format!("SELECT * FROM \"{escaped}\""))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         if let Some(schema_cls) = schema_cls {
             let result = df
@@ -94,9 +95,10 @@ pub fn read_kafka(
             .inner
             .register_kafka_source(&topic, arrow_schema, &bootstrap_servers, &topic, gid)
             .map_err(crate::errors::map_krishiv_error)?;
+        let escaped_topic = topic.replace('"', "\"\"");
         Ok(PyStream::from_pipeline(
             session.inner.clone(),
-            format!("SELECT * FROM \"{topic}\""),
+            format!("SELECT * FROM \"{escaped_topic}\""),
             String::new(),
             0,
         ))

@@ -58,7 +58,10 @@ pub async fn register_hudi_uri(
         }
         r
     };
-    let provider = Arc::new(HudiScanProvider { reader });
+    let schema = reader.schema().map_err(|e| SqlError::DataFusion {
+        message: format!("hudi: failed to read table schema: {e}"),
+    })?;
+    let provider = Arc::new(HudiScanProvider { reader, schema });
     ctx.register_table(table_name, provider)
         .map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
@@ -109,6 +112,7 @@ impl TableProvider for DeltaScanProvider {
 #[derive(Debug)]
 struct HudiScanProvider {
     reader: HudiSnapshotReader,
+    schema: SchemaRef,
 }
 
 #[async_trait]
@@ -118,9 +122,7 @@ impl TableProvider for HudiScanProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.reader
-            .schema()
-            .unwrap_or_else(|_| Arc::new(arrow::datatypes::Schema::empty()))
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -134,13 +136,11 @@ impl TableProvider for HudiScanProvider {
         filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let schema = self.schema();
         let batches = self
             .reader
             .scan_batches()
             .map_err(|e| DataFusionError::External(e.to_string().into()))?;
-
-        let table = MemTable::try_new(schema, vec![batches])?;
+        let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
         table.scan(state, projection, filters, limit).await
     }
 }

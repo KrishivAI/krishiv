@@ -57,10 +57,17 @@ pub fn rewrite_lateral_unnest(sql: &str) -> String {
     let mut result = sql.to_owned();
     for (from, to) in patterns {
         let upper_from = from.to_ascii_uppercase();
+        // Compute the uppercase view once per pattern pass; track the search
+        // position to avoid re-scanning the prefix on each replacement.
+        let mut search_start = 0;
         loop {
-            let upper_result = result.to_ascii_uppercase();
+            let upper_result = result[search_start..].to_ascii_uppercase();
             match upper_result.find(&upper_from) {
-                Some(pos) => result.replace_range(pos..pos + from.len(), to),
+                Some(rel_pos) => {
+                    let pos = search_start + rel_pos;
+                    result.replace_range(pos..pos + from.len(), to);
+                    search_start = pos + to.len();
+                }
                 None => break,
             }
         }

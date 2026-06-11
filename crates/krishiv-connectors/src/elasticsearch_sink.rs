@@ -137,6 +137,35 @@ impl ElasticsearchSink {
                 resp.status_code()
             ))));
         }
+
+        // The bulk API returns HTTP 200 even when individual document operations
+        // fail. Check the `errors` field in the response body and surface any
+        // per-item failures so callers don't silently lose data.
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
+        if body.get("errors").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let failures: Vec<String> = body
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            let op = item.get("index").or_else(|| item.get("create"))?;
+                            let err = op.get("error")?;
+                            Some(err.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Err(ConnectorError::Io(std::io::Error::other(format!(
+                "elasticsearch bulk partial failure ({} errors): {}",
+                failures.len(),
+                failures.join("; ")
+            ))));
+        }
         Ok(())
     }
 }
@@ -165,36 +194,46 @@ fn arrow_scalar_to_json(col: &dyn Array, row: usize) -> JsonValue {
         return JsonValue::Null;
     }
     match col.data_type() {
-        DataType::Boolean => {
-            let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-            JsonValue::Bool(arr.value(row))
-        }
-        DataType::Int32 => {
-            let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-            JsonValue::Number(arr.value(row).into())
-        }
-        DataType::Int64 => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-            JsonValue::Number(arr.value(row).into())
-        }
-        DataType::Float32 => {
-            let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-            JsonValue::Number(
-                serde_json::Number::from_f64(arr.value(row) as f64)
-                    .unwrap_or_else(|| 0.into()),
-            )
-        }
-        DataType::Float64 => {
-            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-            JsonValue::Number(
-                serde_json::Number::from_f64(arr.value(row))
-                    .unwrap_or_else(|| 0.into()),
-            )
-        }
-        DataType::Utf8 => {
-            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-            JsonValue::String(arr.value(row).to_owned())
-        }
+        DataType::Boolean => col
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|arr| JsonValue::Bool(arr.value(row)))
+            .unwrap_or(JsonValue::Null),
+        DataType::Int32 => col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|arr| JsonValue::Number(arr.value(row).into()))
+            .unwrap_or(JsonValue::Null),
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|arr| JsonValue::Number(arr.value(row).into()))
+            .unwrap_or(JsonValue::Null),
+        DataType::Float32 => col
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|arr| {
+                JsonValue::Number(
+                    serde_json::Number::from_f64(arr.value(row) as f64)
+                        .unwrap_or_else(|| 0.into()),
+                )
+            })
+            .unwrap_or(JsonValue::Null),
+        DataType::Float64 => col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|arr| {
+                JsonValue::Number(
+                    serde_json::Number::from_f64(arr.value(row))
+                        .unwrap_or_else(|| 0.into()),
+                )
+            })
+            .unwrap_or(JsonValue::Null),
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|arr| JsonValue::String(arr.value(row).to_owned()))
+            .unwrap_or(JsonValue::Null),
         _ => JsonValue::String(format!("{:?}", col.data_type())),
     }
 }

@@ -672,7 +672,7 @@ pub mod datafusion_bridge {
         fn table_exist(&self, name: &str) -> bool {
             let catalog = self.catalog.read().unwrap_or_else(|p| p.into_inner());
             use super::CatalogProvider as KrishivCatalogProvider;
-            catalog.list_tables().iter().any(|table| table == name)
+            catalog.get_table(name).is_ok()
         }
     }
 }

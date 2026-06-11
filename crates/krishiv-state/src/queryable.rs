@@ -43,6 +43,8 @@ impl QueryableStateStore {
     /// Register `backend` under `(job_id, op_id)`.
     ///
     /// Overwrites any previously registered backend for the same pair.
+    /// Returns silently if the registry lock is poisoned (only possible after
+    /// a panic in a concurrent writer, which leaves the system in an inconsistent state).
     pub fn register(
         &self,
         job_id: &str,
@@ -50,7 +52,9 @@ impl QueryableStateStore {
         backend: Arc<dyn StateBackend + Send + Sync>,
     ) {
         let key = registry_key(job_id, op_id);
-        self.backends.write().unwrap().insert(key, backend);
+        if let Ok(mut map) = self.backends.write() {
+            map.insert(key, backend);
+        }
     }
 
     /// Look up `key` in namespace `(op_id, state_name)` for job `job_id`.
@@ -63,7 +67,9 @@ impl QueryableStateStore {
         state_name: &str,
         key: &[u8],
     ) -> StateResult<Option<Vec<u8>>> {
-        let map = self.backends.read().unwrap();
+        let map = self.backends.read().map_err(|_| StateError::LockPoisoned {
+            message: "queryable state registry lock poisoned".into(),
+        })?;
         let k = registry_key(job_id, op_id);
         match map.get(&k) {
             None => Ok(None),
@@ -76,10 +82,10 @@ impl QueryableStateStore {
 
     /// Return the set of registered `(job_id, op_id)` pairs.
     pub fn list_registered(&self) -> Vec<(String, String)> {
-        self.backends
-            .read()
-            .unwrap()
-            .keys()
+        let Ok(map) = self.backends.read() else {
+            return Vec::new();
+        };
+        map.keys()
             .filter_map(|k| {
                 let mut parts = k.splitn(2, "::");
                 let job = parts.next()?.to_owned();
@@ -97,7 +103,9 @@ impl QueryableStateStore {
         job_id: &str,
         op_id: &str,
     ) -> StateResult<Vec<crate::namespace::Namespace>> {
-        let map = self.backends.read().unwrap();
+        let map = self.backends.read().map_err(|_| StateError::LockPoisoned {
+            message: "queryable state registry lock poisoned".into(),
+        })?;
         let k = registry_key(job_id, op_id);
         match map.get(&k) {
             None => Ok(vec![]),
@@ -108,8 +116,9 @@ impl QueryableStateStore {
     /// Remove all backends registered for `job_id`.
     pub fn deregister_job(&self, job_id: &str) {
         let prefix = format!("{job_id}::");
-        let mut map = self.backends.write().unwrap();
-        map.retain(|k, _| !k.starts_with(&prefix));
+        if let Ok(mut map) = self.backends.write() {
+            map.retain(|k, _| !k.starts_with(&prefix));
+        }
     }
 
     /// Return a `QueryableStateHandle` for point lookups on a specific operator.
@@ -125,7 +134,9 @@ impl QueryableStateStore {
         let backend = self
             .backends
             .read()
-            .unwrap()
+            .map_err(|_| StateError::LockPoisoned {
+                message: "queryable state registry lock poisoned".into(),
+            })?
             .get(&k)
             .cloned()
             .ok_or_else(|| StateError::BackendUnavailable {
@@ -141,7 +152,7 @@ impl QueryableStateStore {
 
 impl std::fmt::Debug for QueryableStateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self.backends.read().unwrap().len();
+        let count = self.backends.read().map(|m| m.len()).unwrap_or(0);
         write!(f, "QueryableStateStore({count} backends)")
     }
 }

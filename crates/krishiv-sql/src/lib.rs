@@ -102,8 +102,14 @@ impl PlanCache {
     }
 
     fn insert(&mut self, key: String, plan: datafusion::logical_expr::LogicalPlan) {
-        if self.map.len() >= self.max && let Some(oldest) = self.order.pop_front() {
-            self.map.remove(&oldest);
+        if self.map.contains_key(&key) {
+            // Remove the stale order entry so a repeated insert doesn't accumulate
+            // duplicate references and corrupt LRU eviction order.
+            self.order.retain(|k| k != &key);
+        } else if self.map.len() >= self.max {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
         }
         self.order.push_back(key.clone());
         self.map.insert(key, plan);
@@ -1307,11 +1313,12 @@ impl SqlEngine {
             .starts_with("MERGE INTO")
         {
             let batches = lakehouse::execute_merge_sql(&self.context, query).await?;
-            lakehouse::register_scan_batches(&self.context, "_krishiv_merge_result", batches)
+            let merge_table = next_ephemeral_name("merge_result");
+            lakehouse::register_scan_batches(&self.context, &merge_table, batches)
                 .await?;
             let dataframe = self
                 .context
-                .sql("SELECT * FROM _krishiv_merge_result")
+                .sql(&format!("SELECT * FROM {merge_table}"))
                 .await?;
             return Ok(
                 SqlDataFrame::new("merge", dataframe, self.table_row_counts()).with_query(query),
@@ -1356,11 +1363,12 @@ impl SqlEngine {
                     );
                 }
                 let results = cep_sql::execute_match_recognize(stmt, &source_batches, false)?;
-                lakehouse::register_scan_batches(&self.context, "_krishiv_cep_result", results)
+                let cep_table = next_ephemeral_name("cep_result");
+                lakehouse::register_scan_batches(&self.context, &cep_table, results)
                     .await?;
                 let dataframe = self
                     .context
-                    .sql("SELECT * FROM _krishiv_cep_result")
+                    .sql(&format!("SELECT * FROM {cep_table}"))
                     .await?;
                 return Ok(
                     SqlDataFrame::new("cep", dataframe, self.table_row_counts()).with_query(query)

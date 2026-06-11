@@ -476,6 +476,11 @@ pub fn extract_auth_context(metadata: &tonic::metadata::MetadataMap) -> AuthCont
 /// Example: `https://accounts.google.com/.well-known/openid-configuration/jwks`
 pub const OIDC_JWKS_URI_ENV: &str = "KRISHIV_OIDC_JWKS_URI";
 
+/// Optional env var to restrict accepted JWT audience (`aud` claim).
+/// When set, tokens whose `aud` does not contain this value are rejected.
+/// When unset, audience validation is skipped to ease multi-provider setups.
+pub const OIDC_AUDIENCE_ENV: &str = "KRISHIV_OIDC_AUDIENCE";
+
 /// JWT-based [`AuthProvider`] backed by OIDC JWKS key material.
 ///
 /// Loads the JWKS endpoint at construction time, caches the decoded
@@ -541,10 +546,13 @@ impl JwtAuthProvider {
             return Err("JWKS contained no usable verification keys".into());
         }
         let mut validation = jsonwebtoken::Validation::default();
-        // Disable audience and issuer validation so the provider works
-        // across OIDC providers without extra configuration.  Callers that
-        // need stricter validation should set the claims themselves.
-        validation.validate_aud = false;
+        if let Ok(aud) = std::env::var(OIDC_AUDIENCE_ENV) {
+            validation.set_audience(&[aud]);
+        } else {
+            // No audience configured — skip `aud` validation so the provider
+            // works across OIDC providers that embed different audience values.
+            validation.validate_aud = false;
+        }
         Ok(Self { keys, validation })
     }
 }
@@ -560,7 +568,7 @@ impl AuthProvider for JwtAuthProvider {
                     .claims
                     .krishiv_role
                     .as_deref()
-                    .unwrap_or("admin")
+                    .unwrap_or("reader")
                     .to_ascii_lowercase()
                     .as_str()
                 {
