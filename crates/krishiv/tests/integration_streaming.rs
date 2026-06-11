@@ -271,6 +271,7 @@ async fn multi_source_watermark_aligns_across_sources() {
         .expect("memory_stream");
 
     let ms_watermark = MultiSourceWatermarkSpec::new()
+        .with_source_id_column("source_id")
         .source("src-a", WatermarkSpec::fixed_lag_ms(0))
         .source("src-b", WatermarkSpec::fixed_lag_ms(0));
 

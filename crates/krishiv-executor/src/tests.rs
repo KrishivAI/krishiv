@@ -2908,7 +2908,9 @@ mod executor_tests {
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
         let backend = FjallStateBackend::ephemeral().unwrap();
         let coordinator = RecordingCoordinator::default();
+        let exec_id = ExecutorId::try_new("exec-checkpoint-fanout").unwrap();
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
+            .with_executor_id(exec_id)
             .with_running_attempts(running_attempts);
         let req = InitiateCheckpointRequest {
             job_id,

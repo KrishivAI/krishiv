@@ -80,7 +80,7 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
                     .into(),
         })
         .map(|caps| {
-            let left_alias = caps[1].trim_matches('`');
+            let _left_alias = caps[1].trim_matches('`');
             let left_col = caps[2].trim_matches('`');
             let right_alias = caps[3].trim_matches('`');
             let right_col = caps[4].trim_matches('`');

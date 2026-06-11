@@ -16,7 +16,6 @@ use crate::{
     InMemoryShuffleStore, LocalDiskShuffleStore, PartitionId, ShuffleError, ShufflePartition,
     ShuffleResult, ShuffleStore,
     memory_store::DEFAULT_SHUFFLE_MEMORY_BYTES,
-    store::PartitionKey,
 };
 
 /// Budget-aware shuffle backend.

@@ -50,15 +50,12 @@ impl LiveTableRegistry {
         Ok(is_new)
     }
 
-    pub fn register(&self, name: impl Into<String>, query: impl Into<String>) {
-        // `unwrap` is safe: an `RwLock` is only poisoned if a writer
-        // panicked, in which case the surrounding SQL session is
-        // already in an unrecoverable state. The single-writer path
-        // (DdlExecutor) is the only place that takes the write lock,
-        // so poison is the only failure mode and we surface it via
-        // a `DataFusion`-shaped error.
-        self.try_register(name, query)
-            .expect("LiveTableRegistry write lock poisoned");
+    pub fn register(
+        &self,
+        name: impl Into<String>,
+        query: impl Into<String>,
+    ) -> Result<(), SqlError> {
+        self.try_register(name, query).map(|_| ())
     }
 
     pub fn remove_table(&self, name: &str) -> SqlResult<bool> {
@@ -207,7 +204,7 @@ pub fn execute_live_table_ddl(
     };
     match &stmt {
         LiveTableStatement::Create { name, query } => {
-            registry.register(name.clone(), query.clone());
+            registry.register(name.clone(), query.clone())?;
         }
         LiveTableStatement::Drop { name } => {
             registry.remove_table(name)?;
@@ -220,7 +217,7 @@ pub fn execute_live_table_ddl(
             };
             // Re-register the same query to bump any "last refresh" bookkeeping
             // and force the executor to re-materialise the result.
-            registry.register(name.clone(), query);
+            registry.register(name.clone(), query)?;
         }
     }
     Ok(Some(plan_live_table(stmt)))

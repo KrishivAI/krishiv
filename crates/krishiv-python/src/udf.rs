@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use pyo3_arrow;
-
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampNanosecondArray,

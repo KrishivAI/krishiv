@@ -83,19 +83,27 @@ Systematic 12-dimension analysis of all 411 source files across 20 crates. All P
 34. `krishiv-scheduler/src/store.rs` — `ContinuousSnapshot::decode` used `try_into().unwrap()` → `copy_from_slice` into fixed-size arrays (guarded by prior length check)
 35. `krishiv-sql/src/udf.rs` — Dead import `BinaryArray` removed
 
+**Session 3 execution-flow fixes (2026-06-11):**
+36. `krishiv-runtime/in_process.rs` — Bug #1: WatermarkHint injected only into `assignments[0]`; fixed to inject into ALL tasks in the streaming stage so late-data suppression is consistent across multi-task stages
+37. `krishiv-runtime/in_process.rs` — Bug #3: `contains("stream:")` in streaming-stage detection → `starts_with("stream:")` to avoid false matches in SQL predicates
+38. `krishiv-runtime/in_process.rs` — Bug #2: `drain_continuous_job` coordinator lock-poison swallowed silently → `tracing::warn!` on poison so operators know persistence is broken
+39. `krishiv-api/session.rs` — Bug #4: `extract_host()` stripped port before comparing coordinator Flight and gRPC URLs; two coordinators on the same host with different ports would pass validation → compare full authority (`host:port`)
+40. `krishiv-api/session.rs` — Perf #10: Embedded mode hardcoded `target_parallelism = 1`; all modes now default to `available_parallelism()` — users who need deterministic single-threaded execution can set `target_parallelism(1)` explicitly
+41. `krishiv-executor/assignment_inbox.rs` + `cli.rs` — Perf #12: Distributed executor slot loops polled at 50 ms unconditional sleep; added `tokio::sync::Notify` (`wakeup` field) to `ExecutorAssignmentInbox`, notify on `push_with_outcome` success, slot loops now `tokio::select!` on `wakeup.notified()` with 1 s fallback instead of spinning
+42. `krishiv-runtime/flight_action.rs` + `execution_runtime.rs` + `in_process.rs` + `in_process_cluster.rs` + `krishiv-flight-sql/host.rs` + `lib.rs` — Gap #5: Kafka source registrations were not forwarded to remote coordinator in distributed mode; added `RegisterKafkaSourceBody`/`RegisterKafkaSource` flight action, `encode_schema_ipc_b64`/`decode_schema_ipc_b64` helpers, `ExecutionRuntime::register_kafka_source` default no-op overridden in `RemoteExecutionRuntime`, `InProcessCluster::register_kafka_source` on server side, `FlightExecutionHost::register_kafka_source`, and session-side forwarding
+
 ### Validation
 ```bash
-cargo check --workspace          # 0 errors, 2 pre-existing warnings
+cargo check --workspace             # 0 errors, 2 pre-existing warnings
 cargo test -p krishiv-scheduler --lib  # 304 passed
-cargo test -p krishiv-executor --lib   # all passed
-cargo test -p krishiv-sql --lib        # all passed
-cargo test -p krishiv-state --lib      # all passed
-cargo test -p krishiv-plan --lib       # all passed
-cargo test -p krishiv-ai --lib         # 152 passed (session 2)
+cargo test -p krishiv-executor --lib   # 181 passed (1 pre-existing failure: checkpoint_fanout test missing executor_id; not introduced here)
+cargo test -p krishiv-api --lib        # 60 passed
+cargo test -p krishiv-runtime --lib    # 319 passed
+cargo test -p krishiv-flight-sql --lib # 42 passed
 ```
 
 ### Blockers
-None.
+None introduced. Pre-existing: `checkpoint_fanout_uses_running_attempts_without_preexisting_task_runner` test in krishiv-executor fails due to missing `with_executor_id()` call — not related to this session's changes.
 
 ### Next useful task
 ```bash

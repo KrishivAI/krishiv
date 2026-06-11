@@ -671,17 +671,23 @@ impl DataFrame {
             .collect();
         let schema = batches.first().map(|b| b.schema());
         let combined = if !display.is_empty() {
-            let schema = schema.unwrap();
+            let schema = schema.ok_or_else(|| KrishivError::Runtime {
+                message: "display is non-empty but batches has no schema".to_string(),
+            })?;
             let arrays: Vec<_> = (0..schema.fields().len())
                 .map(|col_idx| {
                     let chunks: Vec<&dyn Array> = display
                         .iter()
                         .map(|b| b.column(col_idx).as_ref())
                         .collect();
-                    arrow::compute::concat(&chunks).unwrap()
+                    arrow::compute::concat(&chunks).map_err(|e| KrishivError::Runtime {
+                        message: format!("concat column {col_idx}: {e}"),
+                    })
                 })
-                .collect();
-            vec![RecordBatch::try_new(schema, arrays).unwrap()]
+                .collect::<Result<Vec<_>>>()?;
+            vec![RecordBatch::try_new(schema, arrays).map_err(|e| KrishivError::Runtime {
+                message: format!("reconstruct batch for display: {e}"),
+            })?]
         } else {
             vec![]
         };

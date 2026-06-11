@@ -45,6 +45,12 @@ pub struct KrishivFlightSqlService {
     prepared_statements: Arc<tokio::sync::Mutex<lru::LruCache<String, String>>>,
 }
 
+const PREPARED_STMT_CAPACITY: std::num::NonZeroUsize =
+    match std::num::NonZeroUsize::new(128) {
+        Some(n) => n,
+        None => panic!("capacity must be non-zero"),
+    };
+
 impl std::fmt::Debug for KrishivFlightSqlService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KrishivFlightSqlService")
@@ -63,7 +69,7 @@ impl KrishivFlightSqlService {
             host: FlightExecutionHost::from_env()?,
             sql_engine: Arc::new(SqlEngine::new()),
             prepared_statements: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(128).unwrap(),
+                PREPARED_STMT_CAPACITY,
             ))),
         })
     }
@@ -76,7 +82,7 @@ impl KrishivFlightSqlService {
             host,
             sql_engine: Arc::new(SqlEngine::new()),
             prepared_statements: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(128).unwrap(),
+                PREPARED_STMT_CAPACITY,
             ))),
         }
     }
@@ -141,7 +147,13 @@ impl KrishivFlightSqlService {
             }
             return Ok(None);
         };
-        let token = self.bearer_token(req)?.expect("auth is configured");
+        let token = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_owned)
+            .ok_or_else(|| Status::unauthenticated("missing Bearer token"))?;
         auth.authenticate(&token)
             .map(Some)
             .ok_or_else(|| Status::unauthenticated("invalid API key"))

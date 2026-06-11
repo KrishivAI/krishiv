@@ -246,11 +246,33 @@ impl FlightExecutionHost {
                     });
                 }
                 // Already applied in apply_catalog_directives.
-                FlightDirective::RegisterParquet { .. } => {}
-                FlightDirective::RegisterParquetIpc { .. } => {}
+                FlightDirective::RegisterParquet { .. } | FlightDirective::RegisterParquetIpc { .. } => {}
             }
         }
         Ok(vec![status_batch("ok")?])
+    }
+
+    /// Register a Kafka streaming source on the embedded cluster's SQL engine.
+    ///
+    /// Called by the `RegisterKafkaSource` Flight action handler to forward
+    /// Kafka source registrations from distributed-mode clients.
+    #[cfg(feature = "kafka")]
+    pub fn register_kafka_source(
+        &self,
+        name: &str,
+        schema_ipc_b64: &str,
+        bootstrap_servers: &str,
+        topic: &str,
+        group_id: &str,
+    ) -> Result<(), Status> {
+        let schema = krishiv_runtime::decode_schema_ipc_b64(schema_ipc_b64)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let cluster = self
+            .cluster()
+            .ok_or_else(|| Status::internal("embedded cluster unavailable for Kafka registration"))?;
+        run_blocking(|| {
+            cluster.register_kafka_source(name, schema, bootstrap_servers, topic, group_id)
+        })
     }
 }
 
