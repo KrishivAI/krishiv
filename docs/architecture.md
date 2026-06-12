@@ -1,423 +1,375 @@
 # Krishiv Architecture
 
-## Layer Architecture
+This document describes the architecture implemented by the current Rust
+workspace. It is intentionally descriptive rather than aspirational. Proposed
+changes belong in an architecture decision record (ADR) or the public roadmap.
 
-```mermaid
-block-beta
-  columns 5
+## 1. System boundary
 
-  block:EntryPoints:2:2
-    columns 2
-    a1("SQL CLI<br/><i>krishiv sql</i>")
-    a2("REST API<br/><i>/api/v1</i>")
-    a3("Python Bindings<br/><i>krishiv-python</i>")
-    a4("Arrow Flight SQL<br/><i>krishiv-flight-sql</i>")
-  end
+Krishiv is an open-source compute framework for:
 
-  space:1
+- bounded batch SQL and DataFrame workloads;
+- unbounded/stateful streaming pipelines;
+- Arrow-native data exchange;
+- lakehouse-oriented reads and writes, with Apache Iceberg as the primary table
+  format; and
+- embedded, single-host daemon, and distributed deployments using one execution
+  model.
 
-  block:ApiLayer:3:3
-    columns 1
-    b1("SessionBuilder")
-    b2("DataFrame / Stream API")
-    b3("Catalog Bridge<br/><i>krishiv-sql::catalog</i>")
-  end
+The engine does **not** own collaborative notebooks, workflow orchestration,
+billing, enterprise catalog administration, model serving, or other managed data
+platform products. Those systems may use Krishiv through its Rust, Python,
+Flight SQL, CLI, and control-plane interfaces.
 
-  block:Planning:2:3
-    columns 2
-    c1("DataFusion<br/>SQL Parser / Planner / Optimizer")
-    c2("PhysicalPlan<br/>UDF + Governance<br/>CEP + Optimizer<br/><i>krishiv-plan</i>")
-  end
+Normative guarantees are defined in `docs/contracts/engine-semantics.md` and
+`docs/contracts/connectors.md`. This document explains where those guarantees
+are implemented.
 
-  block:Runtime:2:2
-    columns 1
-    d1("ExecutionRuntime")
-    d2("InProcessBackend | RemoteBackend<br/><i>krishiv-runtime</i>")
-  end
+## 2. Architectural invariants
 
-  space:1
+1. Batch and streaming use the same plan, coordinator, executor, shuffle,
+   connector, and observability layers.
+2. Exactly one fenced coordinator owns a job at a time. API replicas may be
+   active-active, but scheduling ownership for one job is not.
+3. Executors are replaceable data-plane workers. Durable recovery cannot depend
+   on the continued existence of one executor process.
+4. Apache Arrow `RecordBatch` is the internal columnar and IPC data model.
+5. DataFusion owns SQL parsing, expressions, local logical planning, and local
+   physical execution unless a Krishiv abstraction explicitly overrides it.
+6. Runtime mode and execution placement are separate decisions. Distributed
+   mode never silently falls back to local execution.
+7. State, shuffle, checkpoint, metadata, and connectors remain behind crate
+   APIs and durability profiles.
+8. Public boundaries prefer typed IDs, capabilities, versions, and errors over
+   string routing.
+9. Exactly-once is a property of a certified source/sink/checkpoint/profile
+   combination, not a global engine slogan.
 
-  block:ControlPlane:3:2
-    columns 1
-    e1("Coordinator<br/>Job/Task lifecycle<br/>Checkpoint fencing<br/>Heartbeat monitoring<br/><i>krishiv-scheduler</i>")
-    e2("Wire Protocol<br/><i>krishiv-proto</i> (gRPC + typed IDs)")
-  end
+## 3. Component map
 
-  block:DataPlane:4:2
-    columns 2
-    f1("Executor TaskRunner<br/><i>krishiv-executor</i>")
-    f2("Arrow Operators<br/><i>krishiv-dataflow</i>")
-    f3("Shuffle<br/><i>krishiv-shuffle</i>")
-    f4("State + Checkpoint<br/><i>krishiv-state</i>")
-  end
-
-  block:Connectors:2:2
-    columns 2
-    h1("Connectors<br/><i>krishiv-connectors</i><br/>Parquet / Kafka / S3")
-    h2("Lakehouse / Schema Registry<br/>CDC / Vector sinks")
-  end
-
-  block:Storage:3:2
-    columns 3
-    i1("Object Store<br/>S3 / GCS")
-    i2("Local FS")
-    i3("etcd")
-    i4("RocksDB")
-    i5("Kafka")
-  end
-
-  EntryPoints --> ApiLayer
-  ApiLayer --> Planning
-  Planning --> Runtime
-  Runtime --> ControlPlane
-  ControlPlane --> DataPlane
-  DataPlane --> Connectors
-  Connectors --> Storage
-
-  block:Observability:2:2
-    columns 2
-    j1("Metrics / Tracing<br/><i>krishiv-metrics</i>")
-    j2("Governance / Audit<br/><i>krishiv-plan::governance</i>")
-    j3("UDF contracts<br/><i>krishiv-plan::udf</i>")
-    j4("AI / RAG<br/><i>krishiv-ai</i>")
-  end
-
-  block:Legend:2:5
-    columns 2
-    l1["Durability Profiles"]
-    l2("dev-local | single-node-durable | distributed-durable")
-  end
+```text
+Rust API / Python / CLI / Arrow Flight SQL
+                  |
+                  v
+        krishiv-api: Session, DataFrame, Stream
+                  |
+          +-------+-------+
+          |               |
+          v               v
+ krishiv-sql          krishiv-plan
+ DataFusion bridge    engine plans, fragments,
+ catalog/providers    optimizer, UDF contracts
+          |               |
+          +-------+-------+
+                  v
+           krishiv-runtime
+     mode + placement + transport routing
+                  |
+                  v
+         krishiv-scheduler coordinator
+ job lifecycle, admission, fencing, assignment,
+ checkpoints, recovery, metadata, control RPC
+                  |
+                  v
+          krishiv-executor workers
+ task attempts, operators, source/sink hooks,
+ shuffle/state/checkpoint participation
+       /          |           |          \
+      v           v           v           v
+ dataflow      shuffle      state      connectors
+ operators     exchange     keyed      external I/O,
+ barriers      and spill    state      offsets, 2PC
+                  |
+                  v
+       metrics / tracing / status UI
 ```
 
-## Crate Dependency Flow
+### Workspace ownership
 
-```mermaid
-flowchart LR
-  CLI["krishiv<br/>CLI + facade"]
-  API["krishiv-api<br/>Session / DataFrame"]
-  SQL["krishiv-sql<br/>DataFusion integration"]
-  PLAN["krishiv-plan<br/>Plan + UDF + Gov + CEP + Opt"]
-  RUNTIME["krishiv-runtime<br/>Runtime routing"]
-  SCHED["krishiv-scheduler<br/>Coordinator"]
-  DATAFLOW["krishiv-dataflow<br/>Operators"]
-  EXECUTOR["krishiv-executor<br/>Task runner"]
-  PROTO["krishiv-proto<br/>Wire contracts"]
-  SHUFFLE["krishiv-shuffle"]
-  STATE["krishiv-state<br/>State + Checkpoint"]
-  CONN["krishiv-connectors"]
-  COMMON["krishiv-common<br/>Shared utilities"]
-  FLIGHT["krishiv-flight-sql"]
-  PYTHON["krishiv-python"]
-  UI["krishiv-ui"]
-  METRICS["krishiv-metrics"]
-  AI["krishiv-ai"]
-  OPS["krishiv-operator"]
-  CLI --> API
-  CLI --> SQL
-  CLI --> RUNTIME
-  API --> SQL
-  API --> COMMON
-  SQL --> PLAN
-  SQL --> COMMON
-  PLAN --> COMMON
-  PLAN --> PROTO
-  RUNTIME --> SCHED
-  RUNTIME --> EXECUTOR
-  RUNTIME --> COMMON
-  SCHED --> PROTO
-  SCHED --> STATE
-  SCHED --> DATAFLOW
-  SCHED --> COMMON
-  EXECUTOR --> PROTO
-  EXECUTOR --> DATAFLOW
-  EXECUTOR --> SHUFFLE
-  EXECUTOR --> STATE
-  EXECUTOR --> CONN
-  EXECUTOR --> COMMON
-  DATAFLOW --> SHUFFLE
-  DATAFLOW --> STATE
-  DATAFLOW --> COMMON
-  CONN --> COMMON
-  FLIGHT --> API
-  FLIGHT --> COMMON
-  PYTHON --> API
-  UI --> SCHED
-  UI --> COMMON
-  OPS --> SCHED
-  AI --> STATE
-  COMMON --> PROTO
-```
-
-## Execution Flow
-
-### Path A — Embedded Fast Path (inline SQL, skips coordinator)
-
-Applies to pure `SELECT` queries in `RuntimeMode::Embedded` with `ExecutionPlacement::LocalInProcess`. The `InProcessStreamingRuntime::execute_batch_sql` checks `can_execute_inline()` — when true, the query goes directly to DataFusion without coordinator involvement.
-
-```
-Session::sql(query)
-  └─ SqlEngine::sql(query)              [krishiv-sql, DataFusion parse]
-  └─ DataFrame::collect_async()
-       └─ runtime.collect_batch_sql()   [krishiv-runtime]
-            └─ InProcessExecutionRuntime::collect_batch_sql()
-                 └─ cluster.collect_batch_sql()
-                      └─ can_execute_inline()?  YES (pure SELECT)
-                           └─ execute_inline_sql() ──► DataFusion
-                                                      └─ RecordBatch
-```
-
-### Path B — Coordinated Path (Embedded / SingleNode)
-
-For DDL, streaming, shuffle-write, or any non-inline fragment. Uses `InProcessCluster` with in-memory channels bridged to a local `Coordinator` and `ExecutorTaskRunner`.
-
-```
-Session::sql(query)
-  └─ PhysicalPlan                          [krishiv-plan]
-  └─ InProcessCluster::execute_batch_sql()  [krishiv-runtime]
-       └─ Coordinator::submit_job()          [krishiv-scheduler]
-       └─ loop:
-            ├─ launch_assigned_task_assignments()
-            └─ ExecutorTaskRunner::run_assignment_with()  [krishiv-executor]
-                 ├─ send_task_status(Running)
-                 ├─ dispatch by fragment prefix:
-                 │    sql:              ──► DataFusion
-                 │    shuffle-write:    ──► ShuffleBackend        [krishiv-shuffle]
-                 │    stream:tw/sw/ses  ──► ContinuousWindowExec  [krishiv-dataflow]
-                 │    stream:loop:      ──► continuous drain cycle
-                 │    connector-pipeline:─► Source → Sink         [krishiv-connectors]
-                 │    local-parquet:    ──► file reads
-                 └─ send_task_status(Succeeded/Failed)
-       └─ evict_completed_job()
-```
-
-### Path C — Distributed Path
-
-Uses `RemoteExecutionRuntime` with `FlightClientPool`. All actions go through Arrow Flight `DoAction` RPC to the coordinator's Flight SQL server.
-
-```
-Session::sql(query)
-  └─ RemoteExecutionRuntime::collect_batch_sql()  [krishiv-runtime]
-       └─ KrishivFlightAction::BatchSql { query, tables, is_streaming }
-       └─ FlightClientPool::do_action()
-            ═════ Arrow Flight DoAction ═══════► Coordinator Flight SQL
-                                                 [krishiv-flight-sql / krishiv-scheduler]
-              Action types:                       └─ Coordinator state machine
-                krishiv.v1.batch_sql                    └─ gRPC task assignment
-                krishiv.v1.bounded_window                     └─ ExecutorTaskRunner
-                krishiv.v1.execute_plan                            [krishiv-executor]
-                krishiv.v1.continuous.register
-                krishiv.v1.continuous.push
-                krishiv.v1.continuous.drain
-                krishiv.v1.explain
-                krishiv.v1.register_parquet
-```
-
-## Transport Boundaries
-
-| Boundary | Protocol | Crate | Purpose |
-|----------|----------|-------|---------|
-| **Session → Runtime** | In-process call | `krishiv-runtime` | Embedded and SingleNode paths |
-| **Runtime → Coordinator** | Arrow Flight DoAction | `krishiv-flight-sql`, `krishiv-proto` | Batch SQL, window ops, continuous stream lifecycle, explain |
-| **Coordinator → Executor** | gRPC | `krishiv-proto` | Task assignment, status reporting, checkpoint ack, barrier injection, heartbeats |
-| **Executor ↔ State** | In-process | `krishiv-state` | StateBackend snapshot/restore |
-| **Executor ↔ Checkpoint** | In-process + filesystem | `krishiv-state::checkpoint` | Write/read epoch snapshots |
-| **Executor ↔ Shuffle** | In-process + filesystem | `krishiv-shuffle` | Shuffle write/read between stages |
-| **All → Wire** | gRPC protobuf | `krishiv-proto` | Typed IDs, fencing tokens, task specs, heartbeat messages |
-
-## Fragment Dispatch Table
-
-The executor dispatches task fragments by prefix matching against the fragment name string.
-
-### Batch fragments (`execute_batch_fragment`)
-
-| Prefix / Condition | Destination | Crate |
-|---|---|---|
-| `sql:` | DataFusion SQL execution | `krishiv-sql` |
-| `window:` | Bounded window aggregation | `krishiv-dataflow` |
-| `shuffle-write:` | Hash-partition to ShuffleBackend | `krishiv-shuffle` |
-| `connector-pipeline:kafka-to-parquet` | Kafka → Parquet sink pipeline | `krishiv-connectors` |
-| `shuffle_read` config (typed) | In-memory shuffle read (R4a) | `krishiv-shuffle` |
-| `shuffle_write` config (typed) | In-memory shuffle write (R4a) | `krishiv-shuffle` |
-
-### Streaming fragments (`execute_streaming_fragment`)
-
-| Prefix | Destination | Crate |
-|---|---|---|
-| `sql:` (streaming) | Streaming SQL via `execute_stream()` | `krishiv-sql` |
-| `stream:tw:` | Tumbling window | `krishiv-dataflow` |
-| `stream:sw:` | Sliding window | `krishiv-dataflow` |
-| `stream:ses:` | Session window | `krishiv-dataflow` |
-| `stream:loop:` | Stateful continuous window loop | `krishiv-dataflow` |
-| `stream-kafka:` | Kafka streaming source | `krishiv-connectors` |
-
-### Input/output partition prefixes
-
-| Prefix | Meaning |
+| Crate | Architectural ownership |
 |---|---|
-| `local-parquet:` | Local filesystem Parquet source |
-| `connector-parquet:` | Connector-provided Parquet source |
-| `object-parquet:` | Object-store Parquet source |
-| `object-parquet-sink:` | Object-store Parquet sink |
-| `parquet-sink:` | Parquet sink |
-| `memory-kafka:` | In-memory Kafka topic (tests) |
+| `krishiv` | CLI and user-facing facade. |
+| `krishiv-api` | Public Rust session, batch, stream, expression, and I/O APIs. |
+| `krishiv-sql` | DataFusion integration, SQL helpers, catalogs, and table providers. |
+| `krishiv-plan` | Logical/physical wrappers, typed task fragments, optimizer and UDF contracts. |
+| `krishiv-runtime` | Embedded/daemon/remote placement and execution routing. |
+| `krishiv-scheduler` | Coordinator state machine, admission, task assignment, checkpoints, recovery, leadership, and metadata stores. |
+| `krishiv-executor` | Replaceable worker process and task-attempt execution. |
+| `krishiv-dataflow` | Arrow operators, bounded queues, barriers, watermarks, windows, joins, sorting, and stateful processing. |
+| `krishiv-shuffle` | Partitioning, compression, spill, tiered storage, transport, metadata, leases, and cleanup. |
+| `krishiv-state` | Keyed state, RocksDB, timers, TTL, snapshots, checkpoints, savepoints, migration, and rescaling. |
+| `krishiv-connectors` | Source/sink contracts, offsets, capabilities, maturity, two-phase commit, file/broker/database connectors, and lakehouse integrations. |
+| `krishiv-proto` | Typed IDs and versioned coordinator/executor wire contracts. |
+| `krishiv-flight-sql` | Arrow Flight SQL service and remote SQL result transport. |
+| `krishiv-operator` | Kubernetes CRDs and reconciliation. |
+| `krishiv-metrics` | Metrics, tracing, and debug-report structures. |
+| `krishiv-ui` | Operational job/executor/checkpoint status surface. |
+| `krishiv-python` | PyO3 bindings over public engine APIs. |
+| `krishiv-bench` | TPC-H/Nexmark and deployment benchmark programs. |
+| `krishiv-common` | Shared durability, async, validation, and fault-injection utilities. |
 
-## Runtime Mode × Placement Matrix
+## 4. Runtime modes and placement
 
-`ExecutionRuntime` is selected by `build_execution_runtime()` based on the `(RuntimeMode, ExecutionPlacement)` pair:
+`ExecutionMode`/`RuntimeMode` describes the user-visible mode.
+`ExecutionPlacement` describes where data-plane work is allowed to run.
 
-| Mode | Placement | Runtime impl | Transport |
-|------|-----------|-------------|-----------|
-| Embedded | LocalInProcess | `InProcessExecutionRuntime::embedded()` | In-process |
-| SingleNode | SingleNodeDaemon | `RemoteExecutionRuntime` (mode=SingleNode) | Flight SQL |
-| Distributed | RemoteClusterRequired | `RemoteExecutionRuntime` (mode=Distributed) | Flight SQL + gRPC |
-| Embedded | *other* | **Error** | — |
-| SingleNode | LocalInProcess or RemoteClusterRequired | **Error** — use Embedded for in-process or SingleNodeDaemon for local daemon | — |
-| Distributed | *other* | **Error** — RemoteClusterRequired is mandatory to prevent silent local fallback | — |
+| Mode | Placement | Control/data path | Required endpoint |
+|---|---|---|---|
+| Embedded | `LocalInProcess` | In-process cluster and DataFusion | None |
+| Single-node | `SingleNodeDaemon` | Local Flight/gRPC daemon | Local coordinator/Flight endpoint |
+| Distributed | `RemoteClusterRequired` | Remote coordinator and executors | Explicit coordinator/Flight endpoint |
 
-## Crate Requirements by Mode
+A distributed session with remote execution disabled is invalid. This fail-closed
+rule prevents tests or production clients from accidentally reporting a remote
+job while executing data locally.
 
-Whether a crate is compiled into the binary depends on Cargo features (set at build time). Whether it is actively needed depends on the runtime mode. The table below covers both dimensions.
+The current `ExecutionRuntime` interface is synchronous. Remote implementations
+use explicit sync-to-async boundaries internally. Checkpoint storage separately
+provides async operations for scheduler/executor paths.
 
-The default preset `local = [embedded, single-node]` compiles all core crates plus `krishiv-shuffle` and `krishiv-flight-sql`. To exclude those, use `cargo build --no-default-features --features embedded`.
+## 5. Query and job lifecycle
 
-| Crate | Embedded | SingleNode | Distributed | Feature gate |
-|---|---|---|---|---|
-| `krishiv-common` | R | R | R | always compiled |
-| `krishiv-proto` | R | R | R | always compiled |
-| `krishiv-plan` | R | R | R | always compiled |
-| `krishiv-sql` | R | R | R | always compiled |
-| `krishiv-api` | R | R | R | always compiled |
-| `krishiv-runtime` | R | R | R | always compiled |
-| `krishiv-scheduler` | R | R | R | always compiled |
-| `krishiv-executor` | R | R | R | always compiled |
-| `krishiv-dataflow` | R | R | R | always compiled |
-| `krishiv-state` | R | R | R | always compiled |
-| `krishiv-connectors` | O | O | O | base always compiled; kafka/iceberg/delta gated |
-| `krishiv-ui` | O | O | O | always compiled; runtime-optional |
-| `krishiv-metrics` | O | O | O | always compiled; runtime-optional |
-| `krishiv-shuffle` | ✗ | R | R | `shuffle` feature |
-| `krishiv-flight-sql` | ✗ | O | R | `flight-sql` feature |
-| `krishiv-operator` | ✗ | ✗ | O | `k8s` feature |
-| `krishiv-ai` | — | — | — | not a dep of the CLI crate |
+### Batch SQL
 
-**Legend:** R = required at runtime, O = optional at runtime (specific workloads), ✗ = excluded from binary by default features, — = unrelated.
+1. A caller creates a `Session` and submits SQL or DataFrame transformations.
+2. `krishiv-sql` uses DataFusion to parse and prepare local plans.
+3. `krishiv-plan` provides engine-owned logical/physical wrappers and versioned
+   task-fragment envelopes.
+4. `krishiv-runtime` either executes locally or forwards SQL and table
+   registrations to the configured remote service.
+5. The coordinator admits the job, creates stages/tasks, assigns attempts, and
+   records fenced state transitions.
+6. Executors run Arrow/DataFusion operators, write shuffle partitions, and
+   return result or sink completion.
+7. Only the winning task attempt may publish scheduler-visible completion.
 
-Notes:
-- Embedded mode with `--no-default-features --features embedded` produces a binary with only core crates (no shuffle, no Flight SQL, no operator).
-- SingleNode needs `krishiv-flight-sql` only for the `SingleNodeDaemon` placement (Flight SQL server). `LocalInProcess` placement works without it.
-- `krishiv-connectors` base crate provides Parquet, object-store, and lakehouse sources/sinks. Kafka, Iceberg, and Delta connectors are feature-gated and excluded from default features.
-- `krishiv-ai` (text embeddings, vector DB sinks) is a standalone crate; the CLI does not depend on it.
+### Stateful streaming
 
-## Durability Profile Spec
+Streaming uses the same job and task machinery with additional contracts:
 
-`DurabilityProfile` (`krishiv-common/src/durability.rs`) selects component backends:
+- replayable/checkpointed source positions;
+- event-time and processing-time timers;
+- watermarks and late-data policy;
+- keyed/operator state;
+- barrier alignment and checkpoint acknowledgements;
+- savepoints and state migration; and
+- sink commit/abort coordination where supported.
 
-| Profile | Metadata | Shuffle | State | Checkpoint | Restart | Multi-node | Fencing |
-|---------|----------|---------|-------|------------|---------|------------|---------|
-| `DevLocal` | In-memory | In-memory | In-memory | Ephemeral local | No | No | No |
-| `SingleNodeDurable` | RocksDB (local file) | Local disk | RocksDB LSM | Local filesystem | Yes | No | No |
-| `DistributedDurable` | etcd (consensus) | Tiered (local + object store) | RocksDB restored from checkpoints | Object store | Yes | Yes | Yes |
+A retry may replay input. The connector capability matrix determines whether the
+observable result is best-effort, at-least-once, effectively-once, or exactly-once.
 
-Resolved at startup from `KRISHIV_DURABILITY_PROFILE` env var via `resolve_durability_profile()`.
+## 6. Planning and compatibility
 
-## Production Backends Per Deployment
+Task work crosses scheduler/executor boundaries as a typed fragment envelope.
+Durable profiles reject legacy untyped fragments. Unknown future envelope
+versions are rejected rather than guessed.
 
-Concrete backend selection for each supported deployment target. `RocksDbStateBackend`
-(`krishiv-state`) is the only operator-state backend; incremental checkpointing
-(`RocksDbIncrementalCheckpointer`) depends on RocksDB SST manifests.
+Persisted state identity is based on:
 
-| Deployment | Metadata | Shuffle | Operator State | Checkpoint | Leadership |
+```text
+(job_id, stable_operator_id, state_name, key_group)
+```
+
+Direct restore requires a matching operator ID, state name, and serializer
+version. Renames or byte-format changes require an explicit migration. The
+compatibility windows for fragments, checkpoints, and savepoints are published
+in `docs/COMPATIBILITY.md`.
+
+## 7. Coordinator and metadata
+
+The scheduler owns:
+
+- job/stage/task/attempt lifecycle;
+- executor registration and heartbeat expiry;
+- admission and queue policy;
+- task assignment and cancellation RPCs;
+- checkpoint epochs and acknowledgements;
+- recovery after coordinator/executor failure;
+- fenced leadership and per-job ownership; and
+- status snapshots used by HTTP/UI surfaces.
+
+Metadata implementations are selected by durability profile:
+
+- memory for development;
+- local RocksDB-backed metadata for durable single-host deployments; and
+- etcd/consensus metadata for distributed durable deployments.
+
+The coordinator launch loop uses notifications rather than a fixed polling-only
+model. Distributed ownership requires fencing tokens/leases so stale
+coordinators cannot commit task or checkpoint state.
+
+## 8. Executor and data plane
+
+Executors receive typed task assignments and run replaceable task attempts.
+Their responsibilities include:
+
+- decoding and validating task fragments;
+- constructing batch or streaming operators;
+- enforcing attempt identity and cancellation;
+- reading sources and writing sinks;
+- producing/fetching shuffle partitions;
+- snapshotting operator state; and
+- reporting heartbeats, task status, checkpoint acknowledgements, and streaming
+  progress.
+
+Blocking filesystem/database work must not be hidden on async executor loops;
+implementations use explicit blocking boundaries where required.
+
+## 9. Shuffle architecture
+
+`krishiv-shuffle` exposes a backend abstraction with:
+
+- in-memory, local-disk, object-store, spillable, and tiered stores;
+- hash, round-robin, broadcast, and range partitioning;
+- Arrow IPC serialization and compression;
+- partition metadata and leases;
+- concurrent partition fetch;
+- orphan scanning/cleanup; and
+- a standalone shuffle service.
+
+`distributed-durable` uses tiered shuffle: local disk is the fast path and object
+storage provides restart/node-loss durability. Object-store-only selection is
+rejected when the profile requires a local tier.
+
+## 10. State, checkpoint, and savepoint architecture
+
+State is namespaced by stable operator identity and supports:
+
+- in-memory and RocksDB backends;
+- batch get/put/delete and namespace inspection;
+- event-time and processing-time timers;
+- TTL;
+- snapshots and incremental RocksDB checkpoints;
+- key groups and rescaling;
+- state migration; and
+- queryable/inspection helpers.
+
+A checkpoint epoch is valid only after required state and metadata are durable
+and its integrity manifest is complete. Checkpoint metadata includes source
+offsets, operator snapshot references, fencing information, and optional
+connector/table commit metadata. Savepoints are retained user-triggered
+checkpoints with versioned metadata.
+
+## 11. Connector architecture
+
+The connector SDK separates:
+
+- `Source`/`DynSource` batch production;
+- `CheckpointSource` offset capture and exact restore;
+- `Sink`/`DynSink` batch consumption and flush;
+- `OffsetCommitter` acknowledgement;
+- `TwoPhaseCommitSink` prepare/commit/abort; and
+- capability and maturity metadata.
+
+Capabilities are necessary but not sufficient for an end-to-end guarantee. For
+example, a transactional sink does not make a non-rewindable source exactly-once.
+Connector maturity is `experimental`, `preview`, or `certified`; certification
+requires the common external failure matrix described in
+`docs/connector-sdk.md`.
+
+Apache Iceberg is the primary lakehouse integration. Delta Lake, Hudi, and vector
+sinks are optional compatibility integrations and are excluded from the standard
+full-engine preset.
+
+## 12. Durability profiles
+
+| Profile | Metadata | Shuffle | State | Checkpoints | Intended use |
 |---|---|---|---|---|---|
-| Single-node (bare-metal / Docker / K8s single-replica) | `RocksDbMetadataStore` | `LocalDiskShuffleStore` | `RocksDbStateBackend` (file-backed) | `LocalFsCheckpointStorage` | `SingleNodeElection` |
-| Distributed bare-metal | `EtcdMetadataStore` | `TieredShuffleStore` (local + S3/MinIO) | `RocksDbStateBackend` + checkpoint restore | `ObjectStoreCheckpointStorage` | `EtcdLeaseElection` |
-| Distributed Docker Compose | `EtcdMetadataStore` | `TieredShuffleStore` + MinIO | `RocksDbStateBackend` (volume) | `ObjectStoreCheckpointStorage` + MinIO | `EtcdLeaseElection` |
-| Distributed K8s direct | `EtcdMetadataStore` | `TieredShuffleStore` + object store | `RocksDbStateBackend` (PVC) | `ObjectStoreCheckpointStorage` | `EtcdLeaseElection` |
-| Distributed K8s operator | `RocksDbMetadataStore` (PVC, single active replica) | `TieredShuffleStore` + object store | `RocksDbStateBackend` (PVC) | `ObjectStoreCheckpointStorage` | `K8sLeaseElection` |
+| `dev-local` | Memory | Memory | Memory | Ephemeral local | Tests and development; not restart durable |
+| `single-node-durable` | Local file/RocksDB | Local disk | Local RocksDB | Local filesystem | One durable host |
+| `distributed-durable` | Distributed consensus | Tiered local + object store | Local RocksDB restored from checkpoints | Object store | Multi-node production with fencing |
 
-Object-store URIs are `s3://` only (`open_shuffle_backend_from_uri`,
-`open_checkpoint_storage_from_uri`): any S3-compatible endpoint works (AWS S3, MinIO,
-GCS/Azure via their S3-compatible interop APIs); native `gs://` / `az://` schemes are
-not implemented.
+A profile is a cross-component contract. Components must fail startup when the
+configured backend cannot satisfy the selected profile.
 
-Enforcement (fail-closed at startup):
+## 13. Security boundaries
 
-- The coordinator auto-selects the metadata backend from the durability profile when
-  `--metadata-backend` is omitted: `dev-local` → in-memory, `single-node-durable` →
-  RocksDB at `/var/lib/krishiv/metadata.db`, `distributed-durable` → **error** unless
-  `--metadata-backend etcd` is explicit (`build_shared_coordinator_sync`). The
-  coordinator's shuffle GC dir auto-defaults to `/var/lib/krishiv/shuffle` under
-  `single-node-durable`.
-- The executor rejects an `s3://` shuffle URI without `--shuffle-dir` under
-  `distributed-durable`: object-store-only shuffle puts a remote round-trip on every
-  partition read; the tiered backend is required (`apply_shuffle_defaults`).
-- The executor's checkpoint URI is profile-driven when `--checkpoint-uri` is omitted:
-  `dev-local` → `memory://`, `single-node-durable` →
-  `file:///var/lib/krishiv/checkpoints`, `distributed-durable` → **error** — shared
-  checkpoint storage must be explicit because node-local checkpoints break recovery
-  on node loss (`apply_checkpoint_default`).
-- The K8s operator row needs no etcd: `K8sLeaseElection` uses the cluster's native
-  lease API for active-passive coordinator HA, and `RocksDbMetadataStore` on a PVC
-  holds metadata as long as a single replica is active.
+Production control-plane paths use bearer-token authentication. Coordinator and
+executor task-control tokens are separate so client-to-coordinator and
+scheduler-to-executor privileges can be rotated independently. Long-lived
+coordinators can reload mounted token files.
 
-etcd backend caveats (`etcd_metadata.rs`): audit events are not persisted
-(`append_event` is a no-op) and continuous-window snapshots are not stored in etcd —
-streaming window-state recovery on distributed deployments relies entirely on
-object-store checkpoints.
+Security-sensitive boundaries include:
 
-## Checkpoint Flow
+- coordinator/executor gRPC authentication and TLS;
+- fencing tokens and lease generations;
+- safe identifier/path validation for shuffle and checkpoint data;
+- connector credentials and credential rotation;
+- UDF execution policy and resource limits; and
+- protected status/UI routes in durable profiles.
 
-```
-Coordinator                    Executor
-───────────                    ────────
-CheckpointCoordinator::try_tick()
-  └─ elapsed >= interval_ms
-       └─ initiate()                 
-            └─ barrier_dispatch        
-                 └─ CheckpointBarrier ──► ExecutorBarrierService (gRPC)
-                                           └─ SharedBarrierInjector
-                                                └─ drain_pending_barriers()
-                                                     └─ initiate_checkpoint_for_job()
-                                                          └─ handle_initiate_checkpoint()
-                                                               ├─ StateBackend::snapshot()
-                                                               └─ CheckpointStorage::write_bytes()
-                                                                    └─ CheckpointAckRequest (gRPC) ──►
-       └─ receive_ack() ◄─────────────────────────────────────────┘
-            └─ pending_acks >= expected_task_count
-                 └─ commit_epoch()
+Vulnerability reporting is documented in `SECURITY.md`.
+
+## 14. Observability
+
+Metrics and tracing cover coordinator, executor, connector, checkpoint, shuffle,
+and streaming progress paths. The operational UI exposes jobs, executors,
+queues, checkpoints, SQL submission, health, readiness, and metrics endpoints.
+
+The engine UI is operational tooling, not a collaborative data-platform
+workspace. Completed-job retention and history-server behavior remain separate
+roadmap items.
+
+## 15. Deployment topology
+
+### Embedded
+
+```text
+application process
+  -> Session
+  -> in-process runtime/coordinator/executor
+  -> local memory/files
 ```
 
-Coordinator background loops (spawned by `SharedCoordinator::spawn_orchestration_loops()`):
+### Single host
 
-| Loop | Interval | Function |
-|------|----------|----------|
-| Heartbeat tick | 5 s | `advance_heartbeat_tick()` — detect lost executors |
-| Task launch | 500 ms | `drive_pending_task_launches()` — push assignments to executors |
-| Barrier dispatch | 2 s | `drive_barrier_dispatches()` — send checkpoint barriers, collect acks |
+```text
+client
+  -> Flight SQL / coordinator daemon
+  -> local executor(s)
+  -> local RocksDB + disk shuffle + filesystem checkpoints
+```
 
-## Key Architectural Decisions
+### Distributed / Kubernetes
 
-1. **One runtime model across modes** — `ExecutionRuntime` trait with `InProcessExecutionRuntime` and `RemoteExecutionRuntime` backends. The same `Session` API works for embedded, single-node, and distributed. `RuntimeMode` and `ExecutionPlacement` are separate enums; invalid combinations are rejected at session build time.
+```text
+clients
+  -> Flight SQL / coordinator service
+  -> fenced coordinator owner per job
+  -> executor pool
+  -> tiered shuffle + local RocksDB state
+  -> object-store checkpoints
+  -> etcd metadata/leases
+```
 
-2. **Coordinator owns job state** — Exactly one active coordinator per job (via fencing tokens). Executors are stateless workers. Task retries and recovery are coordinator-driven.
+Kubernetes supports direct manifests, a CRD/operator path, and a Helm chart.
+Bare-metal deployments use process/systemd management with explicit durable
+paths and backend flags.
 
-3. **Fragment-based dispatch** — Task fragments carry typed prefixes (`sql:`, `shuffle-write:`, `stream:tw:`, etc.) so `ExecutorTaskRunner` does not need a priori knowledge of every fragment kind. New fragment types need only a prefix registration.
+## 16. Extension rules
 
-4. **Durability profiles over feature flags** — Component selection (in-memory vs local file vs object store) is driven by runtime `DurabilityProfile`, not Cargo features. All profiles compile into the same binary.
+- Add compute behavior to the crate that owns the abstraction.
+- Add new wire fields compatibly and version semantic changes.
+- Add stateful operators only with deterministic operator identity and migration
+  behavior.
+- Add connectors through the common SDK and publish capabilities/maturity.
+- Add lakehouse behavior to Iceberg first unless the change is explicitly a
+  compatibility fix for another format.
+- Do not add platform workflow, notebook, billing, or enterprise-governance
+  products to engine crates.
+- Record cross-cutting or irreversible decisions as ADRs under `docs/decisions/`.
 
-5. **Shuffle, state, checkpoint, connectors behind trait abstractions** — Each has a trait (`ShuffleBackend`, `StateBackend`, `CheckpointStorage`, `Source`/`Sink`) with multiple implementations. Executor references them through `Arc<dyn Trait>`.
+## 17. Validation strategy
 
-6. **Checkpoint is a submodule of state** — Both are durability/cold-storage domain. Checkpoint already depended on state; merging removed the circular-ish dependency and simplified the workspace.
+The repository validates architecture at several levels:
 
-7. **Plan is the unified rule/policy crate** — UDF contracts, governance/audit, CEP pattern matching, and optimizer rules all extend the plan layer. They share the same downstream consumers (`krishiv-sql`, `krishiv-scheduler`).
+- crate unit tests for state machines and operator semantics;
+- execution-mode compile matrix for embedded, single-node, bare-metal, and K8s;
+- connector and exactly-once integration tests;
+- bare-metal and kind smoke tests;
+- chaos/fault-injection tests;
+- TPC-H and Nexmark benchmarks; and
+- compatibility fixtures for durable metadata.
 
-## Cross-Cutting Crates
-
-| Crate | Role |
-|---|---|
-| `krishiv-common` | Shared utilities: durability profiles, hashing, async helpers, production env resolution. All crates depend on it. |
-| `krishiv-proto` | All gRPC wire types, typed IDs (JobId, ExecutorId, TaskId, FencingToken), protobuf codegen. |
-| `krishiv-metrics` | Prometheus metrics counters, tracing spans, observability report. Scheduler, executor, and UI consume it. |
-| `krishiv-ai` | Text embeddings (fastembed), vector DB sinks (qdrant, pgvector), RAG pipeline helpers. |
-| `krishiv-ui` | Axum web server with htmx templates: jobs list, executor detail, checkpoint timeline, DAG visualization, auto-refresh. |
-| `krishiv-operator` | Kubernetes CRD controller, pod lifecycle manager, env-var allow-listing, bearer-token mounting. |
-| `krishiv-bench` | Criterion benchmarks (TPC-H SF10, Nexmark). Not in default-members. |
+See `CONTRIBUTING.md`, `docs/BENCHMARKING.md`, and `docs/RELEASE.md` for commands
+and release gates.

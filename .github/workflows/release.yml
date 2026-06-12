@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld protobuf-compiler
+      - name: Validate tag and project metadata
+        run: python3 scripts/check_release.py --tag "${GITHUB_REF_NAME}"
+      - name: Build standard engine binary
+        run: cargo build -p krishiv --release --features full
+      - name: Package and checksum
+        run: |
+          mkdir -p dist/krishiv-${GITHUB_REF_NAME}-x86_64-linux
+          cp target/release/krishiv README.md LICENSE dist/krishiv-${GITHUB_REF_NAME}-x86_64-linux/
+          tar -C dist -czf dist/krishiv-${GITHUB_REF_NAME}-x86_64-linux.tar.gz krishiv-${GITHUB_REF_NAME}-x86_64-linux
+          sha256sum dist/krishiv-${GITHUB_REF_NAME}-x86_64-linux.tar.gz > dist/krishiv-${GITHUB_REF_NAME}-x86_64-linux.tar.gz.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

@@ -11,6 +11,7 @@
 
 // Declared here:
 pub mod checkpoint;
+pub mod compatibility;
 pub mod incremental;
 pub mod key_group;
 pub mod migration;
@@ -40,6 +41,7 @@ pub use checkpoint::{
     EphemeralCheckpointStorage, LocalFsCheckpointStorage, ObjectStoreCheckpointStorage,
     open_checkpoint_storage_from_uri,
 };
+pub use compatibility::OperatorStateDescriptor;
 pub use error::{StateError, StateResult};
 pub use incremental_checkpoint::{
     EpochMetaFile, RocksDbIncrementalCheckpointer, SstEpochManifest, SstFileRef,
@@ -56,7 +58,7 @@ pub use processing_time::{
 pub use queryable::{QueryableStateHandle, QueryableStateStore};
 /// Primary state backend — RocksDB-backed LSM-tree, ephemeral or file-backed.
 pub use rocksdb_backend::RocksDbStateBackend;
-pub use savepoint::{SavepointCoordinator, SavepointMeta};
+pub use savepoint::{SAVEPOINT_FORMAT_VERSION, SavepointCoordinator, SavepointMeta};
 pub use snapshot::{SnapshotEntry, decode_snapshot_entries};
 pub use timer::{InMemoryTimerService, TimerKey, TimerService};
 pub use ttl::{TtlConfig, TtlStateBackend};
