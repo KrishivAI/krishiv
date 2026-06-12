@@ -839,6 +839,18 @@ pub fn parse_coordinator_daemon_config(
     if config.leader_lease_duration_s == 0 {
         return Err("--leader-lease-secs must be greater than zero".into());
     }
+    // Profile-driven default, matching the executor's shuffle dir so the
+    // coordinator's shuffle GC watches the same directory.
+    if config.shuffle_dir.is_none()
+        && config.durability_profile == DurabilityProfile::SingleNodeDurable
+    {
+        let dir = PathBuf::from("/var/lib/krishiv/shuffle");
+        tracing::info!(
+            path = %dir.display(),
+            "single-node-durable: auto-selecting shuffle dir (set --shuffle-dir to override)"
+        );
+        config.shuffle_dir = Some(dir);
+    }
     validate_durability_profile_config(&config)?;
     Ok(config)
 }
@@ -1381,7 +1393,7 @@ mod parse_tests {
 
     #[test]
     fn parses_single_node_durable_profile_with_required_local_storage() {
-        // single-node-durable requires redb (not json) for crash-recovery.
+        // single-node-durable requires rocksdb (not json) for crash-recovery.
         let config = parse_coordinator_daemon_config([
             String::from("--durability-profile"),
             String::from("single-node-durable"),
@@ -1423,16 +1435,18 @@ mod parse_tests {
     #[test]
     fn single_node_durable_allows_omitted_metadata_backend_for_auto_selection() {
         // build_shared_coordinator_sync auto-selects rocksdb at the default
-        // path when no backend is given under single-node-durable.
+        // path when no backend is given; shuffle dir auto-defaults at parse.
         let config = parse_coordinator_daemon_config([
             String::from("--durability-profile"),
             String::from("single-node-durable"),
-            String::from("--shuffle-dir"),
-            String::from("/tmp/krishiv-shuffle"),
         ])
         .unwrap();
         assert!(config.metadata_backend.is_none());
         assert!(config.metadata_path.is_none());
+        assert_eq!(
+            config.shuffle_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/krishiv/shuffle"))
+        );
     }
 
     #[test]

@@ -54,7 +54,8 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
         durability_profile,
     )?;
     let state_dir = apply_state_default(config.state_dir.clone(), durability_profile)?;
-    let checkpoint_uri = config.checkpoint_uri.clone();
+    let checkpoint_uri =
+        apply_checkpoint_default(config.checkpoint_uri.clone(), durability_profile)?;
     let slots = config.slots;
     let mut runtime = ExecutorRuntime::new(config.into_executor_config()?);
 
@@ -305,7 +306,7 @@ async fn heartbeat_loop(
             barrier_injector.clone(),
             runtime.config().executor_id().as_str(),
         )
-        .with_state_backend_kind("fjall")
+        .with_state_backend_kind("rocksdb")
         .with_key_group_ranges(key_group_ranges.clone())
         .with_ack_registry(barrier_ack_registry.clone())
         .with_auth_config(task_auth);
@@ -647,13 +648,14 @@ struct ExecutorCliConfig {
     /// Reads `KRISHIV_SHUFFLE_URI`.
     shuffle_uri: Option<String>,
     /// Root directory for durable window operator state.
-    /// When set, continuous window operators use file-backed Fjall state instead
-    /// of ephemeral (in-memory) state, surviving executor restarts.
+    /// When set, continuous window operators use file-backed RocksDB state
+    /// instead of ephemeral (in-memory) state, surviving executor restarts.
     /// Reads `KRISHIV_STATE_DIR` env var; set automatically for durable profiles.
     state_dir: Option<std::path::PathBuf>,
     /// Checkpoint storage URI (filesystem path or `s3://`, `memory://`, …).
-    /// Defaults to `KRISHIV_CHECKPOINT_STORAGE` then `file:///var/lib/krishiv/checkpoints`.
-    checkpoint_uri: String,
+    /// Reads `KRISHIV_CHECKPOINT_STORAGE`; when unset the durability profile
+    /// selects a default (see `apply_checkpoint_default`).
+    checkpoint_uri: Option<String>,
     /// Durability profile — controls which backends are required/auto-selected.
     /// Reads `KRISHIV_DURABILITY_PROFILE` env var; default is `dev-local`.
     durability_profile: DurabilityProfile,
@@ -708,7 +710,8 @@ impl ExecutorCliConfig {
                 .ok()
                 .map(std::path::PathBuf::from),
             checkpoint_uri: env::var("KRISHIV_CHECKPOINT_STORAGE")
-                .unwrap_or_else(|_| String::from("file:///var/lib/krishiv/checkpoints")),
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             durability_profile: env::var("KRISHIV_DURABILITY_PROFILE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -789,7 +792,8 @@ impl ExecutorCliConfig {
                     config.shuffle_uri = if value.is_empty() { None } else { Some(value) };
                 }
                 "--checkpoint-uri" => {
-                    config.checkpoint_uri = next_arg(&mut args, "--checkpoint-uri")?;
+                    let value = next_arg(&mut args, "--checkpoint-uri")?;
+                    config.checkpoint_uri = if value.is_empty() { None } else { Some(value) };
                 }
                 "--state-dir" => {
                     let value = next_arg(&mut args, "--state-dir")?;
@@ -869,14 +873,15 @@ impl ExecutorCliConfig {
     }
 
     fn validate_durable_startup(&self) -> crate::ExecutorResult<()> {
-        if !krishiv_common::allows_memory_checkpoint_uri(self.durability_profile)
-            && self.checkpoint_uri.trim().starts_with("memory://")
+        if let Some(uri) = self.checkpoint_uri.as_deref()
+            && !krishiv_common::allows_memory_checkpoint_uri(self.durability_profile)
+            && uri.trim().starts_with("memory://")
         {
             return Err(crate::ExecutorError::LocalExecution {
                 message: format!(
-                    "checkpoint URI '{}' is forbidden for durability profile '{}'; \
+                    "checkpoint URI '{uri}' is forbidden for durability profile '{}'; \
                      use a file:// or s3:// URI",
-                    self.checkpoint_uri, self.durability_profile
+                    self.durability_profile
                 ),
             });
         }
@@ -911,7 +916,7 @@ impl ExecutorCliConfig {
            --barrier-grpc-addr <ADDR>   Barrier gRPC server address (default: KRISHIV_BARRIER_GRPC_ADDR or 0.0.0.0:50056; use 'off' to disable)\n\
            --shuffle-dir <DIR>          On-disk shuffle store directory (also KRISHIV_SHUFFLE_DIR)\n\
            --shuffle-uri <URI>          Shuffle storage URI: file://path, s3://bucket/prefix (KRISHIV_SHUFFLE_URI)\n\
-           --checkpoint-uri <URI>       Checkpoint storage URI: file://path, s3://bucket/prefix, memory:// (default: KRISHIV_CHECKPOINT_STORAGE or file:///var/lib/krishiv/checkpoints)\n\
+           --checkpoint-uri <URI>       Checkpoint storage URI: file://path, s3://bucket/prefix, memory:// (default: KRISHIV_CHECKPOINT_STORAGE, else selected by durability profile)\n\
            \n\
          Security:\n\
            Set KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH=true and non-empty KRISHIV_EXECUTOR_TASK_BEARER_TOKEN for distributed task-control gRPC.\n\
@@ -999,6 +1004,43 @@ fn apply_state_default(
                 message: String::from(
                     "durability-profile=distributed-durable requires --state-dir \
                      (set KRISHIV_STATE_DIR or pass --state-dir <path>)",
+                ),
+            })
+        }
+    }
+}
+
+/// Apply checkpoint-URI defaults driven by the durability profile.
+///
+/// | Profile             | Explicit URI | Result                                       |
+/// |---------------------|--------------|----------------------------------------------|
+/// | DevLocal            | any          | use as-is (None = `memory://`, ephemeral)    |
+/// | SingleNodeDurable   | None         | auto: `file:///var/lib/krishiv/checkpoints`  |
+/// | DistributedDurable  | None         | **error** — shared storage must be explicit  |
+fn apply_checkpoint_default(
+    explicit: Option<String>,
+    profile: DurabilityProfile,
+) -> crate::ExecutorResult<String> {
+    match (explicit, profile) {
+        (Some(uri), _) => Ok(uri),
+        (None, DurabilityProfile::DevLocal) => Ok(String::from("memory://")),
+        (None, DurabilityProfile::SingleNodeDurable) => {
+            let uri = String::from("file:///var/lib/krishiv/checkpoints");
+            tracing::info!(
+                uri = %uri,
+                "single-node-durable: auto-selecting checkpoint storage \
+                 (set --checkpoint-uri to override)"
+            );
+            Ok(uri)
+        }
+        // Node-local checkpoint storage breaks recovery on node loss; the
+        // operator must point all executors at the same shared storage.
+        (None, DurabilityProfile::DistributedDurable) => {
+            Err(crate::ExecutorError::LocalExecution {
+                message: String::from(
+                    "durability-profile=distributed-durable requires --checkpoint-uri with \
+                     shared storage reachable by every executor, e.g. s3://bucket/checkpoints \
+                     (set KRISHIV_CHECKPOINT_STORAGE or pass --checkpoint-uri <uri>)",
                 ),
             })
         }
@@ -1332,13 +1374,36 @@ mod tests {
             String::from("s3://bucket/prefix"),
         ])
         .unwrap();
-        assert_eq!(config.checkpoint_uri, "s3://bucket/prefix");
+        assert_eq!(config.checkpoint_uri.as_deref(), Some("s3://bucket/prefix"));
     }
 
     #[test]
-    fn default_checkpoint_uri() {
+    fn checkpoint_uri_defaults_by_profile() {
+        use krishiv_common::durability::DurabilityProfile;
+        // No flag parsed -> None until the profile default is applied.
         let config = ExecutorCliConfig::parse(std::iter::empty::<String>()).unwrap();
-        assert_eq!(config.checkpoint_uri, "file:///var/lib/krishiv/checkpoints");
+        assert!(config.checkpoint_uri.is_none());
+
+        assert_eq!(
+            super::apply_checkpoint_default(None, DurabilityProfile::DevLocal).unwrap(),
+            "memory://"
+        );
+        assert_eq!(
+            super::apply_checkpoint_default(None, DurabilityProfile::SingleNodeDurable).unwrap(),
+            "file:///var/lib/krishiv/checkpoints"
+        );
+        let err = super::apply_checkpoint_default(None, DurabilityProfile::DistributedDurable)
+            .unwrap_err();
+        assert!(err.to_string().contains("--checkpoint-uri"), "got: {err}");
+        // Explicit URIs always win.
+        assert_eq!(
+            super::apply_checkpoint_default(
+                Some(String::from("s3://bucket/cp")),
+                DurabilityProfile::DistributedDurable
+            )
+            .unwrap(),
+            "s3://bucket/cp"
+        );
     }
 
     #[test]

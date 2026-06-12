@@ -1,5 +1,46 @@
 # Krishiv Implementation Status
 
+## Gap closure: profile-driven checkpoints + merge with main (2026-06-12)
+
+### Done
+
+Implemented improvement #10 (see `docs/implementation/architecture_improvements.md`)
+and merged `origin/main` (PR #67 squash + examples lockfile) into the branch.
+
+- **Profile-driven checkpoint default** (`apply_checkpoint_default`, executor CLI):
+  `ExecutorCliConfig.checkpoint_uri` is now `Option<String>`. With no explicit URI:
+  `dev-local` → `memory://`, `single-node-durable` → `file:///var/lib/krishiv/checkpoints`,
+  `distributed-durable` → startup **error** (node-local checkpoints break recovery on
+  node loss; shared storage must be explicit). Closes the gap where distributed
+  executors silently checkpointed to local disk.
+- **Checkpoint metadata label fixed**: `with_state_backend_kind("fjall")` → `"rocksdb"`
+  (the label is stamped into every checkpoint ack's `StateHandle.backend_kind`).
+- **Coordinator shuffle-dir auto-default**: `single-node-durable` now auto-selects
+  `/var/lib/krishiv/shuffle` for the coordinator's shuffle GC instead of erroring,
+  matching the executor's default.
+- **Doc corrections**: object-store URIs documented as `s3://`-only (S3-compatible
+  endpoints; no native `gs://`/`az://`); etcd caveats documented (audit events and
+  continuous-window snapshots not persisted); stale `--features redb` comments removed
+  from `local_cluster.rs`.
+- **Workspace `cargo fmt`** applied (separate commit) to clear pre-existing drift.
+
+### Validation
+```bash
+cargo check --workspace               # clean
+cargo test -p krishiv-executor --lib  # 184 passed
+cargo test -p krishiv-scheduler --lib # 294 passed
+cargo fmt --check                     # clean
+```
+
+### Blockers
+None. PR #67 is merged/closed — the updated branch needs a new PR.
+
+### Next useful task
+Async-trait migration for `MetadataStore`/`CheckpointStorage` (tracker #6) — the one
+remaining structural item.
+
+---
+
 ## Backend consolidation: production-ready backends per deployment (2026-06-12)
 
 ### Done

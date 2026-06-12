@@ -214,7 +214,6 @@ fn run_local_start(args: &[&str]) -> CliResponse {
 
     fs::create_dir_all(&data_dir).ok();
 
-    let _meta_path = data_dir.join("coordinator-meta.json"); // reserved for --features redb
     let free_grpc_port = match get_free_port(9090) {
         Some(port) => port,
         None => return CliResponse::err(String::from("failed to find free gRPC port\n"), 1),
@@ -226,8 +225,8 @@ fn run_local_start(args: &[&str]) -> CliResponse {
     };
 
     // dev-local: InMemoryMetadataStore (no --metadata-backend flag needed).
-    // For durable single-node use --durability-profile single-node-durable and
-    // build with --features redb.
+    // For durable single-node pass --durability-profile single-node-durable;
+    // the daemon then auto-selects RocksDB metadata at /var/lib/krishiv.
     let coordinator_pid = match spawn_krishiv_daemon(
         "coordinator",
         &[

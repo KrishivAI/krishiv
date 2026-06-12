@@ -170,6 +170,32 @@ no fencing) despite being intended as a production bare-metal artifact.
 
 ---
 
+## #10 — Remaining gap closure: profile-driven checkpoints + leftovers ✅ DONE
+
+**Problems fixed:**
+- **Distributed-durable accepted node-local checkpoints**: the executor's checkpoint URI
+  default was static (`file:///var/lib/krishiv/checkpoints`) regardless of profile, so a
+  distributed executor omitting `--checkpoint-uri` silently wrote checkpoints to its own
+  disk — breaking recovery on node loss. New `apply_checkpoint_default`: `dev-local` →
+  `memory://`, `single-node-durable` → `file:///var/lib/krishiv/checkpoints`,
+  `distributed-durable` → startup **error** requiring explicit shared storage.
+- **Stale `"fjall"` backend label** stamped into every checkpoint ack's
+  `StateHandle.backend_kind` (`executor/cli.rs`) — now `"rocksdb"`.
+- **Coordinator/executor asymmetry**: coordinator now auto-defaults `--shuffle-dir` to
+  `/var/lib/krishiv/shuffle` under `single-node-durable` (was a hard error), matching the
+  executor, so shuffle GC watches the same directory.
+- Stale `--features redb` comments in `krishiv/src/local_cluster.rs` (feature never
+  existed); stale Fjall doc comment in executor CLI.
+- Docs: documented `s3://`-only object-store scheme support (S3-compatible endpoints;
+  no native `gs://`/`az://`), the etcd backend caveats (audit events and
+  continuous-window snapshots not persisted), and the new checkpoint enforcement.
+
+**Still deferred:** #6 (async `MetadataStore`/`CheckpointStorage` traits) — works
+correctly today via `block_in_place` on the multi-thread runtime; flipping the traits is
+a dedicated-session refactor across 4 impls and all call sites.
+
+---
+
 ## Validation commands
 
 ```bash
