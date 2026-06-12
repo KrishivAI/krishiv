@@ -1,19 +1,28 @@
 ## Summary
 
-<!-- What changed and why -->
+<!-- What problem does this solve, and why is this design appropriate? -->
 
-## Gap / tracker references
+## Architecture and compatibility
 
-<!-- e.g. GAP-C1, GAP-C10, docs/implementation/status.md -->
+<!-- Crate ownership, ADR, API/wire/state/checkpoint/savepoint/connector impact. -->
 
 ## Validation
 
 ```bash
-# Commands run and results
+# Exact commands and results
 ```
+
+## Performance evidence
+
+<!-- Required for performance claims; link the benchmark manifest and raw output. -->
 
 ## Checklist
 
-- [ ] Updated `docs/implementation/status.md` when behavior or scope changed
-- [ ] Added or updated tests for new behavior
-- [ ] `cargo test` / `cargo clippy` commands recorded above
+- [ ] The change stays inside the compute-engine boundary in `docs/architecture.md`
+- [ ] Focused tests cover behavior and important failure paths
+- [ ] Public or durable compatibility changes are documented in `CHANGELOG.md` and `docs/COMPATIBILITY.md`
+- [ ] Connector guarantees and maturity remain conservative and combination-specific
+- [ ] Documentation and an ADR were updated when architecture or contracts changed
+- [ ] `docs/implementation/status.md` was updated for a substantial implementation session
+- [ ] Exact validation commands and any environment limitations are recorded above
+- [ ] No secrets, private endpoints, generated build output, or unrelated changes are included

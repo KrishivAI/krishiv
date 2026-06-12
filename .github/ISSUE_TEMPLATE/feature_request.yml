@@ -1,0 +1,36 @@
+name: Engine feature request
+description: Propose a capability for the open-source compute engine
+title: "feature: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Compute-engine problem
+      description: Describe the user problem, not only the desired API.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Why this belongs in the engine
+      description: Explain why this is not a workspace, catalog product, notebook, billing, governance portal, or other data-platform concern.
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Proposed contract and alternatives
+    validations:
+      required: true
+  - type: checkboxes
+    id: impact
+    attributes:
+      label: Impacted surfaces
+      options:
+        - label: Public Rust/Python/SQL API
+        - label: Plan or wire protocol
+        - label: Checkpoint, savepoint, or operator state
+        - label: Connector guarantees
+        - label: Scheduler/executor behavior
+        - label: Performance or resource use

@@ -1,0 +1,22 @@
+name: Project hygiene
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  docs-and-release-metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - name: Test project scripts
+        run: python3 -m unittest discover -s scripts/tests -v
+      - name: Check repository-local Markdown links
+        run: python3 scripts/check_markdown_links.py
+      - name: Validate release metadata
+        run: python3 scripts/check_release.py

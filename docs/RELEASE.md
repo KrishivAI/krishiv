@@ -1,63 +1,39 @@
 # Release Process
 
-## Version scheme
+Krishiv uses semantic versions. Before 1.0, minor versions may include documented
+breaking API changes; durable metadata compatibility follows
+[`COMPATIBILITY.md`](COMPATIBILITY.md), not an assumption based only on package
+version.
 
-Krishiv uses [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`).
+## Release checklist
 
-| Change type | Version bump |
-|-------------|-------------|
-| Breaking public API change | `MAJOR` |
-| Backward-compatible new feature or behaviour change | `MINOR` |
-| Bug fix, dependency update, docs, refactoring | `PATCH` |
+1. Select a clean commit from `main` and confirm all required CI jobs pass.
+2. Update `CHANGELOG.md`: move relevant Unreleased entries under a dated version
+   heading and leave an empty Unreleased section.
+3. Update compatibility, migration, and connector maturity documentation.
+4. Run the project checks and mode matrix:
 
-Pre-1.0 (current): `0.MINOR.PATCH` — minor bumps may include breaking changes.
-Starting at `1.0.0`, the standard semver stability guarantees apply.
+   ```bash
+   just project-check
+   cargo fmt --all --check
+   just check
+   cargo test --workspace --lib
+   ```
 
-## Checklist before cutting a release
+5. Update `[workspace.package].version` and regenerate `Cargo.lock` with Cargo.
+6. Validate metadata with `python3 scripts/check_release.py`.
+7. Commit the version bump and create an annotated `vMAJOR.MINOR.PATCH` tag.
+8. Push the commit and tag. The release workflow validates tag/version agreement,
+   builds the standard binary, and uploads a checksummed archive to the GitHub
+   release.
+9. Smoke-test the archive and publish release notes with compatibility and known
+   limitations.
 
-1. All CI checks pass on `main` (`cargo check --workspace`, `cargo test --workspace --lib`, `cargo clippy --workspace`).
-2. `cargo fmt --check` passes.
-3. `docs/implementation/status.md` reflects the current implementation state.
-4. `CHANGELOG.md` (if maintained) has an `## Unreleased` section converted to the new version heading.
+Crate publication is not automated yet. Do not claim crates.io availability
+until package metadata, publication order, and a dry-run publish gate are added.
 
-## Tagging a release
+## Hotfixes
 
-Use the `just release` recipe:
-
-```bash
-VERSION=0.2.0 just release
-git push && git push --tags
-```
-
-This:
-1. Updates `version = "…"` in `Cargo.toml` (workspace root).
-2. Runs `cargo check --workspace` to verify no breakage.
-3. Commits `Cargo.toml` + `Cargo.lock` with message `chore: bump version to X.Y.Z`.
-4. Creates an annotated tag `vX.Y.Z`.
-
-## CI gate matrix
-
-CI enforces the following on every PR and push to `main`:
-
-| Job | What it checks |
-|-----|---------------|
-| `fmt-lint` | `cargo fmt --check`, `cargo clippy -D warnings` |
-| `check (embedded)` | `cargo check -p krishiv --features embedded` |
-| `check (single-node)` | `cargo check -p krishiv --features single-node` |
-| `check (bare-metal)` | `cargo check -p krishiv --features bare-metal` |
-| `check (k8s)` | `cargo check -p krishiv -p krishiv-operator --features k8s` |
-| `test` | `cargo test --workspace --lib` (excludes python, chaos) |
-| `bench` | `cargo bench -p krishiv-bench` (stores baseline on main, compares on PRs) |
-
-## Benchmark baselines
-
-Criterion baselines are stored in `target/criterion/` and cached by CI under the key
-`bench-baseline-main-<SHA>`. PRs automatically compare against the most recent `main`
-baseline. A regression is a warning, not a hard failure — the comparison output is
-uploaded as an artifact for manual review.
-
-To update a local baseline after intentional performance improvements:
-
-```bash
-just bench-save main
-```
+Branch from the affected release tag, make the smallest safe change, run the
+same validation, and release a patch version. Document whether checkpoint,
+savepoint, or connector behavior changes.
