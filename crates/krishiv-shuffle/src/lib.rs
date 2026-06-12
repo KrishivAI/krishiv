@@ -53,7 +53,7 @@ pub use orphan::{cleanup_orphans, scan_orphans};
 pub use partitioner::HashPartitioner;
 pub use range_partitioner::{RangeBound, RangePartitioner, RangeSampler};
 pub use path::ShufflePath;
-pub use storage_uri::open_shuffle_backend_from_uri;
+pub use storage_uri::{open_shuffle_backend_from_uri, open_tiered_shuffle_backend};
 pub use spillable::SpillableShuffleBackend;
 pub use store::{PartitionId, ShuffleBackend, ShufflePartition, ShuffleStore, ShuffleStream};
 pub use tiered_store::TieredShuffleStore;

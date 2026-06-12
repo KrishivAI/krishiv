@@ -21,6 +21,7 @@ use krishiv_common::durability::DurabilityProfile;
 use krishiv_proto::{InitiateCheckpointRequest, JobId, TaskAttemptRef};
 use krishiv_shuffle::{
     InMemoryShuffleStore, LocalDiskShuffleStore, ShuffleBackend, open_shuffle_backend_from_uri,
+    open_tiered_shuffle_backend,
 };
 use krishiv_state::FjallStateBackend;
 use krishiv_state::checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
@@ -349,8 +350,17 @@ async fn heartbeat_loop(
         runner_builder = runner_builder.with_state_dir(dir.clone());
     }
     if let Some(uri) = shuffle_uri {
-        let backend = open_shuffle_backend_from_uri(&uri, durability_profile)
-            .map_err(|e| format!("shuffle URI {uri}: {e}"))?;
+        // When both a local shuffle-dir and an s3:// URI are set, build a tiered
+        // backend: local disk for fast P2P reads, object store for durability.
+        // This is the preferred topology for distributed-durable deployments.
+        let backend = if uri.starts_with("s3://") && shuffle_dir.is_some() {
+            let local_dir = shuffle_dir.as_deref().expect("checked above");
+            open_tiered_shuffle_backend(local_dir, &uri)
+                .map_err(|e| format!("tiered shuffle (local={} s3={uri}): {e}", local_dir.display()))?
+        } else {
+            open_shuffle_backend_from_uri(&uri, durability_profile)
+                .map_err(|e| format!("shuffle URI {uri}: {e}"))?
+        };
         match backend.as_ref() {
             ShuffleBackend::Local(disk) => {
                 let bind: SocketAddr = "0.0.0.0:0"
@@ -366,7 +376,7 @@ async fn heartbeat_loop(
                     std::path::PathBuf::from(if uri.starts_with("file://") {
                         uri.strip_prefix("file://").unwrap_or(&uri)
                     } else {
-                        "/tmp/krishiv-shuffle"
+                        "/var/lib/krishiv/shuffle"
                     })
                 });
                 runner_builder = runner_builder
@@ -638,7 +648,7 @@ struct ExecutorCliConfig {
     /// Reads `KRISHIV_STATE_DIR` env var; set automatically for durable profiles.
     state_dir: Option<std::path::PathBuf>,
     /// Checkpoint storage URI (filesystem path or `s3://`, `memory://`, …).
-    /// Defaults to `KRISHIV_CHECKPOINT_STORAGE` then `file:///tmp/krishiv-checkpoints`.
+    /// Defaults to `KRISHIV_CHECKPOINT_STORAGE` then `file:///var/lib/krishiv/checkpoints`.
     checkpoint_uri: String,
     /// Durability profile — controls which backends are required/auto-selected.
     /// Reads `KRISHIV_DURABILITY_PROFILE` env var; default is `dev-local`.
@@ -694,7 +704,7 @@ impl ExecutorCliConfig {
                 .ok()
                 .map(std::path::PathBuf::from),
             checkpoint_uri: env::var("KRISHIV_CHECKPOINT_STORAGE")
-                .unwrap_or_else(|_| String::from("file:///tmp/krishiv-checkpoints")),
+                .unwrap_or_else(|_| String::from("file:///var/lib/krishiv/checkpoints")),
             durability_profile: env::var("KRISHIV_DURABILITY_PROFILE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -897,7 +907,7 @@ impl ExecutorCliConfig {
            --barrier-grpc-addr <ADDR>   Barrier gRPC server address (default: KRISHIV_BARRIER_GRPC_ADDR or 0.0.0.0:50056; use 'off' to disable)\n\
            --shuffle-dir <DIR>          On-disk shuffle store directory (also KRISHIV_SHUFFLE_DIR)\n\
            --shuffle-uri <URI>          Shuffle storage URI: file://path, s3://bucket/prefix (KRISHIV_SHUFFLE_URI)\n\
-           --checkpoint-uri <URI>       Checkpoint storage URI: file://path, s3://bucket/prefix, memory:// (default: KRISHIV_CHECKPOINT_STORAGE or file:///tmp/krishiv-checkpoints)\n\
+           --checkpoint-uri <URI>       Checkpoint storage URI: file://path, s3://bucket/prefix, memory:// (default: KRISHIV_CHECKPOINT_STORAGE or file:///var/lib/krishiv/checkpoints)\n\
            \n\
          Security:\n\
            Set KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH=true and non-empty KRISHIV_EXECUTOR_TASK_BEARER_TOKEN for distributed task-control gRPC.\n\
@@ -926,7 +936,7 @@ fn apply_shuffle_defaults(
         (Some(dir), _) => Ok((Some(dir), None)),
         (None, DurabilityProfile::DevLocal) => Ok((None, None)),
         (None, DurabilityProfile::SingleNodeDurable) => {
-            let dir = std::path::PathBuf::from("/tmp/krishiv-shuffle");
+            let dir = std::path::PathBuf::from("/var/lib/krishiv/shuffle");
             tracing::info!(
                 path = %dir.display(),
                 "single-node-durable: auto-selecting shuffle dir (set --shuffle-dir to override)"
@@ -949,7 +959,7 @@ fn apply_shuffle_defaults(
 /// | Profile             | Explicit flag | Result                          |
 /// |---------------------|---------------|---------------------------------|
 /// | DevLocal            | any           | use as-is (None = ephemeral OK) |
-/// | SingleNodeDurable   | None          | auto: `/tmp/krishiv-state`      |
+/// | SingleNodeDurable   | None          | auto: `/var/lib/krishiv/state`  |
 /// | DistributedDurable  | None          | **error** — must be explicit    |
 fn apply_state_default(
     explicit: Option<std::path::PathBuf>,
@@ -959,7 +969,7 @@ fn apply_state_default(
         (Some(dir), _) => Ok(Some(dir)),
         (None, DurabilityProfile::DevLocal) => Ok(None),
         (None, DurabilityProfile::SingleNodeDurable) => {
-            let dir = std::path::PathBuf::from("/tmp/krishiv-state");
+            let dir = std::path::PathBuf::from("/var/lib/krishiv/state");
             tracing::info!(
                 path = %dir.display(),
                 "single-node-durable: auto-selecting state dir (set --state-dir to override)"
@@ -1310,7 +1320,7 @@ mod tests {
     #[test]
     fn default_checkpoint_uri() {
         let config = ExecutorCliConfig::parse(std::iter::empty::<String>()).unwrap();
-        assert_eq!(config.checkpoint_uri, "file:///tmp/krishiv-checkpoints");
+        assert_eq!(config.checkpoint_uri, "file:///var/lib/krishiv/checkpoints");
     }
 
     #[test]

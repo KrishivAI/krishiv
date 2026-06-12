@@ -279,18 +279,21 @@ pub(crate) async fn write_object_parquet_sink(
 ///
 /// Multiple partitions sharing the same table name are merged so the engine sees
 /// one logical table regardless of how many physical shuffle partitions were read.
+/// All partitions are fetched concurrently; the first error aborts the remaining
+/// fetches.
 pub(crate) async fn read_shuffle_flight_partitions(
     partitions: &[krishiv_proto::InputPartition],
 ) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
     use std::collections::BTreeMap;
 
+    use futures::StreamExt as _;
+    use futures::stream::FuturesUnordered;
     use krishiv_shuffle::flight::FlightShuffleClient;
 
-    let mut table_batches: BTreeMap<String, Vec<arrow::record_batch::RecordBatch>> =
-        BTreeMap::new();
-
-    for partition in partitions {
-        let (table_name, flight_endpoint, job_id, upstream_stage_id, partition_id) =
+    // Collect the flight-fetch futures for all shuffle-flight partitions.
+    let fetches: FuturesUnordered<_> = partitions
+        .iter()
+        .filter_map(|partition| {
             match partition.descriptor() {
                 Some(InputPartitionDescriptor::ShuffleFlight {
                     table_name,
@@ -298,29 +301,40 @@ pub(crate) async fn read_shuffle_flight_partitions(
                     job_id,
                     upstream_stage_id,
                     partition_id,
-                }) => (
+                }) => Some((
                     table_name.clone(),
                     flight_endpoint.clone(),
                     job_id.clone(),
                     upstream_stage_id.clone(),
                     *partition_id,
+                )),
+                Some(_) | None => None,
+            }
+        })
+        .map(|(table_name, flight_endpoint, job_id, upstream_stage_id, partition_id)| async move {
+            let batches = FlightShuffleClient::fetch(
+                &flight_endpoint,
+                job_id.as_str(),
+                upstream_stage_id.as_str(),
+                partition_id,
+            )
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!(
+                    "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
+                     stage={upstream_stage_id} partition={partition_id}): {e}"
                 ),
-                Some(_) | None => continue,
-            };
+            })?;
+            Ok::<_, ExecutorError>((table_name, batches))
+        })
+        .collect();
 
-        let batches = FlightShuffleClient::fetch(
-            &flight_endpoint,
-            job_id.as_str(),
-            upstream_stage_id.as_str(),
-            partition_id,
-        )
-        .await
-        .map_err(|e| ExecutorError::LocalExecution {
-            message: format!(
-                "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
-                 stage={upstream_stage_id} partition={partition_id}): {e}"
-            ),
-        })?;
+    // Drive all fetches concurrently and merge results by table name.
+    let mut table_batches: BTreeMap<String, Vec<arrow::record_batch::RecordBatch>> =
+        BTreeMap::new();
+    let mut stream = fetches;
+    while let Some(result) = stream.next().await {
+        let (table_name, batches) = result?;
         table_batches.entry(table_name).or_default().extend(batches);
     }
 

@@ -51,7 +51,9 @@ impl DurabilityProfile {
             Self::DistributedDurable => DurabilityProfileSpec {
                 profile: self,
                 metadata: MetadataDurability::DistributedConsensus,
-                shuffle: ShuffleDurability::ObjectStore,
+                // Tiered: local-disk first for fast P2P fetches, async-backed by
+                // object store for durability across executor restarts and node loss.
+                shuffle: ShuffleDurability::Tiered,
                 state: StateDurability::LocalRedbWithCheckpointRestore,
                 checkpoint: CheckpointDurability::ObjectStore,
                 restart_durable: true,
@@ -202,7 +204,7 @@ mod tests {
             distributed.metadata,
             MetadataDurability::DistributedConsensus
         );
-        assert_eq!(distributed.shuffle, ShuffleDurability::ObjectStore);
+        assert_eq!(distributed.shuffle, ShuffleDurability::Tiered);
         assert_eq!(distributed.checkpoint, CheckpointDurability::ObjectStore);
         assert!(distributed.restart_durable);
         assert!(distributed.multi_node_safe);
@@ -231,11 +233,11 @@ mod tests {
     }
 
     #[test]
-    fn distributed_durable_maps_to_object_store_shuffle() {
+    fn distributed_durable_maps_to_tiered_shuffle() {
         assert_eq!(
             DurabilityProfile::DistributedDurable.spec().shuffle,
-            ShuffleDurability::ObjectStore,
-            "DistributedDurable must use ObjectStore shuffle (multi-node safe)"
+            ShuffleDurability::Tiered,
+            "DistributedDurable must use Tiered shuffle (local P2P + object-store durability)"
         );
     }
 

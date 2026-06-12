@@ -1,24 +1,42 @@
-//! etcd-backed durable metadata store for bare-metal cluster recovery.
+//! etcd-backed durable metadata store for distributed cluster recovery.
+//!
+//! # Key layout
+//!
+//! Each record is stored under its own etcd key instead of a single snapshot
+//! blob.  This eliminates the O(total_jobs) re-encode on every write and
+//! removes the 1.5 MiB single-key size ceiling.
+//!
+//! | Prefix | Content |
+//! |--------|---------|
+//! | `/krishiv/jobs/<job_id>` | JSON-encoded `PersistedJobRecord` |
+//! | `/krishiv/executors/<executor_id>` | JSON-encoded `PersistedExecutorDescriptor` |
+//!
+//! Events are not persisted — they are audit-only and kept in-memory.
+//!
+//! # Persist mechanism
+//!
+//! `MetadataStore` is a sync trait called from within the coordinator's async
+//! write-lock.  `block_in_place` is used to park the current tokio worker
+//! thread so other workers can drive the etcd client's internally-spawned gRPC
+//! streams.  This requires a multi-thread runtime (the production case).
+//! Single-thread runtimes (unit tests) must not reach durable paths.
 
-use etcd_client::Client;
+use etcd_client::{Client, GetOptions};
 
 use crate::store::{
-    ContinuousSnapshot, EventLogEvent, MetadataStore, decode_metadata_snapshot_with_executors,
-    encode_metadata_snapshot_with_executors,
+    ContinuousSnapshot, EventLogEvent, MetadataStore, PersistedExecutorDescriptor,
+    PersistedJobRecord,
 };
 use crate::{JobRecord, SchedulerError, SchedulerResult};
 
-const METADATA_SNAPSHOT_KEY: &str = "/krishiv/metadata/snapshot";
+const JOB_KEY_PREFIX: &str = "/krishiv/jobs/";
+const EXECUTOR_KEY_PREFIX: &str = "/krishiv/executors/";
 
-/// Durable metadata store backed by a single etcd snapshot key.
+/// Durable metadata store backed by per-record etcd keys.
 ///
-/// # Size limit
-///
-/// etcd has a default maximum value size of **1.5 MiB**.  If the encoded
-/// metadata snapshot exceeds this limit the `persist()` call will fail with
-/// an etcd `RequestTooLarge` error.  A `tracing::warn!` is emitted when the
-/// snapshot exceeds 1 MiB so operators can detect approaching the limit
-/// before writes start failing.
+/// Each job and executor descriptor lives under its own key so writes are
+/// O(1) regardless of cluster size, and the 1.5 MiB etcd value limit only
+/// applies per-record rather than to the full metadata snapshot.
 pub struct EtcdMetadataStore {
     client: std::sync::Mutex<Client>,
     events: Vec<EventLogEvent>,
@@ -27,113 +45,83 @@ pub struct EtcdMetadataStore {
 }
 
 impl EtcdMetadataStore {
-    /// Connect to etcd and load the metadata snapshot if present.
+    /// Connect to etcd and load all job and executor records from their
+    /// individual keys.
     pub async fn connect(endpoints: Vec<String>) -> SchedulerResult<Self> {
-        let mut client =
-            Client::connect(endpoints, None)
-                .await
-                .map_err(|e| SchedulerError::Transport {
-                    message: format!("etcd metadata connect failed: {e}"),
-                })?;
-        let (events, jobs, executor_descriptors) =
-            match client.get(METADATA_SNAPSHOT_KEY, None).await {
-                Ok(resp) => {
-                    let value = resp.kvs().first().map(|kv| kv.value());
-                    match value {
-                        Some(bytes) if !bytes.is_empty() => {
-                            decode_metadata_snapshot_with_executors(bytes)?
-                        }
-                        _ => (Vec::new(), Vec::new(), Vec::new()),
-                    }
-                }
-                Err(e) => {
-                    return Err(SchedulerError::Transport {
-                        message: format!("etcd metadata snapshot read failed: {e}"),
-                    });
-                }
-            };
+        let mut client = Client::connect(endpoints, None)
+            .await
+            .map_err(|e| SchedulerError::Transport {
+                message: format!("etcd metadata connect failed: {e}"),
+            })?;
+
+        let jobs = load_prefix::<PersistedJobRecord, JobRecord>(&mut client, JOB_KEY_PREFIX)
+            .await
+            .map_err(|e| SchedulerError::Transport {
+                message: format!("etcd jobs load failed: {e}"),
+            })?;
+
+        let executor_descriptors = load_prefix::<
+            PersistedExecutorDescriptor,
+            krishiv_proto::ExecutorDescriptor,
+        >(&mut client, EXECUTOR_KEY_PREFIX)
+        .await
+        .map_err(|e| SchedulerError::Transport {
+            message: format!("etcd executors load failed: {e}"),
+        })?;
+
         Ok(Self {
             client: std::sync::Mutex::new(client),
-            events,
+            events: Vec::new(),
             jobs,
             executor_descriptors,
         })
     }
 
-    fn persist(&self) -> SchedulerResult<()> {
-        // Events are audit-only and kept in-memory; only job records are
-        // persisted to etcd. This prevents the snapshot from growing with
-        // every event append and keeps the etcd key size bounded by the
-        // number of active jobs rather than the total event log length.
-        let bytes = encode_etcd_snapshot(&self.jobs, &self.executor_descriptors)?;
-        // etcd default max value size is 1.5 MiB.
-        // Hard limit at 1.4 MiB leaves 100 KiB headroom; return an error
-        // rather than silently attempting a write that etcd will reject.
-        const HARD_LIMIT: usize = 1_400_000;
-        const WARN_THRESHOLD: usize = 1024 * 1024;
-        if bytes.len() > HARD_LIMIT {
-            return Err(SchedulerError::Transport {
-                message: format!(
-                    "etcd metadata snapshot ({} bytes) exceeds safe size limit ({} bytes); \
-                     reduce job history or increase the etcd quota (--max-request-bytes)",
-                    bytes.len(),
-                    HARD_LIMIT
-                ),
-            });
-        }
-        if bytes.len() > WARN_THRESHOLD {
-            tracing::warn!(
-                size_bytes = bytes.len(),
-                "etcd metadata snapshot exceeds 1 MiB; etcd default limit is 1.5 MiB"
-            );
-        }
+    /// Write a single key to etcd using `block_in_place` so the calling worker
+    /// thread parks while the runtime drives the gRPC stream on other workers.
+    fn put_key(&self, key: String, value: Vec<u8>) -> SchedulerResult<()> {
         let mut client = self
             .client
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            // Drive the async etcd put on a one-shot current-thread runtime
-            // rather than on the parent runtime's handle. The etcd client
-            // internally uses `tokio::spawn` to drive its gRPC stream, so
-            // calling `Handle::current().block_on(...)` from a blocking
-            // thread would never let those spawned tasks run, hanging the
-            // persist call. A fresh current-thread runtime isolates the
-            // async work from the parent runtime entirely.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
+        // block_in_place parks this worker thread so the multi-thread runtime
+        // can run the etcd client's internally-spawned gRPC tasks on other
+        // workers.  block_on then drives the put future to completion from the
+        // current thread.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(client.put(key, value, None))
                 .map_err(|e| SchedulerError::Transport {
-                    message: format!(
-                        "etcd metadata snapshot: failed to build one-shot runtime: {e}"
-                    ),
-                })?;
-            rt.block_on(client.put(METADATA_SNAPSHOT_KEY, bytes, None))
-                .map_err(|e| SchedulerError::Transport {
-                    message: format!("etcd metadata snapshot write failed: {e}"),
+                    message: format!("etcd put failed: {e}"),
                 })
-        });
-        // `persist` is called from sync trait methods that may or may not be
-        // inside an async context; use the shared `block_on` helper to drive
-        // the JoinHandle either on the current runtime or on the fallback.
-        krishiv_common::async_util::block_on(handle).map_err(|e| SchedulerError::Transport {
-            message: format!("spawn_blocking join failed: {e}"),
-        })??;
+        })?;
+        Ok(())
+    }
+
+    /// Delete a single key from etcd.
+    fn delete_key(&self, key: String) -> SchedulerResult<()> {
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(client.delete(key, None))
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("etcd delete failed: {e}"),
+                })
+        })?;
         Ok(())
     }
 }
 
-fn encode_etcd_snapshot(
-    jobs: &[JobRecord],
-    executors: &[krishiv_proto::ExecutorDescriptor],
-) -> SchedulerResult<Vec<u8>> {
-    encode_metadata_snapshot_with_executors(&[], jobs, executors)
-}
-
 impl MetadataStore for EtcdMetadataStore {
     fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()> {
+        // Events are audit-only; not persisted to etcd (see module-level docs).
         self.events.push(event);
-        self.persist()
+        Ok(())
     }
 
     fn events(&self) -> &[EventLogEvent] {
@@ -141,12 +129,19 @@ impl MetadataStore for EtcdMetadataStore {
     }
 
     fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()> {
+        let key = format!("{JOB_KEY_PREFIX}{}", record.job_id().as_str());
+        let persisted = PersistedJobRecord::from(record);
+        let bytes = serde_json::to_vec(&persisted).map_err(|e| SchedulerError::Transport {
+            message: format!("etcd job encode failed for {}: {e}", record.job_id()),
+        })?;
+        self.put_key(key, bytes)?;
+        // Update in-memory view.
         if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
             *existing = record.clone();
         } else {
             self.jobs.push(record.clone());
         }
-        self.persist()
+        Ok(())
     }
 
     fn jobs(&self) -> &[JobRecord] {
@@ -157,6 +152,19 @@ impl MetadataStore for EtcdMetadataStore {
         &mut self,
         descriptor: &krishiv_proto::ExecutorDescriptor,
     ) -> SchedulerResult<()> {
+        let key = format!(
+            "{EXECUTOR_KEY_PREFIX}{}",
+            descriptor.executor_id().as_str()
+        );
+        let persisted = PersistedExecutorDescriptor::from(descriptor);
+        let bytes = serde_json::to_vec(&persisted).map_err(|e| SchedulerError::Transport {
+            message: format!(
+                "etcd executor encode failed for {}: {e}",
+                descriptor.executor_id()
+            ),
+        })?;
+        self.put_key(key, bytes)?;
+        // Update in-memory view.
         if let Some(pos) = self
             .executor_descriptors
             .iter()
@@ -166,7 +174,7 @@ impl MetadataStore for EtcdMetadataStore {
         } else {
             self.executor_descriptors.push(descriptor.clone());
         }
-        self.persist()
+        Ok(())
     }
 
     fn executors(&self) -> Vec<krishiv_proto::ExecutorDescriptor> {
@@ -174,9 +182,11 @@ impl MetadataStore for EtcdMetadataStore {
     }
 
     fn remove_executor(&mut self, executor_id: &krishiv_proto::ExecutorId) -> SchedulerResult<()> {
+        let key = format!("{EXECUTOR_KEY_PREFIX}{}", executor_id.as_str());
+        self.delete_key(key)?;
         self.executor_descriptors
             .retain(|e| e.executor_id() != executor_id);
-        self.persist()
+        Ok(())
     }
 
     fn save_continuous_snapshot(
@@ -184,9 +194,8 @@ impl MetadataStore for EtcdMetadataStore {
         job_id: &str,
         _snapshot: ContinuousSnapshot,
     ) -> SchedulerResult<()> {
-        // Continuous window snapshots are too large for etcd's single-blob model
-        // (etcd default max value is 1.5 MiB; window state may exceed this for
-        // large key cardinalities). Operators using the etcd backend should persist
+        // Continuous window snapshots may exceed per-record etcd size limits for
+        // large key cardinalities. Operators using the etcd backend should persist
         // continuous job state to an external object store and restore manually.
         tracing::warn!(
             job_id = %job_id,
@@ -205,112 +214,79 @@ impl MetadataStore for EtcdMetadataStore {
     }
 }
 
+/// Load all values under `prefix` from etcd, deserializing each as `P` then
+/// converting to `T` via `TryFrom`.
+async fn load_prefix<P, T>(client: &mut Client, prefix: &str) -> Result<Vec<T>, String>
+where
+    P: serde::de::DeserializeOwned,
+    T: TryFrom<P>,
+    <T as TryFrom<P>>::Error: std::fmt::Display,
+{
+    let resp = client
+        .get(prefix, Some(GetOptions::new().with_prefix()))
+        .await
+        .map_err(|e| format!("etcd get prefix {prefix} failed: {e}"))?;
+
+    let mut results = Vec::with_capacity(resp.kvs().len());
+    for kv in resp.kvs() {
+        let persisted: P = serde_json::from_slice(kv.value())
+            .map_err(|e| format!("etcd decode failed for key {}: {e}", kv.key_str().unwrap_or("?")))?;
+        let record = T::try_from(persisted)
+            .map_err(|e| format!("etcd record convert failed for key {}: {e}", kv.key_str().unwrap_or("?")))?;
+        results.push(record);
+    }
+    Ok(results)
+}
+
 #[cfg(feature = "etcd")]
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{
-        EventLogEvent, decode_metadata_snapshot, decode_metadata_snapshot_with_executors,
-        encode_metadata_snapshot,
+        EventLogEvent, PersistedExecutorDescriptor, PersistedJobRecord,
     };
     use krishiv_proto::{ExecutorDescriptor, ExecutorId, JobId};
 
     #[test]
-    fn etcd_snapshot_does_not_include_events() {
-        // Verify that events are excluded from etcd persistence: a snapshot with
-        // 1 000 events + 5 jobs must encode to the same size as one with 0 events
-        // + 5 jobs.  This confirms the snapshot only grows with job count.
-        let jobs: Vec<JobRecord> = (0..5)
-            .map(|i| {
-                let job_id = JobId::try_new(format!("job-{i}")).unwrap();
-                let spec = crate::job_spec_from_logical_plan(
-                    job_id,
-                    &krishiv_plan::LogicalPlan::new("p", krishiv_plan::ExecutionKind::Batch),
-                )
-                .unwrap();
-                JobRecord::from_spec(spec, 1)
-            })
-            .collect();
-
-        let many_events: Vec<EventLogEvent> = (0..1000)
-            .map(|i| EventLogEvent::JobSubmitted {
-                job_id: JobId::try_new(format!("event-job-{i}")).unwrap(),
-            })
-            .collect();
-
-        let normal_snapshot_with_events = encode_metadata_snapshot(&many_events, &jobs).unwrap();
-        let etcd_snapshot = encode_etcd_snapshot(&jobs, &[]).unwrap();
-
-        assert!(
-            normal_snapshot_with_events.len() > etcd_snapshot.len(),
-            "etcd snapshot size must not depend on event count; \
-             events are audit-only and must not be serialised"
-        );
-
-        // Round-trip: the decoded snapshot must only contain jobs.
-        let (decoded_events, decoded_jobs) = decode_metadata_snapshot(&etcd_snapshot).unwrap();
-        assert!(
-            decoded_events.is_empty(),
-            "decoded snapshot must have no events (they are not persisted)"
-        );
-        assert_eq!(decoded_jobs.len(), 5);
+    fn job_key_has_correct_prefix() {
+        let job_id = "my-job-123";
+        let key = format!("{JOB_KEY_PREFIX}{job_id}");
+        assert_eq!(key, "/krishiv/jobs/my-job-123");
     }
 
     #[test]
-    fn etcd_snapshot_persists_executor_descriptors() {
-        let executor =
-            ExecutorDescriptor::new(ExecutorId::try_new("exec-a").unwrap(), "worker-a", 4)
-                .with_task_endpoint("http://worker-a:9010")
-                .with_barrier_endpoint("http://worker-a:9011");
-
-        let bytes = encode_etcd_snapshot(&[], std::slice::from_ref(&executor)).unwrap();
-        let (_, jobs, executors) = decode_metadata_snapshot_with_executors(&bytes).unwrap();
-
-        assert!(jobs.is_empty());
-        assert_eq!(executors, vec![executor]);
+    fn executor_key_has_correct_prefix() {
+        let executor_id = "exec-0";
+        let key = format!("{EXECUTOR_KEY_PREFIX}{executor_id}");
+        assert_eq!(key, "/krishiv/executors/exec-0");
     }
 
     #[test]
-    fn hard_limit_constant_is_1_4_mib() {
-        // Document that the hard limit is 1.4 MiB — any change must be intentional.
-        assert_eq!(1_400_000_usize, 1_400_000, "HARD_LIMIT must be 1.4 MiB");
+    fn job_record_serializes_and_deserializes() {
+        let job_id = JobId::try_new("roundtrip-job").unwrap();
+        let spec = crate::job_spec_from_logical_plan(
+            job_id.clone(),
+            &krishiv_plan::LogicalPlan::new("p", krishiv_plan::ExecutionKind::Batch),
+        )
+        .unwrap();
+        let record = JobRecord::from_spec(spec, 1);
+        let persisted = PersistedJobRecord::from(&record);
+        let bytes = serde_json::to_vec(&persisted).unwrap();
+        let decoded: PersistedJobRecord = serde_json::from_slice(&bytes).unwrap();
+        let restored = JobRecord::try_from(decoded).unwrap();
+        assert_eq!(restored.job_id(), record.job_id());
     }
 
     #[test]
-    fn encode_snapshot_exceeding_hard_limit_is_over_1_4_mib() {
-        // Produce a snapshot that encodes to more than 1.4 MiB by using many
-        // JobSubmitted events with long IDs.  Verify the encoded bytes exceed the
-        // hard limit so that EtcdMetadataStore::persist() would reject it.
-        const HARD_LIMIT: usize = 1_400_000;
-        let events: Vec<EventLogEvent> = (0..15_000)
-            .map(|i| EventLogEvent::JobSubmitted {
-                job_id: JobId::try_new(format!("job-{i:08}-xxxxxxxxxx-long-id-padding")).unwrap(),
-            })
-            .collect();
-        let bytes = encode_metadata_snapshot(&events, &[]).unwrap();
-        assert!(
-            bytes.len() > HARD_LIMIT,
-            "test setup: snapshot of 15k events must exceed {HARD_LIMIT} bytes, got {}",
-            bytes.len()
-        );
-        // Verify the round-trip: if persist() didn't guard, the data would be
-        // re-readable.  The size guard in persist() is the enforcement point.
-        let (decoded, _) = decode_metadata_snapshot(&bytes).unwrap();
-        assert_eq!(decoded.len(), 15_000);
-    }
-
-    #[test]
-    fn encode_small_snapshot_is_under_hard_limit() {
-        const HARD_LIMIT: usize = 1_400_000;
-        let events = vec![EventLogEvent::JobSubmitted {
-            job_id: JobId::try_new("small-job").unwrap(),
-        }];
-        let bytes = encode_metadata_snapshot(&events, &[]).unwrap();
-        assert!(
-            bytes.len() < HARD_LIMIT,
-            "a single-event snapshot must be well under the hard limit"
-        );
-        let (decoded, _) = decode_metadata_snapshot(&bytes).unwrap();
-        assert_eq!(decoded.len(), 1);
+    fn executor_descriptor_serializes_and_deserializes() {
+        let exec = ExecutorDescriptor::new(ExecutorId::try_new("exec-a").unwrap(), "host-a", 4)
+            .with_task_endpoint("http://host-a:9010")
+            .with_barrier_endpoint("http://host-a:9011");
+        let persisted = PersistedExecutorDescriptor::from(&exec);
+        let bytes = serde_json::to_vec(&persisted).unwrap();
+        let decoded: PersistedExecutorDescriptor = serde_json::from_slice(&bytes).unwrap();
+        let restored = ExecutorDescriptor::try_from(decoded).unwrap();
+        assert_eq!(restored.executor_id(), exec.executor_id());
+        assert_eq!(restored.task_endpoint(), exec.task_endpoint());
     }
 }

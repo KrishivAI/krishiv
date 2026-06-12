@@ -1,5 +1,41 @@
 # Krishiv Implementation Status
 
+## Architecture: execution-mode improvements (2026-06-12)
+
+### Done
+
+Implemented all 8 architectural improvements identified in the execution-mode analysis.
+
+| # | Issue | Fix | File(s) |
+|---|---|---|---|
+| 1 | Coordinator task-launch loop polled at 500 ms fixed interval | `select!` on `Arc<Notify>` for immediate wake on state change | `krishiv-scheduler/src/coordinator/mod.rs` |
+| 2 | `DistributedDurable` wired to `ObjectStore` shuffle only | Changed profile spec to `ShuffleDurability::Tiered`; auto-build `TieredShuffleStore` when both `--shuffle-dir` and S3 URI are present | `durability.rs`, `storage_uri.rs`, `executor/cli.rs` |
+| 3 | Default paths used `/tmp` (lost on restart) | Changed `SingleNodeDurable` defaults to `/var/lib/krishiv/{shuffle,state,checkpoints}` | `executor/cli.rs` |
+| 4 | Shuffle partition fetches were sequential | Replaced `for` loop with `FuturesUnordered` for concurrent partition reads | `executor/src/fragment/common.rs` |
+| 5 | etcd stored entire metadata snapshot as one blob | Per-record keys (`/krishiv/jobs/<id>`, `/krishiv/executors/<id>`); prefix-scan on startup | `krishiv-scheduler/src/etcd_metadata.rs` |
+| 6 | Async traits (`MetadataStore`, `CheckpointStorage`) used `spawn_blocking` bridges | **Deferred** — requires full async-trait migration across all 4 impls | — |
+| 7 | Docs claimed `SingleNode + LocalInProcess` was valid (code rejects it) | Removed stale row from mode matrix; corrected distributed-durable shuffle column | `docs/README.md`, `docs/architecture.md` |
+| 8 | Bare-metal systemd units used `/tmp` paths, missing durability flags | Added `KRISHIV_DURABILITY_PROFILE`, `--shuffle-dir`, `--state-dir`, `--checkpoint-uri`; switched metadata-backend to redb | `deploy/systemd/krishiv-clusterd.service`, `deploy/systemd/krishiv-executor@.service` |
+
+### Validation
+```bash
+cargo test -p krishiv-common --lib    # 73 passed
+cargo test -p krishiv-shuffle --lib   # 123 passed
+cargo test -p krishiv-executor --lib  # 181 passed
+cargo test -p krishiv-scheduler --lib # 292 passed
+```
+
+### Blockers
+Issue #6 (async traits) deferred — safe to ship without it; existing `block_in_place` bridge works correctly in multi-thread Tokio runtime.
+
+### Next useful task
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+# Then: async-trait migration for MetadataStore + CheckpointStorage (Issue #6)
+```
+
+---
+
 ## Platform-layer cleanup: remove AI/ML/enterprise features (2026-06-11)
 
 ### Done

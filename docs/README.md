@@ -56,7 +56,6 @@ SQL / API / Flight
   -> DataFusion + Krishiv plan
   -> ExecutionRuntime
        Embedded + LocalInProcess: in-process cluster
-       SingleNode + LocalInProcess: in-process single-host runtime
        SingleNode + SingleNodeDaemon: local Flight/gRPC daemon
        Distributed + RemoteClusterRequired: remote Flight/gRPC cluster
   -> Coordinator
