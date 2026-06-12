@@ -77,8 +77,9 @@ pub(crate) async fn execute_batch_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
     udf_limits: ResourceLimits,
-    #[allow(unused_variables)] memory_budget: Arc<MemoryBudget>,
+    memory_budget: Arc<MemoryBudget>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
+    let engine_memory_limit = crate::fragment::common::task_engine_memory_limit(&memory_budget);
     let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     let fragment = fragment_body.as_str();
     if fragment.is_empty() {
@@ -117,6 +118,7 @@ pub(crate) async fn execute_batch_fragment(
                 shuffle_spec,
                 ctx,
                 udf_limits.clone(),
+                engine_memory_limit,
             )
             .await;
         } else {
@@ -131,8 +133,14 @@ pub(crate) async fn execute_batch_fragment(
     // R4a typed shuffle write: hash-partition SQL output and write to the in-memory store.
     if let Some(write_cfg) = assignment.shuffle_write() {
         if let Some(store) = &runner.inmem_shuffle {
-            return execute_inmem_shuffle_write(assignment, write_cfg, store, udf_limits.clone())
-                .await;
+            return execute_inmem_shuffle_write(
+                assignment,
+                write_cfg,
+                store,
+                udf_limits.clone(),
+                engine_memory_limit,
+            )
+            .await;
         } else {
             return Err(ExecutorError::InvalidAssignment {
                 message: String::from(
@@ -143,9 +151,13 @@ pub(crate) async fn execute_batch_fragment(
     }
 
     if let Some(query) = sql_query_from_fragment(fragment) {
-        // Create a new SQL engine with UDF limits for this task execution.
-        // This enforces per-task resource limits on UDF execution.
-        let engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
+        // Create a new SQL engine with UDF limits and the task's memory limit
+        // for this task execution. The memory limit bounds DataFusion's pool
+        // so sorts/joins/aggregations spill instead of growing unbounded.
+        let engine = Arc::new(
+            krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
+                .with_udf_limits(udf_limits),
+        );
         for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
             engine
                 .register_parquet(partition.table_name(), partition.path())
@@ -330,6 +342,7 @@ async fn execute_shuffle_write_fragment(
     spec: &str,
     ctx: &crate::runner::ShuffleContext,
     udf_limits: ResourceLimits,
+    engine_memory_limit: Option<usize>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
@@ -371,8 +384,11 @@ async fn execute_shuffle_write_fragment(
             ),
         })?;
 
-    // Create a new SQL engine with UDF limits for this task execution.
-    let limited_engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
+    // Create a new SQL engine with UDF limits and the task's memory limit.
+    let limited_engine = Arc::new(
+        krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
+            .with_udf_limits(udf_limits),
+    );
     load_input_tables(&limited_engine, assignment).await?;
 
     let dataframe = limited_engine
@@ -482,12 +498,16 @@ async fn execute_inmem_shuffle_write(
     write_cfg: &krishiv_proto::ShuffleWriteConfig,
     store: &std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
     udf_limits: ResourceLimits,
+    engine_memory_limit: Option<usize>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
     let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
-    // Create a new SQL engine with UDF limits for this task execution.
-    let limited_engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
+    // Create a new SQL engine with UDF limits and the task's memory limit.
+    let limited_engine = Arc::new(
+        krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
+            .with_udf_limits(udf_limits),
+    );
     let batches = if let Some(query) = sql_query_from_fragment(&fragment_body) {
         load_input_tables(&limited_engine, assignment).await?;
         let dataframe =

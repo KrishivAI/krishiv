@@ -17,7 +17,7 @@ arrow-flight = { workspace = true }
 bytes = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 parquet = { workspace = true }
-tokio = { workspace = true, features = ["fs", "net", "sync"] }
+tokio = { workspace = true, features = ["fs", "net", "sync", "time"] }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 tonic = { workspace = true }

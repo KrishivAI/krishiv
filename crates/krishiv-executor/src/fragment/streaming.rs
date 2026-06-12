@@ -445,7 +445,7 @@ pub(crate) async fn execute_streaming_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
     udf_limits: ResourceLimits,
-    #[allow(unused_variables)] memory_budget: Arc<MemoryBudget>,
+    memory_budget: Arc<MemoryBudget>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     let fragment = fragment_body.as_str();
@@ -455,8 +455,14 @@ pub(crate) async fn execute_streaming_fragment(
     //   2. stream:loop: — stateful ContinuousWindowExecutor (long-lived)
     //   3. <default>    — bounded window (tumbling / sliding / session)
     if let Some(query) = crate::fragment::common::sql_query_from_fragment(fragment) {
-        // Create a new SQL engine with UDF limits for this task execution.
-        let engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
+        // Create a new SQL engine with UDF limits and the task's memory limit
+        // for this task execution.
+        let engine = Arc::new(
+            krishiv_sql::SqlEngine::new_with_memory_limit(
+                crate::fragment::common::task_engine_memory_limit(&memory_budget),
+            )
+            .with_udf_limits(udf_limits),
+        );
 
         // Continuous SQL queries must use execute_stream to avoid blocking and buffering forever.
         let dataframe = engine

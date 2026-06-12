@@ -288,7 +288,11 @@ pub(crate) async fn read_shuffle_flight_partitions(
 
     use futures::StreamExt as _;
     use futures::stream::FuturesUnordered;
-    use krishiv_shuffle::flight::FlightShuffleClient;
+    use krishiv_shuffle::flight::{FetchRetryPolicy, FlightShuffleClient};
+
+    // Transient transport failures are retried with backoff; a missing
+    // partition (NotFound) fails immediately so the scheduler can react.
+    let retry_policy = FetchRetryPolicy::from_env();
 
     // Collect the flight-fetch futures for all shuffle-flight partitions.
     let fetches: FuturesUnordered<_> = partitions
@@ -311,11 +315,12 @@ pub(crate) async fn read_shuffle_flight_partitions(
         })
         .map(
             |(table_name, flight_endpoint, job_id, upstream_stage_id, partition_id)| async move {
-                let batches = FlightShuffleClient::fetch(
+                let batches = FlightShuffleClient::fetch_with_retry(
                     &flight_endpoint,
                     job_id.as_str(),
                     upstream_stage_id.as_str(),
                     partition_id,
+                    retry_policy,
                 )
                 .await
                 .map_err(|e| ExecutorError::LocalExecution {
@@ -339,6 +344,18 @@ pub(crate) async fn read_shuffle_flight_partitions(
     }
 
     Ok(table_batches.into_iter().collect())
+}
+
+/// Translate a task's [`MemoryBudget`] limit into a DataFusion engine memory
+/// limit for the per-task `SqlEngine`. Tasks without an explicit limit fall
+/// back to the executor-wide `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` default.
+pub(crate) fn task_engine_memory_limit(
+    memory_budget: &krishiv_common::MemoryBudget,
+) -> Option<usize> {
+    memory_budget
+        .limit()
+        .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
+        .or_else(krishiv_sql::query_memory_limit_from_env)
 }
 
 /// Extract the upstream watermark hint from task input partitions if present.
@@ -404,4 +421,29 @@ pub(crate) fn read_inline_ipc_partitions(
         result.push((table_name, batches));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use krishiv_common::MemoryBudget;
+
+    #[test]
+    fn task_engine_memory_limit_uses_explicit_task_budget() {
+        let budget = MemoryBudget::limited(256 * 1024 * 1024);
+        assert_eq!(
+            super::task_engine_memory_limit(&budget),
+            Some(256 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn task_engine_memory_limit_unlimited_budget_falls_back_to_env_default() {
+        // The env var is not set in unit tests, so an unlimited budget yields
+        // an unbounded engine.
+        let budget = MemoryBudget::unlimited();
+        assert_eq!(
+            super::task_engine_memory_limit(&budget),
+            krishiv_sql::query_memory_limit_from_env()
+        );
+    }
 }
