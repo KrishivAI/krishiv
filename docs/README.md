@@ -1,19 +1,8 @@
 # Krishiv Docs
 
-Treat the Rust workspace as the implementation source of truth. The public
-documentation set defines architecture, compatibility, contribution, and
-operational contracts and must change with the behavior it describes.
-
-## Documentation Map
-
-- [`architecture.md`](architecture.md) — system boundary, component ownership, runtime lifecycle, and deployment topology.
-- [`contracts/engine-semantics.md`](contracts/engine-semantics.md) — normative execution and delivery semantics.
-- [`COMPATIBILITY.md`](COMPATIBILITY.md) — API and durable-artifact upgrade guarantees.
-- [`connector-sdk.md`](connector-sdk.md) — source/sink contracts and certification.
-- [`BENCHMARKING.md`](BENCHMARKING.md) — reproducible performance evidence.
-- [`decisions/`](decisions/) — architecture decision records.
-- [`implementation/status.md`](implementation/status.md) — concise implementation handoff.
-- [`../ROADMAP.md`](../ROADMAP.md) — public priorities and engine/platform boundary.
+This is the minimal project documentation surface. Treat the Rust workspace as
+the source of truth; update this file only when code, crate ownership, commands,
+or supported deployment modes change.
 
 ## Current Architecture
 
@@ -42,7 +31,7 @@ Core implementation choices:
 | `krishiv-common` | Shared utilities used across runtime and engine crates. |
 | `krishiv-api` | Session, DataFrame, Stream, and public Rust API surface. |
 | `krishiv-sql` | DataFusion integration, SQL execution helpers, SQL policy hooks, catalog and table-provider abstractions (`catalog` module). |
-| `krishiv-plan` | Logical/physical plan structures, task fragments, UDF contracts, CEP pattern matcher, and optimizer rules. |
+| `krishiv-plan` | Logical/physical plan structures, UDF contracts, governance/audit/policy, CEP pattern matcher, optimizer rules. |
 | `krishiv-runtime` | Embedded, single-node, and remote runtime routing. |
 | `krishiv-dataflow` | Arrow operator runtime, queues, barriers, windows, joins, stateful ops. |
 | `krishiv-scheduler` | Coordinator, job/task lifecycle, metadata stores, leadership, gRPC server. |
@@ -50,13 +39,13 @@ Core implementation choices:
 | `krishiv-proto` | Typed IDs and coordinator/executor wire contracts. |
 | `krishiv-shuffle` | In-memory, local disk, object-store, and Flight-oriented shuffle support. |
 | `krishiv-state` | In-memory and RocksDB-backed keyed state, TTL, migration, incremental state, and checkpoint/savepoint storage. |
-| `krishiv-connectors` | Source/sink contracts, capability and maturity metadata, Parquet/Kafka/S3 paths, and Iceberg-first lakehouse helpers. Delta/Hudi/vector integrations are optional and experimental. |
+| `krishiv-connectors` | Connector traits, Parquet/Kafka/S3 paths, and lakehouse helpers (`lakehouse` feature: Iceberg/Delta/Hudi). |
 | `krishiv-operator` | Kubernetes CRD and operator integration. |
 | `krishiv-ui` | Status API and web UI assets. |
 | `krishiv-flight-sql` | Arrow Flight SQL service. |
 | `krishiv-python` | PyO3 Python bindings. |
 | `krishiv-metrics` | Metrics, tracing, and debug report structures. |
-| `krishiv-ai` | Deprecated compatibility shim for optional vector sinks; not part of the standard compute-engine build. |
+| `krishiv-ai` | AI/RAG and embedding support. |
 | `krishiv-bench` | Benchmarks. Fault-injection/chaos tests live in `krishiv-common`'s `chaos` feature + `tests/chaos_suite.rs`. Schema registry helpers live in `krishiv-connectors`'s `schema-registry` feature. |
 
 ## Runtime Modes
@@ -137,7 +126,7 @@ Rust `krishiv` facade feature presets:
 | `bare-metal` | Alias for distributed process-managed deployments. |
 | `cluster` | Compatibility alias for `distributed`. |
 | `k8s` | Distributed support plus Kubernetes operator/CRD capability. |
-| `full` | Standard compute-engine build: distributed/Kubernetes, Kafka, and primary Iceberg support; excludes AI/vector and secondary lakehouse formats. |
+| `full` | Broad integration build for release and compatibility checks. |
 
 Rust optional integration features:
 
@@ -148,8 +137,8 @@ Rust optional integration features:
 | `etcd` | etcd-backed scheduler metadata and coordination. |
 | `kafka` | Kafka connector support. |
 | `state` | Connector/state integration. |
-| `iceberg` | Primary/default lakehouse platform. |
-| `delta` | Optional experimental Delta compatibility. |
+| `iceberg` | Iceberg lakehouse support. |
+| `delta` | Delta lakehouse support. |
 | `ui` | Operator UI integration. |
 
 Recommended Rust build commands (`just` is the project command runner):
@@ -176,10 +165,10 @@ extension features are enabled only for integration families:
 |---|---|
 | `kafka` | Kafka sources/connectors. |
 | `iceberg` | Iceberg lakehouse bindings. |
-| `ai` | Deprecated compatibility feature for optional vector sinks; no RAG/LLM engine functionality. |
-| `vector-sinks` | Optional platform-adjacent vector sink compatibility. |
-| `qdrant` | Experimental Qdrant vector sink. |
-| `pgvector` | Experimental pgvector sink. |
+| `ai` | Local embedding/RAG support. |
+| `vector-sinks` | Alias for AI/vector sink support. |
+| `qdrant` | Qdrant vector sink. |
+| `pgvector` | pgvector sink. |
 
 Recommended Python build commands:
 
@@ -187,29 +176,8 @@ Recommended Python build commands:
 maturin develop --manifest-path crates/krishiv-python/Cargo.toml
 maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features iceberg
 maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features kafka
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features ai,qdrant
 ```
-
-
-## Published Engine Contracts
-
-Project policy and implementation references include:
-
-- `docs/implementation/phase-5-open-source-readiness.md` — Phase 5 resolution and follow-up list.
-
-The normative Phase 1 contracts are:
-
-- `docs/contracts/engine-semantics.md` — batch/streaming semantics, delivery
-  guarantees, exactly-once matrix, metadata compatibility, operator identity,
-  and the Iceberg-first policy.
-- `docs/contracts/connectors.md` — source/sink obligations and maturity labels
-  for every in-tree connector.
-- `docs/implementation/phase-1-engine-contract.md` — implementation resolution,
-  completed contract work, and certification follow-ups.
-- `docs/implementation/phase-4-user-apis.md` — implemented Rust/Python user API
-  surface, compatibility rules, and remaining distributed/protocol work.
-
-Apache Iceberg is the primary lakehouse platform. New lakehouse correctness and
-certification work targets Iceberg before Delta Lake or Hudi.
 
 ## Durability Profiles
 
