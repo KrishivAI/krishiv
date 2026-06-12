@@ -9,8 +9,8 @@ license.workspace = true
 path = "src/lib.rs"
 
 [features]
-# Lean embedded baseline: local Parquet only. Enable `kafka`, `lakehouse`, or
-# `vector-sinks` explicitly for integration families.
+# Lean embedded baseline: local Parquet only. Apache Iceberg is the primary
+# lakehouse format; enable `iceberg` or the `full` engine preset when needed.
 default = ["parquet"]
 
 # Core batch/object-store connectors
@@ -52,20 +52,18 @@ pgvector = ["vector-sinks", "dep:sqlx"]
 
 # Convenience presets
 local = ["parquet", "s3", "kafka", "two-phase"]
+# Standard full compute-engine build. AI/vector and secondary lakehouse formats
+# remain opt-in and are intentionally excluded.
 full = [
     "local",
     "avro",
-    "lakehouse",
     "iceberg",
-    "delta",
-    "hudi",
-    "vector-sinks",
-    "qdrant",
-    "pgvector",
     "schema-registry",
     "state",
 ]
-exactly-once-integration = ["lakehouse"]
+# Broader compatibility build for optional/experimental integrations.
+extended = ["full", "delta", "hudi", "vector-sinks", "qdrant", "pgvector"]
+exactly-once-integration = ["iceberg"]
 # E6.4: AWS Kinesis streaming source
 kinesis = ["dep:aws-sdk-kinesis", "dep:aws-config"]
 # E6.5: Apache Pulsar streaming source

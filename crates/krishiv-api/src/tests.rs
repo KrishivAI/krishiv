@@ -877,3 +877,103 @@ async fn execution_result_into_batches_works_for_batch() {
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_columns(), 2);
 }
+
+// ── Phase 4: typed DataFrame expressions, aggregation, I/O, and config ───────
+
+#[test]
+fn typed_expressions_select_filter_and_aggregate() {
+    use crate::{col, count_all, lit, sum};
+
+    let session = Session::builder().build().unwrap();
+    let df = session
+        .sql("SELECT * FROM (VALUES ('a', 10), ('a', 20), ('b', 5)) AS t(category, amount)")
+        .unwrap();
+
+    let filtered = df
+        .filter_expr(col("amount").gt(lit(9)))
+        .unwrap()
+        .select_exprs(&[
+            col("category"),
+            col("amount").multiply(lit(2)).alias("doubled"),
+        ])
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(filtered.row_count(), 2);
+    assert_eq!(filtered.batches()[0].schema().field(1).name(), "doubled");
+
+    let grouped = df
+        .group_by(&[col("category")])
+        .agg(&[count_all().alias("rows"), sum(col("amount")).alias("total")])
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(grouped.row_count(), 2);
+}
+
+#[test]
+fn generic_reader_writer_roundtrip_and_validate_format() {
+    let session = Session::builder().build().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("phase4.parquet");
+    let df = session.sql("SELECT 7 AS value").unwrap();
+
+    df.write()
+        .format("parquet")
+        .unwrap()
+        .save(path.to_str().unwrap())
+        .unwrap();
+    let result = session
+        .read()
+        .format("parquet")
+        .unwrap()
+        .load(&path)
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert!(session.read().format("orc").is_err());
+}
+
+#[test]
+fn session_config_is_shared_across_clones() {
+    let session = Session::builder()
+        .with_config("spark.sql.shuffle.partitions", "16")
+        .build()
+        .unwrap();
+    let clone = session.clone();
+    assert_eq!(
+        session
+            .get_config("spark.sql.shuffle.partitions")
+            .as_deref(),
+        Some("16")
+    );
+    clone.set_config("krishiv.execution.label", "phase4");
+    assert_eq!(
+        session.get_config("krishiv.execution.label").as_deref(),
+        Some("phase4")
+    );
+    assert_eq!(
+        session.unset_config("krishiv.execution.label").as_deref(),
+        Some("phase4")
+    );
+}
+
+#[test]
+fn explain_modes_include_analysis_stats() {
+    let session = Session::builder().build().unwrap();
+    let df = session.sql("SELECT 1 AS value").unwrap();
+    assert!(
+        !df.explain_with(crate::ExplainMode::Logical)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !df.explain_with(crate::ExplainMode::Physical)
+            .unwrap()
+            .is_empty()
+    );
+    let analyzed = df.explain_with(crate::ExplainMode::Analyze).unwrap();
+    assert!(analyzed.contains("Execution statistics"));
+    assert!(analyzed.contains("result_rows=1"));
+}

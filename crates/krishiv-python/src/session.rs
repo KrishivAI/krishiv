@@ -216,6 +216,42 @@ impl PySession {
         })
     }
 
+    pub fn read_csv(&self, py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .read_csv(&path)
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    pub fn read_json(&self, py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .read_json(&path)
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    pub fn set_config(&self, key: String, value: String) {
+        self.inner.set_config(key, value);
+    }
+
+    pub fn get_config(&self, key: String) -> Option<String> {
+        self.inner.get_config(&key)
+    }
+
+    pub fn unset_config(&self, key: String) -> Option<String> {
+        self.inner.unset_config(&key)
+    }
+
+    pub fn configs(&self) -> std::collections::BTreeMap<String, String> {
+        self.inner.configs()
+    }
+
     pub fn register_parquet(&self, name: String, path: String) -> PyResult<()> {
         self.inner
             .register_parquet(&name, &path)

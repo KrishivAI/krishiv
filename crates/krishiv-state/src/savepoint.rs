@@ -20,11 +20,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{StateError, StateResult};
 
+/// Current savepoint metadata format written by the engine.
+pub const SAVEPOINT_FORMAT_VERSION: u32 = 1;
+
+const fn default_savepoint_format_version() -> u32 {
+    SAVEPOINT_FORMAT_VERSION
+}
+
 // ── SavepointMeta ─────────────────────────────────────────────────────────────
 
 /// Immutable metadata for one savepoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavepointMeta {
+    /// Savepoint metadata format version. Legacy unversioned records decode as v1.
+    #[serde(default = "default_savepoint_format_version")]
+    pub format_version: u32,
     /// Unique savepoint ID (UUID v4 string).
     pub savepoint_id: String,
     /// Human-readable label provided by the user.
@@ -37,6 +47,30 @@ pub struct SavepointMeta {
     pub operator_versions: HashMap<String, u64>,
     /// Wall-clock Unix timestamp (seconds) when the savepoint was created.
     pub created_at_secs: u64,
+}
+
+impl SavepointMeta {
+    /// Validate metadata and operator identity before restore.
+    pub fn validate(&self) -> StateResult<()> {
+        if self.format_version != SAVEPOINT_FORMAT_VERSION {
+            return Err(StateError::SnapshotCorrupt {
+                message: format!(
+                    "unsupported savepoint metadata version {}; supported version is {}",
+                    self.format_version, SAVEPOINT_FORMAT_VERSION
+                ),
+            });
+        }
+        if self
+            .operator_versions
+            .keys()
+            .any(|operator_id| operator_id.trim().is_empty())
+        {
+            return Err(StateError::SnapshotCorrupt {
+                message: "savepoint contains an empty operator id".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 // ── SavepointCoordinator ──────────────────────────────────────────────────────
@@ -79,6 +113,7 @@ impl SavepointCoordinator {
             .unwrap_or(0);
 
         let meta = SavepointMeta {
+            format_version: SAVEPOINT_FORMAT_VERSION,
             savepoint_id: savepoint_id.clone(),
             label: label.into(),
             job_id: self.job_id.clone(),
@@ -130,6 +165,7 @@ impl SavepointCoordinator {
                 message: e.to_string(),
             })?;
         for meta in list {
+            meta.validate()?;
             if meta.job_id != self.job_id {
                 return Err(StateError::SnapshotCorrupt {
                     message: format!(
@@ -218,6 +254,15 @@ mod tests {
         coord2.import_index_json(&json).unwrap();
         assert_eq!(coord2.list_savepoints().len(), 1);
         assert_eq!(coord2.list_savepoints()[0].label, "before");
+    }
+
+    #[test]
+    fn import_rejects_unknown_format_version() {
+        let mut coord = SavepointCoordinator::new("job-A");
+        let mut meta = coord.take_savepoint("sp", 1, HashMap::new()).unwrap();
+        meta.format_version = 99;
+        let json = serde_json::to_string(&[meta]).unwrap();
+        assert!(coord.import_index_json(&json).is_err());
     }
 
     #[test]
