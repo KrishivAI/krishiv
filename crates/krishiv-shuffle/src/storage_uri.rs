@@ -121,7 +121,10 @@ pub fn open_tiered_shuffle_backend(
     } else {
         prefix.to_owned()
     };
-    let remote = Arc::new(ObjectStoreShuffleStore::new(Arc::new(store), storage_prefix));
+    let remote = Arc::new(ObjectStoreShuffleStore::new(
+        Arc::new(store),
+        storage_prefix,
+    ));
 
     Ok(Arc::new(ShuffleBackend::Tiered(Arc::new(
         TieredShuffleStore::new(local, remote),

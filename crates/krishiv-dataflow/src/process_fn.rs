@@ -227,7 +227,11 @@ mod tests {
     }
 
     impl CountAndTimerFn {
-        fn new() -> Self { Self { counts: HashMap::new() } }
+        fn new() -> Self {
+            Self {
+                counts: HashMap::new(),
+            }
+        }
     }
 
     impl ProcessFunction for CountAndTimerFn {

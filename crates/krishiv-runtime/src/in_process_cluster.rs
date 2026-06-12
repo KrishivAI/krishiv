@@ -3,7 +3,10 @@
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_plan::{PlanError, window::{WindowExecutionSpec, WindowKind, encode_stream_fragment}};
+use krishiv_plan::{
+    PlanError,
+    window::{WindowExecutionSpec, WindowKind, encode_stream_fragment},
+};
 
 use krishiv_scheduler::MetadataStore;
 
@@ -175,9 +178,14 @@ impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
             crate::local_streaming::LocalWindowKind::Session { gap_ms } => {
                 (WindowKind::Session, None, Some(*gap_ms))
             }
-            crate::local_streaming::LocalWindowKind::Count { size, slide } => {
-                (WindowKind::Count { size: *size, slide: *slide }, None, None)
-            }
+            crate::local_streaming::LocalWindowKind::Count { size, slide } => (
+                WindowKind::Count {
+                    size: *size,
+                    slide: *slide,
+                },
+                None,
+                None,
+            ),
         };
 
         WindowExecutionSpec {

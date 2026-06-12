@@ -183,15 +183,16 @@ pub fn execute_match_recognize(
                     stmt.event_time_column
                 ),
             })?;
-        let key_str = key_col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            SqlError::Unsupported {
+        let key_str = key_col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| SqlError::Unsupported {
                 feature: format!(
                     "MATCH_RECOGNIZE: partition key column '{}' must be Utf8 (got {})",
                     stmt.key_column,
                     key_col.data_type(),
                 ),
-            }
-        })?;
+            })?;
         for i in 0..batch.num_rows() {
             let key = if key_str.is_null(i) {
                 continue;
@@ -311,15 +312,16 @@ pub fn execute_streaming_match_recognize(
                     stmt.event_time_column
                 ),
             })?;
-        let key_str = key_col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            SqlError::Unsupported {
+        let key_str = key_col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| SqlError::Unsupported {
                 feature: format!(
                     "MATCH_RECOGNIZE: partition key column '{}' must be Utf8 (got {})",
                     stmt.key_column,
                     key_col.data_type(),
                 ),
-            }
-        })?;
+            })?;
         for i in 0..batch.num_rows() {
             let key = if key_str.is_null(i) {
                 continue;

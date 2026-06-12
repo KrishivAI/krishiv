@@ -32,11 +32,11 @@
 
 use std::sync::Arc;
 
-use futures::TryStreamExt;
-use pulsar::{Consumer, DeserializeMessage, Payload, Pulsar, SubType, TokioExecutor};
 use arrow::array::{BinaryBuilder, Int64Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use futures::TryStreamExt;
+use pulsar::{Consumer, DeserializeMessage, Payload, Pulsar, SubType, TokioExecutor};
 
 use crate::capabilities::ConnectorCapabilities;
 use crate::error::{ConnectorError, ConnectorResult};
@@ -249,31 +249,69 @@ mod tests {
     fn pulsar_schema_has_four_columns() {
         let schema = pulsar_arrow_schema();
         assert_eq!(schema.fields().len(), 4);
-        assert_eq!(schema.field_with_name("topic").unwrap().data_type(), &DataType::Utf8);
-        assert_eq!(schema.field_with_name("partition_key").unwrap().data_type(), &DataType::Utf8);
-        assert!(schema.field_with_name("partition_key").unwrap().is_nullable());
-        assert_eq!(schema.field_with_name("publish_time_ms").unwrap().data_type(), &DataType::Int64);
-        assert_eq!(schema.field_with_name("data").unwrap().data_type(), &DataType::Binary);
+        assert_eq!(
+            schema.field_with_name("topic").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            schema.field_with_name("partition_key").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        assert!(
+            schema
+                .field_with_name("partition_key")
+                .unwrap()
+                .is_nullable()
+        );
+        assert_eq!(
+            schema
+                .field_with_name("publish_time_ms")
+                .unwrap()
+                .data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            schema.field_with_name("data").unwrap().data_type(),
+            &DataType::Binary
+        );
     }
 
     #[test]
     fn messages_to_batch_converts_correctly() {
         let schema = pulsar_arrow_schema();
         let msgs = vec![
-            ("persistent://public/default/events", Some("key-a"), 1_000_000i64, b"hello".as_ref()),
-            ("persistent://public/default/events", None, 2_000_000i64, b"world".as_ref()),
+            (
+                "persistent://public/default/events",
+                Some("key-a"),
+                1_000_000i64,
+                b"hello".as_ref(),
+            ),
+            (
+                "persistent://public/default/events",
+                None,
+                2_000_000i64,
+                b"world".as_ref(),
+            ),
         ];
         let batch = messages_to_batch(&schema, &msgs).unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 4);
 
         use arrow::array::{Array, StringArray};
-        let topics = batch.column_by_name("topic").unwrap()
-            .as_any().downcast_ref::<StringArray>().unwrap();
+        let topics = batch
+            .column_by_name("topic")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(topics.value(0), "persistent://public/default/events");
 
-        let keys = batch.column_by_name("partition_key").unwrap()
-            .as_any().downcast_ref::<StringArray>().unwrap();
+        let keys = batch
+            .column_by_name("partition_key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(keys.value(0), "key-a");
         assert!(keys.is_null(1));
     }

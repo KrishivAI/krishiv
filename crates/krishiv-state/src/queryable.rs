@@ -220,7 +220,9 @@ mod tests {
         let backend = prepopulated_backend("op-1", "counts", b"user-a", b"42");
         store.register("job-1", "op-1", backend);
 
-        let val = store.get("job-1", "op-1", "counts", b"no-such-key").unwrap();
+        let val = store
+            .get("job-1", "op-1", "counts", b"no-such-key")
+            .unwrap();
         assert!(val.is_none());
     }
 

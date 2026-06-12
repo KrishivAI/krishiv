@@ -17,17 +17,17 @@
 //! # }
 //! ```
 
+use arrow::array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    StringArray,
+};
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use scylla::{
     client::session_builder::SessionBuilder,
     statement::batch::{Batch, BatchType},
     value::CqlValue,
 };
-use arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    Int8Array, Int16Array, StringArray,
-};
-use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatch;
 
 use crate::error::{ConnectorError, ConnectorResult};
 
@@ -91,9 +91,12 @@ impl CassandraSink {
         }
 
         let schema = batch.schema();
-        let column_names: Vec<&str> =
-            schema.fields().iter().map(|f| f.name().as_str()).collect();
-        let placeholders = column_names.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let placeholders = column_names
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
         let cols = column_names.join(", ");
 
         let insert_cql = format!(
@@ -134,11 +137,7 @@ impl CassandraSink {
 /// Convert a single Arrow array cell to an `Option<CqlValue>`.
 ///
 /// Returns `None` for null cells.
-pub fn arrow_scalar_to_cql(
-    col: &dyn Array,
-    row: usize,
-    dt: &DataType,
-) -> Option<CqlValue> {
+pub fn arrow_scalar_to_cql(col: &dyn Array, row: usize, dt: &DataType) -> Option<CqlValue> {
     if col.is_null(row) {
         return None;
     }

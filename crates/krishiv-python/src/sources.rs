@@ -80,8 +80,8 @@ pub fn read_kafka(
     #[cfg(feature = "kafka")]
     {
         use crate::schema::PySchema;
-        use std::sync::Arc;
         use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        use std::sync::Arc;
 
         let arrow_schema: SchemaRef = if let Some(cls) = schema {
             PySchema::arrow_schema_from_class(cls)?

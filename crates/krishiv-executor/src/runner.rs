@@ -855,7 +855,7 @@ impl ExecutorTaskRunner {
 
     /// Set the root directory for durable window operator state.
     ///
-    /// When set, continuous window operators use `FjallStateBackend::open(state_dir/job_id/)`
+    /// When set, continuous window operators use `RocksDbStateBackend::open(state_dir/job_id/)`
     /// instead of `ephemeral()`, making state survive executor restarts.
     /// Corresponds to the `single-node-durable` and `distributed-durable` profiles.
     pub fn with_state_dir(mut self, dir: std::path::PathBuf) -> Self {
@@ -894,7 +894,9 @@ impl ExecutorTaskRunner {
     /// and the task runner share the same `ContinuousWindowExecutor` instances.
     pub fn with_shared_loop_executors(
         mut self,
-        executors: Arc<DashMap<String, Arc<std::sync::Mutex<krishiv_dataflow::ContinuousWindowExecutor>>>>,
+        executors: Arc<
+            DashMap<String, Arc<std::sync::Mutex<krishiv_dataflow::ContinuousWindowExecutor>>>,
+        >,
     ) -> Self {
         self.loop_executors = executors;
         self
@@ -1137,7 +1139,8 @@ impl ExecutorTaskRunner {
             max_execution_time_ms: assignment.cpu_limit_nanos().map(|n| n / 1_000_000),
         };
         // Shared memory budget for all operators within this task.
-        let memory_budget = krishiv_common::MemoryBudget::from_limit(assignment.memory_limit_bytes());
+        let memory_budget =
+            krishiv_common::MemoryBudget::from_limit(assignment.memory_limit_bytes());
 
         let execute_result = match model {
             crate::ExecutionModel::Batch => {
@@ -1169,7 +1172,12 @@ impl ExecutorTaskRunner {
                     .unwrap_or(DEFAULT_STREAMING_TASK_TIMEOUT_SECS);
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    execute_streaming_fragment(self, &assignment, udf_limits.clone(), memory_budget),
+                    execute_streaming_fragment(
+                        self,
+                        &assignment,
+                        udf_limits.clone(),
+                        memory_budget,
+                    ),
                 )
                 .await
                 {
@@ -1259,7 +1267,13 @@ impl ExecutorTaskRunner {
         &self,
         assignment: &ExecutorTaskAssignment,
     ) -> ExecutorResult<ExecutorTaskOutput> {
-        execute_batch_fragment(self, assignment, ResourceLimits::default(), krishiv_common::MemoryBudget::unlimited()).await
+        execute_batch_fragment(
+            self,
+            assignment,
+            ResourceLimits::default(),
+            krishiv_common::MemoryBudget::unlimited(),
+        )
+        .await
     }
 
     /// Execute a streaming (continuous) stage fragment.
@@ -1268,7 +1282,13 @@ impl ExecutorTaskRunner {
         &self,
         assignment: &ExecutorTaskAssignment,
     ) -> ExecutorResult<ExecutorTaskOutput> {
-        execute_streaming_fragment(self, assignment, ResourceLimits::default(), krishiv_common::MemoryBudget::unlimited()).await
+        execute_streaming_fragment(
+            self,
+            assignment,
+            ResourceLimits::default(),
+            krishiv_common::MemoryBudget::unlimited(),
+        )
+        .await
     }
 
     pub(crate) async fn send_task_status<S>(
@@ -1821,7 +1841,7 @@ mod runner_tests {
             epoch: 3,
             fencing_token: krishiv_proto::FencingToken::initial(),
         };
-        let state_backend = krishiv_state::FjallStateBackend::ephemeral().unwrap();
+        let state_backend = krishiv_state::RocksDbStateBackend::ephemeral().unwrap();
         let storage = krishiv_state::checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap();
         let ack = runner
             .handle_initiate_checkpoint(req, &state_backend, &storage)
@@ -1839,7 +1859,7 @@ mod runner_tests {
             epoch: 1,
             fencing_token: krishiv_proto::FencingToken::initial(),
         };
-        let state_backend = krishiv_state::FjallStateBackend::ephemeral().unwrap();
+        let state_backend = krishiv_state::RocksDbStateBackend::ephemeral().unwrap();
         let storage = krishiv_state::checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap();
         let ack = runner
             .handle_initiate_checkpoint(req, &state_backend, &storage)

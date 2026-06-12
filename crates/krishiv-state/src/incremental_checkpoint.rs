@@ -121,9 +121,11 @@ impl RocksDbIncrementalCheckpointer {
             })?;
         }
 
-        backend.create_rocksdb_checkpoint(&local_dir).map_err(|e| {
-            CheckpointError::Storage { message: e.to_string() }
-        })?;
+        backend
+            .create_rocksdb_checkpoint(&local_dir)
+            .map_err(|e| CheckpointError::Storage {
+                message: e.to_string(),
+            })?;
 
         self.seed_from_prev_manifest(storage, storage_prefix, epoch)?;
 
@@ -137,8 +139,8 @@ impl RocksDbIncrementalCheckpointer {
             meta_files,
             manifest_storage_path: manifest_path.clone(),
         };
-        let json = serde_json::to_vec_pretty(&manifest).map_err(|e| {
-            CheckpointError::Storage { message: format!("manifest serialize: {e}") }
+        let json = serde_json::to_vec_pretty(&manifest).map_err(|e| CheckpointError::Storage {
+            message: format!("manifest serialize: {e}"),
         })?;
         storage.write_bytes(&manifest_path, &json)?;
 
@@ -153,7 +155,9 @@ impl RocksDbIncrementalCheckpointer {
         epoch: u64,
     ) -> CheckpointResult<SstEpochManifest> {
         let path = manifest_json_path(storage_prefix, epoch);
-        let bytes = storage.read_bytes(&path)?.ok_or(CheckpointError::NoValidEpoch)?;
+        let bytes = storage
+            .read_bytes(&path)?
+            .ok_or(CheckpointError::NoValidEpoch)?;
         serde_json::from_slice(&bytes).map_err(|e| CheckpointError::Storage {
             message: format!("parse sst manifest: {e}"),
         })
@@ -173,12 +177,13 @@ impl RocksDbIncrementalCheckpointer {
         })?;
 
         for sst in &manifest.sst_files {
-            let data = storage.read_bytes(&sst.storage_path)?.ok_or_else(|| {
-                CheckpointError::Corrupt {
-                    epoch: manifest.epoch,
-                    message: format!("SST file {} missing from storage", sst.filename),
-                }
-            })?;
+            let data =
+                storage
+                    .read_bytes(&sst.storage_path)?
+                    .ok_or_else(|| CheckpointError::Corrupt {
+                        epoch: manifest.epoch,
+                        message: format!("SST file {} missing from storage", sst.filename),
+                    })?;
             verify_sha256(&data, &sst.sha256_hex, &sst.filename, manifest.epoch)?;
             let dest = target_dir.join(&sst.filename);
             std::fs::write(&dest, &data).map_err(|e| CheckpointError::Storage {
@@ -272,7 +277,10 @@ impl RocksDbIncrementalCheckpointer {
             } else {
                 let storage_path = format!("{prefix}/epochs/{epoch:020}/{filename}");
                 storage.write_bytes(&storage_path, &data)?;
-                meta_files.push(EpochMetaFile { filename, storage_path });
+                meta_files.push(EpochMetaFile {
+                    filename,
+                    storage_path,
+                });
             }
         }
 
@@ -292,9 +300,7 @@ fn verify_sha256(data: &[u8], expected: &str, filename: &str, epoch: u64) -> Che
     if actual != expected {
         return Err(CheckpointError::Corrupt {
             epoch,
-            message: format!(
-                "SST file {filename}: expected sha256 {expected}, got {actual}"
-            ),
+            message: format!("SST file {filename}: expected sha256 {expected}, got {actual}"),
         });
     }
     Ok(())
@@ -335,9 +341,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(manifest.epoch, 1);
-        assert!(!manifest.meta_files.is_empty(), "should have CURRENT/MANIFEST meta files");
         assert!(
-            storage.read_bytes(&manifest.manifest_storage_path).unwrap().is_some(),
+            !manifest.meta_files.is_empty(),
+            "should have CURRENT/MANIFEST meta files"
+        );
+        assert!(
+            storage
+                .read_bytes(&manifest.manifest_storage_path)
+                .unwrap()
+                .is_some(),
             "manifest JSON not written"
         );
     }
@@ -354,7 +366,9 @@ mod tests {
             .unwrap();
 
         let ns = Namespace::new("op1", "counts");
-        backend.put(&ns, b"key3".to_vec(), b"val3".to_vec()).unwrap();
+        backend
+            .put(&ns, b"key3".to_vec(), b"val3".to_vec())
+            .unwrap();
         let m2 = ckpt
             .take_checkpoint(&backend, 2, &*storage, "job-1/rocksdb/op-1")
             .unwrap();

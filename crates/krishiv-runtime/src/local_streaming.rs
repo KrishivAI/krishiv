@@ -8,17 +8,26 @@ use crate::RuntimeError;
 use crate::in_process_cluster::local_spec_to_plan_spec;
 
 type BatchStream = std::pin::Pin<
-    Box<dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_dataflow::ExecError>> + Send>,
+    Box<
+        dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_dataflow::ExecError>> + Send,
+    >,
 >;
 
 /// Window operator kind for local execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalWindowKind {
     Tumbling,
-    Sliding { slide_ms: u64 },
-    Session { gap_ms: u64 },
+    Sliding {
+        slide_ms: u64,
+    },
+    Session {
+        gap_ms: u64,
+    },
     /// Row-count based window: fires every `slide` rows, covers last `size` rows.
-    Count { size: u64, slide: u64 },
+    Count {
+        size: u64,
+        slide: u64,
+    },
 }
 
 /// Specification for executing a keyed, windowed stream in-process.

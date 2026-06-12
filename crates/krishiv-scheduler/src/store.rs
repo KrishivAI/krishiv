@@ -249,7 +249,6 @@ pub struct InMemoryMetadataStore {
     evicted_event_count: u64,
 }
 
-
 impl InMemoryMetadataStore {
     /// Number of oldest events evicted by the ring buffer to keep the events
     /// log under [`MAX_EVENTS_LOG_BYTES`].

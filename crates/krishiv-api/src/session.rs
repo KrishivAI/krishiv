@@ -137,7 +137,6 @@ pub(crate) fn shared_embedded_runtime() -> Result<Arc<dyn ExecutionRuntime>> {
     })
 }
 
-
 fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {
     match mode {
         ExecutionMode::Embedded => RuntimeMode::Embedded,
@@ -405,8 +404,7 @@ impl SessionBuilder {
 
         let udf_registry = Arc::new(RwLock::new(UdfRegistry::new()));
         let parallelism = self.target_parallelism.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .unwrap_or(std::num::NonZeroUsize::new(1).unwrap())
+            std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(1).unwrap())
         });
         let sql_engine = SqlEngine::new()
             .with_target_parallelism(parallelism)
@@ -892,10 +890,11 @@ impl Session {
         // In distributed mode, forward the registration to the remote coordinator
         // so the remote SQL engine can plan streaming queries over Kafka topics.
         if self.runtime.uses_remote() {
-            let schema_ipc_b64 = krishiv_runtime::encode_schema_ipc_b64(&schema)
-                .map_err(|e| KrishivError::Runtime {
+            let schema_ipc_b64 = krishiv_runtime::encode_schema_ipc_b64(&schema).map_err(|e| {
+                KrishivError::Runtime {
                     message: e.to_string(),
-                })?;
+                }
+            })?;
             self.runtime
                 .register_kafka_source(name, &schema_ipc_b64, &bootstrap_servers, &topic, &group_id)
                 .map_err(|e| KrishivError::Runtime {
@@ -963,13 +962,13 @@ impl Session {
     /// session mode. Returns a DataFrame with pre-collected results so that
     /// `.collect()` returns immediately without remote routing.
     pub async fn execute_local_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
-        let sql_df = self
-            .sql_engine
-            .sql(query.as_ref())
-            .await
-            .map_err(|e| KrishivError::Runtime {
-                message: e.to_string(),
-            })?;
+        let sql_df =
+            self.sql_engine
+                .sql(query.as_ref())
+                .await
+                .map_err(|e| KrishivError::Runtime {
+                    message: e.to_string(),
+                })?;
         let batches = sql_df.collect().await.map_err(|e| KrishivError::Runtime {
             message: e.to_string(),
         })?;
@@ -1248,7 +1247,9 @@ impl Session {
     /// Check if a table exists in the session.
     pub fn table_exists(&self, name: &str) -> Result<bool> {
         let names = self.list_tables()?;
-        Ok(names.iter().any(|n| n == name || format!("_krishiv_parquet_{name}") == *n))
+        Ok(names
+            .iter()
+            .any(|n| n == name || format!("_krishiv_parquet_{name}") == *n))
     }
 
     /// Create a SQL view in the current session.

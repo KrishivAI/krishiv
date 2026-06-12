@@ -9,13 +9,13 @@ fn ns(op: &str, name: &str) -> Namespace {
 
 #[test]
 fn state_get_missing_returns_none() {
-    let backend = FjallStateBackend::new().unwrap();
+    let backend = RocksDbStateBackend::new().unwrap();
     assert!(backend.get(&ns("op1", "window"), b"k1").unwrap().is_none());
 }
 
 #[test]
 fn state_put_and_get_roundtrip() {
-    let mut backend = FjallStateBackend::new().unwrap();
+    let mut backend = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "counts");
     backend.put(&n, b"user-a".to_vec(), b"42".to_vec()).unwrap();
     assert_eq!(backend.get(&n, b"user-a").unwrap(), Some(b"42".to_vec()));
@@ -23,7 +23,7 @@ fn state_put_and_get_roundtrip() {
 
 #[test]
 fn state_delete_removes_key() {
-    let mut backend = FjallStateBackend::new().unwrap();
+    let mut backend = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "counts");
     backend.put(&n, b"k".to_vec(), b"v".to_vec()).unwrap();
     backend.delete(&n, b"k").unwrap();
@@ -32,7 +32,7 @@ fn state_delete_removes_key() {
 
 #[test]
 fn state_delete_missing_key_is_noop() {
-    let mut backend = FjallStateBackend::new().unwrap();
+    let mut backend = RocksDbStateBackend::new().unwrap();
     backend
         .delete(&ns("op1", "counts"), b"nonexistent")
         .unwrap();
@@ -40,7 +40,7 @@ fn state_delete_missing_key_is_noop() {
 
 #[test]
 fn state_clear_namespace_removes_only_matching_keys() {
-    let mut backend = FjallStateBackend::new().unwrap();
+    let mut backend = RocksDbStateBackend::new().unwrap();
     let ns_a = ns("op1", "window");
     let ns_b = ns("op1", "other");
     let ns_c = ns("op2", "window");
@@ -60,7 +60,7 @@ fn state_clear_namespace_removes_only_matching_keys() {
 
 #[test]
 fn state_namespaces_are_isolated() {
-    let mut backend = FjallStateBackend::new().unwrap();
+    let mut backend = RocksDbStateBackend::new().unwrap();
     let ns_a = ns("op1", "window");
     let ns_b = ns("op2", "window");
     backend
@@ -168,13 +168,13 @@ fn timer_drain_empty_returns_empty() {
 
 #[test]
 fn list_namespaces_empty_backend() {
-    let b = FjallStateBackend::new().unwrap();
+    let b = RocksDbStateBackend::new().unwrap();
     assert!(b.list_namespaces().unwrap().is_empty());
 }
 
 #[test]
 fn list_namespaces_returns_unique_namespaces() {
-    let mut b = FjallStateBackend::new().unwrap();
+    let mut b = RocksDbStateBackend::new().unwrap();
     let n1 = ns("op1", "counts");
     let n2 = ns("op2", "counts");
     b.put(&n1, b"k1".to_vec(), b"v".to_vec()).unwrap();
@@ -187,7 +187,7 @@ fn list_namespaces_returns_unique_namespaces() {
 
 #[test]
 fn list_keys_returns_keys_for_namespace() {
-    let mut b = FjallStateBackend::new().unwrap();
+    let mut b = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "window");
     b.put(&n, b"alpha".to_vec(), b"v".to_vec()).unwrap();
     b.put(&n, b"beta".to_vec(), b"v".to_vec()).unwrap();
@@ -235,7 +235,7 @@ fn processing_time_timer_cancel_is_noop_for_missing() {
 
 #[test]
 fn ttl_backend_returns_value_before_expiry() {
-    let inner = FjallStateBackend::new().unwrap();
+    let inner = RocksDbStateBackend::new().unwrap();
     let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
     let n = ns("op1", "session");
     ttl.put(&n, b"k".to_vec(), b"val".to_vec()).unwrap();
@@ -246,7 +246,7 @@ fn ttl_backend_returns_value_before_expiry() {
 #[test]
 fn ttl_backend_expired_value_returns_none() {
     // Write with an expiry in the past by constructing a raw inner entry.
-    let mut inner = FjallStateBackend::new().unwrap();
+    let mut inner = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "session");
     // Manually encode an already-expired entry (expires_at = 1 ms since epoch).
     let expires_at_ms: i64 = 1;
@@ -262,7 +262,7 @@ fn ttl_backend_expired_value_returns_none() {
 
 #[test]
 fn ttl_backend_corrupt_value_returns_error() {
-    let mut inner = FjallStateBackend::new().unwrap();
+    let mut inner = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "session");
     inner.put(&n, b"k".to_vec(), b"short".to_vec()).unwrap();
 
@@ -273,7 +273,7 @@ fn ttl_backend_corrupt_value_returns_error() {
 
 #[test]
 fn ttl_backend_delete_removes_entry() {
-    let inner = FjallStateBackend::new().unwrap();
+    let inner = RocksDbStateBackend::new().unwrap();
     let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
     let n = ns("op1", "s");
     ttl.put(&n, b"k".to_vec(), b"v".to_vec()).unwrap();
@@ -285,14 +285,14 @@ fn ttl_backend_delete_removes_entry() {
 
 #[test]
 fn state_inspector_is_read_only() {
-    let b = FjallStateBackend::new().unwrap();
+    let b = RocksDbStateBackend::new().unwrap();
     let inspector = StateInspector::new(&b);
     assert!(inspector.is_read_only());
 }
 
 #[test]
 fn state_inspector_key_count_and_namespaces() {
-    let mut b = FjallStateBackend::new().unwrap();
+    let mut b = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "window");
     b.put(&n, b"a".to_vec(), b"1".to_vec()).unwrap();
     b.put(&n, b"b".to_vec(), b"2".to_vec()).unwrap();
@@ -306,7 +306,7 @@ fn state_inspector_key_count_and_namespaces() {
 
 #[test]
 fn in_memory_put_batch_get_batch_roundtrip() {
-    let mut b = FjallStateBackend::new().unwrap();
+    let mut b = RocksDbStateBackend::new().unwrap();
     let entries: &[(&str, &str, &[u8], &[u8])] = &[
         ("op1", "counts", b"k1", b"v1"),
         ("op1", "counts", b"k2", b"v2"),
@@ -329,7 +329,7 @@ fn in_memory_put_batch_get_batch_roundtrip() {
 
 #[test]
 fn redb_put_batch_get_batch_roundtrip() {
-    let mut b = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let entries: &[(&str, &str, &[u8], &[u8])] = &[
         ("op1", "counts", b"k1", b"v1"),
         ("op1", "counts", b"k2", b"v2"),
@@ -390,10 +390,10 @@ fn timer_re_register_updates_deadline() {
     assert_eq!(fired[0].deadline_ms, 1000);
 }
 
-// ── FjallStateBackend (ephemeral, via legacy alias tests) ──────────────────
+// ── RocksDbStateBackend (ephemeral, via legacy alias tests) ──────────────────
 
-fn redb_ephemeral_backend() -> FjallStateBackend {
-    FjallStateBackend::ephemeral().expect("ephemeral backend")
+fn redb_ephemeral_backend() -> RocksDbStateBackend {
+    RocksDbStateBackend::ephemeral().expect("ephemeral backend")
 }
 
 #[test]
@@ -462,13 +462,13 @@ fn redb_ephemeral_survives_reopen() {
     let dir = {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.redb");
-        let mut b = FjallStateBackend::open(&path).expect("open");
+        let mut b = RocksDbStateBackend::open(&path).expect("open");
         let n = ns("op1", "window");
         b.put(&n, b"key1".to_vec(), b"hello".to_vec()).unwrap();
         b.put(&n, b"key2".to_vec(), b"world".to_vec()).unwrap();
         (dir, path)
     };
-    let b2 = FjallStateBackend::open(&dir.1).expect("reopen");
+    let b2 = RocksDbStateBackend::open(&dir.1).expect("reopen");
     let n = ns("op1", "window");
     assert_eq!(b2.get(&n, b"key1").unwrap(), Some(b"hello".to_vec()));
     assert_eq!(b2.get(&n, b"key2").unwrap(), Some(b"world".to_vec()));
@@ -493,7 +493,7 @@ fn redb_ephemeral_ttl_wrapper_expires_on_reopen() {
 
 #[test]
 fn redb_ephemeral_deterministic_replay() {
-    let write_state = |b: &mut FjallStateBackend| {
+    let write_state = |b: &mut RocksDbStateBackend| {
         let n = ns("tumbling-1", "window-counts");
         b.put(&n, b"user-a:0".to_vec(), 42i64.to_le_bytes().to_vec())
             .unwrap();
@@ -537,14 +537,14 @@ fn redb_ephemeral_spawn_blocking_compatible() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("state.redb");
     {
-        let mut b = FjallStateBackend::open(&path).expect("open");
+        let mut b = RocksDbStateBackend::open(&path).expect("open");
         let n = ns("op1", "window");
         b.put(&n, b"blocking-key".to_vec(), b"blocking-val".to_vec())
             .unwrap();
     }
     let path2 = path.clone();
     let result = thread::spawn(move || {
-        let backend = FjallStateBackend::open(&path2).unwrap();
+        let backend = RocksDbStateBackend::open(&path2).unwrap();
         backend.get(&ns("op1", "window"), b"blocking-key").unwrap()
     })
     .join()
@@ -558,12 +558,12 @@ fn redb_ephemeral_spawn_blocking_compatible() {
 
 #[test]
 fn in_memory_snapshot_round_trips() {
-    let mut b = FjallStateBackend::new().unwrap();
+    let mut b = RocksDbStateBackend::new().unwrap();
     let ns = Namespace::new("op1", "counts");
     b.put(&ns, b"k1".to_vec(), b"v1".to_vec()).unwrap();
     b.put(&ns, b"k2".to_vec(), b"v2".to_vec()).unwrap();
     let snap = b.snapshot().unwrap();
-    let mut b2 = FjallStateBackend::new().unwrap();
+    let mut b2 = RocksDbStateBackend::new().unwrap();
     b2.load_snapshot(&snap).unwrap();
     assert_eq!(b2.get(&ns, b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(b2.get(&ns, b"k2").unwrap(), Some(b"v2".to_vec()));
@@ -572,9 +572,9 @@ fn in_memory_snapshot_round_trips() {
 
 #[test]
 fn in_memory_snapshot_empty() {
-    let b = FjallStateBackend::new().unwrap();
+    let b = RocksDbStateBackend::new().unwrap();
     let snap = b.snapshot().unwrap();
-    let mut b2 = FjallStateBackend::new().unwrap();
+    let mut b2 = RocksDbStateBackend::new().unwrap();
     b2.load_snapshot(&snap).unwrap();
     assert_eq!(b2.key_count(), 0);
 }
@@ -582,10 +582,10 @@ fn in_memory_snapshot_empty() {
 #[test]
 fn in_memory_load_snapshot_clears_existing_state() {
     let ns = Namespace::new("op1", "counts");
-    let mut src = FjallStateBackend::new().unwrap();
+    let mut src = RocksDbStateBackend::new().unwrap();
     src.put(&ns, b"k1".to_vec(), b"v1".to_vec()).unwrap();
     let snap = src.snapshot().unwrap();
-    let mut dst = FjallStateBackend::new().unwrap();
+    let mut dst = RocksDbStateBackend::new().unwrap();
     dst.put(&ns, b"old_key".to_vec(), b"old_val".to_vec())
         .unwrap();
     dst.load_snapshot(&snap).unwrap();
@@ -595,22 +595,22 @@ fn in_memory_load_snapshot_clears_existing_state() {
 
 #[test]
 fn rocks_snapshot_round_trips() {
-    let mut b = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let ns = Namespace::new("op1", "counts");
     b.put(&ns, b"k1".to_vec(), b"v1".to_vec()).unwrap();
     b.put(&ns, b"k2".to_vec(), b"v2".to_vec()).unwrap();
     let snap = b.snapshot().unwrap();
-    let mut b2 = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b2 = RocksDbStateBackend::in_memory().expect("in-memory redb");
     b2.load_snapshot(&snap).unwrap();
     assert_eq!(b2.get(&ns, b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(b2.get(&ns, b"k2").unwrap(), Some(b"v2".to_vec()));
 }
 
-// ── FjallStateBackend-specific tests ───────────────────────────────────────
+// ── RocksDbStateBackend-specific tests ───────────────────────────────────────
 
 #[test]
 fn redb_backend_put_get_delete() {
-    let mut backend = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut backend = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "s");
     backend
         .put(&n, b"key1".to_vec(), b"value1".to_vec())
@@ -622,14 +622,14 @@ fn redb_backend_put_get_delete() {
 
 #[test]
 fn redb_backend_snapshot_restore() {
-    let mut backend = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut backend = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "s");
     backend.put(&n, b"k1".to_vec(), b"v1".to_vec()).unwrap();
     backend.put(&n, b"k2".to_vec(), b"v2".to_vec()).unwrap();
 
     let snap = backend.snapshot().unwrap();
 
-    let mut backend2 = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut backend2 = RocksDbStateBackend::in_memory().expect("in-memory redb");
     backend2.load_snapshot(&snap).unwrap();
     assert_eq!(backend2.get(&n, b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(backend2.get(&n, b"k2").unwrap(), Some(b"v2".to_vec()));
@@ -640,13 +640,13 @@ fn redb_backend_file_backed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("state.redb");
     {
-        let mut backend = FjallStateBackend::open(&path).expect("open redb");
+        let mut backend = RocksDbStateBackend::open(&path).expect("open redb");
         let n = ns("op1", "s");
         backend
             .put(&n, b"persistent".to_vec(), b"data".to_vec())
             .unwrap();
     }
-    let backend = FjallStateBackend::open(&path).expect("reopen redb");
+    let backend = RocksDbStateBackend::open(&path).expect("reopen redb");
     let n = ns("op1", "s");
     assert_eq!(
         backend.get(&n, b"persistent").unwrap(),
@@ -658,7 +658,7 @@ fn redb_backend_file_backed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn p0_4_snapshot_async_does_not_block() {
-    let mut backend = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut backend = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "async-snap");
     backend.put(&n, b"k1".to_vec(), b"v1".to_vec()).unwrap();
     backend.put(&n, b"k2".to_vec(), b"v2".to_vec()).unwrap();
@@ -668,7 +668,7 @@ async fn p0_4_snapshot_async_does_not_block() {
         .await
         .expect("snapshot_async failed");
 
-    let mut backend2 = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut backend2 = RocksDbStateBackend::in_memory().expect("in-memory redb");
     backend2.load_snapshot(&snap).unwrap();
     assert_eq!(backend2.get(&n, b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(backend2.get(&n, b"k2").unwrap(), Some(b"v2".to_vec()));
@@ -676,12 +676,12 @@ async fn p0_4_snapshot_async_does_not_block() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn p0_4_load_snapshot_async_does_not_block() {
-    let mut src = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut src = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "async-load");
     src.put(&n, b"ak".to_vec(), b"av".to_vec()).unwrap();
     let snap = src.snapshot().unwrap();
 
-    let mut dst = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut dst = RocksDbStateBackend::in_memory().expect("in-memory redb");
     dst.load_snapshot_async(snap)
         .await
         .expect("load_snapshot_async failed");
@@ -692,14 +692,14 @@ async fn p0_4_load_snapshot_async_does_not_block() {
 
 #[test]
 fn p0_6_corrupt_snapshot_propagates_error() {
-    let mut backend = FjallStateBackend::new().unwrap();
+    let mut backend = RocksDbStateBackend::new().unwrap();
     let result = backend.load_snapshot(b"bad");
     assert!(result.is_err());
 }
 
 #[test]
 fn p0_6_ttl_snapshot_propagates_error_on_corrupt_snapshot() {
-    let mut inner = FjallStateBackend::new().unwrap();
+    let mut inner = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "s");
     inner.put(&n, b"k".to_vec(), b"v".to_vec()).unwrap();
 
@@ -714,9 +714,9 @@ fn p0_6_ttl_snapshot_propagates_error_on_corrupt_snapshot() {
 
 #[test]
 fn p0_7_redb_load_snapshot_incomplete_returns_error() {
-    let mut backend = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut backend = RocksDbStateBackend::in_memory().expect("in-memory redb");
 
-    let mut src = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut src = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "s");
     src.put(&n, b"k1".to_vec(), b"v1".to_vec()).unwrap();
     let snap = src.snapshot().unwrap();
@@ -732,7 +732,7 @@ fn p0_7_redb_load_snapshot_incomplete_returns_error() {
 
 #[test]
 fn p0_7_redb_load_snapshot_failure_preserves_existing_state() {
-    let mut backend = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut backend = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "pre");
     backend
         .put(&n, b"pre".to_vec(), b"exists".to_vec())
@@ -746,13 +746,13 @@ fn p0_7_redb_load_snapshot_failure_preserves_existing_state() {
 
 #[test]
 fn p0_7_redb_load_snapshot_truncated_failure_preserves_existing_state() {
-    let mut backend = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut backend = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let existing = ns("op1", "pre");
     backend
         .put(&existing, b"pre".to_vec(), b"exists".to_vec())
         .unwrap();
 
-    let mut src = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut src = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let replacement = ns("op1", "replacement");
     src.put(&replacement, b"k1".to_vec(), b"v1".to_vec())
         .unwrap();
@@ -811,7 +811,7 @@ fn p0_8_duration_since_before_epoch_returns_clock_error() {
 
 #[test]
 fn p0_9_corrupt_redb_entry_returns_corrupt_entry_error() {
-    let mut inner = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut inner = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "corrupt-test");
     inner.put(&n, b"bad-key".to_vec(), b"sho".to_vec()).unwrap();
 
@@ -838,7 +838,7 @@ fn p0_9_corrupt_entry_variant_displays() {
 
 #[test]
 fn p0_16_ttl_snapshot_no_prefix_leakage() {
-    let inner1 = FjallStateBackend::new().unwrap();
+    let inner1 = RocksDbStateBackend::new().unwrap();
     let mut ttl1 = TtlStateBackend::new(inner1, TtlConfig::new(60_000));
     let n = ns("op1", "session");
 
@@ -849,7 +849,7 @@ fn p0_16_ttl_snapshot_no_prefix_leakage() {
 
     let snap = ttl1.snapshot().expect("snapshot must succeed");
 
-    let inner2 = FjallStateBackend::new().unwrap();
+    let inner2 = RocksDbStateBackend::new().unwrap();
     let mut ttl2 = TtlStateBackend::new(inner2, TtlConfig::new(60_000));
     ttl2.load_snapshot(&snap)
         .expect("load_snapshot must succeed");
@@ -862,7 +862,7 @@ fn p0_16_ttl_snapshot_no_prefix_leakage() {
 
 #[test]
 fn p0_16_ttl_snapshot_redb_no_prefix_leakage() {
-    let inner1 = FjallStateBackend::new().unwrap();
+    let inner1 = RocksDbStateBackend::new().unwrap();
     let mut ttl1 = TtlStateBackend::new(inner1, TtlConfig::new(60_000));
     let n = ns("op1", "counts");
 
@@ -870,7 +870,7 @@ fn p0_16_ttl_snapshot_redb_no_prefix_leakage() {
     ttl1.put(&n, b"k2".to_vec(), b"200".to_vec()).unwrap();
     let snap = ttl1.snapshot().expect("snapshot must succeed");
 
-    let inner2 = FjallStateBackend::in_memory().expect("in-memory redb");
+    let inner2 = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let mut ttl2 = TtlStateBackend::new(inner2, TtlConfig::new(60_000));
     ttl2.load_snapshot(&snap)
         .expect("load_snapshot must succeed");
@@ -881,7 +881,7 @@ fn p0_16_ttl_snapshot_redb_no_prefix_leakage() {
 
 #[test]
 fn p0_16_ttl_snapshot_bytes_are_not_ttl_prefixed() {
-    let inner = FjallStateBackend::new().unwrap();
+    let inner = RocksDbStateBackend::new().unwrap();
     let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
     let n = ns("op1", "raw-check");
     ttl.put(&n, b"k".to_vec(), b"raw-value".to_vec()).unwrap();
@@ -898,7 +898,7 @@ fn p0_16_ttl_snapshot_bytes_are_not_ttl_prefixed() {
 
 #[test]
 fn ttl_purge_expired_removes_stale_entries() {
-    let mut inner = FjallStateBackend::new().unwrap();
+    let mut inner = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "session");
     // Manually encode an already-expired entry (expires_at = 1 ms since epoch).
     let expires_at_ms: i64 = 1;
@@ -919,11 +919,11 @@ fn ttl_purge_expired_removes_stale_entries() {
     assert_eq!(ttl.get(&n, b"live").unwrap(), Some(b"val".to_vec()));
 }
 
-// ── FjallStateBackend: additional coverage ──────────────────────────────────
+// ── RocksDbStateBackend: additional coverage ──────────────────────────────────
 
 #[test]
 fn redb_overwrite_key_updates_value() {
-    let mut b = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "s");
     b.put(&n, b"k".to_vec(), b"v1".to_vec()).unwrap();
     b.put(&n, b"k".to_vec(), b"v2".to_vec()).unwrap();
@@ -932,7 +932,7 @@ fn redb_overwrite_key_updates_value() {
 
 #[test]
 fn redb_clear_namespace_removes_only_matching_keys() {
-    let mut b = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let ns_a = ns("op1", "window");
     let ns_b = ns("op1", "other");
     b.put(&ns_a, b"k1".to_vec(), b"v1".to_vec()).unwrap();
@@ -946,7 +946,7 @@ fn redb_clear_namespace_removes_only_matching_keys() {
 
 #[test]
 fn redb_put_batch_empty_is_noop() {
-    let mut b = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b = RocksDbStateBackend::in_memory().expect("in-memory redb");
     b.put_batch(&[]).unwrap();
     let n = ns("op1", "s");
     assert!(b.get(&n, b"anything").unwrap().is_none());
@@ -954,7 +954,7 @@ fn redb_put_batch_empty_is_noop() {
 
 #[test]
 fn redb_multiple_namespaces_isolated() {
-    let mut b = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n1 = ns("op1", "window");
     let n2 = ns("op2", "window");
     b.put(&n1, b"key".to_vec(), b"val1".to_vec()).unwrap();
@@ -965,7 +965,7 @@ fn redb_multiple_namespaces_isolated() {
 
 #[test]
 fn redb_list_keys_returns_only_own_namespace() {
-    let mut b = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n1 = ns("op1", "window");
     let n2 = ns("op1", "counts");
     b.put(&n1, b"a".to_vec(), b"1".to_vec()).unwrap();
@@ -978,13 +978,13 @@ fn redb_list_keys_returns_only_own_namespace() {
 
 #[test]
 fn redb_snapshot_roundtrip_multiple_namespaces() {
-    let mut b = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n1 = ns("op1", "window");
     let n2 = ns("op2", "counts");
     b.put(&n1, b"k1".to_vec(), b"v1".to_vec()).unwrap();
     b.put(&n2, b"k2".to_vec(), b"v2".to_vec()).unwrap();
     let snap = b.snapshot().unwrap();
-    let mut b2 = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b2 = RocksDbStateBackend::in_memory().expect("in-memory redb");
     b2.load_snapshot(&snap).unwrap();
     assert_eq!(b2.get(&n1, b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(b2.get(&n2, b"k2").unwrap(), Some(b"v2".to_vec()));
@@ -992,11 +992,11 @@ fn redb_snapshot_roundtrip_multiple_namespaces() {
 
 #[test]
 fn redb_load_snapshot_replaces_existing_state() {
-    let mut b = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "s");
     b.put(&n, b"old".to_vec(), b"old_val".to_vec()).unwrap();
 
-    let mut src = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut src = RocksDbStateBackend::in_memory().expect("in-memory redb");
     src.put(&n, b"new".to_vec(), b"new_val".to_vec()).unwrap();
     let snap = src.snapshot().unwrap();
 
@@ -1009,7 +1009,7 @@ fn redb_load_snapshot_replaces_existing_state() {
 
 #[test]
 fn ttl_set_watermark_drives_event_time_expiry() {
-    let inner = FjallStateBackend::new().unwrap();
+    let inner = RocksDbStateBackend::new().unwrap();
     let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(1000));
     let n = ns("op1", "session");
     // Put a key — expiry is wall-clock based: now + 1000ms.
@@ -1028,7 +1028,7 @@ fn ttl_set_watermark_drives_event_time_expiry() {
 
 #[test]
 fn ttl_set_watermark_purge_uses_event_time() {
-    let inner = FjallStateBackend::new().unwrap();
+    let inner = RocksDbStateBackend::new().unwrap();
     let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(1000));
     let n = ns("op1", "session");
     ttl.put(&n, b"k".to_vec(), b"val".to_vec()).unwrap();
@@ -1043,7 +1043,7 @@ fn ttl_set_watermark_purge_uses_event_time() {
 
 #[test]
 fn ttl_list_keys_filters_expired_entries() {
-    let mut inner = FjallStateBackend::new().unwrap();
+    let mut inner = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "session");
     // Manually write an expired entry (expires_at = 1).
     let expires_at_ms: i64 = 1;
@@ -1061,7 +1061,7 @@ fn ttl_list_keys_filters_expired_entries() {
 
 #[test]
 fn ttl_list_keys_returns_empty_when_all_expired() {
-    let mut inner = FjallStateBackend::new().unwrap();
+    let mut inner = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "session");
     let expires_at_ms: i64 = 1;
     let mut encoded = Vec::new();
@@ -1078,7 +1078,7 @@ fn ttl_list_keys_returns_empty_when_all_expired() {
 
 #[test]
 fn state_inspector_empty_namespace_returns_zero() {
-    let b = FjallStateBackend::new().unwrap();
+    let b = RocksDbStateBackend::new().unwrap();
     let inspector = StateInspector::new(&b);
     let n = ns("op1", "empty");
     assert_eq!(inspector.key_count(&n).unwrap(), 0);
@@ -1087,7 +1087,7 @@ fn state_inspector_empty_namespace_returns_zero() {
 
 #[test]
 fn state_inspector_multiple_namespaces() {
-    let mut b = FjallStateBackend::new().unwrap();
+    let mut b = RocksDbStateBackend::new().unwrap();
     let n1 = ns("op1", "window");
     let n2 = ns("op2", "counts");
     let n3 = ns("op1", "buffer");
@@ -1103,7 +1103,7 @@ fn state_inspector_multiple_namespaces() {
 
 #[test]
 fn state_inspector_key_size_bytes_sum_of_key_lengths() {
-    let mut b = FjallStateBackend::new().unwrap();
+    let mut b = RocksDbStateBackend::new().unwrap();
     let n = ns("op1", "s");
     b.put(&n, b"ab".to_vec(), b"x".to_vec()).unwrap();
     b.put(&n, b"cde".to_vec(), b"y".to_vec()).unwrap();
@@ -1115,7 +1115,7 @@ fn state_inspector_key_size_bytes_sum_of_key_lengths() {
 
 #[test]
 fn state_inspector_on_redb_read_only() {
-    let mut b = FjallStateBackend::in_memory().expect("in-memory redb");
+    let mut b = RocksDbStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "s");
     b.put(&n, b"k".to_vec(), b"v".to_vec()).unwrap();
     let inspector = StateInspector::new(&b);

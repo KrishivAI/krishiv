@@ -71,9 +71,8 @@ type InterceptedCoordinatorClient =
 /// this is a fatal start-up misconfiguration.
 fn client_tls_config_from_env() -> Option<tonic::transport::ClientTlsConfig> {
     if let Ok(ca_path) = std::env::var("KRISHIV_CA_CERT") {
-        let ca_pem = std::fs::read(&ca_path).unwrap_or_else(|e| {
-            panic!("KRISHIV_CA_CERT: cannot read '{ca_path}': {e}")
-        });
+        let ca_pem = std::fs::read(&ca_path)
+            .unwrap_or_else(|e| panic!("KRISHIV_CA_CERT: cannot read '{ca_path}': {e}"));
         let ca = tonic::transport::Certificate::from_pem(ca_pem);
         return Some(tonic::transport::ClientTlsConfig::new().ca_certificate(ca));
     }

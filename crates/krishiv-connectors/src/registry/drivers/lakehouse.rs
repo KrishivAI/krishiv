@@ -15,7 +15,8 @@ use crate::config::ConnectorConfig;
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::lakehouse::{
     DeltaTableHandle, DeltaWriteMode, HudiCowWriter, HudiSnapshotReader, IcebergFsTable,
-    IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaVersion, write_delta,
+    IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaVersion,
+    write_delta,
 };
 use crate::registry::descriptor::ConnectorDescriptor;
 use crate::registry::driver::{SinkDriver, SourceDriver};
@@ -24,7 +25,9 @@ use crate::sink::DynSink;
 use crate::source::DynSource;
 
 fn map_lh(e: LakehouseError) -> ConnectorError {
-    ConnectorError::Config { message: e.to_string() }
+    ConnectorError::Config {
+        message: e.to_string(),
+    }
 }
 
 fn require_path(config: &ConnectorConfig) -> ConnectorResult<PathBuf> {
@@ -40,21 +43,33 @@ struct IcebergSource {
 impl IcebergSource {
     async fn open(path: PathBuf) -> ConnectorResult<Self> {
         let table_ref = IcebergTableRef::new("default", "default", path.to_string_lossy().as_ref());
-        let table = IcebergFsTable::new(&path, table_ref, SchemaVersion { schema_id: 0, fields: vec![] })
+        let table = IcebergFsTable::new(
+            &path,
+            table_ref,
+            SchemaVersion {
+                schema_id: 0,
+                fields: vec![],
+            },
+        )
+        .map_err(map_lh)?;
+        let batches = table
+            .scan(&IcebergScanOptions::new())
+            .await
             .map_err(map_lh)?;
-        let batches = table.scan(&IcebergScanOptions::new()).await.map_err(map_lh)?;
-        Ok(Self { batches: batches.into() })
+        Ok(Self {
+            batches: batches.into(),
+        })
     }
 }
 
 impl crate::source::Source for IcebergSource {
     fn capabilities(&self) -> crate::capabilities::ConnectorCapabilities {
-        ConnectorCapabilities::new().with_bounded().with_rewindable()
+        ConnectorCapabilities::new()
+            .with_bounded()
+            .with_rewindable()
     }
 
-    fn read_batch(
-        &mut self,
-    ) -> impl Future<Output = ConnectorResult<Option<RecordBatch>>> + Send {
+    fn read_batch(&mut self) -> impl Future<Output = ConnectorResult<Option<RecordBatch>>> + Send {
         let batch = self.batches.pop_front();
         async move { Ok(batch) }
     }
@@ -72,15 +87,27 @@ struct IcebergSink {
 impl IcebergSink {
     fn open(path: PathBuf) -> ConnectorResult<Self> {
         let table_ref = IcebergTableRef::new("default", "default", path.to_string_lossy().as_ref());
-        let table = IcebergFsTable::new(&path, table_ref, SchemaVersion { schema_id: 0, fields: vec![] })
-            .map_err(map_lh)?;
-        Ok(Self { table: Arc::new(table), pending: Vec::new() })
+        let table = IcebergFsTable::new(
+            &path,
+            table_ref,
+            SchemaVersion {
+                schema_id: 0,
+                fields: vec![],
+            },
+        )
+        .map_err(map_lh)?;
+        Ok(Self {
+            table: Arc::new(table),
+            pending: Vec::new(),
+        })
     }
 }
 
 impl crate::sink::Sink for IcebergSink {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_bounded().with_idempotent()
+        ConnectorCapabilities::new()
+            .with_bounded()
+            .with_idempotent()
     }
 
     fn write_batch(
@@ -110,7 +137,9 @@ impl SourceDriver for IcebergSourceDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Iceberg,
             ConnectorRole::Source,
-            ConnectorCapabilities::new().with_bounded().with_rewindable(),
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable(),
         )
     }
 
@@ -138,7 +167,9 @@ impl SinkDriver for IcebergSinkDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Iceberg,
             ConnectorRole::Sink,
-            ConnectorCapabilities::new().with_bounded().with_idempotent(),
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_idempotent(),
         )
     }
 
@@ -171,18 +202,20 @@ impl DeltaSource {
             .await
             .map_err(map_lh)?;
         let batches = handle.scan_batches().await.map_err(map_lh)?;
-        Ok(Self { batches: batches.into() })
+        Ok(Self {
+            batches: batches.into(),
+        })
     }
 }
 
 impl crate::source::Source for DeltaSource {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_bounded().with_rewindable()
+        ConnectorCapabilities::new()
+            .with_bounded()
+            .with_rewindable()
     }
 
-    fn read_batch(
-        &mut self,
-    ) -> impl Future<Output = ConnectorResult<Option<RecordBatch>>> + Send {
+    fn read_batch(&mut self) -> impl Future<Output = ConnectorResult<Option<RecordBatch>>> + Send {
         let batch = self.batches.pop_front();
         async move { Ok(batch) }
     }
@@ -215,9 +248,14 @@ impl crate::sink::Sink for DeltaSink {
         let path = self.path.clone();
         async move {
             if !batches.is_empty() {
-                write_delta(path.to_string_lossy().as_ref(), batches, DeltaWriteMode::Append, false)
-                    .await
-                    .map_err(map_lh)?;
+                write_delta(
+                    path.to_string_lossy().as_ref(),
+                    batches,
+                    DeltaWriteMode::Append,
+                    false,
+                )
+                .await
+                .map_err(map_lh)?;
             }
             Ok(())
         }
@@ -231,7 +269,9 @@ impl SourceDriver for DeltaSourceDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Delta,
             ConnectorRole::Source,
-            ConnectorCapabilities::new().with_bounded().with_rewindable(),
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable(),
         )
     }
 
@@ -274,7 +314,10 @@ impl SinkDriver for DeltaSinkDriver {
     ) -> Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSink>>> + Send + 'a>> {
         let path = require_path(config);
         Box::pin(async move {
-            let sink = DeltaSink { path: path?, pending: Vec::new() };
+            let sink = DeltaSink {
+                path: path?,
+                pending: Vec::new(),
+            };
             Ok(Box::new(sink) as Box<dyn DynSink>)
         })
     }
@@ -290,18 +333,20 @@ impl HudiSource {
     fn open(path: PathBuf) -> ConnectorResult<Self> {
         let reader = HudiSnapshotReader::open(&path);
         let batches = reader.scan_batches().map_err(map_lh)?;
-        Ok(Self { batches: batches.into() })
+        Ok(Self {
+            batches: batches.into(),
+        })
     }
 }
 
 impl crate::source::Source for HudiSource {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_bounded().with_rewindable()
+        ConnectorCapabilities::new()
+            .with_bounded()
+            .with_rewindable()
     }
 
-    fn read_batch(
-        &mut self,
-    ) -> impl Future<Output = ConnectorResult<Option<RecordBatch>>> + Send {
+    fn read_batch(&mut self) -> impl Future<Output = ConnectorResult<Option<RecordBatch>>> + Send {
         let batch = self.batches.pop_front();
         async move { Ok(batch) }
     }
@@ -343,7 +388,9 @@ impl SourceDriver for HudiSourceDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Hudi,
             ConnectorRole::Source,
-            ConnectorCapabilities::new().with_bounded().with_rewindable(),
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable(),
         )
     }
 
@@ -429,8 +476,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_string_lossy().to_string();
 
-        let config = ConnectorConfig::new("test_table", "iceberg")
-            .with_property("path", &path);
+        let config = ConnectorConfig::new("test_table", "iceberg").with_property("path", &path);
 
         // ── INSERT: write two batches through the sink driver ─────────────────
         let sink_driver = IcebergSinkDriver;
@@ -495,7 +541,10 @@ mod tests {
         drop(sink2);
 
         // Scan should see both rows
-        let mut source = IcebergSourceDriver.open(&config).await.expect("open source");
+        let mut source = IcebergSourceDriver
+            .open(&config)
+            .await
+            .expect("open source");
         let mut total = 0usize;
         while let Some(b) = source.read_batch_dyn().await.expect("read") {
             total += b.num_rows();

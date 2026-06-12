@@ -205,7 +205,9 @@ impl CepOperator {
             restored.insert(key, state);
         }
         self.states = restored;
-        if let Some(epoch_bytes) = backend.get(namespace, b"cep:epoch")? && epoch_bytes.len() >= 8 {
+        if let Some(epoch_bytes) = backend.get(namespace, b"cep:epoch")?
+            && epoch_bytes.len() >= 8
+        {
             self.last_barrier_epoch = u64::from_le_bytes([
                 epoch_bytes[0],
                 epoch_bytes[1],
@@ -354,7 +356,7 @@ mod tests {
 
     #[test]
     fn cep_state_round_trips_through_backend() {
-        use krishiv_state::{FjallStateBackend, Namespace};
+        use krishiv_state::{Namespace, RocksDbStateBackend};
 
         let pattern = Pattern::begin("a")
             .followed_by("b")
@@ -365,7 +367,7 @@ mod tests {
         op.on_barrier(7);
         op.states.entry(b"k1".to_vec()).or_default().last_event_ms = 42;
 
-        let mut backend = FjallStateBackend::ephemeral().expect("ephemeral backend");
+        let mut backend = RocksDbStateBackend::ephemeral().expect("ephemeral backend");
         let ns = Namespace::new("job-1", "op-cep");
         op.persist_to_state(&mut backend, &ns).expect("persist");
 

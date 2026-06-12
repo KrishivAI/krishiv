@@ -22,10 +22,7 @@ impl RocksDbStateBackend {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let db = DB::open(&opts, path.as_ref()).map_err(db_err)?;
-        Ok(Self {
-            db,
-            _tempdir: None,
-        })
+        Ok(Self { db, _tempdir: None })
     }
 
     /// Create an ephemeral database backed by a temp directory.
@@ -87,20 +84,18 @@ impl RocksDbStateBackend {
     /// The target directory is created by RocksDB and will contain all SST
     /// files (hard-linked) plus MANIFEST, CURRENT, and OPTIONS files (copied).
     /// Used by [`crate::incremental_checkpoint::RocksDbIncrementalCheckpointer`].
-    pub fn create_rocksdb_checkpoint(
-        &self,
-        target_dir: &std::path::Path,
-    ) -> StateResult<()> {
+    pub fn create_rocksdb_checkpoint(&self, target_dir: &std::path::Path) -> StateResult<()> {
         let ckpt = rocksdb::checkpoint::Checkpoint::new(&self.db).map_err(|e| {
             StateError::BackendUnavailable {
                 message: format!("rocksdb checkpoint create: {e}"),
                 source: None,
             }
         })?;
-        ckpt.create_checkpoint(target_dir).map_err(|e| StateError::BackendUnavailable {
-            message: format!("rocksdb checkpoint write: {e}"),
-            source: None,
-        })
+        ckpt.create_checkpoint(target_dir)
+            .map_err(|e| StateError::BackendUnavailable {
+                message: format!("rocksdb checkpoint write: {e}"),
+                source: None,
+            })
     }
 
     pub async fn snapshot_async(&self) -> StateResult<Vec<u8>> {
@@ -400,11 +395,8 @@ mod tests {
     fn rocksdb_put_batch_and_delete_batch() {
         let mut b = RocksDbStateBackend::new().unwrap();
         let n = ns("op", "s");
-        b.put_batch(&[
-            ("op", "s", b"k1", b"v1"),
-            ("op", "s", b"k2", b"v2"),
-        ])
-        .unwrap();
+        b.put_batch(&[("op", "s", b"k1", b"v1"), ("op", "s", b"k2", b"v2")])
+            .unwrap();
         assert_eq!(b.get(&n, b"k1").unwrap(), Some(b"v1".to_vec()));
         assert_eq!(b.get(&n, b"k2").unwrap(), Some(b"v2".to_vec()));
         b.delete_batch(&[(&n, b"k1".as_ref())]).unwrap();

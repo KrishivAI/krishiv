@@ -18,8 +18,8 @@
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-use arrow::csv::reader::Format;
 use arrow::csv::ReaderBuilder as CsvReaderBuilder;
+use arrow::csv::reader::Format;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::json::reader::ReaderBuilder as JsonReaderBuilder;
 use arrow::json::reader::infer_json_schema;
@@ -59,11 +59,26 @@ impl Default for CsvOptions {
 }
 
 impl CsvOptions {
-    pub fn with_has_header(mut self, v: bool) -> Self { self.has_header = v; self }
-    pub fn with_delimiter(mut self, v: u8) -> Self { self.delimiter = v; self }
-    pub fn with_infer_rows(mut self, v: usize) -> Self { self.infer_rows = v; self }
-    pub fn with_batch_size(mut self, v: usize) -> Self { self.batch_size = v; self }
-    pub fn with_schema(mut self, s: SchemaRef) -> Self { self.schema = Some(s); self }
+    pub fn with_has_header(mut self, v: bool) -> Self {
+        self.has_header = v;
+        self
+    }
+    pub fn with_delimiter(mut self, v: u8) -> Self {
+        self.delimiter = v;
+        self
+    }
+    pub fn with_infer_rows(mut self, v: usize) -> Self {
+        self.infer_rows = v;
+        self
+    }
+    pub fn with_batch_size(mut self, v: usize) -> Self {
+        self.batch_size = v;
+        self
+    }
+    pub fn with_schema(mut self, s: SchemaRef) -> Self {
+        self.schema = Some(s);
+        self
+    }
 }
 
 /// Reads CSV data as Arrow [`RecordBatch`] values.
@@ -107,12 +122,16 @@ impl CsvSource {
 
         let mut batches = Vec::new();
         for result in reader_built {
-            let batch = result
-                .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
+            let batch =
+                result.map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
             batches.push(batch);
         }
 
-        Ok(Self { schema, batches, cursor: 0 })
+        Ok(Self {
+            schema,
+            batches,
+            cursor: 0,
+        })
     }
 
     /// Arrow schema (inferred or explicit).
@@ -147,7 +166,9 @@ impl CsvSource {
 
     /// Connector capabilities.
     pub fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::default().with_bounded().with_rewindable()
+        ConnectorCapabilities::default()
+            .with_bounded()
+            .with_rewindable()
     }
 }
 
@@ -166,14 +187,27 @@ pub struct NdjsonOptions {
 
 impl Default for NdjsonOptions {
     fn default() -> Self {
-        Self { infer_rows: 100, batch_size: 1024, schema: None }
+        Self {
+            infer_rows: 100,
+            batch_size: 1024,
+            schema: None,
+        }
     }
 }
 
 impl NdjsonOptions {
-    pub fn with_infer_rows(mut self, v: usize) -> Self { self.infer_rows = v; self }
-    pub fn with_batch_size(mut self, v: usize) -> Self { self.batch_size = v; self }
-    pub fn with_schema(mut self, s: SchemaRef) -> Self { self.schema = Some(s); self }
+    pub fn with_infer_rows(mut self, v: usize) -> Self {
+        self.infer_rows = v;
+        self
+    }
+    pub fn with_batch_size(mut self, v: usize) -> Self {
+        self.batch_size = v;
+        self
+    }
+    pub fn with_schema(mut self, s: SchemaRef) -> Self {
+        self.schema = Some(s);
+        self
+    }
 }
 
 /// Reads newline-delimited JSON (NDJSON) as Arrow [`RecordBatch`] values.
@@ -212,12 +246,16 @@ impl NdjsonSource {
 
         let mut batches = Vec::new();
         for result in reader {
-            let batch = result
-                .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
+            let batch =
+                result.map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
             batches.push(batch);
         }
 
-        Ok(Self { schema, batches, cursor: 0 })
+        Ok(Self {
+            schema,
+            batches,
+            cursor: 0,
+        })
     }
 
     /// Arrow schema.
@@ -247,7 +285,9 @@ impl NdjsonSource {
 
     /// Connector capabilities.
     pub fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::default().with_bounded().with_rewindable()
+        ConnectorCapabilities::default()
+            .with_bounded()
+            .with_rewindable()
     }
 }
 
@@ -288,12 +328,17 @@ mod tests {
 
     #[test]
     fn csv_infers_schema_and_reads() {
-        let mut src =
-            CsvSource::open(Cursor::new(csv_bytes()), CsvOptions::default()).unwrap();
+        let mut src = CsvSource::open(Cursor::new(csv_bytes()), CsvOptions::default()).unwrap();
         let schema = src.schema().clone();
         assert_eq!(schema.fields().len(), 3);
-        assert_eq!(schema.field_with_name("id").unwrap().data_type(), &DataType::Int64);
-        assert_eq!(schema.field_with_name("name").unwrap().data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field_with_name("id").unwrap().data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            schema.field_with_name("name").unwrap().data_type(),
+            &DataType::Utf8
+        );
         let batch = src.read_batch().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 3);
@@ -318,8 +363,7 @@ mod tests {
 
     #[test]
     fn csv_exhausts_to_none() {
-        let mut src =
-            CsvSource::open(Cursor::new(csv_bytes()), CsvOptions::default()).unwrap();
+        let mut src = CsvSource::open(Cursor::new(csv_bytes()), CsvOptions::default()).unwrap();
         // Exhaust all batches.
         while src.read_batch().unwrap().is_some() {}
         assert!(src.read_batch().unwrap().is_none());
@@ -327,8 +371,7 @@ mod tests {
 
     #[test]
     fn csv_reset_replays() {
-        let mut src =
-            CsvSource::open(Cursor::new(csv_bytes()), CsvOptions::default()).unwrap();
+        let mut src = CsvSource::open(Cursor::new(csv_bytes()), CsvOptions::default()).unwrap();
         while src.read_batch().unwrap().is_some() {}
         src.reset();
         let batch = src.read_batch().unwrap().unwrap();
@@ -350,7 +393,9 @@ mod tests {
         ]));
         let mut src = CsvSource::open(
             Cursor::new(data as &[u8]),
-            CsvOptions::default().with_has_header(false).with_schema(schema),
+            CsvOptions::default()
+                .with_has_header(false)
+                .with_schema(schema),
         )
         .unwrap();
         let batch = src.read_batch().unwrap().unwrap();
@@ -382,8 +427,7 @@ mod tests {
 
     #[test]
     fn ndjson_infers_schema_and_reads() {
-        let mut src =
-            NdjsonSource::open(ndjson_bytes(), NdjsonOptions::default()).unwrap();
+        let mut src = NdjsonSource::open(ndjson_bytes(), NdjsonOptions::default()).unwrap();
         let schema = src.schema().clone();
         assert_eq!(schema.fields().len(), 3);
         let batch = src.read_batch().unwrap().unwrap();

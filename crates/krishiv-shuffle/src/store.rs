@@ -123,10 +123,7 @@ impl ShuffleStore for ShuffleBackend {
         }
     }
 
-    async fn read_partition(
-        &self,
-        id: &PartitionId,
-    ) -> ShuffleResult<Option<ShufflePartition>> {
+    async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
         match self {
             Self::Local(s) => s.read_partition(id).await,
             Self::InMemory(s) => s.read_partition(id).await,
@@ -135,10 +132,7 @@ impl ShuffleStore for ShuffleBackend {
         }
     }
 
-    async fn stream_partition(
-        &self,
-        id: &PartitionId,
-    ) -> ShuffleResult<Option<ShuffleStream>> {
+    async fn stream_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShuffleStream>> {
         match self {
             Self::Local(s) => s.stream_partition(id).await,
             Self::InMemory(s) => s.stream_partition(id).await,

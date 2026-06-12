@@ -176,14 +176,14 @@ fn execute_cep_fragment(
     use arrow::array::{Array, Int64Array, StringArray};
     use krishiv_plan::cep::PartitionedCepMatcher;
 
-    let payload = fragment
-        .strip_prefix(STREAM_CEP_PREFIX)
-        .ok_or_else(|| ExecutorError::InvalidAssignment {
+    let payload = fragment.strip_prefix(STREAM_CEP_PREFIX).ok_or_else(|| {
+        ExecutorError::InvalidAssignment {
             message: format!(
                 "execute_cep_fragment called with wrong prefix; expected '{STREAM_CEP_PREFIX}', \
                  got: {fragment}"
             ),
-        })?;
+        }
+    })?;
 
     let spec: CepFragmentSpec =
         serde_json::from_str(payload).map_err(|e| ExecutorError::InvalidAssignment {
@@ -205,12 +205,10 @@ fn execute_cep_fragment(
             if !inmem.is_empty() {
                 inmem
             } else {
-                crate::fragment::common::read_inline_ipc_partitions(
-                    assignment.input_partitions(),
-                )?
-                .into_iter()
-                .flat_map(|(_, batches)| batches)
-                .collect()
+                crate::fragment::common::read_inline_ipc_partitions(assignment.input_partitions())?
+                    .into_iter()
+                    .flat_map(|(_, batches)| batches)
+                    .collect()
             }
         };
 
@@ -247,39 +245,33 @@ fn execute_cep_fragment(
                     ),
                 })?;
 
-        let key_col =
-            batch
-                .column(key_idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| ExecutorError::InvalidAssignment {
-                    message: format!(
-                        "stream:cep key_column '{}' must be Utf8",
-                        spec.key_column
-                    ),
-                })?;
-        let time_col =
-            batch
-                .column(time_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| ExecutorError::InvalidAssignment {
-                    message: format!(
-                        "stream:cep event_time_column '{}' must be Int64",
-                        spec.event_time_column
-                    ),
-                })?;
-        let stage_col =
-            batch
-                .column(stage_idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| ExecutorError::InvalidAssignment {
-                    message: format!(
-                        "stream:cep stage_column '{}' must be Utf8",
-                        spec.stage_column
-                    ),
-                })?;
+        let key_col = batch
+            .column(key_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| ExecutorError::InvalidAssignment {
+                message: format!("stream:cep key_column '{}' must be Utf8", spec.key_column),
+            })?;
+        let time_col = batch
+            .column(time_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| ExecutorError::InvalidAssignment {
+                message: format!(
+                    "stream:cep event_time_column '{}' must be Int64",
+                    spec.event_time_column
+                ),
+            })?;
+        let stage_col = batch
+            .column(stage_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| ExecutorError::InvalidAssignment {
+                message: format!(
+                    "stream:cep stage_column '{}' must be Utf8",
+                    spec.stage_column
+                ),
+            })?;
 
         for row in 0..batch.num_rows() {
             if key_col.is_null(row) || time_col.is_null(row) || stage_col.is_null(row) {
@@ -298,13 +290,11 @@ fn execute_cep_fragment(
                 if stage_batches.is_empty() {
                     continue;
                 }
-                let merged = arrow::compute::concat_batches(
-                    &stage_batches[0].schema(),
-                    &stage_batches,
-                )
-                .map_err(|e| ExecutorError::LocalExecution {
-                    message: format!("stream:cep concat match stages: {e}"),
-                })?;
+                let merged =
+                    arrow::compute::concat_batches(&stage_batches[0].schema(), &stage_batches)
+                        .map_err(|e| ExecutorError::LocalExecution {
+                            message: format!("stream:cep concat match stages: {e}"),
+                        })?;
                 matched_batches.push(merged);
             }
         }
@@ -312,7 +302,10 @@ fn execute_cep_fragment(
 
     let total_rows: usize = matched_batches.iter().map(|b| b.num_rows()).sum();
     let total_batches = matched_batches.len();
-    let column_count = matched_batches.first().map(|b| b.num_columns()).unwrap_or(0);
+    let column_count = matched_batches
+        .first()
+        .map(|b| b.num_columns())
+        .unwrap_or(0);
 
     krishiv_metrics::global_metrics().set_streaming_rows(
         job_id,

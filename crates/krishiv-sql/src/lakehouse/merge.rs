@@ -15,8 +15,10 @@ use crate::SqlResult;
 
 /// Match `alias.col = alias.col` in the ON clause, capturing alias and col for both sides.
 static KEY_COL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)((?:\w+|`[^`]+`))\.((?:\w+|`[^`]+`))\s*=\s*((?:\w+|`[^`]+`))\.((?:\w+|`[^`]+`))")
-        .unwrap()
+    Regex::new(
+        r"(?i)((?:\w+|`[^`]+`))\.((?:\w+|`[^`]+`))\s*=\s*((?:\w+|`[^`]+`))\.((?:\w+|`[^`]+`))",
+    )
+    .unwrap()
 });
 
 static MERGE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -247,7 +249,11 @@ async fn dry_run_merge(
 fn merge_result_batch(
     result: krishiv_connectors::lakehouse::MergeDeltaResult,
 ) -> SqlResult<RecordBatch> {
-    merge_metrics_batch(result.rows_inserted, result.rows_updated, result.rows_deleted)
+    merge_metrics_batch(
+        result.rows_inserted,
+        result.rows_updated,
+        result.rows_deleted,
+    )
 }
 
 fn merge_metrics_batch(inserted: u64, updated: u64, deleted: u64) -> SqlResult<RecordBatch> {
@@ -264,7 +270,9 @@ fn merge_metrics_batch(inserted: u64, updated: u64, deleted: u64) -> SqlResult<R
             Arc::new(Int64Array::from(vec![deleted as i64])),
         ],
     )
-    .map_err(|e| SqlError::DataFusion { message: format!("merge metrics batch: {e}") })
+    .map_err(|e| SqlError::DataFusion {
+        message: format!("merge metrics batch: {e}"),
+    })
 }
 
 #[cfg(test)]

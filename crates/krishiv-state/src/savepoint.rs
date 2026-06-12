@@ -55,7 +55,10 @@ pub struct SavepointCoordinator {
 impl SavepointCoordinator {
     /// Create a new coordinator for `job_id`.
     pub fn new(job_id: impl Into<String>) -> Self {
-        Self { job_id: job_id.into(), index: HashMap::new() }
+        Self {
+            job_id: job_id.into(),
+            index: HashMap::new(),
+        }
     }
 
     /// Take a savepoint at `epoch` with the given operator version map.
@@ -104,24 +107,28 @@ impl SavepointCoordinator {
     ///
     /// Returns an error if the savepoint does not exist.
     pub fn delete_savepoint(&mut self, savepoint_id: &str) -> StateResult<SavepointMeta> {
-        self.index.remove(savepoint_id).ok_or_else(|| {
-            StateError::BackendUnavailable {
+        self.index
+            .remove(savepoint_id)
+            .ok_or_else(|| StateError::BackendUnavailable {
                 message: format!("savepoint '{savepoint_id}' not found"),
                 source: None,
-            }
-        })
+            })
     }
 
     /// Serialise all savepoints as JSON (for durable persistence).
     pub fn export_index_json(&self) -> StateResult<String> {
         let list: Vec<&SavepointMeta> = self.list_savepoints();
-        serde_json::to_string(&list).map_err(|e| StateError::SnapshotCorrupt { message: e.to_string() })
+        serde_json::to_string(&list).map_err(|e| StateError::SnapshotCorrupt {
+            message: e.to_string(),
+        })
     }
 
     /// Restore the index from serialised JSON.
     pub fn import_index_json(&mut self, json: &str) -> StateResult<()> {
         let list: Vec<SavepointMeta> =
-            serde_json::from_str(json).map_err(|e| StateError::SnapshotCorrupt { message: e.to_string() })?;
+            serde_json::from_str(json).map_err(|e| StateError::SnapshotCorrupt {
+                message: e.to_string(),
+            })?;
         for meta in list {
             if meta.job_id != self.job_id {
                 return Err(StateError::SnapshotCorrupt {

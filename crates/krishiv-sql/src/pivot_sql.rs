@@ -88,19 +88,22 @@ pub fn parse_pivot(sql: &str) -> SqlResult<Option<PivotClause>> {
     let body_start = pivot_pos + pivot_kw.len();
     let body_end = find_closing_paren(&sql[body_start..]).ok_or_else(|| SqlError::Unsupported {
         feature: "PIVOT: unmatched parenthesis".into(),
-    })?
-        + body_start;
+    })? + body_start;
 
     let body = sql[body_start..body_end].trim();
     let body_upper = body.to_ascii_uppercase();
 
     // Parse: AGG(col) FOR dim IN (v1, v2, ...)
-    let for_pos = body_upper.find(" FOR ").ok_or_else(|| SqlError::Unsupported {
-        feature: "PIVOT: missing FOR keyword".into(),
-    })?;
-    let in_pos = body_upper.find(" IN (").ok_or_else(|| SqlError::Unsupported {
-        feature: "PIVOT: missing IN keyword".into(),
-    })?;
+    let for_pos = body_upper
+        .find(" FOR ")
+        .ok_or_else(|| SqlError::Unsupported {
+            feature: "PIVOT: missing FOR keyword".into(),
+        })?;
+    let in_pos = body_upper
+        .find(" IN (")
+        .ok_or_else(|| SqlError::Unsupported {
+            feature: "PIVOT: missing IN keyword".into(),
+        })?;
 
     let agg_expr = body[..for_pos].trim();
     let for_column = body[for_pos + 5..in_pos].trim().to_owned();
@@ -125,8 +128,11 @@ pub fn parse_pivot(sql: &str) -> SqlResult<Option<PivotClause>> {
         + in_list_start;
     let in_list = &body[in_list_start..in_list_end];
 
-    let in_values: Vec<String> =
-        in_list.split(',').map(|v| v.trim().to_owned()).filter(|v| !v.is_empty()).collect();
+    let in_values: Vec<String> = in_list
+        .split(',')
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .collect();
 
     if in_values.is_empty() {
         return Err(SqlError::Unsupported {
@@ -134,7 +140,13 @@ pub fn parse_pivot(sql: &str) -> SqlResult<Option<PivotClause>> {
         });
     }
 
-    Ok(Some(PivotClause { agg_fn, agg_column, for_column, in_values, source }))
+    Ok(Some(PivotClause {
+        agg_fn,
+        agg_column,
+        for_column,
+        in_values,
+        source,
+    }))
 }
 
 /// Rewrite a PIVOT statement to equivalent `CASE WHEN` SQL.
@@ -193,36 +205,46 @@ pub fn parse_unpivot(sql: &str) -> SqlResult<Option<UnpivotClause>> {
 
     let source = sql[..unpivot_pos].trim().to_owned();
     let body_start = unpivot_pos
-        + sql[unpivot_pos..].find('(').ok_or_else(|| SqlError::Unsupported {
-            feature: "UNPIVOT: missing opening parenthesis".into(),
-        })?
+        + sql[unpivot_pos..]
+            .find('(')
+            .ok_or_else(|| SqlError::Unsupported {
+                feature: "UNPIVOT: missing opening parenthesis".into(),
+            })?
         + 1;
-    let body_end = find_closing_paren(&sql[body_start..]).ok_or_else(|| {
-        SqlError::Unsupported { feature: "UNPIVOT: unmatched parenthesis".into() }
-    })?
-        + body_start;
+    let body_end = find_closing_paren(&sql[body_start..]).ok_or_else(|| SqlError::Unsupported {
+        feature: "UNPIVOT: unmatched parenthesis".into(),
+    })? + body_start;
     let body = sql[body_start..body_end].trim();
     let body_upper = body.to_ascii_uppercase();
 
-    let for_pos = body_upper.find(" FOR ").ok_or_else(|| SqlError::Unsupported {
-        feature: "UNPIVOT: missing FOR keyword".into(),
-    })?;
-    let in_pos = body_upper.find(" IN (").ok_or_else(|| SqlError::Unsupported {
-        feature: "UNPIVOT: missing IN keyword".into(),
-    })?;
+    let for_pos = body_upper
+        .find(" FOR ")
+        .ok_or_else(|| SqlError::Unsupported {
+            feature: "UNPIVOT: missing FOR keyword".into(),
+        })?;
+    let in_pos = body_upper
+        .find(" IN (")
+        .ok_or_else(|| SqlError::Unsupported {
+            feature: "UNPIVOT: missing IN keyword".into(),
+        })?;
 
     let value_column = body[..for_pos].trim().to_owned();
     let name_column = body[for_pos + 5..in_pos].trim().to_owned();
 
     let in_list_start = in_pos + 5;
-    let in_list_end = body[in_list_start..].find(')').ok_or_else(|| SqlError::Unsupported {
-        feature: "UNPIVOT: IN list is not closed".into(),
-    })?
+    let in_list_end = body[in_list_start..]
+        .find(')')
+        .ok_or_else(|| SqlError::Unsupported {
+            feature: "UNPIVOT: IN list is not closed".into(),
+        })?
         + in_list_start;
     let in_list = &body[in_list_start..in_list_end];
 
-    let in_columns: Vec<String> =
-        in_list.split(',').map(|v| v.trim().to_owned()).filter(|v| !v.is_empty()).collect();
+    let in_columns: Vec<String> = in_list
+        .split(',')
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .collect();
 
     if in_columns.is_empty() {
         return Err(SqlError::Unsupported {
@@ -230,7 +252,12 @@ pub fn parse_unpivot(sql: &str) -> SqlResult<Option<UnpivotClause>> {
         });
     }
 
-    Ok(Some(UnpivotClause { value_column, name_column, in_columns, source }))
+    Ok(Some(UnpivotClause {
+        value_column,
+        name_column,
+        in_columns,
+        source,
+    }))
 }
 
 /// Rewrite an UNPIVOT statement to a `UNION ALL` of SELECT statements.
@@ -251,7 +278,11 @@ pub fn rewrite_unpivot(sql: &str) -> SqlResult<String> {
         let val_col_quoted = unpivot.value_column.replace('"', "\"\"");
         branches.push(format!(
             "SELECT '{}' AS \"{}\", \"{}\" AS \"{}\" FROM {}",
-            col.replace('\'', "''"), name_col_quoted, col_quoted, val_col_quoted, from_clause,
+            col.replace('\'', "''"),
+            name_col_quoted,
+            col_quoted,
+            val_col_quoted,
+            from_clause,
         ));
     }
 
@@ -313,7 +344,9 @@ mod tests {
 
     #[test]
     fn detects_pivot() {
-        assert!(contains_pivot("SELECT * FROM t PIVOT (SUM(x) FOR y IN ('a'))"));
+        assert!(contains_pivot(
+            "SELECT * FROM t PIVOT (SUM(x) FOR y IN ('a'))"
+        ));
         assert!(!contains_pivot("SELECT * FROM t WHERE x = 1"));
     }
 
@@ -364,7 +397,9 @@ mod tests {
 
     #[test]
     fn detects_unpivot() {
-        assert!(contains_unpivot("SELECT * FROM t UNPIVOT (val FOR month IN (jan, feb))"));
+        assert!(contains_unpivot(
+            "SELECT * FROM t UNPIVOT (val FOR month IN (jan, feb))"
+        ));
         assert!(!contains_unpivot("SELECT * FROM t WHERE x = 1"));
     }
 

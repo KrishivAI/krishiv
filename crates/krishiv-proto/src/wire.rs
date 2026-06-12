@@ -1091,13 +1091,11 @@ fn input_partition_descriptor_to_wire(
             ..Default::default()
         }),
         // InMemory is in-process only and must never reach the wire.
-        InputPartitionDescriptor::InMemory { table_name, .. } => {
-            Err(WireError::new(format!(
-                "InputPartitionDescriptor::InMemory (table_name={table_name:?}) \
+        InputPartitionDescriptor::InMemory { table_name, .. } => Err(WireError::new(format!(
+            "InputPartitionDescriptor::InMemory (table_name={table_name:?}) \
                  is in-process only and cannot be serialised to the wire; \
                  use InlineIpc for remote task assignments"
-            )))
-        }
+        ))),
         InputPartitionDescriptor::WatermarkHint { watermark_ms } => {
             Ok(v1::InputPartitionDescriptor {
                 kind: v1::InputPartitionDescriptorKind::WatermarkHint as i32,

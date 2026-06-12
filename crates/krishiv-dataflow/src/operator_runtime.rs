@@ -4,7 +4,7 @@ use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{
     WindowAgg, WindowAggKind, WindowExecutionSpec, WindowKind, validate_window_execution_spec,
 };
-use krishiv_state::{FjallStateBackend, StateBackend, TtlConfig, TtlStateBackend};
+use krishiv_state::{RocksDbStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
 /// Open or create a state backend for a window operator.
 ///
@@ -16,7 +16,7 @@ pub(crate) fn open_state_backend(
     ttl_ms: Option<u64>,
 ) -> ExecResult<Box<dyn StateBackend>> {
     let backend = match state_dir {
-        None => FjallStateBackend::ephemeral()
+        None => RocksDbStateBackend::ephemeral()
             .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?,
         Some(dir) => {
             let path = dir.join(tag);
@@ -26,7 +26,7 @@ pub(crate) fn open_state_backend(
                     path.display()
                 ))
             })?;
-            FjallStateBackend::open(&path)
+            RocksDbStateBackend::open(&path)
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?
         }
     };

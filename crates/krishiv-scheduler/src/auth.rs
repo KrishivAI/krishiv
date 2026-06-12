@@ -34,7 +34,15 @@ impl StaticApiKeyAuthProviderWithRole {
     fn new(entries: impl IntoIterator<Item = (String, String, Role)>) -> Self {
         let keys = entries
             .into_iter()
-            .map(|(k, s, r)| (k, Principal { subject: s, role: r }))
+            .map(|(k, s, r)| {
+                (
+                    k,
+                    Principal {
+                        subject: s,
+                        role: r,
+                    },
+                )
+            })
             .collect();
         Self { keys }
     }
@@ -377,7 +385,10 @@ fn validate_grpc_auth_with_provider(
                 return Err(tonic::Status::unauthenticated("invalid API key"));
             };
             let role = subject_to_role(&authenticated_subject);
-            let principal = Principal { subject: authenticated_subject, role };
+            let principal = Principal {
+                subject: authenticated_subject,
+                role,
+            };
             validate_principal_role(&principal, required_role)
         }
         AuthContext::Anonymous => Err(tonic::Status::unauthenticated("missing Bearer token")),
@@ -508,17 +519,13 @@ impl JwtAuthProvider {
     }
 
     /// Fetch a JWKS endpoint and build a provider.
-    pub fn from_jwks_uri(
-        uri: &str,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn from_jwks_uri(uri: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let body = reqwest::blocking::get(uri)?.text()?;
         Self::from_jwks_json(&body)
     }
 
     /// Parse a JWKS JSON document and build a provider.
-    pub fn from_jwks_json(
-        json: &str,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn from_jwks_json(json: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_str(json)?;
         let mut keys = Vec::new();
         for jwk in &jwks.keys {

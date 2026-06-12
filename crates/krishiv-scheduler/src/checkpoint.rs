@@ -681,7 +681,6 @@ impl CheckpointCoordinator {
             epoch,
             reason: reason.to_owned(),
         };
-
     }
 
     /// Load the latest valid epoch from storage on coordinator restart.

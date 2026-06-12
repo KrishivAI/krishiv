@@ -14,8 +14,7 @@ use krishiv_common::MemoryBudget;
 
 use crate::{
     InMemoryShuffleStore, LocalDiskShuffleStore, PartitionId, ShuffleError, ShufflePartition,
-    ShuffleResult, ShuffleStore,
-    memory_store::DEFAULT_SHUFFLE_MEMORY_BYTES,
+    ShuffleResult, ShuffleStore, memory_store::DEFAULT_SHUFFLE_MEMORY_BYTES,
 };
 
 /// Budget-aware shuffle backend.
@@ -41,27 +40,35 @@ impl SpillableShuffleBackend {
         std::fs::create_dir_all(&spill_dir).map_err(|e| {
             ShuffleError::Io(std::io::Error::new(
                 e.kind(),
-                format!("failed to create shuffle spill dir '{}': {e}", spill_dir.display()),
+                format!(
+                    "failed to create shuffle spill dir '{}': {e}",
+                    spill_dir.display()
+                ),
             ))
         })?;
 
-        let spill_store = Arc::new(
-            LocalDiskShuffleStore::new(&spill_dir).map_err(|e| {
-                ShuffleError::Io(std::io::Error::other(format!(
-                    "failed to open spill store at '{}': {e}",
-                    spill_dir.display()
-                )))
-            })?,
-        );
+        let spill_store = Arc::new(LocalDiskShuffleStore::new(&spill_dir).map_err(|e| {
+            ShuffleError::Io(std::io::Error::other(format!(
+                "failed to open spill store at '{}': {e}",
+                spill_dir.display()
+            )))
+        })?);
 
-        let max_bytes = budget.limit().map(|l| l as usize).unwrap_or(DEFAULT_SHUFFLE_MEMORY_BYTES);
+        let max_bytes = budget
+            .limit()
+            .map(|l| l as usize)
+            .unwrap_or(DEFAULT_SHUFFLE_MEMORY_BYTES);
         let inner = Arc::new(
             InMemoryShuffleStore::new_unbounded()
                 .with_max_bytes(max_bytes)
                 .with_spill_store(spill_store),
         );
 
-        Ok(Self { inner, budget, spill_dir })
+        Ok(Self {
+            inner,
+            budget,
+            spill_dir,
+        })
     }
 
     /// Spill directory path.
@@ -100,10 +107,7 @@ impl ShuffleStore for SpillableShuffleBackend {
         result
     }
 
-    async fn read_partition(
-        &self,
-        id: &PartitionId,
-    ) -> ShuffleResult<Option<ShufflePartition>> {
+    async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
         // Only release budget for partitions served from in-memory storage.
         // Spilled partitions were never accounted in this budget counter, so
         // releasing for them would underflow the counter.
@@ -127,7 +131,6 @@ impl ShuffleStore for SpillableShuffleBackend {
         async move { inner.delete_job_partitions(&job_id).await }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -161,11 +164,14 @@ mod tests {
         let p = make_partition("job-1", "s0", 0, 10);
         store.write_partition(p, 1).await.unwrap();
 
-        let read = store.read_partition(&PartitionId {
-            job_id: "job-1".into(),
-            stage_id: "s0".into(),
-            partition: 0,
-        }).await.unwrap();
+        let read = store
+            .read_partition(&PartitionId {
+                job_id: "job-1".into(),
+                stage_id: "s0".into(),
+                partition: 0,
+            })
+            .await
+            .unwrap();
         assert!(read.is_some());
         assert_eq!(read.unwrap().batches[0].num_rows(), 10);
     }

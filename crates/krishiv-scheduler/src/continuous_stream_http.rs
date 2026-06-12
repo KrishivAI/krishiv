@@ -262,8 +262,8 @@ pub async fn register_continuous_stream_coordinated(
     job_id: &str,
     spec: &krishiv_plan::window::WindowExecutionSpec,
 ) -> Result<(), ContinuousStreamError> {
-    use krishiv_plan::{ExecutionKind, TypedTaskFragment};
     use krishiv_plan::window::encode_window_execution_spec;
+    use krishiv_plan::{ExecutionKind, TypedTaskFragment};
     use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 
     let job_id_typed = JobId::try_new(job_id).map_err(|e| {
@@ -296,9 +296,12 @@ pub async fn register_continuous_stream_coordinated(
         })?;
     let stage = StageSpec::new(stage_id, "continuous-streaming")
         .with_task(TaskSpec::new(task_id, fragment));
-    let job_spec =
-        JobSpec::new(job_id_typed.clone(), "continuous-streaming", JobKind::Streaming)
-            .with_stage(stage);
+    let job_spec = JobSpec::new(
+        job_id_typed.clone(),
+        "continuous-streaming",
+        JobKind::Streaming,
+    )
+    .with_stage(stage);
 
     let mut coord = coordinator.write().await;
     coord

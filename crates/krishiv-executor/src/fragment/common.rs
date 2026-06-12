@@ -293,40 +293,40 @@ pub(crate) async fn read_shuffle_flight_partitions(
     // Collect the flight-fetch futures for all shuffle-flight partitions.
     let fetches: FuturesUnordered<_> = partitions
         .iter()
-        .filter_map(|partition| {
-            match partition.descriptor() {
-                Some(InputPartitionDescriptor::ShuffleFlight {
-                    table_name,
-                    flight_endpoint,
-                    job_id,
-                    upstream_stage_id,
-                    partition_id,
-                }) => Some((
-                    table_name.clone(),
-                    flight_endpoint.clone(),
-                    job_id.clone(),
-                    upstream_stage_id.clone(),
-                    *partition_id,
-                )),
-                Some(_) | None => None,
-            }
-        })
-        .map(|(table_name, flight_endpoint, job_id, upstream_stage_id, partition_id)| async move {
-            let batches = FlightShuffleClient::fetch(
-                &flight_endpoint,
-                job_id.as_str(),
-                upstream_stage_id.as_str(),
+        .filter_map(|partition| match partition.descriptor() {
+            Some(InputPartitionDescriptor::ShuffleFlight {
+                table_name,
+                flight_endpoint,
+                job_id,
+                upstream_stage_id,
                 partition_id,
-            )
-            .await
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: format!(
-                    "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
-                     stage={upstream_stage_id} partition={partition_id}): {e}"
-                ),
-            })?;
-            Ok::<_, ExecutorError>((table_name, batches))
+            }) => Some((
+                table_name.clone(),
+                flight_endpoint.clone(),
+                job_id.clone(),
+                upstream_stage_id.clone(),
+                *partition_id,
+            )),
+            Some(_) | None => None,
         })
+        .map(
+            |(table_name, flight_endpoint, job_id, upstream_stage_id, partition_id)| async move {
+                let batches = FlightShuffleClient::fetch(
+                    &flight_endpoint,
+                    job_id.as_str(),
+                    upstream_stage_id.as_str(),
+                    partition_id,
+                )
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!(
+                        "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
+                     stage={upstream_stage_id} partition={partition_id}): {e}"
+                    ),
+                })?;
+                Ok::<_, ExecutorError>((table_name, batches))
+            },
+        )
         .collect();
 
     // Drive all fetches concurrently and merge results by table name.

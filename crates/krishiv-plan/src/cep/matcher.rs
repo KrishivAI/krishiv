@@ -184,7 +184,9 @@ where
     /// timestamp no longer matches the heap entry).
     fn evict_stalest(&mut self) {
         while let Some(Reverse((ts, k))) = self.eviction_heap.pop() {
-            if let Some((_, state)) = self.states.get(&k) && state.last_event_ms == ts {
+            if let Some((_, state)) = self.states.get(&k)
+                && state.last_event_ms == ts
+            {
                 self.states.remove(&k);
                 return;
             }

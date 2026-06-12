@@ -66,12 +66,10 @@ async fn api_query_state(
 ) -> Result<Json<QueryStateResponse>, StatusCode> {
     let key = hex::decode(&key_hex).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let value = store
-        .get(&job_id, &op_id, &state_name, &key)
-        .map_err(|e| {
-            tracing::warn!(job_id, op_id, state_name, error = %e, "queryable state lookup error");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let value = store.get(&job_id, &op_id, &state_name, &key).map_err(|e| {
+        tracing::warn!(job_id, op_id, state_name, error = %e, "queryable state lookup error");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let resp = match value {
         Some(bytes) => QueryStateResponse::Found {
@@ -179,22 +177,19 @@ mod tests {
 
         let key_hex = encode_key_hex(b"user-a");
         let uri = format!("/api/v1/jobs/job-1/state/op-1/counts/{key_hex}");
-        let req = Request::builder()
-            .uri(&uri)
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), 8192)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["found"], "true");
         // Verify the decoded value.
         let v_b64 = parsed["value_base64"].as_str().unwrap();
-        let v_bytes = base64::engine::general_purpose::STANDARD.decode(v_b64).unwrap();
+        let v_bytes = base64::engine::general_purpose::STANDARD
+            .decode(v_b64)
+            .unwrap();
         assert_eq!(v_bytes, b"100");
     }
 
@@ -210,9 +205,7 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), 8192)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["found"], "false");
     }
@@ -243,9 +236,7 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), 8192)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["found"], "false");
     }
@@ -263,9 +254,7 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), 8192)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let names = parsed["state_names"].as_array().unwrap();
         assert!(names.iter().any(|n| n == "counts"));

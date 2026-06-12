@@ -20,8 +20,7 @@ use crate::{AssignmentPushOutcome, ExecutorAssignmentInbox, ExecutorError};
 /// Keyed by job-id. Shared between `ExecutorTaskInboxService` (for
 /// `push_continuous_input` / `drain_continuous_output`) and `ExecutorTaskRunner`
 /// (for `stream:loop:` fragment execution).
-pub type SharedLoopExecutors =
-    Arc<DashMap<String, Arc<Mutex<ContinuousWindowExecutor>>>>;
+pub type SharedLoopExecutors = Arc<DashMap<String, Arc<Mutex<ContinuousWindowExecutor>>>>;
 
 /// Shared per-job input buffer for continuous streaming tasks.
 ///
@@ -291,9 +290,8 @@ fn decode_ipc_batches(ipc_bytes: &[u8]) -> Result<Vec<RecordBatch>, tonic::Statu
         .map_err(|e| tonic::Status::invalid_argument(format!("IPC decode: {e}")))?;
     let mut batches = Vec::new();
     for batch in reader {
-        batches.push(
-            batch.map_err(|e| tonic::Status::invalid_argument(format!("IPC batch: {e}")))?,
-        );
+        batches
+            .push(batch.map_err(|e| tonic::Status::invalid_argument(format!("IPC batch: {e}")))?);
     }
     Ok(batches)
 }
@@ -468,7 +466,8 @@ pub fn executor_task_grpc_server_with_continuous(
     loop_executors: SharedLoopExecutors,
     continuous_inputs: SharedContinuousInputs,
 ) -> wire::v1::executor_task_server::ExecutorTaskServer<ExecutorTaskGrpcService> {
-    let inner = ExecutorTaskInboxService::new_with_continuous(inbox, loop_executors, continuous_inputs);
+    let inner =
+        ExecutorTaskInboxService::new_with_continuous(inbox, loop_executors, continuous_inputs);
     let auth = ExecutorTaskAuthConfig::from_env();
     let auth_misconfiguration = (auth.require_auth() && !auth.has_bearer_token()).then(|| {
         format!(

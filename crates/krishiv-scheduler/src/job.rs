@@ -1320,14 +1320,18 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
             });
         }
     }
-    if let Some(interval) = spec.checkpoint_interval_ms() && interval == 0 {
+    if let Some(interval) = spec.checkpoint_interval_ms()
+        && interval == 0
+    {
         return Err(SchedulerError::InvalidJob {
             message: String::from(
                 "checkpoint_interval_ms must be > 0; use None to disable checkpointing",
             ),
         });
     }
-    if let Some(path) = spec.checkpoint_storage_path() && path.is_empty() {
+    if let Some(path) = spec.checkpoint_storage_path()
+        && path.is_empty()
+    {
         return Err(SchedulerError::InvalidJob {
             message: String::from(
                 "checkpoint_storage_path must not be empty when checkpoint_interval_ms is set",

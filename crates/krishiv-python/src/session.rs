@@ -161,9 +161,7 @@ impl PySession {
             .with_policy(policy_hook);
         builder = match mode {
             "local" => builder, // "local" means embedded (in-process); no mode change needed
-            "single-node" => {
-                builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
-            }
+            "single-node" => builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode),
             "distributed" => builder.with_execution_mode(krishiv_api::ExecutionMode::Distributed),
             _ => builder,
         };
@@ -548,4 +546,3 @@ mod tests {
         assert!(session.state_ttl().is_some());
     }
 }
-

@@ -434,14 +434,18 @@ impl FlightClientPool {
         let len = health.len();
 
         // First try current endpoint if healthy
-        if let Some(h) = health.get(current_idx) && h.is_healthy {
+        if let Some(h) = health.get(current_idx)
+            && h.is_healthy
+        {
             return Ok(h.endpoint.clone());
         }
 
         // Search for any healthy endpoint
         for i in 0..len {
             let idx = (current_idx + i) % len;
-            if let Some(h) = health.get(idx) && h.is_healthy {
+            if let Some(h) = health.get(idx)
+                && h.is_healthy
+            {
                 return Ok(h.endpoint.clone());
             }
         }

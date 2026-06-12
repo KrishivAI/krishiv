@@ -387,7 +387,7 @@ fn key_value_to_typed_array(key_type: &str, key_value: &str) -> Arc<dyn arrow::a
 mod state_tests {
     use super::*;
     use crate::aggregate::AggFunction;
-    use krishiv_state::{FjallStateBackend, Namespace};
+    use krishiv_state::{Namespace, RocksDbStateBackend};
 
     #[test]
     fn tumbling_state_persist_and_restore_roundtrip() {
@@ -420,7 +420,7 @@ mod state_tests {
         op.process_batch(&batch, 100).expect("process");
         assert_eq!(op.open_window_count(), 1);
 
-        let mut backend = FjallStateBackend::ephemeral().unwrap();
+        let mut backend = RocksDbStateBackend::ephemeral().unwrap();
         let ns = Namespace::new("op-1", "windows");
         op.persist_to_state(&mut backend, &ns).expect("persist");
 

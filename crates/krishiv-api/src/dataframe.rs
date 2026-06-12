@@ -530,8 +530,7 @@ impl DataFrame {
         }
         match &self.sql_dataframe {
             Some(df) => {
-                let new_ops =
-                    krishiv_common::async_util::block_on(df.sort(columns, descending))?;
+                let new_ops = krishiv_common::async_util::block_on(df.sort(columns, descending))?;
                 Ok(self.with_new_ops(new_ops))
             }
             None => Err(KrishivError::unsupported(
@@ -596,8 +595,7 @@ impl DataFrame {
     pub fn fill_null(&self, column: &str, value: &str) -> Result<DataFrame> {
         match &self.sql_dataframe {
             Some(df) => {
-                let new_ops =
-                    krishiv_common::async_util::block_on(df.fill_null(column, value))?;
+                let new_ops = krishiv_common::async_util::block_on(df.fill_null(column, value))?;
                 Ok(self.with_new_ops(new_ops))
             }
             None => Err(KrishivError::unsupported(
@@ -620,9 +618,12 @@ impl DataFrame {
     ) -> Result<DataFrame> {
         match (&self.sql_dataframe, &right.sql_dataframe) {
             (Some(left), Some(right)) => {
-                let new_ops = krishiv_common::async_util::block_on(
-                    left.join(right.as_ref(), how, left_on, right_on),
-                )?;
+                let new_ops = krishiv_common::async_util::block_on(left.join(
+                    right.as_ref(),
+                    how,
+                    left_on,
+                    right_on,
+                ))?;
                 Ok(self.with_new_ops(new_ops))
             }
             _ => Err(KrishivError::unsupported(
@@ -638,8 +639,7 @@ impl DataFrame {
     pub fn union(&self, right: &DataFrame) -> Result<DataFrame> {
         match (&self.sql_dataframe, &right.sql_dataframe) {
             (Some(left), Some(right)) => {
-                let new_ops =
-                    krishiv_common::async_util::block_on(left.union(right.as_ref()))?;
+                let new_ops = krishiv_common::async_util::block_on(left.union(right.as_ref()))?;
                 Ok(self.with_new_ops(new_ops))
             }
             _ => Err(KrishivError::unsupported(
@@ -676,25 +676,26 @@ impl DataFrame {
             })?;
             let arrays: Vec<_> = (0..schema.fields().len())
                 .map(|col_idx| {
-                    let chunks: Vec<&dyn Array> = display
-                        .iter()
-                        .map(|b| b.column(col_idx).as_ref())
-                        .collect();
+                    let chunks: Vec<&dyn Array> =
+                        display.iter().map(|b| b.column(col_idx).as_ref()).collect();
                     arrow::compute::concat(&chunks).map_err(|e| KrishivError::Runtime {
                         message: format!("concat column {col_idx}: {e}"),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            vec![RecordBatch::try_new(schema, arrays).map_err(|e| KrishivError::Runtime {
-                message: format!("reconstruct batch for display: {e}"),
-            })?]
+            vec![
+                RecordBatch::try_new(schema, arrays).map_err(|e| KrishivError::Runtime {
+                    message: format!("reconstruct batch for display: {e}"),
+                })?,
+            ]
         } else {
             vec![]
         };
-        let text = arrow::util::pretty::pretty_format_batches(&combined)
-            .map_err(|e| KrishivError::Runtime {
+        let text = arrow::util::pretty::pretty_format_batches(&combined).map_err(|e| {
+            KrishivError::Runtime {
                 message: e.to_string(),
-            })?;
+            }
+        })?;
         Ok(text.to_string())
     }
 
@@ -727,12 +728,11 @@ impl DataFrame {
         let file = File::create(Path::new(path)).map_err(|e| KrishivError::Runtime {
             message: format!("failed to create parquet file '{path}': {e}"),
         })?;
-        let mut writer =
-            parquet::arrow::ArrowWriter::try_new(file, schema, None).map_err(|e| {
-                KrishivError::Runtime {
-                    message: format!("failed to create parquet writer: {e}"),
-                }
-            })?;
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None).map_err(|e| {
+            KrishivError::Runtime {
+                message: format!("failed to create parquet writer: {e}"),
+            }
+        })?;
         for batch in &batches {
             writer.write(batch).map_err(|e| KrishivError::Runtime {
                 message: format!("failed to write parquet batch: {e}"),

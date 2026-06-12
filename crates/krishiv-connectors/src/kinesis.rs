@@ -38,14 +38,14 @@
 
 use std::sync::Arc;
 
+use arrow::array::{BinaryBuilder, Int64Builder, StringBuilder};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use aws_sdk_kinesis::{
     Client,
     config::Region,
     types::{Record, ShardIteratorType},
 };
-use arrow::array::{BinaryBuilder, Int64Builder, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
 
 use crate::capabilities::ConnectorCapabilities;
 use crate::error::{ConnectorError, ConnectorResult};
@@ -142,12 +142,10 @@ impl KinesisSource {
     /// responsible for constructing and configuring AWS credentials (via
     /// environment, EC2 instance profile, or explicit config).
     pub async fn new(config: KinesisConfig) -> ConnectorResult<Self> {
-        let sdk_config = aws_config::defaults(
-            aws_sdk_kinesis::config::BehaviorVersion::latest(),
-        )
-        .region(Region::new(config.region.clone()))
-        .load()
-        .await;
+        let sdk_config = aws_config::defaults(aws_sdk_kinesis::config::BehaviorVersion::latest())
+            .region(Region::new(config.region.clone()))
+            .load()
+            .await;
 
         let client = Client::new(&sdk_config);
 
@@ -172,9 +170,10 @@ impl KinesisSource {
             req = req.starting_sequence_number(s);
         }
 
-        let resp = req.send().await.map_err(|e| {
-            ConnectorError::Io(std::io::Error::other(e.to_string()))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
 
         let shard_iterator = resp.shard_iterator().map(str::to_owned);
 
@@ -282,10 +281,28 @@ mod tests {
     fn kinesis_schema_has_four_columns() {
         let schema = kinesis_arrow_schema();
         assert_eq!(schema.fields().len(), 4);
-        assert_eq!(schema.field_with_name("sequence_number").unwrap().data_type(), &DataType::Utf8);
-        assert_eq!(schema.field_with_name("partition_key").unwrap().data_type(), &DataType::Utf8);
-        assert_eq!(schema.field_with_name("data").unwrap().data_type(), &DataType::Binary);
-        assert_eq!(schema.field_with_name("arrival_timestamp_ms").unwrap().data_type(), &DataType::Int64);
+        assert_eq!(
+            schema
+                .field_with_name("sequence_number")
+                .unwrap()
+                .data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            schema.field_with_name("partition_key").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            schema.field_with_name("data").unwrap().data_type(),
+            &DataType::Binary
+        );
+        assert_eq!(
+            schema
+                .field_with_name("arrival_timestamp_ms")
+                .unwrap()
+                .data_type(),
+            &DataType::Int64
+        );
     }
 
     #[test]
@@ -300,13 +317,21 @@ mod tests {
         assert_eq!(batch.num_columns(), 4);
 
         use arrow::array::{BinaryArray, StringArray};
-        let seq = batch.column_by_name("sequence_number").unwrap()
-            .as_any().downcast_ref::<StringArray>().unwrap();
+        let seq = batch
+            .column_by_name("sequence_number")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(seq.value(0), "seq-001");
         assert_eq!(seq.value(1), "seq-002");
 
-        let data = batch.column_by_name("data").unwrap()
-            .as_any().downcast_ref::<BinaryArray>().unwrap();
+        let data = batch
+            .column_by_name("data")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
         assert_eq!(data.value(0), b"hello");
         assert_eq!(data.value(1), b"world");
     }

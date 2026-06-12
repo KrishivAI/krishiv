@@ -41,11 +41,10 @@ pub use checkpoint::{
     open_checkpoint_storage_from_uri,
 };
 pub use error::{StateError, StateResult};
+pub use incremental_checkpoint::{
+    EpochMetaFile, RocksDbIncrementalCheckpointer, SstEpochManifest, SstFileRef,
+};
 pub use inspector::StateInspector;
-/// Primary state backend — RocksDB-backed LSM-tree, ephemeral or file-backed.
-pub use rocksdb_backend::RocksDbStateBackend;
-/// Legacy alias kept for source compatibility.
-pub type FjallStateBackend = RocksDbStateBackend;
 pub use krishiv_common::durability::{DurabilityProfile, StateDurability};
 pub use migration::{
     SharedStateMigrationRegistry, StateMigrationError, StateMigrationFn, StateMigrationRegistry,
@@ -54,11 +53,10 @@ pub use namespace::Namespace;
 pub use processing_time::{
     InMemoryProcessingTimeTimerService, ProcessingTimeTimerKey, ProcessingTimeTimerService,
 };
+pub use queryable::{QueryableStateHandle, QueryableStateStore};
+/// Primary state backend — RocksDB-backed LSM-tree, ephemeral or file-backed.
+pub use rocksdb_backend::RocksDbStateBackend;
+pub use savepoint::{SavepointCoordinator, SavepointMeta};
 pub use snapshot::{SnapshotEntry, decode_snapshot_entries};
 pub use timer::{InMemoryTimerService, TimerKey, TimerService};
 pub use ttl::{TtlConfig, TtlStateBackend};
-pub use queryable::{QueryableStateHandle, QueryableStateStore};
-pub use incremental_checkpoint::{
-    EpochMetaFile, RocksDbIncrementalCheckpointer, SstEpochManifest, SstFileRef,
-};
-pub use savepoint::{SavepointCoordinator, SavepointMeta};

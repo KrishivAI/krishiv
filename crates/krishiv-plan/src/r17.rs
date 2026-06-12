@@ -45,8 +45,8 @@ mod tests {
 
     #[test]
     fn vector_sink_accepts_valid_config() {
-        let cfg =
-            VectorSinkPlanConfig::new("pinecone", serde_json::json!({"index": "my-index"})).unwrap();
+        let cfg = VectorSinkPlanConfig::new("pinecone", serde_json::json!({"index": "my-index"}))
+            .unwrap();
         assert_eq!(cfg.sink_type, "pinecone");
     }
 }

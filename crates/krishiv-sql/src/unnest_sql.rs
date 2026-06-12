@@ -104,14 +104,20 @@ mod tests {
     #[test]
     fn detects_unnest_call() {
         assert!(contains_unnest("SELECT UNNEST(tags) FROM t"));
-        assert!(contains_unnest("SELECT * FROM t, LATERAL UNNEST(t.ids) AS id(v)"));
+        assert!(contains_unnest(
+            "SELECT * FROM t, LATERAL UNNEST(t.ids) AS id(v)"
+        ));
         assert!(!contains_unnest("SELECT * FROM t WHERE x = 1"));
     }
 
     #[test]
     fn detects_lateral() {
-        assert!(contains_lateral("SELECT * FROM t, LATERAL UNNEST(t.ids) AS id(v)"));
-        assert!(!contains_lateral("SELECT * FROM t CROSS JOIN UNNEST(t.ids)"));
+        assert!(contains_lateral(
+            "SELECT * FROM t, LATERAL UNNEST(t.ids) AS id(v)"
+        ));
+        assert!(!contains_lateral(
+            "SELECT * FROM t CROSS JOIN UNNEST(t.ids)"
+        ));
     }
 
     #[test]
@@ -126,7 +132,10 @@ mod tests {
     fn rewrites_lateral_unnest_preserves_alias() {
         let sql = "SELECT t.id, tag.value FROM t, LATERAL UNNEST(t.tags) AS tag(value)";
         let rewritten = rewrite_lateral_unnest(sql);
-        assert!(rewritten.contains("tag(value)"), "alias preserved: {rewritten}");
+        assert!(
+            rewritten.contains("tag(value)"),
+            "alias preserved: {rewritten}"
+        );
     }
 
     #[test]
@@ -147,7 +156,11 @@ mod tests {
     fn build_unnest_op_returns_correct_variant() {
         let op = build_unnest_op("tags", "tag", false);
         match op {
-            NodeOp::Unnest { array_column, output_column, with_ordinality } => {
+            NodeOp::Unnest {
+                array_column,
+                output_column,
+                with_ordinality,
+            } => {
                 assert_eq!(array_column, "tags");
                 assert_eq!(output_column, "tag");
                 assert!(!with_ordinality);
@@ -160,7 +173,9 @@ mod tests {
     fn build_unnest_op_with_ordinality() {
         let op = build_unnest_op("items", "item", true);
         match op {
-            NodeOp::Unnest { with_ordinality, .. } => assert!(with_ordinality),
+            NodeOp::Unnest {
+                with_ordinality, ..
+            } => assert!(with_ordinality),
             _ => panic!("expected Unnest"),
         }
     }

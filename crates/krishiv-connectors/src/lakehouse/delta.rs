@@ -178,8 +178,7 @@ impl RocksDbDeltaStore {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let ns = namespace.as_ref().to_vec();
-        let db =
-            DB::open(&opts, dir.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let db = DB::open(&opts, dir.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
         Ok(Self {
             db,
             namespace: ns,
@@ -224,10 +223,10 @@ impl DeltaStore for RocksDbDeltaStore {
     fn scan(&self) -> Result<Vec<DeltaEntry>, LakehouseError> {
         let prefix = self.namespace.as_slice();
         let mut out = Vec::new();
-        for item in self.db.iterator(IteratorMode::From(
-            prefix,
-            rocksdb::Direction::Forward,
-        )) {
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+        {
             let (k, v) = item.map_err(|e| LakehouseError::Io(e.to_string()))?;
             if !k.starts_with(prefix) {
                 break;
@@ -240,10 +239,10 @@ impl DeltaStore for RocksDbDeltaStore {
     fn truncate(&self) -> Result<(), LakehouseError> {
         let prefix = self.namespace.as_slice();
         let mut batch = WriteBatch::default();
-        for item in self.db.iterator(IteratorMode::From(
-            prefix,
-            rocksdb::Direction::Forward,
-        )) {
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+        {
             let (k, _) = item.map_err(|e| LakehouseError::Io(e.to_string()))?;
             if !k.starts_with(prefix) {
                 break;

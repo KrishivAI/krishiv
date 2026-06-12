@@ -67,9 +67,12 @@ pub fn parse_recursive_cte(sql: &str) -> SqlResult<Option<RecursiveCteStatement>
         feature: format!("WITH RECURSIVE parse error: {e}"),
     })?;
 
-    let stmt = stmts.into_iter().next().ok_or_else(|| SqlError::Unsupported {
-        feature: "WITH RECURSIVE produced no statement".into(),
-    })?;
+    let stmt = stmts
+        .into_iter()
+        .next()
+        .ok_or_else(|| SqlError::Unsupported {
+            feature: "WITH RECURSIVE produced no statement".into(),
+        })?;
 
     extract_recursive_cte(stmt)
 }
@@ -85,19 +88,21 @@ fn extract_recursive_cte(stmt: Statement) -> SqlResult<Option<RecursiveCteStatem
         return Ok(None);
     }
 
-    let cte = with.cte_tables.first().ok_or_else(|| SqlError::Unsupported {
-        feature: "WITH RECURSIVE requires at least one CTE".into(),
-    })?;
+    let cte = with
+        .cte_tables
+        .first()
+        .ok_or_else(|| SqlError::Unsupported {
+            feature: "WITH RECURSIVE requires at least one CTE".into(),
+        })?;
 
     let name = cte.alias.name.value.clone();
 
-    let (base_query, recursive_query) = split_union_all(&cte.query).ok_or_else(|| {
-        SqlError::Unsupported {
+    let (base_query, recursive_query) =
+        split_union_all(&cte.query).ok_or_else(|| SqlError::Unsupported {
             feature: format!(
                 "WITH RECURSIVE '{name}': body must be `base_query UNION ALL recursive_query`"
             ),
-        }
-    })?;
+        })?;
 
     Ok(Some(RecursiveCteStatement {
         name,
@@ -206,7 +211,11 @@ where
         iterations += 1;
     }
 
-    Ok(RecursiveCteResult { batches: accumulator, iterations, hit_limit })
+    Ok(RecursiveCteResult {
+        batches: accumulator,
+        iterations,
+        hit_limit,
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -277,7 +286,11 @@ mod tests {
         };
         let op = build_recursive_cte_op(&stmt);
         match op {
-            NodeOp::RecursiveCte { name, max_iterations, .. } => {
+            NodeOp::RecursiveCte {
+                name,
+                max_iterations,
+                ..
+            } => {
                 assert_eq!(name, "tree");
                 assert_eq!(max_iterations, 50);
             }
@@ -323,7 +336,9 @@ mod tests {
                 schema_clone.clone(),
                 vec![Arc::new(Int32Array::from(values))],
             )
-            .map_err(|e| SqlError::Unsupported { feature: e.to_string() })?;
+            .map_err(|e| SqlError::Unsupported {
+                feature: e.to_string(),
+            })?;
             Ok(vec![batch])
         };
 
@@ -357,7 +372,9 @@ mod tests {
                 schema_clone.clone(),
                 vec![Arc::new(Int32Array::from(vec![42i32]))],
             )
-            .map_err(|e| SqlError::Unsupported { feature: e.to_string() })?;
+            .map_err(|e| SqlError::Unsupported {
+                feature: e.to_string(),
+            })?;
             Ok(vec![batch])
         };
 

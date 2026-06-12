@@ -432,7 +432,6 @@ mod tests {
             reset_ids.values(),
             "data must match after reset"
         );
-
     }
 
     #[test]

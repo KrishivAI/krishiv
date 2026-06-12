@@ -72,9 +72,9 @@ pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use config::{CoordinatorConfig, JobSubmitter, TlsConfig};
 pub use coordinator::{Coordinator, OrchestratorHandles, SharedCoordinator};
 pub use coordinator_daemon::{
-    CoordinatorDaemonConfig, CoordinatorSidecarFn, JobCoordinatorDaemonConfig, build_leader_election,
-    build_shared_coordinator, coordinator_daemon_help, coordinator_http_router,
-    job_coordinator_daemon_help, parse_coordinator_daemon_config,
+    CoordinatorDaemonConfig, CoordinatorSidecarFn, JobCoordinatorDaemonConfig,
+    build_leader_election, build_shared_coordinator, coordinator_daemon_help,
+    coordinator_http_router, job_coordinator_daemon_help, parse_coordinator_daemon_config,
     parse_job_coordinator_daemon_config, run_cluster_control_plane, run_clusterd_daemon,
     run_job_coordinator_daemon, run_standalone_coordinator, spawn_coordinator_sidecars,
 };
@@ -83,8 +83,11 @@ pub use error::{SchedulerError, SchedulerResult, TaskUpdateOutcome};
 pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
 #[cfg(feature = "etcd")]
 pub use etcd_metadata::EtcdMetadataStore;
-pub(crate) mod redb_metadata;
 pub(crate) mod rocksdb_metadata;
+pub use continuous_stream_http::{
+    ContinuousStreamError, drain_continuous_stream_coordinated, push_continuous_input_coordinated,
+    register_continuous_stream_coordinated,
+};
 pub use grpc::{
     CoordinatorExecutorGrpcService, CoordinatorExecutorTonicService,
     CoordinatorManagementGrpcService, coordinator_executor_grpc_server,
@@ -107,17 +110,12 @@ pub use job_coordinator::JobCoordinator;
 pub use krishiv_common::DurabilityProfile;
 pub use leadership::{LeaderElection, SingleNodeElection};
 pub use metrics::{SchedulerMetrics, scheduler_metrics};
-pub use redb_metadata::RedbMetadataStore;
+pub use queryable_state_http::{
+    QueryStateResponse, decode_key_hex, encode_key_hex, queryable_state_router,
+};
 pub use rocksdb_metadata::RocksDbMetadataStore;
 pub use store::{
     ContinuousSnapshot, EventLogEvent, InMemoryMetadataStore, MetadataStore, NonBlockingStoreHandle,
-};
-pub use continuous_stream_http::{
-    ContinuousStreamError, drain_continuous_stream_coordinated, push_continuous_input_coordinated,
-    register_continuous_stream_coordinated,
-};
-pub use queryable_state_http::{
-    QueryStateResponse, decode_key_hex, encode_key_hex, queryable_state_router,
 };
 pub use transport::CoordinatorExecutorTransport;
 

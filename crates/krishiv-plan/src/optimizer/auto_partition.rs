@@ -89,8 +89,8 @@ impl AqeRule for AutoPartitionRule {
         }
 
         // Compute target partition count.
-        let target = u64::from(self.max_buckets)
-            .min(total_bytes.div_ceil(self.target_partition_bytes));
+        let target =
+            u64::from(self.max_buckets).min(total_bytes.div_ceil(self.target_partition_bytes));
         let target = target.max(1) as u32;
 
         self.stamp_target(plan, target)
