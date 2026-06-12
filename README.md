@@ -51,10 +51,10 @@ Primary crates:
 - `krishiv-executor` - executor process and task runner.
 - `krishiv-dataflow` - Arrow operator runtime.
 - `krishiv-shuffle`, `krishiv-state` - data-plane services (checkpoint merged into state).
-- `krishiv-connectors` - I/O, sinks, and lakehouse helpers (Iceberg/Delta/Hudi via `lakehouse` feature); vector sinks live in `krishiv-ai::vector_sinks`.
+- `krishiv-connectors` - source/sink contracts, capability/maturity metadata, I/O, and Iceberg-first lakehouse support; Delta/Hudi/vector integrations are optional and experimental.
 - `krishiv-operator`, `krishiv-ui`, `krishiv-flight-sql`, `krishiv-python` - deployment and interface surfaces.
 
-See `docs/README.md` for the full crate map.
+See `docs/README.md` for the full crate map and `docs/contracts/engine-semantics.md` for the published engine guarantees.
 
 ## Contributing
 

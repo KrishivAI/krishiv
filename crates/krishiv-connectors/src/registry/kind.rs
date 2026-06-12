@@ -1,5 +1,6 @@
 //! Typed connector identifiers used by the driver registry.
 
+use crate::capabilities::ConnectorMaturity;
 use crate::error::{ConnectorError, ConnectorResult};
 
 /// Logical role of a registered connector driver.
@@ -81,6 +82,28 @@ impl ConnectorKind {
         }
     }
 
+    /// Return the repository-published maturity for this connector kind.
+    pub fn default_maturity(self) -> ConnectorMaturity {
+        match self {
+            Self::Parquet | Self::S3 => ConnectorMaturity::Preview,
+            #[cfg(feature = "kafka")]
+            Self::Kafka => ConnectorMaturity::Preview,
+            Self::TwoPhaseParquet => ConnectorMaturity::Preview,
+            #[cfg(feature = "lakehouse")]
+            Self::Iceberg => ConnectorMaturity::Preview,
+            #[cfg(feature = "lakehouse")]
+            Self::Delta | Self::Hudi => ConnectorMaturity::Experimental,
+            #[cfg(feature = "vector-sinks")]
+            Self::MemoryVector | Self::LanceDb | Self::Weaviate | Self::Pinecone => {
+                ConnectorMaturity::Experimental
+            }
+            #[cfg(all(feature = "vector-sinks", feature = "qdrant"))]
+            Self::Qdrant => ConnectorMaturity::Experimental,
+            #[cfg(all(feature = "vector-sinks", feature = "pgvector"))]
+            Self::Pgvector => ConnectorMaturity::Experimental,
+        }
+    }
+
     /// Return the canonical configuration string for this kind.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -108,5 +131,26 @@ impl ConnectorKind {
             #[cfg(feature = "lakehouse")]
             Self::Hudi => "hudi",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_connector_maturity_is_published() {
+        assert_eq!(
+            ConnectorKind::Parquet.default_maturity(),
+            ConnectorMaturity::Preview
+        );
+        assert_eq!(
+            ConnectorKind::S3.default_maturity(),
+            ConnectorMaturity::Preview
+        );
+        assert_eq!(
+            ConnectorKind::TwoPhaseParquet.default_maturity(),
+            ConnectorMaturity::Preview
+        );
     }
 }

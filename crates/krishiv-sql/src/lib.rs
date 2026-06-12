@@ -1577,6 +1577,16 @@ pub trait KrishivDataFrameOps: Send + Sync {
     /// Select columns by name.
     async fn select(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
+    /// Select arbitrary SQL expressions.
+    async fn select_exprs(&self, expressions: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Group by expressions and compute aggregate expressions.
+    async fn aggregate(
+        &self,
+        group_exprs: &[&str],
+        aggregate_exprs: &[&str],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
     /// Filter rows by a SQL predicate expression.
     async fn filter(&self, predicate: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
@@ -2011,6 +2021,66 @@ pub struct SqlExecutionStats {
     pub cpu_nanos: u64,
 }
 
+fn top_level_alias_index(expression: &str) -> Option<usize> {
+    let bytes = expression.as_bytes();
+    let mut depth = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut candidate = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' if !double_quoted => {
+                if single_quoted && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                single_quoted = !single_quoted;
+            }
+            b'"' if !single_quoted => {
+                if double_quoted && bytes.get(index + 1) == Some(&b'"') {
+                    index += 2;
+                    continue;
+                }
+                double_quoted = !double_quoted;
+            }
+            b'(' if !single_quoted && !double_quoted => depth += 1,
+            b')' if !single_quoted && !double_quoted => depth = depth.saturating_sub(1),
+            b' ' if depth == 0 && !single_quoted && !double_quoted => {
+                if bytes
+                    .get(index..index + 4)
+                    .is_some_and(|slice| slice.eq_ignore_ascii_case(b" AS "))
+                {
+                    candidate = Some(index);
+                    index += 3;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    candidate
+}
+
+fn parse_dataframe_expression(
+    dataframe: &datafusion::dataframe::DataFrame,
+    expression: &str,
+) -> SqlResult<datafusion::logical_expr::Expr> {
+    if let Some(index) = top_level_alias_index(expression) {
+        let (body, alias) = expression.split_at(index);
+        let alias = alias[4..].trim();
+        if !alias.is_empty() {
+            let alias = alias
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(alias)
+                .replace("\"\"", "\"");
+            return Ok(dataframe.parse_sql_expr(body.trim())?.alias(alias));
+        }
+    }
+    dataframe.parse_sql_expr(expression).map_err(Into::into)
+}
+
 #[async_trait::async_trait]
 impl KrishivDataFrameOps for SqlDataFrame {
     async fn collect(&self) -> SqlResult<Vec<RecordBatch>> {
@@ -2051,6 +2121,40 @@ impl KrishivDataFrameOps for SqlDataFrame {
     async fn select(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
         let df = self.dataframe.clone().select_columns(columns)?;
         Ok(Box::new(self.with_new_dataframe(df, "select")))
+    }
+
+    async fn select_exprs(&self, expressions: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let expressions = expressions
+            .iter()
+            .map(|expression| parse_dataframe_expression(&self.dataframe, expression))
+            .collect::<Result<Vec<_>, _>>()?;
+        let df = self.dataframe.clone().select(expressions)?;
+        Ok(Box::new(self.with_new_dataframe(df, "select_exprs")))
+    }
+
+    async fn aggregate(
+        &self,
+        group_exprs: &[&str],
+        aggregate_exprs: &[&str],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        if aggregate_exprs.is_empty() {
+            return Err(SqlError::Unsupported {
+                feature: "aggregate requires at least one aggregate expression".into(),
+            });
+        }
+        let group_exprs = group_exprs
+            .iter()
+            .map(|expression| parse_dataframe_expression(&self.dataframe, expression))
+            .collect::<Result<Vec<_>, _>>()?;
+        let aggregate_exprs = aggregate_exprs
+            .iter()
+            .map(|expression| parse_dataframe_expression(&self.dataframe, expression))
+            .collect::<Result<Vec<_>, _>>()?;
+        let df = self
+            .dataframe
+            .clone()
+            .aggregate(group_exprs, aggregate_exprs)?;
+        Ok(Box::new(self.with_new_dataframe(df, "aggregate")))
     }
 
     async fn filter(&self, predicate: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
@@ -2278,6 +2382,16 @@ pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dataframe_alias_parser_ignores_nested_as_tokens() {
+        assert_eq!(super::top_level_alias_index("CAST(value AS BIGINT)"), None);
+        assert_eq!(
+            super::top_level_alias_index("CAST(value AS BIGINT) AS \"value64\""),
+            Some(21)
+        );
+        assert_eq!(super::top_level_alias_index("' AS '"), None);
+    }
+
     use krishiv_plan::optimizer::{Cost, CostModel, Optimizer, OptimizerError, OptimizerRule};
     use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 

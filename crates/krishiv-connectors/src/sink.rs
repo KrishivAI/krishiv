@@ -34,6 +34,9 @@ pub trait Sink {
 /// trait provides a blanket implementation over every `T: Sink + Send` and can
 /// be used as `Box<dyn DynSink>` wherever dynamic dispatch is needed.
 pub trait DynSink: Send {
+    /// Return the capabilities advertised by the concrete sink.
+    fn capabilities(&self) -> ConnectorCapabilities;
+
     fn write_batch_dyn(
         &mut self,
         batch: arrow::record_batch::RecordBatch,
@@ -43,6 +46,10 @@ pub trait DynSink: Send {
 }
 
 impl<T: Sink + Send> DynSink for T {
+    fn capabilities(&self) -> ConnectorCapabilities {
+        Sink::capabilities(self)
+    }
+
     fn write_batch_dyn(
         &mut self,
         batch: arrow::record_batch::RecordBatch,

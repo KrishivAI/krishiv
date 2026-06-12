@@ -35,7 +35,7 @@ default = ["local"]
 # Build presets
 minimal = []
 local   = ["embedded", "single-node"]
-full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "delta"]
+full    = ["single-node", "distributed", "k8s", "kafka", "iceberg"]
 
 # Deployment capability surfaces (gate optional dep families)
 embedded    = []                                                 # baseline; no optional deps
