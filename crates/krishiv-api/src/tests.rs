@@ -44,16 +44,18 @@ fn session_builder_defaults_to_embedded() {
 }
 
 #[test]
-fn session_builder_accepts_single_node() {
-    let session = match Session::builder()
+fn session_builder_single_node_without_coordinator_errors() {
+    // SingleNode mode now requires a coordinator Flight URL.
+    // Users who want in-process execution should use Embedded mode.
+    let error = Session::builder()
         .with_execution_mode(ExecutionMode::SingleNode)
         .build()
-    {
-        Ok(session) => session,
-        Err(error) => panic!("unexpected API error: {error}"),
-    };
+        .expect_err("SingleNode without coordinator URL must fail");
 
-    assert_eq!(session.mode(), ExecutionMode::SingleNode);
+    assert!(
+        error.to_string().contains("coordinator Flight URL"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -95,7 +97,9 @@ fn sql_collects_literal_query() {
 }
 
 #[test]
-fn embedded_and_single_node_sql_over_parquet_match() {
+fn two_embedded_sessions_sql_over_parquet_match() {
+    // Previously compared Embedded vs SingleNode(LocalInProcess), which are now identical
+    // (SingleNode requires a daemon). Use two Embedded sessions to verify consistent results.
     let temp = match tempdir() {
         Ok(temp) => temp,
         Err(error) => panic!("unexpected tempdir error: {error}"),
@@ -103,37 +107,37 @@ fn embedded_and_single_node_sql_over_parquet_match() {
     let parquet_path = temp.path().join("people.parquet");
     write_people_parquet(&parquet_path);
 
-    let embedded = Session::builder()
+    let session_a = Session::builder()
         .with_execution_mode(ExecutionMode::Embedded)
         .build()
         .unwrap_or_else(|error| panic!("unexpected API error: {error}"));
-    let single_node = Session::builder()
-        .with_execution_mode(ExecutionMode::SingleNode)
+    let session_b = Session::builder()
+        .with_execution_mode(ExecutionMode::Embedded)
         .build()
         .unwrap_or_else(|error| panic!("unexpected API error: {error}"));
 
-    embedded
+    session_a
         .register_parquet("people", &parquet_path)
         .unwrap_or_else(|error| panic!("unexpected register error: {error}"));
-    single_node
+    session_b
         .register_parquet("people", &parquet_path)
         .unwrap_or_else(|error| panic!("unexpected register error: {error}"));
 
     let query = "select city, count(*) as count from people group by city order by city";
-    let embedded_pretty = embedded
+    let pretty_a = session_a
         .sql(query)
         .and_then(|dataframe| dataframe.collect())
         .and_then(|result| result.pretty())
-        .unwrap_or_else(|error| panic!("unexpected embedded query error: {error}"));
-    let single_node_pretty = single_node
+        .unwrap_or_else(|error| panic!("unexpected query error: {error}"));
+    let pretty_b = session_b
         .sql(query)
         .and_then(|dataframe| dataframe.collect())
         .and_then(|result| result.pretty())
-        .unwrap_or_else(|error| panic!("unexpected single-node query error: {error}"));
+        .unwrap_or_else(|error| panic!("unexpected query error: {error}"));
 
-    assert_eq!(embedded_pretty, single_node_pretty);
-    assert!(embedded_pretty.contains("London"));
-    assert!(embedded_pretty.contains("Paris"));
+    assert_eq!(pretty_a, pretty_b);
+    assert!(pretty_a.contains("London"));
+    assert!(pretty_a.contains("Paris"));
 }
 
 #[test]
