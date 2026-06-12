@@ -13,10 +13,10 @@ use crate::ids::{
 use crate::lifecycle::{ExecutorState, TaskState};
 use crate::task::{
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment, InputPartition,
-    InputPartitionDescriptor, KeyGroupRange, MemoryKafkaRecord, OutputContract,
-    OutputContractDescriptor, OutputContractKind, PlanFragment, RegisterExecutorRequest,
-    RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest, TaskStatusRequest,
-    TaskStatusResponse, TransportDisposition,
+    InputPartitionDescriptor, KeyGroupRange, MemoryKafkaRecord, MissingShufflePartition,
+    OutputContract, OutputContractDescriptor, OutputContractKind, PlanFragment,
+    RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest,
+    TaskStatusRequest, TaskStatusResponse, TransportDisposition,
 };
 
 pub mod v1 {
@@ -642,6 +642,14 @@ pub fn executor_task_assignment_from_wire(
 /// Convert a domain task status request to protobuf.
 pub fn task_status_request_to_wire(value: TaskStatusRequest) -> v1::TaskStatusRequest {
     let (trace_parent, trace_state) = trace_context_to_wire(value.trace_context());
+    let missing_shuffle_partitions = value
+        .missing_shuffle_partitions()
+        .iter()
+        .map(|m| v1::MissingShufflePartitionWire {
+            stage_id: m.stage_id().as_str().to_owned(),
+            partition_id: m.partition_id(),
+        })
+        .collect();
     v1::TaskStatusRequest {
         version: Some(transport_version_to_wire(value.version())),
         job_id: value.job_id().as_str().to_owned(),
@@ -655,6 +663,7 @@ pub fn task_status_request_to_wire(value: TaskStatusRequest) -> v1::TaskStatusRe
         output_metadata: value.output_metadata().map(task_output_metadata_to_wire),
         trace_parent,
         trace_state,
+        missing_shuffle_partitions,
     }
 }
 
@@ -683,6 +692,14 @@ pub fn task_status_request_from_wire(
     }
     if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
         request = request.with_trace_context(ctx);
+    }
+    if !value.missing_shuffle_partitions.is_empty() {
+        let mut missing = Vec::with_capacity(value.missing_shuffle_partitions.len());
+        for m in value.missing_shuffle_partitions {
+            let stage_id = StageId::try_new(m.stage_id).map_err(WireError::from_id)?;
+            missing.push(MissingShufflePartition::new(stage_id, m.partition_id));
+        }
+        request = request.with_missing_shuffle_partitions(missing);
     }
     Ok(request)
 }

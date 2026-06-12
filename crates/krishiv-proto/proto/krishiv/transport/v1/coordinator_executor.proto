@@ -261,6 +261,17 @@ message TaskStatusRequest {
   // W3C traceparent header for distributed tracing.
   string trace_parent = 11;
   string trace_state = 12;
+  // Shuffle partitions found missing while fetching this task's inputs.
+  // A Failed status carrying entries here asks the coordinator to recompute
+  // the producing stage instead of only retrying this consumer task.
+  repeated MissingShufflePartitionWire missing_shuffle_partitions = 13;
+}
+
+// A shuffle partition the consumer could not fetch (producer output lost).
+message MissingShufflePartitionWire {
+  // Stage that produced the missing partition.
+  string stage_id = 1;
+  uint32 partition_id = 2;
 }
 
 // Structured shuffle partition output (replaces the parallel shuffle_partition_*

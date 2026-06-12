@@ -94,6 +94,7 @@ pub struct TaskStatusUpdate {
     attempt: u32,
     message: Option<String>,
     output_metadata: Option<TaskOutputMetadata>,
+    missing_shuffle_partitions: Vec<MissingShufflePartition>,
 }
 
 impl TaskStatusUpdate {
@@ -116,6 +117,7 @@ impl TaskStatusUpdate {
             attempt,
             message: None,
             output_metadata: None,
+            missing_shuffle_partitions: Vec::new(),
         }
     }
 
@@ -123,6 +125,16 @@ impl TaskStatusUpdate {
     #[must_use]
     pub fn with_lease_generation(mut self, lease_generation: LeaseGeneration) -> Self {
         self.lease_generation = lease_generation;
+        self
+    }
+
+    /// Attach shuffle partitions the consumer found missing during input fetch.
+    #[must_use]
+    pub fn with_missing_shuffle_partitions(
+        mut self,
+        missing: Vec<MissingShufflePartition>,
+    ) -> Self {
+        self.missing_shuffle_partitions = missing;
         self
     }
 
@@ -183,6 +195,43 @@ impl TaskStatusUpdate {
     /// Optional lightweight task output metadata.
     pub fn output_metadata(&self) -> Option<&TaskOutputMetadata> {
         self.output_metadata.as_ref()
+    }
+
+    /// Shuffle partitions the consumer found missing during input fetch.
+    ///
+    /// Non-empty only on `Failed` updates where the failure was caused by a
+    /// missing upstream shuffle partition. The coordinator reacts by marking
+    /// the producing partitions failed and re-queuing the producer tasks.
+    pub fn missing_shuffle_partitions(&self) -> &[MissingShufflePartition] {
+        &self.missing_shuffle_partitions
+    }
+}
+
+/// A shuffle partition a consumer task could not fetch because the producer's
+/// output is gone (e.g. the producing executor's disk was lost).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingShufflePartition {
+    stage_id: StageId,
+    partition_id: u32,
+}
+
+impl MissingShufflePartition {
+    /// Create a missing-partition reference for the producing stage.
+    pub fn new(stage_id: StageId, partition_id: u32) -> Self {
+        Self {
+            stage_id,
+            partition_id,
+        }
+    }
+
+    /// Stage that produced the missing partition.
+    pub fn stage_id(&self) -> &StageId {
+        &self.stage_id
+    }
+
+    /// Partition index within the producing stage.
+    pub fn partition_id(&self) -> u32 {
+        self.partition_id
     }
 }
 
@@ -1307,6 +1356,7 @@ pub struct TaskStatusRequest {
     output_metadata: Option<TaskOutputMetadata>,
     /// W3C trace context for distributed tracing (R8 wiring).
     trace_context: Option<TraceContext>,
+    missing_shuffle_partitions: Vec<MissingShufflePartition>,
 }
 
 impl TaskStatusRequest {
@@ -1329,7 +1379,23 @@ impl TaskStatusRequest {
             message: None,
             output_metadata: None,
             trace_context: None,
+            missing_shuffle_partitions: Vec::new(),
         }
+    }
+
+    /// Attach shuffle partitions the consumer found missing during input fetch.
+    #[must_use]
+    pub fn with_missing_shuffle_partitions(
+        mut self,
+        missing: Vec<MissingShufflePartition>,
+    ) -> Self {
+        self.missing_shuffle_partitions = missing;
+        self
+    }
+
+    /// Shuffle partitions the consumer found missing during input fetch.
+    pub fn missing_shuffle_partitions(&self) -> &[MissingShufflePartition] {
+        &self.missing_shuffle_partitions
     }
 
     /// Override the transport version when mapping from a wire request.

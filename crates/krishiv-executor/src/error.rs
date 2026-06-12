@@ -43,6 +43,20 @@ pub enum ExecutorError {
     /// available on this executor configuration.
     #[error("streaming execution not available on this executor configuration")]
     StreamingNotImplemented,
+
+    /// An upstream shuffle partition could not be fetched because the producer's
+    /// output is no longer available (executor lost, disk failure).
+    ///
+    /// This is a non-retryable failure at the consumer; the coordinator must
+    /// re-schedule the producing task to regenerate the partition.
+    #[error(
+        "upstream shuffle partition not found (stage={stage_id} partition={partition_id}): {message}"
+    )]
+    ShufflePartitionMissing {
+        stage_id: String,
+        partition_id: u32,
+        message: String,
+    },
 }
 
 impl From<String> for ExecutorError {

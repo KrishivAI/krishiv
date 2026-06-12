@@ -1,13 +1,18 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, Int32Array, Int64Array,
+    Int64Builder, StringArray,
+};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use smallvec::SmallVec;
 
 use crate::join::AggKey;
+use crate::spill::SpillFile;
 use crate::{ExecError, ExecResult};
 
 /// Pre-downcasted Arrow array reference for fast per-row value extraction.
@@ -572,6 +577,601 @@ impl LocalAggregator {
         }
 
         Ok(RecordBatch::try_new(out_schema, columns)?)
+    }
+}
+
+// ── ExternalAggregator ────────────────────────────────────────────────────────
+
+/// Memory-bounded aggregation operator that spills partial aggregates to disk.
+///
+/// Accumulates input batches across multiple `push` calls, tracking estimated
+/// HashMap memory usage.  When the in-memory groups exceed the attached budget,
+/// the partial aggregates are serialized to Arrow IPC spill files.  `finish`
+/// merges all spill runs into the final output batch.
+///
+/// Without a budget the operator is fully in-memory, identical in semantics to
+/// `LocalAggregator::aggregate` called once per batch but accumulated.
+pub struct ExternalAggregator {
+    group_by: Vec<String>,
+    agg_exprs: Vec<AggExpr>,
+    memory_budget: Option<Arc<krishiv_common::MemoryBudget>>,
+    groups: HashMap<SmallVec<[AggKey; 4]>, AggState>,
+    reserved_bytes: u64,
+    runs: Vec<SpillFile>,
+    spill_bytes: AtomicU64,
+    spill_file_count: AtomicU64,
+    input_schema: Option<SchemaRef>,
+}
+
+impl ExternalAggregator {
+    /// Create a new aggregator.
+    pub fn new(group_by: Vec<String>, agg_exprs: Vec<AggExpr>) -> Self {
+        Self {
+            group_by,
+            agg_exprs,
+            memory_budget: None,
+            groups: HashMap::new(),
+            reserved_bytes: 0,
+            runs: Vec::new(),
+            spill_bytes: AtomicU64::new(0),
+            spill_file_count: AtomicU64::new(0),
+            input_schema: None,
+        }
+    }
+
+    /// Attach a shared memory budget; exceeding it spills partial aggregates.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<krishiv_common::MemoryBudget>) -> Self {
+        self.memory_budget = Some(budget);
+        self
+    }
+
+    /// Process `batch`, accumulating rows into in-memory partial aggregates.
+    pub fn push(&mut self, batch: &RecordBatch) -> ExecResult<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        if self.input_schema.is_none() {
+            self.input_schema = Some(batch.schema());
+        }
+
+        // Resolve group-by and aggregate column indices.
+        let gb_indices: Vec<usize> = self
+            .group_by
+            .iter()
+            .map(|col| {
+                batch
+                    .schema()
+                    .index_of(col)
+                    .map_err(|_| ExecError::ColumnNotFound(col.clone()))
+            })
+            .collect::<ExecResult<_>>()?;
+        let pre_gb: Vec<PreDowncastCol> = gb_indices
+            .iter()
+            .map(|&idx| PreDowncastCol::downcast(batch.column(idx)))
+            .collect::<ExecResult<_>>()?;
+
+        let mut pre_agg_indices: Vec<usize> = Vec::with_capacity(self.agg_exprs.len());
+        let mut pre_agg_cols: Vec<Option<PreDowncastCol>> =
+            Vec::with_capacity(self.agg_exprs.len());
+        for expr in &self.agg_exprs {
+            if matches!(expr.function, AggFunction::Count) {
+                pre_agg_indices.push(0);
+                pre_agg_cols.push(None);
+            } else {
+                let col_idx = batch
+                    .schema()
+                    .index_of(&expr.input_column)
+                    .map_err(|_| ExecError::ColumnNotFound(expr.input_column.clone()))?;
+                pre_agg_cols.push(Some(PreDowncastCol::downcast(batch.column(col_idx))?));
+                pre_agg_indices.push(col_idx);
+            }
+        }
+
+        for row in 0..batch.num_rows() {
+            let key: SmallVec<[AggKey; 4]> =
+                pre_gb.iter().map(|col| col.extract_agg_key(row)).collect();
+            let state = self
+                .groups
+                .entry(key)
+                .or_insert_with(|| AggState::new(&self.agg_exprs));
+            update_agg_state_pre(state, &self.agg_exprs, &pre_agg_cols, row)?;
+        }
+
+        // Spill if memory budget exceeded.  Estimate: ~256 bytes per group
+        // (key + AggState overhead) plus 24 bytes per aggregate expression.
+        if let Some(budget) = self.memory_budget.clone() {
+            let per_group: u64 = 256 + (24 * self.agg_exprs.len()) as u64;
+            let estimated: u64 = (self.groups.len() as u64).saturating_mul(per_group);
+            let over_budget = budget
+                .limit()
+                .map(|limit| estimated > limit.saturating_sub(self.reserved_bytes))
+                .unwrap_or(false);
+            if over_budget {
+                self.spill_partial()?;
+            } else {
+                // Reserve the incremental delta so budget tracking stays accurate.
+                let delta = estimated.saturating_sub(self.reserved_bytes);
+                if delta > 0 && !budget.try_reserve(delta) {
+                    self.spill_partial()?;
+                } else {
+                    self.reserved_bytes = estimated;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge all spilled runs with in-memory groups and return the final batch.
+    pub fn finish(&mut self) -> ExecResult<RecordBatch> {
+        let schema = self.input_schema.clone();
+
+        // Spill remaining in-memory state so all runs are uniform.
+        if !self.runs.is_empty() && !self.groups.is_empty() {
+            if let Some(ref s) = schema {
+                self.spill_partial_with_schema(s.clone())?;
+            }
+        }
+
+        let spilled = std::mem::take(&mut self.runs);
+        // Merge spill runs into groups.
+        for file in &spilled {
+            for batch in file.read()? {
+                self.merge_partial_batch(&batch)?;
+            }
+        }
+        self.release_reserved();
+        drop(spilled); // removes temp files
+
+        let input_schema = match &schema {
+            Some(s) => s.clone(),
+            None => {
+                // No rows pushed; return empty batch.
+                return Ok(RecordBatch::new_empty(self.empty_output_schema()));
+            }
+        };
+        self.build_output_batch(&input_schema)
+    }
+
+    /// Total bytes written to spill files.
+    pub fn spill_bytes(&self) -> u64 {
+        self.spill_bytes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Number of spill files written.
+    pub fn spill_file_count(&self) -> u64 {
+        self.spill_file_count.load(AtomicOrdering::Relaxed)
+    }
+
+    fn spill_partial(&mut self) -> ExecResult<()> {
+        let schema = self.input_schema.clone().ok_or_else(|| {
+            ExecError::Spill("spill_partial called before any batch was pushed".into())
+        })?;
+        self.spill_partial_with_schema(schema)
+    }
+
+    fn spill_partial_with_schema(&mut self, input_schema: SchemaRef) -> ExecResult<()> {
+        if self.groups.is_empty() {
+            return Ok(());
+        }
+        let partial_schema = Self::build_partial_schema(&self.group_by, &self.agg_exprs, &input_schema);
+        let batch = self.serialize_partial(&partial_schema, &input_schema)?;
+        let (file, bytes) = SpillFile::write("agg", &partial_schema, &[batch])?;
+        self.spill_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+        self.spill_file_count.fetch_add(1, AtomicOrdering::Relaxed);
+        self.runs.push(file);
+        self.groups.clear();
+        self.release_reserved();
+        Ok(())
+    }
+
+    fn release_reserved(&mut self) {
+        if let Some(budget) = &self.memory_budget {
+            budget.release(self.reserved_bytes);
+        }
+        self.reserved_bytes = 0;
+    }
+
+    /// Build the partial-aggregate RecordBatch schema.
+    ///
+    /// Layout: group-by columns | per-agg [__pval_i, __phas_i, __pavs_i, __pavc_i]
+    fn build_partial_schema(
+        group_by: &[String],
+        agg_exprs: &[AggExpr],
+        input_schema: &Schema,
+    ) -> Schema {
+        let mut fields: Vec<Field> = Vec::with_capacity(group_by.len() + agg_exprs.len() * 4);
+        for col in group_by {
+            if let Ok(f) = input_schema.field_with_name(col) {
+                fields.push(f.clone());
+            }
+        }
+        for i in 0..agg_exprs.len() {
+            fields.push(Field::new(format!("__pval_{i}"), DataType::Int64, false));
+            fields.push(Field::new(format!("__phas_{i}"), DataType::Boolean, false));
+            fields.push(Field::new(format!("__pavs_{i}"), DataType::Float64, false));
+            fields.push(Field::new(format!("__pavc_{i}"), DataType::Int64, false));
+        }
+        Schema::new(fields)
+    }
+
+    /// Serialize the in-memory `groups` HashMap to a partial-aggregate RecordBatch.
+    fn serialize_partial(
+        &self,
+        partial_schema: &Schema,
+        input_schema: &SchemaRef,
+    ) -> ExecResult<RecordBatch> {
+        let mut sorted: Vec<(&SmallVec<[AggKey; 4]>, &AggState)> =
+            self.groups.iter().collect();
+        sorted.sort_by(|(a, _), (b, _)| {
+            a.iter()
+                .zip(b.iter())
+                .map(|(ai, bi)| ai.cmp(bi))
+                .find(|&o| o != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        });
+
+        let n = sorted.len();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(partial_schema.fields().len());
+
+        // Group-by columns.
+        for (gb_pos, col_name) in self.group_by.iter().enumerate() {
+            let dtype = input_schema
+                .field_with_name(col_name)
+                .map_err(|_| ExecError::ColumnNotFound(col_name.clone()))?
+                .data_type()
+                .clone();
+            let col: ArrayRef = match dtype {
+                DataType::Int32 => {
+                    Arc::new(Int32Array::from(
+                        sorted
+                            .iter()
+                            .map(|(key, _)| match key[gb_pos] {
+                                AggKey::Int32(v) => Ok(v),
+                                _ => Err(ExecError::UnsupportedType("Int32 key mismatch".into())),
+                            })
+                            .collect::<ExecResult<Vec<i32>>>()?,
+                    ))
+                }
+                DataType::Int64 => {
+                    Arc::new(Int64Array::from(
+                        sorted
+                            .iter()
+                            .map(|(key, _)| match key[gb_pos] {
+                                AggKey::Int64(v) => Ok(v),
+                                _ => Err(ExecError::UnsupportedType("Int64 key mismatch".into())),
+                            })
+                            .collect::<ExecResult<Vec<i64>>>()?,
+                    ))
+                }
+                DataType::Float64 => {
+                    Arc::new(Float64Array::from(
+                        sorted
+                            .iter()
+                            .map(|(key, _)| match key[gb_pos] {
+                                AggKey::Float64(bits) => Ok(f64::from_bits(bits)),
+                                _ => Err(ExecError::UnsupportedType("Float64 key mismatch".into())),
+                            })
+                            .collect::<ExecResult<Vec<f64>>>()?,
+                    ))
+                }
+                DataType::Utf8 => {
+                    Arc::new(StringArray::from(
+                        sorted
+                            .iter()
+                            .map(|(key, _)| match &key[gb_pos] {
+                                AggKey::Utf8(s) => Ok(s.clone()),
+                                _ => Err(ExecError::UnsupportedType("Utf8 key mismatch".into())),
+                            })
+                            .collect::<ExecResult<Vec<String>>>()?,
+                    ))
+                }
+                DataType::Boolean => {
+                    Arc::new(BooleanArray::from(
+                        sorted
+                            .iter()
+                            .map(|(key, _)| match key[gb_pos] {
+                                AggKey::Bool(v) => Ok(v),
+                                _ => Err(ExecError::UnsupportedType("Bool key mismatch".into())),
+                            })
+                            .collect::<ExecResult<Vec<bool>>>()?,
+                    ))
+                }
+                other => {
+                    return Err(ExecError::UnsupportedType(format!(
+                        "unsupported group-by type for {col_name}: {other}"
+                    )));
+                }
+            };
+            columns.push(col);
+        }
+
+        // Partial aggregate columns.
+        for i in 0..self.agg_exprs.len() {
+            let mut val_b = Int64Builder::with_capacity(n);
+            let mut has_b = BooleanBuilder::with_capacity(n);
+            let mut avs_b = Float64Builder::with_capacity(n);
+            let mut avc_b = Int64Builder::with_capacity(n);
+            for (_, state) in &sorted {
+                val_b.append_value(state.values[i]);
+                has_b.append_value(state.has_value[i]);
+                avs_b.append_value(state.avg_sums[i]);
+                avc_b.append_value(state.avg_counts[i] as i64);
+            }
+            columns.push(Arc::new(val_b.finish()) as ArrayRef);
+            columns.push(Arc::new(has_b.finish()) as ArrayRef);
+            columns.push(Arc::new(avs_b.finish()) as ArrayRef);
+            columns.push(Arc::new(avc_b.finish()) as ArrayRef);
+        }
+
+        Ok(RecordBatch::try_new(Arc::new(partial_schema.clone()), columns)?)
+    }
+
+    /// Merge one partial-aggregate RecordBatch into `self.groups`.
+    fn merge_partial_batch(&mut self, partial: &RecordBatch) -> ExecResult<()> {
+        let n = partial.num_rows();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let n_gb = self.group_by.len();
+        let n_agg = self.agg_exprs.len();
+
+        // Pre-downcast group-by columns.
+        let pre_gb: Vec<PreDowncastCol> = (0..n_gb)
+            .map(|i| PreDowncastCol::downcast(partial.column(i)))
+            .collect::<ExecResult<_>>()?;
+
+        // Pre-read partial agg columns: 4 columns per agg_expr starting after group-by.
+        let base = n_gb;
+        let val_cols: Vec<&Int64Array> = (0..n_agg)
+            .map(|i| {
+                partial
+                    .column(base + i * 4)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| ExecError::Spill("partial val column not Int64".into()))
+            })
+            .collect::<ExecResult<_>>()?;
+        let has_cols: Vec<&BooleanArray> = (0..n_agg)
+            .map(|i| {
+                partial
+                    .column(base + i * 4 + 1)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| ExecError::Spill("partial has column not Boolean".into()))
+            })
+            .collect::<ExecResult<_>>()?;
+        let avs_cols: Vec<&Float64Array> = (0..n_agg)
+            .map(|i| {
+                partial
+                    .column(base + i * 4 + 2)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| ExecError::Spill("partial avs column not Float64".into()))
+            })
+            .collect::<ExecResult<_>>()?;
+        let avc_cols: Vec<&Int64Array> = (0..n_agg)
+            .map(|i| {
+                partial
+                    .column(base + i * 4 + 3)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| ExecError::Spill("partial avc column not Int64".into()))
+            })
+            .collect::<ExecResult<_>>()?;
+
+        for row in 0..n {
+            let key: SmallVec<[AggKey; 4]> =
+                pre_gb.iter().map(|col| col.extract_agg_key(row)).collect();
+            let existing = self.groups.entry(key).or_insert_with(|| {
+                let n_agg = self.agg_exprs.len();
+                AggState {
+                    values: vec![0i64; n_agg],
+                    has_value: vec![false; n_agg],
+                    avg_sums: vec![0.0f64; n_agg],
+                    avg_counts: vec![0u64; n_agg],
+                }
+            });
+            for (i, expr) in self.agg_exprs.iter().enumerate() {
+                let pval = val_cols[i].value(row);
+                let phas = has_cols[i].value(row);
+                let pavs = avs_cols[i].value(row);
+                let pavc = avc_cols[i].value(row) as u64;
+                match expr.function {
+                    AggFunction::Count | AggFunction::Sum => {
+                        existing.values[i] = existing.values[i]
+                            .checked_add(pval)
+                            .ok_or_else(|| ExecError::InvalidInput(
+                                "aggregate overflow during spill merge".into(),
+                            ))?;
+                    }
+                    AggFunction::Min => {
+                        if phas && (!existing.has_value[i] || pval < existing.values[i]) {
+                            existing.values[i] = pval;
+                        }
+                    }
+                    AggFunction::Max => {
+                        if phas && (!existing.has_value[i] || pval > existing.values[i]) {
+                            existing.values[i] = pval;
+                        }
+                    }
+                    AggFunction::Avg => {
+                        existing.avg_sums[i] += pavs;
+                        existing.avg_counts[i] = existing.avg_counts[i].saturating_add(pavc);
+                    }
+                }
+                existing.has_value[i] = existing.has_value[i] || phas;
+            }
+        }
+        Ok(())
+    }
+
+    fn empty_output_schema(&self) -> SchemaRef {
+        Arc::new(Schema::new(
+            self.group_by
+                .iter()
+                .map(|c| Field::new(c.as_str(), DataType::Utf8, true))
+                .chain(self.agg_exprs.iter().map(|e| {
+                    let dtype = if matches!(e.function, AggFunction::Avg) {
+                        DataType::Float64
+                    } else {
+                        DataType::Int64
+                    };
+                    Field::new(e.output_column.as_str(), dtype, true)
+                }))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn build_output_batch(&self, input_schema: &SchemaRef) -> ExecResult<RecordBatch> {
+        let mut sorted: Vec<(&SmallVec<[AggKey; 4]>, &AggState)> =
+            self.groups.iter().collect();
+        sorted.sort_by(|(a, _), (b, _)| {
+            a.iter()
+                .zip(b.iter())
+                .map(|(ai, bi)| ai.cmp(bi))
+                .find(|&o| o != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        });
+
+        let n = sorted.len();
+        let mut fields: Vec<Field> = Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
+        for col_name in &self.group_by {
+            let f = input_schema
+                .field_with_name(col_name)
+                .map_err(|_| ExecError::ColumnNotFound(col_name.clone()))?;
+            fields.push(f.clone());
+        }
+        for agg in &self.agg_exprs {
+            let dtype = if matches!(agg.function, AggFunction::Avg) {
+                DataType::Float64
+            } else {
+                DataType::Int64
+            };
+            fields.push(Field::new(&agg.output_column, dtype, true));
+        }
+        let out_schema = Arc::new(Schema::new(fields));
+
+        if n == 0 {
+            return Ok(RecordBatch::new_empty(out_schema));
+        }
+
+        let gb_indices: Vec<usize> = self
+            .group_by
+            .iter()
+            .map(|col| {
+                input_schema
+                    .index_of(col)
+                    .map_err(|_| ExecError::ColumnNotFound(col.clone()))
+            })
+            .collect::<ExecResult<_>>()?;
+
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
+        for (gb_pos, col_name) in self.group_by.iter().enumerate() {
+            let col_idx = gb_indices[gb_pos];
+            let dtype = input_schema.field(col_idx).data_type().clone();
+            let col: ArrayRef = match dtype {
+                DataType::Int32 => {
+                    Arc::new(Int32Array::from(
+                        sorted
+                            .iter()
+                            .map(|(key, _)| match key[gb_pos] {
+                                AggKey::Int32(v) => Ok(v),
+                                _ => Err(ExecError::UnsupportedType(format!(
+                                    "Int32 group key mismatch for {col_name}"
+                                ))),
+                            })
+                            .collect::<ExecResult<Vec<i32>>>()?,
+                    ))
+                }
+                DataType::Int64 => {
+                    Arc::new(Int64Array::from(
+                        sorted
+                            .iter()
+                            .map(|(key, _)| match key[gb_pos] {
+                                AggKey::Int64(v) => Ok(v),
+                                _ => Err(ExecError::UnsupportedType(format!(
+                                    "Int64 group key mismatch for {col_name}"
+                                ))),
+                            })
+                            .collect::<ExecResult<Vec<i64>>>()?,
+                    ))
+                }
+                DataType::Float64 => {
+                    Arc::new(Float64Array::from(
+                        sorted
+                            .iter()
+                            .map(|(key, _)| match key[gb_pos] {
+                                AggKey::Float64(bits) => Ok(f64::from_bits(bits)),
+                                _ => Err(ExecError::UnsupportedType(format!(
+                                    "Float64 group key mismatch for {col_name}"
+                                ))),
+                            })
+                            .collect::<ExecResult<Vec<f64>>>()?,
+                    ))
+                }
+                DataType::Utf8 => {
+                    Arc::new(StringArray::from(
+                        sorted
+                            .iter()
+                            .map(|(key, _)| match &key[gb_pos] {
+                                AggKey::Utf8(s) => Ok(s.as_str()),
+                                _ => Err(ExecError::UnsupportedType(format!(
+                                    "Utf8 group key mismatch for {col_name}"
+                                ))),
+                            })
+                            .collect::<ExecResult<Vec<&str>>>()?,
+                    ))
+                }
+                DataType::Boolean => {
+                    Arc::new(BooleanArray::from(
+                        sorted
+                            .iter()
+                            .map(|(key, _)| match key[gb_pos] {
+                                AggKey::Bool(v) => Ok(v),
+                                _ => Err(ExecError::UnsupportedType(format!(
+                                    "Bool group key mismatch for {col_name}"
+                                ))),
+                            })
+                            .collect::<ExecResult<Vec<bool>>>()?,
+                    ))
+                }
+                other => {
+                    return Err(ExecError::UnsupportedType(format!(
+                        "unsupported group-by column type for {col_name}: {other}"
+                    )));
+                }
+            };
+            columns.push(col);
+        }
+
+        for (agg_pos, agg) in self.agg_exprs.iter().enumerate() {
+            match agg.function {
+                AggFunction::Avg => {
+                    let arr: Float64Array = sorted
+                        .iter()
+                        .map(|(_, state)| state.finalized_avg(agg_pos))
+                        .collect();
+                    columns.push(Arc::new(arr) as ArrayRef);
+                }
+                _ => {
+                    let arr: Int64Array = sorted
+                        .iter()
+                        .map(|(_, state)| state.finalized_value(agg_pos, agg))
+                        .collect();
+                    columns.push(Arc::new(arr) as ArrayRef);
+                }
+            }
+        }
+
+        Ok(RecordBatch::try_new(out_schema, columns)?)
+    }
+}
+
+impl Drop for ExternalAggregator {
+    fn drop(&mut self) {
+        self.release_reserved();
     }
 }
 

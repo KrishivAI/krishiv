@@ -48,7 +48,10 @@ pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, ExecutorHeartbeatEffects,
     ThrottleDecision,
 };
-pub use admission::{InMemoryQueueManager, QueueManager};
+pub use admission::{
+    InMemoryQueueManager, NAMESPACE_MAX_ACTIVE_JOBS_ENV, NAMESPACE_MAX_CPU_NANOS_ENV,
+    NAMESPACE_MAX_MEMORY_BYTES_ENV, NamespaceQuotaQueueManager, QueueManager,
+};
 pub use auth::{
     AuthContext, COORDINATOR_AUTH_RELOAD_INTERVAL_SECS_ENV, COORDINATOR_BEARER_TOKEN_ENV,
     COORDINATOR_BEARER_TOKEN_FILE_ENV, COORDINATOR_BEARER_TOKENS_ENV,

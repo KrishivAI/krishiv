@@ -6,9 +6,9 @@ use krishiv_plan::{
 use krishiv_proto::{
     AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, ExecutorTaskAssignment,
     InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, KeyGroupRange,
-    LeaseGeneration, OutputContract, OutputContractKind, PlanFragment, StageId, StageSpec,
-    StageState, StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskId, TaskOutputMetadata,
-    TaskSpec, TaskState, TaskStatusUpdate,
+    LeaseGeneration, MissingShufflePartition, OutputContract, OutputContractKind, PlanFragment,
+    StageId, StageSpec, StageState, StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskId,
+    TaskOutputMetadata, TaskSpec, TaskState, TaskStatusUpdate,
 };
 use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 
@@ -637,6 +637,85 @@ impl JobRecord {
                     for path in &paths_to_invalidate {
                         meta_entry.mark_failed(path, "executor lost".to_owned());
                     }
+                }
+                stage.refresh_state();
+            }
+        }
+
+        if affected {
+            self.refresh_state();
+        }
+
+        affected
+    }
+
+    /// Invalidate specific shuffle partitions reported missing by a consumer task.
+    ///
+    /// When a consumer task reports `MissingShufflePartition` entries in its `Failed`
+    /// status update, the producing tasks that wrote those partitions must be re-run.
+    /// This method marks the named (stage_id, partition_id) paths as Failed and resets
+    /// their owning tasks to Pending so they are re-scheduled.
+    ///
+    /// Returns `true` if any tasks were affected.
+    pub(crate) fn invalidate_specific_shuffle_partitions(
+        &mut self,
+        missing: &[MissingShufflePartition],
+    ) -> bool {
+        if missing.is_empty() {
+            return false;
+        }
+        let job_id_str = self.spec.job_id().as_str().to_owned();
+        let mut affected = false;
+
+        for stage in &mut self.stages {
+            let stage_id = stage.spec.stage_id().clone();
+            // Collect which partition_ids in this stage are reported missing.
+            let missing_ids: Vec<u32> = missing
+                .iter()
+                .filter(|m| m.stage_id() == &stage_id)
+                .map(|m| m.partition_id())
+                .collect();
+            if missing_ids.is_empty() {
+                continue;
+            }
+
+            let mut stage_affected = false;
+            let mut paths_to_invalidate: Vec<ShufflePath> = Vec::new();
+
+            for task in &mut stage.tasks {
+                if task.state != TaskState::Succeeded {
+                    continue;
+                }
+                let Some(meta) = &task.output_metadata else {
+                    continue;
+                };
+                let affected_partitions: Vec<ShufflePath> = meta
+                    .shuffle_partitions()
+                    .iter()
+                    .filter(|p| missing_ids.contains(&p.partition_id))
+                    .map(|p| ShufflePath {
+                        job_id: job_id_str.clone(),
+                        stage_id: stage_id.as_str().to_owned(),
+                        partition_id: p.partition_id,
+                    })
+                    .collect();
+
+                if affected_partitions.is_empty() {
+                    continue;
+                }
+
+                paths_to_invalidate.extend(affected_partitions);
+                task.state = TaskState::Pending;
+                task.assigned_executor = None;
+                task.launch_in_flight = false;
+                stage_affected = true;
+                affected = true;
+            }
+
+            if stage_affected {
+                let meta_entry = self.shuffle_output.entry(stage_id).or_default();
+                for path in &paths_to_invalidate {
+                    meta_entry.mark_failed(path, "shuffle partition missing on consumer fetch".to_owned());
                 }
                 stage.refresh_state();
             }

@@ -1,6 +1,8 @@
 //! Shared helper functions used by multiple fragment execution modules.
 
+use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 
 use krishiv_proto::{
     InputPartitionDescriptor, OutputContract, OutputContractDescriptor, TaskState,
@@ -277,10 +279,24 @@ pub(crate) async fn write_object_parquet_sink(
 /// Fetch all `shuffle-flight:` input partitions via Arrow IPC over TCP and return
 /// `(table_name, batches)` pairs ready for registration with the SQL engine.
 ///
+/// Executor-wide semaphore that caps concurrent Arrow Flight shuffle fetches.
+///
+/// Default is 8 simultaneous in-flight requests per executor. Configurable via
+/// `KRISHIV_SHUFFLE_FETCH_CONCURRENCY`. Shared across all tasks running on the
+/// same executor process to prevent thundering-herd on shuffle services.
+static SHUFFLE_FETCH_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    let concurrency = std::env::var("KRISHIV_SHUFFLE_FETCH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8);
+    Arc::new(tokio::sync::Semaphore::new(concurrency))
+});
+
 /// Multiple partitions sharing the same table name are merged so the engine sees
 /// one logical table regardless of how many physical shuffle partitions were read.
-/// All partitions are fetched concurrently; the first error aborts the remaining
-/// fetches.
+/// All partitions are fetched concurrently up to `KRISHIV_SHUFFLE_FETCH_CONCURRENCY`
+/// (default 8) simultaneous requests; the first error aborts the remaining fetches.
 pub(crate) async fn read_shuffle_flight_partitions(
     partitions: &[krishiv_proto::InputPartition],
 ) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
@@ -315,6 +331,12 @@ pub(crate) async fn read_shuffle_flight_partitions(
         })
         .map(
             |(table_name, flight_endpoint, job_id, upstream_stage_id, partition_id)| async move {
+                // Acquire a concurrency permit before touching the network.
+                // The permit is released when it drops at the end of this block.
+                let _permit = SHUFFLE_FETCH_SEMAPHORE
+                    .acquire()
+                    .await
+                    .expect("shuffle fetch semaphore closed");
                 let batches = FlightShuffleClient::fetch_with_retry(
                     &flight_endpoint,
                     job_id.as_str(),
@@ -323,11 +345,21 @@ pub(crate) async fn read_shuffle_flight_partitions(
                     retry_policy,
                 )
                 .await
-                .map_err(|e| ExecutorError::LocalExecution {
-                    message: format!(
-                        "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
-                     stage={upstream_stage_id} partition={partition_id}): {e}"
-                    ),
+                .map_err(|e| {
+                    if e.kind() == io::ErrorKind::NotFound {
+                        ExecutorError::ShufflePartitionMissing {
+                            stage_id: upstream_stage_id.as_str().to_owned(),
+                            partition_id,
+                            message: e.to_string(),
+                        }
+                    } else {
+                        ExecutorError::LocalExecution {
+                            message: format!(
+                                "shuffle-flight fetch failed (endpoint={flight_endpoint} \
+                                 job={job_id} stage={upstream_stage_id} partition={partition_id}): {e}"
+                            ),
+                        }
+                    }
                 })?;
                 Ok::<_, ExecutorError>((table_name, batches))
             },

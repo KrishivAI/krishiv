@@ -10,14 +10,17 @@
 //! [`SortedBatchMerger`] to obtain the final merged output.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
 };
 use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use krishiv_common::MemoryBudget;
 
+use crate::spill::SpillFile;
 use crate::{ExecError, ExecResult};
 
 // ── Sort key descriptor ───────────────────────────────────────────────────────
@@ -194,6 +197,172 @@ impl SortedBatchMerger {
             }
         }
         Ok(false) // equal — treat as not-less
+    }
+}
+
+// ── External sorter ───────────────────────────────────────────────────────────
+
+/// Memory-bounded sort over an unbounded sequence of input batches.
+///
+/// Batches are buffered in memory while they fit the attached
+/// [`MemoryBudget`].  When a reservation fails, the buffered batches are
+/// sorted into a single run, written to a temp file as Arrow IPC, and the
+/// memory is released.  [`ExternalSorter::finish`] performs a k-way merge of
+/// every spilled run plus the remaining in-memory run via
+/// [`SortedBatchMerger`].
+///
+/// Without a budget (the default) the sorter behaves as a fully in-memory
+/// sort.  Spill files are removed on `finish` and on drop.
+pub struct ExternalSorter {
+    keys: Vec<SortKey>,
+    memory_budget: Option<Arc<MemoryBudget>>,
+    schema: Option<SchemaRef>,
+    in_memory: Vec<RecordBatch>,
+    reserved_bytes: u64,
+    runs: Vec<SpillFile>,
+    spill_bytes: AtomicU64,
+    spill_files: AtomicU64,
+}
+
+impl ExternalSorter {
+    /// Create an in-memory sorter over `keys` (no spilling until a budget is
+    /// attached via [`ExternalSorter::with_budget`]).
+    pub fn new(keys: Vec<SortKey>) -> Self {
+        Self {
+            keys,
+            memory_budget: None,
+            schema: None,
+            in_memory: Vec::new(),
+            reserved_bytes: 0,
+            runs: Vec::new(),
+            spill_bytes: AtomicU64::new(0),
+            spill_files: AtomicU64::new(0),
+        }
+    }
+
+    /// Attach a shared memory budget; exceeding it spills sorted runs to disk
+    /// instead of failing with `ResourceExhausted`.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<MemoryBudget>) -> Self {
+        self.memory_budget = Some(budget);
+        self
+    }
+
+    /// Buffer `batch` for sorting, spilling the current run if the memory
+    /// budget cannot hold it.
+    pub fn push(&mut self, batch: RecordBatch) -> ExecResult<()> {
+        if self.schema.is_none() {
+            self.schema = Some(batch.schema());
+        }
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let bytes = batch.get_array_memory_size() as u64;
+        if let Some(budget) = self.memory_budget.clone() {
+            if !budget.try_reserve(bytes) {
+                // Free our share of the budget by spilling the buffered run.
+                self.spill_run()?;
+                if !budget.try_reserve(bytes) {
+                    // The batch alone exceeds the remaining budget: sort it
+                    // and spill it as its own run without buffering.
+                    self.in_memory.push(batch);
+                    return self.spill_run();
+                }
+            }
+            self.reserved_bytes += bytes;
+        }
+        self.in_memory.push(batch);
+        Ok(())
+    }
+
+    /// Merge all spilled runs with the in-memory run into sorted output.
+    ///
+    /// Consumes the buffered state: spill files are deleted and reserved
+    /// memory is released.  Returns one fully sorted batch (or an empty batch
+    /// when all input was empty; an empty `Vec` when nothing was pushed).
+    pub fn finish(&mut self) -> ExecResult<Vec<RecordBatch>> {
+        let spilled = std::mem::take(&mut self.runs);
+        let mut run_batches: Vec<RecordBatch> = Vec::with_capacity(spilled.len() + 1);
+        for file in &spilled {
+            run_batches.extend(file.read()?);
+        }
+        if !self.in_memory.is_empty() {
+            let batches = std::mem::take(&mut self.in_memory);
+            run_batches.push(self.sorted_run(&batches)?);
+        }
+        self.release_reserved();
+        // `spilled` dropped here removes the temp files.
+        drop(spilled);
+        match run_batches.len() {
+            0 => Ok(self
+                .schema
+                .as_ref()
+                .map(|s| vec![RecordBatch::new_empty(s.clone())])
+                .unwrap_or_default()),
+            1 => Ok(run_batches),
+            _ => {
+                let merger = SortedBatchMerger::new(self.keys.clone());
+                Ok(vec![merger.merge(&run_batches)?])
+            }
+        }
+    }
+
+    /// Total bytes written to spill files so far.
+    pub fn spill_bytes(&self) -> u64 {
+        self.spill_bytes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Number of spill files written so far.
+    pub fn spill_file_count(&self) -> u64 {
+        self.spill_files.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Sort the buffered batches into one run and write it to a spill file.
+    fn spill_run(&mut self) -> ExecResult<()> {
+        if self.in_memory.is_empty() {
+            return Ok(());
+        }
+        let batches = std::mem::take(&mut self.in_memory);
+        let run = self.sorted_run(&batches)?;
+        let (file, bytes) = SpillFile::write("sort", run.schema().as_ref(), &[run])?;
+        self.spill_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+        self.spill_files.fetch_add(1, AtomicOrdering::Relaxed);
+        self.runs.push(file);
+        self.release_reserved();
+        Ok(())
+    }
+
+    /// Sort each buffered batch and merge them into a single sorted run.
+    fn sorted_run(&self, batches: &[RecordBatch]) -> ExecResult<RecordBatch> {
+        let sorted: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| sort_batch(b, &self.keys))
+            .collect::<ExecResult<_>>()?;
+        if sorted.len() == 1 {
+            let mut sorted = sorted;
+            return Ok(sorted.remove(0));
+        }
+        SortedBatchMerger::new(self.keys.clone()).merge(&sorted)
+    }
+
+    fn release_reserved(&mut self) {
+        if let Some(budget) = &self.memory_budget {
+            budget.release(self.reserved_bytes);
+        }
+        self.reserved_bytes = 0;
+    }
+
+    /// Paths of the live spill files (test inspection only).
+    #[cfg(test)]
+    fn spill_paths(&self) -> Vec<std::path::PathBuf> {
+        self.runs.iter().map(|f| f.path().to_path_buf()).collect()
+    }
+}
+
+impl Drop for ExternalSorter {
+    fn drop(&mut self) {
+        self.release_reserved();
+        // `runs` dropping removes any remaining spill files.
     }
 }
 

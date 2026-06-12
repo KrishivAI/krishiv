@@ -56,8 +56,8 @@ pub use services::{CoordinatorExecutorService, ExecutorTaskService};
 pub use task::{
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment,
     InitiateCheckpointCommand, InputPartition, InputPartitionDescriptor, KeyGroupRange,
-    MemoryKafkaRecord, OutputContract, OutputContractDescriptor, OutputContractKind, PlanFragment,
-    RegisterExecutorRequest, RegisterExecutorResponse, TaskAssignment, TaskAttemptRef,
-    TaskCancellationRequest, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate,
-    TransportDisposition,
+    MemoryKafkaRecord, MissingShufflePartition, OutputContract, OutputContractDescriptor,
+    OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
+    TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskStatusRequest, TaskStatusResponse,
+    TaskStatusUpdate, TransportDisposition,
 };

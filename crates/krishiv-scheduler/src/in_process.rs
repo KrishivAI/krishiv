@@ -211,6 +211,11 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         if let Some(meta) = request.output_metadata() {
             update = update.with_output_metadata(meta.clone());
         }
+        if !request.missing_shuffle_partitions().is_empty() {
+            update = update.with_missing_shuffle_partitions(
+                request.missing_shuffle_partitions().to_vec(),
+            );
+        }
         let mut coordinator = lock_coord(&self.coordinator)?;
         let response = match coordinator.apply_task_update(update) {
             Ok(TaskUpdateOutcome::Applied) => {

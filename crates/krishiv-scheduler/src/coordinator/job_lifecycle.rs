@@ -182,6 +182,9 @@ impl Coordinator {
             .unwrap_or_default();
         let terminal_state = update.state();
         let executor_id_for_circuit = update.executor_id().clone();
+        // Save before update is moved.
+        let missing_partitions: Vec<krishiv_proto::MissingShufflePartition> =
+            update.missing_shuffle_partitions().to_vec();
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
 
         if outcome == TaskUpdateOutcome::Duplicate {
@@ -243,6 +246,26 @@ impl Coordinator {
         } else if terminal_state == TaskState::Succeeded {
             krishiv_metrics::global_metrics().inc_tasks_succeeded();
             self.executors.reset_task_failures(&executor_id_for_circuit);
+        }
+
+        // Re-queue the producing stage when the consumer reports missing partitions.
+        // This handles the case where a producer executor's shuffle data is lost
+        // (disk failure, eviction, restart) after the produce stage already succeeded.
+        if terminal_state == TaskState::Failed && !missing_partitions.is_empty() {
+            tracing::warn!(
+                job_id = %job_id,
+                stage_id = %stage_id,
+                missing_count = missing_partitions.len(),
+                "consumer task reported missing upstream shuffle partitions; invalidating producers"
+            );
+            let producers_affected = if let Ok(mut job) = self.find_job_mut(&job_id) {
+                job.invalidate_specific_shuffle_partitions(&missing_partitions)
+            } else {
+                false
+            };
+            if producers_affected {
+                self.notify.notify_waiters();
+            }
         }
 
         if terminal_state == TaskState::Succeeded && !inline_ipc.is_empty() {
