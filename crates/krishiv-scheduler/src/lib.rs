@@ -66,12 +66,13 @@ pub use batch_sql::{
     BatchSqlInlineTable, BatchSqlOutcome, BatchSqlTable, decode_inline_record_batches,
     execute_batch_sql_coordinated, submit_batch_sql_job,
 };
+pub use bounded_window::execute_bounded_window_coordinated;
 pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use config::{CoordinatorConfig, JobSubmitter, TlsConfig};
 pub use coordinator::{Coordinator, OrchestratorHandles, SharedCoordinator};
 pub use coordinator_daemon::{
-    CoordinatorDaemonConfig, JobCoordinatorDaemonConfig, build_leader_election,
+    CoordinatorDaemonConfig, CoordinatorSidecarFn, JobCoordinatorDaemonConfig, build_leader_election,
     build_shared_coordinator, coordinator_daemon_help, coordinator_http_router,
     job_coordinator_daemon_help, parse_coordinator_daemon_config,
     parse_job_coordinator_daemon_config, run_cluster_control_plane, run_clusterd_daemon,
@@ -110,6 +111,10 @@ pub use redb_metadata::RedbMetadataStore;
 pub use rocksdb_metadata::RocksDbMetadataStore;
 pub use store::{
     ContinuousSnapshot, EventLogEvent, InMemoryMetadataStore, MetadataStore, NonBlockingStoreHandle,
+};
+pub use continuous_stream_http::{
+    ContinuousStreamError, drain_continuous_stream_coordinated, push_continuous_input_coordinated,
+    register_continuous_stream_coordinated,
 };
 pub use queryable_state_http::{
     QueryStateResponse, decode_key_hex, encode_key_hex, queryable_state_router,

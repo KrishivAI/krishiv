@@ -216,6 +216,230 @@ pub async fn api_continuous_drain(
     }))
 }
 
+// -------------------------------------------------------------------------
+// Public programmatic API — no HTTP types.
+// Used by co-located services (e.g., Flight SQL sidecar) that call the
+// coordinator directly without an HTTP round-trip.
+// -------------------------------------------------------------------------
+
+/// Error returned by the programmatic continuous-stream helpers.
+#[derive(Debug)]
+pub enum ContinuousStreamError {
+    /// A `SchedulerError` wrapped for external callers.
+    Scheduler(crate::SchedulerError),
+    /// The push cycle was aborted (e.g., no executor available).
+    Unavailable(String),
+    /// A cycle was aborted because it conflicted with the current state.
+    Aborted(String),
+}
+
+impl std::fmt::Display for ContinuousStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scheduler(e) => write!(f, "scheduler error: {e}"),
+            Self::Unavailable(msg) => write!(f, "unavailable: {msg}"),
+            Self::Aborted(msg) => write!(f, "aborted: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ContinuousStreamError {}
+
+impl From<crate::SchedulerError> for ContinuousStreamError {
+    fn from(e: crate::SchedulerError) -> Self {
+        Self::Scheduler(e)
+    }
+}
+
+/// Register a new continuous streaming job with the coordinator.
+///
+/// This is the programmatic equivalent of `api_continuous_register` — it calls
+/// the same coordinator methods without serialising to HTTP.
+///
+/// The job is identified by `job_id` and parameterised by `spec`.
+pub async fn register_continuous_stream_coordinated(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    spec: &krishiv_plan::window::WindowExecutionSpec,
+) -> Result<(), ContinuousStreamError> {
+    use krishiv_plan::{ExecutionKind, TypedTaskFragment};
+    use krishiv_plan::window::encode_window_execution_spec;
+    use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+
+    let job_id_typed = JobId::try_new(job_id).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    let stage_id = StageId::try_new("stage-streaming").map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    let task_id = TaskId::try_new("task-streaming").map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    let encoded_spec = encode_window_execution_spec(spec).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    let loop_fragment = format!("stream:loop:{job_id}|{encoded_spec}");
+    let fragment = TypedTaskFragment::new(ExecutionKind::Streaming, loop_fragment)
+        .encode()
+        .map_err(|e| {
+            ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+                message: e.to_string(),
+            })
+        })?;
+    let stage = StageSpec::new(stage_id, "continuous-streaming")
+        .with_task(TaskSpec::new(task_id, fragment));
+    let job_spec =
+        JobSpec::new(job_id_typed.clone(), "continuous-streaming", JobKind::Streaming)
+            .with_stage(stage);
+
+    let mut coord = coordinator.write().await;
+    coord
+        .ensure_active()
+        .map_err(ContinuousStreamError::Scheduler)?;
+    coord
+        .submit_job(job_spec)
+        .map_err(ContinuousStreamError::Scheduler)?;
+    Ok(())
+}
+
+/// Push one cycle of IPC bytes as input for a continuous streaming job.
+///
+/// This is the programmatic equivalent of `api_continuous_push` — it calls the
+/// same coordinator methods without serialising to HTTP.
+///
+/// `ipc_bytes` must be a valid Arrow IPC stream (non-empty).
+pub async fn push_continuous_input_coordinated(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    ipc_bytes: Vec<u8>,
+) -> Result<(), ContinuousStreamError> {
+    use krishiv_proto::{InputPartition, InputPartitionDescriptor, JobId};
+
+    let job_id_typed = JobId::try_new(job_id).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+
+    let partition = InputPartition::typed(
+        "continuous-input",
+        InputPartitionDescriptor::InlineIpc {
+            table_name: String::from("input"),
+            ipc_bytes,
+        },
+    );
+
+    let (targets, channels, target_count) = {
+        let mut coord = coordinator.write().await;
+        coord
+            .prepare_continuous_input_cycle(&job_id_typed, vec![partition])
+            .map_err(ContinuousStreamError::Scheduler)?;
+        let assignments = match coord.launch_assigned_task_assignments(&job_id_typed) {
+            Ok(assignments) if !assignments.is_empty() => assignments,
+            Ok(_) => {
+                coord.abort_continuous_input_cycle(&job_id_typed);
+                return Err(ContinuousStreamError::Unavailable(String::from(
+                    "no executor available for continuous cycle",
+                )));
+            }
+            Err(error) => {
+                coord.abort_continuous_input_cycle(&job_id_typed);
+                return Err(ContinuousStreamError::Scheduler(error));
+            }
+        };
+        let targets = match coord.resolve_assignment_targets(assignments) {
+            Ok(targets) => targets,
+            Err(error) => {
+                coord.abort_continuous_input_cycle(&job_id_typed);
+                return Err(ContinuousStreamError::Scheduler(error));
+            }
+        };
+        if targets
+            .iter()
+            .any(|(endpoint, _)| crate::is_in_process_task_endpoint(endpoint))
+        {
+            coord.abort_continuous_input_cycle(&job_id_typed);
+            return Err(ContinuousStreamError::Unavailable(String::from(
+                "continuous push cannot reach in-process-only executor via co-located Flight SQL",
+            )));
+        }
+        let target_count = targets.len();
+        (targets, coord.executor_channels.clone(), target_count)
+    };
+
+    let responses =
+        match Coordinator::deliver_assignment_targets_with_channels(channels, targets).await {
+            Ok(responses) => responses,
+            Err(_) => {
+                coordinator
+                    .write()
+                    .await
+                    .abort_continuous_input_cycle(&job_id_typed);
+                return Err(ContinuousStreamError::Unavailable(String::from(
+                    "assignment delivery failed",
+                )));
+            }
+        };
+
+    let mut coord = coordinator.write().await;
+    if !coord.continuous_input_cycles.contains(&job_id_typed) {
+        return Err(ContinuousStreamError::Aborted(String::from(
+            "continuous cycle was aborted concurrently",
+        )));
+    }
+    let accepted = coord.apply_assignment_dispatch_responses(&job_id_typed, &responses);
+    if accepted != target_count {
+        coord.abort_continuous_input_cycle(&job_id_typed);
+        return Err(ContinuousStreamError::Unavailable(String::from(
+            "not all assignment targets accepted the cycle",
+        )));
+    }
+    Ok(())
+}
+
+/// Drain completed results from a continuous streaming job.
+///
+/// This is the programmatic equivalent of `api_continuous_drain` — it calls the
+/// same coordinator methods without serialising to HTTP.
+///
+/// Returns IPC byte payloads (one per completed window), or an empty vec if no
+/// results are available yet.
+pub async fn drain_continuous_stream_coordinated(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+) -> Result<Vec<Vec<u8>>, ContinuousStreamError> {
+    use krishiv_proto::JobId;
+
+    let job_id_typed = JobId::try_new(job_id).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+
+    let mut coord = coordinator.write().await;
+    let snapshot = coord
+        .job_snapshot(&job_id_typed)
+        .map_err(ContinuousStreamError::Scheduler)?;
+    if snapshot.kind() != krishiv_proto::JobKind::Streaming {
+        return Err(ContinuousStreamError::Scheduler(
+            crate::SchedulerError::InvalidJob {
+                message: format!("job {job_id} is not a streaming job"),
+            },
+        ));
+    }
+    Ok(coord
+        .take_job_inline_results(&job_id_typed)
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

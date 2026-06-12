@@ -37,6 +37,16 @@ const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
 const COORDINATOR_BEARER_TOKEN_ENV: &str = crate::auth::COORDINATOR_BEARER_TOKEN_ENV;
 const COORDINATOR_BEARER_TOKENS_ENV: &str = crate::auth::COORDINATOR_BEARER_TOKENS_ENV;
 
+/// Callback invoked by `spawn_coordinator_sidecars` to start co-located services
+/// that depend on both the coordinator and crates not available in krishiv-scheduler.
+///
+/// The future is spawned as a Tokio task so it runs concurrently with the coordinator.
+/// Example: start a Flight SQL server co-located with the coordinator.
+pub type CoordinatorSidecarFn = Box<
+    dyn FnOnce(SharedCoordinator) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send,
+>;
+
 /// CLI configuration for coordinator-family binaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorDaemonConfig {
@@ -57,6 +67,10 @@ pub struct CoordinatorDaemonConfig {
     pub leader_lease_duration_s: u64,
     /// Allow anonymous gRPC (dev only; default: false).
     pub insecure: bool,
+    /// If set, start a co-located Arrow Flight SQL server on this address.
+    /// The Flight server is wired directly to the coordinator — no HTTP proxy.
+    /// Set via `--flight-addr <HOST:PORT>` or `KRISHIV_FLIGHT_ADDR`.
+    pub flight_addr: Option<SocketAddr>,
     pub help: bool,
 }
 
@@ -76,6 +90,7 @@ impl CoordinatorDaemonConfig {
             etcd_lease_key: String::from("/krishiv/ccp/leader"),
             leader_lease_duration_s: 15,
             insecure: false,
+            flight_addr: None,
             help: false,
         }
     }
@@ -280,11 +295,18 @@ pub async fn run_cluster_control_plane(
     Ok(())
 }
 
-/// Spawn shuffle GC and HTTP/metrics when configured.
+/// Spawn shuffle GC, HTTP/metrics, and any additional co-located services.
+///
+/// `extra_sidecars` are additional futures to run alongside the coordinator.
+/// Each factory receives a `SharedCoordinator` clone and returns a future that
+/// is spawned as a Tokio task. Use this to start co-located services (e.g., a
+/// Flight SQL server) that depend on both the coordinator and crates not
+/// available in `krishiv-scheduler`.
 pub async fn spawn_coordinator_sidecars(
     coordinator: &SharedCoordinator,
     config: &CoordinatorDaemonConfig,
     extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
+    extra_sidecars: Vec<CoordinatorSidecarFn>,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(shuffle_dir) = &config.shuffle_dir {
         let store: Arc<LocalDiskShuffleStore> =
@@ -348,6 +370,12 @@ pub async fn spawn_coordinator_sidecars(
             };
             let _ = axum::serve(http_listener, router).await;
         });
+    }
+
+    // Spawn any additional co-located services (e.g., Flight SQL server).
+    for sidecar_fn in extra_sidecars {
+        let coordinator_clone = coordinator.clone();
+        tokio::spawn(sidecar_fn(coordinator_clone));
     }
 
     // Orchestration loops (heartbeat, task launch, barrier dispatch) are now spawned
@@ -690,6 +718,9 @@ pub fn parse_coordinator_daemon_config(
         insecure: env::var("KRISHIV_ALLOW_ANONYMOUS")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false),
+        flight_addr: env::var("KRISHIV_FLIGHT_ADDR")
+            .ok()
+            .and_then(|value| value.parse().ok()),
         help: false,
     };
     let mut args = args.into_iter();
@@ -746,6 +777,14 @@ pub fn parse_coordinator_daemon_config(
                     .map_err(|_| format!("invalid integer for --leader-lease-secs: {value}"))?;
             }
             "--insecure" => config.insecure = true,
+            "--flight-addr" => {
+                let value = next_daemon_arg(&mut args, "--flight-addr")?;
+                config.flight_addr = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid socket address for --flight-addr: {value}"))?,
+                );
+            }
             "--help" | "-h" => config.help = true,
             unknown => {
                 return Err(
@@ -946,13 +985,19 @@ pub fn coordinator_daemon_help() -> &'static str {
         --etcd-lease-key <KEY>      Leader key (default /krishiv/ccp/leader)\n\
         --leader-lease-secs <N>     etcd lease TTL seconds (default 15)\n\
         --insecure                  Allow anonymous gRPC (dev only; default: false)\n\
+        --flight-addr <HOST:PORT>   Co-locate Arrow Flight SQL on this address (KRISHIV_FLIGHT_ADDR)\n\
         -h, --help                  Show help\n"
 }
 
 /// Standalone active coordinator (bare metal / VM).
+///
+/// `extra_sidecars` are additional co-located services to spawn alongside the
+/// coordinator (e.g., a Flight SQL server). Each factory receives a
+/// `SharedCoordinator` clone and returns a future that is spawned as a Tokio task.
 pub async fn run_standalone_coordinator(
     config: CoordinatorDaemonConfig,
     extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
+    extra_sidecars: Vec<CoordinatorSidecarFn>,
 ) -> Result<(), Box<dyn Error>> {
     let grpc_auth_configured = configure_coordinator_grpc_auth(&config);
     validate_runtime_security_config(
@@ -975,7 +1020,7 @@ pub async fn run_standalone_coordinator(
         let token = leader.bump_fencing_token();
         coordinator.sync_leader_fencing_token(token);
     }
-    spawn_coordinator_sidecars(&coordinator, &config, extra_http_factory).await?;
+    spawn_coordinator_sidecars(&coordinator, &config, extra_http_factory, extra_sidecars).await?;
     // Standalone must spawn orchestration loops for task dispatch and heartbeat management.
     let _handles = coordinator.spawn_orchestration_loops();
     let listener = TcpListener::bind(config.grpc_addr).await?;
@@ -1030,9 +1075,13 @@ pub async fn run_standalone_coordinator(
 ///
 /// When `extra_http_factory` is provided, the returned routes are merged
 /// into the coordinator's HTTP server.
+///
+/// `extra_sidecars` are additional co-located services to spawn alongside the
+/// coordinator (e.g., a Flight SQL server).
 pub async fn run_clusterd_daemon(
     config: CoordinatorDaemonConfig,
     extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
+    extra_sidecars: Vec<CoordinatorSidecarFn>,
 ) -> Result<(), Box<dyn Error>> {
     let grpc_auth_configured = configure_coordinator_grpc_auth(&config);
     validate_runtime_security_config(
@@ -1054,7 +1103,7 @@ pub async fn run_clusterd_daemon(
         shared.clone(),
         leader,
     ));
-    spawn_coordinator_sidecars(&shared, &config, extra_http_factory).await?;
+    spawn_coordinator_sidecars(&shared, &config, extra_http_factory, extra_sidecars).await?;
     let listener = TcpListener::bind(config.grpc_addr).await?;
     tracing::info!(coordinator_id = %config.coordinator_id, addr = %listener.local_addr()?, leader_backend = %config.leader_backend, "Krishiv clusterd (CCP) gRPC listening");
     run_cluster_control_plane(ccp, listener).await
