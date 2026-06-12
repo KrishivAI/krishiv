@@ -1,5 +1,64 @@
 # Krishiv Implementation Status
 
+## Phase 2: Distributed batch reliability — memory limits + shuffle retry (2026-06-12)
+
+### Done
+
+Phase 2 todo list created at `docs/implementation/phase2_distributed_batch.md`.
+Three concrete items implemented and tested this session:
+
+**2.1/2.2 — Production memory manager wired to DataFusion**
+
+- `SqlEngine::new_with_memory_limit(limit: Option<usize>)` — new constructor
+  that builds a `FairSpillPool` + default disk manager in DataFusion's
+  `RuntimeEnv` when a limit is supplied. Spill-capable operators (sort, hash
+  join, aggregation) spill to disk instead of growing without bound.
+- `resolve_query_memory_limit_bytes` / `query_memory_limit_from_env`
+  (`KRISHIV_QUERY_MEMORY_LIMIT_BYTES`) — env-configurable default applied to
+  every `SqlEngine::new()` call.
+- `SqlEngine::memory_limit_bytes()` accessor.
+- `SqlEngine::new()` now reads `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` on
+  construction; `SqlEngine::try_new()` and `with_in_memory_catalog()` do
+  likewise. Both constructors fall back to an unbounded pool if
+  `RuntimeEnv` construction fails.
+- Executor fragments (`krishiv-executor/src/fragment/batch.rs` and
+  `streaming.rs`) now call `new_with_memory_limit` using the task's
+  `MemoryBudget` limit (via `task_engine_memory_limit` helper in
+  `fragment/common.rs`), falling back to the env default for tasks without
+  an explicit coordinator-assigned limit. The `#[allow(unused_variables)]`
+  suppression is removed.
+
+**2.4 — Shuffle fetch retry with exponential backoff**
+
+- `FetchRetryPolicy` struct (`krishiv-shuffle/src/flight.rs`) — configurable
+  max attempts and base delay; `from_env()` reads `KRISHIV_SHUFFLE_FETCH_RETRIES`
+  and `KRISHIV_SHUFFLE_FETCH_RETRY_BASE_MS`.
+- `FlightShuffleClient::fetch_with_retry` — retries transient transport failures
+  (connection refused, stream errors) with exponential backoff up to 5 s cap;
+  `NotFound` and `InvalidInput` fail immediately without retrying so the
+  scheduler can react.
+- `read_shuffle_flight_partitions` (executor) now uses `fetch_with_retry`.
+- `tokio/time` feature added to `krishiv-shuffle/Cargo.toml`.
+
+### Validation
+```
+cargo check -p krishiv-sql              # clean
+cargo check -p krishiv-shuffle          # clean
+cargo check -p krishiv-executor         # clean
+cargo fmt --check                       # clean
+cargo test -p krishiv-sql --lib         # 274 passed
+cargo test -p krishiv-shuffle --lib     # 128 passed
+cargo test -p krishiv-executor --lib    # 186 passed
+```
+
+### Blockers
+None.
+
+### Next useful task
+See `docs/implementation/phase2_distributed_batch.md` for the remaining items.
+
+---
+
 ## Phase 4: typed Rust/Python user APIs (2026-06-12)
 
 ### Done
