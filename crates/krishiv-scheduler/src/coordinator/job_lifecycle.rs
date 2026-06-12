@@ -251,6 +251,65 @@ impl Coordinator {
                 .or_default()
                 .extend(inline_ipc);
         }
+
+        // AQE stage-boundary re-optimization (Phase 2.9).
+        //
+        // When a shuffle stage completes, collect per-task serialized_bytes and
+        // run the default AQE optimizer so downstream stage launch can use the
+        // `coalesced_partition_count` hint to right-size reduce parallelism.
+        if terminal_state == TaskState::Succeeded {
+            let stage_just_succeeded = self
+                .job_coordinators
+                .get(&job_id)
+                .map(|jc| {
+                    let r = jc.read_record();
+                    r.stages
+                        .iter()
+                        .find(|s| s.stage_id() == &stage_id)
+                        .is_some_and(|s| s.state == StageState::Succeeded)
+                })
+                .unwrap_or(false);
+            if stage_just_succeeded {
+                let stats = self
+                    .job_coordinators
+                    .get(&job_id)
+                    .map(|jc| jc.read_record().collect_stage_runtime_stats(&stage_id))
+                    .unwrap_or_default();
+                if !stats.is_empty() && stats.iter().any(|s| s.serialized_bytes > 0) {
+                    let aqe = krishiv_plan::optimizer::default_aqe_optimizer();
+                    let placeholder = krishiv_plan::PhysicalPlan::new(
+                        job_id.as_str(),
+                        krishiv_plan::ExecutionKind::Batch,
+                    );
+                    match aqe.apply(placeholder, &stats) {
+                        Ok((plan, applied)) if !applied.is_empty() => {
+                            if let Some(hint) = plan.coalesced_partition_count() {
+                                tracing::info!(
+                                    job_id = %job_id,
+                                    stage_id = %stage_id,
+                                    coalesced_partition_count = hint,
+                                    applied_rules = ?applied,
+                                    "AQE stage-boundary re-optimization: coalesce hint stored"
+                                );
+                                // Store the hint for the next stage launch.
+                                self.aqe_coalesce_hints
+                                    .insert((job_id.clone(), stage_id.clone()), hint);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                job_id = %job_id,
+                                stage_id = %stage_id,
+                                error = %e,
+                                "AQE stage-boundary re-optimization skipped"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if is_continuous_cycle && terminal_state == TaskState::Succeeded {
             self.complete_continuous_input_cycle(&job_id, &task_id);
         } else if is_continuous_cycle && terminal_state == TaskState::Failed {
@@ -378,6 +437,7 @@ impl Coordinator {
         // that finish before their next task-launch cycle consumes the entry.
         self.skew_repartition_overrides.remove(job_id);
         self.streaming_advisory_partitions.remove(job_id);
+        self.aqe_coalesce_hints.retain(|(jid, _), _| jid != job_id);
     }
 
     /// Convert and submit a Krishiv logical DAG through the R2 scheduler.

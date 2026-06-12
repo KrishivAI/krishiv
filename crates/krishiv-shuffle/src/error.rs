@@ -54,6 +54,18 @@ pub enum ShuffleError {
         expected: String,
         actual: String,
     },
+
+    /// The local disk is full; the write cannot proceed.
+    ///
+    /// Distinct from the generic `Io` variant so callers (the executor task
+    /// runner) can surface a clear diagnostic rather than treating it as a
+    /// transient I/O error and retrying indefinitely.
+    #[error("shuffle disk full: {path}: {source}")]
+    DiskFull {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Acquire a write lock, mapping poison to [`ShuffleError::LockPoisoned`].

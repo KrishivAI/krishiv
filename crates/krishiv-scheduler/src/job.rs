@@ -572,6 +572,121 @@ impl JobRecord {
             .map(|p| p.size_bytes)
             .sum()
     }
+
+    /// Invalidate shuffle partitions owned by a lost executor.
+    ///
+    /// When an executor is lost, the shuffle data it served (via Arrow Flight)
+    /// is no longer accessible.  This method scans all Succeeded tasks whose
+    /// `assigned_executor` matches `executor_id`, marks their non-inline shuffle
+    /// partitions as Failed in `shuffle_output`, resets those tasks to Pending
+    /// so they are re-scheduled, and refreshes the affected stage + job state.
+    ///
+    /// Returns `true` if any tasks were affected.
+    pub(crate) fn invalidate_executor_shuffle_partitions(
+        &mut self,
+        executor_id: &ExecutorId,
+    ) -> bool {
+        let job_id_str = self.spec.job_id().as_str().to_owned();
+        let mut affected = false;
+
+        for stage in &mut self.stages {
+            let stage_id_str = stage.spec.stage_id().as_str().to_owned();
+            let mut stage_affected = false;
+
+            // Collect shuffle paths to invalidate without holding a mutable borrow
+            // on both stage.tasks and self.shuffle_output simultaneously.
+            let mut paths_to_invalidate: Vec<ShufflePath> = Vec::new();
+
+            for task in &mut stage.tasks {
+                if task.state != TaskState::Succeeded {
+                    continue;
+                }
+                if task.assigned_executor.as_ref() != Some(executor_id) {
+                    continue;
+                }
+                let Some(meta) = &task.output_metadata else {
+                    continue;
+                };
+                let remote_partitions: Vec<ShufflePath> = meta
+                    .shuffle_partitions()
+                    .iter()
+                    .filter(|p| !p.flight_endpoint.is_empty())
+                    .map(|p| ShufflePath {
+                        job_id: job_id_str.clone(),
+                        stage_id: stage_id_str.clone(),
+                        partition_id: p.partition_id,
+                    })
+                    .collect();
+
+                if remote_partitions.is_empty() {
+                    continue;
+                }
+
+                paths_to_invalidate.extend(remote_partitions);
+                task.state = TaskState::Pending;
+                task.assigned_executor = None;
+                task.launch_in_flight = false;
+                stage_affected = true;
+                affected = true;
+            }
+
+            if stage_affected {
+                // Mark the collected paths as Failed in the metadata registry.
+                if let Some(stage_key) = krishiv_proto::StageId::try_new(&stage_id_str).ok() {
+                    let meta_entry = self.shuffle_output.entry(stage_key).or_default();
+                    for path in &paths_to_invalidate {
+                        meta_entry.mark_failed(path, "executor lost".to_owned());
+                    }
+                }
+                stage.refresh_state();
+            }
+        }
+
+        if affected {
+            self.refresh_state();
+        }
+
+        affected
+    }
+
+    /// Collect per-task serialized shuffle bytes for a completed stage.
+    ///
+    /// Called after a shuffle stage succeeds to gather AQE re-optimization inputs.
+    /// Returns a `Vec<RuntimeStats>` with one entry per task (order matches tasks).
+    pub(crate) fn collect_stage_runtime_stats(
+        &self,
+        stage_id: &StageId,
+    ) -> Vec<krishiv_plan::optimizer::RuntimeStats> {
+        let Some(stage) = self.stages.iter().find(|s| s.stage_id() == stage_id) else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        for t in stage.tasks.iter().filter(|t| t.state == TaskState::Succeeded) {
+            let meta = t.output_metadata.as_ref();
+            let partitions = meta.map(|m| m.shuffle_partitions()).unwrap_or(&[]);
+            if !partitions.is_empty() {
+                // One RuntimeStats per shuffle partition: CoalesceRule needs
+                // per-partition granularity to decide how many groups to form.
+                for p in partitions {
+                    let mut ps = krishiv_plan::optimizer::RuntimeStats::default();
+                    ps.serialized_bytes = p.size_bytes;
+                    result.push(ps);
+                }
+            } else {
+                // No shuffle partitions: use aggregate task stats (non-shuffle stage).
+                let rs = meta.and_then(|m| m.runtime_stats());
+                let mut ps = krishiv_plan::optimizer::RuntimeStats::default();
+                ps.input_rows = rs.map_or(0, |s| s.input_rows);
+                ps.output_rows = rs.map_or(0, |s| s.output_rows);
+                ps.cpu_nanos = rs.map_or(0, |s| s.cpu_nanos);
+                ps.memory_bytes = rs.map_or(0, |s| s.memory_bytes);
+                ps.spill_bytes = rs.map_or(0, |s| s.spill_bytes);
+                ps.serialized_bytes = rs.map_or(0, |s| s.serialized_bytes);
+                result.push(ps);
+            }
+        }
+        result
+    }
 }
 
 /// Stage record owned by a job coordinator.

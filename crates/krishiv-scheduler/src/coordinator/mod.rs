@@ -7,9 +7,9 @@ use krishiv_proto::{
     AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorId, CoordinatorState,
     ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorTaskAssignment,
     HeartbeatHotKeyReport, InitiateCheckpointCommand, InitiateCheckpointRequest, JobId, JobKind,
-    JobSpec, JobState, LeaseGeneration, StageId, StreamingProgressReport, StreamingTaskState,
-    TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState, TaskStatusResponse,
-    TaskStatusUpdate, wire,
+    JobSpec, JobState, LeaseGeneration, StageId, StageState, StreamingProgressReport,
+    StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState,
+    TaskStatusResponse, TaskStatusUpdate, wire,
 };
 use krishiv_state::checkpoint::{
     CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
@@ -166,6 +166,13 @@ pub struct Coordinator {
 
     /// Per-job coordinators. Each owns its JobRecord and per-job launch decisions.
     pub(crate) job_coordinators: HashMap<JobId, Arc<crate::job_coordinator::JobCoordinator>>,
+
+    /// AQE coalesce hints produced by stage-boundary re-optimization (Phase 2.9).
+    ///
+    /// Keyed by (job_id, completed_stage_id).  Populated after a shuffle stage
+    /// completes and the CoalesceRule fires.  Consumed by `launch_assigned_task_assignments`
+    /// for the downstream stage to right-size reduce-side parallelism.
+    pub(crate) aqe_coalesce_hints: HashMap<(JobId, StageId), usize>,
 }
 
 impl fmt::Debug for Coordinator {
@@ -692,6 +699,7 @@ impl Coordinator {
             streaming_advisory_partitions: HashMap::new(),
             notify: Arc::new(Notify::new()),
             job_coordinators: HashMap::new(),
+            aqe_coalesce_hints: HashMap::new(),
         }
     }
 

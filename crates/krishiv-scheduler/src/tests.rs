@@ -6681,4 +6681,184 @@ mod scheduler_tests {
             "task must be Assigned after executor registers and tick fires"
         );
     }
+
+    /// Phase 2.5: When an executor is lost, shuffle partitions produced by
+    /// tasks that ran on it are marked Failed and those tasks are reset to Pending.
+    #[test]
+    fn executor_loss_invalidates_remote_shuffle_partitions() {
+        use krishiv_proto::{ShufflePartitionOutput, StageState, TaskRuntimeStats};
+
+        allow_anonymous_for_tests();
+
+        let exec_id = ExecutorId::try_new("exec-shuffle-loss").unwrap();
+        let coord_id = CoordinatorId::try_new("coord-shuffle-loss").unwrap();
+        let job_id = JobId::try_new("job-shuffle-loss").unwrap();
+        let stage0_id = StageId::try_new("stage-0").unwrap();
+        let stage1_id = StageId::try_new("stage-1").unwrap();
+        let task0_id = TaskId::try_new("task-0").unwrap();
+        let task1_id = TaskId::try_new("task-1").unwrap();
+
+        let mut coordinator = Coordinator::active(coord_id);
+        let lease_gen = coordinator
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-loss", 2))
+            .unwrap();
+
+        coordinator
+            .submit_job(
+                JobSpec::new(job_id.clone(), "shuffle-loss-test", JobKind::Batch)
+                    .with_stage(
+                        StageSpec::new(stage0_id.clone(), "write stage")
+                            .with_task(TaskSpec::new(task0_id.clone(), "shuffle-write:hash:col:2")),
+                    )
+                    .with_stage(
+                        StageSpec::new(stage1_id.clone(), "read stage")
+                            .with_upstream_stage(stage0_id.clone())
+                            .with_task(TaskSpec::new(task1_id.clone(), "sql: SELECT 1")),
+                    ),
+            )
+            .unwrap();
+
+        let assignments = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap();
+        let assign = assignments.first().unwrap();
+
+        // Simulate stage-0 task completing with remote shuffle partitions.
+        let shuffle_meta = TaskOutputMetadata::new("shuffle", 10, 1, 1)
+            .with_shuffle_partitions(vec![
+                ShufflePartitionOutput::new(0, 1024, "http://exec-loss-host:9000"),
+                ShufflePartitionOutput::new(1, 1024, "http://exec-loss-host:9000"),
+            ])
+            .with_runtime_stats(TaskRuntimeStats {
+                serialized_bytes: 2048,
+                ..Default::default()
+            });
+
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    assign.job_id().clone(),
+                    assign.stage_id().clone(),
+                    assign.task_id().clone(),
+                    exec_id.clone(),
+                    TaskState::Succeeded,
+                    assign.attempt_id().as_u32(),
+                )
+                .with_lease_generation(lease_gen)
+                .with_output_metadata(shuffle_meta),
+            )
+            .unwrap();
+
+        // Stage-0 should be Succeeded.
+        {
+            let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+            let s0 = detail
+                .stages()
+                .iter()
+                .find(|s| s.stage_id() == &stage0_id)
+                .unwrap();
+            assert_eq!(s0.state(), StageState::Succeeded, "stage-0 must be Succeeded");
+        }
+
+        // Now mark the executor as lost — shuffle partitions should be invalidated.
+        coordinator.mark_executor_lost(&exec_id).unwrap();
+
+        // The stage-0 task should now be Pending (its shuffle data is gone).
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let s0 = detail
+            .stages()
+            .iter()
+            .find(|s| s.stage_id() == &stage0_id)
+            .unwrap();
+        let t0 = s0.tasks().iter().find(|t| t.task_id() == &task0_id).unwrap();
+        assert_eq!(
+            t0.state(),
+            TaskState::Pending,
+            "task-0 must be reset to Pending after executor loss"
+        );
+    }
+
+    /// Phase 2.9: After a shuffle stage completes with serialized_bytes reported,
+    /// the AQE coalesce hint is stored on the coordinator.
+    #[test]
+    fn aqe_stage_boundary_hint_stored_after_shuffle_stage_completes() {
+        use krishiv_proto::{ShufflePartitionOutput, TaskRuntimeStats};
+
+        allow_anonymous_for_tests();
+
+        let exec_id = ExecutorId::try_new("exec-aqe-hint").unwrap();
+        let coord_id = CoordinatorId::try_new("coord-aqe-hint").unwrap();
+        let job_id = JobId::try_new("job-aqe-hint").unwrap();
+        let stage0_id = StageId::try_new("stage-aqe-0").unwrap();
+        let stage1_id = StageId::try_new("stage-aqe-1").unwrap();
+        let task0_id = TaskId::try_new("task-aqe-0").unwrap();
+
+        let mut coordinator = Coordinator::active(coord_id);
+        let lease_gen = coordinator
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-aqe", 2))
+            .unwrap();
+
+        coordinator
+            .submit_job(
+                JobSpec::new(job_id.clone(), "aqe-hint-test", JobKind::Batch)
+                    .with_stage(
+                        StageSpec::new(stage0_id.clone(), "shuffle write").with_task(
+                            TaskSpec::new(task0_id.clone(), "shuffle-write:hash:col:200"),
+                        ),
+                    )
+                    .with_stage(
+                        StageSpec::new(stage1_id.clone(), "aggregate")
+                            .with_upstream_stage(stage0_id.clone())
+                            .with_task(TaskSpec::new(
+                                TaskId::try_new("task-aqe-1").unwrap(),
+                                "sql: SELECT 1",
+                            )),
+                    ),
+            )
+            .unwrap();
+
+        let assignments = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap();
+        let assign = assignments.first().unwrap();
+
+        // 200 partitions × 1 byte serialized — well below 128 MiB CoalesceRule target.
+        let shuffle_meta = TaskOutputMetadata::new("shuffle", 200, 1, 1)
+            .with_shuffle_partitions(
+                (0u32..200)
+                    .map(|p| ShufflePartitionOutput::new(p, 1, "http://aqe-host:9000"))
+                    .collect(),
+            )
+            .with_runtime_stats(TaskRuntimeStats {
+                serialized_bytes: 200,
+                ..Default::default()
+            });
+
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    assign.job_id().clone(),
+                    assign.stage_id().clone(),
+                    assign.task_id().clone(),
+                    exec_id.clone(),
+                    TaskState::Succeeded,
+                    assign.attempt_id().as_u32(),
+                )
+                .with_lease_generation(lease_gen)
+                .with_output_metadata(shuffle_meta),
+            )
+            .unwrap();
+
+        // The AQE hint must be stored and collapse 200 tiny partitions to ≤ 10.
+        let hint_key = (job_id.clone(), stage0_id.clone());
+        assert!(
+            coordinator.aqe_coalesce_hints.contains_key(&hint_key),
+            "AQE coalesce hint must be stored after shuffle stage completes"
+        );
+        let hint = coordinator.aqe_coalesce_hints[&hint_key];
+        assert!(
+            hint <= 10,
+            "coalesced hint must collapse 200 × 1-byte partitions to ≤ 10, got {hint}"
+        );
+    }
 }
