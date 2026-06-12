@@ -4663,6 +4663,7 @@ dependencies = [
  "base64 0.22.1",
  "constant_time_eq 0.3.1",
  "dashmap",
+ "futures",
  "krishiv-ai",
  "krishiv-common",
  "krishiv-connectors",

@@ -7,8 +7,17 @@ Wants=network-online.target
 Type=simple
 User=krishiv
 Group=krishiv
-Environment=KRISHIV_METADATA_PATH=/var/lib/krishiv/metadata.json
-ExecStart=/usr/local/bin/krishiv-clusterd --grpc-addr 0.0.0.0:9090 --metadata-backend json --metadata-path /var/lib/krishiv/metadata.json
+# single-node-durable: restart-safe local metadata, shuffle, state, and checkpoints.
+# All paths under /var/lib/krishiv must be owned by the krishiv user.
+# For distributed-durable (multi-host) replace metadata-backend with etcd and
+# set KRISHIV_ETCD_ENDPOINTS; add --leader-backend etcd --etcd-endpoints $ENDPOINTS.
+Environment=KRISHIV_DURABILITY_PROFILE=single-node-durable
+ExecStart=/usr/local/bin/krishiv-clusterd \
+    --grpc-addr 0.0.0.0:9090 \
+    --http-addr 0.0.0.0:18080 \
+    --metadata-backend redb \
+    --metadata-path /var/lib/krishiv/metadata.db \
+    --durability-profile single-node-durable
 Restart=always
 RestartSec=5
 LimitNOFILE=65536

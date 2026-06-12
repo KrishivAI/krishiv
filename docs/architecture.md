@@ -268,12 +268,11 @@ The executor dispatches task fragments by prefix matching against the fragment n
 | Mode | Placement | Runtime impl | Transport |
 |------|-----------|-------------|-----------|
 | Embedded | LocalInProcess | `InProcessExecutionRuntime::embedded()` | In-process |
-| SingleNode | LocalInProcess | `InProcessExecutionRuntime::single_node()` | In-process |
 | SingleNode | SingleNodeDaemon | `RemoteExecutionRuntime` (mode=SingleNode) | Flight SQL |
 | Distributed | RemoteClusterRequired | `RemoteExecutionRuntime` (mode=Distributed) | Flight SQL + gRPC |
 | Embedded | *other* | **Error** | — |
-| SingleNode | RemoteClusterRequired | **Error** | — |
-| Distributed | *other* | **Error** | — |
+| SingleNode | LocalInProcess or RemoteClusterRequired | **Error** — use Embedded for in-process or SingleNodeDaemon for local daemon | — |
+| Distributed | *other* | **Error** — RemoteClusterRequired is mandatory to prevent silent local fallback | — |
 
 ## Crate Requirements by Mode
 
@@ -316,8 +315,8 @@ Notes:
 | Profile | Metadata | Shuffle | State | Checkpoint | Restart | Multi-node | Fencing |
 |---------|----------|---------|-------|------------|---------|------------|---------|
 | `DevLocal` | In-memory | In-memory | In-memory | Ephemeral local | No | No | No |
-| `SingleNodeDurable` | Local file | Local disk | Redb | Local filesystem | Yes | No | No |
-| `DistributedDurable` | Consensus | Object store | Redb + checkpoint restore | Object store | Yes | Yes | Yes |
+| `SingleNodeDurable` | Local file | Local disk | Fjall LSM (labelled `LocalRedb` in code) | Local filesystem | Yes | No | No |
+| `DistributedDurable` | Consensus | Tiered (local + object store) | Fjall LSM restored from checkpoints | Object store | Yes | Yes | Yes |
 
 Resolved at startup from `KRISHIV_DURABILITY_PROFILE` env var via `resolve_durability_profile()`.
 

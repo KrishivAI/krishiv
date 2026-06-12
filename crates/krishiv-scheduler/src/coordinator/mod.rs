@@ -565,16 +565,22 @@ impl SharedCoordinator {
             abort_handles.push(task.abort_handle());
         }
 
-        // Task launch loop
+        // Task launch loop — wakes immediately on any state-change notification
+        // (job submit, task completion, executor registration, etc.) with a 500 ms
+        // fallback interval so missed notifications never stall the queue.
         {
             let coord = self.clone();
             let mut rx = shutdown_rx.clone();
             let task = tokio::spawn(async move {
+                // Clone the Arc<Notify> once before the loop to avoid taking the
+                // coordinator read-lock on every iteration.
+                let notify = coord.inner.read().await.notify.clone();
                 let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {}
+                        _ = notify.notified() => {}
                         _ = rx.changed() => { if *rx.borrow() { return; } }
                     }
                     if let Err(error) = coord.drive_pending_task_launches().await {
