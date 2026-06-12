@@ -81,6 +81,19 @@ fn generate_coordinator_id() -> SchedulerResult<CoordinatorId> {
     })
 }
 
+/// Directive instructing executors of a job to reload state and source
+/// offsets from a committed checkpoint epoch (global rollback).
+///
+/// Set on explicit restore activation and on executor loss for checkpointed
+/// streaming jobs: surviving executors must roll back too, otherwise their
+/// post-checkpoint state would double-count the source data that rewound
+/// sources re-deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreDirective {
+    pub epoch: u64,
+    pub fencing_token: u64,
+}
+
 /// Active coordinator.
 ///
 /// Intentionally does *not* derive `Clone`.  Cloning the coordinator would
@@ -128,6 +141,18 @@ pub struct Coordinator {
     /// DashMap avoids a full TCP+TLS handshake per task push.
     pub(crate) executor_channels: Arc<DashMap<String, tonic::transport::Channel>>,
     pub(crate) checkpoint_notify_sent: indexmap::IndexSet<(JobId, ExecutorId, u64)>,
+    /// (job_id, executor_id, epoch) triples for which a checkpoint-complete
+    /// notification (transactional-sink commit signal) was already delivered.
+    pub(crate) checkpoint_complete_sent: indexmap::IndexSet<(JobId, ExecutorId, u64)>,
+    /// Active restore directives per job: every executor with tasks in the job
+    /// must reload state/offsets from the directive's epoch (global rollback).
+    pub(crate) restore_directives: HashMap<JobId, RestoreDirective>,
+    /// (job_id, executor_id, epoch) triples for which a restore directive was
+    /// already delivered.
+    pub(crate) restore_notify_sent: indexmap::IndexSet<(JobId, ExecutorId, u64)>,
+    /// Jobs that must be cancelled once their savepoint epoch commits
+    /// (stop-with-savepoint protocol).  Maps job → savepoint epoch.
+    pub(crate) pending_stop_after_savepoint: HashMap<JobId, u64>,
     /// (job_id, epoch) pairs for which a gRPC barrier round-trip was dispatched.
     pub(crate) barrier_dispatch_sent: HashSet<(JobId, u64)>,
     /// Inline Arrow IPC result batches keyed by job id (terminal SQL/window collect).
@@ -682,6 +707,10 @@ impl Coordinator {
             streaming_job_task_index: HashMap::new(),
             executor_channels: Arc::new(DashMap::new()),
             checkpoint_notify_sent: indexmap::IndexSet::new(),
+            checkpoint_complete_sent: indexmap::IndexSet::new(),
+            restore_directives: HashMap::new(),
+            restore_notify_sent: indexmap::IndexSet::new(),
+            pending_stop_after_savepoint: HashMap::new(),
             barrier_dispatch_sent: HashSet::new(),
             job_inline_results: HashMap::new(),
             batch_sql_job_tables: HashMap::new(),

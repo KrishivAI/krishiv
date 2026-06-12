@@ -365,7 +365,7 @@ impl CheckpointCoordinator {
             job_id: self.job_id.as_str().to_owned(),
             fencing_token: self.fencing_token.as_u64(),
             coordinator_id: Some(self.coordinator_id.clone()),
-            timestamp_ms: epoch * self.interval_ms,
+            timestamp_ms: u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0),
             source_offsets,
             operator_snapshots: operator_snapshots.clone(),
             is_savepoint,
@@ -572,7 +572,7 @@ impl CheckpointCoordinator {
             job_id: self.job_id.as_str().to_owned(),
             fencing_token: self.fencing_token.as_u64(),
             coordinator_id: Some(self.coordinator_id.clone()),
-            timestamp_ms: epoch * self.interval_ms,
+            timestamp_ms: u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0),
             source_offsets,
             operator_snapshots,
             is_savepoint,
@@ -732,6 +732,11 @@ impl CheckpointCoordinator {
         self.current_epoch
     }
 
+    /// Checkpoint storage backing this coordinator.
+    pub fn storage(&self) -> &Arc<dyn CheckpointStorage> {
+        &self.storage
+    }
+
     /// Current fencing token.
     pub fn fencing_token(&self) -> FencingToken {
         self.fencing_token
@@ -740,6 +745,18 @@ impl CheckpointCoordinator {
     /// Whether a checkpoint is currently in progress (awaiting acks).
     pub fn is_awaiting_acks(&self) -> bool {
         matches!(self.state, CheckpointCoordinatorState::AwaitingAcks { .. })
+    }
+
+    /// Latest durably committed epoch, if the coordinator is at rest on one.
+    ///
+    /// `None` while a checkpoint is in flight or before the first commit —
+    /// callers must not notify executors of completion (or direct restores)
+    /// for an epoch that is not at rest.
+    pub fn committed_epoch(&self) -> Option<u64> {
+        match self.state {
+            CheckpointCoordinatorState::Committed { epoch } => Some(epoch),
+            _ => None,
+        }
     }
 
     /// Coordinator state.

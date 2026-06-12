@@ -1135,6 +1135,20 @@ pub fn create_savepoint(
     label: Option<&str>,
 ) -> CheckpointResult<(u64, CheckpointMetadata)> {
     let epoch = latest_valid_epoch(storage, job_id)?;
+    create_savepoint_at_epoch(storage, job_id, epoch, label)
+}
+
+/// Create an immutable savepoint from a specific committed checkpoint epoch.
+///
+/// Same contract as [`create_savepoint`] but pinned to `epoch` rather than the
+/// latest valid epoch, so callers that just committed a savepoint-flagged
+/// epoch cannot race with a concurrently committing newer epoch.
+pub fn create_savepoint_at_epoch(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+    label: Option<&str>,
+) -> CheckpointResult<(u64, CheckpointMetadata)> {
     let source_manifest = read_required_manifest(storage, &manifest_path(job_id, epoch), epoch)?;
     let mut metadata =
         read_epoch_metadata(storage, job_id, epoch)?.ok_or(CheckpointError::NoValidEpoch)?;

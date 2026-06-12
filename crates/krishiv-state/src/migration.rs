@@ -62,6 +62,44 @@ impl StateMigrationRegistry {
     }
 }
 
+/// Current operator state schema version stamped into checkpoint acks.
+///
+/// Bump this when an operator's serialized state value layout changes in a
+/// way that requires a registered [`StateMigrationFn`] to read old snapshots.
+pub const CURRENT_STATE_SCHEMA_VERSION: u32 = 1;
+
+/// Migrate every entry *value* of a portable state snapshot from schema
+/// version `from` to `to` using `registry`.
+///
+/// Decodes the snapshot produced by `StateBackend::snapshot()`, applies the
+/// chained migrations to each entry's value bytes, and re-encodes.  Entry
+/// keys, namespaces, and ordering are preserved.  Empty snapshots (stateless
+/// operators) pass through unchanged.
+///
+/// Returns a typed error when a migration step is missing — restoring a
+/// snapshot written by incompatible operator code must fail loudly, never
+/// load garbage state.
+pub fn migrate_snapshot(
+    snapshot_bytes: &[u8],
+    registry: &StateMigrationRegistry,
+    from: u32,
+    to: u32,
+) -> Result<Vec<u8>, StateMigrationError> {
+    if from == to || snapshot_bytes.is_empty() {
+        return Ok(snapshot_bytes.to_vec());
+    }
+    let mut entries =
+        crate::snapshot::decode_snapshot_entries(snapshot_bytes).map_err(|error| {
+            StateMigrationError {
+                message: format!("snapshot decode before migration: {error}"),
+            }
+        })?;
+    for entry in &mut entries {
+        entry.3 = registry.migrate(from, to, &entry.3)?;
+    }
+    Ok(crate::snapshot::encode_snapshot_entries(&entries))
+}
+
 /// Thread-safe global registry for session-scoped migrations.
 #[derive(Default, Clone)]
 pub struct SharedStateMigrationRegistry {
@@ -120,5 +158,69 @@ mod tests {
     fn missing_migration_returns_error() {
         let reg = StateMigrationRegistry::new();
         assert!(reg.migrate(1, 2, b"x").is_err());
+    }
+
+    #[test]
+    fn migrate_snapshot_transforms_values_and_preserves_keys() {
+        let entries = vec![
+            (
+                "op".to_owned(),
+                "window".to_owned(),
+                b"k1".to_vec(),
+                b"old-1".to_vec(),
+            ),
+            (
+                "op".to_owned(),
+                "window".to_owned(),
+                b"k2".to_vec(),
+                b"old-2".to_vec(),
+            ),
+        ];
+        let snapshot = crate::snapshot::encode_snapshot_entries(&entries);
+
+        let mut reg = StateMigrationRegistry::new();
+        reg.register(
+            1,
+            2,
+            Arc::new(|b| {
+                let mut out = b"new:".to_vec();
+                out.extend_from_slice(b);
+                Ok(out)
+            }),
+        );
+
+        let migrated = migrate_snapshot(&snapshot, &reg, 1, 2).unwrap();
+        let decoded = crate::snapshot::decode_snapshot_entries(&migrated).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].2, b"k1");
+        assert_eq!(decoded[0].3, b"new:old-1");
+        assert_eq!(decoded[1].3, b"new:old-2");
+    }
+
+    #[test]
+    fn migrate_snapshot_same_version_is_identity() {
+        let entries = vec![(
+            "op".to_owned(),
+            "s".to_owned(),
+            b"k".to_vec(),
+            b"v".to_vec(),
+        )];
+        let snapshot = crate::snapshot::encode_snapshot_entries(&entries);
+        let reg = StateMigrationRegistry::new();
+        assert_eq!(migrate_snapshot(&snapshot, &reg, 1, 1).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn migrate_snapshot_missing_step_fails_loudly() {
+        let entries = vec![(
+            "op".to_owned(),
+            "s".to_owned(),
+            b"k".to_vec(),
+            b"v".to_vec(),
+        )];
+        let snapshot = crate::snapshot::encode_snapshot_entries(&entries);
+        let reg = StateMigrationRegistry::new();
+        let err = migrate_snapshot(&snapshot, &reg, 1, 3).expect_err("missing migration");
+        assert!(err.message.contains("missing migration"));
     }
 }

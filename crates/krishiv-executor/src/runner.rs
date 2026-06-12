@@ -488,6 +488,181 @@ impl fmt::Debug for ShuffleContext {
 
 // ── R6 CheckpointState ────────────────────────────────────────────────────────
 
+/// Typed access to the state a task snapshots at a checkpoint barrier and
+/// reloads at restore.
+///
+/// Continuous window jobs keep their operator state inside the per-job
+/// [`ContinuousWindowExecutor`] — snapshotting the executor-wide generic
+/// backend for them would persist vacuous state (the window operators never
+/// write to it).  This enum makes the selection explicit and typed instead of
+/// hiding it behind a partially implemented `StateBackend` adapter.
+#[derive(Clone)]
+pub enum CheckpointStateHandle {
+    /// Generic keyed state backend shared by non-window stateful tasks.
+    Backend(Arc<std::sync::Mutex<Box<dyn StateBackend>>>),
+    /// Stateful continuous window executor owned by a `stream:loop:` job.
+    ContinuousWindow(Arc<std::sync::Mutex<krishiv_dataflow::ContinuousWindowExecutor>>),
+}
+
+impl fmt::Debug for CheckpointStateHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(_) => f.write_str("CheckpointStateHandle::Backend"),
+            Self::ContinuousWindow(_) => f.write_str("CheckpointStateHandle::ContinuousWindow"),
+        }
+    }
+}
+
+impl CheckpointStateHandle {
+    /// Wrap a concrete state backend.
+    pub fn from_backend(backend: impl StateBackend + 'static) -> Self {
+        Self::Backend(Arc::new(std::sync::Mutex::new(Box::new(backend))))
+    }
+
+    /// Take a portable snapshot of the underlying state.
+    pub fn snapshot(&self) -> krishiv_state::StateResult<Vec<u8>> {
+        match self {
+            Self::Backend(backend) => backend
+                .lock()
+                .map_err(|e| krishiv_state::StateError::LockPoisoned {
+                    message: e.to_string(),
+                })?
+                .snapshot(),
+            Self::ContinuousWindow(exec) => exec
+                .lock()
+                .map_err(|e| krishiv_state::StateError::LockPoisoned {
+                    message: e.to_string(),
+                })?
+                .snapshot()
+                .map_err(|e| krishiv_state::StateError::BackendUnavailable {
+                    message: format!("continuous window snapshot: {e}"),
+                    source: None,
+                }),
+        }
+    }
+
+    /// Replace the underlying state with `bytes` (a snapshot produced by
+    /// [`Self::snapshot`]).  Pass the canonical empty snapshot to clear.
+    pub fn load_snapshot(&self, bytes: &[u8]) -> krishiv_state::StateResult<()> {
+        match self {
+            Self::Backend(backend) => backend
+                .lock()
+                .map_err(|e| krishiv_state::StateError::LockPoisoned {
+                    message: e.to_string(),
+                })?
+                .load_snapshot(bytes),
+            Self::ContinuousWindow(exec) => exec
+                .lock()
+                .map_err(|e| krishiv_state::StateError::LockPoisoned {
+                    message: e.to_string(),
+                })?
+                .restore_from_snapshot(bytes)
+                .map_err(|e| krishiv_state::StateError::BackendUnavailable {
+                    message: format!("continuous window restore: {e}"),
+                    source: None,
+                }),
+        }
+    }
+
+    /// Merge `bytes` additively into the underlying state.
+    pub fn merge_snapshot(&self, bytes: &[u8]) -> krishiv_state::StateResult<()> {
+        match self {
+            Self::Backend(backend) => {
+                let entries = krishiv_state::decode_snapshot_entries(bytes)?;
+                let mut guard =
+                    backend
+                        .lock()
+                        .map_err(|e| krishiv_state::StateError::LockPoisoned {
+                            message: e.to_string(),
+                        })?;
+                let batch: Vec<(&str, &str, &[u8], &[u8])> = entries
+                    .iter()
+                    .map(|(op, name, key, value)| {
+                        (op.as_str(), name.as_str(), key.as_slice(), value.as_slice())
+                    })
+                    .collect();
+                guard.put_batch(&batch)
+            }
+            Self::ContinuousWindow(exec) => exec
+                .lock()
+                .map_err(|e| krishiv_state::StateError::LockPoisoned {
+                    message: e.to_string(),
+                })?
+                .merge_snapshot(bytes)
+                .map_err(|e| krishiv_state::StateError::BackendUnavailable {
+                    message: format!("continuous window merge restore: {e}"),
+                    source: None,
+                }),
+        }
+    }
+}
+
+/// Restore directive applied (or pending application) on this executor for a
+/// job, recorded from a `RestoreFromCheckpointCommand`.
+///
+/// Snapshot bytes are read from checkpoint storage when the command arrives so
+/// a lazily created loop executor can be seeded without re-reading storage.
+#[derive(Debug, Clone)]
+pub struct RestoredJobCheckpoint {
+    pub epoch: u64,
+    pub fencing_token: u64,
+    /// Operator snapshot bytes from the restored checkpoint, in metadata order.
+    pub snapshots: Vec<Vec<u8>>,
+}
+
+/// Apply restored snapshot bytes to a state handle: the first non-empty
+/// snapshot replaces the state, the rest merge additively.  With no snapshots
+/// the state is cleared — the job had no state at the restored checkpoint.
+pub(crate) fn apply_snapshots_to_state(
+    state: &CheckpointStateHandle,
+    snapshots: &[Vec<u8>],
+) -> krishiv_state::StateResult<()> {
+    let mut non_empty = snapshots.iter().filter(|bytes| !bytes.is_empty());
+    match non_empty.next() {
+        None => state.load_snapshot(&krishiv_state::encode_snapshot_entries(&[])),
+        Some(first) => {
+            state.load_snapshot(first)?;
+            for rest in non_empty {
+                state.merge_snapshot(rest)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Parse Kafka offsets out of checkpoint source-offset records.
+///
+/// Checkpoint acks encode each Kafka partition as
+/// `kafka-{topic}-{partition}`; the partition index is always the final
+/// `-`-separated segment, so `rsplit_once` recovers topics that themselves
+/// contain `-`.
+pub fn kafka_offsets_from_source_records(
+    records: &[krishiv_state::checkpoint::SourceOffsetRecord],
+) -> Vec<krishiv_connectors::kafka::KafkaOffset> {
+    let mut offsets = Vec::new();
+    for record in records {
+        let Some(rest) = record.partition_id.strip_prefix("kafka-") else {
+            continue;
+        };
+        let Some((topic, partition)) = rest.rsplit_once('-') else {
+            continue;
+        };
+        let Ok(partition) = partition.parse::<i32>() else {
+            continue;
+        };
+        if topic.is_empty() {
+            continue;
+        }
+        offsets.push(krishiv_connectors::kafka::KafkaOffset {
+            topic: topic.to_owned(),
+            partition,
+            offset: record.offset,
+        });
+    }
+    offsets.sort_by(|a, b| (&a.topic, a.partition).cmp(&(&b.topic, b.partition)));
+    offsets
+}
+
 /// Per-task checkpoint state for executor-side checkpoint participation (R6).
 ///
 /// Tracks the last acked epoch, operator/task identity, and source offsets so the
@@ -528,14 +703,14 @@ impl TaskRunner {
     /// Handle a `InitiateCheckpointRequest`.
     ///
     /// 1. Rejects stale epochs (epoch <= last_acked_epoch).
-    /// 2. Takes a snapshot via `state_backend.snapshot()`.
+    /// 2. Takes a snapshot via `state.snapshot()`.
     /// 3. Writes the snapshot to `storage`.
     /// 4. Returns a `CheckpointAckRequest` with source offsets and snapshot path.
     /// 5. Updates `last_acked_epoch`.
     pub fn handle_initiate_checkpoint(
         &mut self,
         req: InitiateCheckpointRequest,
-        state_backend: &dyn StateBackend,
+        state: &CheckpointStateHandle,
         storage: &(impl CheckpointStorage + ?Sized),
     ) -> ExecutorResult<CheckpointAckRequest> {
         // Stale epoch: return an ack that signals the stale condition via epoch.
@@ -562,7 +737,7 @@ impl TaskRunner {
                 if attempt > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
-                match state_backend.snapshot() {
+                match state.snapshot() {
                     Ok(bytes) => {
                         result = Some(bytes);
                         break;
@@ -641,6 +816,19 @@ impl TaskRunner {
             source_offsets,
             snapshot_path: snap_path,
         })
+    }
+
+    /// Reset this task's checkpoint progress to a restored epoch.
+    ///
+    /// After a global rollback the coordinator resumes epochs from
+    /// `restored_epoch + 1`; seeding `last_acked_epoch` here makes the runner
+    /// reject any straggler barrier for a pre-rollback epoch as stale.
+    /// `kafka_source_offsets` is cleared — the rewound source re-populates it
+    /// on its first post-restore read, and the authoritative restored offsets
+    /// flow through the runner-level Kafka restore table.
+    pub fn apply_restored_epoch(&mut self, restored_epoch: u64) {
+        self.last_acked_epoch = restored_epoch;
+        self.kafka_source_offsets.clear();
     }
 }
 
@@ -786,6 +974,21 @@ pub struct ExecutorTaskRunner {
     /// so the coordinator can correlate them with the registered executor.
     /// `None` in unit-test runners where no real executor identity is needed.
     pub(crate) own_executor_id: Option<krishiv_proto::ExecutorId>,
+
+    /// Restored job checkpoints pending application to lazily created loop
+    /// executors.  Inserted when a `RestoreFromCheckpointCommand` arrives
+    /// before the job's `ContinuousWindowExecutor` exists (fresh process);
+    /// consumed by `execute_loop_fragment` at executor creation.
+    pub(crate) pending_restores: Arc<DashMap<String, RestoredJobCheckpoint>>,
+
+    /// Restored Kafka offsets per job, consumed by source pipelines at source
+    /// construction to seek the broker consumer to the checkpointed position.
+    pub kafka_restore_offsets: Arc<DashMap<String, Vec<krishiv_connectors::kafka::KafkaOffset>>>,
+
+    /// Transactional-sink registry driven by the checkpoint lifecycle:
+    /// `pre_commit` at the barrier, `commit_through` on completion
+    /// notifications, `restore_to` on restore directives.
+    pub transaction_log: crate::transactions::TwoPhaseSinkRegistry,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -850,6 +1053,9 @@ impl ExecutorTaskRunner {
             registered_parquet_cache: Arc::new(DashMap::new()),
             state_dir: None,
             own_executor_id: None,
+            pending_restores: Arc::new(DashMap::new()),
+            kafka_restore_offsets: Arc::new(DashMap::new()),
+            transaction_log: crate::transactions::TwoPhaseSinkRegistry::new(),
         }
     }
 
@@ -1399,12 +1605,25 @@ impl ExecutorTaskRunner {
         }
     }
 
+    /// Effective checkpoint-state source for a job: the stateful loop executor
+    /// when one exists, otherwise the supplied generic backend.
+    pub fn checkpoint_state_for_job(
+        &self,
+        job_id: &str,
+        fallback: CheckpointStateHandle,
+    ) -> CheckpointStateHandle {
+        match self.loop_executors.get(job_id) {
+            Some(entry) => CheckpointStateHandle::ContinuousWindow(Arc::clone(entry.value())),
+            None => fallback,
+        }
+    }
+
     /// Handle a checkpoint initiation request and deliver the ack to the coordinator (P1-17).
     pub async fn initiate_checkpoint_and_deliver_ack<S>(
         &self,
         assignment: &ExecutorTaskAssignment,
         req: InitiateCheckpointRequest,
-        state_backend: Arc<dyn StateBackend>,
+        state: CheckpointStateHandle,
         storage: Arc<dyn CheckpointStorage>,
         coordinator: S,
     ) -> Result<CheckpointAckResponse, tonic::Status>
@@ -1423,7 +1642,7 @@ impl ExecutorTaskRunner {
 
         let ack = tokio::task::spawn_blocking(move || {
             task_runner
-                .handle_initiate_checkpoint(req, state_backend.as_ref(), storage.as_ref())
+                .handle_initiate_checkpoint(req, &state, storage.as_ref())
                 .map(|ack| (ack, task_runner))
         })
         .await
@@ -1447,7 +1666,7 @@ impl ExecutorTaskRunner {
     pub async fn initiate_checkpoint_for_job<S>(
         &self,
         req: &InitiateCheckpointRequest,
-        state_backend: Arc<dyn StateBackend>,
+        fallback_state: CheckpointStateHandle,
         storage: Arc<dyn CheckpointStorage>,
         coordinator: S,
     ) -> Result<(), tonic::Status>
@@ -1484,6 +1703,29 @@ impl ExecutorTaskRunner {
             )));
         }
 
+        // Transactional sinks: durably stage the open buffer under this epoch
+        // BEFORE any state snapshot or ack.  A committed checkpoint must have
+        // its sink output prepared; failing here fails the whole barrier (no
+        // ack is sent, the epoch aborts on timeout, and processing continues).
+        let job_id_str = req.job_id.as_str().to_owned();
+        if self.transaction_log.has_job(&job_id_str) {
+            let log = self.transaction_log.clone();
+            let epoch = req.epoch;
+            tokio::task::spawn_blocking(move || log.pre_commit(&job_id_str, epoch))
+                .await
+                .map_err(|error| tonic::Status::internal(error.to_string()))?
+                .map_err(|error| {
+                    tonic::Status::internal(format!(
+                        "transactional sink pre-commit failed for epoch {}: {error}",
+                        req.epoch
+                    ))
+                })?;
+        }
+
+        // Continuous window jobs snapshot the per-job loop executor — the
+        // generic backend would persist vacuous state for them.
+        let state = self.checkpoint_state_for_job(req.job_id.as_str(), fallback_state);
+
         for attempt in attempts {
             let task_id = attempt.task_id().clone();
             let stage_id = attempt.stage_id().clone();
@@ -1501,14 +1743,13 @@ impl ExecutorTaskRunner {
                 OutputContract::new(OutputContractKind::InlineRecordBatches, "checkpoint"),
             );
 
-            let sb_clone = Arc::clone(&state_backend);
             let s_clone = Arc::clone(&storage);
             let coord_clone = coordinator.clone();
             if let Err(error) = self
                 .initiate_checkpoint_and_deliver_ack(
                     &assignment,
                     req.clone(),
-                    sb_clone,
+                    state.clone(),
                     s_clone,
                     coord_clone,
                 )
@@ -1520,11 +1761,242 @@ impl ExecutorTaskRunner {
         Ok(())
     }
 
+    /// Apply a `CheckpointCompleteCommand`: commit transactional-sink output
+    /// prepared at or before the committed epoch.
+    ///
+    /// Completion notifications are best-effort.  A failed or missed commit
+    /// here is repaired by the next completion notification (commit-through
+    /// covers earlier epochs) or by restore (recover-and-commit), so errors
+    /// are logged rather than escalated.
+    pub async fn handle_checkpoint_complete(&self, cmd: &krishiv_proto::CheckpointCompleteCommand) {
+        self.cached_coordinator_fencing_token
+            .store(cmd.fencing_token.as_u64(), Ordering::SeqCst);
+        let log = self.transaction_log.clone();
+        let job_id = cmd.job_id.as_str().to_owned();
+        let epoch = cmd.epoch;
+        let result = tokio::task::spawn_blocking(move || log.commit_through(&job_id, epoch)).await;
+        match result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(committed)) => tracing::info!(
+                job_id = %cmd.job_id,
+                epoch = cmd.epoch,
+                committed,
+                "committed transactional sink output for completed checkpoint"
+            ),
+            Ok(Err(error)) => tracing::error!(
+                job_id = %cmd.job_id,
+                epoch = cmd.epoch,
+                error = %error,
+                "transactional sink commit failed; retried on the next completion or restore"
+            ),
+            Err(join_error) => tracing::error!(
+                job_id = %cmd.job_id,
+                epoch = cmd.epoch,
+                error = %join_error,
+                "transactional sink commit task panicked"
+            ),
+        }
+    }
+
+    /// Apply a `RestoreFromCheckpointCommand`: reload operator state, re-seed
+    /// source offsets, and reconcile transactional sinks for one job.
+    ///
+    /// Blocking storage I/O — call via `spawn_blocking` from async contexts.
+    pub fn restore_job_from_checkpoint(
+        &self,
+        cmd: &krishiv_proto::RestoreFromCheckpointCommand,
+        fallback_state: &CheckpointStateHandle,
+        storage: &dyn CheckpointStorage,
+    ) -> ExecutorResult<()> {
+        use krishiv_state::checkpoint::read_epoch_metadata;
+
+        let job_id = cmd.job_id.as_str();
+        let restore_err = |message: String| ExecutorError::LocalExecution { message };
+
+        let metadata = read_epoch_metadata(storage, job_id, cmd.epoch)
+            .map_err(|e| restore_err(format!("restore read metadata for {job_id}: {e}")))?
+            .ok_or_else(|| {
+                restore_err(format!(
+                    "restore failed for job {job_id}: checkpoint epoch {} not found in \
+                     executor checkpoint storage",
+                    cmd.epoch
+                ))
+            })?;
+        metadata
+            .validate()
+            .map_err(|e| restore_err(format!("restore metadata invalid for {job_id}: {e}")))?;
+        if metadata.job_id != job_id || metadata.epoch != cmd.epoch {
+            return Err(restore_err(format!(
+                "restore metadata mismatch for job {job_id} epoch {}: metadata has job {} epoch {}",
+                cmd.epoch, metadata.job_id, metadata.epoch
+            )));
+        }
+
+        self.cached_coordinator_fencing_token
+            .store(cmd.fencing_token.as_u64(), Ordering::SeqCst);
+
+        // Transactional sinks: commit output covered by the restored
+        // checkpoint, abort everything after it.  A failure here must fail
+        // the restore — proceeding would silently drop committed-checkpoint
+        // sink output or leak post-checkpoint output.
+        let (committed, aborted) = self
+            .transaction_log
+            .restore_to(job_id, cmd.epoch)
+            .map_err(|e| restore_err(format!("transactional sink restore for {job_id}: {e}")))?;
+        if committed > 0 || aborted > 0 {
+            tracing::info!(
+                job_id,
+                epoch = cmd.epoch,
+                committed,
+                aborted,
+                "reconciled transactional sink output during restore"
+            );
+        }
+
+        // Source offsets: stash restored Kafka positions for the pipelines to
+        // seek at (re)construction.
+        let kafka_offsets = kafka_offsets_from_source_records(&metadata.source_offsets);
+        if kafka_offsets.is_empty() {
+            self.kafka_restore_offsets.remove(job_id);
+        } else {
+            self.kafka_restore_offsets
+                .insert(job_id.to_owned(), kafka_offsets);
+        }
+
+        // Operator state: read every snapshot referenced by the checkpoint.
+        let mut snapshots = Vec::with_capacity(metadata.operator_snapshots.len());
+        for snap_ref in &metadata.operator_snapshots {
+            let bytes = storage
+                .read_bytes(&snap_ref.snapshot_path)
+                .map_err(|e| restore_err(format!("restore read {}: {e}", snap_ref.snapshot_path)))?
+                .ok_or_else(|| {
+                    restore_err(format!(
+                        "restore failed for job {job_id}: snapshot {} referenced by \
+                         checkpoint epoch {} is missing",
+                        snap_ref.snapshot_path, cmd.epoch
+                    ))
+                })?;
+            snapshots.push(bytes);
+        }
+
+        if let Some(loop_exec) = self
+            .loop_executors
+            .get(job_id)
+            .map(|e| Arc::clone(e.value()))
+        {
+            // Live loop executor: roll its window state back now.
+            apply_snapshots_to_state(
+                &CheckpointStateHandle::ContinuousWindow(loop_exec),
+                &snapshots,
+            )
+            .map_err(|e| restore_err(format!("restore window state for {job_id}: {e}")))?;
+            self.pending_restores.remove(job_id);
+        } else {
+            // No loop executor yet (fresh process): stash the snapshots so the
+            // executor created by the first `stream:loop:` fragment is seeded
+            // before its first drain.
+            self.pending_restores.insert(
+                job_id.to_owned(),
+                RestoredJobCheckpoint {
+                    epoch: cmd.epoch,
+                    fencing_token: cmd.fencing_token.as_u64(),
+                    snapshots: snapshots.clone(),
+                },
+            );
+        }
+
+        // Generic backend: clear this job's operator namespaces and merge the
+        // restored entries so non-window stateful tasks roll back too.
+        if let CheckpointStateHandle::Backend(backend) = fallback_state {
+            let mut guard = backend
+                .lock()
+                .map_err(|e| restore_err(format!("state backend lock poisoned: {e}")))?;
+            let namespaces = guard
+                .list_namespaces()
+                .map_err(|e| restore_err(format!("restore list namespaces: {e}")))?;
+            for ns in namespaces {
+                if metadata
+                    .operator_snapshots
+                    .iter()
+                    .any(|s| s.operator_id == ns.operator_id())
+                {
+                    guard
+                        .clear_namespace(&ns)
+                        .map_err(|e| restore_err(format!("restore clear namespace: {e}")))?;
+                }
+            }
+            for bytes in &snapshots {
+                let entries = krishiv_state::decode_snapshot_entries(bytes)
+                    .map_err(|e| restore_err(format!("restore decode snapshot: {e}")))?;
+                let batch: Vec<(&str, &str, &[u8], &[u8])> = entries
+                    .iter()
+                    .map(|(op, name, key, value)| {
+                        (op.as_str(), name.as_str(), key.as_slice(), value.as_slice())
+                    })
+                    .collect();
+                if !batch.is_empty() {
+                    guard
+                        .put_batch(&batch)
+                        .map_err(|e| restore_err(format!("restore merge into backend: {e}")))?;
+                }
+            }
+        }
+
+        // Reset per-task checkpoint progress so pre-rollback barriers are
+        // rejected as stale and the next epoch acks cleanly.
+        if let Some(running) = &self.running_attempts {
+            for entry in running.iter() {
+                if entry.value().job_id() != &cmd.job_id {
+                    continue;
+                }
+                let task_id = entry.value().task_id().clone();
+                self.checkpoint_runners
+                    .entry(task_id.clone())
+                    .or_insert_with(|| TaskRunner::new(task_id))
+                    .apply_restored_epoch(cmd.epoch);
+            }
+        }
+
+        tracing::info!(
+            job_id,
+            epoch = cmd.epoch,
+            snapshots = snapshots.len(),
+            "restored job state from checkpoint"
+        );
+        Ok(())
+    }
+
+    /// Key-group range this executor covers for `job_id`, derived from the
+    /// ranges registered at task assignment.  Defaults to the full range when
+    /// no hosted task registered one (single-node deployments).
+    fn key_group_range_for_job(&self, job_id: &str) -> krishiv_proto::KeyGroupRange {
+        let (Some(running), Some(ranges)) = (&self.running_attempts, &self.key_group_ranges) else {
+            return krishiv_proto::KeyGroupRange::full();
+        };
+        let mut bounds: Option<(u32, u32)> = None;
+        for entry in running.iter() {
+            if entry.value().job_id().as_str() != job_id {
+                continue;
+            }
+            if let Some(range) = ranges.get(entry.value().task_id().as_str()) {
+                bounds = Some(match bounds {
+                    None => (range.start(), range.end()),
+                    Some((start, end)) => (start.min(range.start()), end.max(range.end())),
+                });
+            }
+        }
+        match bounds {
+            Some((start, end)) => krishiv_proto::KeyGroupRange::try_new(start, end)
+                .unwrap_or_else(|_| krishiv_proto::KeyGroupRange::full()),
+            None => krishiv_proto::KeyGroupRange::full(),
+        }
+    }
+
     /// Drain all pending barriers from the shared injector and initiate
     /// checkpoints for each one.  Called from the runner loop in `cli.rs`.
     pub async fn drain_pending_barriers<S>(
         &self,
-        state_backend: Arc<dyn StateBackend>,
+        fallback_state: CheckpointStateHandle,
         storage: Arc<dyn CheckpointStorage>,
         coordinator: S,
     ) where
@@ -1553,17 +2025,16 @@ impl ExecutorTaskRunner {
                 fencing_token,
             };
 
-            let sb_clone = Arc::clone(&state_backend);
             let s_clone = Arc::clone(&storage);
             let coord_clone = coordinator.clone();
             if let Err(e) = self
-                .initiate_checkpoint_for_job(&req, sb_clone, s_clone, coord_clone)
+                .initiate_checkpoint_for_job(&req, fallback_state.clone(), s_clone, coord_clone)
                 .await
             {
                 tracing::warn!(error = %e, "barrier checkpoint failed");
             } else if let Some(registry) = &self.barrier_ack_registry {
                 use crate::barrier_transport::BarrierAckCompletion;
-                let (kg_start, kg_end) = (0u32, 32_767u32);
+                let range = self.key_group_range_for_job(&barrier.job_id);
                 registry.complete(
                     &barrier.job_id,
                     barrier.epoch,
@@ -1572,8 +2043,8 @@ impl ExecutorTaskRunner {
                             "checkpoint://{}/{}",
                             barrier.job_id, barrier.checkpoint_id
                         ),
-                        key_group_range_start: kg_start,
-                        key_group_range_end: kg_end,
+                        key_group_range_start: range.start(),
+                        key_group_range_end: range.end(),
                     },
                 );
             }
@@ -1841,10 +2312,12 @@ mod runner_tests {
             epoch: 3,
             fencing_token: krishiv_proto::FencingToken::initial(),
         };
-        let state_backend = krishiv_state::RocksDbStateBackend::ephemeral().unwrap();
+        let state = CheckpointStateHandle::from_backend(
+            krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
+        );
         let storage = krishiv_state::checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap();
         let ack = runner
-            .handle_initiate_checkpoint(req, &state_backend, &storage)
+            .handle_initiate_checkpoint(req, &state, &storage)
             .unwrap();
         assert_eq!(ack.epoch, 5); // signals stale
     }
@@ -1859,10 +2332,12 @@ mod runner_tests {
             epoch: 1,
             fencing_token: krishiv_proto::FencingToken::initial(),
         };
-        let state_backend = krishiv_state::RocksDbStateBackend::ephemeral().unwrap();
+        let state = CheckpointStateHandle::from_backend(
+            krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
+        );
         let storage = krishiv_state::checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap();
         let ack = runner
-            .handle_initiate_checkpoint(req, &state_backend, &storage)
+            .handle_initiate_checkpoint(req, &state, &storage)
             .unwrap();
         assert_eq!(ack.epoch, 1);
         assert_eq!(runner.last_acked_epoch, 1);

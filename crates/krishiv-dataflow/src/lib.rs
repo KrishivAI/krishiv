@@ -55,6 +55,7 @@ pub use krishiv_plan::JoinType;
 
 pub mod adaptive;
 pub mod aggregate;
+pub mod aligned_input;
 pub mod barrier_align;
 pub mod cep;
 pub mod coalesce_partitions;
@@ -82,6 +83,10 @@ pub use adaptive::{
     HotKeyReport, RateLimiter, SinkLatencyTracker, StreamingPartitionAdvisor, ThrottleCommand,
 };
 pub use aggregate::{AggExpr, AggFunction, LocalAggregator};
+pub use aligned_input::{
+    AlignedEvent, AlignedInputMessage, AlignedInputReceiver, AlignedInputSender, AlignedMultiInput,
+    AlignedWindowJoinDriver, aligned_channel,
+};
 pub use coalesce_partitions::{CoalescePartitionsOperator, coalesce_partition_batches};
 pub use continuous::ContinuousWindowExecutor;
 pub use join::{
@@ -1103,6 +1108,43 @@ mod tests {
 
         let (tx, mut rx) = operator_queue(8);
         tx.send_data(batch.clone()).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        assert!(matches!(msg, OperatorMessage::Data(_)));
+    }
+
+    /// Phase 3 backpressure validation: a checkpoint barrier must reach the
+    /// consumer even while the data channel is saturated and the producer is
+    /// blocked on it.  This is what keeps checkpoints completing under
+    /// sustained backpressure on the source-injection path.
+    #[tokio::test]
+    async fn operator_queue_barrier_delivered_while_data_channel_saturated() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1])) as Arc<dyn arrow::array::Array>],
+        )
+        .unwrap();
+
+        // Capacity-1 data channel: one queued batch saturates it.
+        let (tx, mut rx) = operator_queue(1);
+        tx.send_data(batch.clone()).await.unwrap();
+
+        // A second data send must block (sustained backpressure)…
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            tx.send_data(batch.clone()),
+        )
+        .await;
+        assert!(blocked.is_err(), "saturated data channel must backpressure");
+
+        // …while the barrier still goes through and is delivered first.
+        tx.send_barrier(9).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        assert!(
+            matches!(msg, OperatorMessage::Barrier { epoch: 9 }),
+            "barrier must bypass the saturated data channel"
+        );
+        // The queued data is still intact behind it.
         let msg = rx.recv().await.unwrap();
         assert!(matches!(msg, OperatorMessage::Data(_)));
     }

@@ -71,8 +71,9 @@ pub use schema_normalize::SchemaNormalizeOperator;
 pub use sink::{AtLeastOnceSinkContract, DynSink, PostWriteOffsetCommitProtocol, Sink};
 pub use source::{CheckpointSource, DynSource, Source};
 pub use two_phase::{
-    InMemoryCommitHandle, InMemoryTwoPhaseCommitSink, LocalParquetTwoPhaseCommitSink,
-    ParquetCommitHandle, TwoPhaseCommitSink,
+    EpochTransactionLog, InMemoryCommitHandle, InMemoryTwoPhaseCommitSink,
+    LocalParquetTwoPhaseCommitSink, ParquetCommitHandle, TransactionalSinkParticipant,
+    TwoPhaseCommitSink,
 };
 
 #[cfg(all(feature = "vector-sinks", feature = "pgvector"))]

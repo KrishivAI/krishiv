@@ -35,6 +35,9 @@ mod tests;
 
 // Re-export the full public API at crate root for source compatibility.
 pub use backend::StateBackend;
+pub use checkpoint::rescaling::{
+    EntryRouting, KeyGroupRescaler, RescaleChecksum, redistribute_snapshots, window_group_key,
+};
 pub use checkpoint::{
     CheckpointDurability, CheckpointError, CheckpointResult, CheckpointStorage,
     EphemeralCheckpointStorage, LocalFsCheckpointStorage, ObjectStoreCheckpointStorage,
@@ -47,7 +50,8 @@ pub use incremental_checkpoint::{
 pub use inspector::StateInspector;
 pub use krishiv_common::durability::{DurabilityProfile, StateDurability};
 pub use migration::{
-    SharedStateMigrationRegistry, StateMigrationError, StateMigrationFn, StateMigrationRegistry,
+    CURRENT_STATE_SCHEMA_VERSION, SharedStateMigrationRegistry, StateMigrationError,
+    StateMigrationFn, StateMigrationRegistry, migrate_snapshot,
 };
 pub use namespace::Namespace;
 pub use processing_time::{
@@ -57,6 +61,6 @@ pub use queryable::{QueryableStateHandle, QueryableStateStore};
 /// Primary state backend — RocksDB-backed LSM-tree, ephemeral or file-backed.
 pub use rocksdb_backend::RocksDbStateBackend;
 pub use savepoint::{SavepointCoordinator, SavepointMeta};
-pub use snapshot::{SnapshotEntry, decode_snapshot_entries};
+pub use snapshot::{SnapshotEntry, decode_snapshot_entries, encode_snapshot_entries};
 pub use timer::{InMemoryTimerService, TimerKey, TimerService};
 pub use ttl::{TtlConfig, TtlStateBackend};
