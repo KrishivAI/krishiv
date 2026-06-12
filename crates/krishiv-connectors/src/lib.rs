@@ -7,26 +7,26 @@
 // Submodules with implementations
 #[cfg(feature = "avro")]
 pub mod avro;
-pub mod csv_json;
-#[cfg(feature = "kinesis")]
-pub mod kinesis;
-#[cfg(feature = "pulsar-source")]
-pub mod pulsar_connector;
-#[cfg(feature = "elasticsearch")]
-pub mod elasticsearch_sink;
 #[cfg(feature = "cassandra")]
 pub mod cassandra_sink;
-#[cfg(feature = "hbase")]
-pub mod hbase_connector;
 #[cfg(feature = "lakehouse")]
 pub mod cdc;
 #[cfg(all(feature = "lakehouse", feature = "kafka"))]
 pub mod cdc_router;
+pub mod csv_json;
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch_sink;
+#[cfg(feature = "hbase")]
+pub mod hbase_connector;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+#[cfg(feature = "kinesis")]
+pub mod kinesis;
 #[cfg(feature = "lakehouse")]
 pub mod lakehouse;
 pub mod parquet;
+#[cfg(feature = "pulsar-source")]
+pub mod pulsar_connector;
 pub mod s3;
 pub mod schema_normalize;
 #[cfg(feature = "schema-registry")]
@@ -85,7 +85,6 @@ pub use vector::{
     ScoredChunk, VectorSink, VectorSinkConfig, VectorSinkError, VectorSinkRegistry, WeaviateSink,
     point_id_from_doc_epoch, validate_identifier,
 };
-
 
 #[cfg(all(feature = "state", feature = "lakehouse"))]
 pub use cdc::CdcOffsetTracker;

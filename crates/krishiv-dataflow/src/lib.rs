@@ -63,10 +63,9 @@ pub mod interval_join;
 pub mod join;
 pub mod live_table;
 pub mod lookup_join;
-pub mod process_fn;
-pub mod window_join;
 pub mod memo;
 pub mod operator_runtime;
+pub mod process_fn;
 pub mod queue;
 pub mod schema_normalize;
 pub mod side_output;
@@ -76,6 +75,7 @@ pub mod temporal_join;
 mod watermark_e2e;
 pub mod watermark_util;
 pub mod window;
+pub mod window_join;
 
 pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, HeavyHittersTracker,
@@ -84,26 +84,30 @@ pub use adaptive::{
 pub use aggregate::{AggExpr, AggFunction, LocalAggregator};
 pub use coalesce_partitions::{CoalescePartitionsOperator, coalesce_partition_batches};
 pub use continuous::ContinuousWindowExecutor;
-pub use join::{BroadcastJoin, BuiltBroadcastJoin, HashJoin, NestedLoopJoin, SortMergeJoin, StreamTableJoin};
-pub use lookup_join::{InMemoryLookupSource, LookupError, LookupJoin, LookupJoinSpec, LookupSource, LookupValue};
-pub use process_fn::{ProcessContext, ProcessFunction, ProcessFunctionExecutor};
-pub use window_join::{WindowJoin, WindowJoinSpec};
-pub use sort::{SortKey, SortedBatchMerger, sort_batch};
+pub use join::{
+    BroadcastJoin, BuiltBroadcastJoin, HashJoin, NestedLoopJoin, SortMergeJoin, StreamTableJoin,
+};
+pub use lookup_join::{
+    InMemoryLookupSource, LookupError, LookupJoin, LookupJoinSpec, LookupSource, LookupValue,
+};
 pub use operator_runtime::{
     LocalWindowKindBridge, LocalWindowParams, execute_bounded_window, execute_streaming_window,
     local_spec_to_window_execution,
 };
+pub use process_fn::{ProcessContext, ProcessFunction, ProcessFunctionExecutor};
 pub use queue::{
     OperatorMessage, OperatorQueueError, OperatorQueueMetrics, OperatorQueueReceiver,
     OperatorQueueSender, operator_queue,
 };
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
+pub use sort::{SortKey, SortedBatchMerger, sort_batch};
 pub use window::{
     CountWindowOperator, CountWindowSpec, MultiSourceWatermarkState, SessionWindowOperator,
     SessionWindowSpec, SlidingWindowOperator, SlidingWindowSpec, StateBackedSessionWindowOperator,
     StateBackedSlidingWindowOperator, StateBackedTumblingWindowOperator, TumblingWindowOperator,
     TumblingWindowSpec, WatermarkState,
 };
+pub use window_join::{WindowJoin, WindowJoinSpec};
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

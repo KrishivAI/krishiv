@@ -378,7 +378,9 @@ mod tests {
 
         fn merge(&self, a: AggState, b: AggState) -> Result<AggState, UdfError> {
             Ok(AggState {
-                data: (read_i64_state(&a) + read_i64_state(&b)).to_le_bytes().to_vec(),
+                data: (read_i64_state(&a) + read_i64_state(&b))
+                    .to_le_bytes()
+                    .to_vec(),
             })
         }
     }

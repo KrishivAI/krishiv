@@ -10,11 +10,11 @@
 
 use std::collections::HashSet;
 
+use datafusion::sql::sqlparser::ast::visit_relations;
 use datafusion::sql::sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem, SetExpr,
     Statement,
 };
-use datafusion::sql::sqlparser::ast::visit_relations;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
@@ -94,15 +94,30 @@ fn collect_from_select(sel: &Select, out: &mut Vec<DetectedSubquery>) {
 
 fn collect_from_expr(expr: &Expr, out: &mut Vec<DetectedSubquery>) {
     match expr {
-        Expr::InSubquery { subquery, negated, .. } => {
-            let kind =
-                if *negated { SubqueryKind::NotInSubquery } else { SubqueryKind::InSubquery };
-            out.push(DetectedSubquery { kind, inner_query: subquery.to_string() });
+        Expr::InSubquery {
+            subquery, negated, ..
+        } => {
+            let kind = if *negated {
+                SubqueryKind::NotInSubquery
+            } else {
+                SubqueryKind::InSubquery
+            };
+            out.push(DetectedSubquery {
+                kind,
+                inner_query: subquery.to_string(),
+            });
             collect_subqueries_from_query(subquery, out);
         }
         Expr::Exists { subquery, negated } => {
-            let kind = if *negated { SubqueryKind::NotExists } else { SubqueryKind::Exists };
-            out.push(DetectedSubquery { kind, inner_query: subquery.to_string() });
+            let kind = if *negated {
+                SubqueryKind::NotExists
+            } else {
+                SubqueryKind::Exists
+            };
+            out.push(DetectedSubquery {
+                kind,
+                inner_query: subquery.to_string(),
+            });
             collect_subqueries_from_query(subquery, out);
         }
         Expr::Subquery(q) => {
@@ -118,12 +133,19 @@ fn collect_from_expr(expr: &Expr, out: &mut Vec<DetectedSubquery>) {
         }
         Expr::UnaryOp { expr, .. } => collect_from_expr(expr, out),
         Expr::IsNull(e) | Expr::IsNotNull(e) => collect_from_expr(e, out),
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             collect_from_expr(expr, out);
             collect_from_expr(low, out);
             collect_from_expr(high, out);
         }
-        Expr::Case { operand, conditions, else_result, .. } => {
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
             if let Some(e) = operand {
                 collect_from_expr(e, out);
             }
@@ -140,7 +162,10 @@ fn collect_from_expr(expr: &Expr, out: &mut Vec<DetectedSubquery>) {
                 for fa in &list.args {
                     let inner = match fa {
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                        FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } => Some(e),
+                        FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } => Some(e),
                         _ => None,
                     };
                     if let Some(e) = inner {
@@ -174,8 +199,7 @@ pub fn validate_no_streaming_subqueries(
 
     // Normalize to lowercase for case-insensitive matching against the SQL
     // identifier names produced by extract_table_names_from_query.
-    let lower_tables: HashSet<String> =
-        streaming_tables.iter().map(|s| s.to_lowercase()).collect();
+    let lower_tables: HashSet<String> = streaming_tables.iter().map(|s| s.to_lowercase()).collect();
 
     let dialect = GenericDialect {};
     let stmts = match Parser::parse_sql(&dialect, sql) {
@@ -250,8 +274,7 @@ mod tests {
 
     #[test]
     fn detects_in_subquery() {
-        let sql =
-            "SELECT * FROM orders WHERE customer_id IN (SELECT id FROM vip_customers)";
+        let sql = "SELECT * FROM orders WHERE customer_id IN (SELECT id FROM vip_customers)";
         let found = detect_subqueries(sql).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].kind, SubqueryKind::InSubquery);
@@ -291,8 +314,7 @@ mod tests {
 
     #[test]
     fn detects_nested_subqueries() {
-        let sql =
-            "SELECT * FROM a WHERE x IN (SELECT y FROM b WHERE y NOT IN (SELECT z FROM c))";
+        let sql = "SELECT * FROM a WHERE x IN (SELECT y FROM b WHERE y NOT IN (SELECT z FROM c))";
         let found = detect_subqueries(sql).unwrap();
         assert!(found.len() >= 2);
         assert!(found.iter().any(|s| s.kind == SubqueryKind::InSubquery));

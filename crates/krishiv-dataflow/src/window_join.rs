@@ -88,7 +88,11 @@ impl WindowJoin {
     }
 
     fn push_rows(&mut self, batch: &RecordBatch, is_left: bool) -> ExecResult<()> {
-        let key_col = if is_left { &self.spec.left_key } else { &self.spec.right_key };
+        let key_col = if is_left {
+            &self.spec.left_key
+        } else {
+            &self.spec.right_key
+        };
         let key_idx = batch
             .schema()
             .index_of(key_col)
@@ -124,8 +128,15 @@ impl WindowJoin {
                 self.watermark_ms = new_wm;
             }
 
-            let entry = RowBuf { batch: batch.clone(), row };
-            let buf = if is_left { &mut self.left_buf } else { &mut self.right_buf };
+            let entry = RowBuf {
+                batch: batch.clone(),
+                row,
+            };
+            let buf = if is_left {
+                &mut self.left_buf
+            } else {
+                &mut self.right_buf
+            };
             buf.entry((key_str, window_start)).or_default().push(entry);
         }
 
@@ -220,7 +231,10 @@ fn join_row_bufs(
     // Build a hash map from right key → right row indices.
     let mut right_by_key: HashMap<AggKey, Vec<usize>> = HashMap::new();
     for (ri, rb) in right.iter().enumerate() {
-        let key_idx = rb.batch.schema().index_of(&spec.right_key)
+        let key_idx = rb
+            .batch
+            .schema()
+            .index_of(&spec.right_key)
             .map_err(|_| ExecError::ColumnNotFound(spec.right_key.clone()))?;
         let key = extract_agg_key(&rb.batch, key_idx, rb.row)?;
         right_by_key.entry(key).or_default().push(ri);
@@ -230,7 +244,10 @@ fn join_row_bufs(
     let mut right_indices: Vec<u32> = Vec::new();
 
     for (li, lb) in left.iter().enumerate() {
-        let key_idx = lb.batch.schema().index_of(&spec.left_key)
+        let key_idx = lb
+            .batch
+            .schema()
+            .index_of(&spec.left_key)
             .map_err(|_| ExecError::ColumnNotFound(spec.left_key.clone()))?;
         let key = extract_agg_key(&lb.batch, key_idx, lb.row)?;
         if let Some(right_match) = right_by_key.get(&key) {
@@ -262,11 +279,20 @@ fn join_row_bufs(
             let row = left[li as usize].row;
             let src_col = left[li as usize].batch.column(col_idx);
             let idx = UInt32Array::from(vec![row as u32]);
-            values.push(take(src_col.as_ref(), &idx, None).map_err(|e| ExecError::Arrow(e.to_string()))?);
+            values.push(
+                take(src_col.as_ref(), &idx, None).map_err(|e| ExecError::Arrow(e.to_string()))?,
+            );
         }
-        columns.push(arrow::compute::concat(
-            values.iter().map(|a| a.as_ref()).collect::<Vec<_>>().as_slice(),
-        ).map_err(|e| ExecError::Arrow(e.to_string()))?);
+        columns.push(
+            arrow::compute::concat(
+                values
+                    .iter()
+                    .map(|a| a.as_ref())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )
+            .map_err(|e| ExecError::Arrow(e.to_string()))?,
+        );
     }
 
     // Materialise right columns.
@@ -276,14 +302,25 @@ fn join_row_bufs(
             let row = right[ri as usize].row;
             let src_col = right[ri as usize].batch.column(col_idx);
             let idx = UInt32Array::from(vec![row as u32]);
-            values.push(take(src_col.as_ref(), &idx, None).map_err(|e| ExecError::Arrow(e.to_string()))?);
+            values.push(
+                take(src_col.as_ref(), &idx, None).map_err(|e| ExecError::Arrow(e.to_string()))?,
+            );
         }
-        columns.push(arrow::compute::concat(
-            values.iter().map(|a| a.as_ref()).collect::<Vec<_>>().as_slice(),
-        ).map_err(|e| ExecError::Arrow(e.to_string()))?);
+        columns.push(
+            arrow::compute::concat(
+                values
+                    .iter()
+                    .map(|a| a.as_ref())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )
+            .map_err(|e| ExecError::Arrow(e.to_string()))?,
+        );
     }
 
-    Ok(Some(RecordBatch::try_new(schema, columns).map_err(|e| ExecError::Arrow(e.to_string()))?))
+    Ok(Some(
+        RecordBatch::try_new(schema, columns).map_err(|e| ExecError::Arrow(e.to_string()))?,
+    ))
 }
 
 #[cfg(test)]
@@ -368,7 +405,10 @@ mod tests {
         op.push_right(&right).unwrap();
 
         let result = op.advance_watermark(10_001).unwrap();
-        assert!(result.is_empty(), "rows in different windows are not joined");
+        assert!(
+            result.is_empty(),
+            "rows in different windows are not joined"
+        );
     }
 
     #[test]

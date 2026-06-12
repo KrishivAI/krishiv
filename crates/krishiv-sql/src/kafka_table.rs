@@ -81,7 +81,10 @@ impl PartitionStream for KafkaPartitionStream {
                     Ok(Some(batch)) => {
                         let send_result = match project_batch(&batch, &schema) {
                             Ok(projected) => tx.send(Ok(projected)).await,
-                            Err(e) => tx.send(Err(DataFusionError::ArrowError(Box::new(e), None))).await,
+                            Err(e) => {
+                                tx.send(Err(DataFusionError::ArrowError(Box::new(e), None)))
+                                    .await
+                            }
                         };
                         if send_result.is_err() {
                             break; // receiver dropped — query cancelled

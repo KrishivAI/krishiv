@@ -31,10 +31,16 @@ pub struct SortKey {
 
 impl SortKey {
     pub fn asc(column: impl Into<String>) -> Self {
-        Self { column: column.into(), ascending: true }
+        Self {
+            column: column.into(),
+            ascending: true,
+        }
     }
     pub fn desc(column: impl Into<String>) -> Self {
-        Self { column: column.into(), ascending: false }
+        Self {
+            column: column.into(),
+            ascending: false,
+        }
     }
 }
 
@@ -69,8 +75,8 @@ pub fn sort_batch(batch: &RecordBatch, keys: &[SortKey]) -> ExecResult<RecordBat
         })
         .collect::<ExecResult<Vec<_>>>()?;
 
-    let indices = lexsort_to_indices(&sort_columns, None)
-        .map_err(|e| ExecError::Arrow(e.to_string()))?;
+    let indices =
+        lexsort_to_indices(&sort_columns, None).map_err(|e| ExecError::Arrow(e.to_string()))?;
 
     let columns: Vec<ArrayRef> = batch
         .columns()
@@ -209,35 +215,49 @@ fn scalar_at(arr: &dyn arrow::array::Array, row: usize) -> ExecResult<ScalarVal>
     if arr.is_null(row) {
         return Ok(ScalarVal::Null);
     }
-    let downcast_err = |dt: &DataType| {
-        ExecError::Arrow(format!("sort: downcast failed for type {dt}"))
-    };
+    let downcast_err =
+        |dt: &DataType| ExecError::Arrow(format!("sort: downcast failed for type {dt}"));
     match arr.data_type() {
         DataType::Int32 => Ok(ScalarVal::Int32(
-            arr.as_any().downcast_ref::<Int32Array>()
-                .ok_or_else(|| downcast_err(&DataType::Int32))?.value(row),
+            arr.as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| downcast_err(&DataType::Int32))?
+                .value(row),
         )),
         DataType::Int64 => Ok(ScalarVal::Int64(
-            arr.as_any().downcast_ref::<Int64Array>()
-                .ok_or_else(|| downcast_err(&DataType::Int64))?.value(row),
+            arr.as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| downcast_err(&DataType::Int64))?
+                .value(row),
         )),
         DataType::Float64 => Ok(ScalarVal::Float64(
-            arr.as_any().downcast_ref::<Float64Array>()
-                .ok_or_else(|| downcast_err(&DataType::Float64))?.value(row),
+            arr.as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| downcast_err(&DataType::Float64))?
+                .value(row),
         )),
         DataType::Utf8 => Ok(ScalarVal::Utf8(
-            arr.as_any().downcast_ref::<StringArray>()
-                .ok_or_else(|| downcast_err(&DataType::Utf8))?.value(row).to_owned(),
+            arr.as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| downcast_err(&DataType::Utf8))?
+                .value(row)
+                .to_owned(),
         )),
         DataType::Boolean => Ok(ScalarVal::Bool(
-            arr.as_any().downcast_ref::<BooleanArray>()
-                .ok_or_else(|| downcast_err(&DataType::Boolean))?.value(row),
+            arr.as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err(&DataType::Boolean))?
+                .value(row),
         )),
         DataType::UInt32 => Ok(ScalarVal::UInt32(
-            arr.as_any().downcast_ref::<UInt32Array>()
-                .ok_or_else(|| downcast_err(&DataType::UInt32))?.value(row),
+            arr.as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| downcast_err(&DataType::UInt32))?
+                .value(row),
         )),
-        dt => Err(ExecError::UnsupportedType(format!("sort: unsupported type {dt}"))),
+        dt => Err(ExecError::UnsupportedType(format!(
+            "sort: unsupported type {dt}"
+        ))),
     }
 }
 
@@ -274,9 +294,8 @@ fn materialise_column(
             continue;
         }
         let idx_arr = UInt32Array::from(per_batch_indices[bi].clone());
-        let taken =
-            take(inputs[bi].column(col_idx), &idx_arr, None)
-                .map_err(|e| ExecError::Arrow(e.to_string()))?;
+        let taken = take(inputs[bi].column(col_idx), &idx_arr, None)
+            .map_err(|e| ExecError::Arrow(e.to_string()))?;
         out_pieces.push((bi, taken));
     }
 
@@ -316,9 +335,21 @@ fn scatter_column(
     let result: ArrayRef = match dt {
         DataType::Int32 => scatter_prim!(Int32Array, Int32Builder, std::convert::identity, "Int32"),
         DataType::Int64 => scatter_prim!(Int64Array, Int64Builder, std::convert::identity, "Int64"),
-        DataType::Float64 => scatter_prim!(Float64Array, Float64Builder, std::convert::identity, "Float64"),
-        DataType::UInt32 => scatter_prim!(UInt32Array, UInt32Builder, std::convert::identity, "UInt32"),
-        DataType::Boolean => scatter_prim!(BooleanArray, BooleanBuilder, std::convert::identity, "Boolean"),
+        DataType::Float64 => scatter_prim!(
+            Float64Array,
+            Float64Builder,
+            std::convert::identity,
+            "Float64"
+        ),
+        DataType::UInt32 => {
+            scatter_prim!(UInt32Array, UInt32Builder, std::convert::identity, "UInt32")
+        }
+        DataType::Boolean => scatter_prim!(
+            BooleanArray,
+            BooleanBuilder,
+            std::convert::identity,
+            "Boolean"
+        ),
         DataType::Utf8 => {
             let mut b = StringBuilder::with_capacity(total, total * 8);
             for &(bi, ri) in order {
@@ -368,7 +399,12 @@ mod tests {
     fn sort_batch_ascending_by_id() {
         let batch = make_batch(&[3, 1, 2], &["c", "a", "b"]);
         let sorted = sort_batch(&batch, &[SortKey::asc("id")]).unwrap();
-        let ids = sorted.column_by_name("id").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = sorted
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(ids.values(), &[1, 2, 3]);
     }
 
@@ -376,7 +412,12 @@ mod tests {
     fn sort_batch_descending_by_id() {
         let batch = make_batch(&[1, 3, 2], &["a", "c", "b"]);
         let sorted = sort_batch(&batch, &[SortKey::desc("id")]).unwrap();
-        let ids = sorted.column_by_name("id").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = sorted
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(ids.values(), &[3, 2, 1]);
     }
 
@@ -394,7 +435,12 @@ mod tests {
         let right = make_batch(&[2, 4, 6], &["b", "d", "f"]);
         let merger = SortedBatchMerger::new(vec![SortKey::asc("id")]);
         let merged = merger.merge(&[left, right]).unwrap();
-        let ids = merged.column_by_name("id").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = merged
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(ids.values(), &[1, 2, 3, 4, 5, 6]);
     }
 
@@ -405,7 +451,12 @@ mod tests {
         let b3 = make_batch(&[3, 6], &["c", "f"]);
         let merger = SortedBatchMerger::new(vec![SortKey::asc("id")]);
         let merged = merger.merge(&[b1, b2, b3]).unwrap();
-        let ids = merged.column_by_name("id").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = merged
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(ids.values(), &[1, 2, 3, 4, 5, 6]);
     }
 
@@ -415,7 +466,12 @@ mod tests {
         let sorted = sort_batch(&batch, &[SortKey::asc("id")]).unwrap();
         let merger = SortedBatchMerger::new(vec![SortKey::asc("id")]);
         let merged = merger.merge(&[sorted.clone()]).unwrap();
-        let ids = merged.column_by_name("id").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = merged
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(ids.values(), &[1, 3, 5]);
     }
 
@@ -426,7 +482,12 @@ mod tests {
         let merger = SortedBatchMerger::new(vec![SortKey::asc("id")]);
         let merged = merger.merge(&[b1, b2]).unwrap();
         assert_eq!(merged.num_rows(), 4);
-        let ids = merged.column_by_name("id").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = merged
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         // Both rows with id=1 appear, in some order before id=2, id=3.
         let sorted_ids: Vec<i32> = (0..merged.num_rows()).map(|i| ids.value(i)).collect();
         assert_eq!(sorted_ids, vec![1, 1, 2, 3]);

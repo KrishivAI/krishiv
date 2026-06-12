@@ -11,7 +11,10 @@ pub enum WindowKind {
     Sliding,
     Session,
     /// E3.1 — count-based window: closes every `size` rows, slides every `slide` rows.
-    Count { size: u64, slide: u64 },
+    Count {
+        size: u64,
+        slide: u64,
+    },
 }
 
 /// Aggregate function in a streaming window plan.
@@ -474,14 +477,16 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
                 );
             }
             "csize" => {
-                count_size = Some(v.trim().parse::<u64>().map_err(|e| {
-                    PlanError::Parse(format!("invalid csize value '{v}': {e}"))
-                })?);
+                count_size =
+                    Some(v.trim().parse::<u64>().map_err(|e| {
+                        PlanError::Parse(format!("invalid csize value '{v}': {e}"))
+                    })?);
             }
             "cslide" => {
-                count_slide = Some(v.trim().parse::<u64>().map_err(|e| {
-                    PlanError::Parse(format!("invalid cslide value '{v}': {e}"))
-                })?);
+                count_slide =
+                    Some(v.trim().parse::<u64>().map_err(|e| {
+                        PlanError::Parse(format!("invalid cslide value '{v}': {e}"))
+                    })?);
             }
             "agg" => agg_kind = Some(v.trim().to_owned()),
             "col" => agg_col = Some(v.trim().to_owned()),

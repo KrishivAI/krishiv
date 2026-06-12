@@ -550,7 +550,10 @@ mod watermark_tests {
         state.update("a", 1_000);
         state.update("b", 1_000);
         let lag = state.per_source_lag_ms();
-        assert_eq!(lag["a"], 0, "source at effective watermark should have lag 0");
+        assert_eq!(
+            lag["a"], 0,
+            "source at effective watermark should have lag 0"
+        );
         assert_eq!(lag["b"], 0);
     }
 
@@ -573,7 +576,8 @@ mod watermark_tests {
         state.update("active", 1_000);
         let lag = state.per_source_lag_ms();
         assert_eq!(
-            lag["never_seen"], i64::MAX,
+            lag["never_seen"],
+            i64::MAX,
             "never-seen source should have i64::MAX lag"
         );
     }

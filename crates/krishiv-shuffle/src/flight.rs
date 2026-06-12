@@ -171,10 +171,9 @@ impl FlightService for ShuffleFlightService {
             .map_err(|e| Status::invalid_argument(format!("reading first message: {e}")))?
             .ok_or_else(|| Status::invalid_argument("do_put stream was empty"))?;
 
-        let descriptor = first
-            .flight_descriptor
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("first FlightData must carry a FlightDescriptor"))?;
+        let descriptor = first.flight_descriptor.as_ref().ok_or_else(|| {
+            Status::invalid_argument("first FlightData must carry a FlightDescriptor")
+        })?;
 
         if descriptor.path.is_empty() {
             return Err(Status::invalid_argument(
@@ -188,7 +187,11 @@ impl FlightService for ShuffleFlightService {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(1);
 
-        let id = PartitionId { job_id, stage_id, partition };
+        let id = PartitionId {
+            job_id,
+            stage_id,
+            partition,
+        };
 
         // Re-assemble a stream that starts with the first (schema) message.
         let schema_msg = futures::stream::once(async move {
@@ -211,7 +214,11 @@ impl FlightService for ShuffleFlightService {
             .map(|b| b.schema())
             .unwrap_or_else(|| arrow::datatypes::SchemaRef::new(arrow::datatypes::Schema::empty()));
 
-        let partition = crate::ShufflePartition { id, schema, batches };
+        let partition = crate::ShufflePartition {
+            id,
+            schema,
+            batches,
+        };
         self.store
             .write_partition(partition, lease_token)
             .await
@@ -220,7 +227,9 @@ impl FlightService for ShuffleFlightService {
         // Return an empty PutResult stream — the write has been committed.
         let (tx, rx) = mpsc::channel::<Result<PutResult, Status>>(1);
         drop(tx);
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx)) as Self::DoPutStream))
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::DoPutStream
+        ))
     }
 
     async fn do_action(
@@ -371,7 +380,9 @@ impl FlightShuffleClient {
             .unwrap_or_else(|| arrow::datatypes::SchemaRef::new(arrow::datatypes::Schema::empty()));
 
         let batch_stream = futures::stream::iter(
-            batches.into_iter().map(Ok::<_, arrow_flight::error::FlightError>),
+            batches
+                .into_iter()
+                .map(Ok::<_, arrow_flight::error::FlightError>),
         );
         let encoder = FlightDataEncoderBuilder::new()
             .with_schema(schema)

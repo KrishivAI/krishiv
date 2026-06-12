@@ -960,9 +960,7 @@ async fn ui_executor_detail(
     Path(executor_id): Path<String>,
 ) -> Result<Html<String>, UiError> {
     let executor = api_executor_detail_inner(&state, &executor_id).await?;
-    let template = ExecutorTemplate {
-        executor,
-    };
+    let template = ExecutorTemplate { executor };
     Ok(Html(template.render()?))
 }
 
@@ -1029,10 +1027,14 @@ fn status_snapshot_inner(coordinator: &krishiv_scheduler::Coordinator) -> Status
 fn filter_jobs(jobs: Vec<JobSummaryView>, filter: &JobsFilter) -> Vec<JobSummaryView> {
     jobs.into_iter()
         .filter(|j| {
-            if let Some(ref state) = filter.state && !j.state.eq_ignore_ascii_case(state) {
+            if let Some(ref state) = filter.state
+                && !j.state.eq_ignore_ascii_case(state)
+            {
                 return false;
             }
-            if let Some(ref kind) = filter.kind && !j.kind.eq_ignore_ascii_case(kind) {
+            if let Some(ref kind) = filter.kind
+                && !j.kind.eq_ignore_ascii_case(kind)
+            {
                 return false;
             }
             true

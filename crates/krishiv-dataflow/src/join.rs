@@ -870,7 +870,12 @@ impl NestedLoopJoin {
             );
         }
 
-        let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| (**f).clone()).collect();
+        let mut fields: Vec<Field> = left
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (**f).clone())
+            .collect();
         fields.extend(right.schema().fields().iter().map(|f| (**f).clone()));
         let schema = Arc::new(Schema::new(fields));
 
@@ -1025,8 +1030,7 @@ mod tests {
         let left = RecordBatch::try_new(left_schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])
             .unwrap();
         let right_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let right =
-            RecordBatch::new_empty(right_schema);
+        let right = RecordBatch::new_empty(right_schema);
         let join = SortMergeJoin::new("id", "id");
         let result = join.join(&left, &right).unwrap();
         assert_eq!(result.num_rows(), 0);
@@ -1053,8 +1057,8 @@ mod tests {
     #[test]
     fn nested_loop_join_cross_produces_cartesian_product() {
         let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let left =
-            RecordBatch::try_new(left_schema, vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+        let left = RecordBatch::try_new(left_schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])
+            .unwrap();
         let right_schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
         let right = RecordBatch::try_new(
             right_schema,

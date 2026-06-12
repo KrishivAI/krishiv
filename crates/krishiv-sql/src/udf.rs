@@ -242,7 +242,6 @@ impl Accumulator for KrishivAggregateAccumulator {
     }
 }
 
-
 fn krishiv_scalar_to_datafusion(
     value: &krishiv_plan::udf::ScalarValue,
 ) -> datafusion::error::Result<datafusion::scalar::ScalarValue> {

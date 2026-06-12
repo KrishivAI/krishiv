@@ -18,14 +18,16 @@
 //! # }
 //! ```
 
+use arrow::array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+};
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use elasticsearch::{
     BulkOperations, BulkParts, Elasticsearch,
     auth::Credentials,
     http::transport::{SingleNodeConnectionPool, TransportBuilder},
 };
-use arrow::array::{Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
-use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatch;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::error::{ConnectorError, ConnectorResult};
@@ -79,17 +81,20 @@ pub struct ElasticsearchSink {
 impl ElasticsearchSink {
     /// Create and connect a new sink.
     pub async fn connect(config: ElasticsearchConfig) -> ConnectorResult<Self> {
-        let url = config.url.parse::<url::Url>()
+        let url = config
+            .url
+            .parse::<url::Url>()
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
         let pool = SingleNodeConnectionPool::new(url);
 
         let mut transport_builder = TransportBuilder::new(pool);
         if let Some((user, pass)) = &config.credentials {
-            transport_builder = transport_builder
-                .auth(Credentials::Basic(user.clone(), pass.clone()));
+            transport_builder =
+                transport_builder.auth(Credentials::Basic(user.clone(), pass.clone()));
         }
 
-        let transport = transport_builder.build()
+        let transport = transport_builder
+            .build()
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
         let client = Elasticsearch::new(transport);
 
@@ -108,9 +113,11 @@ impl ElasticsearchSink {
         let docs = batch_to_json_docs(batch);
         let mut ops = BulkOperations::new();
 
-        let id_col_idx = self.config.id_column.as_deref().and_then(|name| {
-            batch.schema().index_of(name).ok()
-        });
+        let id_col_idx = self
+            .config
+            .id_column
+            .as_deref()
+            .and_then(|name| batch.schema().index_of(name).ok());
 
         for (row_idx, doc) in docs.into_iter().enumerate() {
             let source = JsonValue::Object(doc);
@@ -124,7 +131,8 @@ impl ElasticsearchSink {
             }
         }
 
-        let resp = self.client
+        let resp = self
+            .client
             .bulk(BulkParts::Index(&self.config.index))
             .body(vec![ops])
             .send()
@@ -145,7 +153,11 @@ impl ElasticsearchSink {
             .json()
             .await
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
-        if body.get("errors").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if body
+            .get("errors")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             let failures: Vec<String> = body
                 .get("items")
                 .and_then(|v| v.as_array())
@@ -214,8 +226,7 @@ fn arrow_scalar_to_json(col: &dyn Array, row: usize) -> JsonValue {
             .downcast_ref::<Float32Array>()
             .map(|arr| {
                 JsonValue::Number(
-                    serde_json::Number::from_f64(arr.value(row) as f64)
-                        .unwrap_or_else(|| 0.into()),
+                    serde_json::Number::from_f64(arr.value(row) as f64).unwrap_or_else(|| 0.into()),
                 )
             })
             .unwrap_or(JsonValue::Null),
@@ -224,8 +235,7 @@ fn arrow_scalar_to_json(col: &dyn Array, row: usize) -> JsonValue {
             .downcast_ref::<Float64Array>()
             .map(|arr| {
                 JsonValue::Number(
-                    serde_json::Number::from_f64(arr.value(row))
-                        .unwrap_or_else(|| 0.into()),
+                    serde_json::Number::from_f64(arr.value(row)).unwrap_or_else(|| 0.into()),
                 )
             })
             .unwrap_or(JsonValue::Null),

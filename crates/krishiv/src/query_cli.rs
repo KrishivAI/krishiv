@@ -221,9 +221,7 @@ async fn query_dataframe(
 
 fn auth_from_env() -> Result<Arc<dyn AuthProvider>, String> {
     let raw = std::env::var("KRISHIV_API_KEYS").map_err(|_| {
-        String::from(
-            "KRISHIV_API_KEYS is required for --api-key (format: key1=user,key2=svc)",
-        )
+        String::from("KRISHIV_API_KEYS is required for --api-key (format: key1=user,key2=svc)")
     })?;
     let mut map = std::collections::HashMap::new();
     for part in raw.split(',') {

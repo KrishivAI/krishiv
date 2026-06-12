@@ -29,8 +29,8 @@
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    Int8Array, Int16Array, StringArray,
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    StringArray,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -41,8 +41,7 @@ use hbase_thrift::{
 };
 use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
 use thrift::transport::{
-    ReadHalf, TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel,
-    WriteHalf,
+    ReadHalf, TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel, WriteHalf,
 };
 
 use crate::error::{ConnectorError, ConnectorResult};
@@ -130,9 +129,9 @@ impl HBaseSink {
         let client = Arc::clone(&self.client);
 
         tokio::task::spawn_blocking(move || {
-            let mut guard = client
-                .lock()
-                .map_err(|_| ConnectorError::Io(std::io::Error::other("hbase client mutex poisoned")))?;
+            let mut guard = client.lock().map_err(|_| {
+                ConnectorError::Io(std::io::Error::other("hbase client mutex poisoned"))
+            })?;
             guard
                 .mutate_rows(table_bytes, row_mutations, Default::default())
                 .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))
@@ -232,46 +231,46 @@ pub fn arrow_cell_to_bytes(col: &dyn Array, row: usize) -> Option<Vec<u8>> {
         return None;
     }
     let s = match col.data_type() {
-        DataType::Boolean => {
-            col.as_any().downcast_ref::<BooleanArray>()
-                .map(|arr| arr.value(row).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Int8 => {
-            col.as_any().downcast_ref::<Int8Array>()
-                .map(|arr| arr.value(row).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Int16 => {
-            col.as_any().downcast_ref::<Int16Array>()
-                .map(|arr| arr.value(row).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Int32 => {
-            col.as_any().downcast_ref::<Int32Array>()
-                .map(|arr| arr.value(row).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Int64 => {
-            col.as_any().downcast_ref::<Int64Array>()
-                .map(|arr| arr.value(row).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Float32 => {
-            col.as_any().downcast_ref::<Float32Array>()
-                .map(|arr| arr.value(row).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Float64 => {
-            col.as_any().downcast_ref::<Float64Array>()
-                .map(|arr| arr.value(row).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Utf8 => {
-            col.as_any().downcast_ref::<StringArray>()
-                .map(|arr| arr.value(row).to_owned())
-                .unwrap_or_default()
-        }
+        DataType::Boolean => col
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|arr| arr.value(row).to_string())
+            .unwrap_or_default(),
+        DataType::Int8 => col
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|arr| arr.value(row).to_string())
+            .unwrap_or_default(),
+        DataType::Int16 => col
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|arr| arr.value(row).to_string())
+            .unwrap_or_default(),
+        DataType::Int32 => col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|arr| arr.value(row).to_string())
+            .unwrap_or_default(),
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|arr| arr.value(row).to_string())
+            .unwrap_or_default(),
+        DataType::Float32 => col
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|arr| arr.value(row).to_string())
+            .unwrap_or_default(),
+        DataType::Float64 => col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|arr| arr.value(row).to_string())
+            .unwrap_or_default(),
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|arr| arr.value(row).to_owned())
+            .unwrap_or_default(),
         DataType::Binary => {
             return col
                 .as_any()
@@ -314,8 +313,7 @@ mod tests {
     #[test]
     fn build_row_mutations_produces_one_per_row() {
         let batch = make_batch();
-        let config = HBaseConfig::new("localhost:9090", "t1", "cf")
-            .with_row_key_column("row_id");
+        let config = HBaseConfig::new("localhost:9090", "t1", "cf").with_row_key_column("row_id");
         let mutations = build_row_mutations(&batch, &config).unwrap();
         assert_eq!(mutations.len(), 3);
     }
@@ -323,8 +321,7 @@ mod tests {
     #[test]
     fn row_key_set_from_column() {
         let batch = make_batch();
-        let config = HBaseConfig::new("localhost:9090", "t1", "cf")
-            .with_row_key_column("row_id");
+        let config = HBaseConfig::new("localhost:9090", "t1", "cf").with_row_key_column("row_id");
         let mutations = build_row_mutations(&batch, &config).unwrap();
         assert_eq!(mutations[0].row.as_deref(), Some(b"r001".as_ref()));
         assert_eq!(mutations[1].row.as_deref(), Some(b"r002".as_ref()));
@@ -342,8 +339,7 @@ mod tests {
     #[test]
     fn mutations_exclude_row_key_column() {
         let batch = make_batch();
-        let config = HBaseConfig::new("localhost:9090", "t1", "cf")
-            .with_row_key_column("row_id");
+        let config = HBaseConfig::new("localhost:9090", "t1", "cf").with_row_key_column("row_id");
         let mutations = build_row_mutations(&batch, &config).unwrap();
         let cols: Vec<String> = mutations[0]
             .mutations
@@ -360,8 +356,7 @@ mod tests {
     #[test]
     fn mutation_column_uses_family_qualifier() {
         let batch = make_batch();
-        let config = HBaseConfig::new("localhost:9090", "t1", "cf")
-            .with_row_key_column("row_id");
+        let config = HBaseConfig::new("localhost:9090", "t1", "cf").with_row_key_column("row_id");
         let mutations = build_row_mutations(&batch, &config).unwrap();
         let cols: Vec<String> = mutations[0]
             .mutations
@@ -391,8 +386,7 @@ mod tests {
 
     #[test]
     fn config_fields() {
-        let cfg = HBaseConfig::new("h:9090", "tbl", "d")
-            .with_row_key_column("pk");
+        let cfg = HBaseConfig::new("h:9090", "tbl", "d").with_row_key_column("pk");
         assert_eq!(cfg.host, "h:9090");
         assert_eq!(cfg.table, "tbl");
         assert_eq!(cfg.column_family, "d");

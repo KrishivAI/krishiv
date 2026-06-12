@@ -39,11 +39,10 @@ pub struct KrishivFlightSqlService {
     prepared_statements: Arc<tokio::sync::Mutex<lru::LruCache<String, String>>>,
 }
 
-const PREPARED_STMT_CAPACITY: std::num::NonZeroUsize =
-    match std::num::NonZeroUsize::new(128) {
-        Some(n) => n,
-        None => panic!("capacity must be non-zero"),
-    };
+const PREPARED_STMT_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(128) {
+    Some(n) => n,
+    None => panic!("capacity must be non-zero"),
+};
 
 impl std::fmt::Debug for KrishivFlightSqlService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -169,11 +168,7 @@ fn extract_from_table(query: &str) -> Option<String> {
         .find(|c: char| c.is_whitespace() || c == ';' || c == ')')
         .unwrap_or(rest.len());
     let table = rest[..end].trim().to_string();
-    if table.is_empty() {
-        None
-    } else {
-        Some(table)
-    }
+    if table.is_empty() { None } else { Some(table) }
 }
 
 #[tonic::async_trait]
@@ -524,7 +519,10 @@ impl KrishivFlightSqlService {
                         .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                     let job_id = plan.name().to_string();
                     self.host
-                        .register_continuous_stream(&job_id, &krishiv_plan::window::WindowExecutionSpec::from(&spec))
+                        .register_continuous_stream(
+                            &job_id,
+                            &krishiv_plan::window::WindowExecutionSpec::from(&spec),
+                        )
                         .await
                         .map_err(KrishivActionError::Status)?;
                     return Ok(Vec::new());
@@ -692,8 +690,7 @@ pub async fn run_flight_server_with_host(
 
     let service = KrishivFlightSqlService::with_host(host);
     let service = configure_flight_auth_from_env(service)?;
-    let server =
-        arrow_flight::flight_service_server::FlightServiceServer::new(service);
+    let server = arrow_flight::flight_service_server::FlightServiceServer::new(service);
     tonic::transport::Server::builder()
         .add_service(server)
         .serve_with_incoming(TcpListenerStream::new(listener))

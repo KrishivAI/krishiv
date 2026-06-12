@@ -7,12 +7,12 @@ mod operator_tests {
 
     use crate::pod_manager::build_executor_pod;
     use crate::{
-        BootstrapExecutor, ConditionStatus, EXECUTOR_ID_LABEL,
-        ExecutorPodLaunchFailure, FIELD_MANAGER, FINALIZER, K8sLeaseElection, KrishivJobMode,
-        KrishivJobPhase, KrishivJobReconciler, KrishivJobResource, KrishivJobSpec,
-        KrishivJobStatus, KrishivQueue, KrishivQueueSpec, KrishivQueueStatus,
-        KubernetesControllerConfig, KubernetesControllerRuntime, ObjectMeta, OperatorError,
-        ReconcileAction, TaskStatusCounters, build_executor_pod_template, demo_coordinator,
+        BootstrapExecutor, ConditionStatus, EXECUTOR_ID_LABEL, ExecutorPodLaunchFailure,
+        FIELD_MANAGER, FINALIZER, K8sLeaseElection, KrishivJobMode, KrishivJobPhase,
+        KrishivJobReconciler, KrishivJobResource, KrishivJobSpec, KrishivJobStatus, KrishivQueue,
+        KrishivQueueSpec, KrishivQueueStatus, KubernetesControllerConfig,
+        KubernetesControllerRuntime, ObjectMeta, OperatorError, ReconcileAction,
+        TaskStatusCounters, build_executor_pod_template, demo_coordinator,
         detect_executor_pod_launch_failure, job_spec_from_resource, krishivjob_api_resource,
         resource_from_dynamic_object, status_patch,
     };

@@ -23,8 +23,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use apache_avro::{
-    Reader as AvroReader, Schema as AvroSchema, Writer as AvroWriter,
-    types::Value as AvroValue,
+    Reader as AvroReader, Schema as AvroSchema, Writer as AvroWriter, types::Value as AvroValue,
 };
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
@@ -72,8 +71,10 @@ fn avro_schema_to_arrow_type(schema: &AvroSchema) -> ConnectorResult<(DataType, 
         AvroSchema::String | AvroSchema::Enum(_) => Ok((DataType::Utf8, false)),
         AvroSchema::Union(u) => {
             let variants = u.variants();
-            let non_null: Vec<_> =
-                variants.iter().filter(|s| !matches!(s, AvroSchema::Null)).collect();
+            let non_null: Vec<_> = variants
+                .iter()
+                .filter(|s| !matches!(s, AvroSchema::Null))
+                .collect();
             if non_null.len() == 1 && variants.len() == 2 {
                 let (dt, _) = avro_schema_to_arrow_type(non_null[0])?;
                 Ok((dt, true))
@@ -257,8 +258,9 @@ fn arrow_type_to_avro_json(dt: &DataType, nullable: bool) -> serde_json::Value {
     let base = match dt {
         DataType::Null => serde_json::json!("null"),
         DataType::Boolean => serde_json::json!("boolean"),
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::UInt8
-        | DataType::UInt16 => serde_json::json!("int"),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::UInt8 | DataType::UInt16 => {
+            serde_json::json!("int")
+        }
         DataType::Int64 | DataType::UInt32 | DataType::UInt64 => serde_json::json!("long"),
         DataType::Float32 => serde_json::json!("float"),
         DataType::Float64 => serde_json::json!("double"),
@@ -303,49 +305,79 @@ fn arrow_scalar_to_avro(col: &dyn arrow::array::Array, row: usize, nullable: boo
     } else {
         match col.data_type() {
             DataType::Null => AvroValue::Null,
-            DataType::Boolean => col.as_any().downcast_ref::<BooleanArray>()
+            DataType::Boolean => col
+                .as_any()
+                .downcast_ref::<BooleanArray>()
                 .map(|arr| AvroValue::Boolean(arr.value(row)))
                 .unwrap_or(AvroValue::Null),
-            DataType::Int8 => col.as_any().downcast_ref::<Int8Array>()
+            DataType::Int8 => col
+                .as_any()
+                .downcast_ref::<Int8Array>()
                 .map(|arr| AvroValue::Int(arr.value(row) as i32))
                 .unwrap_or(AvroValue::Null),
-            DataType::Int16 => col.as_any().downcast_ref::<Int16Array>()
+            DataType::Int16 => col
+                .as_any()
+                .downcast_ref::<Int16Array>()
                 .map(|arr| AvroValue::Int(arr.value(row) as i32))
                 .unwrap_or(AvroValue::Null),
-            DataType::Int32 => col.as_any().downcast_ref::<Int32Array>()
+            DataType::Int32 => col
+                .as_any()
+                .downcast_ref::<Int32Array>()
                 .map(|arr| AvroValue::Int(arr.value(row)))
                 .unwrap_or(AvroValue::Null),
-            DataType::Int64 => col.as_any().downcast_ref::<Int64Array>()
+            DataType::Int64 => col
+                .as_any()
+                .downcast_ref::<Int64Array>()
                 .map(|arr| AvroValue::Long(arr.value(row)))
                 .unwrap_or(AvroValue::Null),
-            DataType::UInt8 => col.as_any().downcast_ref::<UInt8Array>()
+            DataType::UInt8 => col
+                .as_any()
+                .downcast_ref::<UInt8Array>()
                 .map(|arr| AvroValue::Int(arr.value(row) as i32))
                 .unwrap_or(AvroValue::Null),
-            DataType::UInt16 => col.as_any().downcast_ref::<UInt16Array>()
+            DataType::UInt16 => col
+                .as_any()
+                .downcast_ref::<UInt16Array>()
                 .map(|arr| AvroValue::Int(arr.value(row) as i32))
                 .unwrap_or(AvroValue::Null),
-            DataType::UInt32 => col.as_any().downcast_ref::<UInt32Array>()
+            DataType::UInt32 => col
+                .as_any()
+                .downcast_ref::<UInt32Array>()
                 .map(|arr| AvroValue::Long(arr.value(row) as i64))
                 .unwrap_or(AvroValue::Null),
-            DataType::UInt64 => col.as_any().downcast_ref::<UInt64Array>()
+            DataType::UInt64 => col
+                .as_any()
+                .downcast_ref::<UInt64Array>()
                 .map(|arr| AvroValue::Long(arr.value(row) as i64))
                 .unwrap_or(AvroValue::Null),
-            DataType::Float32 => col.as_any().downcast_ref::<Float32Array>()
+            DataType::Float32 => col
+                .as_any()
+                .downcast_ref::<Float32Array>()
                 .map(|arr| AvroValue::Float(arr.value(row)))
                 .unwrap_or(AvroValue::Null),
-            DataType::Float64 => col.as_any().downcast_ref::<Float64Array>()
+            DataType::Float64 => col
+                .as_any()
+                .downcast_ref::<Float64Array>()
                 .map(|arr| AvroValue::Double(arr.value(row)))
                 .unwrap_or(AvroValue::Null),
-            DataType::Utf8 => col.as_any().downcast_ref::<StringArray>()
+            DataType::Utf8 => col
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .map(|arr| AvroValue::String(arr.value(row).to_owned()))
                 .unwrap_or(AvroValue::Null),
-            DataType::LargeUtf8 => col.as_any().downcast_ref::<LargeStringArray>()
+            DataType::LargeUtf8 => col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
                 .map(|arr| AvroValue::String(arr.value(row).to_owned()))
                 .unwrap_or(AvroValue::Null),
-            DataType::Binary => col.as_any().downcast_ref::<BinaryArray>()
+            DataType::Binary => col
+                .as_any()
+                .downcast_ref::<BinaryArray>()
                 .map(|arr| AvroValue::Bytes(arr.value(row).to_vec()))
                 .unwrap_or(AvroValue::Null),
-            DataType::LargeBinary => col.as_any().downcast_ref::<LargeBinaryArray>()
+            DataType::LargeBinary => col
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
                 .map(|arr| AvroValue::Bytes(arr.value(row).to_vec()))
                 .unwrap_or(AvroValue::Null),
             _ => AvroValue::String(format!("{:?}", col.data_type())),
@@ -430,7 +462,9 @@ impl AvroSource {
 
     /// Connector capabilities: bounded and rewindable.
     pub fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::default().with_bounded().with_rewindable()
+        ConnectorCapabilities::default()
+            .with_bounded()
+            .with_rewindable()
     }
 }
 
@@ -450,7 +484,11 @@ impl<W: Write> AvroSink<W> {
     /// Create a new sink.  The Avro schema is derived from `arrow_schema`.
     pub fn new(writer: W, arrow_schema: &Schema) -> ConnectorResult<Self> {
         let avro_schema = arrow_schema_to_avro(arrow_schema)?;
-        Ok(Self { writer, avro_schema, buffered: Vec::new() })
+        Ok(Self {
+            writer,
+            avro_schema,
+            buffered: Vec::new(),
+        })
     }
 
     /// Buffer a batch for later writing.
@@ -464,17 +502,21 @@ impl<W: Write> AvroSink<W> {
     ///
     /// Consumes `self` and returns the inner writer.
     pub fn flush(self) -> ConnectorResult<W> {
-        let AvroSink { mut writer, avro_schema, buffered } = self;
+        let AvroSink {
+            mut writer,
+            avro_schema,
+            buffered,
+        } = self;
         {
             let mut avro_writer = AvroWriter::new(&avro_schema, &mut writer);
             for value in buffered {
-                avro_writer.append(value).map_err(|e| {
-                    ConnectorError::Io(std::io::Error::other(e.to_string()))
-                })?;
+                avro_writer
+                    .append(value)
+                    .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
             }
-            avro_writer.flush().map_err(|e| {
-                ConnectorError::Io(std::io::Error::other(e.to_string()))
-            })?;
+            avro_writer
+                .flush()
+                .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
         } // avro_writer dropped → borrow of writer released
         Ok(writer)
     }
@@ -539,10 +581,22 @@ mod tests {
         let s = AvroSchema::parse_str(SAMPLE_SCHEMA).unwrap();
         let arrow = avro_schema_to_arrow(&s).unwrap();
         assert_eq!(arrow.fields().len(), 4);
-        assert_eq!(arrow.field_with_name("id").unwrap().data_type(), &DataType::Int32);
-        assert_eq!(arrow.field_with_name("name").unwrap().data_type(), &DataType::Utf8);
-        assert_eq!(arrow.field_with_name("score").unwrap().data_type(), &DataType::Float64);
-        assert_eq!(arrow.field_with_name("active").unwrap().data_type(), &DataType::Boolean);
+        assert_eq!(
+            arrow.field_with_name("id").unwrap().data_type(),
+            &DataType::Int32
+        );
+        assert_eq!(
+            arrow.field_with_name("name").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            arrow.field_with_name("score").unwrap().data_type(),
+            &DataType::Float64
+        );
+        assert_eq!(
+            arrow.field_with_name("active").unwrap().data_type(),
+            &DataType::Boolean
+        );
     }
 
     #[test]
@@ -566,12 +620,14 @@ mod tests {
     #[test]
     fn avro_source_respects_batch_size() {
         let recs: Vec<Vec<(&str, AvroValue)>> = (0..10)
-            .map(|i| vec![
-                ("id", AvroValue::Int(i)),
-                ("name", AvroValue::String(format!("u{i}"))),
-                ("score", AvroValue::Double(0.0)),
-                ("active", AvroValue::Boolean(true)),
-            ])
+            .map(|i| {
+                vec![
+                    ("id", AvroValue::Int(i)),
+                    ("name", AvroValue::String(format!("u{i}"))),
+                    ("score", AvroValue::Double(0.0)),
+                    ("active", AvroValue::Boolean(true)),
+                ]
+            })
             .collect();
         let bytes = make_avro_bytes(SAMPLE_SCHEMA, &recs);
         let mut src = AvroSource::open(Cursor::new(bytes), 3).unwrap();
@@ -677,7 +733,10 @@ mod tests {
             ]),
             AvroValue::Record(vec![
                 ("id".to_owned(), AvroValue::Int(2)),
-                ("label".to_owned(), AvroValue::Union(0, Box::new(AvroValue::Null))),
+                (
+                    "label".to_owned(),
+                    AvroValue::Union(0, Box::new(AvroValue::Null)),
+                ),
             ]),
         ];
 

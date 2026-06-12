@@ -28,12 +28,12 @@ pub mod catalog;
 pub mod cep_sql;
 mod connector_table;
 pub mod create_function_ddl;
+mod lakehouse;
+pub mod live_table;
 pub mod pivot_sql;
 pub mod recursive_cte;
 pub mod subquery;
 pub mod unnest_sql;
-mod lakehouse;
-pub mod live_table;
 
 pub mod streaming;
 mod udf;
@@ -1115,7 +1115,9 @@ impl SqlEngine {
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
-        if total_rows > 0 && let Ok(mut counts) = self.table_row_counts.write() {
+        if total_rows > 0
+            && let Ok(mut counts) = self.table_row_counts.write()
+        {
             counts.insert(table_name.to_string(), total_rows as u64);
         }
         self.invalidate_plan_cache();
@@ -1319,8 +1321,7 @@ impl SqlEngine {
         {
             let batches = lakehouse::execute_merge_sql(&self.context, query).await?;
             let merge_table = next_ephemeral_name("merge_result");
-            lakehouse::register_scan_batches(&self.context, &merge_table, batches)
-                .await?;
+            lakehouse::register_scan_batches(&self.context, &merge_table, batches).await?;
             let dataframe = self
                 .context
                 .sql(&format!("SELECT * FROM {merge_table}"))
@@ -1337,47 +1338,46 @@ impl SqlEngine {
             && let Some(stmt) = cep_sql::parse_match_recognize(query)?
         {
             let is_streaming = self.is_streaming_source(&stmt.source_table);
-                // For streaming sources collect a bounded window of recent events
-                // (capped at the configured limit) so the query terminates. The
-                // cap is configurable through `KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT`
-                // (default 100_000) so users can raise it for high-rate streams
-                // or lower it to bound memory on small executors. The truncation
-                // is logged at warn level because the result is no longer a
-                // complete match over the unbounded stream.
-                let streaming_limit = streaming_match_recognize_limit_from_env();
-                let source_sql = if is_streaming {
-                    format!(
-                        "SELECT * FROM {} LIMIT {}",
-                        stmt.source_table, streaming_limit
-                    )
-                } else {
-                    format!("SELECT * FROM {}", stmt.source_table)
-                };
-                let source_df = self.context.sql(&source_sql).await?;
-                let source_batches = source_df.collect().await?;
-                if is_streaming {
-                    tracing::warn!(
-                        source = %stmt.source_table,
-                        limit = streaming_limit,
-                        collected_rows = source_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-                        "MATCH_RECOGNIZE executed against a streaming source under \
-                         bounded materialisation; results only cover the first {0} rows \
-                         of the source. Set KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT to a \
-                         larger value if your executor has the memory budget.",
-                        streaming_limit
-                    );
-                }
-                let results = cep_sql::execute_match_recognize(stmt, &source_batches, false)?;
-                let cep_table = next_ephemeral_name("cep_result");
-                lakehouse::register_scan_batches(&self.context, &cep_table, results)
-                    .await?;
-                let dataframe = self
-                    .context
-                    .sql(&format!("SELECT * FROM {cep_table}"))
-                    .await?;
-                return Ok(
-                    SqlDataFrame::new("cep", dataframe, self.table_row_counts()).with_query(query)
+            // For streaming sources collect a bounded window of recent events
+            // (capped at the configured limit) so the query terminates. The
+            // cap is configurable through `KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT`
+            // (default 100_000) so users can raise it for high-rate streams
+            // or lower it to bound memory on small executors. The truncation
+            // is logged at warn level because the result is no longer a
+            // complete match over the unbounded stream.
+            let streaming_limit = streaming_match_recognize_limit_from_env();
+            let source_sql = if is_streaming {
+                format!(
+                    "SELECT * FROM {} LIMIT {}",
+                    stmt.source_table, streaming_limit
+                )
+            } else {
+                format!("SELECT * FROM {}", stmt.source_table)
+            };
+            let source_df = self.context.sql(&source_sql).await?;
+            let source_batches = source_df.collect().await?;
+            if is_streaming {
+                tracing::warn!(
+                    source = %stmt.source_table,
+                    limit = streaming_limit,
+                    collected_rows = source_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                    "MATCH_RECOGNIZE executed against a streaming source under \
+                     bounded materialisation; results only cover the first {0} rows \
+                     of the source. Set KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT to a \
+                     larger value if your executor has the memory budget.",
+                    streaming_limit
                 );
+            }
+            let results = cep_sql::execute_match_recognize(stmt, &source_batches, false)?;
+            let cep_table = next_ephemeral_name("cep_result");
+            lakehouse::register_scan_batches(&self.context, &cep_table, results).await?;
+            let dataframe = self
+                .context
+                .sql(&format!("SELECT * FROM {cep_table}"))
+                .await?;
+            return Ok(
+                SqlDataFrame::new("cep", dataframe, self.table_row_counts()).with_query(query)
+            );
         }
 
         let (rewritten, as_ofs) =
@@ -1426,7 +1426,9 @@ impl SqlEngine {
             let maybe_rows = provider
                 .statistics()
                 .and_then(|s| s.num_rows.get_value().copied());
-            if let Some(n) = maybe_rows && let Ok(mut counts) = self.table_row_counts.write() {
+            if let Some(n) = maybe_rows
+                && let Ok(mut counts) = self.table_row_counts.write()
+            {
                 counts.entry(table_name).or_insert(n as u64);
             }
         }
@@ -1446,7 +1448,6 @@ impl SqlEngine {
                 .with_shuffle_partitions(shuffle_override),
         )
     }
-
 }
 
 /// Extract the table name from a `CREATE EXTERNAL TABLE <name> ...` DDL statement.
@@ -1503,7 +1504,11 @@ pub trait KrishivDataFrameOps: Send + Sync {
     async fn distinct(&self) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Sort by columns with optional descending flags.
-    async fn sort(&self, columns: &[&str], descending: &[bool]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+    async fn sort(
+        &self,
+        columns: &[&str],
+        descending: &[bool],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Assign an alias (table name) to this DataFrame.
     async fn alias(&self, alias: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
@@ -1524,7 +1529,8 @@ pub trait KrishivDataFrameOps: Send + Sync {
     async fn describe(&self) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Fill null values in `column` with the literal SQL `value`.
-    async fn fill_null(&self, column: &str, value: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+    async fn fill_null(&self, column: &str, value: &str)
+    -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Join with another DataFrame using a join type and equi-join keys.
     async fn join(
@@ -1536,7 +1542,10 @@ pub trait KrishivDataFrameOps: Send + Sync {
     ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Union this DataFrame with another (UNION ALL semantics).
-    async fn union(&self, right: &dyn KrishivDataFrameOps) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+    async fn union(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 }
 
 /// Recursively walk a DataFusion `LogicalPlan` and produce Krishiv `PlanNode`
@@ -1977,7 +1986,11 @@ impl KrishivDataFrameOps for SqlDataFrame {
         Ok(Box::new(self.with_new_dataframe(df, "distinct")))
     }
 
-    async fn sort(&self, columns: &[&str], descending: &[bool]) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+    async fn sort(
+        &self,
+        columns: &[&str],
+        descending: &[bool],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
         use datafusion::logical_expr::SortExpr;
         let exprs: Vec<SortExpr> = columns
             .iter()
@@ -2018,7 +2031,11 @@ impl KrishivDataFrameOps for SqlDataFrame {
         Ok(Box::new(self.with_new_dataframe(df, "describe")))
     }
 
-    async fn fill_null(&self, column: &str, value: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+    async fn fill_null(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
         let expr = format!("COALESCE({column}, {value})");
         let parsed = self.dataframe.parse_sql_expr(&expr)?;
         let df = self.dataframe.clone().with_column(column, parsed)?;
@@ -2051,19 +2068,16 @@ impl KrishivDataFrameOps for SqlDataFrame {
             _ => {
                 return Err(SqlError::DataFusion {
                     message: format!("unsupported join type: {how}"),
-                })
+                });
             }
         };
-        let df = self
-            .dataframe
-            .clone()
-            .join(
-                right_sql.dataframe.clone(),
-                join_type,
-                left_on,
-                right_on,
-                None,
-            )?;
+        let df = self.dataframe.clone().join(
+            right_sql.dataframe.clone(),
+            join_type,
+            left_on,
+            right_on,
+            None,
+        )?;
         Ok(Box::new(self.with_new_dataframe(df, "join")))
     }
 
@@ -2077,10 +2091,7 @@ impl KrishivDataFrameOps for SqlDataFrame {
             .ok_or_else(|| SqlError::DataFusion {
                 message: "right DataFrame must be SqlDataFrame for union".into(),
             })?;
-        let df = self
-            .dataframe
-            .clone()
-            .union(right_sql.dataframe.clone())?;
+        let df = self.dataframe.clone().union(right_sql.dataframe.clone())?;
         Ok(Box::new(self.with_new_dataframe(df, "union")))
     }
 }

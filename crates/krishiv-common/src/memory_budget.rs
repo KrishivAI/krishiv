@@ -2,8 +2,8 @@
 
 //! Runtime memory accounting shared across operators within one task.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-task memory accounting.  Created from the coordinator-supplied
 /// `memory_limit_bytes` and shared (via `Arc`) across every operator that
@@ -77,11 +77,11 @@ impl MemoryBudget {
 
     /// Release previously reserved `bytes`. Saturates at zero on underflow.
     pub fn release(&self, bytes: u64) {
-        let _ = self.used_bytes.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_sub(bytes)),
-        );
+        let _ = self
+            .used_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(bytes))
+            });
     }
 
     /// Remaining bytes before the limit is hit, or `None` for unlimited.

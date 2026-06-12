@@ -624,7 +624,9 @@ impl InProcessStreamingRuntime {
                     // G1: Collect watermark from streaming stages for the next stage.
                     // Skip i64::MIN (WATERMARK_UNSET) — it is the uninitialized sentinel
                     // returned by windows that have not yet processed any events (B3/A4).
-                    if let Some(wm) = report.output().watermark_ms() && wm > WATERMARK_UNSET {
+                    if let Some(wm) = report.output().watermark_ms()
+                        && wm > WATERMARK_UNSET
+                    {
                         stage_watermark_ms =
                             Some(stage_watermark_ms.map_or(wm, |prev: i64| prev.max(wm)));
                     }

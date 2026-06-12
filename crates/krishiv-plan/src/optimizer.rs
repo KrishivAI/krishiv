@@ -514,13 +514,12 @@ impl AqeOptimizer {
 
         for rule in &self.always_rules {
             let rule_name = rule.name().to_string();
-            let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(&current, effective_stats))).map_err(
-                |payload| OptimizerError::RulePanicked {
+            let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(&current, effective_stats)))
+                .map_err(|payload| OptimizerError::RulePanicked {
                     optimizer: "AQE",
                     rule: rule_name.clone(),
                     message: krishiv_common::panic_payload_to_string(&*payload),
-                },
-            )?;
+                })?;
             if let Some(new_plan) = outcome {
                 if new_plan.name() != current.name() || new_plan.kind() != current.kind() {
                     return Err(OptimizerError::InvalidRuleOutput {
@@ -548,12 +547,13 @@ impl AqeOptimizer {
         if !input_is_streaming && !StreamingAqeGuard::plan_is_streaming(&current) {
             for rule in &self.guarded_rules {
                 let rule_name = rule.name().to_string();
-                let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(&current, effective_stats)))
-                    .map_err(|payload| OptimizerError::RulePanicked {
-                        optimizer: "AQE",
-                        rule: rule_name.clone(),
-                        message: krishiv_common::panic_payload_to_string(&*payload),
-                    })?;
+                let outcome =
+                    catch_unwind(AssertUnwindSafe(|| rule.apply(&current, effective_stats)))
+                        .map_err(|payload| OptimizerError::RulePanicked {
+                            optimizer: "AQE",
+                            rule: rule_name.clone(),
+                            message: krishiv_common::panic_payload_to_string(&*payload),
+                        })?;
                 if let Some(new_plan) = outcome {
                     if new_plan.name() != current.name() || new_plan.kind() != current.kind() {
                         return Err(OptimizerError::InvalidRuleOutput {

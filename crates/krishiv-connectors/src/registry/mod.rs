@@ -1,10 +1,10 @@
 //! Connector driver registry and built-in driver registrations.
 
+mod connector_registry;
 mod descriptor;
 mod driver;
 mod drivers;
 mod kind;
-mod connector_registry;
 
 #[cfg(feature = "vector-sinks")]
 mod vector_drivers;
@@ -15,9 +15,8 @@ mod tests;
 pub use connector_registry::{ConnectorRegistry, default_registry};
 pub use descriptor::ConnectorDescriptor;
 pub use driver::{
-    OpenSinkFuture, OpenSourceFuture, OpenTwoPhaseSinkFuture, OpenedTwoPhaseSink,
-    SharedSinkDriver, SharedSourceDriver, SharedTwoPhaseSinkDriver, SinkDriver, SourceDriver,
-    TwoPhaseSinkDriver,
+    OpenSinkFuture, OpenSourceFuture, OpenTwoPhaseSinkFuture, OpenedTwoPhaseSink, SharedSinkDriver,
+    SharedSourceDriver, SharedTwoPhaseSinkDriver, SinkDriver, SourceDriver, TwoPhaseSinkDriver,
 };
 #[cfg(feature = "vector-sinks")]
 pub use driver::{OpenVectorSinkFuture, SharedVectorSinkDriver, VectorSinkDriver};

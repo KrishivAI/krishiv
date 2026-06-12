@@ -114,8 +114,9 @@ impl LookupJoin {
         let n = batch.num_rows();
 
         // Collect per-column right-side values.
-        let mut right_values: Vec<Vec<Option<LookupValue>>> =
-            (0..right_schema.len()).map(|_| Vec::with_capacity(n)).collect();
+        let mut right_values: Vec<Vec<Option<LookupValue>>> = (0..right_schema.len())
+            .map(|_| Vec::with_capacity(n))
+            .collect();
 
         for row in 0..n {
             let key = extract_agg_key(batch, key_idx, row)?;
@@ -138,8 +139,12 @@ impl LookupJoin {
         }
 
         // Build output: left cols + right cols.
-        let mut fields: Vec<Field> =
-            batch.schema().fields().iter().map(|f| (**f).clone()).collect();
+        let mut fields: Vec<Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (**f).clone())
+            .collect();
         for (col_name, dt) in &right_schema {
             fields.push(Field::new(col_name, dt.clone(), true));
         }
@@ -157,10 +162,7 @@ impl LookupJoin {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn build_nullable_array(
-    dt: &DataType,
-    values: &[Option<LookupValue>],
-) -> ExecResult<ArrayRef> {
+fn build_nullable_array(dt: &DataType, values: &[Option<LookupValue>]) -> ExecResult<ArrayRef> {
     use arrow::array::{BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder};
 
     match dt {
@@ -230,7 +232,10 @@ pub struct InMemoryLookupSource {
 
 impl InMemoryLookupSource {
     pub fn new(schema: Vec<(String, DataType)>) -> Self {
-        Self { data: HashMap::new(), schema }
+        Self {
+            data: HashMap::new(),
+            schema,
+        }
     }
 
     pub fn insert(&mut self, key: impl Into<String>, row: LookupRow) {
@@ -273,7 +278,9 @@ mod tests {
 
     #[test]
     fn lookup_join_enriches_matched_rows() {
-        let spec = LookupJoinSpec { left_key: "id".into() };
+        let spec = LookupJoinSpec {
+            left_key: "id".into(),
+        };
         let join = LookupJoin::new(spec, Box::new(make_source()));
         let batch = make_left_batch(&[1, 2]);
         let result = join.join(&batch).unwrap();
@@ -287,7 +294,9 @@ mod tests {
 
     #[test]
     fn lookup_join_null_on_miss() {
-        let spec = LookupJoinSpec { left_key: "id".into() };
+        let spec = LookupJoinSpec {
+            left_key: "id".into(),
+        };
         let join = LookupJoin::new(spec, Box::new(make_source()));
         let batch = make_left_batch(&[1, 99]); // 99 has no match
         let result = join.join(&batch).unwrap();
@@ -300,7 +309,9 @@ mod tests {
 
     #[test]
     fn lookup_join_all_miss_returns_nulls() {
-        let spec = LookupJoinSpec { left_key: "id".into() };
+        let spec = LookupJoinSpec {
+            left_key: "id".into(),
+        };
         let join = LookupJoin::new(spec, Box::new(make_source()));
         let batch = make_left_batch(&[100, 200]);
         let result = join.join(&batch).unwrap();

@@ -8,8 +8,8 @@
 //! draining output.  When credits drop to zero the producer signals backpressure
 //! upward via `BackpressureSignal`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Backpressure signal attached to a task output or operator boundary.
 ///
@@ -60,7 +60,6 @@ impl BackpressureSignal {
     }
 }
 
-
 /// Shared credit gate between a producer and consumer operator.
 ///
 /// The consumer initialises the gate with `capacity` bytes of credit; the
@@ -106,11 +105,15 @@ impl CreditGate {
         if bytes == 0 {
             return true;
         }
-        let prev = self.available.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| if cur >= bytes { Some(cur - bytes) } else { None },
-        );
+        let prev = self
+            .available
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if cur >= bytes {
+                    Some(cur - bytes)
+                } else {
+                    None
+                }
+            });
         prev.is_ok()
     }
 
@@ -118,11 +121,11 @@ impl CreditGate {
     ///
     /// Saturates at `capacity`.
     pub fn ack(&self, bytes: u64) {
-        let _ = self.available.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some((cur + bytes).min(self.capacity)),
-        );
+        let _ = self
+            .available
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some((cur + bytes).min(self.capacity))
+            });
     }
 
     /// Reset to full capacity (e.g. on pipeline restart).

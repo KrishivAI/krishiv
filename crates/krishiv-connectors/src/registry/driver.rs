@@ -24,9 +24,8 @@ pub type OpenSinkFuture<'a> =
 pub type OpenTwoPhaseSinkFuture<'a> =
     Pin<Box<dyn Future<Output = ConnectorResult<OpenedTwoPhaseSink>> + Send + 'a>>;
 #[cfg(feature = "vector-sinks")]
-pub type OpenVectorSinkFuture<'a> = Pin<
-    Box<dyn Future<Output = ConnectorResult<Arc<dyn crate::vector::VectorSink>>> + Send + 'a>,
->;
+pub type OpenVectorSinkFuture<'a> =
+    Pin<Box<dyn Future<Output = ConnectorResult<Arc<dyn crate::vector::VectorSink>>> + Send + 'a>>;
 
 /// Builds [`DynSource`] instances from validated [`ConnectorConfig`] values.
 pub trait SourceDriver: Send + Sync {

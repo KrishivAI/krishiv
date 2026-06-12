@@ -81,7 +81,8 @@ impl CountWindowOperator {
                 "count window slide must be > 0 and ≤ size".into(),
             ));
         }
-        let schema = build_window_output_schema(&spec.key_column, &spec.key_column_type, &spec.agg_exprs);
+        let schema =
+            build_window_output_schema(&spec.key_column, &spec.key_column_type, &spec.agg_exprs);
         Ok(Self {
             spec,
             key_states: HashMap::new(),
@@ -105,10 +106,13 @@ impl CountWindowOperator {
             let global_row = self.global_row;
             self.global_row += 1;
 
-            let state = self.key_states.entry(key_str.clone()).or_insert_with(|| KeyState {
-                buf: VecDeque::new(),
-                window_start_row: global_row,
-            });
+            let state = self
+                .key_states
+                .entry(key_str.clone())
+                .or_insert_with(|| KeyState {
+                    buf: VecDeque::new(),
+                    window_start_row: global_row,
+                });
 
             // Compute the single-row contribution and push it.
             let mut contrib = AggState::new(&self.spec.agg_exprs);
@@ -120,7 +124,11 @@ impl CountWindowOperator {
                 let window_start = state.window_start_row;
                 let window_end = window_start + self.spec.size;
                 let merged = fold_agg_states(
-                    state.buf.iter().take(self.spec.size as usize).map(|c| &c.agg),
+                    state
+                        .buf
+                        .iter()
+                        .take(self.spec.size as usize)
+                        .map(|c| &c.agg),
                     &self.spec.agg_exprs,
                 );
                 output.push(build_window_record_batch(
@@ -234,14 +242,12 @@ mod tests {
     }
 
     fn make_batch(ids: &[i32]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("user_id", DataType::Int32, false),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(ids.to_vec()))],
-        )
-        .unwrap()
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "user_id",
+            DataType::Int32,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids.to_vec()))]).unwrap()
     }
 
     #[test]

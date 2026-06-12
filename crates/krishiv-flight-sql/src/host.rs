@@ -7,9 +7,7 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
-use krishiv_runtime::flight_protocol::{
-    FlightDirective, apply_register_directives, parse_sql,
-};
+use krishiv_runtime::flight_protocol::{FlightDirective, apply_register_directives, parse_sql};
 use krishiv_runtime::in_process_cluster::{InProcessCluster, plan_spec_to_local};
 use krishiv_scheduler::{BatchSqlInlineTable, SharedCoordinator, execute_batch_sql_coordinated};
 use krishiv_sql::explain_sql;
@@ -48,8 +46,7 @@ impl FlightExecutionHost {
     ///
     /// Used by the standalone `krishiv flight-server` subcommand.
     pub fn embedded() -> Result<Self, Status> {
-        let cluster =
-            InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
+        let cluster = InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
         Ok(Self {
             backend: Arc::new(FlightHostBackend::InProcess(Arc::new(cluster))),
             catalog: Arc::new(DashMap::new()),
@@ -142,10 +139,9 @@ impl FlightExecutionHost {
                 run_blocking(move || cluster.collect_batch_sql(&sql, &tables, is_streaming))
             }
             FlightHostBackend::Coordinator(coordinator) => {
-                let outcome =
-                    execute_batch_sql_coordinated(coordinator, query, inline_tables)
-                        .await
-                        .map_err(|e| Status::internal(e.to_string()))?;
+                let outcome = execute_batch_sql_coordinated(coordinator, query, inline_tables)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
                 krishiv_scheduler::decode_inline_record_batches(&outcome.inline_record_batch_ipc)
                     .map_err(|e| Status::internal(e.to_string()))
             }
@@ -167,15 +163,14 @@ impl FlightExecutionHost {
                 run_blocking(move || cluster.collect_bounded_window(&topic, input_batches, &local))
             }
             FlightHostBackend::Coordinator(coordinator) => {
-                let outcome =
-                    krishiv_scheduler::execute_bounded_window_coordinated(
-                        coordinator,
-                        topic,
-                        spec,
-                        &input_batches,
-                    )
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let outcome = krishiv_scheduler::execute_bounded_window_coordinated(
+                    coordinator,
+                    topic,
+                    spec,
+                    &input_batches,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
                 krishiv_scheduler::decode_inline_record_batches(&outcome.inline_record_batch_ipc)
                     .map_err(|e| Status::internal(e.to_string()))
             }
@@ -260,10 +255,7 @@ impl FlightExecutionHost {
     }
 
     /// Drain completed results from a continuous streaming job.
-    pub async fn drain_continuous_stream(
-        &self,
-        job_id: &str,
-    ) -> Result<Vec<RecordBatch>, Status> {
+    pub async fn drain_continuous_stream(&self, job_id: &str) -> Result<Vec<RecordBatch>, Status> {
         match self.backend.as_ref() {
             FlightHostBackend::InProcess(cluster) => {
                 let job_id = job_id.to_string();
@@ -273,12 +265,10 @@ impl FlightExecutionHost {
             FlightHostBackend::Coordinator(coordinator) => {
                 // Delegate to the public helper in krishiv-scheduler which
                 // accesses coordinator internals within the same crate.
-                let ipc_payloads = krishiv_scheduler::drain_continuous_stream_coordinated(
-                    coordinator,
-                    job_id,
-                )
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+                let ipc_payloads =
+                    krishiv_scheduler::drain_continuous_stream_coordinated(coordinator, job_id)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
 
                 krishiv_scheduler::decode_inline_record_batches(&ipc_payloads)
                     .map_err(|e| Status::internal(e.to_string()))
@@ -349,7 +339,10 @@ impl FlightExecutionHost {
             .collect();
 
         // Handle explain directive.
-        if directives.iter().any(|d| matches!(d, FlightDirective::Explain)) {
+        if directives
+            .iter()
+            .any(|d| matches!(d, FlightDirective::Explain))
+        {
             let text = explain_sql(sql).map_err(|e| Status::internal(e.to_string()))?;
             return Ok(vec![explain_batch(&text)?]);
         }

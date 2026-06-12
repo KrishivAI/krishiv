@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use crate::{LocalDiskShuffleStore, PartitionId, ShuffleCompression, ShuffleStore};
 use axum::Router;
-use constant_time_eq::constant_time_eq;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use constant_time_eq::constant_time_eq;
 use tokio::net::TcpListener;
 
 #[derive(Clone)]

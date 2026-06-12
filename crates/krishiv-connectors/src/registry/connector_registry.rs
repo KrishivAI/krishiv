@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use super::descriptor::ConnectorDescriptor;
 #[cfg(feature = "vector-sinks")]
+use super::driver::OpenVectorSinkFuture;
+#[cfg(feature = "vector-sinks")]
 use super::driver::SharedVectorSinkDriver;
 use super::driver::{
-    OpenSinkFuture, OpenSourceFuture, OpenTwoPhaseSinkFuture,
-    SharedSinkDriver, SharedSourceDriver, SharedTwoPhaseSinkDriver,
+    OpenSinkFuture, OpenSourceFuture, OpenTwoPhaseSinkFuture, SharedSinkDriver, SharedSourceDriver,
+    SharedTwoPhaseSinkDriver,
 };
-#[cfg(feature = "vector-sinks")]
-use super::driver::OpenVectorSinkFuture;
 use super::kind::{ConnectorKind, ConnectorRole};
 use crate::config::ConnectorConfig;
 use crate::error::{ConnectorError, ConnectorResult};
@@ -90,20 +90,14 @@ impl ConnectorRegistry {
         self.sources.get(&kind)?.estimated_row_count(config)
     }
 
-    pub fn open_source<'a>(
-        &'a self,
-        config: &'a ConnectorConfig,
-    ) -> OpenSourceFuture<'a> {
+    pub fn open_source<'a>(&'a self, config: &'a ConnectorConfig) -> OpenSourceFuture<'a> {
         match self.lookup_source(config) {
             Ok(driver) => driver.open(config),
             Err(error) => Box::pin(async move { Err(error) }),
         }
     }
 
-    pub fn open_sink<'a>(
-        &'a self,
-        config: &'a ConnectorConfig,
-    ) -> OpenSinkFuture<'a> {
+    pub fn open_sink<'a>(&'a self, config: &'a ConnectorConfig) -> OpenSinkFuture<'a> {
         match self.lookup_sink(config) {
             Ok(driver) => driver.open(config),
             Err(error) => Box::pin(async move { Err(error) }),
@@ -121,10 +115,7 @@ impl ConnectorRegistry {
     }
 
     #[cfg(feature = "vector-sinks")]
-    pub fn open_vector_sink<'a>(
-        &'a self,
-        config: &'a ConnectorConfig,
-    ) -> OpenVectorSinkFuture<'a> {
+    pub fn open_vector_sink<'a>(&'a self, config: &'a ConnectorConfig) -> OpenVectorSinkFuture<'a> {
         match self.lookup_vector_sink(config) {
             Ok(driver) => driver.open(config),
             Err(error) => Box::pin(async move { Err(error) }),

@@ -20,10 +20,12 @@ pub mod stream_quality;
 pub mod test_fixtures;
 pub mod validate;
 
+pub use backpressure::{BackpressureSignal, CreditGate};
 pub use durability::{
     CheckpointDurability, DurabilityProfile, DurabilityProfileParseError, DurabilityProfileSpec,
     MetadataDurability, ShuffleDurability, StateDurability,
 };
+pub use memory_budget::MemoryBudget;
 pub use panic_util::panic_payload_to_string;
 pub use production::{
     ALLOW_ANONYMOUS_HTTP_ENV, ALLOW_LEGACY_FRAGMENTS_ENV, DURABILITY_PROFILE_ENV,
@@ -36,8 +38,6 @@ pub use production::{
     requires_file_backed_state, requires_http_auth, requires_manual_kafka_commit,
     resolve_durability_profile,
 };
-pub use backpressure::{BackpressureSignal, CreditGate};
-pub use memory_budget::MemoryBudget;
 pub use stream_quality::{StreamQualityHook, StreamQualityResult};
 
 #[cfg(test)]

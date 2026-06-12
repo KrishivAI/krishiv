@@ -6,8 +6,6 @@
 use pyo3::prelude::*;
 
 mod agg;
-#[cfg(feature = "ai")]
-mod ai;
 mod batch;
 mod dataframe;
 mod errors;
@@ -28,7 +26,9 @@ mod stream_exec;
 mod udf;
 mod windows;
 
-#[cfg(not(feature = "ai"))]
+// Stub `krishiv.ai` Python submodule. The AI/RAG implementation was removed in
+// the platform-layer cleanup; the empty module is kept so `import krishiv.ai`
+// keeps failing gracefully at attribute level rather than at import level.
 mod ai {
     use pyo3::prelude::*;
 
