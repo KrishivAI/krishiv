@@ -38,7 +38,7 @@ Core implementation choices:
 | `krishiv-executor` | Executor process, task runner, task assignment receiver, shuffle/checkpoint hooks. |
 | `krishiv-proto` | Typed IDs and coordinator/executor wire contracts. |
 | `krishiv-shuffle` | In-memory, local disk, object-store, and Flight-oriented shuffle support. |
-| `krishiv-state` | In-memory, redb-backed, TTL, migration, incremental state, and checkpoint/savepoint storage. |
+| `krishiv-state` | In-memory and RocksDB-backed keyed state, TTL, migration, incremental state, and checkpoint/savepoint storage. |
 | `krishiv-connectors` | Connector traits, Parquet/Kafka/S3 paths, and lakehouse helpers (`lakehouse` feature: Iceberg/Delta/Hudi). |
 | `krishiv-operator` | Kubernetes CRD and operator integration. |
 | `krishiv-ui` | Status API and web UI assets. |
@@ -121,7 +121,7 @@ Rust `krishiv` facade feature presets:
 | `minimal` | Smallest facade surface; no optional deployment capabilities. |
 | `local` | Default developer build; embedded plus single-node capabilities. |
 | `embedded` | In-process API use; intentionally has no optional dependencies. |
-| `single-node` | Local daemon/in-process cluster support with Flight SQL, shuffle, and Redb metadata. |
+| `single-node` | Local daemon/in-process cluster support with Flight SQL, shuffle, and RocksDB metadata. |
 | `distributed` | Bare remote cluster support with Flight SQL, shuffle, and etcd metadata. |
 | `bare-metal` | Alias for distributed process-managed deployments. |
 | `cluster` | Compatibility alias for `distributed`. |
@@ -135,7 +135,6 @@ Rust optional integration features:
 | `flight-sql` | Arrow Flight SQL transport/server support. |
 | `shuffle` | Shuffle service/store support. |
 | `etcd` | etcd-backed scheduler metadata and coordination. |
-| `redb` | Redb scheduler metadata option. |
 | `kafka` | Kafka connector support. |
 | `state` | Connector/state integration. |
 | `iceberg` | Iceberg lakehouse support. |
@@ -187,11 +186,11 @@ configuration:
 
 - `dev-local`: in-memory metadata/shuffle/state with ephemeral local
   checkpoints; not restart durable.
-- `single-node-durable`: local file metadata, local disk shuffle, local redb
-  state, and local filesystem checkpoints; restart durable on one host.
-- `distributed-durable`: consensus metadata, object-store shuffle/checkpoints,
-  local redb state restored from checkpoints, and fenced coordination for
-  multi-node deployments.
+- `single-node-durable`: local RocksDB metadata, local disk shuffle, local
+  RocksDB state, and local filesystem checkpoints; restart durable on one host.
+- `distributed-durable`: etcd metadata, tiered (local + object store) shuffle,
+  object-store checkpoints, local RocksDB state restored from checkpoints, and
+  fenced coordination for multi-node deployments.
 
 ## Commands
 

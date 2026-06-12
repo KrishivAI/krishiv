@@ -23,7 +23,7 @@ use krishiv_shuffle::{
     InMemoryShuffleStore, LocalDiskShuffleStore, ShuffleBackend, open_shuffle_backend_from_uri,
     open_tiered_shuffle_backend,
 };
-use krishiv_state::FjallStateBackend;
+use krishiv_state::RocksDbStateBackend;
 use krishiv_state::checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -327,7 +327,7 @@ async fn heartbeat_loop(
         open_checkpoint_storage_from_uri(&checkpoint_uri)
             .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
     let state_backend = Arc::new(
-        FjallStateBackend::open_for_profile(durability_profile, state_dir.as_deref())
+        RocksDbStateBackend::open_for_profile(durability_profile, state_dir.as_deref())
             .map_err(|e| format!("state backend: {e}"))?,
     );
 
@@ -355,8 +355,12 @@ async fn heartbeat_loop(
         // This is the preferred topology for distributed-durable deployments.
         let backend = if uri.starts_with("s3://") && shuffle_dir.is_some() {
             let local_dir = shuffle_dir.as_deref().expect("checked above");
-            open_tiered_shuffle_backend(local_dir, &uri)
-                .map_err(|e| format!("tiered shuffle (local={} s3={uri}): {e}", local_dir.display()))?
+            open_tiered_shuffle_backend(local_dir, &uri).map_err(|e| {
+                format!(
+                    "tiered shuffle (local={} s3={uri}): {e}",
+                    local_dir.display()
+                )
+            })?
         } else {
             open_shuffle_backend_from_uri(&uri, durability_profile)
                 .map_err(|e| format!("shuffle URI {uri}: {e}"))?
@@ -930,6 +934,20 @@ fn apply_shuffle_defaults(
     profile: DurabilityProfile,
 ) -> crate::ExecutorResult<(Option<std::path::PathBuf>, Option<String>)> {
     if let Some(uri) = shuffle_uri.filter(|u| !u.trim().is_empty()) {
+        // Object-store-only shuffle puts a remote round-trip on every partition
+        // read; distributed-durable requires the tiered backend (local + remote).
+        if profile == DurabilityProfile::DistributedDurable
+            && uri.starts_with("s3://")
+            && explicit_dir.is_none()
+        {
+            return Err(crate::ExecutorError::LocalExecution {
+                message: format!(
+                    "durability-profile=distributed-durable with shuffle URI '{uri}' also \
+                     requires --shuffle-dir (or KRISHIV_SHUFFLE_DIR) so the tiered \
+                     local + object-store shuffle backend can be built"
+                ),
+            });
+        }
         return Ok((explicit_dir, Some(uri)));
     }
     match (explicit_dir, profile) {
@@ -1321,6 +1339,47 @@ mod tests {
     fn default_checkpoint_uri() {
         let config = ExecutorCliConfig::parse(std::iter::empty::<String>()).unwrap();
         assert_eq!(config.checkpoint_uri, "file:///var/lib/krishiv/checkpoints");
+    }
+
+    #[test]
+    fn distributed_durable_rejects_object_store_only_shuffle() {
+        use krishiv_common::durability::DurabilityProfile;
+        let err = super::apply_shuffle_defaults(
+            None,
+            Some(String::from("s3://bucket/shuffle")),
+            DurabilityProfile::DistributedDurable,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--shuffle-dir"), "got: {err}");
+    }
+
+    #[test]
+    fn distributed_durable_accepts_tiered_shuffle_inputs() {
+        use krishiv_common::durability::DurabilityProfile;
+        let (dir, uri) = super::apply_shuffle_defaults(
+            Some(std::path::PathBuf::from("/var/lib/krishiv/shuffle")),
+            Some(String::from("s3://bucket/shuffle")),
+            DurabilityProfile::DistributedDurable,
+        )
+        .unwrap();
+        assert_eq!(
+            dir,
+            Some(std::path::PathBuf::from("/var/lib/krishiv/shuffle"))
+        );
+        assert_eq!(uri.as_deref(), Some("s3://bucket/shuffle"));
+    }
+
+    #[test]
+    fn dev_local_allows_object_store_only_shuffle() {
+        use krishiv_common::durability::DurabilityProfile;
+        let (dir, uri) = super::apply_shuffle_defaults(
+            None,
+            Some(String::from("s3://bucket/shuffle")),
+            DurabilityProfile::DevLocal,
+        )
+        .unwrap();
+        assert!(dir.is_none());
+        assert_eq!(uri.as_deref(), Some("s3://bucket/shuffle"));
     }
 
     #[test]

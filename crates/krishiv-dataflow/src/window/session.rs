@@ -439,7 +439,7 @@ mod session_state_tests {
     use super::*;
     use crate::aggregate::AggFunction;
     use arrow::datatypes::{DataType, Field, Schema};
-    use krishiv_state::{FjallStateBackend, Namespace};
+    use krishiv_state::{Namespace, RocksDbStateBackend};
 
     #[test]
     fn session_state_persist_and_restore_roundtrip() {
@@ -472,7 +472,7 @@ mod session_state_tests {
         op.process_batch(&batch, 300).expect("process");
         assert_eq!(op.open_session_count(), 1);
 
-        let mut backend = FjallStateBackend::ephemeral().unwrap();
+        let mut backend = RocksDbStateBackend::ephemeral().unwrap();
         let ns = Namespace::new("op-session", "windows");
         op.persist_to_state(&mut backend, &ns).expect("persist");
 

@@ -62,7 +62,7 @@ block-beta
     i1("Object Store<br/>S3 / GCS")
     i2("Local FS")
     i3("etcd")
-    i4("Redb")
+    i4("RocksDB")
     i5("Kafka")
   end
 
@@ -315,10 +315,37 @@ Notes:
 | Profile | Metadata | Shuffle | State | Checkpoint | Restart | Multi-node | Fencing |
 |---------|----------|---------|-------|------------|---------|------------|---------|
 | `DevLocal` | In-memory | In-memory | In-memory | Ephemeral local | No | No | No |
-| `SingleNodeDurable` | Local file | Local disk | Fjall LSM (labelled `LocalRedb` in code) | Local filesystem | Yes | No | No |
-| `DistributedDurable` | Consensus | Tiered (local + object store) | Fjall LSM restored from checkpoints | Object store | Yes | Yes | Yes |
+| `SingleNodeDurable` | RocksDB (local file) | Local disk | RocksDB LSM | Local filesystem | Yes | No | No |
+| `DistributedDurable` | etcd (consensus) | Tiered (local + object store) | RocksDB restored from checkpoints | Object store | Yes | Yes | Yes |
 
 Resolved at startup from `KRISHIV_DURABILITY_PROFILE` env var via `resolve_durability_profile()`.
+
+## Production Backends Per Deployment
+
+Concrete backend selection for each supported deployment target. `RocksDbStateBackend`
+(`krishiv-state`) is the only operator-state backend; incremental checkpointing
+(`RocksDbIncrementalCheckpointer`) depends on RocksDB SST manifests.
+
+| Deployment | Metadata | Shuffle | Operator State | Checkpoint | Leadership |
+|---|---|---|---|---|---|
+| Single-node (bare-metal / Docker / K8s single-replica) | `RocksDbMetadataStore` | `LocalDiskShuffleStore` | `RocksDbStateBackend` (file-backed) | `LocalFsCheckpointStorage` | `SingleNodeElection` |
+| Distributed bare-metal | `EtcdMetadataStore` | `TieredShuffleStore` (local + S3/MinIO) | `RocksDbStateBackend` + checkpoint restore | `ObjectStoreCheckpointStorage` | `EtcdLeaseElection` |
+| Distributed Docker Compose | `EtcdMetadataStore` | `TieredShuffleStore` + MinIO | `RocksDbStateBackend` (volume) | `ObjectStoreCheckpointStorage` + MinIO | `EtcdLeaseElection` |
+| Distributed K8s direct | `EtcdMetadataStore` | `TieredShuffleStore` + S3/GCS | `RocksDbStateBackend` (PVC) | `ObjectStoreCheckpointStorage` | `EtcdLeaseElection` |
+| Distributed K8s operator | `RocksDbMetadataStore` (PVC, single active replica) | `TieredShuffleStore` + S3/GCS | `RocksDbStateBackend` (PVC) | `ObjectStoreCheckpointStorage` | `K8sLeaseElection` |
+
+Enforcement (fail-closed at startup):
+
+- The coordinator auto-selects the metadata backend from the durability profile when
+  `--metadata-backend` is omitted: `dev-local` → in-memory, `single-node-durable` →
+  RocksDB at `/var/lib/krishiv/metadata.db`, `distributed-durable` → **error** unless
+  `--metadata-backend etcd` is explicit (`build_shared_coordinator_sync`).
+- The executor rejects an `s3://` shuffle URI without `--shuffle-dir` under
+  `distributed-durable`: object-store-only shuffle puts a remote round-trip on every
+  partition read; the tiered backend is required (`apply_shuffle_defaults`).
+- The K8s operator row needs no etcd: `K8sLeaseElection` uses the cluster's native
+  lease API for active-passive coordinator HA, and `RocksDbMetadataStore` on a PVC
+  holds metadata as long as a single replica is active.
 
 ## Checkpoint Flow
 

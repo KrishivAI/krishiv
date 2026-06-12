@@ -54,16 +54,12 @@ impl RocksDbMetadataStore {
         Self::open_at(p, None)
     }
 
-    fn open_at(
-        path: &Path,
-        _tempdir: Option<tempfile::TempDir>,
-    ) -> SchedulerResult<Self> {
+    fn open_at(path: &Path, _tempdir: Option<tempfile::TempDir>) -> SchedulerResult<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        let db = DB::open_cf_descriptors(&opts, path, all_cfs())
-            .map_err(Self::store_err)?;
+        let db = DB::open_cf_descriptors(&opts, path, all_cfs()).map_err(Self::store_err)?;
 
         let mut events = Vec::new();
         let mut jobs = Vec::new();
@@ -73,12 +69,16 @@ impl RocksDbMetadataStore {
 
         // Load events
         {
-            let cf = db.cf_handle(CF_EVENTS).ok_or_else(|| Self::store_err("missing events CF"))?;
+            let cf = db
+                .cf_handle(CF_EVENTS)
+                .ok_or_else(|| Self::store_err("missing events CF"))?;
             let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
             for item in iter {
                 let (k, v) = item.map_err(Self::store_err)?;
                 let id = u64::from_le_bytes(
-                    k[..8].try_into().map_err(|_| Self::store_err("corrupt event key"))?,
+                    k[..8]
+                        .try_into()
+                        .map_err(|_| Self::store_err("corrupt event key"))?,
                 );
                 if id >= next_event_id {
                     next_event_id = id + 1;
@@ -93,7 +93,9 @@ impl RocksDbMetadataStore {
 
         // Load jobs
         {
-            let cf = db.cf_handle(CF_JOBS).ok_or_else(|| Self::store_err("missing jobs CF"))?;
+            let cf = db
+                .cf_handle(CF_JOBS)
+                .ok_or_else(|| Self::store_err("missing jobs CF"))?;
             let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
             for item in iter {
                 let (_, v) = item.map_err(Self::store_err)?;
@@ -255,9 +257,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .db
             .cf_handle(CF_CONTINUOUS)
             .ok_or_else(|| Self::store_err("missing continuous_snapshots CF"))?;
-        self.db
-            .delete_cf(&cf, job_id)
-            .map_err(Self::store_err)?;
+        self.db.delete_cf(&cf, job_id).map_err(Self::store_err)?;
         self.continuous_snapshots.remove(job_id);
         Ok(())
     }
@@ -353,7 +353,10 @@ mod tests {
             .save_continuous_snapshot("job-1", snap.clone())
             .unwrap();
         assert_eq!(
-            store.load_continuous_snapshot("job-1").unwrap().watermark_ms,
+            store
+                .load_continuous_snapshot("job-1")
+                .unwrap()
+                .watermark_ms,
             12345
         );
         store.remove_continuous_snapshot("job-1").unwrap();

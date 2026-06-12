@@ -15,7 +15,7 @@ Environment=KRISHIV_DURABILITY_PROFILE=single-node-durable
 ExecStart=/usr/local/bin/krishiv-clusterd \
     --grpc-addr 0.0.0.0:9090 \
     --http-addr 0.0.0.0:18080 \
-    --metadata-backend redb \
+    --metadata-backend rocksdb \
     --metadata-path /var/lib/krishiv/metadata.db \
     --durability-profile single-node-durable
 Restart=always

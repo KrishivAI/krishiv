@@ -110,13 +110,11 @@ cargo check -p krishiv-scheduler  # baseline before the async trait flip
 **Problems fixed:**
 - `docs/README.md` and `docs/architecture.md` listed `SingleNode + LocalInProcess` as a valid
   mode pair; the code (`execution_runtime.rs:613-616`) rejects it.
-- `docs/architecture.md` durability profile table listed "Redb" for state (actual impl: Fjall LSM,
-  named `LocalRedb` only historically).
+- `docs/architecture.md` durability profile table listed "Redb" for state. The real backend is
+  `RocksDbStateBackend`; "Fjall" survived only as an uncompiled orphan file plus a
+  `type FjallStateBackend = RocksDbStateBackend` source-compat alias (both removed in the
+  backend-consolidation follow-up, see #9 below).
 - `docs/architecture.md` distributed-durable shuffle listed as `Object store` (now `Tiered`).
-
-**RocksDB feature gate:** `krishiv-state` compiles both `FjallStateBackend` and `RocksDbStateBackend`
-unconditionally. Feature-gating RocksDB would cut binary size but requires updating all
-downstream dep declarations. Left for a focused cleanup session.
 
 ---
 
@@ -128,11 +126,47 @@ no fencing) despite being intended as a production bare-metal artifact.
 
 **Fix:** Both unit files updated:
 - `KRISHIV_DURABILITY_PROFILE=single-node-durable` set in environment.
-- `--metadata-backend redb --metadata-path /var/lib/krishiv/metadata.db` for durable metadata.
+- `--metadata-backend rocksdb --metadata-path /var/lib/krishiv/metadata.db` for durable metadata.
 - `krishiv-executor@.service`: explicit `--shuffle-dir /var/lib/krishiv/shuffle`,
   `--state-dir /var/lib/krishiv/state-%i`, `--checkpoint-uri file:///var/lib/krishiv/checkpoints`.
 - Per-instance state dirs (`state-%i`) prevent multiple executors on the same host from sharing
   a state directory.
+
+---
+
+## #9 — Backend consolidation: production-ready backends per deployment ✅ DONE
+
+**Problem:** Storage backend sprawl with dead code and misleading names:
+- `krishiv-state/src/fjall_backend.rs` was an orphaned file: never declared in `lib.rs`,
+  `fjall` absent from `Cargo.toml`, so it never compiled. The exported `FjallStateBackend`
+  was a `type` alias for `RocksDbStateBackend`.
+- `krishiv-scheduler/src/redb_metadata.rs` was a one-line `type RedbMetadataStore =
+  RocksDbMetadataStore` alias.
+- `StateDurability::LocalRedb{,WithCheckpointRestore}` named a backend two migrations old
+  (redb → fjall → rocksdb).
+- The coordinator silently defaulted to in-memory metadata under durable profiles.
+- An `s3://` shuffle URI without `--shuffle-dir` silently selected object-store-only
+  shuffle in distributed mode (remote round-trip on every partition read).
+
+**Fix:**
+- Deleted `fjall_backend.rs` and the `FjallStateBackend` alias; all call sites renamed to
+  `RocksDbStateBackend` (`krishiv-state`, `krishiv-executor`, `krishiv-dataflow`).
+  RocksDB is the architectural commitment: `RocksDbIncrementalCheckpointer` depends on
+  RocksDB SST manifests for incremental checkpoints.
+- Deleted `redb_metadata.rs` and the `RedbMetadataStore` export; the daemon still accepts
+  `--metadata-backend redb` as a flag alias for `rocksdb`.
+- Renamed `StateDurability::LocalRedb*` → `LocalRocksDb*` in `krishiv-common/durability.rs`.
+- `build_shared_coordinator_sync` now auto-selects the metadata backend from the durability
+  profile when `--metadata-backend` is omitted: `dev-local` → memory, `single-node-durable`
+  → RocksDB at `/var/lib/krishiv/metadata.db`, `distributed-durable` → fail-closed error
+  requiring explicit `--metadata-backend etcd`.
+- `apply_shuffle_defaults` (executor CLI) rejects `s3://` shuffle URIs without
+  `--shuffle-dir` under `distributed-durable`, forcing the tiered backend.
+- `deploy/systemd/krishiv-clusterd.service` switched to the canonical
+  `--metadata-backend rocksdb` name.
+- Docs: removed the nonexistent `redb` Cargo feature from `docs/README.md`; corrected all
+  Fjall/redb references to RocksDB; added a "Production Backends Per Deployment" matrix to
+  `docs/architecture.md` covering bare-metal, Docker, K8s direct, and K8s operator modes.
 
 ---
 

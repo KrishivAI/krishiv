@@ -48,11 +48,12 @@ impl EtcdMetadataStore {
     /// Connect to etcd and load all job and executor records from their
     /// individual keys.
     pub async fn connect(endpoints: Vec<String>) -> SchedulerResult<Self> {
-        let mut client = Client::connect(endpoints, None)
-            .await
-            .map_err(|e| SchedulerError::Transport {
-                message: format!("etcd metadata connect failed: {e}"),
-            })?;
+        let mut client =
+            Client::connect(endpoints, None)
+                .await
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("etcd metadata connect failed: {e}"),
+                })?;
 
         let jobs = load_prefix::<PersistedJobRecord, JobRecord>(&mut client, JOB_KEY_PREFIX)
             .await
@@ -152,10 +153,7 @@ impl MetadataStore for EtcdMetadataStore {
         &mut self,
         descriptor: &krishiv_proto::ExecutorDescriptor,
     ) -> SchedulerResult<()> {
-        let key = format!(
-            "{EXECUTOR_KEY_PREFIX}{}",
-            descriptor.executor_id().as_str()
-        );
+        let key = format!("{EXECUTOR_KEY_PREFIX}{}", descriptor.executor_id().as_str());
         let persisted = PersistedExecutorDescriptor::from(descriptor);
         let bytes = serde_json::to_vec(&persisted).map_err(|e| SchedulerError::Transport {
             message: format!(
@@ -229,10 +227,18 @@ where
 
     let mut results = Vec::with_capacity(resp.kvs().len());
     for kv in resp.kvs() {
-        let persisted: P = serde_json::from_slice(kv.value())
-            .map_err(|e| format!("etcd decode failed for key {}: {e}", kv.key_str().unwrap_or("?")))?;
-        let record = T::try_from(persisted)
-            .map_err(|e| format!("etcd record convert failed for key {}: {e}", kv.key_str().unwrap_or("?")))?;
+        let persisted: P = serde_json::from_slice(kv.value()).map_err(|e| {
+            format!(
+                "etcd decode failed for key {}: {e}",
+                kv.key_str().unwrap_or("?")
+            )
+        })?;
+        let record = T::try_from(persisted).map_err(|e| {
+            format!(
+                "etcd record convert failed for key {}: {e}",
+                kv.key_str().unwrap_or("?")
+            )
+        })?;
         results.push(record);
     }
     Ok(results)
@@ -242,9 +248,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{
-        EventLogEvent, PersistedExecutorDescriptor, PersistedJobRecord,
-    };
+    use crate::store::{EventLogEvent, PersistedExecutorDescriptor, PersistedJobRecord};
     use krishiv_proto::{ExecutorDescriptor, ExecutorId, JobId};
 
     #[test]

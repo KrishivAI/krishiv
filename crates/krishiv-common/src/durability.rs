@@ -42,7 +42,7 @@ impl DurabilityProfile {
                 profile: self,
                 metadata: MetadataDurability::LocalFile,
                 shuffle: ShuffleDurability::LocalDisk,
-                state: StateDurability::LocalRedb,
+                state: StateDurability::LocalRocksDb,
                 checkpoint: CheckpointDurability::LocalFilesystem,
                 restart_durable: true,
                 multi_node_safe: false,
@@ -54,7 +54,7 @@ impl DurabilityProfile {
                 // Tiered: local-disk first for fast P2P fetches, async-backed by
                 // object store for durability across executor restarts and node loss.
                 shuffle: ShuffleDurability::Tiered,
-                state: StateDurability::LocalRedbWithCheckpointRestore,
+                state: StateDurability::LocalRocksDbWithCheckpointRestore,
                 checkpoint: CheckpointDurability::ObjectStore,
                 restart_durable: true,
                 multi_node_safe: true,
@@ -68,7 +68,6 @@ impl DurabilityProfile {
         &["dev-local", "single-node-durable", "distributed-durable"]
     }
 }
-
 
 impl fmt::Display for DurabilityProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -149,10 +148,10 @@ pub enum ShuffleDurability {
 pub enum StateDurability {
     /// In-memory operator state.
     Memory,
-    /// File-backed embedded state on one host (Fjall LSM; historically named redb).
-    LocalRedb,
-    /// Local embedded state restored from distributed checkpoints.
-    LocalRedbWithCheckpointRestore,
+    /// File-backed embedded state on one host (RocksDB LSM).
+    LocalRocksDb,
+    /// Local RocksDB state restored from distributed checkpoints.
+    LocalRocksDbWithCheckpointRestore,
 }
 
 /// Checkpoint durability class.

@@ -1,5 +1,55 @@
 # Krishiv Implementation Status
 
+## Backend consolidation: production-ready backends per deployment (2026-06-12)
+
+### Done
+
+Implemented improvement #9 (see `docs/implementation/architecture_improvements.md`):
+one production backend per component, fail-closed profile enforcement.
+
+- **Removed Fjall debris**: deleted orphaned `krishiv-state/src/fjall_backend.rs`
+  (never declared in `lib.rs`; `fjall` was not even a Cargo dependency) and the
+  `type FjallStateBackend = RocksDbStateBackend` alias. All call sites in
+  `krishiv-state`, `krishiv-executor`, and `krishiv-dataflow` renamed to
+  `RocksDbStateBackend`. RocksDB is the committed state backend —
+  `RocksDbIncrementalCheckpointer` depends on RocksDB SST manifests.
+- **Removed `RedbMetadataStore` alias**: deleted `krishiv-scheduler/src/redb_metadata.rs`;
+  the daemon keeps accepting `--metadata-backend redb` as a flag alias for `rocksdb`.
+- **Renamed `StateDurability::LocalRedb{,WithCheckpointRestore}`** →
+  `LocalRocksDb{,WithCheckpointRestore}` (`krishiv-common/src/durability.rs`).
+- **Coordinator metadata auto-selection** (`build_shared_coordinator_sync`): with no
+  `--metadata-backend`, the durability profile decides — `dev-local` → in-memory,
+  `single-node-durable` → RocksDB at `/var/lib/krishiv/metadata.db`,
+  `distributed-durable` → startup error requiring explicit `--metadata-backend etcd`.
+- **Tiered-shuffle enforcement** (`apply_shuffle_defaults`): `distributed-durable`
+  rejects an `s3://` shuffle URI without `--shuffle-dir`; object-store-only shuffle is
+  no longer silently selectable in distributed mode. 3 new unit tests.
+- **systemd**: `krishiv-clusterd.service` uses canonical `--metadata-backend rocksdb`.
+- **Docs**: removed nonexistent `redb` Cargo feature from `docs/README.md`; corrected
+  all Fjall/redb references to RocksDB; added "Production Backends Per Deployment"
+  matrix (bare-metal / Docker / K8s direct / K8s operator) to `docs/architecture.md`.
+
+### Validation
+```bash
+cargo check --workspace               # clean (pre-existing warnings only)
+cargo test -p krishiv-common --lib    # 73 passed
+cargo test -p krishiv-state           # 304 + 4 + 2 passed
+cargo test -p krishiv-dataflow --lib  # passed
+cargo test -p krishiv-executor --lib  # passed (3 new shuffle-guard tests)
+cargo test -p krishiv-scheduler --lib # passed
+```
+
+### Blockers
+None.
+
+### Next useful task
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+# Optional: docker-compose deployment example (etcd + MinIO + coordinator + executors)
+```
+
+---
+
 ## Architecture: execution-mode improvements (2026-06-12)
 
 ### Done

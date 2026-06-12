@@ -33,6 +33,9 @@ use crate::RocksDbMetadataStore;
 #[cfg(feature = "etcd")]
 use crate::{EtcdLeaseElection, EtcdMetadataStore};
 
+/// Default RocksDB metadata path auto-selected under `single-node-durable`.
+const DEFAULT_SINGLE_NODE_METADATA_PATH: &str = "/var/lib/krishiv/metadata.db";
+
 const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";
 const COORDINATOR_BEARER_TOKEN_ENV: &str = crate::auth::COORDINATOR_BEARER_TOKEN_ENV;
 const COORDINATOR_BEARER_TOKENS_ENV: &str = crate::auth::COORDINATOR_BEARER_TOKENS_ENV;
@@ -161,13 +164,11 @@ pub fn build_shared_coordinator_sync(
 ) -> Result<SharedCoordinator, Box<dyn Error>> {
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
         .map_err(|error| format!("invalid coordinator id: {error}"))?;
-    // `mut` is required when the `redb` or `etcd` features are enabled so the
-    // `recover_from_store` arm can take `&mut self`; in the default in-memory
-    // build the binding is read-only.
+    // `mut` is required so the `recover_from_store` arms can take `&mut self`.
     #[allow(unused_mut)]
     let mut coord = Coordinator::active(coordinator_id);
     let coordinator = match (config.metadata_backend.as_deref(), &config.metadata_path) {
-        (Some("memory"), _) | (None, None) => {
+        (Some("memory"), _) => {
             // InMemoryMetadataStore is the correct default for embedded/test use.
             SharedCoordinator::new(attach_metadata_store(
                 coord,
@@ -175,6 +176,41 @@ pub fn build_shared_coordinator_sync(
                 config,
             ))
         }
+        // No backend specified: select one from the durability profile so
+        // durable deployments cannot silently run on in-memory metadata.
+        (None, None) => match config.durability_profile {
+            DurabilityProfile::DevLocal => SharedCoordinator::new(attach_metadata_store(
+                coord,
+                InMemoryMetadataStore::default(),
+                config,
+            )),
+            DurabilityProfile::SingleNodeDurable => {
+                let path = PathBuf::from(DEFAULT_SINGLE_NODE_METADATA_PATH);
+                tracing::info!(
+                    path = %path.display(),
+                    "single-node-durable: auto-selecting rocksdb metadata store \
+                     (set --metadata-backend/--metadata-path to override)"
+                );
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("create metadata dir '{}': {e}", parent.display()))?;
+                }
+                let store = RocksDbMetadataStore::open(path.as_path())
+                    .map_err(|e| format!("rocksdb store '{}': {e}", path.display()))?;
+                coord
+                    .recover_from_store(&store)
+                    .map_err(|e| format!("coordinator recovery failed: {e}"))?;
+                SharedCoordinator::new(attach_metadata_store(coord, store, config))
+            }
+            DurabilityProfile::DistributedDurable => {
+                return Err(
+                    "durability-profile=distributed-durable requires an explicit shared \
+                     metadata backend: --metadata-backend etcd --etcd-endpoints <HOSTS> \
+                     (in-memory or single-host rocksdb metadata is not multi-node safe)"
+                        .into(),
+                );
+            }
+        },
         #[cfg(feature = "etcd")]
         (Some("etcd"), _) => {
             if config.etcd_endpoints.is_empty() {
@@ -243,8 +279,8 @@ pub async fn run_cluster_control_plane(
 
     let coordinator = ccp.shared_coordinator().clone();
     let in_flight = InFlightTracker::new();
-    let tls_config = server_tls_config_from_env()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let tls_config =
+        server_tls_config_from_env().map_err(|e| std::io::Error::other(e.to_string()))?;
     let grpc_serve = serve_coordinator_executor_grpc_with_listener_and_tracker(
         listener,
         coordinator.clone(),
@@ -779,11 +815,10 @@ pub fn parse_coordinator_daemon_config(
             "--insecure" => config.insecure = true,
             "--flight-addr" => {
                 let value = next_daemon_arg(&mut args, "--flight-addr")?;
-                config.flight_addr = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("invalid socket address for --flight-addr: {value}"))?,
-                );
+                config.flight_addr =
+                    Some(value.parse().map_err(|_| {
+                        format!("invalid socket address for --flight-addr: {value}")
+                    })?);
             }
             "--help" | "-h" => config.help = true,
             unknown => {
@@ -815,22 +850,18 @@ fn validate_durability_profile_config(
         DurabilityProfile::DevLocal => Ok(()),
         DurabilityProfile::SingleNodeDurable => {
             // Only rocksdb gives real crash-recovery for coordinator metadata.
+            // `None` is allowed: build_shared_coordinator_sync auto-selects
+            // rocksdb at the default path under this profile.
             match config.metadata_backend.as_deref() {
-                Some("rocksdb" | "redb") => {}
+                Some("rocksdb" | "redb") | None => {}
                 Some(other) => {
                     return Err(format!(
-                        "single-node-durable requires --metadata-backend redb; got '{other}'"
+                        "single-node-durable requires --metadata-backend rocksdb; got '{other}'"
                     )
                     .into());
                 }
-                None => {
-                    return Err(
-                        "single-node-durable requires --metadata-backend redb and --metadata-path <path>"
-                            .into(),
-                    );
-                }
             }
-            if config.metadata_path.is_none() {
+            if config.metadata_backend.is_some() && config.metadata_path.is_none() {
                 return Err("single-node-durable requires --metadata-path".into());
             }
             if config.shuffle_dir.is_none() {
@@ -1027,8 +1058,8 @@ pub async fn run_standalone_coordinator(
     tracing::info!(coordinator_id = %config.coordinator_id, addr = %listener.local_addr()?, "Krishiv coordinator gRPC listening");
 
     let in_flight = InFlightTracker::new();
-    let tls_config = server_tls_config_from_env()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let tls_config =
+        server_tls_config_from_env().map_err(|e| std::io::Error::other(e.to_string()))?;
     let grpc_serve = serve_coordinator_executor_grpc_with_listener_and_tracker(
         listener,
         coordinator.clone(),
@@ -1288,12 +1319,21 @@ pub async fn run_job_coordinator_daemon(
 #[cfg(test)]
 mod parse_tests {
     use super::{
-        coordinator_daemon_help, parse_coordinator_daemon_config, render_metrics_body,
-        validate_runtime_security_config,
+        CoordinatorDaemonConfig, build_shared_coordinator_sync, coordinator_daemon_help,
+        parse_coordinator_daemon_config, render_metrics_body, validate_runtime_security_config,
     };
     use crate::{Coordinator, SharedCoordinator};
     use krishiv_common::durability::DurabilityProfile;
     use krishiv_proto::CoordinatorId;
+
+    #[test]
+    fn build_coordinator_rejects_distributed_durable_without_explicit_backend() {
+        // Defense-in-depth for programmatically built configs: the durable
+        // distributed profile must never fall back to in-memory metadata.
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DistributedDurable);
+        let err = build_shared_coordinator_sync(&config).unwrap_err();
+        assert!(err.to_string().contains("etcd"), "error: {err}");
+    }
 
     #[test]
     fn parses_defaults() {
@@ -1377,7 +1417,22 @@ mod parse_tests {
             String::from("/tmp/krishiv-shuffle"),
         ])
         .unwrap_err();
-        assert!(err.to_string().contains("redb"), "error: {err}");
+        assert!(err.to_string().contains("rocksdb"), "error: {err}");
+    }
+
+    #[test]
+    fn single_node_durable_allows_omitted_metadata_backend_for_auto_selection() {
+        // build_shared_coordinator_sync auto-selects rocksdb at the default
+        // path when no backend is given under single-node-durable.
+        let config = parse_coordinator_daemon_config([
+            String::from("--durability-profile"),
+            String::from("single-node-durable"),
+            String::from("--shuffle-dir"),
+            String::from("/tmp/krishiv-shuffle"),
+        ])
+        .unwrap();
+        assert!(config.metadata_backend.is_none());
+        assert!(config.metadata_path.is_none());
     }
 
     #[test]

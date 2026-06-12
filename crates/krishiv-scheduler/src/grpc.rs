@@ -801,9 +801,8 @@ fn trace_and_auth_interceptor(
 ///
 /// Returns `Ok(None)` when the env vars are absent (plaintext mode).
 /// Returns an error when only one of cert/key is set, or when a file cannot be read.
-pub fn server_tls_config_from_env(
-) -> Result<Option<tonic::transport::ServerTlsConfig>, Box<dyn std::error::Error + Send + Sync>>
-{
+pub fn server_tls_config_from_env()
+-> Result<Option<tonic::transport::ServerTlsConfig>, Box<dyn std::error::Error + Send + Sync>> {
     let cert_path = std::env::var("KRISHIV_TLS_CERT").ok();
     let key_path = std::env::var("KRISHIV_TLS_KEY").ok();
     match (cert_path, key_path) {

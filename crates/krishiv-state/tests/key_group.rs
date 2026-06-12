@@ -3,7 +3,7 @@
 use krishiv_state::key_group::{
     NUM_KEY_GROUPS, key_group_for_key, key_group_ranges_for_parallelism,
 };
-use krishiv_state::{FjallStateBackend, Namespace, StateBackend};
+use krishiv_state::{Namespace, RocksDbStateBackend, StateBackend};
 
 #[test]
 fn keys_hash_into_valid_key_groups() {
@@ -21,7 +21,7 @@ fn parallelism_four_covers_all_groups() {
 
 #[test]
 fn state_backend_exposes_full_key_group_range_by_default() {
-    let backend = FjallStateBackend::ephemeral().unwrap();
+    let backend = RocksDbStateBackend::ephemeral().unwrap();
     let range = backend.key_group_range();
     assert_eq!(*range.start(), 0);
     assert_eq!(*range.end(), NUM_KEY_GROUPS - 1);
@@ -29,10 +29,10 @@ fn state_backend_exposes_full_key_group_range_by_default() {
 
 #[test]
 fn put_get_roundtrip_with_key_group_prefix_in_redb() {
-    use krishiv_state::FjallStateBackend;
+    use krishiv_state::RocksDbStateBackend;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let mut backend = FjallStateBackend::open(&path).unwrap();
+    let mut backend = RocksDbStateBackend::open(&path).unwrap();
     let ns = Namespace::new("op", "state");
     backend.put(&ns, b"k".to_vec(), b"v".to_vec()).unwrap();
     assert_eq!(backend.get(&ns, b"k").unwrap().unwrap(), b"v");

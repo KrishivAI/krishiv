@@ -2378,7 +2378,7 @@ mod executor_tests {
 
     use krishiv_proto::InitiateCheckpointRequest;
     use krishiv_state::checkpoint::{CheckpointStorage, LocalFsCheckpointStorage, snapshot_path};
-    use krishiv_state::{FjallStateBackend, StateBackend};
+    use krishiv_state::{RocksDbStateBackend, StateBackend};
 
     use crate::runner::TaskRunner;
 
@@ -2454,7 +2454,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-cp-1").unwrap();
         let mut runner = TaskRunner::new(task_id.clone());
 
-        let mut backend = FjallStateBackend::ephemeral().unwrap();
+        let mut backend = RocksDbStateBackend::ephemeral().unwrap();
         let ns = krishiv_state::Namespace::new("operator-task-cp-1", "my-state");
         backend
             .put(&ns, b"key1".to_vec(), b"value1".to_vec())
@@ -2490,7 +2490,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-cp-path").unwrap();
         let mut runner = TaskRunner::new(task_id.clone());
 
-        let mut backend_with_state = FjallStateBackend::ephemeral().unwrap();
+        let mut backend_with_state = RocksDbStateBackend::ephemeral().unwrap();
         let ns = krishiv_state::Namespace::new("operator-task-cp-path", "data");
         backend_with_state
             .put(&ns, b"k".to_vec(), b"v".to_vec())
@@ -2537,7 +2537,7 @@ mod executor_tests {
                 offset: 7,
             },
         ]);
-        let backend = FjallStateBackend::ephemeral().unwrap();
+        let backend = RocksDbStateBackend::ephemeral().unwrap();
 
         let req = InitiateCheckpointRequest {
             job_id: job_id.clone(),
@@ -2572,7 +2572,7 @@ mod executor_tests {
         let task_id = TaskId::try_new("task-cp-stale").unwrap();
         let job_id = JobId::try_new("job-cp-stale").unwrap();
         let mut runner = TaskRunner::new(task_id.clone());
-        let backend = FjallStateBackend::ephemeral().unwrap();
+        let backend = RocksDbStateBackend::ephemeral().unwrap();
 
         let req5 = InitiateCheckpointRequest {
             job_id: job_id.clone(),
@@ -2609,7 +2609,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-cp-write-fail").unwrap();
         let mut runner = TaskRunner::new(TaskId::try_new("task-cp-write-fail").unwrap());
 
-        let mut backend = FjallStateBackend::ephemeral().unwrap();
+        let mut backend = RocksDbStateBackend::ephemeral().unwrap();
         let ns = krishiv_state::Namespace::new("operator-task-cp-write-fail", "state");
         backend.put(&ns, b"k".to_vec(), b"v".to_vec()).unwrap();
 
@@ -2690,7 +2690,7 @@ mod executor_tests {
         }
 
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
-        let backend = FjallStateBackend::ephemeral().unwrap();
+        let backend = RocksDbStateBackend::ephemeral().unwrap();
         let coordinator = RecordingCoordinator::default();
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
         let assignment = ExecutorTaskAssignment::new(
@@ -2795,7 +2795,7 @@ mod executor_tests {
         }
 
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
-        let backend = FjallStateBackend::ephemeral().unwrap();
+        let backend = RocksDbStateBackend::ephemeral().unwrap();
         let coordinator = FlakyCoordinator::default();
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
         let assignment = ExecutorTaskAssignment::new(
@@ -2906,7 +2906,7 @@ mod executor_tests {
         running_attempts.insert(task_id.as_str().to_string(), attempt);
 
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
-        let backend = FjallStateBackend::ephemeral().unwrap();
+        let backend = RocksDbStateBackend::ephemeral().unwrap();
         let coordinator = RecordingCoordinator::default();
         let exec_id = ExecutorId::try_new("exec-checkpoint-fanout").unwrap();
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())

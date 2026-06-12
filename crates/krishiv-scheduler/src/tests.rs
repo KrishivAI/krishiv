@@ -21,9 +21,8 @@ mod scheduler_tests {
         CheckpointCoordinatorState, Coordinator, CoordinatorConfig,
         CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry, InMemoryQueueManager,
         InProcessCoordinatorBridge, LeaderElection, MetadataStore, NamespaceQuotaSnapshot,
-        QueueManager, SchedulerError, SharedCoordinator,
-        SingleNodeElection, StaticScheduler, SubmitOutcome, TaskUpdateOutcome,
-        job_spec_from_logical_plan, job_spec_from_physical_plan,
+        QueueManager, SchedulerError, SharedCoordinator, SingleNodeElection, StaticScheduler,
+        SubmitOutcome, TaskUpdateOutcome, job_spec_from_logical_plan, job_spec_from_physical_plan,
         serve_coordinator_executor_grpc_with_listener,
     };
 
@@ -2685,8 +2684,7 @@ mod scheduler_tests {
 
         let reopened = crate::rocksdb_metadata::RocksDbMetadataStore::open(&path).unwrap();
         assert_eq!(reopened.events().len(), 1);
-        let mut recovered =
-            Coordinator::active(CoordinatorId::try_new("coord-rocksdb-2").unwrap());
+        let mut recovered = Coordinator::active(CoordinatorId::try_new("coord-rocksdb-2").unwrap());
         recovered.recover_from_store(&reopened).unwrap();
         let snapshot = recovered.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.task_count(), 1);

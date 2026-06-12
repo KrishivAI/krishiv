@@ -301,7 +301,6 @@ impl Coordinator {
                 self.job_inline_results.remove(&job_id);
             }
             self.queue_manager.on_job_complete(&job_id, &usage);
-
         }
         if let Some(record) = self
             .job_coordinators
