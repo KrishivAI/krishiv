@@ -10,12 +10,14 @@
 mod auto_partition;
 mod broadcast;
 mod coalesce;
+mod join_reorder;
 mod predicate_pushdown;
 mod small_file;
 
 pub use auto_partition::AutoPartitionRule;
 pub use broadcast::{BroadcastAutoRule, DEFAULT_BROADCAST_THRESHOLD_ROWS};
 pub use coalesce::{CoalesceAdvice, CoalesceRule};
+pub use join_reorder::JoinReorderRule;
 pub use predicate_pushdown::PredicatePushdownRule;
 pub use small_file::{FileStats, SmallFilePlanner, SplitPlanAdvice};
 
@@ -591,10 +593,16 @@ impl Default for AqeOptimizer {
 
 pub fn default_logical_optimizer() -> Optimizer {
     let mut optimizer = Optimizer::new();
+    // 1. Push filters into scans so that estimated_rows on scan nodes reflect
+    //    the actual filtered size before join ordering kicks in.
+    optimizer.add_rule(Box::new(PredicatePushdownRule));
+    // 2. Mark small scan nodes as broadcast-eligible (uses estimated_rows).
     optimizer.add_rule(Box::new(BroadcastAutoRule::new(
         DEFAULT_BROADCAST_THRESHOLD_ROWS,
     )));
-    optimizer.add_rule(Box::new(PredicatePushdownRule));
+    // 3. Reorder commutative join inputs so the smaller table is on the left,
+    //    minimising intermediate result sizes in left-deep join trees.
+    optimizer.add_rule(Box::new(JoinReorderRule));
     optimizer
 }
 

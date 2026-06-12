@@ -1,5 +1,58 @@
 # Krishiv Implementation Status
 
+## Phase 2 (cont.): Column statistics, cardinality estimation, join reordering (2026-06-12)
+
+### Done
+
+**2.7 — Column statistics, cardinality estimation, join reordering**
+
+- **`crates/krishiv-plan/src/statistics.rs`** (new):
+  - `ColumnStats` — per-column stats (row_count, null_fraction, distinct_count_estimate, min/max values)
+  - `TableStats` — per-table stats with `estimate_after_filters(&[String]) -> u64`; predicate selectivity
+    uses NDV for equality (`1/NDV`), `1/3` for range, per-column null_fraction for `IS NULL`
+  - `CardinalityEstimator` — walks a `LogicalPlan` in topological order and fills in missing
+    `estimated_rows` per node: Scan from table stats + filter selectivity; Filter at 50%;
+    Inner join via geometric-mean heuristic; Aggregate at 10% for grouped, 1 row for global;
+    Project/Exchange pass-through; Unnest ×5; Outer/semi/anti joins use preserved-side size
+  - Pre-existing `estimated_rows` on nodes are respected and not overridden
+
+- **`crates/krishiv-plan/src/optimizer/join_reorder.rs`** (new):
+  - `JoinReorderRule` — for `NodeOp::Join { Inner | Cross }` with 2 inputs and known
+    `estimated_rows`, swaps inputs when the right input is strictly smaller than the left so the
+    smaller table is on the left (outer side, driving side for sort-merge; minimises intermediate
+    result sizes in left-deep trees)
+  - Non-commutative types (Left, Right, Full, Semi, Anti) are never touched
+  - Missing estimates treated as `u64::MAX` so nodes with known size sort to the left
+
+- **`crates/krishiv-plan/src/optimizer.rs`** (updated):
+  - Declares `mod join_reorder;` and re-exports `JoinReorderRule`
+  - `default_logical_optimizer()` now runs 3 rules in order:
+    1. `PredicatePushdownRule` — push filters into scans before any cardinality reasoning
+    2. `BroadcastAutoRule` — mark small scans broadcast-eligible using `estimated_rows`
+    3. `JoinReorderRule` — reorder commutative join inputs to put smaller table on left
+
+- **`crates/krishiv-plan/src/lib.rs`** (updated):
+  - Added `pub mod statistics;`
+
+### Validation
+```
+cargo check --workspace              # clean (1 pre-existing warning in krishiv-flight-sql)
+cargo test -p krishiv-plan --lib     # 385 passed
+cargo test -p krishiv-scheduler --lib # 296 passed
+```
+
+### Blockers
+None.
+
+### Next useful tasks (Phase 2 remaining)
+- **2.3** Distributed sink stage: temp-file + coordinator-commit protocol, write modes, partitioned writes
+- **2.6** Post-restart shuffle availability audit; chaos/failure injection test suite
+- **2.8** Partition salting/range-splitting for skew mitigation
+- **2.9** BroadcastRuntimeRule AQE guarded rule
+- **2.10** Distributed benchmark harness (multi-executor in-process cluster, SF1→SF10→SF100)
+
+---
+
 ## Phase 2: Distributed batch reliability — memory limits + shuffle retry (2026-06-12)
 
 ### Done
