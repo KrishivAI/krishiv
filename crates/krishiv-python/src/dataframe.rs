@@ -82,6 +82,123 @@ impl PyDataFrame {
         self.inner.explain_logical()
     }
 
+    #[pyo3(signature = (mode="physical"))]
+    pub fn explain_mode(&self, py: Python<'_>, mode: &str) -> PyResult<String> {
+        let mode = match mode {
+            "logical" => krishiv_api::ExplainMode::Logical,
+            "physical" => krishiv_api::ExplainMode::Physical,
+            "analyze" => krishiv_api::ExplainMode::Analyze,
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "unknown explain mode '{other}'; expected logical, physical, or analyze"
+                )));
+            }
+        };
+        let inner = self.inner.clone();
+        py.detach(move || inner.explain_with(mode).map_err(map_krishiv_error))
+    }
+
+    pub fn select(&self, columns: Vec<String>) -> PyResult<Self> {
+        let refs = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner
+            .select(&refs)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn select_exprs(&self, expressions: Vec<String>) -> PyResult<Self> {
+        let expressions = expressions
+            .into_iter()
+            .map(krishiv_api::Expr::raw)
+            .collect::<Vec<_>>();
+        self.inner
+            .select_exprs(&expressions)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn filter(&self, predicate: String) -> PyResult<Self> {
+        self.inner
+            .filter(&predicate)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn limit(&self, n: usize) -> PyResult<Self> {
+        self.inner
+            .limit(n)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn distinct(&self) -> PyResult<Self> {
+        self.inner
+            .distinct()
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    #[pyo3(signature = (columns, descending=None))]
+    pub fn sort(&self, columns: Vec<String>, descending: Option<Vec<bool>>) -> PyResult<Self> {
+        let descending = descending.unwrap_or_else(|| vec![false; columns.len()]);
+        let refs = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner
+            .sort(&refs, &descending)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn drop_columns(&self, columns: Vec<String>) -> PyResult<Self> {
+        let refs = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner
+            .drop(&refs)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn rename(&self, old: String, new: String) -> PyResult<Self> {
+        self.inner
+            .rename(&old, &new)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn with_column(&self, name: String, expression: String) -> PyResult<Self> {
+        self.inner
+            .with_column(&name, &expression)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn fill_null(&self, column: String, value: String) -> PyResult<Self> {
+        self.inner
+            .fill_null(&column, &value)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn group_by(&self, expressions: Vec<String>) -> PyGroupedDataFrame {
+        PyGroupedDataFrame {
+            dataframe: self.inner.clone(),
+            group_exprs: expressions,
+        }
+    }
+
+    pub fn write_parquet(&self, py: Python<'_>, path: String) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.detach(move || inner.write_parquet(&path).map_err(map_krishiv_error))
+    }
+
+    pub fn write_csv(&self, py: Python<'_>, path: String) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.detach(move || inner.write_csv(&path).map_err(map_krishiv_error))
+    }
+
+    pub fn write_json(&self, py: Python<'_>, path: String) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.detach(move || inner.write_json(&path).map_err(map_krishiv_error))
+    }
+
     pub fn num_rows(&self, py: Python<'_>) -> PyResult<usize> {
         let inner = self.inner.clone();
         py.detach(move || {
@@ -94,6 +211,47 @@ impl PyDataFrame {
 
     pub fn __repr__(&self) -> String {
         format!("DataFrame(plan={})", self.inner.explain_logical())
+    }
+}
+
+#[pyclass(name = "GroupedDataFrame")]
+pub struct PyGroupedDataFrame {
+    dataframe: krishiv_api::DataFrame,
+    group_exprs: Vec<String>,
+}
+
+#[pymethods]
+impl PyGroupedDataFrame {
+    pub fn agg(&self, expressions: Vec<String>) -> PyResult<PyDataFrame> {
+        let groups = self
+            .group_exprs
+            .iter()
+            .cloned()
+            .map(krishiv_api::Expr::raw)
+            .collect::<Vec<_>>();
+        let aggregates = expressions
+            .into_iter()
+            .map(krishiv_api::Expr::raw)
+            .collect::<Vec<_>>();
+        self.dataframe
+            .group_by(&groups)
+            .agg(&aggregates)
+            .map(|inner| PyDataFrame { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn count(&self) -> PyResult<PyDataFrame> {
+        let groups = self
+            .group_exprs
+            .iter()
+            .cloned()
+            .map(krishiv_api::Expr::raw)
+            .collect::<Vec<_>>();
+        self.dataframe
+            .group_by(&groups)
+            .count()
+            .map(|inner| PyDataFrame { inner })
+            .map_err(map_krishiv_error)
     }
 }
 

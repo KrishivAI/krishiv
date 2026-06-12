@@ -14,6 +14,8 @@ use krishiv_runtime::{
 use krishiv_sql::KrishivDataFrameOps;
 
 use crate::error::{KrishivError, Result};
+use crate::expression::Expr;
+use crate::io::DataFrameWriter;
 use crate::types::{ExecutionMode, QueryResult};
 
 /// Unified execution result for [`DataFrame::execute`].
@@ -63,6 +65,21 @@ impl ExecutionResult {
     }
 }
 
+/// Explain output requested by [`DataFrame::explain_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainMode {
+    Logical,
+    Physical,
+    Analyze,
+}
+
+/// Lightweight query metrics returned by [`DataFrame::collect_with_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueryExecutionStats {
+    pub output_rows: u64,
+    pub cpu_nanos: u64,
+}
+
 /// DataFrame API backed by DataFusion for R1 local execution.
 #[derive(Clone)]
 pub struct DataFrame {
@@ -96,6 +113,37 @@ impl fmt::Debug for DataFrame {
                 &self.pre_collected.as_ref().map(|b| b.len()),
             )
             .finish_non_exhaustive()
+    }
+}
+
+/// A lazily grouped DataFrame awaiting aggregate expressions.
+#[derive(Clone)]
+pub struct GroupedDataFrame {
+    dataframe: DataFrame,
+    group_exprs: Vec<Expr>,
+}
+
+impl GroupedDataFrame {
+    /// Compute aggregate expressions for each group.
+    pub fn agg(&self, aggregate_exprs: &[Expr]) -> Result<DataFrame> {
+        let Some(ops) = &self.dataframe.sql_dataframe else {
+            return Err(KrishivError::unsupported(
+                "grouped aggregation requires an SQL-backed DataFrame",
+            ));
+        };
+        let groups = self
+            .group_exprs
+            .iter()
+            .map(Expr::as_sql)
+            .collect::<Vec<_>>();
+        let aggregates = aggregate_exprs.iter().map(Expr::as_sql).collect::<Vec<_>>();
+        let new_ops = krishiv_common::async_util::block_on(ops.aggregate(&groups, &aggregates))?;
+        Ok(self.dataframe.with_new_ops(new_ops))
+    }
+
+    /// Count rows in each group.
+    pub fn count(&self) -> Result<DataFrame> {
+        self.agg(&[crate::expression::count_all().alias("count")])
     }
 }
 
@@ -187,6 +235,53 @@ impl DataFrame {
     /// Explain the current plan.
     pub fn explain(&self) -> Result<String> {
         krishiv_common::async_util::block_on(self.explain_async())
+    }
+
+    /// Explain the plan at the requested detail level.
+    pub fn explain_with(&self, mode: ExplainMode) -> Result<String> {
+        match mode {
+            ExplainMode::Logical => Ok(self.explain_logical()),
+            ExplainMode::Physical => self.explain(),
+            ExplainMode::Analyze => {
+                let (result, stats) = self.collect_with_stats()?;
+                Ok(format!(
+                    "{}
+
+Execution statistics:
+  output_rows={}
+  result_rows={}
+  cpu_nanos={}",
+                    self.explain()?,
+                    stats.output_rows,
+                    result.row_count(),
+                    stats.cpu_nanos
+                ))
+            }
+        }
+    }
+
+    /// Collect local SQL results with engine execution statistics.
+    pub fn collect_with_stats(&self) -> Result<(QueryResult, QueryExecutionStats)> {
+        if self.runtime.uses_remote_execution() && !self.force_local {
+            return Err(KrishivError::unsupported(
+                "remote collect_with_stats requires coordinator query-metrics transport",
+            ));
+        }
+        let Some(dataframe) = &self.sql_dataframe else {
+            return Ok((
+                QueryResult::new(self.pre_collected.clone().unwrap_or_default()),
+                QueryExecutionStats::default(),
+            ));
+        };
+        let (batches, stats) =
+            krishiv_common::async_util::block_on(dataframe.collect_with_stats())?;
+        Ok((
+            QueryResult::new(batches),
+            QueryExecutionStats {
+                output_rows: stats.output_rows,
+                cpu_nanos: stats.cpu_nanos,
+            },
+        ))
     }
 
     /// Unified execution entry point — routes to `collect_async()` for batch
@@ -471,6 +566,33 @@ impl DataFrame {
         }
     }
 
+    /// Select typed expressions.
+    pub fn select_exprs(&self, expressions: &[Expr]) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let expressions = expressions.iter().map(Expr::as_sql).collect::<Vec<_>>();
+                let new_ops = krishiv_common::async_util::block_on(df.select_exprs(&expressions))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "select_exprs requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Filter rows using a typed expression.
+    pub fn filter_expr(&self, predicate: Expr) -> Result<DataFrame> {
+        self.filter(predicate.as_sql())
+    }
+
+    /// Group rows by typed expressions.
+    pub fn group_by(&self, expressions: &[Expr]) -> GroupedDataFrame {
+        GroupedDataFrame {
+            dataframe: self.clone(),
+            group_exprs: expressions.to_vec(),
+        }
+    }
+
     /// Filter rows by a SQL predicate expression.
     pub fn filter(&self, predicate: &str) -> Result<DataFrame> {
         match &self.sql_dataframe {
@@ -710,6 +832,11 @@ impl DataFrame {
                 "describe requires an SQL-backed DataFrame",
             )),
         }
+    }
+
+    /// Start a generic file writer builder.
+    pub fn write(&self) -> DataFrameWriter {
+        DataFrameWriter::new(self.clone())
     }
 
     // ── Write API ────────────────────────────────────────────────────────────
