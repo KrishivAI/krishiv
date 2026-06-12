@@ -384,7 +384,7 @@ impl FlightExecutionHost {
         }
 
         // Plain SQL execution.
-        self.execute_batch_sql(sql, &ipc_tables).await
+        self.execute_batch_sql(&sql, &ipc_tables).await
     }
 }
 

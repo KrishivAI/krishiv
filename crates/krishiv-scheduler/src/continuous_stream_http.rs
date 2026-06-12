@@ -643,4 +643,179 @@ mod tests {
         assert!(result.is_err(), "empty job_id must be rejected");
     }
 
-    #
+    #[tokio::test]
+    async fn register_rejects_invalid_window_spec_before_job_creation() {
+        let coordinator = make_coordinator_with_executor("invalid-window").await;
+        let mut spec = tumbling_spec();
+        spec.window_size_ms = 0;
+
+        let error = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-invalid-window".into(),
+                spec,
+            }),
+        )
+        .await
+        .expect_err("invalid window spec must fail registration");
+
+        assert_eq!(error, StatusCode::BAD_REQUEST);
+        let job_id = krishiv_proto::JobId::try_new("cs-invalid-window").unwrap();
+        assert!(matches!(
+            coordinator.read().await.job_snapshot(&job_id),
+            Err(SchedulerError::UnknownJob { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_register_returns_conflict_without_replacing_job() {
+        let coordinator = make_coordinator_with_executor("duplicate").await;
+        let request = || ContinuousRegisterRequest {
+            job_id: "cs-duplicate-job".to_string(),
+            spec: tumbling_spec(),
+        };
+        let _ = api_continuous_register(State(coordinator.clone()), Json(request()))
+            .await
+            .unwrap();
+        let error = api_continuous_register(State(coordinator), Json(request()))
+            .await
+            .expect_err("duplicate job must fail");
+        assert_eq!(error, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn push_and_drain_unknown_job_return_not_found() {
+        let coordinator = make_coordinator_with_executor("unknown").await;
+        let push = api_continuous_push(
+            State(coordinator.clone()),
+            Json(ContinuousPushRequest {
+                job_id: "missing-job".into(),
+                input_batches_b64: encoded_input(),
+            }),
+        )
+        .await
+        .expect_err("unknown push must fail");
+        assert_eq!(push, StatusCode::NOT_FOUND);
+
+        let drain = api_continuous_drain(
+            State(coordinator),
+            Json(ContinuousDrainRequest {
+                job_id: "missing-job".into(),
+            }),
+        )
+        .await
+        .expect_err("unknown drain must fail");
+        assert_eq!(drain, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn concurrent_push_is_rejected_while_cycle_is_in_flight() {
+        let coordinator = make_coordinator_with_executor("busy").await;
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-busy-job".into(),
+                spec: tumbling_spec(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = prepare_cycle(&coordinator, "cs-busy-job").await;
+        let error = api_continuous_push(
+            State(coordinator),
+            Json(ContinuousPushRequest {
+                job_id: "cs-busy-job".into(),
+                input_batches_b64: encoded_input(),
+            }),
+        )
+        .await
+        .expect_err("second concurrent cycle must be fenced");
+        assert_eq!(error, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn successful_cycle_publishes_output_and_returns_task_to_idle() {
+        use base64::Engine as _;
+        use krishiv_proto::{TaskOutputMetadata, TaskState, TaskStatusUpdate};
+
+        let coordinator = make_coordinator_with_executor("cycle").await;
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-cycle-job".into(),
+                spec: tumbling_spec(),
+            }),
+        )
+        .await
+        .unwrap();
+        let assignment = prepare_cycle(&coordinator, "cs-cycle-job").await;
+
+        let job_id = krishiv_proto::JobId::try_new("cs-cycle-job").unwrap();
+        let running = TaskStatusUpdate::new(
+            job_id.clone(),
+            assignment.stage_id().clone(),
+            assignment.task_id().clone(),
+            assignment.executor_id().clone(),
+            TaskState::Running,
+            assignment.attempt_id().as_u32(),
+        )
+        .with_lease_generation(assignment.lease_generation());
+        coordinator
+            .write()
+            .await
+            .apply_task_update(running)
+            .unwrap();
+
+        let output_ipc = base64::engine::general_purpose::STANDARD
+            .decode(encoded_input())
+            .unwrap();
+        let succeeded = TaskStatusUpdate::new(
+            job_id.clone(),
+            assignment.stage_id().clone(),
+            assignment.task_id().clone(),
+            assignment.executor_id().clone(),
+            TaskState::Succeeded,
+            assignment.attempt_id().as_u32(),
+        )
+        .with_lease_generation(assignment.lease_generation())
+        .with_output_metadata(
+            TaskOutputMetadata::new("streaming_window", 1, 1, 2)
+                .with_inline_record_batch_ipc(vec![output_ipc.clone()]),
+        );
+        coordinator
+            .write()
+            .await
+            .apply_task_update(succeeded.clone())
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .write()
+                .await
+                .apply_task_update(succeeded)
+                .unwrap(),
+            crate::TaskUpdateOutcome::Duplicate
+        );
+
+        let blocked_push = api_continuous_push(
+            State(coordinator.clone()),
+            Json(ContinuousPushRequest {
+                job_id: "cs-cycle-job".into(),
+                input_batches_b64: encoded_input(),
+            }),
+        )
+        .await
+        .expect_err("undrained output must backpressure the next cycle");
+        assert_eq!(blocked_push, StatusCode::CONFLICT);
+
+        let mut coord = coordinator.write().await;
+        let detail = coord.job_detail_snapshot(&job_id).unwrap();
+        assert_eq!(detail.job().state(), krishiv_proto::JobState::Running);
+        assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Succeeded);
+        assert!(!coord.continuous_input_cycles.contains(&job_id));
+        assert!(!coord.job_input_partitions.contains_key(&job_id));
+        assert_eq!(
+            coord.take_job_inline_results(&job_id),
+            Some(vec![output_ipc])
+        );
+    }
+}
