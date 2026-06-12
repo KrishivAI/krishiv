@@ -96,6 +96,92 @@ cargo test -p krishiv-executor --lib -- --ignored   # 300-cycle soak
 
 ---
 
+## Phase 4: typed Rust/Python user APIs (2026-06-12)
+
+### Done
+
+- Added engine-neutral typed expressions and grouped aggregation to the Rust API.
+- Added generic Parquet/CSV/JSON reader and writer builders with explicit option
+  rejection until typed option semantics are implemented.
+- Added shared session configuration and logical/physical/analyze explain modes.
+- Added Python parity for core DataFrame transformations, grouping, file I/O,
+  explain modes, CSV/JSON reads, and session properties.
+- Documented remaining distributed sink, UDF, progress/cancellation, SQL gateway,
+  prepared statement, and cache/view work in
+  `docs/implementation/phase-4-user-apis.md`.
+
+### Validation
+
+```bash
+cargo check -p krishiv-sql -p krishiv-api  # passed; pre-existing scheduler warnings
+cargo test -p krishiv-api --lib            # 60 passed, 1 ignored
+cargo check -p krishiv-python              # passed; pre-existing scheduler warnings
+cargo test -p krishiv-sql dataframe_alias_parser_ignores_nested_as_tokens --lib  # 1 passed; 1 pre-existing warning
+cargo fmt --check                          # passed
+git diff --check                           # passed
+```
+
+### Blockers
+
+Remote query metrics/progress/cancellation require a versioned coordinator and
+Flight protocol extension. JDBC/ODBC should be implemented as a SQL gateway,
+not embedded into the DataFrame API.
+
+### Next useful task
+
+```bash
+cargo test -p krishiv-api --lib
+cargo check -p krishiv-python
+```
+
+---
+
+## Phase 1: versioned engine contracts and Iceberg-first scope (2026-06-12)
+
+### Done
+
+- Published normative batch/streaming semantics, delivery definitions, an
+  exactly-once combination matrix, metadata compatibility, stable operator
+  identity rules, and the Iceberg-first lakehouse policy.
+- Added connector delivery-guarantee and maturity types; registry descriptors
+  now publish maturity and dynamic sinks expose capabilities.
+- Versioned typed task-fragment envelopes and savepoint metadata; checkpoint
+  metadata now writes v2 while accepting v1-v2 restores.
+- Added `OperatorStateDescriptor` for direct state restore compatibility checks.
+- Labeled every in-tree connector and documented the remaining certification
+  work. No connector is called certified until the common external failure
+  harness exists.
+- Removed AI/vector and Delta/Hudi integrations from standard `full` presets;
+  optional integrations remain available through explicit features and the
+  connector `extended` preset. SQL defaults to Iceberg.
+- Added the Phase 1 implementation resolution and follow-up checklist in
+  `docs/implementation/phase-1-engine-contract.md`.
+
+### Validation
+
+```bash
+cargo test -p krishiv-connectors --lib  # 61 passed; 3 pre-existing warnings
+cargo test -p krishiv-plan --lib        # 350 passed
+cargo test -p krishiv-state --lib       # 307 passed
+cargo check -p krishiv-sql -p krishiv -p krishiv-ai  # passed; pre-existing scheduler/Flight warnings
+cargo fmt --check                       # passed
+git diff --check                        # passed
+```
+
+### Blockers
+
+Connector certification requires external Kafka/object-store failure tests; the
+Phase 1 contracts deliberately publish those combinations as preview rather
+than certified.
+
+### Next useful task
+
+```bash
+cargo test -p krishiv-connectors --test exactly_once --features exactly-once-integration
+```
+
+---
+
 ## Gap closure: profile-driven checkpoints + merge with main (2026-06-12)
 
 ### Done

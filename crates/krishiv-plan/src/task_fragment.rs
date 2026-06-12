@@ -4,9 +4,19 @@ use crate::{ExecutionKind, NodeOp, PlanError, PlanNode};
 
 const FRAGMENT_PREFIX: &str = "krishiv-fragment:";
 
+/// Current typed task-fragment envelope version.
+pub const TASK_FRAGMENT_VERSION: u32 = 1;
+
+const fn default_task_fragment_version() -> u32 {
+    TASK_FRAGMENT_VERSION
+}
+
 /// Wire- and log-stable task fragment envelope.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TypedTaskFragment {
+    /// Envelope format version. Version changes are independent from operator/state versions.
+    #[serde(default = "default_task_fragment_version")]
+    pub version: u32,
     pub execution_kind: ExecutionKind,
     pub body: String,
 }
@@ -14,6 +24,7 @@ pub struct TypedTaskFragment {
 impl TypedTaskFragment {
     pub fn new(execution_kind: ExecutionKind, body: impl Into<String>) -> Self {
         Self {
+            version: TASK_FRAGMENT_VERSION,
             execution_kind,
             body: body.into(),
         }
@@ -26,8 +37,23 @@ impl TypedTaskFragment {
     }
 
     pub fn decode(fragment: &str) -> Option<Self> {
-        let payload = fragment.strip_prefix(FRAGMENT_PREFIX)?;
-        serde_json::from_str(payload).ok()
+        Self::decode_versioned(fragment).ok()
+    }
+
+    /// Decode and validate the fragment envelope version.
+    pub fn decode_versioned(fragment: &str) -> Result<Self, PlanError> {
+        let payload = fragment.strip_prefix(FRAGMENT_PREFIX).ok_or_else(|| {
+            PlanError::Parse("task fragment does not use the typed envelope".into())
+        })?;
+        let decoded: Self = serde_json::from_str(payload)
+            .map_err(|e| PlanError::Parse(format!("fragment json: {e}")))?;
+        if decoded.version != TASK_FRAGMENT_VERSION {
+            return Err(PlanError::Validation(format!(
+                "unsupported task fragment version {}; supported version is {}",
+                decoded.version, TASK_FRAGMENT_VERSION
+            )));
+        }
+        Ok(decoded)
     }
 
     pub fn execution_kind_from_legacy(fragment: &str) -> ExecutionKind {
@@ -61,8 +87,8 @@ impl TypedTaskFragment {
         fragment: &str,
         profile: krishiv_common::DurabilityProfile,
     ) -> Result<Self, PlanError> {
-        if let Some(decoded) = Self::decode(fragment) {
-            return Ok(decoded);
+        if fragment.starts_with(FRAGMENT_PREFIX) {
+            return Self::decode_versioned(fragment);
         }
         if krishiv_common::allow_legacy_task_fragments(profile) {
             return Ok(Self::decode_or_legacy(fragment));
@@ -148,6 +174,19 @@ mod tests {
         assert_eq!(
             execution_kind_from_fragment("stream:tw:key=u"),
             ExecutionKind::Streaming
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_fragment_version() {
+        let encoded = format!(
+            "{FRAGMENT_PREFIX}{}",
+            serde_json::json!({"version": 99, "execution_kind": "Batch", "body": "scan"})
+        );
+        let err = TypedTaskFragment::decode_versioned(&encoded).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported task fragment version")
         );
     }
 

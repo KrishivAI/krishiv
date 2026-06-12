@@ -73,11 +73,11 @@ pub type CheckpointResult<T> = Result<T, CheckpointError>;
 
 /// Versioned checkpoint metadata record written to `metadata.json`.
 ///
-/// `version` must be `1` for all R6 checkpoints.  Restore rejects unknown
-/// versions with [`CheckpointError::IncompatibleVersion`].
+/// Versions 1 and 2 are restore-compatible. Version 2 adds coordinator identity;
+/// restore rejects versions outside the published compatibility window.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CheckpointMetadata {
-    /// Format version.  Must be `1` for R6.
+    /// Format version. New checkpoints use [`CheckpointMetadata::VERSION`].
     pub version: u32,
     /// Monotonically increasing checkpoint epoch per job.
     pub epoch: u64,
@@ -112,12 +112,14 @@ pub struct CheckpointMetadata {
 }
 
 impl CheckpointMetadata {
-    /// Current metadata format version.
-    pub const VERSION: u32 = 1;
+    /// Oldest metadata format accepted for restore.
+    pub const MIN_SUPPORTED_VERSION: u32 = 1;
+    /// Current metadata format written by the engine.
+    pub const VERSION: u32 = 2;
 
     /// Validate that this metadata can be used for restore.
     pub fn validate(&self) -> CheckpointResult<()> {
-        if self.version != Self::VERSION {
+        if !(Self::MIN_SUPPORTED_VERSION..=Self::VERSION).contains(&self.version) {
             return Err(CheckpointError::IncompatibleVersion {
                 version: self.version,
             });
@@ -3178,8 +3180,12 @@ mod tests {
     // ── CheckpointMetadata version constant ─────────────────────────────
 
     #[test]
-    fn metadata_version_constant_is_one() {
-        assert_eq!(CheckpointMetadata::VERSION, 1);
+    fn metadata_version_window_is_published() {
+        assert_eq!(CheckpointMetadata::MIN_SUPPORTED_VERSION, 1);
+        assert_eq!(CheckpointMetadata::VERSION, 2);
+        let mut legacy = sample_metadata(1);
+        legacy.version = 1;
+        assert!(legacy.validate().is_ok());
     }
 
     // ── EphemeralCheckpointStorage Deref/DerefMut ───────────────────────

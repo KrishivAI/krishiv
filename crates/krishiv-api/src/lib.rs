@@ -6,6 +6,8 @@
 
 pub mod dataframe;
 pub mod error;
+pub mod expression;
+pub mod io;
 pub mod session;
 pub mod stream;
 pub mod streaming_dataframe;
@@ -16,8 +18,12 @@ pub mod window;
 mod tests;
 
 // Re-export the public API at the crate root for perfect source compatibility.
-pub use dataframe::{DataFrame, ExecutionResult};
+pub use dataframe::{
+    DataFrame, ExecutionResult, ExplainMode, GroupedDataFrame, QueryExecutionStats,
+};
 pub use error::{KrishivError, Result};
+pub use expression::{Expr, Literal, avg, col, count, count_all, lit, max, min, sum};
+pub use io::{DataFormat, DataFrameReader, DataFrameWriter};
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
 pub use streaming_dataframe::{

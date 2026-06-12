@@ -13,7 +13,7 @@ qdrant = ["vector-sinks", "krishiv-connectors/qdrant"]
 pgvector = ["vector-sinks", "krishiv-connectors/pgvector"]
 
 [dependencies]
-krishiv-connectors = { path = "../krishiv-connectors", features = ["vector-sinks"] }
+krishiv-connectors = { path = "../krishiv-connectors", default-features = false }
 
 [lints]
 workspace = true

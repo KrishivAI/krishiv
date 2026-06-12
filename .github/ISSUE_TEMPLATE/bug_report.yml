@@ -1,0 +1,45 @@
+name: Bug report
+description: Report reproducible incorrect engine behavior
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not report security vulnerabilities here; use SECURITY.md."
+  - type: input
+    id: version
+    attributes:
+      label: Krishiv version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Execution mode
+      options: [Embedded, Single-node, Bare-metal distributed, Kubernetes, Unknown]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include commands, query or pipeline, configuration, and test data shape.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and logs
+    validations:
+      required: true
+  - type: textarea
+    id: durability
+    attributes:
+      label: State, checkpoint, and connector details
+      description: Required for recovery, duplication, loss, or exactly-once reports.

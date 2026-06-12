@@ -209,6 +209,19 @@ bench-compare name:
     {{ cargo }} bench -p krishiv-bench \
         -- --baseline {{ name }}
 
+# ── Project hygiene ────────────────────────────────────────────────────────────
+
+# Validate repository scripts, local documentation links, and release metadata.
+project-check:
+    python3 -m unittest discover -s scripts/tests -v
+    python3 scripts/check_markdown_links.py
+    python3 scripts/check_release.py
+
+# Record the machine and revision used for a benchmark run.
+# Usage: just bench-manifest criterion "cargo bench -p krishiv-bench"
+bench-manifest suite command:
+    python3 scripts/benchmark_manifest.py --suite "{{ suite }}" --command "{{ command }}" --output target/benchmark-manifest.json
+
 # ── Release ───────────────────────────────────────────────────────────────────
 
 # Bump the workspace version and tag a release.

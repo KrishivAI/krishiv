@@ -55,7 +55,7 @@ pub mod vector;
 mod tests;
 
 // Root re-exports for perfect compatibility
-pub use capabilities::ConnectorCapabilities;
+pub use capabilities::{ConnectorCapabilities, ConnectorMaturity, DeliveryGuarantee};
 pub use config::ConnectorConfig;
 pub use error::{ConnectorError, ConnectorResult};
 pub use offset::{CommitHandle, Offset, OffsetCommitter, ParquetOffset};
