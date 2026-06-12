@@ -456,142 +456,77 @@ impl From<Status> for KrishivActionError {
 
 impl KrishivFlightSqlService {
     /// Dispatch a typed Krishiv DoAction into the execution host (B3, D2).
+    ///
+    /// The host encapsulates InProcess vs Coordinator dispatch — the action
+    /// handler just calls host methods without checking the backend variant.
     async fn handle_krishiv_action(
         &self,
         action: krishiv_runtime::KrishivFlightAction,
     ) -> Result<Vec<u8>, KrishivActionError> {
         use krishiv_runtime::KrishivFlightAction as A;
 
-        // Per-action dispatch.  Empty body on success unless the action
-        // produces record batches, in which case we return Arrow IPC bytes.
         match action {
             A::RegisterParquet(body) => {
-                // Stash the registration in the host's catalog.  We reuse the
-                // existing legacy path by handing it a synthetic comment.
-                let sql = krishiv_runtime::flight_protocol::encode_batch_sql(
-                    "SELECT 1 AS registered",
-                    &[krishiv_runtime::in_process::BatchSqlTable {
-                        table_name: body.table,
-                        path: body.path,
-                    }],
-                );
-                let _ = self
-                    .host
-                    .execute_sql(&sql)
-                    .await
-                    .map_err(KrishivActionError::Status)?;
+                // Update the host's client-side catalog.
+                self.host.register_parquet(&body.table, body.path);
                 Ok(Vec::new())
             }
             A::ContinuousRegister(body) => {
-                if let Some(http_base) = self.host.coordinator_http_url() {
-                    krishiv_runtime::execute_coordinator_continuous_register(
-                        http_base,
-                        &body.job_id,
-                        &body.spec,
-                    )
+                self.host
+                    .register_continuous_stream(&body.job_id, &body.spec)
                     .await
-                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                    return Ok(Vec::new());
-                }
-                let cluster = self.host.cluster().ok_or_else(|| {
-                    KrishivActionError::Other("embedded cluster unavailable in proxy mode".into())
-                })?;
-                let local = krishiv_runtime::in_process_cluster::plan_spec_to_local(&body.spec);
-                let job_id = body.job_id.clone();
-                tokio::task::block_in_place(|| cluster.register_continuous_job(&job_id, &local))
-                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    .map_err(KrishivActionError::Status)?;
                 Ok(Vec::new())
             }
             A::ContinuousPush(body) => {
                 let batches = krishiv_runtime::decode_batches(&body.batches_b64)
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                if let Some(http_base) = self.host.coordinator_http_url() {
-                    krishiv_runtime::execute_coordinator_continuous_push(
-                        http_base,
-                        &body.job_id,
-                        &batches,
-                    )
+                self.host
+                    .push_continuous_input(&body.job_id, batches)
                     .await
-                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                    return Ok(Vec::new());
-                }
-                let cluster = self.host.cluster().ok_or_else(|| {
-                    KrishivActionError::Other("embedded cluster unavailable in proxy mode".into())
-                })?;
-                let job_id = body.job_id.clone();
-                tokio::task::block_in_place(|| cluster.push_continuous_input(&job_id, batches))
-                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    .map_err(KrishivActionError::Status)?;
                 Ok(Vec::new())
             }
             A::ContinuousDrain(body) => {
-                if let Some(http_base) = self.host.coordinator_http_url() {
-                    let batches = krishiv_runtime::execute_coordinator_continuous_drain(
-                        http_base,
-                        &body.job_id,
-                    )
+                let batches = self
+                    .host
+                    .drain_continuous_stream(&body.job_id)
                     .await
-                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                    return encode_batches_ipc(&batches);
-                }
-                let cluster = self.host.cluster().ok_or_else(|| {
-                    KrishivActionError::Other("embedded cluster unavailable in proxy mode".into())
-                })?;
-                let job_id = body.job_id.clone();
-                let batches = tokio::task::block_in_place(|| cluster.drain_continuous_job(&job_id))
-                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    .map_err(KrishivActionError::Status)?;
                 encode_batches_ipc(&batches)
             }
             A::BoundedWindow(body) => {
                 let input_batches = krishiv_runtime::decode_batches(&body.batches_b64)
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                if let Some(http_base) = self.host.coordinator_http_url() {
-                    let result = krishiv_runtime::execute_coordinator_bounded_window(
-                        http_base,
-                        &body.topic,
-                        &body.spec,
-                        &input_batches,
-                    )
+                let result = self
+                    .host
+                    .execute_bounded_window(&body.topic, &body.spec, input_batches)
                     .await
-                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                    encode_batches_ipc(&result)
-                } else {
-                    let cluster = self.host.cluster().ok_or_else(|| {
-                        KrishivActionError::Other("embedded cluster unavailable".into())
-                    })?;
-                    let local = krishiv_runtime::in_process_cluster::plan_spec_to_local(&body.spec);
-                    let topic = body.topic.clone();
-                    let result = tokio::task::block_in_place(|| {
-                        cluster.collect_bounded_window(&topic, input_batches, &local)
-                    })
-                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                    encode_batches_ipc(&result)
-                }
+                    .map_err(KrishivActionError::Status)?;
+                encode_batches_ipc(&result)
             }
             A::Explain(body) => {
-                let text = krishiv_sql::explain_sql(&body.sql)
-                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                let text = self
+                    .host
+                    .explain_sql_query(&body.sql)
+                    .map_err(KrishivActionError::Status)?;
                 Ok(text.into_bytes())
             }
             A::ExecutePlan(body) => {
                 let plan = body
                     .to_plan()
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                if let Some(http_base) = self.host.coordinator_http_url() {
-                    krishiv_runtime::execute_coordinator_physical_plan(http_base, &plan)
-                        .await
-                        .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                    return Ok(Vec::new());
-                }
+                // For both backends, route ExecutePlan through execute_sql (handles
+                // streaming plans by registering them as continuous jobs).
                 let sql = krishiv_runtime::flight_client::plan_to_sql(&plan);
                 if plan.kind() == krishiv_plan::ExecutionKind::Streaming {
                     let spec = krishiv_runtime::streaming_spec_from_plan(&plan)
                         .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                    let cluster = self.host.cluster().ok_or_else(|| {
-                        KrishivActionError::Other("embedded cluster unavailable".into())
-                    })?;
                     let job_id = plan.name().to_string();
-                    tokio::task::block_in_place(|| cluster.register_continuous_job(&job_id, &spec))
-                        .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    self.host
+                        .register_continuous_stream(&job_id, &krishiv_plan::window::WindowExecutionSpec::from(&spec))
+                        .await
+                        .map_err(KrishivActionError::Status)?;
                     return Ok(Vec::new());
                 }
                 let _ = self
@@ -602,16 +537,38 @@ impl KrishivFlightSqlService {
                 Ok(Vec::new())
             }
             A::BatchSql(body) => {
-                let mut sql =
-                    krishiv_runtime::flight_protocol::encode_batch_sql(&body.query, &body.tables);
-                if body.is_streaming {
+                // Convert BatchSqlTable entries to BatchSqlInlineTable.
+                // For InProcess backend the ipc_b64 can be empty (path-based tables
+                // are already registered in catalog). For Coordinator backend the
+                // client is expected to pass IPC bytes. We use encode_batch_sql to
+                // produce inline IPC via the existing protocol path for InProcess,
+                // and pass the body.tables directly for Coordinator.
+                use krishiv_scheduler::BatchSqlInlineTable;
+                let inline_tables: Vec<BatchSqlInlineTable> = body
+                    .tables
+                    .iter()
+                    .map(|t| BatchSqlInlineTable {
+                        table_name: t.table_name.clone(),
+                        ipc_b64: String::new(), // path-based: coordinator will resolve via catalog
+                    })
+                    .collect();
+                let batches = if body.is_streaming {
+                    // Streaming queries go through execute_sql to classify properly.
+                    let mut sql = krishiv_runtime::flight_protocol::encode_batch_sql(
+                        &body.query,
+                        &body.tables,
+                    );
                     sql = format!("-- krishiv:streaming=true\n{sql}");
-                }
-                let batches = self
-                    .host
-                    .execute_sql(&sql)
-                    .await
-                    .map_err(KrishivActionError::Status)?;
+                    self.host
+                        .execute_sql(&sql)
+                        .await
+                        .map_err(KrishivActionError::Status)?
+                } else {
+                    self.host
+                        .execute_batch_sql(&body.query, &inline_tables)
+                        .await
+                        .map_err(KrishivActionError::Status)?
+                };
                 encode_batches_ipc(&batches)
             }
             #[cfg(feature = "kafka")]
@@ -720,6 +677,28 @@ fn auth_provider_from_env() -> Result<Option<Arc<dyn AuthProvider>>, String> {
         return Err(String::from("KRISHIV_API_KEYS must list at least one key"));
     }
     Ok(Some(Arc::new(StaticApiKeyAuthProvider::new(map))))
+}
+
+/// Run the Arrow Flight SQL server with a pre-built execution host and a bound listener.
+///
+/// Used by the coordinator to start a co-located Flight SQL sidecar via
+/// `spawn_coordinator_sidecars`. The listener is bound by the caller before the
+/// tokio task starts so bind errors surface immediately rather than inside a spawned task.
+pub async fn run_flight_server_with_host(
+    host: FlightExecutionHost,
+    listener: tokio::net::TcpListener,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    let service = KrishivFlightSqlService::with_host(host);
+    let service = configure_flight_auth_from_env(service)?;
+    let server =
+        arrow_flight::flight_service_server::FlightServiceServer::new(service);
+    tonic::transport::Server::builder()
+        .add_service(server)
+        .serve_with_incoming(TcpListenerStream::new(listener))
+        .await?;
+    Ok(())
 }
 
 /// Run the Arrow Flight SQL server (env `KRISHIV_FLIGHT_ADDR`, default `127.0.0.1:50051`).

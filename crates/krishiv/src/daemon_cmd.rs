@@ -2,7 +2,7 @@
 
 use krishiv_common::async_util::block_on;
 use krishiv_scheduler::{
-    SharedCoordinator, coordinator_daemon_help, job_coordinator_daemon_help,
+    CoordinatorSidecarFn, SharedCoordinator, coordinator_daemon_help, job_coordinator_daemon_help,
     parse_coordinator_daemon_config, parse_job_coordinator_daemon_config, run_clusterd_daemon,
     run_job_coordinator_daemon, run_standalone_coordinator,
 };
@@ -41,7 +41,11 @@ fn run_coordinator(args: &[String]) -> i32 {
         }
         Ok(config) => {
             let factory = build_ui_http_factory();
-            match block_on(run_standalone_coordinator(config, factory)) {
+            let mut sidecars: Vec<CoordinatorSidecarFn> = Vec::new();
+            if let Some(sidecar) = build_flight_sidecar(&config) {
+                sidecars.push(sidecar);
+            }
+            match block_on(run_standalone_coordinator(config, factory, sidecars)) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("{e}");
@@ -64,7 +68,11 @@ fn run_clusterd(args: &[String]) -> i32 {
         }
         Ok(config) => {
             let factory = build_ui_http_factory();
-            match block_on(run_clusterd_daemon(config, factory)) {
+            let mut sidecars: Vec<CoordinatorSidecarFn> = Vec::new();
+            if let Some(sidecar) = build_flight_sidecar(&config) {
+                sidecars.push(sidecar);
+            }
+            match block_on(run_clusterd_daemon(config, factory, sidecars)) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("{e}");
@@ -86,6 +94,49 @@ fn build_ui_http_factory() -> Option<Box<dyn FnOnce(SharedCoordinator) -> axum::
         let ui_state = krishiv_ui::UiState::from_shared_coordinator(shared).with_sql_engine(engine);
         krishiv_ui::embedded_router(ui_state)
     }))
+}
+
+/// Build a Flight SQL sidecar factory when `config.flight_addr` is set.
+///
+/// The returned factory is passed to `spawn_coordinator_sidecars` and binds the
+/// Flight SQL server co-located with the coordinator — no HTTP proxy hop.
+#[cfg(feature = "flight-sql")]
+fn build_flight_sidecar(
+    config: &krishiv_scheduler::CoordinatorDaemonConfig,
+) -> Option<CoordinatorSidecarFn> {
+    let addr = config.flight_addr?;
+    Some(Box::new(move |coordinator: SharedCoordinator| {
+        Box::pin(async move {
+            use krishiv_flight_sql::{FlightExecutionHost, run_flight_server_with_host};
+            let host = FlightExecutionHost::with_coordinator(coordinator);
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(
+                        addr = %addr,
+                        error = %e,
+                        "Failed to bind co-located Flight SQL address"
+                    );
+                    return;
+                }
+            };
+            tracing::info!(addr = %addr, "Krishiv Flight SQL co-located with coordinator");
+            if let Err(e) = run_flight_server_with_host(host, listener).await {
+                tracing::error!(
+                    error = %e,
+                    "Co-located Flight SQL server terminated unexpectedly"
+                );
+            }
+        })
+    }))
+}
+
+/// When flight-sql feature is disabled, no sidecar is built.
+#[cfg(not(feature = "flight-sql"))]
+fn build_flight_sidecar(
+    _config: &krishiv_scheduler::CoordinatorDaemonConfig,
+) -> Option<CoordinatorSidecarFn> {
+    None
 }
 
 fn run_job_coordinator(args: &[String]) -> i32 {

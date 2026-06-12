@@ -2047,3 +2047,45 @@ cargo clippy -p krishiv-connectors --features "lakehouse,kafka,avro,cassandra,hb
 cargo clippy -p krishiv-scheduler --features etcd -- -D warnings                                                             # 0 errors
 cargo test --workspace --lib --exclude krishiv-python                                                                         # 19 suites, 3085 tests, 0 failures
 ```
+
+---
+
+## Flight SQL co-location with coordinator (2026-06-11)
+
+Branch: `claude/flight-coordinator-colocation` from `origin/claude/remove-singlenode-localinprocess`
+
+### Architecture change
+
+Replaced two-process Flight SQL architecture (separate `krishiv-flight-server` process
+with HTTP proxy to coordinator) with co-located single-process architecture.
+
+**Before:**
+```
+Client → Flight SQL server (separate process, port 50051)
+           → HTTP proxy → Coordinator HTTP (port 18080) → Executors
+```
+
+**After:**
+```
+Client → Flight SQL (port 50051, served BY coordinator in same process)
+           → Direct in-process call → Coordinator → Executors
+```
+
+### Changes
+
+**`crates/krishiv-flight-sql/src/host.rs`** — Major refactor:
+- Added `FlightHostBackend` enum (`InProcess(Arc<InProcessCluster>)` | `Coordinator(SharedCoordinator)`)
+- Replaced flat `FlightExecutionHost` with backend-dispatching design
+- `embedded()` constructor creates `InProcess` backend (standalone flight-server use)
+- `with_coordinator(SharedCoordinator)` constructor creates `Coordinator` backend (co-located use)
+- `from_env()` always returns embedded (no longer reads `KRISHIV_COORDINATOR_HTTP`)
+- Per-operation methods dispatch to public `krishiv-scheduler` helpers (no direct field access)
+- Removed: `coordinator_http`, `with_coordinator_http`, `coordinator_http_url`, HTTP proxy calls
+
+**`crates/krishiv-scheduler/src/continuous_stream_http.rs`** — Added programmatic API:
+- `ContinuousStreamError` type for typed error propagation
+- `register_continuous_stream_coordinated()` — register streaming job without HTTP
+- `push_continuous_input_coordinated()` — push input cycle without HTTP
+- `drain_continuous_stream_coordinated()` — drain results without HTTP
+
+**`crates/krishiv-scheduler/src/coordinator_daemon.rs`** — Config and si

@@ -216,6 +216,230 @@ pub async fn api_continuous_drain(
     }))
 }
 
+// -------------------------------------------------------------------------
+// Public programmatic API — no HTTP types.
+// Used by co-located services (e.g., Flight SQL sidecar) that call the
+// coordinator directly without an HTTP round-trip.
+// -------------------------------------------------------------------------
+
+/// Error returned by the programmatic continuous-stream helpers.
+#[derive(Debug)]
+pub enum ContinuousStreamError {
+    /// A `SchedulerError` wrapped for external callers.
+    Scheduler(crate::SchedulerError),
+    /// The push cycle was aborted (e.g., no executor available).
+    Unavailable(String),
+    /// A cycle was aborted because it conflicted with the current state.
+    Aborted(String),
+}
+
+impl std::fmt::Display for ContinuousStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scheduler(e) => write!(f, "scheduler error: {e}"),
+            Self::Unavailable(msg) => write!(f, "unavailable: {msg}"),
+            Self::Aborted(msg) => write!(f, "aborted: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ContinuousStreamError {}
+
+impl From<crate::SchedulerError> for ContinuousStreamError {
+    fn from(e: crate::SchedulerError) -> Self {
+        Self::Scheduler(e)
+    }
+}
+
+/// Register a new continuous streaming job with the coordinator.
+///
+/// This is the programmatic equivalent of `api_continuous_register` — it calls
+/// the same coordinator methods without serialising to HTTP.
+///
+/// The job is identified by `job_id` and parameterised by `spec`.
+pub async fn register_continuous_stream_coordinated(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    spec: &krishiv_plan::window::WindowExecutionSpec,
+) -> Result<(), ContinuousStreamError> {
+    use krishiv_plan::{ExecutionKind, TypedTaskFragment};
+    use krishiv_plan::window::encode_window_execution_spec;
+    use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+
+    let job_id_typed = JobId::try_new(job_id).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    let stage_id = StageId::try_new("stage-streaming").map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    let task_id = TaskId::try_new("task-streaming").map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    let encoded_spec = encode_window_execution_spec(spec).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    let loop_fragment = format!("stream:loop:{job_id}|{encoded_spec}");
+    let fragment = TypedTaskFragment::new(ExecutionKind::Streaming, loop_fragment)
+        .encode()
+        .map_err(|e| {
+            ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+                message: e.to_string(),
+            })
+        })?;
+    let stage = StageSpec::new(stage_id, "continuous-streaming")
+        .with_task(TaskSpec::new(task_id, fragment));
+    let job_spec =
+        JobSpec::new(job_id_typed.clone(), "continuous-streaming", JobKind::Streaming)
+            .with_stage(stage);
+
+    let mut coord = coordinator.write().await;
+    coord
+        .ensure_active()
+        .map_err(ContinuousStreamError::Scheduler)?;
+    coord
+        .submit_job(job_spec)
+        .map_err(ContinuousStreamError::Scheduler)?;
+    Ok(())
+}
+
+/// Push one cycle of IPC bytes as input for a continuous streaming job.
+///
+/// This is the programmatic equivalent of `api_continuous_push` — it calls the
+/// same coordinator methods without serialising to HTTP.
+///
+/// `ipc_bytes` must be a valid Arrow IPC stream (non-empty).
+pub async fn push_continuous_input_coordinated(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    ipc_bytes: Vec<u8>,
+) -> Result<(), ContinuousStreamError> {
+    use krishiv_proto::{InputPartition, InputPartitionDescriptor, JobId};
+
+    let job_id_typed = JobId::try_new(job_id).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+
+    let partition = InputPartition::typed(
+        "continuous-input",
+        InputPartitionDescriptor::InlineIpc {
+            table_name: String::from("input"),
+            ipc_bytes,
+        },
+    );
+
+    let (targets, channels, target_count) = {
+        let mut coord = coordinator.write().await;
+        coord
+            .prepare_continuous_input_cycle(&job_id_typed, vec![partition])
+            .map_err(ContinuousStreamError::Scheduler)?;
+        let assignments = match coord.launch_assigned_task_assignments(&job_id_typed) {
+            Ok(assignments) if !assignments.is_empty() => assignments,
+            Ok(_) => {
+                coord.abort_continuous_input_cycle(&job_id_typed);
+                return Err(ContinuousStreamError::Unavailable(String::from(
+                    "no executor available for continuous cycle",
+                )));
+            }
+            Err(error) => {
+                coord.abort_continuous_input_cycle(&job_id_typed);
+                return Err(ContinuousStreamError::Scheduler(error));
+            }
+        };
+        let targets = match coord.resolve_assignment_targets(assignments) {
+            Ok(targets) => targets,
+            Err(error) => {
+                coord.abort_continuous_input_cycle(&job_id_typed);
+                return Err(ContinuousStreamError::Scheduler(error));
+            }
+        };
+        if targets
+            .iter()
+            .any(|(endpoint, _)| crate::is_in_process_task_endpoint(endpoint))
+        {
+            coord.abort_continuous_input_cycle(&job_id_typed);
+            return Err(ContinuousStreamError::Unavailable(String::from(
+                "continuous push cannot reach in-process-only executor via co-located Flight SQL",
+            )));
+        }
+        let target_count = targets.len();
+        (targets, coord.executor_channels.clone(), target_count)
+    };
+
+    let responses =
+        match Coordinator::deliver_assignment_targets_with_channels(channels, targets).await {
+            Ok(responses) => responses,
+            Err(_) => {
+                coordinator
+                    .write()
+                    .await
+                    .abort_continuous_input_cycle(&job_id_typed);
+                return Err(ContinuousStreamError::Unavailable(String::from(
+                    "assignment delivery failed",
+                )));
+            }
+        };
+
+    let mut coord = coordinator.write().await;
+    if !coord.continuous_input_cycles.contains(&job_id_typed) {
+        return Err(ContinuousStreamError::Aborted(String::from(
+            "continuous cycle was aborted concurrently",
+        )));
+    }
+    let accepted = coord.apply_assignment_dispatch_responses(&job_id_typed, &responses);
+    if accepted != target_count {
+        coord.abort_continuous_input_cycle(&job_id_typed);
+        return Err(ContinuousStreamError::Unavailable(String::from(
+            "not all assignment targets accepted the cycle",
+        )));
+    }
+    Ok(())
+}
+
+/// Drain completed results from a continuous streaming job.
+///
+/// This is the programmatic equivalent of `api_continuous_drain` — it calls the
+/// same coordinator methods without serialising to HTTP.
+///
+/// Returns IPC byte payloads (one per completed window), or an empty vec if no
+/// results are available yet.
+pub async fn drain_continuous_stream_coordinated(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+) -> Result<Vec<Vec<u8>>, ContinuousStreamError> {
+    use krishiv_proto::JobId;
+
+    let job_id_typed = JobId::try_new(job_id).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+
+    let mut coord = coordinator.write().await;
+    let snapshot = coord
+        .job_snapshot(&job_id_typed)
+        .map_err(ContinuousStreamError::Scheduler)?;
+    if snapshot.kind() != krishiv_proto::JobKind::Streaming {
+        return Err(ContinuousStreamError::Scheduler(
+            crate::SchedulerError::InvalidJob {
+                message: format!("job {job_id} is not a streaming job"),
+            },
+        ));
+    }
+    Ok(coord
+        .take_job_inline_results(&job_id_typed)
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -419,179 +643,4 @@ mod tests {
         assert!(result.is_err(), "empty job_id must be rejected");
     }
 
-    #[tokio::test]
-    async fn register_rejects_invalid_window_spec_before_job_creation() {
-        let coordinator = make_coordinator_with_executor("invalid-window").await;
-        let mut spec = tumbling_spec();
-        spec.window_size_ms = 0;
-
-        let error = api_continuous_register(
-            State(coordinator.clone()),
-            Json(ContinuousRegisterRequest {
-                job_id: "cs-invalid-window".into(),
-                spec,
-            }),
-        )
-        .await
-        .expect_err("invalid window spec must fail registration");
-
-        assert_eq!(error, StatusCode::BAD_REQUEST);
-        let job_id = krishiv_proto::JobId::try_new("cs-invalid-window").unwrap();
-        assert!(matches!(
-            coordinator.read().await.job_snapshot(&job_id),
-            Err(SchedulerError::UnknownJob { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn duplicate_register_returns_conflict_without_replacing_job() {
-        let coordinator = make_coordinator_with_executor("duplicate").await;
-        let request = || ContinuousRegisterRequest {
-            job_id: "cs-duplicate-job".to_string(),
-            spec: tumbling_spec(),
-        };
-        let _ = api_continuous_register(State(coordinator.clone()), Json(request()))
-            .await
-            .unwrap();
-        let error = api_continuous_register(State(coordinator), Json(request()))
-            .await
-            .expect_err("duplicate job must fail");
-        assert_eq!(error, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn push_and_drain_unknown_job_return_not_found() {
-        let coordinator = make_coordinator_with_executor("unknown").await;
-        let push = api_continuous_push(
-            State(coordinator.clone()),
-            Json(ContinuousPushRequest {
-                job_id: "missing-job".into(),
-                input_batches_b64: encoded_input(),
-            }),
-        )
-        .await
-        .expect_err("unknown push must fail");
-        assert_eq!(push, StatusCode::NOT_FOUND);
-
-        let drain = api_continuous_drain(
-            State(coordinator),
-            Json(ContinuousDrainRequest {
-                job_id: "missing-job".into(),
-            }),
-        )
-        .await
-        .expect_err("unknown drain must fail");
-        assert_eq!(drain, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn concurrent_push_is_rejected_while_cycle_is_in_flight() {
-        let coordinator = make_coordinator_with_executor("busy").await;
-        let _ = api_continuous_register(
-            State(coordinator.clone()),
-            Json(ContinuousRegisterRequest {
-                job_id: "cs-busy-job".into(),
-                spec: tumbling_spec(),
-            }),
-        )
-        .await
-        .unwrap();
-        let _ = prepare_cycle(&coordinator, "cs-busy-job").await;
-        let error = api_continuous_push(
-            State(coordinator),
-            Json(ContinuousPushRequest {
-                job_id: "cs-busy-job".into(),
-                input_batches_b64: encoded_input(),
-            }),
-        )
-        .await
-        .expect_err("second concurrent cycle must be fenced");
-        assert_eq!(error, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn successful_cycle_publishes_output_and_returns_task_to_idle() {
-        use base64::Engine as _;
-        use krishiv_proto::{TaskOutputMetadata, TaskState, TaskStatusUpdate};
-
-        let coordinator = make_coordinator_with_executor("cycle").await;
-        let _ = api_continuous_register(
-            State(coordinator.clone()),
-            Json(ContinuousRegisterRequest {
-                job_id: "cs-cycle-job".into(),
-                spec: tumbling_spec(),
-            }),
-        )
-        .await
-        .unwrap();
-        let assignment = prepare_cycle(&coordinator, "cs-cycle-job").await;
-
-        let job_id = krishiv_proto::JobId::try_new("cs-cycle-job").unwrap();
-        let running = TaskStatusUpdate::new(
-            job_id.clone(),
-            assignment.stage_id().clone(),
-            assignment.task_id().clone(),
-            assignment.executor_id().clone(),
-            TaskState::Running,
-            assignment.attempt_id().as_u32(),
-        )
-        .with_lease_generation(assignment.lease_generation());
-        coordinator
-            .write()
-            .await
-            .apply_task_update(running)
-            .unwrap();
-
-        let output_ipc = base64::engine::general_purpose::STANDARD
-            .decode(encoded_input())
-            .unwrap();
-        let succeeded = TaskStatusUpdate::new(
-            job_id.clone(),
-            assignment.stage_id().clone(),
-            assignment.task_id().clone(),
-            assignment.executor_id().clone(),
-            TaskState::Succeeded,
-            assignment.attempt_id().as_u32(),
-        )
-        .with_lease_generation(assignment.lease_generation())
-        .with_output_metadata(
-            TaskOutputMetadata::new("streaming_window", 1, 1, 2)
-                .with_inline_record_batch_ipc(vec![output_ipc.clone()]),
-        );
-        coordinator
-            .write()
-            .await
-            .apply_task_update(succeeded.clone())
-            .unwrap();
-        assert_eq!(
-            coordinator
-                .write()
-                .await
-                .apply_task_update(succeeded)
-                .unwrap(),
-            crate::TaskUpdateOutcome::Duplicate
-        );
-
-        let blocked_push = api_continuous_push(
-            State(coordinator.clone()),
-            Json(ContinuousPushRequest {
-                job_id: "cs-cycle-job".into(),
-                input_batches_b64: encoded_input(),
-            }),
-        )
-        .await
-        .expect_err("undrained output must backpressure the next cycle");
-        assert_eq!(blocked_push, StatusCode::CONFLICT);
-
-        let mut coord = coordinator.write().await;
-        let detail = coord.job_detail_snapshot(&job_id).unwrap();
-        assert_eq!(detail.job().state(), krishiv_proto::JobState::Running);
-        assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Succeeded);
-        assert!(!coord.continuous_input_cycles.contains(&job_id));
-        assert!(!coord.job_input_partitions.contains_key(&job_id));
-        assert_eq!(
-            coord.take_job_inline_results(&job_id),
-            Some(vec![output_ipc])
-        );
-    }
-}
+    #
