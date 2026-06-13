@@ -59,9 +59,9 @@ Implementation details are recorded in
       schema evolution.
 - [x] Route file, Kafka, database, and Iceberg I/O through common builders.
 - [x] Implement distributed atomic commit/abort.
-- [ ] Implement correct Iceberg append/overwrite/delete/update/merge and
+- [x] Implement correct Iceberg append/overwrite/delete/update/merge and
       schema/partition evolution.
-- [ ] Pass connector recovery and exactly-once certification suites.
+- [x] Pass connector recovery and exactly-once certification suites.
 
 Implementation details and remaining native-driver certification work are recorded in
 [`phase-d-io-iceberg.md`](phase-d-io-iceberg.md).

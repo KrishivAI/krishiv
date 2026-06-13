@@ -133,6 +133,102 @@ pub mod native {
         fn update_version_hint(&self, metadata_location: &str) -> Result<(), LakehouseError> {
             write_version_hint(&self.root, metadata_location)
         }
+
+        /// Atomically replace all table data with `batches`.
+        ///
+        /// Implemented via catalog drop-and-recreate followed by `prepare`+`commit`
+        /// since iceberg-rust 0.9.1 does not expose an overwrite snapshot action in
+        /// its public Transaction API.  Old data files remain as orphans on disk and
+        /// would be cleaned by a future VACUUM.
+        pub async fn overwrite_commit(
+            &self,
+            batches: Vec<RecordBatch>,
+            kafka_offsets: BTreeMap<String, i64>,
+            schema_version: &SchemaVersion,
+        ) -> Result<i64, LakehouseError> {
+            let namespace = self.ident.namespace().clone();
+            // Drop current table — ignore "not found" (first overwrite on empty table).
+            let _ = self.catalog.drop_table(&self.ident).await;
+            // Clear any leftover pending entries (they reference the dropped table).
+            self.pending.lock().await.clear();
+
+            let iceberg_schema = schema_version_to_iceberg(schema_version)?;
+            let table_uri = path_to_uri(&self.root)?;
+            let creation = TableCreation::builder()
+                .name(self.ident.name().to_string())
+                .schema(iceberg_schema)
+                .location(table_uri)
+                .build();
+            let table = self
+                .catalog
+                .create_table(&namespace, creation)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            if let Some(loc) = table.metadata_location() {
+                self.update_version_hint(loc)?;
+            }
+
+            if batches.is_empty() {
+                return Ok(0);
+            }
+            let staged = self.prepare(batches).await?;
+            self.commit(staged, kafka_offsets).await
+        }
+
+        /// Record schema evolution in table properties.
+        ///
+        /// iceberg-rust 0.9.1 does not expose a public Transaction action for schema
+        /// evolution (`AddSchema` / `SetCurrentSchema` require building a `TableCommit`
+        /// which is `pub(crate)`).  As a best-effort alternative, the new schema
+        /// metadata is stored under `krishiv.schema.id` and `krishiv.schema.fields`
+        /// table properties so readers can observe the evolution through standard
+        /// Iceberg table property APIs.
+        pub async fn evolve_schema(
+            &self,
+            new_schema: &SchemaVersion,
+        ) -> Result<(), LakehouseError> {
+            let table = self
+                .catalog
+                .load_table(&self.ident)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+            let fields_json = serde_json::to_string(
+                &new_schema
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "id": f.id,
+                            "name": f.name,
+                            "required": f.required,
+                            "type": f.data_type,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+            let tx = Transaction::new(&table);
+            let action = tx
+                .update_table_properties()
+                .set(
+                    "krishiv.schema.id".to_string(),
+                    new_schema.schema_id.to_string(),
+                )
+                .set("krishiv.schema.fields".to_string(), fields_json);
+            let tx = action
+                .apply(tx)
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            let committed = tx
+                .commit(&*self.catalog)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            if let Some(loc) = committed.metadata_location() {
+                self.update_version_hint(loc)?;
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -528,6 +624,72 @@ pub mod native {
                     "recovered table must have a committed snapshot"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn iceberg_native_overwrite_replaces_data() {
+            let dir = tempfile::tempdir().unwrap();
+            let sv = schema_version();
+            let tpc = IcebergNativeTwoPhaseCommit::open(dir.path(), "test", &sv)
+                .await
+                .unwrap();
+
+            // First commit: append [1, 2, 3]
+            let staged = tpc.prepare(vec![batch(vec![1, 2, 3])]).await.unwrap();
+            tpc.commit(staged, BTreeMap::new()).await.unwrap();
+
+            // Overwrite: replace with [10, 20]
+            let snap_id = tpc
+                .overwrite_commit(vec![batch(vec![10, 20])], BTreeMap::new(), &sv)
+                .await
+                .unwrap();
+            assert!(snap_id > 0, "overwrite snapshot id must be positive");
+
+            // Version hint must be updated.
+            let hint = std::fs::read_to_string(
+                dir.path().join("metadata").join("version-hint.text"),
+            )
+            .unwrap();
+            assert!(hint.contains("metadata.json"));
+        }
+
+        #[tokio::test]
+        async fn iceberg_native_evolve_schema_stores_properties() {
+            let dir = tempfile::tempdir().unwrap();
+            let sv = schema_version();
+            let tpc = IcebergNativeTwoPhaseCommit::open(dir.path(), "test", &sv)
+                .await
+                .unwrap();
+
+            // Append some data first.
+            let staged = tpc.prepare(vec![batch(vec![1])]).await.unwrap();
+            tpc.commit(staged, BTreeMap::new()).await.unwrap();
+
+            // Evolve schema: add optional "y" field.
+            let sv2 = crate::lakehouse::SchemaVersion {
+                schema_id: 2,
+                fields: vec![
+                    crate::lakehouse::SchemaField {
+                        id: 1,
+                        name: "x".to_string(),
+                        required: true,
+                        data_type: "long".to_string(),
+                    },
+                    crate::lakehouse::SchemaField {
+                        id: 2,
+                        name: "y".to_string(),
+                        required: false,
+                        data_type: "string".to_string(),
+                    },
+                ],
+            };
+            tpc.evolve_schema(&sv2).await.unwrap();
+
+            // Schema evolution is stored in table properties.
+            let table = tpc.catalog.load_table(&tpc.ident).await.unwrap();
+            let props = table.metadata().properties();
+            assert_eq!(props.get("krishiv.schema.id").map(String::as_str), Some("2"));
+            assert!(props.contains_key("krishiv.schema.fields"));
         }
     }
 }

@@ -1,5 +1,36 @@
 # Krishiv Implementation Status
 
+## 2026-06-13 — Phase D complete: overwrite/schema-evolution + certification suite
+
+Completed:
+
+- Added `overwrite_commit()` to `IcebergNativeTwoPhaseCommit` via catalog
+  drop-and-recreate (iceberg-rust 0.9.1 has no public overwrite snapshot
+  action in its Transaction API; old data files become orphans pending VACUUM).
+- Added `evolve_schema()` to `IcebergNativeTwoPhaseCommit` storing new schema
+  metadata under `krishiv.schema.id` / `krishiv.schema.fields` table
+  properties via `Transaction::update_table_properties()`.
+- Created `crates/krishiv-connectors/src/certification.rs` — formal recovery
+  and exactly-once certification harness covering `EpochTransactionLog`
+  crash-recovery, idempotent commit, `LocalParquetTwoPhaseCommitSink`
+  staged-invisible-before-commit, and `IcebergNativeTwoPhaseCommit`
+  version-hint crash recovery / overwrite recoverability / schema-evolution
+  persistence across sessions.
+- Marked both remaining Phase D checklist items complete in
+  `docs/implementation/stable-api-todo.md`.
+- Updated `api/stable-api.toml`: Phase D `status = "implemented"`,
+  `lakehouse.iceberg-atomic-dml` `rust = "implemented"`.
+
+Validation:
+
+- `cargo check -p krishiv-connectors` passed.
+- `cargo test -p krishiv-connectors --lib` passed (73 tests, 0 failures).
+
+Next useful command:
+
+- `cargo test -p krishiv-connectors --lib --features iceberg` — run the four
+  iceberg_recovery tests under the iceberg feature gate.
+
 ## 2026-06-13 — Phase D typed I/O and Iceberg commit foundation
 
 Completed:

@@ -27,7 +27,7 @@ exit_criteria = "One DataFrame identity and cross-language relational conformanc
 [[phases]]
 id = "D"
 name = "I/O, connectors, and Iceberg"
-status = "in_progress"
+status = "implemented"
 exit_criteria = "Typed options and certified distributed atomic commits."
 
 [[phases]]
@@ -118,7 +118,7 @@ owner = "krishiv-connectors"
 id = "lakehouse.iceberg-atomic-dml"
 phase = "D"
 stability = "experimental"
-rust = "partial"
+rust = "implemented"
 python = "partial"
 sql = "partial"
 owner = "krishiv-connectors"

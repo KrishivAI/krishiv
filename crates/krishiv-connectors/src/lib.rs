@@ -55,6 +55,8 @@ pub mod vector;
 #[cfg(test)]
 mod tests;
 
+pub mod certification;
+
 // Root re-exports for perfect compatibility
 pub use capabilities::{ConnectorCapabilities, ConnectorMaturity, DeliveryGuarantee};
 pub use config::ConnectorConfig;
