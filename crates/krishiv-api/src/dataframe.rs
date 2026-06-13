@@ -14,6 +14,8 @@ use krishiv_runtime::{
 use krishiv_sql::KrishivDataFrameOps;
 
 use crate::error::{KrishivError, Result};
+use crate::expression::Expr;
+use crate::io::DataFrameWriter;
 use crate::types::{ExecutionMode, QueryResult};
 
 /// Unified execution result for [`DataFrame::execute`].
@@ -63,6 +65,85 @@ impl ExecutionResult {
     }
 }
 
+/// Explain output requested by [`DataFrame::explain_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainMode {
+    Logical,
+    Physical,
+    Analyze,
+}
+
+/// Lightweight query metrics returned by [`DataFrame::collect_with_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueryExecutionStats {
+    pub output_rows: u64,
+    pub cpu_nanos: u64,
+}
+
+/// Whether a canonical DataFrame has finite or unbounded input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Boundedness {
+    Bounded,
+    Unbounded,
+}
+
+impl Boundedness {
+    pub fn is_bounded(self) -> bool {
+        matches!(self, Self::Bounded)
+    }
+}
+
+/// Canonical equi-join type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    LeftSemi,
+    RightSemi,
+    LeftAnti,
+    RightAnti,
+}
+
+impl JoinType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inner => "inner",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Full => "full",
+            Self::LeftSemi => "left_semi",
+            Self::RightSemi => "right_semi",
+            Self::LeftAnti => "left_anti",
+            Self::RightAnti => "right_anti",
+        }
+    }
+}
+
+/// Grouping-set expansion requested for an aggregate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupingSpec {
+    Sets(Vec<Vec<Expr>>),
+    Cube(Vec<Expr>),
+    Rollup(Vec<Expr>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PivotValue {
+    pub value: crate::ScalarValue,
+    pub alias: String,
+}
+
+impl PivotValue {
+    pub fn new(value: crate::ScalarValue, alias: impl Into<String>) -> Self {
+        Self {
+            value,
+            alias: alias.into(),
+        }
+    }
+}
+
 /// DataFrame API backed by DataFusion for R1 local execution.
 #[derive(Clone)]
 pub struct DataFrame {
@@ -96,6 +177,63 @@ impl fmt::Debug for DataFrame {
                 &self.pre_collected.as_ref().map(|b| b.len()),
             )
             .finish_non_exhaustive()
+    }
+}
+
+/// A lazily grouped DataFrame awaiting aggregate expressions.
+#[derive(Clone)]
+pub struct GroupedDataFrame {
+    dataframe: DataFrame,
+    group_exprs: Vec<Expr>,
+}
+
+impl GroupedDataFrame {
+    /// Compute aggregate expressions for each group.
+    pub fn agg(&self, aggregate_exprs: &[Expr]) -> Result<DataFrame> {
+        let Some(ops) = &self.dataframe.sql_dataframe else {
+            return Err(KrishivError::unsupported(
+                "grouped aggregation requires an SQL-backed DataFrame",
+            ));
+        };
+        let groups = self.group_exprs.iter().map(Expr::node).collect::<Vec<_>>();
+        let aggregates = aggregate_exprs.iter().map(Expr::node).collect::<Vec<_>>();
+        let new_ops = krishiv_common::async_util::block_on(ops.aggregate(&groups, &aggregates))?;
+        Ok(self.dataframe.with_new_ops(new_ops))
+    }
+
+    /// Aggregate using SQL-compatible GROUPING SETS, CUBE, or ROLLUP semantics.
+    pub fn agg_grouping(
+        &self,
+        grouping: GroupingSpec,
+        aggregate_exprs: &[Expr],
+    ) -> Result<DataFrame> {
+        let Some(ops) = &self.dataframe.sql_dataframe else {
+            return Err(KrishivError::unsupported(
+                "grouping aggregation requires an SQL-backed DataFrame",
+            ));
+        };
+        let aggregates = aggregate_exprs.iter().map(Expr::node).collect::<Vec<_>>();
+        let grouping = match &grouping {
+            GroupingSpec::Sets(sets) => krishiv_sql::GroupingMode::Sets(
+                sets.iter()
+                    .map(|set| set.iter().map(Expr::node).collect())
+                    .collect(),
+            ),
+            GroupingSpec::Cube(exprs) => {
+                krishiv_sql::GroupingMode::Cube(exprs.iter().map(Expr::node).collect())
+            }
+            GroupingSpec::Rollup(exprs) => {
+                krishiv_sql::GroupingMode::Rollup(exprs.iter().map(Expr::node).collect())
+            }
+        };
+        let new_ops =
+            krishiv_common::async_util::block_on(ops.aggregate_grouping(grouping, &aggregates))?;
+        Ok(self.dataframe.with_new_ops(new_ops))
+    }
+
+    /// Count rows in each group.
+    pub fn count(&self) -> Result<DataFrame> {
+        self.agg(&[crate::expression::count_all().alias("count")])
     }
 }
 
@@ -184,9 +322,69 @@ impl DataFrame {
         &self.logical_plan
     }
 
+    /// Explicit finite/unbounded metadata carried by the canonical DataFrame.
+    pub fn boundedness(&self) -> Boundedness {
+        if self.logical_plan.kind() == ExecutionKind::Streaming {
+            Boundedness::Unbounded
+        } else {
+            Boundedness::Bounded
+        }
+    }
+
+    pub fn is_bounded(&self) -> bool {
+        self.boundedness().is_bounded()
+    }
+
     /// Explain the current plan.
     pub fn explain(&self) -> Result<String> {
         krishiv_common::async_util::block_on(self.explain_async())
+    }
+
+    /// Explain the plan at the requested detail level.
+    pub fn explain_with(&self, mode: ExplainMode) -> Result<String> {
+        match mode {
+            ExplainMode::Logical => Ok(self.explain_logical()),
+            ExplainMode::Physical => self.explain(),
+            ExplainMode::Analyze => {
+                let (result, stats) = self.collect_with_stats()?;
+                Ok(format!(
+                    "{}
+
+Execution statistics:
+  output_rows={}
+  result_rows={}
+  cpu_nanos={}",
+                    self.explain()?,
+                    stats.output_rows,
+                    result.row_count(),
+                    stats.cpu_nanos
+                ))
+            }
+        }
+    }
+
+    /// Collect local SQL results with engine execution statistics.
+    pub fn collect_with_stats(&self) -> Result<(QueryResult, QueryExecutionStats)> {
+        if self.runtime.uses_remote_execution() && !self.force_local {
+            return Err(KrishivError::unsupported(
+                "remote collect_with_stats requires coordinator query-metrics transport",
+            ));
+        }
+        let Some(dataframe) = &self.sql_dataframe else {
+            return Ok((
+                QueryResult::new(self.pre_collected.clone().unwrap_or_default()),
+                QueryExecutionStats::default(),
+            ));
+        };
+        let (batches, stats) =
+            krishiv_common::async_util::block_on(dataframe.collect_with_stats())?;
+        Ok((
+            QueryResult::new(batches),
+            QueryExecutionStats {
+                output_rows: stats.output_rows,
+                cpu_nanos: stats.cpu_nanos,
+            },
+        ))
     }
 
     /// Unified execution entry point — routes to `collect_async()` for batch
@@ -213,6 +411,56 @@ impl DataFrame {
     /// for executing async stream operations with windows and aggregations.
     pub fn stream(&self) -> crate::streaming_dataframe::StreamingDataFrame {
         crate::streaming_dataframe::StreamingDataFrame::new(self.clone())
+    }
+
+    /// Configure event-time processing on the canonical DataFrame.
+    pub fn with_event_time(
+        &self,
+        column: impl Into<String>,
+    ) -> crate::streaming_dataframe::StreamingDataFrame {
+        self.stream().with_event_time(column)
+    }
+
+    /// Key the canonical DataFrame for stateful/windowed processing.
+    pub fn key_by(
+        &self,
+        column: impl Into<String>,
+    ) -> crate::streaming_dataframe::StreamingDataFrame {
+        self.stream().key_by(column)
+    }
+
+    /// Configure a tumbling event-time window from the canonical DataFrame.
+    pub fn tumbling_window(
+        &self,
+        event_time: impl Into<String>,
+        window_size_ms: u64,
+    ) -> crate::streaming_dataframe::StreamingDataFrame {
+        self.stream()
+            .with_event_time(event_time)
+            .tumbling_window(window_size_ms)
+    }
+
+    /// Configure a sliding event-time window from the canonical DataFrame.
+    pub fn sliding_window(
+        &self,
+        event_time: impl Into<String>,
+        window_size_ms: u64,
+        slide_ms: u64,
+    ) -> crate::streaming_dataframe::StreamingDataFrame {
+        self.stream()
+            .with_event_time(event_time)
+            .sliding_window(window_size_ms, slide_ms)
+    }
+
+    /// Configure a session event-time window from the canonical DataFrame.
+    pub fn session_window(
+        &self,
+        event_time: impl Into<String>,
+        gap_ms: u64,
+    ) -> crate::streaming_dataframe::StreamingDataFrame {
+        self.stream()
+            .with_event_time(event_time)
+            .session_window(gap_ms)
     }
 
     pub async fn explain_async(&self) -> Result<String> {
@@ -471,6 +719,86 @@ impl DataFrame {
         }
     }
 
+    /// Select typed expressions.
+    pub fn select_exprs(&self, expressions: &[Expr]) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let expressions = expressions.iter().map(Expr::node).collect::<Vec<_>>();
+                let new_ops = krishiv_common::async_util::block_on(df.select_exprs(&expressions))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "select_exprs requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Filter rows using a typed expression.
+    pub fn filter_expr(&self, predicate: Expr) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops =
+                    krishiv_common::async_util::block_on(df.filter_expr(predicate.node()))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "filter_expr requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Group rows by typed expressions.
+    pub fn group_by(&self, expressions: &[Expr]) -> GroupedDataFrame {
+        GroupedDataFrame {
+            dataframe: self.clone(),
+            group_exprs: expressions.to_vec(),
+        }
+    }
+
+    /// Pivot known values into aggregate columns.
+    pub fn pivot(
+        &self,
+        group_exprs: &[Expr],
+        pivot_column: Expr,
+        aggregate_expr: Expr,
+        values: &[PivotValue],
+    ) -> Result<DataFrame> {
+        let Some(ops) = &self.sql_dataframe else {
+            return Err(KrishivError::unsupported(
+                "pivot requires an SQL-backed DataFrame",
+            ));
+        };
+        let groups = group_exprs.iter().map(Expr::node).collect::<Vec<_>>();
+        let values = values
+            .iter()
+            .map(|value| (value.value.clone(), value.alias.clone()))
+            .collect::<Vec<_>>();
+        let new_ops = krishiv_common::async_util::block_on(ops.pivot(
+            &groups,
+            pivot_column.node(),
+            aggregate_expr.node(),
+            &values,
+        ))?;
+        Ok(self.with_new_ops(new_ops))
+    }
+
+    /// Unpivot columns into name/value rows while preserving all other columns.
+    pub fn unpivot(
+        &self,
+        columns: &[&str],
+        name_column: &str,
+        value_column: &str,
+    ) -> Result<DataFrame> {
+        let Some(ops) = &self.sql_dataframe else {
+            return Err(KrishivError::unsupported(
+                "unpivot requires an SQL-backed DataFrame",
+            ));
+        };
+        let new_ops =
+            krishiv_common::async_util::block_on(ops.unpivot(columns, name_column, value_column))?;
+        Ok(self.with_new_ops(new_ops))
+    }
+
     /// Filter rows by a SQL predicate expression.
     pub fn filter(&self, predicate: &str) -> Result<DataFrame> {
         match &self.sql_dataframe {
@@ -511,6 +839,37 @@ impl DataFrame {
             }
             None => Err(KrishivError::unsupported(
                 "distinct requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Drop rows containing nulls in any selected column. Empty `columns` checks all columns.
+    pub fn drop_nulls(&self, columns: &[&str]) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.drop_nulls(columns))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "drop_nulls requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Bernoulli-sample rows using a fraction in the inclusive range 0..=1.
+    pub fn sample(&self, fraction: f64) -> Result<DataFrame> {
+        if !(0.0..=1.0).contains(&fraction) {
+            return Err(KrishivError::InvalidConfig {
+                message: "sample fraction must be between 0 and 1".into(),
+            });
+        }
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.sample(fraction))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None => Err(KrishivError::unsupported(
+                "sample requires an SQL-backed DataFrame",
             )),
         }
     }
@@ -609,6 +968,16 @@ impl DataFrame {
     /// Both DataFrames must be SQL-backed (created via `sql()` or `read_parquet()`).
     /// Supported join types: inner, left, right, full/outer, left_semi, right_semi,
     /// left_anti, right_anti.
+    pub fn join_on(
+        &self,
+        right: &DataFrame,
+        how: JoinType,
+        left_on: &[&str],
+        right_on: &[&str],
+    ) -> Result<DataFrame> {
+        self.join(right, how.as_str(), left_on, right_on)
+    }
+
     pub fn join(
         &self,
         right: &DataFrame,
@@ -644,6 +1013,66 @@ impl DataFrame {
             }
             _ => Err(KrishivError::unsupported(
                 "union requires both DataFrames to be SQL-backed",
+            )),
+        }
+    }
+
+    /// Union and remove duplicate rows.
+    pub fn union_distinct(&self, right: &DataFrame) -> Result<DataFrame> {
+        match (&self.sql_dataframe, &right.sql_dataframe) {
+            (Some(left), Some(right)) => {
+                let ops =
+                    krishiv_common::async_util::block_on(left.union_distinct(right.as_ref()))?;
+                Ok(self.with_new_ops(ops))
+            }
+            _ => Err(KrishivError::unsupported(
+                "union_distinct requires SQL-backed DataFrames",
+            )),
+        }
+    }
+
+    /// Return rows present in both DataFrames, preserving duplicate multiplicity.
+    pub fn intersect(&self, right: &DataFrame) -> Result<DataFrame> {
+        self.intersect_impl(right, false)
+    }
+
+    /// Return distinct rows present in both DataFrames.
+    pub fn intersect_distinct(&self, right: &DataFrame) -> Result<DataFrame> {
+        self.intersect_impl(right, true)
+    }
+
+    fn intersect_impl(&self, right: &DataFrame, distinct: bool) -> Result<DataFrame> {
+        match (&self.sql_dataframe, &right.sql_dataframe) {
+            (Some(left), Some(right)) => {
+                let ops =
+                    krishiv_common::async_util::block_on(left.intersect(right.as_ref(), distinct))?;
+                Ok(self.with_new_ops(ops))
+            }
+            _ => Err(KrishivError::unsupported(
+                "intersect requires SQL-backed DataFrames",
+            )),
+        }
+    }
+
+    /// Return rows from this DataFrame that are absent from `right`.
+    pub fn except(&self, right: &DataFrame) -> Result<DataFrame> {
+        self.except_impl(right, false)
+    }
+
+    /// Return distinct rows from this DataFrame that are absent from `right`.
+    pub fn except_distinct(&self, right: &DataFrame) -> Result<DataFrame> {
+        self.except_impl(right, true)
+    }
+
+    fn except_impl(&self, right: &DataFrame, distinct: bool) -> Result<DataFrame> {
+        match (&self.sql_dataframe, &right.sql_dataframe) {
+            (Some(left), Some(right)) => {
+                let ops =
+                    krishiv_common::async_util::block_on(left.except(right.as_ref(), distinct))?;
+                Ok(self.with_new_ops(ops))
+            }
+            _ => Err(KrishivError::unsupported(
+                "except requires SQL-backed DataFrames",
             )),
         }
     }
@@ -710,6 +1139,11 @@ impl DataFrame {
                 "describe requires an SQL-backed DataFrame",
             )),
         }
+    }
+
+    /// Start a generic file writer builder.
+    pub fn write(&self) -> DataFrameWriter {
+        DataFrameWriter::new(self.clone())
     }
 
     // ── Write API ────────────────────────────────────────────────────────────

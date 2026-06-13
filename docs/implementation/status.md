@@ -1,5 +1,179 @@
 # Krishiv Implementation Status
 
+## 2026-06-13 — Phase D typed I/O and Iceberg commit foundation
+
+Completed:
+
+- Replaced rejected generic reader/writer options with typed format, endpoint,
+  layout, mode, distribution, sizing, and schema-evolution contracts.
+- Added canonical async load/save/table resolution and Python typed file entry
+  points while retaining compatibility wrappers.
+- Added partitioned/hashed/sorted atomic local writes and Iceberg table reads,
+  append, and overwrite through the common builders.
+- Added coordinator-owned atomic multi-task Iceberg commit/abort with idempotent
+  epoch retry and no visibility for incomplete epochs.
+- Added the in-memory Iceberg DML conformance model for delete, update, merge,
+  schema/partition evolution, and named references.
+
+Remaining Phase D blockers:
+
+- Native Iceberg row-level DML and object-store failure certification.
+- Kafka replay/backpressure/exactly-once certification and a registered
+  JDBC-compatible database driver.
+
+Validation:
+
+- `cargo test -p krishiv-api phase_d --lib` passed (2 tests).
+- Focused typed-I/O, concurrent distributed-commit, and in-memory Iceberg DML
+  connector tests passed with the `iceberg` feature.
+- `cargo check -p krishiv-api -p krishiv-python --lib` passed; pre-existing
+  scheduler warnings remain.
+- API inventories/stubs, project scripts, Markdown links, release metadata,
+  formatting, and diff checks passed.
+
+## 2026-06-13 — Phase C canonical DataFrame and catalog
+
+Completed:
+
+- Added explicit boundedness metadata to the canonical DataFrame and canonical
+  entry points for existing event-time/window behavior.
+- Added set operations, null dropping, sampling, grouping sets, cube/rollup,
+  pivot/unpivot, typed joins, and Python parity.
+- Added typed catalog identifiers and table/view/function metadata APIs.
+- Added typed prepared SQL parameters shared by Rust and Python.
+- Added focused Rust/Python/SQL relational conformance tests and execution-mode
+  boundedness checks.
+
+Validation:
+
+- `cargo check -p krishiv-plan -p krishiv-sql -p krishiv-api` passed.
+- `cargo check -p krishiv-python --lib` passed.
+- `cargo test -p krishiv-api phase_c --lib` passed (4 tests).
+- Focused prepared-statement and typed-identifier tests passed.
+- API inventory, Markdown links, script tests, formatting, and diff checks passed.
+
+The focused Python Phase C test build was stopped after a lengthy fresh test-profile
+native dependency rebuild; the Python crate check completed successfully.
+
+## 2026-06-12 — Phase B expression/type contract
+
+Completed:
+
+- Added the versioned engine-owned expression, scalar, and logical type AST in
+  `krishiv-plan`, including decimal, timestamp/timezone, interval, nested type,
+  and field-nullability semantics.
+- Migrated Rust typed expressions and DataFrame typed projection/filter/grouping
+  to the AST and centralized DataFusion lowering in `krishiv-sql`.
+- Added Python `Column` operators, function helpers, windows, normalized AST
+  inspection, and typed DataFrame methods while retaining explicit raw-SQL
+  preview escape hatches.
+- Added focused round-trip, validation, cross-language normalization, and
+  typed-versus-SQL execution tests.
+
+Validation:
+
+- `cargo test -p krishiv-plan expression --lib` passed (5 tests).
+- API inventory, Markdown-link, formatting, and diff checks passed.
+- The additive API comparison against `origin/main` reported 755 additive and
+  zero breaking or semantic changes.
+- SQL/API/Python crate checks were started, but this checkout required a fresh
+  native RocksDB build and did not complete within the validation window.
+
+Next useful command: `cargo test -p krishiv-sql typed_expression_ast_matches_raw_sql_execution --lib && cargo test -p krishiv-python python_column_uses_the_same_normalized_ast_as_rust --lib`.
+
+## Phase A complete: public API inventory and stability enforcement (2026-06-12)
+
+### Done
+
+- Added per-item Rust, Python, and SQL stability, documentation, deprecation, replacement, and signature metadata.
+- Added additive/breaking/semantic API comparison against `origin/main`, with explicit approval records required for breaking or semantic changes.
+- Added generated Python native-module type stubs and a deterministic Rust public API signature report.
+- Added full-history CI comparison and uploaded API change reports. Phase A is now marked implemented in `api/stable-api.toml`.
+
+### Validation
+
+```bash
+python3 -m unittest discover -s scripts/tests -v  # 10 passed
+python3 scripts/check_api_surface.py               # passed
+python3 scripts/compare_api_surface.py --against-ref does-not-exist --report /tmp/api-change-report.json  # 710 additive; 0 breaking/semantic
+python3 scripts/check_markdown_links.py            # passed
+python3 scripts/check_release.py                   # passed for v0.1.0
+python3 -m py_compile scripts/check_api_surface.py scripts/compare_api_surface.py  # passed
+cargo fmt --all --check                           # passed
+git diff --check                                  # passed
+```
+
+`cargo check -p krishiv-python --lib` was started, but the fresh native dependency build did not complete in the validation window.
+
+### Blockers
+
+None for Phase A. Phase B remains the next dependency: replace SQL-string expressions with the versioned structured expression/type AST.
+
+### Next useful task
+
+Implement the Phase B AST nodes, scalar values, serialization version, and DataFusion lowering.
+
+---
+
+## Stable API execution foundation (2026-06-12)
+
+### Done
+
+- Added an executable Phase A-I checklist and machine-readable capability/parity manifest.
+- Added generated Rust, Python, and SQL API inventories plus CI validation for stale inventories, invalid phase metadata, and duplicate Python class names.
+- Renamed the legacy Python unified wrapper from `DataFrame` to `Relation`, leaving one canonical Python `DataFrame` class identity.
+
+### Validation
+
+```bash
+python3 -m unittest discover -s scripts/tests -v  # 7 passed
+python3 scripts/check_api_surface.py               # passed
+python3 scripts/check_markdown_links.py            # passed
+python3 scripts/check_release.py                   # passed for v0.1.0
+cargo fmt --all --check                           # passed
+git diff --check                                  # passed
+```
+
+`cargo test -p krishiv-python --lib` was started but not completed in the validation window because this checkout required a fresh native/dependency build.
+
+### Blockers
+
+Phases B-I remain engine-scale implementation work. They are intentionally unchecked rather than being marked complete from documentation alone. Phase A still needs per-method stability/deprecation metadata and semver/type-stub baseline tooling.
+
+### Next useful task
+
+Implement the structured expression/type AST in Phase B without adding further SQL-string-based public expression methods.
+
+---
+
+## Stable Rust, Python, and SQL API plan (2026-06-12)
+
+### Done
+
+- Accepted ADR-0002: one canonical relational API, a separate lower-level state/time API, synchronous lazy plan construction, async-first Rust execution, an explicit blocking facade, and genuine Python asyncio methods.
+- Added a phased stable-public-API plan covering inventories, expressions/types, DataFrame/catalog parity, I/O and Iceberg, query lifecycle, structured streaming, process/state/timer APIs, SQL completeness, and 1.0 gates.
+- Defined P0/P1/P2 priorities, ownership, language parity, compatibility requirements, and explicit data-platform non-goals.
+
+### Validation
+
+```bash
+python3 -m unittest discover -s scripts/tests -v  # 4 passed
+python3 scripts/check_markdown_links.py           # passed
+python3 scripts/check_release.py                  # passed for v0.1.0
+cargo fmt --all --check                          # passed
+git diff --check                                 # passed
+```
+
+### Blockers
+
+This change is a plan and architectural decision; implementation begins with the P0 API inventory, duplicate Python `DataFrame` removal, structured expression AST, and `QueryHandle`.
+
+### Next useful task
+
+Implement Phase A inventory generation and CI baseline enforcement from `docs/implementation/stable-public-api-plan.md`.
+
+---
+
 ## Gap closure: profile-driven checkpoints + merge with main (2026-06-12)
 
 ### Done

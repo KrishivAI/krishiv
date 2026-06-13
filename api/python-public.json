@@ -1,0 +1,2061 @@
+{
+  "classes": [
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/live_table.rs#L76",
+      "id": "crates/krishiv-python/src/live_table.rs::ChangeFeedIter",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/live_table.rs#L104",
+          "id": "ChangeFeedIter.__aiter__",
+          "kind": "method",
+          "name": "__aiter__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/live_table.rs#L108",
+          "id": "ChangeFeedIter.__anext__",
+          "kind": "method",
+          "name": "__anext__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/live_table.rs#L82",
+          "id": "ChangeFeedIter.__iter__",
+          "kind": "method",
+          "name": "__iter__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/live_table.rs#L86",
+          "id": "ChangeFeedIter.__next__",
+          "kind": "method",
+          "name": "__next__",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "ChangeFeedIter",
+      "replacement": null,
+      "rust_type": "PyChangeFeedIter",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/expression.rs#L9",
+      "id": "crates/krishiv-python/src/expression.rs::Column",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L90",
+          "id": "Column.__add__",
+          "kind": "method",
+          "name": "__add__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L114",
+          "id": "Column.__and__",
+          "kind": "method",
+          "name": "__and__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L126",
+          "id": "Column.__bool__",
+          "kind": "method",
+          "name": "__bool__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L102",
+          "id": "Column.__mul__",
+          "kind": "method",
+          "name": "__mul__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L120",
+          "id": "Column.__or__",
+          "kind": "method",
+          "name": "__or__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L132",
+          "id": "Column.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L76",
+          "id": "Column.__richcmp__",
+          "kind": "method",
+          "name": "__richcmp__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L96",
+          "id": "Column.__sub__",
+          "kind": "method",
+          "name": "__sub__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L108",
+          "id": "Column.__truediv__",
+          "kind": "method",
+          "name": "__truediv__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L21",
+          "id": "Column.alias",
+          "kind": "method",
+          "name": "alias",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L58",
+          "id": "Column.asc",
+          "kind": "method",
+          "name": "asc",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L33",
+          "id": "Column.cast",
+          "kind": "method",
+          "name": "cast",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L62",
+          "id": "Column.desc",
+          "kind": "method",
+          "name": "desc",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L29",
+          "id": "Column.is_not_null",
+          "kind": "method",
+          "name": "is_not_null",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L25",
+          "id": "Column.is_null",
+          "kind": "method",
+          "name": "is_null",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L66",
+          "id": "Column.normalized_ast",
+          "kind": "method",
+          "name": "normalized_ast",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L47",
+          "id": "Column.over",
+          "kind": "method",
+          "name": "over",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L72",
+          "id": "Column.sql",
+          "kind": "method",
+          "name": "sql",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L39",
+          "id": "Column.try_cast",
+          "kind": "method",
+          "name": "try_cast",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "Column",
+      "replacement": null,
+      "rust_type": "PyColumn",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/dataframe.rs#L10",
+      "id": "crates/krishiv-python/src/dataframe.rs::DataFrame",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L403",
+          "id": "DataFrame.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L153",
+          "id": "DataFrame.boundedness",
+          "kind": "method",
+          "name": "boundedness",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L18",
+          "id": "DataFrame.collect",
+          "kind": "method",
+          "name": "collect",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L43",
+          "id": "DataFrame.collect_async",
+          "kind": "method",
+          "name": "collect_async",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L40",
+          "id": "DataFrame.collect_batches",
+          "kind": "method",
+          "name": "collect_batches",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L29",
+          "id": "DataFrame.collect_pretty",
+          "kind": "method",
+          "name": "collect_pretty",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L180",
+          "id": "DataFrame.distinct",
+          "kind": "method",
+          "name": "distinct",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L197",
+          "id": "DataFrame.drop_columns",
+          "kind": "method",
+          "name": "drop_columns",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L166",
+          "id": "DataFrame.drop_nulls",
+          "kind": "method",
+          "name": "drop_nulls",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L272",
+          "id": "DataFrame.except_all",
+          "kind": "method",
+          "name": "except_all",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L279",
+          "id": "DataFrame.except_distinct",
+          "kind": "method",
+          "name": "except_distinct",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L52",
+          "id": "DataFrame.execute_stream_async",
+          "kind": "method",
+          "name": "execute_stream_async",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L76",
+          "id": "DataFrame.explain",
+          "kind": "method",
+          "name": "explain",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L81",
+          "id": "DataFrame.explain_logical",
+          "kind": "method",
+          "name": "explain_logical",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L87",
+          "id": "DataFrame.explain_mode",
+          "kind": "method",
+          "name": "explain_mode",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L219",
+          "id": "DataFrame.fill_null",
+          "kind": "method",
+          "name": "fill_null",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L139",
+          "id": "DataFrame.filter",
+          "kind": "method",
+          "name": "filter",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L132",
+          "id": "DataFrame.filter_column",
+          "kind": "method",
+          "name": "filter_column",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L228",
+          "id": "DataFrame.group_by",
+          "kind": "method",
+          "name": "group_by",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L237",
+          "id": "DataFrame.group_by_columns",
+          "kind": "method",
+          "name": "group_by_columns",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L258",
+          "id": "DataFrame.intersect",
+          "kind": "method",
+          "name": "intersect",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L265",
+          "id": "DataFrame.intersect_distinct",
+          "kind": "method",
+          "name": "intersect_distinct",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L160",
+          "id": "DataFrame.is_bounded",
+          "kind": "method",
+          "name": "is_bounded",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L146",
+          "id": "DataFrame.limit",
+          "kind": "method",
+          "name": "limit",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L393",
+          "id": "DataFrame.num_rows",
+          "kind": "method",
+          "name": "num_rows",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L286",
+          "id": "DataFrame.pivot",
+          "kind": "method",
+          "name": "pivot",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L205",
+          "id": "DataFrame.rename",
+          "kind": "method",
+          "name": "rename",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L173",
+          "id": "DataFrame.sample",
+          "kind": "method",
+          "name": "sample",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L101",
+          "id": "DataFrame.select",
+          "kind": "method",
+          "name": "select",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L121",
+          "id": "DataFrame.select_columns",
+          "kind": "method",
+          "name": "select_columns",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L111",
+          "id": "DataFrame.select_exprs",
+          "kind": "method",
+          "name": "select_exprs",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L73",
+          "id": "DataFrame.show",
+          "kind": "method",
+          "name": "show",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L189",
+          "id": "DataFrame.sort",
+          "kind": "method",
+          "name": "sort",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L244",
+          "id": "DataFrame.union",
+          "kind": "method",
+          "name": "union",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L251",
+          "id": "DataFrame.union_distinct",
+          "kind": "method",
+          "name": "union_distinct",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L314",
+          "id": "DataFrame.unpivot",
+          "kind": "method",
+          "name": "unpivot",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L212",
+          "id": "DataFrame.with_column",
+          "kind": "method",
+          "name": "with_column",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L383",
+          "id": "DataFrame.write_csv",
+          "kind": "method",
+          "name": "write_csv",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L329",
+          "id": "DataFrame.write_file",
+          "kind": "method",
+          "name": "write_file",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L388",
+          "id": "DataFrame.write_json",
+          "kind": "method",
+          "name": "write_json",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L378",
+          "id": "DataFrame.write_parquet",
+          "kind": "method",
+          "name": "write_parquet",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "DataFrame",
+      "replacement": null,
+      "rust_type": "PyDataFrame",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/dataframe.rs#L486",
+      "id": "crates/krishiv-python/src/dataframe.rs::DataFrameStream",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L492",
+          "id": "DataFrameStream.__aiter__",
+          "kind": "method",
+          "name": "__aiter__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L496",
+          "id": "DataFrameStream.__anext__",
+          "kind": "method",
+          "name": "__anext__",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "DataFrameStream",
+      "replacement": null,
+      "rust_type": "PyDataFrameStream",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/dataframe.rs#L409",
+      "id": "crates/krishiv-python/src/dataframe.rs::GroupedDataFrame",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L416",
+          "id": "GroupedDataFrame.agg",
+          "kind": "method",
+          "name": "agg",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L429",
+          "id": "GroupedDataFrame.agg_columns",
+          "kind": "method",
+          "name": "agg_columns",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L475",
+          "id": "GroupedDataFrame.count",
+          "kind": "method",
+          "name": "count",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L441",
+          "id": "GroupedDataFrame.cube",
+          "kind": "method",
+          "name": "cube",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L456",
+          "id": "GroupedDataFrame.rollup",
+          "kind": "method",
+          "name": "rollup",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "GroupedDataFrame",
+      "replacement": null,
+      "rust_type": "PyGroupedDataFrame",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lakehouse.rs#L43",
+      "id": "crates/krishiv-python/src/lakehouse.rs::HudiWriteResult",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L51",
+          "id": "HudiWriteResult.instant",
+          "kind": "method",
+          "name": "instant",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L56",
+          "id": "HudiWriteResult.rows_inserted",
+          "kind": "method",
+          "name": "rows_inserted",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L61",
+          "id": "HudiWriteResult.rows_updated",
+          "kind": "method",
+          "name": "rows_updated",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L66",
+          "id": "HudiWriteResult.snapshot_rows",
+          "kind": "method",
+          "name": "snapshot_rows",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "HudiWriteResult",
+      "replacement": null,
+      "rust_type": "PyHudiWriteResult",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lakehouse.rs#L138",
+      "id": "crates/krishiv-python/src/lakehouse.rs::IcebergRestCatalog",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L203",
+          "id": "IcebergRestCatalog.list_tables",
+          "kind": "method",
+          "name": "list_tables",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L213",
+          "id": "IcebergRestCatalog.load_table_metadata",
+          "kind": "method",
+          "name": "load_table_metadata",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L157",
+          "id": "IcebergRestCatalog.new",
+          "kind": "method",
+          "name": "new",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "IcebergRestCatalog",
+      "replacement": null,
+      "rust_type": "PyIcebergRestCatalog",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/job_status.rs#L5",
+      "id": "crates/krishiv-python/src/job_status.rs::JobStatus",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/job_status.rs#L38",
+          "id": "JobStatus.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/job_status.rs#L25",
+          "id": "JobStatus.id",
+          "kind": "method",
+          "name": "id",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/job_status.rs#L30",
+          "id": "JobStatus.name",
+          "kind": "method",
+          "name": "name",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/job_status.rs#L35",
+          "id": "JobStatus.state",
+          "kind": "method",
+          "name": "state",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "JobStatus",
+      "replacement": null,
+      "rust_type": "PyJobStatus",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/stream.rs#L157",
+      "id": "crates/krishiv-python/src/stream.rs::KeyedStream",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L189",
+          "id": "KeyedStream.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L196",
+          "id": "KeyedStream._repr_html_",
+          "kind": "method",
+          "name": "_repr_html_",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L175",
+          "id": "KeyedStream.tumbling_window",
+          "kind": "method",
+          "name": "tumbling_window",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L183",
+          "id": "KeyedStream.tumbling_window_ms",
+          "kind": "method",
+          "name": "tumbling_window_ms",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L163",
+          "id": "KeyedStream.window",
+          "kind": "method",
+          "name": "window",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "KeyedStream",
+      "replacement": null,
+      "rust_type": "PyKeyedStream",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/live_table.rs#L21",
+      "id": "crates/krishiv-python/src/live_table.rs::LiveTable",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/live_table.rs#L47",
+          "id": "LiveTable.change_feed",
+          "kind": "method",
+          "name": "change_feed",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/live_table.rs#L40",
+          "id": "LiveTable.drop",
+          "kind": "method",
+          "name": "drop",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/live_table.rs#L60",
+          "id": "LiveTable.ingest_row",
+          "kind": "method",
+          "name": "ingest_row",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/live_table.rs#L31",
+          "id": "LiveTable.name",
+          "kind": "method",
+          "name": "name",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/live_table.rs#L34",
+          "id": "LiveTable.refresh",
+          "kind": "method",
+          "name": "refresh",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "LiveTable",
+      "replacement": null,
+      "rust_type": "PyLiveTable",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/memo.rs#L17",
+      "id": "crates/krishiv-python/src/memo.rs::MemoCacheInfo",
+      "kind": "class",
+      "methods": [],
+      "name": "MemoCacheInfo",
+      "replacement": null,
+      "rust_type": "MemoCacheInfo",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/sinks.rs#L6",
+      "id": "crates/krishiv-python/src/sinks.rs::ParquetSink",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L22",
+          "id": "ParquetSink.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L14",
+          "id": "ParquetSink.new",
+          "kind": "method",
+          "name": "new",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L19",
+          "id": "ParquetSink.path",
+          "kind": "method",
+          "name": "path",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "ParquetSink",
+      "replacement": null,
+      "rust_type": "PyParquetSink",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/prepared.rs#L8",
+      "id": "crates/krishiv-python/src/prepared.rs::PreparedStatement",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/prepared.rs#L22",
+          "id": "PreparedStatement.bind",
+          "kind": "method",
+          "name": "bind",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/prepared.rs#L18",
+          "id": "PreparedStatement.parameter_count",
+          "kind": "method",
+          "name": "parameter_count",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/prepared.rs#L14",
+          "id": "PreparedStatement.sql",
+          "kind": "method",
+          "name": "sql",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "PreparedStatement",
+      "replacement": null,
+      "rust_type": "PyPreparedStatement",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/query_result.rs#L117",
+      "id": "crates/krishiv-python/src/query_result.rs::PyQueryResultIter",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L124",
+          "id": "PyQueryResultIter.__iter__",
+          "kind": "method",
+          "name": "__iter__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L128",
+          "id": "PyQueryResultIter.__next__",
+          "kind": "method",
+          "name": "__next__",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "PyQueryResultIter",
+      "replacement": null,
+      "rust_type": "PyQueryResultIter",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/query_result.rs#L10",
+      "id": "crates/krishiv-python/src/query_result.rs::QueryResult",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L92",
+          "id": "QueryResult.__iter__",
+          "kind": "method",
+          "name": "__iter__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L103",
+          "id": "QueryResult.__len__",
+          "kind": "method",
+          "name": "__len__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L107",
+          "id": "QueryResult.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L22",
+          "id": "QueryResult.batches",
+          "kind": "method",
+          "name": "batches",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L35",
+          "id": "QueryResult.pretty",
+          "kind": "method",
+          "name": "pretty",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L32",
+          "id": "QueryResult.row_count",
+          "kind": "method",
+          "name": "row_count",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L44",
+          "id": "QueryResult.show",
+          "kind": "method",
+          "name": "show",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L53",
+          "id": "QueryResult.to_arrow",
+          "kind": "method",
+          "name": "to_arrow",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/query_result.rs#L78",
+          "id": "QueryResult.to_pandas",
+          "kind": "method",
+          "name": "to_pandas",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "QueryResult",
+      "replacement": null,
+      "rust_type": "PyQueryResult",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/relation.rs#L53",
+      "id": "crates/krishiv-python/src/relation.rs::Relation",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L286",
+          "id": "Relation.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L239",
+          "id": "Relation.collect",
+          "kind": "method",
+          "name": "collect",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L111",
+          "id": "Relation.explain",
+          "kind": "method",
+          "name": "explain",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L103",
+          "id": "Relation.is_bounded",
+          "kind": "method",
+          "name": "is_bounded",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L141",
+          "id": "Relation.key_by",
+          "kind": "method",
+          "name": "key_by",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L203",
+          "id": "Relation.session_window",
+          "kind": "method",
+          "name": "session_window",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L245",
+          "id": "Relation.show",
+          "kind": "method",
+          "name": "show",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L198",
+          "id": "Relation.sliding_window",
+          "kind": "method",
+          "name": "sliding_window",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L250",
+          "id": "Relation.to_arrow",
+          "kind": "method",
+          "name": "to_arrow",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L255",
+          "id": "Relation.to_pandas",
+          "kind": "method",
+          "name": "to_pandas",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L193",
+          "id": "Relation.tumbling_window",
+          "kind": "method",
+          "name": "tumbling_window",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L133",
+          "id": "Relation.watermark",
+          "kind": "method",
+          "name": "watermark",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L164",
+          "id": "Relation.window",
+          "kind": "method",
+          "name": "window",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L150",
+          "id": "Relation.with_event_time",
+          "kind": "method",
+          "name": "with_event_time",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L226",
+          "id": "Relation.with_source_id_column",
+          "kind": "method",
+          "name": "with_source_id_column",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L219",
+          "id": "Relation.with_source_watermark",
+          "kind": "method",
+          "name": "with_source_watermark",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/relation.rs#L263",
+          "id": "Relation.write_parquet",
+          "kind": "method",
+          "name": "write_parquet",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "Relation",
+      "replacement": null,
+      "rust_type": "PyRelation",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/session.rs#L63",
+      "id": "crates/krishiv-python/src/session.rs::Session",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L303",
+          "id": "Session.configs",
+          "kind": "method",
+          "name": "configs",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L153",
+          "id": "Session.connect",
+          "kind": "method",
+          "name": "connect",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L446",
+          "id": "Session.dataframe",
+          "kind": "method",
+          "name": "dataframe",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L130",
+          "id": "Session.embedded",
+          "kind": "method",
+          "name": "embedded",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L469",
+          "id": "Session.from_bounded_stream",
+          "kind": "method",
+          "name": "from_bounded_stream",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L184",
+          "id": "Session.from_env",
+          "kind": "method",
+          "name": "from_env",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L461",
+          "id": "Session.from_source",
+          "kind": "method",
+          "name": "from_source",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L295",
+          "id": "Session.get_config",
+          "kind": "method",
+          "name": "get_config",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L331",
+          "id": "Session.jobs",
+          "kind": "method",
+          "name": "jobs",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L387",
+          "id": "Session.list_udfs",
+          "kind": "method",
+          "name": "list_udfs",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L391",
+          "id": "Session.live_table",
+          "kind": "method",
+          "name": "live_table",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L135",
+          "id": "Session.local",
+          "kind": "method",
+          "name": "local",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L398",
+          "id": "Session.memory_stream",
+          "kind": "method",
+          "name": "memory_stream",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L413",
+          "id": "Session.memory_stream_collect",
+          "kind": "method",
+          "name": "memory_stream_collect",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L231",
+          "id": "Session.mode",
+          "kind": "method",
+          "name": "mode",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L72",
+          "id": "Session.new",
+          "kind": "method",
+          "name": "new",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L520",
+          "id": "Session.poll_stream_job",
+          "kind": "method",
+          "name": "poll_stream_job",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L121",
+          "id": "Session.prepare",
+          "kind": "method",
+          "name": "prepare",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L509",
+          "id": "Session.push_stream_job_input",
+          "kind": "method",
+          "name": "push_stream_job_input",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L271",
+          "id": "Session.read_csv",
+          "kind": "method",
+          "name": "read_csv",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L85",
+          "id": "Session.read_file",
+          "kind": "method",
+          "name": "read_file",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L281",
+          "id": "Session.read_json",
+          "kind": "method",
+          "name": "read_json",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L261",
+          "id": "Session.read_parquet",
+          "kind": "method",
+          "name": "read_parquet",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L307",
+          "id": "Session.register_parquet",
+          "kind": "method",
+          "name": "register_parquet",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L313",
+          "id": "Session.register_parquet_stream",
+          "kind": "method",
+          "name": "register_parquet_stream",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L356",
+          "id": "Session.register_udf",
+          "kind": "method",
+          "name": "register_udf",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L319",
+          "id": "Session.register_unbounded",
+          "kind": "method",
+          "name": "register_unbounded",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L291",
+          "id": "Session.set_config",
+          "kind": "method",
+          "name": "set_config",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L238",
+          "id": "Session.sql",
+          "kind": "method",
+          "name": "sql",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L248",
+          "id": "Session.sql_async",
+          "kind": "method",
+          "name": "sql_async",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L341",
+          "id": "Session.stream",
+          "kind": "method",
+          "name": "stream",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L501",
+          "id": "Session.submit_stream_job",
+          "kind": "method",
+          "name": "submit_stream_job",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L75",
+          "id": "Session.table",
+          "kind": "method",
+          "name": "table",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L299",
+          "id": "Session.unset_config",
+          "kind": "method",
+          "name": "unset_config",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L196",
+          "id": "Session.with_policy",
+          "kind": "method",
+          "name": "with_policy",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "Session",
+      "replacement": null,
+      "rust_type": "PySession",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/stream.rs#L31",
+      "id": "crates/krishiv-python/src/stream.rs::Stream",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L146",
+          "id": "Stream.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L150",
+          "id": "Stream._repr_html_",
+          "kind": "method",
+          "name": "_repr_html_",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L129",
+          "id": "Stream._tumbling_window_secs_body",
+          "kind": "method",
+          "name": "_tumbling_window_secs_body",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L97",
+          "id": "Stream.key_by",
+          "kind": "method",
+          "name": "key_by",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L126",
+          "id": "Stream.tumbling_window",
+          "kind": "method",
+          "name": "tumbling_window",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L109",
+          "id": "Stream.tumbling_window_ms",
+          "kind": "method",
+          "name": "tumbling_window_ms",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L92",
+          "id": "Stream.watermark",
+          "kind": "method",
+          "name": "watermark",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L85",
+          "id": "Stream.with_state_ttl",
+          "kind": "method",
+          "name": "with_state_ttl",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L77",
+          "id": "Stream.with_watermark",
+          "kind": "method",
+          "name": "with_watermark",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "Stream",
+      "replacement": null,
+      "rust_type": "PyStream",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/stream.rs#L203",
+      "id": "crates/krishiv-python/src/stream.rs::WindowedStream",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L253",
+          "id": "WindowedStream.__aiter__",
+          "kind": "method",
+          "name": "__aiter__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L264",
+          "id": "WindowedStream.__anext__",
+          "kind": "method",
+          "name": "__anext__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L302",
+          "id": "WindowedStream.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L309",
+          "id": "WindowedStream._repr_html_",
+          "kind": "method",
+          "name": "_repr_html_",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L231",
+          "id": "WindowedStream.agg",
+          "kind": "method",
+          "name": "agg",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L240",
+          "id": "WindowedStream.collect",
+          "kind": "method",
+          "name": "collect",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L290",
+          "id": "WindowedStream.try_next",
+          "kind": "method",
+          "name": "try_next",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/stream.rs#L222",
+          "id": "WindowedStream.tumbling_window",
+          "kind": "method",
+          "name": "tumbling_window",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "WindowedStream",
+      "replacement": null,
+      "rust_type": "PyWindowedStream",
+      "stability": "preview"
+    }
+  ],
+  "duplicates": [],
+  "functions": [
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "apply_state_migration",
+      "kind": "function",
+      "name": "apply_state_migration",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "avg",
+      "kind": "function",
+      "name": "avg",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "call_function",
+      "kind": "function",
+      "name": "call_function",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "col",
+      "kind": "function",
+      "name": "col",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "count",
+      "kind": "function",
+      "name": "count",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "count_all",
+      "kind": "function",
+      "name": "count_all",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "expr",
+      "kind": "function",
+      "name": "expr",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "lit",
+      "kind": "function",
+      "name": "lit",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "make_example_batch",
+      "kind": "function",
+      "name": "make_example_batch",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "max",
+      "kind": "function",
+      "name": "max",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "memo_cache_info",
+      "kind": "function",
+      "name": "memo_cache_info",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "memo_transform_call",
+      "kind": "function",
+      "name": "memo_transform_call",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "min",
+      "kind": "function",
+      "name": "min",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "read_delta",
+      "kind": "function",
+      "name": "read_delta",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "read_hudi",
+      "kind": "function",
+      "name": "read_hudi",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "read_iceberg",
+      "kind": "function",
+      "name": "read_iceberg",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "read_kafka",
+      "kind": "function",
+      "name": "read_kafka",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "read_parquet",
+      "kind": "function",
+      "name": "read_parquet",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "register_state_migration",
+      "kind": "function",
+      "name": "register_state_migration",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "schema_registry_confluent",
+      "kind": "function",
+      "name": "schema_registry_confluent",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "state_migration",
+      "kind": "function",
+      "name": "state_migration",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "sum",
+      "kind": "function",
+      "name": "sum",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "udf",
+      "kind": "function",
+      "name": "udf",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "write_hudi_append",
+      "kind": "function",
+      "name": "write_hudi_append",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "write_hudi_upsert",
+      "kind": "function",
+      "name": "write_hudi_upsert",
+      "replacement": null,
+      "stability": "preview"
+    }
+  ]
+}

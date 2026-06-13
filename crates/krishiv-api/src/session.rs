@@ -46,6 +46,8 @@ pub struct SessionBuilder {
     /// skipped and this value is used as the bucket count for all `Hash` /
     /// `RoundRobin` exchange nodes.
     shuffle_partitions: Option<u32>,
+    /// User-visible session properties propagated to the built session.
+    config: std::collections::BTreeMap<String, String>,
 }
 
 impl fmt::Debug for SessionBuilder {
@@ -59,6 +61,7 @@ impl fmt::Debug for SessionBuilder {
             .field("state_ttl", &self.state_ttl)
             .field("target_parallelism", &self.target_parallelism)
             .field("remote_execution", &self.remote_execution)
+            .field("config", &self.config)
             .field(
                 "in_process_cluster",
                 &self
@@ -85,6 +88,7 @@ impl Default for SessionBuilder {
             in_process_cluster: None,
             remote_execution_explicit: false,
             shuffle_partitions: None,
+            config: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -370,6 +374,13 @@ impl SessionBuilder {
     }
 
     /// Build a session.
+    /// Set a user-visible session property.
+    #[must_use]
+    pub fn with_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config.insert(key.into(), value.into());
+        self
+    }
+
     pub fn build(self) -> Result<Session> {
         // R12: Validate that coordinator_url and local_cluster_grpc point to the
         // same coordinator when both are set. The two fields serve different
@@ -493,6 +504,7 @@ impl SessionBuilder {
             registered_parquet: Arc::new(DashMap::new()),
             stream_jobs: Arc::new(DashMap::new()),
             unbounded_streams: Arc::new(DashMap::new()),
+            config: Arc::new(DashMap::from_iter(self.config)),
         })
     }
 }
@@ -515,6 +527,7 @@ pub struct Session {
     registered_parquet: Arc<DashMap<String, PathBuf>>,
     stream_jobs: Arc<DashMap<String, LocalWindowExecutionSpec>>,
     unbounded_streams: Arc<DashMap<String, Arc<ContinuousTableInput>>>,
+    config: Arc<DashMap<String, String>>,
 }
 
 impl fmt::Debug for Session {
@@ -555,6 +568,34 @@ impl Session {
     /// Override explicitly with [`SessionBuilder::with_deployment_target`].
     pub fn deployment_target(&self) -> DeploymentTarget {
         self.deployment_target
+    }
+
+    /// Set or replace a session property for client-side API behavior and tooling.
+    pub fn set_config(&self, key: impl Into<String>, value: impl Into<String>) {
+        self.config.insert(key.into(), value.into());
+    }
+
+    /// Return a session property.
+    pub fn get_config(&self, key: &str) -> Option<String> {
+        self.config.get(key).map(|value| value.value().clone())
+    }
+
+    /// Remove and return a session property.
+    pub fn unset_config(&self, key: &str) -> Option<String> {
+        self.config.remove(key).map(|(_, value)| value)
+    }
+
+    /// Snapshot all session properties in deterministic key order.
+    pub fn configs(&self) -> std::collections::BTreeMap<String, String> {
+        self.config
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
+    /// Start a generic file reader builder.
+    pub fn read(&self) -> crate::DataFrameReader {
+        crate::DataFrameReader::new(self.clone())
     }
 
     /// Streaming state TTL configuration, if set.
@@ -937,6 +978,17 @@ impl Session {
         )
     }
 
+    pub(crate) fn dataframe_from_batches(&self, batches: Vec<RecordBatch>) -> DataFrame {
+        DataFrame::from_batches(
+            self.mode,
+            batches,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+            self.runtime.clone(),
+            self.registered_parquet.clone(),
+        )
+    }
+
     /// Create a DataFrame from a SQL query.
     pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         block_on(self.sql_async(query))
@@ -1279,10 +1331,18 @@ impl Session {
 
     /// Asynchronously create a DataFrame by reading a local CSV file.
     pub async fn read_csv_async(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
-        let path = path.as_ref();
+        self.read_csv_with_options_async(path, true, b',').await
+    }
+
+    pub async fn read_csv_with_options_async(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        has_header: bool,
+        delimiter: u8,
+    ) -> Result<DataFrame> {
         let sql_dataframe = self
             .sql_engine
-            .read_csv(path)
+            .read_csv_with_options(path, has_header, delimiter)
             .await
             .map_err(KrishivError::from)?;
         Ok(self.dataframe_from_sql(sql_dataframe))

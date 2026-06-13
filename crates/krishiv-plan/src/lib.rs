@@ -9,6 +9,7 @@
 use std::fmt;
 
 pub mod cep;
+pub mod expression;
 pub mod governance;
 mod graph;
 pub mod lowering;
@@ -19,11 +20,16 @@ pub mod streaming_plan;
 pub mod task_fragment;
 pub mod udf;
 pub mod window;
+pub use expression::{
+    AggregateFunction as ExprAggregateFunction, BinaryOperator as ExprBinaryOperator,
+    EXPRESSION_FORMAT_VERSION, Expr, ExprDataType, ExprField, IntervalUnit, NullOrdering,
+    ScalarValue, SortDirection, TimeUnit,
+};
 pub use graph::lower_to_physical;
 pub use r17::VectorSinkPlanConfig;
 pub use task_fragment::{
-    TypedTaskFragment, encode_typed_task_fragment, execution_kind_from_fragment,
-    task_body_for_profile, validate_job_fragments,
+    TASK_FRAGMENT_VERSION, TypedTaskFragment, encode_typed_task_fragment,
+    execution_kind_from_fragment, task_body_for_profile, validate_job_fragments,
 };
 
 /// Errors returned by plan encoding, decoding, and validation operations.

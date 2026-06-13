@@ -1,0 +1,33 @@
+name: Project hygiene
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  docs-and-release-metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - name: Test project scripts
+        run: python3 -m unittest discover -s scripts/tests -v
+      - name: Validate public API inventories and parity manifest
+        run: python3 scripts/check_api_surface.py
+      - name: Classify API changes against main
+        run: python3 scripts/compare_api_surface.py --against-ref origin/main --report target/api-change-report.json
+      - name: Upload API change report
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-change-report
+          path: target/api-change-report.json
+      - name: Check repository-local Markdown links
+        run: python3 scripts/check_markdown_links.py
+      - name: Validate release metadata
+        run: python3 scripts/check_release.py

@@ -4,8 +4,12 @@
 //!
 //! High-level client API for constructing local, batch SQL, and streaming pipelines.
 
+pub mod catalog;
 pub mod dataframe;
 pub mod error;
+pub mod expression;
+pub mod io;
+pub mod prepared;
 pub mod session;
 pub mod stream;
 pub mod streaming_dataframe;
@@ -16,8 +20,29 @@ pub mod window;
 mod tests;
 
 // Re-export the public API at the crate root for perfect source compatibility.
-pub use dataframe::{DataFrame, ExecutionResult};
+pub use catalog::{
+    FunctionIdentifier, FunctionMetadata, Identifier, Namespace, TableIdentifier, TableMetadata,
+    ViewIdentifier,
+};
+pub use dataframe::{
+    Boundedness, DataFrame, ExecutionResult, ExplainMode, GroupedDataFrame, GroupingSpec, JoinType,
+    PivotValue, QueryExecutionStats,
+};
 pub use error::{KrishivError, Result};
+pub use expression::{
+    AggregateFunction as ExprAggregateFunction, BinaryOperator as ExprBinaryOperator,
+    EXPRESSION_FORMAT_VERSION, Expr, ExprDataType, ExprField, IntervalUnit, Literal, NullOrdering,
+    ScalarValue, SortDirection, TimeUnit, avg, col, count, count_all, function, lit, max, min, sum,
+};
+pub use io::{
+    CsvReadOptions, DataFormat, DataFrameReader, DataFrameWriter, FileReadOptions,
+    FileWriteOptions, JsonReadOptions, MalformedRecordPolicy, ParquetReadOptions,
+};
+pub use krishiv_connectors::{
+    DatabaseIoOptions, FileLayout, FileSortDirection, KafkaIoOptions, SchemaEvolutionMode,
+    SortField, WriteDistribution, WriteMode,
+};
+pub use prepared::PreparedStatement;
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
 pub use streaming_dataframe::{

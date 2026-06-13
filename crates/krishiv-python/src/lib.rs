@@ -9,12 +9,14 @@ mod agg;
 mod batch;
 mod dataframe;
 mod errors;
+mod expression;
 mod job_status;
 mod lakehouse;
 mod live_table;
 mod memo;
 mod migration;
 mod pipeline;
+mod prepared;
 mod query_result;
 mod relation;
 mod schema;
@@ -44,13 +46,15 @@ mod ai {
 
 pub use agg::PyAggExpr;
 pub use batch::PyBatch;
-pub use dataframe::PyDataFrame;
+pub use dataframe::{PyDataFrame, PyGroupedDataFrame};
 pub use errors::{
     AuthorizationError, CheckpointError, ConnectorError, KrishivError, ModeError, QueryError,
     SchemaError, UdfError,
 };
+pub use expression::PyColumn;
 pub use job_status::PyJobStatus;
 pub use live_table::{PyChangeFeedIter, PyLiveTable};
+pub use prepared::PyPreparedStatement;
 pub use query_result::PyQueryResult;
 pub use relation::PyRelation;
 pub use schema::PySchema;
@@ -83,6 +87,9 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<session::PySession>()?;
     m.add_class::<dataframe::PyDataFrame>()?;
+    m.add_class::<prepared::PyPreparedStatement>()?;
+    m.add_class::<expression::PyColumn>()?;
+    m.add_class::<dataframe::PyGroupedDataFrame>()?;
     m.add_class::<dataframe::PyDataFrameStream>()?;
     m.add_class::<stream::PyStream>()?;
     m.add_class::<stream::PyKeyedStream>()?;
@@ -102,6 +109,17 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sinks::PyParquetSink>()?;
     m.add_class::<sinks::PyKafkaSink>()?;
     m.add_class::<sinks::PyIcebergSink>()?;
+
+    m.add_function(wrap_pyfunction!(expression::col, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::lit, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::expr, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::count, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::count_all, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::sum, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::avg, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::min, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::max, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::call_function, m)?)?;
 
     m.add_function(wrap_pyfunction!(sources::read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(sources::read_kafka, m)?)?;

@@ -73,6 +73,59 @@ impl PySession {
         build_embedded_session()
     }
 
+    pub fn table(&self, name: String) -> PyResult<PyDataFrame> {
+        let identifier = krishiv_api::TableIdentifier::new(name).map_err(map_krishiv_error)?;
+        self.inner
+            .table(&identifier)
+            .map(|inner| PyDataFrame { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    #[pyo3(signature = (path, format, *, header = true, delimiter = ','))]
+    pub fn read_file(
+        &self,
+        py: Python<'_>,
+        path: String,
+        format: String,
+        header: bool,
+        delimiter: char,
+    ) -> PyResult<PyDataFrame> {
+        let session = Arc::clone(&self.inner);
+        py.detach(move || {
+            let reader = session.read();
+            let reader = match format.to_ascii_lowercase().as_str() {
+                "parquet" => reader.parquet(krishiv_api::ParquetReadOptions::default()),
+                "csv" => {
+                    if !delimiter.is_ascii() {
+                        return Err(PyRuntimeError::new_err("delimiter must be one ASCII byte"));
+                    }
+                    reader.csv(krishiv_api::CsvReadOptions {
+                        has_header: header,
+                        delimiter: delimiter as u8,
+                        ..krishiv_api::CsvReadOptions::default()
+                    })
+                }
+                "json" | "ndjson" => reader.json(krishiv_api::JsonReadOptions::default()),
+                other => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "unsupported format '{other}'"
+                    )));
+                }
+            };
+            reader
+                .load(path)
+                .map(|inner| PyDataFrame { inner })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    pub fn prepare(&self, sql: String) -> PyResult<crate::prepared::PyPreparedStatement> {
+        self.inner
+            .prepare(sql)
+            .map(|inner| crate::prepared::PyPreparedStatement { inner })
+            .map_err(map_krishiv_error)
+    }
+
     #[classmethod]
     pub fn embedded(_cls: &Bound<'_, PyType>) -> PyResult<Self> {
         build_embedded_session()
@@ -216,6 +269,42 @@ impl PySession {
         })
     }
 
+    pub fn read_csv(&self, py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .read_csv(&path)
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    pub fn read_json(&self, py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .read_json(&path)
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    pub fn set_config(&self, key: String, value: String) {
+        self.inner.set_config(key, value);
+    }
+
+    pub fn get_config(&self, key: String) -> Option<String> {
+        self.inner.get_config(&key)
+    }
+
+    pub fn unset_config(&self, key: String) -> Option<String> {
+        self.inner.unset_config(&key)
+    }
+
+    pub fn configs(&self) -> std::collections::BTreeMap<String, String> {
+        self.inner.configs()
+    }
+
     pub fn register_parquet(&self, name: String, path: String) -> PyResult<()> {
         self.inner
             .register_parquet(&name, &path)
@@ -349,10 +438,11 @@ impl PySession {
         })
     }
 
-    /// Create a unified DataFrame backed by SQL (batch).
+    /// Create a legacy unified `Relation` backed by batch SQL.
     ///
-    /// Equivalent to `sql()` but returns a `DataFrame` usable in both batch
-    /// and streaming contexts via `SessionExt`-style API.
+    /// New batch code should use `sql()`, which returns the canonical
+    /// `DataFrame`. This method remains while streaming-only relation behavior
+    /// migrates to the canonical API.
     pub fn dataframe(&self, py: Python<'_>, query: String) -> PyResult<PyRelation> {
         let inner = self.inner.clone();
         py.detach(move || {

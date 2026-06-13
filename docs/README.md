@@ -31,7 +31,7 @@ Core implementation choices:
 | `krishiv-common` | Shared utilities used across runtime and engine crates. |
 | `krishiv-api` | Session, DataFrame, Stream, and public Rust API surface. |
 | `krishiv-sql` | DataFusion integration, SQL execution helpers, SQL policy hooks, catalog and table-provider abstractions (`catalog` module). |
-| `krishiv-plan` | Logical/physical plan structures, UDF contracts, governance/audit/policy, CEP pattern matcher, optimizer rules. |
+| `krishiv-plan` | Logical/physical plans, the versioned public expression/type AST, UDF contracts, governance/audit/policy, CEP pattern matcher, and optimizer rules. |
 | `krishiv-runtime` | Embedded, single-node, and remote runtime routing. |
 | `krishiv-dataflow` | Arrow operator runtime, queues, barriers, windows, joins, stateful ops. |
 | `krishiv-scheduler` | Coordinator, job/task lifecycle, metadata stores, leadership, gRPC server. |

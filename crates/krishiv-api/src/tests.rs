@@ -877,3 +877,325 @@ async fn execution_result_into_batches_works_for_batch() {
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_columns(), 2);
 }
+
+// ── Phase 4: typed DataFrame expressions, aggregation, I/O, and config ───────
+
+#[test]
+fn typed_expressions_select_filter_and_aggregate() {
+    use crate::{col, count_all, lit, sum};
+
+    let session = Session::builder().build().unwrap();
+    let df = session
+        .sql("SELECT * FROM (VALUES ('a', 10), ('a', 20), ('b', 5)) AS t(category, amount)")
+        .unwrap();
+
+    let filtered = df
+        .filter_expr(col("amount").gt(lit(9)))
+        .unwrap()
+        .select_exprs(&[
+            col("category"),
+            col("amount").multiply(lit(2)).alias("doubled"),
+        ])
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(filtered.row_count(), 2);
+    assert_eq!(filtered.batches()[0].schema().field(1).name(), "doubled");
+
+    let grouped = df
+        .group_by(&[col("category")])
+        .agg(&[count_all().alias("rows"), sum(col("amount")).alias("total")])
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(grouped.row_count(), 2);
+}
+
+#[test]
+fn generic_reader_writer_roundtrip_and_validate_format() {
+    let session = Session::builder().build().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("phase4.parquet");
+    let df = session.sql("SELECT 7 AS value").unwrap();
+
+    df.write()
+        .format("parquet")
+        .unwrap()
+        .save(path.to_str().unwrap())
+        .unwrap();
+    let result = session
+        .read()
+        .format("parquet")
+        .unwrap()
+        .load(&path)
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert!(session.read().format("orc").is_err());
+}
+
+#[test]
+fn session_config_is_shared_across_clones() {
+    let session = Session::builder()
+        .with_config("spark.sql.shuffle.partitions", "16")
+        .build()
+        .unwrap();
+    let clone = session.clone();
+    assert_eq!(
+        session
+            .get_config("spark.sql.shuffle.partitions")
+            .as_deref(),
+        Some("16")
+    );
+    clone.set_config("krishiv.execution.label", "phase4");
+    assert_eq!(
+        session.get_config("krishiv.execution.label").as_deref(),
+        Some("phase4")
+    );
+    assert_eq!(
+        session.unset_config("krishiv.execution.label").as_deref(),
+        Some("phase4")
+    );
+}
+
+#[test]
+fn explain_modes_include_analysis_stats() {
+    let session = Session::builder().build().unwrap();
+    let df = session.sql("SELECT 1 AS value").unwrap();
+    assert!(
+        !df.explain_with(crate::ExplainMode::Logical)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !df.explain_with(crate::ExplainMode::Physical)
+            .unwrap()
+            .is_empty()
+    );
+    let analyzed = df.explain_with(crate::ExplainMode::Analyze).unwrap();
+    assert!(analyzed.contains("Execution statistics"));
+    assert!(analyzed.contains("result_rows=1"));
+}
+
+#[test]
+fn phase_c_boundedness_and_typed_catalog_are_canonical() {
+    let session = Session::builder().build().unwrap();
+    let dataframe = session.sql("SELECT 1 AS id").unwrap();
+    assert_eq!(dataframe.boundedness(), crate::Boundedness::Bounded);
+    assert!(dataframe.is_bounded());
+
+    session
+        .create_view("phase_c_view", "SELECT 7 AS value")
+        .unwrap();
+    let identifier = crate::TableIdentifier::new("phase_c_view").unwrap();
+    let metadata = session.table_metadata(&identifier).unwrap();
+    assert_eq!(metadata.identifier, identifier);
+    assert_eq!(metadata.schema.field(0).name(), "value");
+    assert_eq!(metadata.boundedness, crate::Boundedness::Bounded);
+}
+
+#[test]
+fn phase_c_prepared_statements_bind_typed_values() {
+    let session = Session::builder().build().unwrap();
+    let prepared = session
+        .prepare("SELECT $1 AS name, $2 AS amount, '$3' AS literal")
+        .unwrap();
+    assert_eq!(prepared.parameter_count(), 2);
+    let result = prepared
+        .bind(&[
+            crate::ScalarValue::Utf8("O'Reilly".into()),
+            crate::ScalarValue::Int64(42),
+        ])
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+}
+
+#[test]
+fn phase_c_set_null_sample_and_shape_operations_execute() {
+    use crate::{col, sum};
+
+    let session = Session::builder().build().unwrap();
+    let left = session
+        .sql("SELECT 1 AS id, 'a' AS category, 10 AS amount UNION ALL SELECT 2, NULL, 20")
+        .unwrap();
+    let right = session
+        .sql("SELECT 1 AS id, 'a' AS category, 10 AS amount")
+        .unwrap();
+
+    assert_eq!(
+        left.drop_nulls(&["category"])
+            .unwrap()
+            .collect()
+            .unwrap()
+            .row_count(),
+        1
+    );
+    assert_eq!(left.sample(0.0).unwrap().collect().unwrap().row_count(), 0);
+    assert_eq!(
+        left.intersect_distinct(&right)
+            .unwrap()
+            .collect()
+            .unwrap()
+            .row_count(),
+        1
+    );
+    assert_eq!(
+        left.except_distinct(&right)
+            .unwrap()
+            .collect()
+            .unwrap()
+            .row_count(),
+        1
+    );
+    assert_eq!(
+        right
+            .union_distinct(&right)
+            .unwrap()
+            .collect()
+            .unwrap()
+            .row_count(),
+        1
+    );
+
+    let cube = left
+        .drop_nulls(&["category"])
+        .unwrap()
+        .group_by(&[])
+        .agg_grouping(
+            crate::GroupingSpec::Cube(vec![col("category")]),
+            &[sum(col("amount")).alias("total")],
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(cube.row_count(), 2);
+
+    let pivoted = left
+        .drop_nulls(&["category"])
+        .unwrap()
+        .pivot(
+            &[],
+            col("category"),
+            sum(col("amount")),
+            &[crate::PivotValue::new(
+                crate::ScalarValue::Utf8("a".into()),
+                "a_total",
+            )],
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(pivoted.row_count(), 1);
+
+    let wide = session.sql("SELECT 1 AS id, 10 AS jan, 20 AS feb").unwrap();
+    let unpivoted = wide
+        .unpivot(&["jan", "feb"], "month", "amount")
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(unpivoted.row_count(), 2);
+}
+
+#[test]
+fn phase_c_boundedness_metadata_exists_in_all_session_modes() {
+    let sessions = [
+        Session::builder().build().unwrap(),
+        Session::builder()
+            .with_local_cluster("http://127.0.0.1:50052")
+            .build()
+            .unwrap(),
+        Session::builder()
+            .with_coordinator("http://127.0.0.1:50051")
+            .build()
+            .unwrap(),
+    ];
+    for session in sessions {
+        let dataframe = session.sql("SELECT 1 AS id").unwrap();
+        assert_eq!(dataframe.boundedness(), crate::Boundedness::Bounded);
+    }
+}
+
+#[test]
+fn phase_d_typed_file_writer_partitions_sorts_and_overwrites() {
+    use crate::{DataFormat, FileLayout, FileWriteOptions, SortField, WriteMode};
+
+    let session = Session::builder().build().unwrap();
+    let dataframe = session
+        .sql("SELECT 2 AS id, 'b' AS region UNION ALL SELECT 1, 'a' UNION ALL SELECT 3, 'a'")
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("partitioned");
+    let options = FileWriteOptions {
+        format: DataFormat::Parquet,
+        mode: WriteMode::Overwrite,
+        layout: FileLayout {
+            partition_by: vec!["region".into()],
+            sort_by: vec![SortField {
+                column: "id".into(),
+                direction: crate::FileSortDirection::Ascending,
+            }],
+            max_rows_per_file: Some(1),
+            ..FileLayout::default()
+        },
+        schema_evolution: crate::SchemaEvolutionMode::Strict,
+    };
+    dataframe
+        .write()
+        .file_options(options)
+        .unwrap()
+        .save(output.to_str().unwrap())
+        .unwrap();
+    assert!(output.join("region=a").is_dir());
+    assert!(output.join("region=b").is_dir());
+    assert_eq!(
+        std::fs::read_dir(output.join("region=a")).unwrap().count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn phase_d_async_reader_and_iceberg_writer_round_trip() {
+    use std::sync::Arc;
+
+    use krishiv_connectors::lakehouse::{
+        IcebergScanOptions, IcebergTableRef, MemoryLakehouseTable, SchemaField, SchemaVersion,
+    };
+
+    let session = Session::builder().build().unwrap();
+    let dataframe = session
+        .sql_async("SELECT 1 AS id UNION ALL SELECT 2")
+        .await
+        .unwrap();
+    let table = Arc::new(MemoryLakehouseTable::new(
+        IcebergTableRef::new("default", "public", "phase_d"),
+        SchemaVersion {
+            schema_id: 1,
+            fields: vec![SchemaField {
+                id: 1,
+                name: "id".into(),
+                required: true,
+                data_type: "long".into(),
+            }],
+        },
+    ));
+    dataframe
+        .write()
+        .mode(crate::WriteMode::Overwrite)
+        .iceberg(table.clone())
+        .save_target_async()
+        .await
+        .unwrap();
+    let loaded = session
+        .read()
+        .iceberg(table, IcebergScanOptions::new())
+        .load_source_async()
+        .await
+        .unwrap()
+        .collect_async()
+        .await
+        .unwrap();
+    assert_eq!(loaded.row_count(), 2);
+}
