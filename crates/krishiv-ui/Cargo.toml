@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 askama.workspace = true
 axum.workspace = true
+constant_time_eq = "0.3"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 arrow = { workspace = true }

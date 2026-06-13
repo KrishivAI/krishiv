@@ -1,164 +1,149 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ job.summary.job_id }} · Krishiv</title>
-    <link rel="stylesheet" href="/assets/krishiv.css">
-    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
-  </head>
-  <body>
-    <main class="shell"
-          hx-get="/ui/jobs/{{ job.summary.job_id }}"
-          hx-trigger="every 15s"
-          hx-select="main"
-          hx-swap="outerHTML"
-          hx-indicator="#refresh-note">
-      {% include "nav.html" %}
+{% extends "base.html" %}
+{% block title %}{{ job.summary.job_id }} · Krishiv{% endblock %}
+{% block content %}
+<div class="breadcrumb">
+  <a href="/ui">Jobs</a><span class="sep">/</span>{{ job.summary.job_id }}
+  <span class="sep">·</span><a href="/ui/jobs/{{ job.summary.job_id }}/checkpoints">Checkpoints</a>
+  <span class="sep">·</span><a href="/ui/jobs/{{ job.summary.job_id }}/diagnose">Diagnose</a>
+</div>
 
-      <div class="breadcrumb">
-        <a href="/ui">Jobs</a><span class="sep">/</span>{{ job.summary.job_id }}
-        <span class="sep">·</span><a href="/ui/jobs/{{ job.summary.job_id }}/checkpoints">Checkpoints</a>
-        <span class="sep">·</span><a href="/ui/jobs/{{ job.summary.job_id }}/diagnose">Diagnose</a>
+<div id="live-region" data-live-interval="15000">
+  <div class="metrics">
+    <div class="metric">
+      <div class="label">Stages</div>
+      <div class="value">{{ job.summary.stage_count }}</div>
+    </div>
+    <div class="metric">
+      <div class="label">Tasks</div>
+      <div class="value">{{ job.summary.task_count }}</div>
+    </div>
+    <div class="metric">
+      <div class="label">Running</div>
+      <div class="value">{{ job.summary.running_task_count }}</div>
+    </div>
+    <div class="metric">
+      <div class="label">Failed</div>
+      <div class="value {% if job.summary.failed_task_count > 0 %}bad{% endif %}">{{ job.summary.failed_task_count }}</div>
+    </div>
+  </div>
+
+  <section class="section">
+    <h2>Stage DAG</h2>
+    <div class="dag">
+      {% for stage in job.stages %}
+      <div class="dag-stage">
+        <div class="dag-stage-head">
+          <span class="state-dot {{ stage.state }}">{{ stage.state }}</span>
+          <span class="dag-stage-name">{{ stage.stage_id }}</span>
+        </div>
+        <div class="dag-stage-info">{{ stage.task_count }} tasks · {{ stage.retry_count }} retries</div>
       </div>
+      {% if !loop.last %}<div class="dag-arrow">→</div>{% endif %}
+      {% endfor %}
+    </div>
+  </section>
 
-      <div class="metrics">
-        <div class="metric">
-          <div class="label">Stages</div>
-          <div class="value">{{ job.summary.stage_count }}</div>
-        </div>
-        <div class="metric">
-          <div class="label">Tasks</div>
-          <div class="value">{{ job.summary.task_count }}</div>
-        </div>
-        <div class="metric">
-          <div class="label">Running</div>
-          <div class="value">{{ job.summary.running_task_count }}</div>
-        </div>
-        <div class="metric">
-          <div class="label">Failed</div>
-          <div class="value {% if job.summary.failed_task_count > 0 %}bad{% endif %}">{{ job.summary.failed_task_count }}</div>
-        </div>
-      </div>
-
-      <section class="section">
-        <h2>Stage DAG</h2>
-        <div class="dag">
+  <section class="section">
+    <h2>Stages</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Stage</th>
+            <th>State</th>
+            <th>Retries</th>
+            <th>Tasks</th>
+          </tr>
+        </thead>
+        <tbody>
           {% for stage in job.stages %}
-          <div class="dag-stage">
-            <div class="dag-stage-head">
-              <span class="state-dot {{ stage.state }}">{{ stage.state }}</span>
-              <span class="dag-stage-name">{{ stage.stage_id }}</span>
-            </div>
-            <div class="dag-stage-info">{{ stage.task_count }} tasks · {{ stage.retry_count }} retries</div>
-          </div>
-          {% if !loop.last %}<div class="dag-arrow">→</div>{% endif %}
+          <tr>
+            <td>{{ stage.stage_id }}</td>
+            <td><span class="state-dot {{ stage.state }}">{{ stage.state }}</span></td>
+            <td>{{ stage.retry_count }}</td>
+            <td>{{ stage.task_count }}</td>
+          </tr>
           {% endfor %}
-        </div>
-      </section>
+        </tbody>
+      </table>
+    </div>
+  </section>
 
-      <section class="section">
-        <h2>Stages</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Stage</th>
-                <th>State</th>
-                <th>Retries</th>
-                <th>Tasks</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for stage in job.stages %}
-              <tr>
-                <td>{{ stage.stage_id }}</td>
-                <td><span class="state-dot {{ stage.state }}">{{ stage.state }}</span></td>
-                <td>{{ stage.retry_count }}</td>
-                <td>{{ stage.task_count }}</td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      </section>
+  <section class="section">
+    <h2>Tasks</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Task</th>
+            <th>Stage</th>
+            <th>State</th>
+            <th>Executor</th>
+            <th>Attempt</th>
+            <th>Failures</th>
+            <th>Watermark</th>
+            <th>Offset</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for stage in job.stages %}
+          {% for task in stage.tasks %}
+          <tr>
+            <td>{{ task.task_id }}</td>
+            <td>{{ stage.stage_id }}</td>
+            <td><span class="state-dot {{ task.state }}">{{ task.state }}</span></td>
+            <td>
+              {% if task.assigned_executor != "-" %}
+              <a href="/ui/executors/{{ task.assigned_executor }}">{{ task.assigned_executor }}</a>
+              {% else %}&mdash;{% endif %}
+            </td>
+            <td>{{ task.attempt }}</td>
+            <td>{% if task.failure_count > 0 %}<strong class="bad">{{ task.failure_count }}</strong>{% else %}{{ task.failure_count }}{% endif %}</td>
+            <td>{{ task.last_watermark_display }}</td>
+            <td>{{ task.last_source_offset_display }}</td>
+          </tr>
+          {% if !task.failure_reason_display.is_empty() %}
+          <tr>
+            <td colspan="8" style="padding:0 14px 8px">
+              <div class="failure-detail" title="{{ task.failure_reason_display }}">&#x2715; {{ task.failure_reason_display }}</div>
+            </td>
+          </tr>
+          {% endif %}
+          {% endfor %}
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
 
-      <section class="section">
-        <h2>Tasks</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Task</th>
-                <th>Stage</th>
-                <th>State</th>
-                <th>Executor</th>
-                <th>Attempt</th>
-                <th>Failures</th>
-                <th>Watermark</th>
-                <th>Offset</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for stage in job.stages %}
-              {% for task in stage.tasks %}
-              <tr>
-                <td>{{ task.task_id }}</td>
-                <td>{{ stage.stage_id }}</td>
-                <td><span class="state-dot {{ task.state }}">{{ task.state }}</span></td>
-                <td>
-                  {% if task.assigned_executor != "-" %}
-                  <a href="/ui/executors/{{ task.assigned_executor }}">{{ task.assigned_executor }}</a>
-                  {% else %}&mdash;{% endif %}
-                </td>
-                <td>{{ task.attempt }}</td>
-                <td>{% if task.failure_count > 0 %}<strong class="bad">{{ task.failure_count }}</strong>{% else %}{{ task.failure_count }}{% endif %}</td>
-                <td>{{ task.last_watermark_display }}</td>
-                <td>{{ task.last_source_offset_display }}</td>
-              </tr>
-              {% if !task.failure_reason_display.is_empty() %}
-              <tr>
-                <td colspan="8" style="padding:0 14px 8px">
-                  <div class="failure-detail" title="{{ task.failure_reason_display }}">&#x2715; {{ task.failure_reason_display }}</div>
-                </td>
-              </tr>
-              {% endif %}
-              {% endfor %}
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      </section>
+  <section class="section">
+    <h2>Executors</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Executor</th>
+            <th>State</th>
+            <th>Slots</th>
+            <th>Host</th>
+            <th>Memory</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for executor in executors %}
+          <tr>
+            <td><a href="/ui/executors/{{ executor.executor_id }}">{{ executor.executor_id }}</a></td>
+            <td><span class="state-dot {{ executor.state }}">{{ executor.state }}</span></td>
+            <td>{{ executor.slots }}</td>
+            <td>{{ executor.host }}</td>
+            <td>{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB / {{ executor.memory_limit_bytes.unwrap_or(0) / 1048576 }} MB{% else %}&mdash;{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
 
-      <section class="section">
-        <h2>Executors</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Executor</th>
-                <th>State</th>
-                <th>Slots</th>
-                <th>Host</th>
-                <th>Memory</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for executor in executors %}
-              <tr>
-                <td><a href="/ui/executors/{{ executor.executor_id }}">{{ executor.executor_id }}</a></td>
-                <td><span class="state-dot {{ executor.state }}">{{ executor.state }}</span></td>
-                <td>{{ executor.slots }}</td>
-                <td>{{ executor.host }}</td>
-                <td>{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB / {{ executor.memory_limit_bytes.unwrap_or(0) / 1048576 }} MB{% else %}&mdash;{% endif %}</td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <span id="refresh-note" class="refresh-note" hidden>refreshing</span>
-    </main>
-  </body>
-</html>
+  <span class="refresh-note" hidden>refreshing</span>
+</div>
+{% endblock %}

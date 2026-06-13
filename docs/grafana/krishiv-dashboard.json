@@ -1,0 +1,177 @@
+{
+  "__inputs": [],
+  "__requires": [],
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["krishiv", "compute"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": "${datasource}",
+        "query": "label_values(krishiv_checkpoint_epoch, job)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "Krishiv Compute Engine",
+  "uid": "krishiv-compute",
+  "panels": [
+    { "id": 1, "type": "row", "title": "Overview", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false },
+    {
+      "id": 2, "type": "stat", "title": "Running Tasks", "datasource": "${datasource}",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" } }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum(krishiv_tasks_running)", "legendFormat": "running" }]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Job Queue Depth", "datasource": "${datasource}",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "sum(krishiv_job_queue_depth)", "legendFormat": "queued" }]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Executors Lost (total)", "datasource": "${datasource}",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "sum(krishiv_executor_lost_total)", "legendFormat": "lost" }]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Failed Assignments (total)", "datasource": "${datasource}",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "sum(krishiv_failed_assignments_total)", "legendFormat": "failed" }]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Task Throughput by Status (rate)", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 5 },
+      "targets": [{ "refId": "A", "expr": "sum by (status) (rate(krishiv_tasks_total[5m]))", "legendFormat": "{{status}}" }]
+    },
+
+    { "id": 10, "type": "row", "title": "Tasks & Retries", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 }, "collapsed": false },
+    {
+      "id": 11, "type": "timeseries", "title": "Stage Retries (rate)", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
+      "targets": [{ "refId": "A", "expr": "rate(krishiv_task_retries_total[5m])", "legendFormat": "retries/s" }]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Failed Assignments (rate)", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
+      "targets": [{ "refId": "A", "expr": "rate(krishiv_failed_assignments_total[5m])", "legendFormat": "failed/s" }]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Task Attempts by Stage (rate)", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "targets": [{ "refId": "A", "expr": "sum by (stage) (rate(krishiv_task_attempts_total[5m]))", "legendFormat": "{{stage}}" }]
+    },
+
+    { "id": 20, "type": "row", "title": "Memory & Spill", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }, "collapsed": false },
+    {
+      "id": 21, "type": "timeseries", "title": "Operator Peak Memory", "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 23 },
+      "targets": [{ "refId": "A", "expr": "krishiv_operator_memory_bytes", "legendFormat": "{{operator}}" }]
+    },
+    {
+      "id": 22, "type": "timeseries", "title": "Spill Bytes (rate)", "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
+      "targets": [{ "refId": "A", "expr": "rate(krishiv_spill_bytes_total[5m])", "legendFormat": "spill bytes/s" }]
+    },
+    {
+      "id": 23, "type": "timeseries", "title": "Spill Files (total)", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+      "targets": [{ "refId": "A", "expr": "krishiv_spill_files_total", "legendFormat": "spill files" }]
+    },
+
+    { "id": 30, "type": "row", "title": "Streaming & State", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 }, "collapsed": false },
+    {
+      "id": 31, "type": "timeseries", "title": "Watermark (ms) by Job", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "targets": [{ "refId": "A", "expr": "krishiv_watermark_ms{job=~\"$job\"}", "legendFormat": "{{job}}" }]
+    },
+    {
+      "id": 32, "type": "timeseries", "title": "Source Offset Lag", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "targets": [{ "refId": "A", "expr": "krishiv_source_offset_lag{job=~\"$job\"}", "legendFormat": "{{job}}/{{source}}" }]
+    },
+    {
+      "id": 33, "type": "timeseries", "title": "State Bytes by Job", "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "targets": [{ "refId": "A", "expr": "krishiv_state_bytes{job=~\"$job\"}", "legendFormat": "{{job}}" }]
+    },
+    {
+      "id": 34, "type": "timeseries", "title": "State Key Count by Job", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+      "targets": [{ "refId": "A", "expr": "krishiv_state_key_count{job=~\"$job\"}", "legendFormat": "{{job}}" }]
+    },
+    {
+      "id": 35, "type": "timeseries", "title": "Streaming Rows Emitted (rate)", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
+      "targets": [{ "refId": "A", "expr": "sum(rate(krishiv_streaming_rows_emitted_total[5m]))", "legendFormat": "rows/s" }]
+    },
+
+    { "id": 40, "type": "row", "title": "Checkpoints", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 }, "collapsed": false },
+    {
+      "id": 41, "type": "timeseries", "title": "Committed Checkpoint Epoch by Job", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 49 },
+      "targets": [{ "refId": "A", "expr": "krishiv_checkpoint_epoch{job=~\"$job\"}", "legendFormat": "{{job}}" }]
+    },
+    {
+      "id": 42, "type": "timeseries", "title": "Checkpoint Epochs (rate)", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 49 },
+      "targets": [{ "refId": "A", "expr": "rate(krishiv_checkpoint_epochs_total[5m])", "legendFormat": "epochs/s" }]
+    },
+    {
+      "id": 43, "type": "timeseries", "title": "Checkpoint Commit p95 (s)", "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 49 },
+      "targets": [{ "refId": "A", "expr": "histogram_quantile(0.95, sum(rate(krishiv_checkpoint_commit_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" }]
+    },
+
+    { "id": 50, "type": "row", "title": "Shuffle & gRPC", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 }, "collapsed": false },
+    {
+      "id": 51, "type": "timeseries", "title": "Shuffle Bytes Written (rate)", "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 58 },
+      "targets": [{ "refId": "A", "expr": "rate(krishiv_shuffle_bytes_written_total[5m])", "legendFormat": "shuffle bytes/s" }]
+    },
+    {
+      "id": 52, "type": "timeseries", "title": "Shuffle Partitions", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 58 },
+      "targets": [{ "refId": "A", "expr": "krishiv_shuffle_partitions", "legendFormat": "{{state}}" }]
+    },
+    {
+      "id": 53, "type": "timeseries", "title": "gRPC Call Duration p95 (s)", "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 58 },
+      "targets": [{ "refId": "A", "expr": "histogram_quantile(0.95, sum(rate(krishiv_grpc_call_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" }]
+    },
+    {
+      "id": 54, "type": "timeseries", "title": "Max Executor Heartbeat Age (ticks)", "datasource": "${datasource}",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 66 },
+      "targets": [{ "refId": "A", "expr": "max(krishiv_max_executor_heartbeat_age_ticks)", "legendFormat": "max age" }]
+    }
+  ]
+}

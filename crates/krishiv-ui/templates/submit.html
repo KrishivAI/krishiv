@@ -1,83 +1,28 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SQL · Krishiv</title>
-  <link rel="stylesheet" href="/assets/krishiv.css">
-  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
-  <script src="https://unpkg.com/htmx.org@2.0.4/dist/ext/json-enc.js"></script>
-</head>
-<body>
-  <main class="shell">
-    {% include "nav.html" %}
-    <h1 class="page-heading">SQL Editor</h1>
+{% extends "base.html" %}
+{% block title %}SQL · Krishiv{% endblock %}
+{% block head_extra %}<script src="/assets/krishiv-sql.js" defer></script>{% endblock %}
+{% block content %}
+<h1 class="page-heading">SQL Editor</h1>
 
-    <form class="sql-form" hx-post="/api/v1/sql" hx-target="#results" hx-indicator="#spinner" hx-ext="json-enc">
-      <textarea name="query" rows="8" placeholder="SELECT * FROM ...">SELECT 1 AS col</textarea>
-      <div class="toolbar">
-        <button type="submit" class="btn">Run Query</button>
-        <span id="spinner" class="htmx-indicator">Running&hellip;</span>
-      </div>
-    </form>
+<form class="sql-form">
+  <textarea name="query" rows="8" placeholder="SELECT * FROM ...">SELECT 1 AS col</textarea>
+  <div class="toolbar">
+    <button type="submit" class="btn">Run Query</button>
+    <span id="spinner" class="htmx-indicator">Running&hellip;</span>
+  </div>
+</form>
 
-    <div id="results">
-      <div class="empty">Submit a query to see results.</div>
-    </div>
-  </main>
+<div id="results">
+  <div class="empty">Submit a query to see results.</div>
+</div>
 
-  <template id="result-template">
-    <div class="table-wrap">
-      <table>
-        <thead><tr></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-    <p class="meta"></p>
-  </template>
-
-  <script>
-    document.body.addEventListener('htmx:beforeSwap', function(evt) {
-      if (evt.detail.target && evt.detail.target.id === 'results') {
-        try {
-          var data = JSON.parse(evt.detail.xhr.responseText);
-        } catch(e) { return; }
-        evt.detail.shouldSwap = true;
-        evt.detail.isError = false;
-
-        var clone = document.getElementById('result-template').content.cloneNode(true);
-
-        if (data.error) {
-          clone.querySelector('p.meta').textContent = 'Error: ' + data.error;
-          evt.detail.target.innerHTML = '';
-          evt.detail.target.appendChild(clone);
-          return;
-        }
-
-        var thead = clone.querySelector('thead tr');
-        data.columns.forEach(function(col) {
-          var th = document.createElement('th');
-          th.textContent = col;
-          thead.appendChild(th);
-        });
-
-        var tbody = clone.querySelector('tbody');
-        data.rows.forEach(function(row) {
-          var tr = document.createElement('tr');
-          row.forEach(function(cell) {
-            var td = document.createElement('td');
-            td.textContent = cell === null ? 'NULL' : String(cell);
-            tr.appendChild(td);
-          });
-          tbody.appendChild(tr);
-        });
-
-        clone.querySelector('p.meta').textContent = data.row_count + ' row(s) in ' + data.elapsed_ms + ' ms';
-
-        evt.detail.target.innerHTML = '';
-        evt.detail.target.appendChild(clone);
-      }
-    });
-  </script>
-</body>
-</html>
+<template id="result-template">
+  <div class="table-wrap">
+    <table>
+      <thead><tr></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <p class="meta"></p>
+</template>
+{% endblock %}

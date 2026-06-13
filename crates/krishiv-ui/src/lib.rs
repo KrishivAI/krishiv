@@ -181,7 +181,10 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .route("/assets/krishiv.css", get(stylesheet));
+        .route("/assets/krishiv.css", get(stylesheet))
+        .route("/assets/krishiv-live.js", get(live_js))
+        .route("/assets/krishiv-sql.js", get(sql_js))
+        .route("/api/v1/openapi.json", get(openapi_json));
 
     let protected = Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui") }))
@@ -191,10 +194,7 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
             "/api/v1/jobs/{job_id}/checkpoints",
             get(api_job_checkpoints),
         )
-        .route(
-            "/api/v1/jobs/{job_id}/diagnose",
-            get(api_job_diagnose),
-        )
+        .route("/api/v1/jobs/{job_id}/diagnose", get(api_job_diagnose))
         .route("/api/v1/executors", get(api_executors))
         .route("/api/v1/executors/{executor_id}", get(api_executor_detail))
         .route("/api/v1/queues", get(api_queues))
@@ -229,6 +229,7 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
     Router::new()
         .merge(public)
         .merge(protected)
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
 
@@ -238,7 +239,11 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
 /// Skips `/healthz`, `/readyz`, and `/metrics` — the coordinator already serves
 /// those. Includes `/assets/*`, `/`, `/ui*`, and `/api/v1/*` routes.
 pub fn embedded_router(state: UiState) -> Router {
-    let public = Router::new().route("/assets/krishiv.css", get(stylesheet));
+    let public = Router::new()
+        .route("/assets/krishiv.css", get(stylesheet))
+        .route("/assets/krishiv-live.js", get(live_js))
+        .route("/assets/krishiv-sql.js", get(sql_js))
+        .route("/api/v1/openapi.json", get(openapi_json));
 
     let protected = Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui") }))
@@ -247,10 +252,7 @@ pub fn embedded_router(state: UiState) -> Router {
             "/api/v1/jobs/{job_id}/checkpoints",
             get(api_job_checkpoints),
         )
-        .route(
-            "/api/v1/jobs/{job_id}/diagnose",
-            get(api_job_diagnose),
-        )
+        .route("/api/v1/jobs/{job_id}/diagnose", get(api_job_diagnose))
         .route("/api/v1/executors/{executor_id}", get(api_executor_detail))
         .route("/api/v1/queues", get(api_queues))
         .route("/api/v1/sql", post(api_sql_execute))
@@ -283,7 +285,33 @@ pub fn embedded_router(state: UiState) -> Router {
     Router::new()
         .merge(public)
         .merge(protected)
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Attach hardening headers to every response. With htmx vendored locally and
+/// the SQL editor moved to a same-origin script, `script-src 'self'` holds.
+/// Inline `style="..."` attributes still appear in a few templates, so
+/// `style-src` keeps `'unsafe-inline'`; scripts (the real XSS vector) do not.
+async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
+    use axum::http::HeaderValue;
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        "Content-Security-Policy",
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; connect-src 'self'; base-uri 'none'; \
+             form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    headers.insert("Referrer-Policy", HeaderValue::from_static("no-referrer"));
+    response
 }
 
 async fn require_bearer(request: axum::extract::Request, next: Next, expected: &str) -> Response {
@@ -297,7 +325,9 @@ async fn require_bearer(request: axum::extract::Request, next: Next, expected: &
     match auth {
         Some(value) if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") => {
             let token = &value[7..];
-            if token == expected {
+            // Constant-time comparison so a timing side-channel can't be used to
+            // recover the token byte-by-byte.
+            if constant_time_eq::constant_time_eq(token.as_bytes(), expected.as_bytes()) {
                 next.run(request).await
             } else {
                 (StatusCode::UNAUTHORIZED, "invalid bearer token").into_response()
@@ -347,8 +377,14 @@ pub fn demo_state() -> UiResult<UiState> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobsResponse {
-    /// Job summaries.
+    /// Job summaries for the requested page.
     pub jobs: Vec<JobSummaryView>,
+    /// Total number of jobs known to the coordinator (before pagination).
+    pub total: usize,
+    /// Page size applied.
+    pub limit: usize,
+    /// Page offset applied.
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -723,12 +759,33 @@ impl JobHistoryView {
 #[derive(Debug, Clone, Serialize)]
 pub struct JobHistoryListResponse {
     pub records: Vec<JobHistoryView>,
+    /// Total archived records (before pagination).
+    pub total: usize,
+    /// Page size applied.
+    pub limit: usize,
+    /// Page offset applied.
+    pub offset: usize,
 }
 
 #[derive(Template)]
 #[template(path = "history.html")]
 struct HistoryTemplate {
     records: Vec<JobHistoryView>,
+    total: usize,
+    limit: usize,
+    offset: usize,
+}
+
+impl HistoryTemplate {
+    /// True when more archived records exist beyond this page.
+    fn has_more(&self) -> bool {
+        self.offset + self.records.len() < self.total
+    }
+
+    /// Offset for the next page link.
+    fn next_offset(&self) -> usize {
+        self.offset + self.limit
+    }
 }
 
 #[derive(Template)]
@@ -760,6 +817,30 @@ pub struct JobsFilter {
 impl JobsFilter {
     fn has_any(&self) -> bool {
         self.state.is_some() || self.kind.is_some()
+    }
+}
+
+/// Page window for list endpoints. `limit` is clamped to `1..=MAX_PAGE_LIMIT`
+/// and defaults to `DEFAULT_PAGE_LIMIT`; `offset` defaults to 0.
+#[derive(Debug, Default, Deserialize)]
+pub struct Pagination {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// Default page size when the caller does not specify `limit`.
+const DEFAULT_PAGE_LIMIT: usize = 100;
+/// Hard cap on page size so a single request can't force a huge serialization.
+const MAX_PAGE_LIMIT: usize = 1000;
+
+impl Pagination {
+    /// Resolve `(limit, offset)` applying defaults and the hard cap.
+    fn resolved(&self) -> (usize, usize) {
+        let limit = self
+            .limit
+            .unwrap_or(DEFAULT_PAGE_LIMIT)
+            .clamp(1, MAX_PAGE_LIMIT);
+        (limit, self.offset.unwrap_or(0))
     }
 }
 
@@ -837,10 +918,19 @@ async fn readyz(State(state): State<UiState>) -> Result<impl IntoResponse, UiErr
     Ok((StatusCode::OK, "ready\n"))
 }
 
-async fn api_jobs(State(state): State<UiState>) -> Result<Json<JobsResponse>, UiError> {
+async fn api_jobs(
+    State(state): State<UiState>,
+    pagination: Query<Pagination>,
+) -> Result<Json<JobsResponse>, UiError> {
     let snapshot = status_snapshot(&state).await?;
+    let (limit, offset) = pagination.resolved();
+    let total = snapshot.jobs.len();
+    let jobs = snapshot.jobs.into_iter().skip(offset).take(limit).collect();
     Ok(Json(JobsResponse {
-        jobs: snapshot.jobs,
+        jobs,
+        total,
+        limit,
+        offset,
     }))
 }
 
@@ -1097,8 +1187,8 @@ async fn api_job_diagnose(
         &coordinator,
         &job_id,
     )?;
-    let json = serde_json::to_value(&report)
-        .map_err(|e| UiError::Sql(format!("serialize error: {e}")))?;
+    let json =
+        serde_json::to_value(&report).map_err(|e| UiError::Sql(format!("serialize error: {e}")))?;
     Ok(Json(json))
 }
 
@@ -1112,8 +1202,8 @@ async fn ui_job_diagnose(
         &coordinator,
         &job_id,
     )?;
-    let report_json = serde_json::to_string_pretty(&report)
-        .unwrap_or_else(|e| format!("serialize error: {e}"));
+    let report_json =
+        serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("serialize error: {e}"));
     let template = JobDiagnoseTemplate {
         job_id: job_id_str,
         report_json,
@@ -1123,14 +1213,24 @@ async fn ui_job_diagnose(
 
 async fn api_history(
     State(state): State<UiState>,
+    pagination: Query<Pagination>,
 ) -> Result<Json<JobHistoryListResponse>, UiError> {
     let coordinator = state.coordinator.read().await;
-    let records = coordinator
-        .list_job_history()
+    let all = coordinator.list_job_history();
+    let (limit, offset) = pagination.resolved();
+    let total = all.len();
+    let records = all
         .iter()
+        .skip(offset)
+        .take(limit)
         .map(JobHistoryView::from_record)
         .collect();
-    Ok(Json(JobHistoryListResponse { records }))
+    Ok(Json(JobHistoryListResponse {
+        records,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 async fn api_history_detail(
@@ -1141,21 +1241,34 @@ async fn api_history_detail(
     coordinator
         .get_job_history(&job_id)
         .map(|r| Json(JobHistoryView::from_record(&r)))
-        .ok_or_else(|| UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownJob {
-            job_id: krishiv_proto::JobId::try_new(job_id).unwrap_or_else(|_| {
-                krishiv_proto::JobId::try_new("unknown").unwrap()
-            }),
-        }))
+        .ok_or_else(|| {
+            UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownJob {
+                job_id: krishiv_proto::JobId::try_new(job_id)
+                    .unwrap_or_else(|_| krishiv_proto::JobId::try_new("unknown").unwrap()),
+            })
+        })
 }
 
-async fn ui_history(State(state): State<UiState>) -> Result<Html<String>, UiError> {
+async fn ui_history(
+    State(state): State<UiState>,
+    pagination: Query<Pagination>,
+) -> Result<Html<String>, UiError> {
     let coordinator = state.coordinator.read().await;
-    let records = coordinator
-        .list_job_history()
+    let all = coordinator.list_job_history();
+    let (limit, offset) = pagination.resolved();
+    let total = all.len();
+    let records = all
         .iter()
+        .skip(offset)
+        .take(limit)
         .map(JobHistoryView::from_record)
         .collect();
-    let template = HistoryTemplate { records };
+    let template = HistoryTemplate {
+        records,
+        total,
+        limit,
+        offset,
+    };
     Ok(Html(template.render()?))
 }
 
@@ -1167,11 +1280,12 @@ async fn ui_history_detail(
     let record = coordinator
         .get_job_history(&job_id)
         .map(|r| JobHistoryView::from_record(&r))
-        .ok_or_else(|| UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownJob {
-            job_id: krishiv_proto::JobId::try_new(job_id).unwrap_or_else(|_| {
-                krishiv_proto::JobId::try_new("unknown").unwrap()
-            }),
-        }))?;
+        .ok_or_else(|| {
+            UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownJob {
+                job_id: krishiv_proto::JobId::try_new(job_id)
+                    .unwrap_or_else(|_| krishiv_proto::JobId::try_new("unknown").unwrap()),
+            })
+        })?;
     let template = HistoryDetailTemplate { record };
     Ok(Html(template.render()?))
 }
@@ -1196,6 +1310,33 @@ async fn stylesheet() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../static/style.css"),
+    )
+}
+
+/// Vendored live-refresh helper (fragment polling + theme toggle). Replaces the
+/// former htmx CDN dependency so the UI works in air-gapped clusters and under
+/// a strict CSP.
+async fn live_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/krishiv-live.js"),
+    )
+}
+
+/// Vendored SQL-editor script (plain `fetch`, no htmx).
+async fn sql_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/krishiv-sql.js"),
+    )
+}
+
+/// Hand-maintained OpenAPI 3.1 description of the `/api/v1` surface, served so
+/// operators and codegen tooling can discover the API.
+async fn openapi_json() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/json; charset=utf-8")],
+        include_str!("../static/openapi.json"),
     )
 }
 
@@ -1887,5 +2028,127 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vendored_live_js_is_public_and_js() {
+        // The live-refresh helper must be served locally (no CDN) and reachable
+        // without a bearer token, like the stylesheet.
+        let response = router_with_token(demo_state().unwrap(), Some("secret"))
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/krishiv-live.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(ct.contains("javascript"), "unexpected content-type: {ct}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("live-region"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rendered_pages_have_no_cdn_script() {
+        // Regression: pages must not pull htmx (or anything) from an external CDN.
+        for uri in ["/ui", "/ui/health", "/ui/metrics", "/ui/submit"] {
+            let response = router(demo_state().unwrap())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(!body.contains("unpkg.com"), "{uri} still references a CDN");
+            assert!(
+                body.contains("/assets/krishiv-live.js"),
+                "{uri} missing vendored live script"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responses_carry_security_headers() {
+        let response = router(demo_state().unwrap())
+            .oneshot(Request::builder().uri("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let headers = response.headers();
+        let csp = headers
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(csp.contains("script-src 'self'"), "CSP missing: {csp}");
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            headers.get("x-frame-options").and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn openapi_spec_is_served_and_valid_json() {
+        let response = router(demo_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["openapi"], "3.1.0");
+        assert!(parsed["paths"]["/api/v1/jobs"].is_object());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_jobs_pagination_limits_results() {
+        let response = router(demo_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs?limit=0&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // limit=0 is clamped up to 1; demo has exactly one job, total reflects it.
+        assert_eq!(parsed["limit"], 1);
+        assert_eq!(parsed["total"], 1);
+        assert_eq!(parsed["jobs"].as_array().unwrap().len(), 1);
+
+        // offset past the end yields an empty page but preserves total.
+        let response = router(demo_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs?offset=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["total"], 1);
+        assert!(parsed["jobs"].as_array().unwrap().is_empty());
     }
 }

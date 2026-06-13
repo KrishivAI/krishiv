@@ -300,6 +300,13 @@ impl MetadataStore for RocksDbMetadataStore {
             .map_err(Self::store_err)?;
         self.history.retain(|r| r.job_id != record.job_id);
         self.history.insert(0, record);
+        // Bound the archive: evict oldest records past the cap from both the
+        // in-memory view and the column family so disk usage stays bounded.
+        while self.history.len() > crate::store::MAX_JOB_HISTORY {
+            if let Some(evicted) = self.history.pop() {
+                let _ = self.db.delete_cf(&cf, evicted.job_id.as_str());
+            }
+        }
         Ok(())
     }
 

@@ -190,6 +190,10 @@ impl ContinuousSnapshot {
 /// Kept permanently so `/ui/history` can show completed jobs after they are
 /// evicted from the live coordinator snapshot. Serialized as JSON for all
 /// store backends.
+/// Maximum number of terminal-job history records retained per store. Oldest
+/// records are evicted past this bound so the archive can't grow without limit.
+pub const MAX_JOB_HISTORY: usize = 1000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobHistoryRecord {
     pub job_id: String,
@@ -368,6 +372,7 @@ impl MetadataStore for InMemoryMetadataStore {
     fn save_job_history(&mut self, record: JobHistoryRecord) -> SchedulerResult<()> {
         self.history.retain(|r| r.job_id != record.job_id);
         self.history.insert(0, record);
+        self.history.truncate(MAX_JOB_HISTORY);
         Ok(())
     }
 
