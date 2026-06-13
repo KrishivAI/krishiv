@@ -754,11 +754,15 @@ impl ExternalAggregator {
         if self.groups.is_empty() {
             return Ok(());
         }
-        let partial_schema = Self::build_partial_schema(&self.group_by, &self.agg_exprs, &input_schema);
+        let partial_schema =
+            Self::build_partial_schema(&self.group_by, &self.agg_exprs, &input_schema);
         let batch = self.serialize_partial(&partial_schema, &input_schema)?;
         let (file, bytes) = SpillFile::write("agg", &partial_schema, &[batch])?;
         self.spill_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
         self.spill_file_count.fetch_add(1, AtomicOrdering::Relaxed);
+        let metrics = krishiv_metrics::global_metrics();
+        metrics.record_spill(bytes, 1);
+        metrics.record_operator_memory("external_aggregate", self.reserved_bytes);
         self.runs.push(file);
         self.groups.clear();
         self.release_reserved();
@@ -801,8 +805,7 @@ impl ExternalAggregator {
         partial_schema: &Schema,
         input_schema: &SchemaRef,
     ) -> ExecResult<RecordBatch> {
-        let mut sorted: Vec<(&SmallVec<[AggKey; 4]>, &AggState)> =
-            self.groups.iter().collect();
+        let mut sorted: Vec<(&SmallVec<[AggKey; 4]>, &AggState)> = self.groups.iter().collect();
         sorted.sort_by(|(a, _), (b, _)| {
             a.iter()
                 .zip(b.iter())
@@ -822,61 +825,51 @@ impl ExternalAggregator {
                 .data_type()
                 .clone();
             let col: ArrayRef = match dtype {
-                DataType::Int32 => {
-                    Arc::new(Int32Array::from(
-                        sorted
-                            .iter()
-                            .map(|(key, _)| match key[gb_pos] {
-                                AggKey::Int32(v) => Ok(v),
-                                _ => Err(ExecError::UnsupportedType("Int32 key mismatch".into())),
-                            })
-                            .collect::<ExecResult<Vec<i32>>>()?,
-                    ))
-                }
-                DataType::Int64 => {
-                    Arc::new(Int64Array::from(
-                        sorted
-                            .iter()
-                            .map(|(key, _)| match key[gb_pos] {
-                                AggKey::Int64(v) => Ok(v),
-                                _ => Err(ExecError::UnsupportedType("Int64 key mismatch".into())),
-                            })
-                            .collect::<ExecResult<Vec<i64>>>()?,
-                    ))
-                }
-                DataType::Float64 => {
-                    Arc::new(Float64Array::from(
-                        sorted
-                            .iter()
-                            .map(|(key, _)| match key[gb_pos] {
-                                AggKey::Float64(bits) => Ok(f64::from_bits(bits)),
-                                _ => Err(ExecError::UnsupportedType("Float64 key mismatch".into())),
-                            })
-                            .collect::<ExecResult<Vec<f64>>>()?,
-                    ))
-                }
-                DataType::Utf8 => {
-                    Arc::new(StringArray::from(
-                        sorted
-                            .iter()
-                            .map(|(key, _)| match &key[gb_pos] {
-                                AggKey::Utf8(s) => Ok(s.clone()),
-                                _ => Err(ExecError::UnsupportedType("Utf8 key mismatch".into())),
-                            })
-                            .collect::<ExecResult<Vec<String>>>()?,
-                    ))
-                }
-                DataType::Boolean => {
-                    Arc::new(BooleanArray::from(
-                        sorted
-                            .iter()
-                            .map(|(key, _)| match key[gb_pos] {
-                                AggKey::Bool(v) => Ok(v),
-                                _ => Err(ExecError::UnsupportedType("Bool key mismatch".into())),
-                            })
-                            .collect::<ExecResult<Vec<bool>>>()?,
-                    ))
-                }
+                DataType::Int32 => Arc::new(Int32Array::from(
+                    sorted
+                        .iter()
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Int32(v) => Ok(v),
+                            _ => Err(ExecError::UnsupportedType("Int32 key mismatch".into())),
+                        })
+                        .collect::<ExecResult<Vec<i32>>>()?,
+                )),
+                DataType::Int64 => Arc::new(Int64Array::from(
+                    sorted
+                        .iter()
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Int64(v) => Ok(v),
+                            _ => Err(ExecError::UnsupportedType("Int64 key mismatch".into())),
+                        })
+                        .collect::<ExecResult<Vec<i64>>>()?,
+                )),
+                DataType::Float64 => Arc::new(Float64Array::from(
+                    sorted
+                        .iter()
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Float64(bits) => Ok(f64::from_bits(bits)),
+                            _ => Err(ExecError::UnsupportedType("Float64 key mismatch".into())),
+                        })
+                        .collect::<ExecResult<Vec<f64>>>()?,
+                )),
+                DataType::Utf8 => Arc::new(StringArray::from(
+                    sorted
+                        .iter()
+                        .map(|(key, _)| match &key[gb_pos] {
+                            AggKey::Utf8(s) => Ok(s.clone()),
+                            _ => Err(ExecError::UnsupportedType("Utf8 key mismatch".into())),
+                        })
+                        .collect::<ExecResult<Vec<String>>>()?,
+                )),
+                DataType::Boolean => Arc::new(BooleanArray::from(
+                    sorted
+                        .iter()
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Bool(v) => Ok(v),
+                            _ => Err(ExecError::UnsupportedType("Bool key mismatch".into())),
+                        })
+                        .collect::<ExecResult<Vec<bool>>>()?,
+                )),
                 other => {
                     return Err(ExecError::UnsupportedType(format!(
                         "unsupported group-by type for {col_name}: {other}"
@@ -904,7 +897,10 @@ impl ExternalAggregator {
             columns.push(Arc::new(avc_b.finish()) as ArrayRef);
         }
 
-        Ok(RecordBatch::try_new(Arc::new(partial_schema.clone()), columns)?)
+        Ok(RecordBatch::try_new(
+            Arc::new(partial_schema.clone()),
+            columns,
+        )?)
     }
 
     /// Merge one partial-aggregate RecordBatch into `self.groups`.
@@ -980,11 +976,12 @@ impl ExternalAggregator {
                 let pavc = avc_cols[i].value(row) as u64;
                 match expr.function {
                     AggFunction::Count | AggFunction::Sum => {
-                        existing.values[i] = existing.values[i]
-                            .checked_add(pval)
-                            .ok_or_else(|| ExecError::InvalidInput(
-                                "aggregate overflow during spill merge".into(),
-                            ))?;
+                        existing.values[i] =
+                            existing.values[i].checked_add(pval).ok_or_else(|| {
+                                ExecError::InvalidInput(
+                                    "aggregate overflow during spill merge".into(),
+                                )
+                            })?;
                     }
                     AggFunction::Min => {
                         if phas && (!existing.has_value[i] || pval < existing.values[i]) {
@@ -1025,8 +1022,7 @@ impl ExternalAggregator {
     }
 
     fn build_output_batch(&self, input_schema: &SchemaRef) -> ExecResult<RecordBatch> {
-        let mut sorted: Vec<(&SmallVec<[AggKey; 4]>, &AggState)> =
-            self.groups.iter().collect();
+        let mut sorted: Vec<(&SmallVec<[AggKey; 4]>, &AggState)> = self.groups.iter().collect();
         sorted.sort_by(|(a, _), (b, _)| {
             a.iter()
                 .zip(b.iter())
@@ -1067,76 +1063,67 @@ impl ExternalAggregator {
             })
             .collect::<ExecResult<_>>()?;
 
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
         for (gb_pos, col_name) in self.group_by.iter().enumerate() {
             let col_idx = gb_indices[gb_pos];
             let dtype = input_schema.field(col_idx).data_type().clone();
             let col: ArrayRef = match dtype {
-                DataType::Int32 => {
-                    Arc::new(Int32Array::from(
-                        sorted
-                            .iter()
-                            .map(|(key, _)| match key[gb_pos] {
-                                AggKey::Int32(v) => Ok(v),
-                                _ => Err(ExecError::UnsupportedType(format!(
-                                    "Int32 group key mismatch for {col_name}"
-                                ))),
-                            })
-                            .collect::<ExecResult<Vec<i32>>>()?,
-                    ))
-                }
-                DataType::Int64 => {
-                    Arc::new(Int64Array::from(
-                        sorted
-                            .iter()
-                            .map(|(key, _)| match key[gb_pos] {
-                                AggKey::Int64(v) => Ok(v),
-                                _ => Err(ExecError::UnsupportedType(format!(
-                                    "Int64 group key mismatch for {col_name}"
-                                ))),
-                            })
-                            .collect::<ExecResult<Vec<i64>>>()?,
-                    ))
-                }
-                DataType::Float64 => {
-                    Arc::new(Float64Array::from(
-                        sorted
-                            .iter()
-                            .map(|(key, _)| match key[gb_pos] {
-                                AggKey::Float64(bits) => Ok(f64::from_bits(bits)),
-                                _ => Err(ExecError::UnsupportedType(format!(
-                                    "Float64 group key mismatch for {col_name}"
-                                ))),
-                            })
-                            .collect::<ExecResult<Vec<f64>>>()?,
-                    ))
-                }
-                DataType::Utf8 => {
-                    Arc::new(StringArray::from(
-                        sorted
-                            .iter()
-                            .map(|(key, _)| match &key[gb_pos] {
-                                AggKey::Utf8(s) => Ok(s.as_str()),
-                                _ => Err(ExecError::UnsupportedType(format!(
-                                    "Utf8 group key mismatch for {col_name}"
-                                ))),
-                            })
-                            .collect::<ExecResult<Vec<&str>>>()?,
-                    ))
-                }
-                DataType::Boolean => {
-                    Arc::new(BooleanArray::from(
-                        sorted
-                            .iter()
-                            .map(|(key, _)| match key[gb_pos] {
-                                AggKey::Bool(v) => Ok(v),
-                                _ => Err(ExecError::UnsupportedType(format!(
-                                    "Bool group key mismatch for {col_name}"
-                                ))),
-                            })
-                            .collect::<ExecResult<Vec<bool>>>()?,
-                    ))
-                }
+                DataType::Int32 => Arc::new(Int32Array::from(
+                    sorted
+                        .iter()
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Int32(v) => Ok(v),
+                            _ => Err(ExecError::UnsupportedType(format!(
+                                "Int32 group key mismatch for {col_name}"
+                            ))),
+                        })
+                        .collect::<ExecResult<Vec<i32>>>()?,
+                )),
+                DataType::Int64 => Arc::new(Int64Array::from(
+                    sorted
+                        .iter()
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Int64(v) => Ok(v),
+                            _ => Err(ExecError::UnsupportedType(format!(
+                                "Int64 group key mismatch for {col_name}"
+                            ))),
+                        })
+                        .collect::<ExecResult<Vec<i64>>>()?,
+                )),
+                DataType::Float64 => Arc::new(Float64Array::from(
+                    sorted
+                        .iter()
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Float64(bits) => Ok(f64::from_bits(bits)),
+                            _ => Err(ExecError::UnsupportedType(format!(
+                                "Float64 group key mismatch for {col_name}"
+                            ))),
+                        })
+                        .collect::<ExecResult<Vec<f64>>>()?,
+                )),
+                DataType::Utf8 => Arc::new(StringArray::from(
+                    sorted
+                        .iter()
+                        .map(|(key, _)| match &key[gb_pos] {
+                            AggKey::Utf8(s) => Ok(s.as_str()),
+                            _ => Err(ExecError::UnsupportedType(format!(
+                                "Utf8 group key mismatch for {col_name}"
+                            ))),
+                        })
+                        .collect::<ExecResult<Vec<&str>>>()?,
+                )),
+                DataType::Boolean => Arc::new(BooleanArray::from(
+                    sorted
+                        .iter()
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Bool(v) => Ok(v),
+                            _ => Err(ExecError::UnsupportedType(format!(
+                                "Bool group key mismatch for {col_name}"
+                            ))),
+                        })
+                        .collect::<ExecResult<Vec<bool>>>()?,
+                )),
                 other => {
                     return Err(ExecError::UnsupportedType(format!(
                         "unsupported group-by column type for {col_name}: {other}"

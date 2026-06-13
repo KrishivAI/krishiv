@@ -1982,7 +1982,10 @@ impl SqlDataFrame {
     /// Execute and collect this DataFrame, also returning lightweight runtime statistics.
     ///
     /// Collects `output_rows` from DataFusion's execution metrics. `cpu_nanos`
-    /// is approximated from `elapsed_compute` when available; other fields default to 0.
+    /// is approximated from `elapsed_compute` when available. `spill_bytes`
+    /// and `spill_count` are aggregated across every operator in the physical
+    /// plan tree (sorts, hash joins, and aggregations report spills when the
+    /// memory pool forces them to disk); other fields default to 0.
     pub async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
         use datafusion::physical_plan::collect as df_collect;
 
@@ -2004,14 +2007,43 @@ impl SqlDataFrame {
             }
         }
 
+        let (spill_bytes, spill_count) = aggregate_spill_metrics(physical_plan.as_ref());
+
         Ok((
             batches,
             SqlExecutionStats {
                 output_rows,
                 cpu_nanos,
+                spill_bytes,
+                spill_count,
             },
         ))
     }
+}
+
+/// Recursively sum `spilled_bytes` and `spill_count` metrics across every
+/// operator in a physical plan tree.
+///
+/// The root node's `metrics()` only reflects the root operator; spilling
+/// happens in interior sort/join/aggregate nodes, so the whole tree must be
+/// walked to account for all disk spill activity.
+fn aggregate_spill_metrics(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> (u64, u64) {
+    let mut spill_bytes: u64 = 0;
+    let mut spill_count: u64 = 0;
+    if let Some(metrics) = plan.metrics() {
+        if let Some(bytes) = metrics.spilled_bytes() {
+            spill_bytes = spill_bytes.saturating_add(bytes as u64);
+        }
+        if let Some(count) = metrics.spill_count() {
+            spill_count = spill_count.saturating_add(count as u64);
+        }
+    }
+    for child in plan.children() {
+        let (child_bytes, child_count) = aggregate_spill_metrics(child.as_ref());
+        spill_bytes = spill_bytes.saturating_add(child_bytes);
+        spill_count = spill_count.saturating_add(child_count);
+    }
+    (spill_bytes, spill_count)
 }
 
 /// Lightweight execution statistics collected from a DataFusion physical plan.
@@ -2019,6 +2051,10 @@ impl SqlDataFrame {
 pub struct SqlExecutionStats {
     pub output_rows: u64,
     pub cpu_nanos: u64,
+    /// Total bytes spilled to disk across all operators in the plan.
+    pub spill_bytes: u64,
+    /// Number of spill events (roughly: spill files written) across all operators.
+    pub spill_count: u64,
 }
 
 fn top_level_alias_index(expression: &str) -> Option<usize> {

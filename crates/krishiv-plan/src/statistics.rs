@@ -486,10 +486,8 @@ mod tests {
 
     #[test]
     fn table_stats_equality_filter_with_column() {
-        let ts = TableStats::new(1000).with_column(
-            "status",
-            ColumnStats::new(1000).with_distinct_count(10),
-        );
+        let ts = TableStats::new(1000)
+            .with_column("status", ColumnStats::new(1000).with_distinct_count(10));
         let rows = ts.estimate_after_filters(&["status = 'active'".to_string()]);
         // selectivity = 1/10 = 0.1 → 100 rows
         assert_eq!(rows, 100);
@@ -512,10 +510,8 @@ mod tests {
 
     #[test]
     fn table_stats_column_lookup_case_insensitive() {
-        let ts = TableStats::new(100).with_column(
-            "Amount",
-            ColumnStats::new(100).with_distinct_count(50),
-        );
+        let ts = TableStats::new(100)
+            .with_column("Amount", ColumnStats::new(100).with_distinct_count(50));
         assert!(ts.column("amount").is_some());
         assert!(ts.column("AMOUNT").is_some());
     }
@@ -524,8 +520,7 @@ mod tests {
 
     #[test]
     fn estimator_scan_from_table_stats() {
-        let est = CardinalityEstimator::new()
-            .with_table("orders", TableStats::new(10_000));
+        let est = CardinalityEstimator::new().with_table("orders", TableStats::new(10_000));
         assert_eq!(est.estimate_scan("orders", &[]), Some(10_000));
     }
 
@@ -560,8 +555,7 @@ mod tests {
         let plan = LogicalPlan::new("q", ExecutionKind::Batch)
             .with_node(make_scan_no_estimate("s", "orders"));
 
-        let est = CardinalityEstimator::new()
-            .with_table("orders", TableStats::new(50_000));
+        let est = CardinalityEstimator::new().with_table("orders", TableStats::new(50_000));
         let annotated = est.annotate_plan(plan);
         let scan = annotated.nodes().iter().find(|n| n.id() == "s").unwrap();
         assert_eq!(scan.estimated_rows(), Some(50_000));
@@ -569,11 +563,10 @@ mod tests {
 
     #[test]
     fn estimator_annotate_plan_respects_existing_estimate() {
-        let plan = LogicalPlan::new("q", ExecutionKind::Batch)
-            .with_node(make_scan("s", "orders", 999));
+        let plan =
+            LogicalPlan::new("q", ExecutionKind::Batch).with_node(make_scan("s", "orders", 999));
 
-        let est = CardinalityEstimator::new()
-            .with_table("orders", TableStats::new(50_000));
+        let est = CardinalityEstimator::new().with_table("orders", TableStats::new(50_000));
         let annotated = est.annotate_plan(plan.clone());
         // Pre-existing estimate must not be replaced.
         let scan = annotated.nodes().iter().find(|n| n.id() == "s").unwrap();
@@ -596,8 +589,7 @@ mod tests {
 
     #[test]
     fn estimator_annotate_plan_noop_when_all_estimates_present() {
-        let plan = LogicalPlan::new("q", ExecutionKind::Batch)
-            .with_node(make_scan("s", "t", 100));
+        let plan = LogicalPlan::new("q", ExecutionKind::Batch).with_node(make_scan("s", "t", 100));
 
         let est = CardinalityEstimator::new();
         let annotated = est.annotate_plan(plan.clone());

@@ -327,6 +327,9 @@ impl ExternalSorter {
         let (file, bytes) = SpillFile::write("sort", run.schema().as_ref(), &[run])?;
         self.spill_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
         self.spill_files.fetch_add(1, AtomicOrdering::Relaxed);
+        let metrics = krishiv_metrics::global_metrics();
+        metrics.record_spill(bytes, 1);
+        metrics.record_operator_memory("external_sort", self.reserved_bytes);
         self.runs.push(file);
         self.release_reserved();
         Ok(())

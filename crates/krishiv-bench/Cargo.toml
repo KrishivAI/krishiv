@@ -10,6 +10,10 @@ name = "tpch_sf10"
 harness = false
 
 [[bench]]
+name = "tpch_distributed"
+harness = false
+
+[[bench]]
 name = "nexmark"
 harness = false
 
@@ -17,6 +21,7 @@ harness = false
 criterion = { version = "0.8.2", features = ["html_reports"] }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-api = { path = "../krishiv-api" }
+krishiv-runtime = { path = "../krishiv-runtime" }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 parquet = { workspace = true }

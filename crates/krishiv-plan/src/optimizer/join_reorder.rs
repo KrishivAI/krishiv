@@ -193,8 +193,16 @@ mod tests {
 
         let result = JoinReorderRule.apply(&plan).expect("should swap");
         let join_node = result.nodes().iter().find(|n| n.id() == "j").unwrap();
-        assert_eq!(join_node.inputs()[0], "small", "small table must be on left");
-        assert_eq!(join_node.inputs()[1], "large", "large table must be on right");
+        assert_eq!(
+            join_node.inputs()[0],
+            "small",
+            "small table must be on left"
+        );
+        assert_eq!(
+            join_node.inputs()[1],
+            "large",
+            "large table must be on right"
+        );
     }
 
     #[test]
@@ -204,7 +212,9 @@ mod tests {
             .with_node(scan("tiny", 5))
             .with_node(join_with_type("j", "big", "tiny", JoinType::Cross));
 
-        let result = JoinReorderRule.apply(&plan).expect("cross join should swap");
+        let result = JoinReorderRule
+            .apply(&plan)
+            .expect("cross join should swap");
         let join_node = result.nodes().iter().find(|n| n.id() == "j").unwrap();
         assert_eq!(join_node.inputs()[0], "tiny");
         assert_eq!(join_node.inputs()[1], "big");
