@@ -39,6 +39,8 @@ pub struct FlightExecutionHost {
     /// Path-based Parquet table catalog shared across concurrent requests.
     /// Uses DashMap for lock-free concurrent access.
     catalog: Arc<DashMap<String, PathBuf>>,
+    /// Optional HTTP URL of a remote coordinator, for informational / test use.
+    coordinator_http_url: Option<String>,
 }
 
 impl FlightExecutionHost {
@@ -50,6 +52,7 @@ impl FlightExecutionHost {
         Ok(Self {
             backend: Arc::new(FlightHostBackend::InProcess(Arc::new(cluster))),
             catalog: Arc::new(DashMap::new()),
+            coordinator_http_url: None,
         })
     }
 
@@ -62,7 +65,26 @@ impl FlightExecutionHost {
         Self {
             backend: Arc::new(FlightHostBackend::Coordinator(coordinator)),
             catalog: Arc::new(DashMap::new()),
+            coordinator_http_url: None,
         }
+    }
+
+    /// Create an embedded host that remembers a remote coordinator HTTP URL.
+    ///
+    /// Useful for tests and tooling that need to record the coordinator address
+    /// without actually connecting to it.
+    pub fn with_coordinator_http(url: Option<String>) -> Result<Self, Status> {
+        let cluster = InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Self {
+            backend: Arc::new(FlightHostBackend::InProcess(Arc::new(cluster))),
+            catalog: Arc::new(DashMap::new()),
+            coordinator_http_url: url,
+        })
+    }
+
+    /// Return the coordinator HTTP URL recorded at construction time, if any.
+    pub fn coordinator_http_url(&self) -> Option<&str> {
+        self.coordinator_http_url.as_deref()
     }
 
     /// Build from environment variables (for standalone flight-server use only).
@@ -144,6 +166,37 @@ impl FlightExecutionHost {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 krishiv_scheduler::decode_inline_record_batches(&outcome.inline_record_batch_ipc)
                     .map_err(|e| Status::internal(e.to_string()))
+            }
+        }
+    }
+
+    /// Execute a batch SQL write through a sink output contract (Phase 2.3
+    /// staged distributed write). Blocks until the job has succeeded and its
+    /// staged output has been published; sink jobs return no result rows.
+    pub async fn execute_batch_sql_sink(
+        &self,
+        query: &str,
+        inline_tables: &[BatchSqlInlineTable],
+        sink_contract: &str,
+    ) -> Result<(), Status> {
+        match self.backend.as_ref() {
+            FlightHostBackend::InProcess(cluster) => {
+                let tables = self.catalog_tables();
+                let sql = query.to_string();
+                let contract = sink_contract.to_string();
+                let cluster = Arc::clone(cluster);
+                run_blocking(move || cluster.execute_batch_sql_sink(&sql, &tables, &contract))
+            }
+            FlightHostBackend::Coordinator(coordinator) => {
+                krishiv_scheduler::execute_batch_sql_sink_coordinated(
+                    coordinator,
+                    query,
+                    inline_tables,
+                    sink_contract,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| Status::internal(e.to_string()))
             }
         }
     }

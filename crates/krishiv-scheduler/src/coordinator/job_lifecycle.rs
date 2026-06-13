@@ -22,7 +22,28 @@ impl Coordinator {
 
         // Admission control: compute live quota snapshot then ask the queue manager.
         let quota = self.namespace_quota_snapshot(spec.namespace_id());
-        let outcome = self.queue_manager.admit(&spec, &quota);
+        let mut outcome = self.queue_manager.admit(&spec, &quota);
+
+        // Memory-estimate admission: when the job declares a memory ask and the
+        // cluster reports memory capacity via heartbeats, queue the job if its
+        // ask exceeds what is currently available across schedulable executors.
+        // Unknown capacity (no executor reports a memory limit) skips the check
+        // so clusters without memory reporting are unaffected.
+        if matches!(outcome, SubmitOutcome::Accepted)
+            && let Some(ask) = spec.memory_limit_bytes()
+            && ask > 0
+            && let Some(available) = self.executors.cluster_available_memory_bytes()
+            && ask > available
+        {
+            tracing::warn!(
+                job_id = %spec.job_id(),
+                memory_ask = ask,
+                cluster_available = available,
+                "job memory ask exceeds available cluster memory; queueing"
+            );
+            outcome = SubmitOutcome::Queued { position: 0 };
+        }
+
         if let SubmitOutcome::Queued { .. } = &outcome {
             if krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile) {
                 return Err(SchedulerError::InvalidJob {
@@ -339,6 +360,13 @@ impl Coordinator {
             self.continuous_input_cycles.remove(&job_id);
             self.job_input_partitions.remove(&job_id);
         }
+
+        // Phase 2.3 distributed write commit: when this update drove the job
+        // to a terminal state, publish staged sink outputs (job success) or
+        // clean up staging (failure/cancel). Runs before the state snapshot
+        // below so a publish failure demotes the job to Failed prior to
+        // persistence and GC bookkeeping.
+        self.finalize_staged_sink_outputs(&job_id);
 
         // Snapshot the job's current state and resource usage after the update.
         let (is_terminal, usage, state, job_name, namespace) = self

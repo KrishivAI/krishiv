@@ -249,6 +249,10 @@ pub struct ExecutorTaskOutput {
     pub(crate) watermark_ms: Option<i64>,
     /// Hot-key reports from `HeavyHittersTracker` observed during shuffle write.
     pub(crate) hot_key_reports: Vec<krishiv_proto::HeartbeatHotKeyReport>,
+    /// Staged sink files (relative to the sink base_dir) written under the
+    /// Phase 2.3 staged commit protocol. Empty for non-sink and legacy
+    /// direct-write sink tasks.
+    pub(crate) sink_staged_files: Vec<String>,
     /// EMA-based partition bucket recommendation from `StreamingPartitionAdvisor`.
     /// `None` for non-streaming tasks; `Some(n)` when the advisor has observed
     /// enough data to suggest a bucket count for the next streaming cycle.
@@ -272,6 +276,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
         }
@@ -293,6 +298,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
         }
@@ -309,6 +315,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
         }
@@ -328,6 +335,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
         }
@@ -350,6 +358,7 @@ impl ExecutorTaskOutput {
             record_batches,
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
         }
@@ -368,6 +377,17 @@ impl ExecutorTaskOutput {
     pub(crate) fn with_record_batches(mut self, batches: Vec<RecordBatch>) -> Self {
         self.record_batches = batches;
         self
+    }
+
+    /// Attach staged sink file paths (Phase 2.3 staged commit protocol).
+    pub(crate) fn with_sink_staged_files(mut self, files: Vec<String>) -> Self {
+        self.sink_staged_files = files;
+        self
+    }
+
+    /// Staged sink files written by this task (empty for non-staged tasks).
+    pub fn sink_staged_files(&self) -> &[String] {
+        &self.sink_staged_files
     }
 
     /// Attach the maximum event-time watermark reached by this streaming task.
@@ -454,6 +474,9 @@ impl ExecutorTaskOutput {
         }
         if !self.hot_key_reports.is_empty() {
             meta = meta.with_hot_key_reports(self.hot_key_reports.clone());
+        }
+        if !self.sink_staged_files.is_empty() {
+            meta = meta.with_sink_staged_files(self.sink_staged_files.clone());
         }
         meta
     }

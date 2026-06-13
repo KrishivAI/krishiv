@@ -37,6 +37,19 @@ impl InProcessCluster {
         self.inner.execute_batch_sql(query, tables, is_streaming)
     }
 
+    /// Execute a batch SQL write through the coordinator with a sink output
+    /// contract (Phase 2.3 staged distributed write). Blocks until the job
+    /// has succeeded and its staged output has been published.
+    pub fn execute_batch_sql_sink(
+        &self,
+        query: &str,
+        tables: &[crate::in_process::BatchSqlTable],
+        sink_contract: &str,
+    ) -> RuntimeResult<()> {
+        self.inner
+            .execute_batch_sql_sink(query, tables, sink_contract)
+    }
+
     /// Check if a query is streaming.
     pub fn is_streaming_query(&self, query: &str) -> RuntimeResult<bool> {
         self.inner.is_streaming_query(query)

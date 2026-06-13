@@ -809,6 +809,7 @@ fn task_output_metadata_to_wire(value: &TaskOutputMetadata) -> v1::TaskOutputMet
             .iter()
             .map(hot_key_report_to_wire)
             .collect(),
+        sink_staged_files: value.sink_staged_files().to_vec(),
     }
 }
 
@@ -885,6 +886,9 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
             .map(hot_key_report_from_wire)
             .collect::<WireResult<Vec<_>>>()?;
         meta = meta.with_hot_key_reports(reports);
+    }
+    if !value.sink_staged_files.is_empty() {
+        meta = meta.with_sink_staged_files(value.sink_staged_files);
     }
     Ok(meta)
 }

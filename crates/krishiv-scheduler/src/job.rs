@@ -356,10 +356,19 @@ impl JobRecord {
                             krishiv_plan::execution_kind_from_fragment(&task_description)
                                 == PlanExecutionKind::Streaming,
                         ),
-                        OutputContract::new(
-                            OutputContractKind::InlineRecordBatches,
-                            format!("inline result for {}", task.task_id()),
-                        ),
+                        match task.spec.sink_contract() {
+                            // Terminal write tasks carry a sink contract on
+                            // their spec (Phase 2.3 distributed writes); the
+                            // executor stages output and the coordinator
+                            // publishes it on job success.
+                            Some(contract) => {
+                                OutputContract::new(OutputContractKind::Sink, contract)
+                            }
+                            None => OutputContract::new(
+                                OutputContractKind::InlineRecordBatches,
+                                format!("inline result for {}", task.task_id()),
+                            ),
+                        },
                     )
                     .with_input_partitions(input_partitions)
                     .with_key_group_range(key_group_range_for_task(task_index, stage_parallelism));
@@ -715,7 +724,10 @@ impl JobRecord {
             if stage_affected {
                 let meta_entry = self.shuffle_output.entry(stage_id).or_default();
                 for path in &paths_to_invalidate {
-                    meta_entry.mark_failed(path, "shuffle partition missing on consumer fetch".to_owned());
+                    meta_entry.mark_failed(
+                        path,
+                        "shuffle partition missing on consumer fetch".to_owned(),
+                    );
                 }
                 stage.refresh_state();
             }
@@ -740,7 +752,11 @@ impl JobRecord {
             return Vec::new();
         };
         let mut result = Vec::new();
-        for t in stage.tasks.iter().filter(|t| t.state == TaskState::Succeeded) {
+        for t in stage
+            .tasks
+            .iter()
+            .filter(|t| t.state == TaskState::Succeeded)
+        {
             let meta = t.output_metadata.as_ref();
             let partitions = meta.map(|m| m.shuffle_partitions()).unwrap_or(&[]);
             if !partitions.is_empty() {

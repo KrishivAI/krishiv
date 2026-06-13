@@ -235,9 +235,8 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             update = update.with_output_metadata(output_metadata.clone());
         }
         if !request.missing_shuffle_partitions().is_empty() {
-            update = update.with_missing_shuffle_partitions(
-                request.missing_shuffle_partitions().to_vec(),
-            );
+            update = update
+                .with_missing_shuffle_partitions(request.missing_shuffle_partitions().to_vec());
         }
 
         let mut coordinator = self.coordinator.write().await;

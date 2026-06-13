@@ -456,12 +456,13 @@ pub(crate) async fn execute_streaming_fragment(
     //   3. <default>    — bounded window (tumbling / sliding / session)
     if let Some(query) = crate::fragment::common::sql_query_from_fragment(fragment) {
         // Create a new SQL engine with UDF limits and the task's memory limit
-        // for this task execution.
+        // for this task execution. The reservation guard holds this task's
+        // share of the executor process budget until the fragment returns.
+        let (engine_memory_limit, _process_memory_reservation) =
+            crate::fragment::common::reserve_task_engine_memory(&memory_budget);
         let engine = Arc::new(
-            krishiv_sql::SqlEngine::new_with_memory_limit(
-                crate::fragment::common::task_engine_memory_limit(&memory_budget),
-            )
-            .with_udf_limits(udf_limits),
+            krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
+                .with_udf_limits(udf_limits),
         );
 
         // Continuous SQL queries must use execute_stream to avoid blocking and buffering forever.
@@ -485,6 +486,23 @@ pub(crate) async fn execute_streaming_fragment(
         let mut total_batches = 0;
         let mut column_count = 0;
 
+        let is_object_parquet_sink = assignment.output_contract().kind()
+            == krishiv_proto::OutputContractKind::Sink
+            && assignment
+                .output_contract()
+                .description()
+                .trim()
+                .starts_with(crate::runner::OBJECT_PARQUET_SINK_PREFIX);
+        // Staged sink contracts buffer the bounded stream output and run one
+        // staged write at the end (the commit protocol needs whole-task
+        // output); legacy direct contracts keep their per-batch write.
+        let is_staged_sink = is_object_parquet_sink
+            && crate::fragment::common::parse_object_parquet_sink_spec(
+                assignment.output_contract(),
+            )?
+            .staged;
+        let mut staged_buffer: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+
         while let Some(batch_res) = stream.next().await {
             let batch = batch_res.map_err(|error| ExecutorError::LocalExecution {
                 message: error.to_string(),
@@ -492,13 +510,9 @@ pub(crate) async fn execute_streaming_fragment(
 
             column_count = batch.num_columns();
 
-            if assignment.output_contract().kind() == krishiv_proto::OutputContractKind::Sink
-                && assignment
-                    .output_contract()
-                    .description()
-                    .trim()
-                    .starts_with(crate::runner::OBJECT_PARQUET_SINK_PREFIX)
-            {
+            if is_staged_sink {
+                staged_buffer.push(batch.clone());
+            } else if is_object_parquet_sink {
                 crate::fragment::common::write_object_parquet_sink(
                     assignment.output_contract(),
                     std::slice::from_ref(&batch),
@@ -510,12 +524,23 @@ pub(crate) async fn execute_streaming_fragment(
             total_batches += 1;
         }
 
+        let sink_staged_files = if is_staged_sink {
+            crate::fragment::common::write_object_parquet_sink_for_task(
+                assignment,
+                &staged_buffer,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+
         return Ok(ExecutorTaskOutput::streaming_window(
             total_rows,
             total_batches,
             column_count,
             vec![],
-        ));
+        )
+        .with_sink_staged_files(sink_staged_files));
     }
 
     // GAP-10: stream:cep: fragments use PartitionedCepMatcher for sequential

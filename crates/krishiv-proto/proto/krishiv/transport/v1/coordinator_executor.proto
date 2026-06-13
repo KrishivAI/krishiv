@@ -311,6 +311,10 @@ message TaskOutputMetadata {
   bool has_runtime_stats = 17;
   // Hot-key reports from HeavyHittersTracker observed during shuffle write.
   repeated HeartbeatHotKeyReport hot_key_reports = 18;
+  // Staged sink files written by this task (paths relative to the sink
+  // base_dir). Populated by object-parquet sink tasks running the Phase 2.3
+  // staged commit protocol; the coordinator publishes them on job success.
+  repeated string sink_staged_files = 19;
 }
 
 message TaskCancellationRequest {
