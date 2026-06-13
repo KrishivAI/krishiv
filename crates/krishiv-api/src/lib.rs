@@ -4,12 +4,14 @@
 //!
 //! High-level client API for constructing local, batch SQL, and streaming pipelines.
 
+pub mod blocking;
 pub mod catalog;
 pub mod dataframe;
 pub mod error;
 pub mod expression;
 pub mod io;
 pub mod prepared;
+pub mod query;
 pub mod session;
 pub mod stream;
 pub mod streaming_dataframe;
@@ -24,10 +26,12 @@ pub use catalog::{
     FunctionIdentifier, FunctionMetadata, Identifier, Namespace, TableIdentifier, TableMetadata,
     ViewIdentifier,
 };
+pub use blocking::BlockingSession;
 pub use dataframe::{
     Boundedness, DataFrame, ExecutionResult, ExplainMode, GroupedDataFrame, GroupingSpec, JoinType,
     PivotValue, QueryExecutionStats,
 };
+pub use query::{QueryCompletion, QueryHandle, QueryId, QueryProgress, QueryStatus};
 pub use error::{KrishivError, Result};
 pub use expression::{
     AggregateFunction as ExprAggregateFunction, BinaryOperator as ExprBinaryOperator,

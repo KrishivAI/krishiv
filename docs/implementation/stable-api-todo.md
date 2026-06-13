@@ -68,13 +68,13 @@ Implementation details and remaining native-driver certification work are record
 
 ## Phase E — Query lifecycle and async correctness
 
-- [ ] Add typed query ID, handle, status, progress, failure, and result stream.
-- [ ] Route collect, writes, and stream submission through one query handle.
-- [ ] Add coordinator-backed cancellation, timeout, progress, and completion.
-- [ ] Add explicit `krishiv::blocking` facade using one owned runtime.
-- [ ] Remove hidden runtime creation/blocking from normal Rust APIs.
-- [ ] Convert every Python `*_async` method into a genuine asyncio awaitable.
-- [ ] Propagate Python interrupts and client disconnect cancellation.
+- [x] Add typed query ID, handle, status, progress, failure, and result stream.
+- [x] Route collect, writes, and stream submission through one query handle.
+- [x] Add coordinator-backed cancellation, timeout, progress, and completion.
+- [x] Add explicit `krishiv::blocking` facade using one owned runtime.
+- [x] Remove hidden runtime creation/blocking from normal Rust APIs.
+- [x] Convert every Python `*_async` method into a genuine asyncio awaitable.
+- [x] Propagate Python interrupts and client disconnect cancellation.
 
 ## Phase F — Structured streaming
 

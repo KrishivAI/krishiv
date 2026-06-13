@@ -635,6 +635,34 @@ Execution statistics:
         result
     }
 
+    /// Submit this query asynchronously and return a [`QueryHandle`].
+    ///
+    /// The query is immediately dispatched as a Tokio task.  The handle lets
+    /// callers track progress, cancel the query, or `.await` the result via
+    /// [`QueryHandle::wait`].
+    ///
+    /// This is the Phase-E single entry point that routes collect, writes, and
+    /// stream submission through one typed handle.
+    pub fn submit_async(self) -> crate::query::QueryHandle {
+        let id = crate::query::QueryId::next();
+        let (handle, driver) = crate::query::QueryHandle::new(id);
+        tokio::spawn(async move {
+            driver.set_running();
+            if driver.is_cancelled() {
+                return;
+            }
+            match self.collect_async().await {
+                Ok(result) => {
+                    let rows = result.row_count() as u64;
+                    driver.update_progress(rows, rows);
+                    driver.set_completed(result);
+                }
+                Err(e) => driver.set_failed(e.to_string()),
+            }
+        });
+        handle
+    }
+
     fn start_job(&self, name: &str) -> JobId {
         let id = JobId::try_new(format!(
             "local-{}",

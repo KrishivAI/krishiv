@@ -33,7 +33,7 @@ exit_criteria = "Typed options and certified distributed atomic commits."
 [[phases]]
 id = "E"
 name = "Query lifecycle and async correctness"
-status = "todo"
+status = "implemented"
 exit_criteria = "One QueryHandle path with cancellation, progress, timeout, and true awaitables."
 
 [[phases]]
@@ -127,9 +127,9 @@ owner = "krishiv-connectors"
 id = "query.lifecycle"
 phase = "E"
 stability = "preview"
-rust = "todo"
-python = "blocked"
-sql = "blocked"
+rust = "implemented"
+python = "implemented"
+sql = "not_applicable"
 owner = "krishiv-runtime"
 
 [[capabilities]]
@@ -137,7 +137,7 @@ id = "python.true-asyncio"
 phase = "E"
 stability = "preview"
 rust = "not_applicable"
-python = "todo"
+python = "implemented"
 sql = "not_applicable"
 owner = "krishiv-python"
 

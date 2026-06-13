@@ -1,5 +1,44 @@
 # Krishiv Implementation Status
 
+## 2026-06-13 — Phase E complete: query lifecycle and async correctness
+
+Completed:
+
+- Created `crates/krishiv-api/src/query.rs` with typed `QueryId`, `QueryStatus`
+  (Pending/Running/Completed/Cancelled/Failed), `QueryProgress`, `QueryHandle`
+  (wait, cancel, timeout), and internal `QueryDriver` using `tokio::sync::watch`
+  channels for zero-copy state propagation.
+- Added `DataFrame::submit_async()` that spawns the query as a Tokio task and
+  returns a `QueryHandle` immediately — single entry point for collect, write,
+  and stream submission through one typed handle.
+- Created `crates/krishiv-api/src/blocking.rs` with `BlockingSession` wrapping
+  a session and an owned `tokio::Runtime` — explicit sync facade that removes
+  all hidden `block_on` calls from user-facing Rust APIs.
+- Created `crates/krishiv-python/src/query_handle.rs` with `PyQueryHandle`:
+  sync `status()`, `cancel()`, `progress()`, `is_done()` methods plus a
+  genuine asyncio-awaitable `collect_async()` coroutine via PyO3
+  `experimental-async`.
+- Upgraded `PySession::sql_async` from `block_in_place` disguise to a real
+  `async fn` coroutine; cancellation propagates through the `QueryHandle`
+  cancel channel to the Tokio executor.
+- Added `PySession::submit_async()` returning `PyQueryHandle` for explicit
+  lifecycle management.
+- Enabled `experimental-async` feature on pyo3 workspace dependency.
+- Marked all Phase E checklist items complete in `docs/implementation/stable-api-todo.md`.
+- Updated `api/stable-api.toml`: Phase E `status = "implemented"`,
+  `query.lifecycle` and `python.true-asyncio` capabilities marked implemented.
+
+Validation:
+
+- `cargo check -p krishiv-api -p krishiv-python --lib` passed; 0 errors.
+- `cargo test -p krishiv-api --lib` — query lifecycle tests pass.
+- `cargo test -p krishiv-python --lib` — session and dataframe tests pass.
+
+Next useful command:
+
+- `cargo test -p krishiv-api --lib query` — run query.rs unit tests.
+- `cargo test -p krishiv-python --lib` — all Python binding tests.
+
 ## 2026-06-13 — Phase D complete: overwrite/schema-evolution + certification suite
 
 Completed:
