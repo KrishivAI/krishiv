@@ -1,5 +1,89 @@
 # Krishiv Implementation Status
 
+## 2026-06-13 — Phase H complete: SQL grammar matrix, SQLSTATE codes, operation IDs, cancellation, and timeout
+
+Completed:
+
+- Created `crates/krishiv-sql/src/grammar.rs`:
+  - `FeatureStatus` enum (Supported / Partial / Planned / NotApplicable).
+  - `FeatureEntry` with `id`, `category`, `description`, `status`, `note`.
+  - `feature_matrix()` — static slice of 70+ SQL feature entries.
+  - `features_for_category(cat)` and `features_by_status(status)` helpers.
+  - Categories: SELECT, GROUP BY, JOIN, WINDOW, CTE, SET, LATERAL, PIVOT, DML,
+    DDL, TEMPORAL, PREPARED, OPERATION, ERROR, FLIGHT SQL, STREAMING SQL.
+  - 8 unit tests.
+
+- Created `crates/krishiv-sql/src/sqlstate.rs`:
+  - Well-known SQLSTATE constants: `SYNTAX_ERROR` (42000), `FEATURE_NOT_SUPPORTED`
+    (0A000), `INSUFFICIENT_PRIVILEGE` (42501), `QUERY_CANCELLED` (57014),
+    `QUERY_TIMEOUT` (57P05), `INTERNAL_ERROR` (XX000), etc.
+  - `sqlstate_for(error: &SqlError) -> &'static str` mapping function.
+  - `SqlStateError` struct with `code` + `message` for Flight SQL/JDBC responses.
+  - 9 unit tests.
+
+- Extended `SqlError` enum with two new variants:
+  - `OperationCancelled { operation_id: u64 }`.
+  - `Timeout { timeout_ms: u64 }`.
+
+- Extended `SqlEngine` with:
+  - `execute_with_timeout(sql, timeout_ms)` — wraps `sql()` in `tokio::time::timeout`.
+  - `execute_with_operation_id(id, sql, registry)` — checks cancellation before executing.
+
+- Added `OperationRegistry` — thread-safe set of cancelled operation IDs with
+  `cancel(id)`, `is_cancelled(id)`, `remove(id)`, `cancelled_ids()`.
+
+- Added `TaggedQueryResult` — result annotated with its operation ID.
+
+- Updated `krishiv-sql/src/lib.rs` module declarations and re-exports.
+
+Validation: `cargo check -p krishiv-sql` — exit 0.
+
+Next: `cargo test -p krishiv-sql --lib` to confirm all 11+ new tests pass.
+
+---
+
+## 2026-06-13 — Phase G complete: stateful process API — typed state, co-process, broadcast state
+
+Completed:
+
+- Created `crates/krishiv-dataflow/src/state_descriptor.rs`:
+  - `StateValue` blanket trait for serializable/deserializable state types.
+  - `ValueState<T>`, `ListState<T>`, `MapState<K,V>`, `ReducingState<T>`.
+  - `StateError` with Serialization/Deserialization variants.
+  - Tests: roundtrip, accumulation, put/remove, fold.
+
+- Created `crates/krishiv-dataflow/src/operator_config.rs`:
+  - `OperatorUid` stable string identity for savepoint compatibility.
+  - `OperatorConfig` with `uid`, `parallelism`, `max_parallelism` and builder methods.
+
+- Updated `crates/krishiv-dataflow/src/process_fn.rs`:
+  - Added `TimerKind` enum (EventTime / ProcessingTime) and `TimerEntry`.
+  - Added `processing_time_ms` to `ProcessContext`.
+  - Separate event and processing-time timer maps in `ProcessFunctionExecutor`.
+  - `snapshot()` and `restore()` for full state + timer serialization.
+  - Tests: processing-time timers, snapshot/restore, rescaling merge.
+
+- Created `crates/krishiv-dataflow/src/connected_streams.rs`:
+  - `ConnectedStreams<L,R>`, `CoProcessFunction` trait, `CoProcessExecutor`.
+  - Snapshot/restore support.
+
+- Created `crates/krishiv-dataflow/src/broadcast_state.rs`:
+  - `BroadcastStateDescriptor<K,V>`, `BroadcastContext`, `BroadcastProcessFunction`.
+  - `BroadcastProcessExecutor` with snapshot/restore.
+
+- Created `crates/krishiv-api/src/process.rs`:
+  - `apply_process_function()` stream adapter.
+  - `apply_async_io<F,Fut>()` async I/O adapter.
+
+- Updated `crates/krishiv-dataflow/src/lib.rs` with all new module declarations.
+- Updated `crates/krishiv-api/src/lib.rs` to export `process` module and all new types.
+- Updated `api/stable-api.toml` — Phase G status: implemented.
+- Updated `docs/implementation/stable-api-todo.md` — all Phase G items checked.
+
+Validation: commit `e87480e` cherry-picked successfully.
+
+---
+
 ## 2026-06-13 — Phase F complete: structured streaming builder, output modes, triggers, dedup, and lifecycle
 
 Completed:

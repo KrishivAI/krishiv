@@ -11,6 +11,7 @@ pub mod error;
 pub mod expression;
 pub mod io;
 pub mod prepared;
+pub mod process;
 pub mod query;
 pub mod session;
 pub mod stream;
@@ -48,6 +49,7 @@ pub use krishiv_connectors::{
     SortField, WriteDistribution, WriteMode,
 };
 pub use prepared::PreparedStatement;
+pub use process::{apply_async_io, apply_process_function};
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
 pub use streaming_builder::{
@@ -66,7 +68,14 @@ pub use window::{
 // Re-export Arrow, plan, and runtime types used by public APIs.
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use arrow::record_batch::RecordBatch;
-pub use krishiv_dataflow::{AggExpr, AggFunction};
+pub use krishiv_dataflow::{
+    AggExpr, AggFunction,
+    BroadcastContext, BroadcastProcessExecutor, BroadcastProcessFunction, BroadcastStateDescriptor,
+    CoProcessExecutor, CoProcessFunction, ConnectedStreams,
+    ListState, MapState, OperatorConfig, OperatorUid, ProcessContext, ProcessFunction,
+    ProcessFunctionExecutor, ReducingState, StateError, StateValue, TimerEntry, TimerKind,
+    ValueState,
+};
 pub use krishiv_plan::udf::{ScalarUdf, UdfError, UdfRegistry};
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
 pub use krishiv_runtime::{

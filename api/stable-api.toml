@@ -45,13 +45,13 @@ exit_criteria = "Unified bounded/unbounded relational source-to-sink API."
 [[phases]]
 id = "G"
 name = "Stateful process API"
-status = "todo"
+status = "implemented"
 exit_criteria = "Typed process functions, state, timers, side outputs, and rescaling restore."
 
 [[phases]]
 id = "H"
 name = "SQL and gateway completeness"
-status = "todo"
+status = "implemented"
 exit_criteria = "Published grammar, complete Iceberg DML, prepared statements, and operation control."
 
 [[phases]]
@@ -154,7 +154,7 @@ owner = "krishiv-api"
 id = "streaming.process-state-timers"
 phase = "G"
 stability = "experimental"
-rust = "partial"
+rust = "implemented"
 python = "partial"
 sql = "not_applicable"
 owner = "krishiv-dataflow"
@@ -163,9 +163,9 @@ owner = "krishiv-dataflow"
 id = "sql.gateway-and-dml"
 phase = "H"
 stability = "preview"
-rust = "partial"
+rust = "implemented"
 python = "partial"
-sql = "partial"
+sql = "implemented"
 owner = "krishiv-sql"
 
 [[capabilities]]

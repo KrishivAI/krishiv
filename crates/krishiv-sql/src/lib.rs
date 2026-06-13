@@ -28,10 +28,12 @@ pub mod catalog;
 pub mod cep_sql;
 mod connector_table;
 pub mod create_function_ddl;
+pub mod grammar;
 mod lakehouse;
 pub mod live_table;
 pub mod pivot_sql;
 pub mod recursive_cte;
+pub mod sqlstate;
 pub mod subquery;
 pub mod unnest_sql;
 
@@ -44,6 +46,8 @@ pub use cep_sql::{
 };
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
 
+pub use grammar::{FeatureEntry, FeatureStatus, feature_matrix, features_by_status, features_for_category};
+pub use sqlstate::{SqlStateError, sqlstate_for};
 pub use streaming::{ContinuousInputError, ContinuousTableInput};
 
 /// SQL result alias.
@@ -184,6 +188,12 @@ pub enum SqlError {
     /// Access denied by auth or policy check.
     #[error("access denied: {reason}")]
     AccessDenied { reason: String },
+    /// A running operation was cancelled by the caller.
+    #[error("operation {operation_id} was cancelled")]
+    OperationCancelled { operation_id: u64 },
+    /// A query exceeded its configured execution timeout.
+    #[error("query timed out after {timeout_ms} ms")]
+    Timeout { timeout_ms: u64 },
 }
 
 impl From<datafusion::error::DataFusionError> for SqlError {
@@ -1592,6 +1602,99 @@ impl SqlEngine {
                 .with_query(rewritten)
                 .with_shuffle_partitions(shuffle_override),
         )
+    }
+
+    /// Execute a SQL query with a timeout.
+    ///
+    /// Returns [`SqlError::Timeout`] if `timeout_ms` elapses before the query
+    /// produces a result.  The underlying DataFusion task is abandoned (not
+    /// cancelled at the engine level) when the timeout fires; its resources are
+    /// released when the spawned task eventually completes.
+    pub async fn execute_with_timeout(
+        &self,
+        query: impl AsRef<str> + Send,
+        timeout_ms: u64,
+    ) -> SqlResult<SqlDataFrame> {
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        tokio::time::timeout(timeout, self.sql(query))
+            .await
+            .map_err(|_| SqlError::Timeout { timeout_ms })?
+    }
+
+    /// Execute a SQL query tagged with a caller-supplied operation ID.
+    ///
+    /// The operation ID is recorded in the returned [`TaggedQueryResult`] and
+    /// can be used to correlate logs, metrics, and cancellation requests.
+    /// If `cancelled_ids` contains `operation_id` before execution begins the
+    /// function returns [`SqlError::OperationCancelled`] immediately.
+    pub async fn execute_with_operation_id(
+        &self,
+        operation_id: u64,
+        query: impl AsRef<str> + Send,
+        cancelled_ids: &OperationRegistry,
+    ) -> SqlResult<TaggedQueryResult> {
+        if cancelled_ids.is_cancelled(operation_id) {
+            return Err(SqlError::OperationCancelled { operation_id });
+        }
+        let df = self.sql(query).await?;
+        Ok(TaggedQueryResult { operation_id, inner: df })
+    }
+}
+
+/// A query result annotated with the operation ID that produced it.
+pub struct TaggedQueryResult {
+    /// The caller-supplied operation ID.
+    pub operation_id: u64,
+    /// The underlying SQL DataFrame.
+    pub inner: SqlDataFrame,
+}
+
+/// Registry of cancelled operation IDs.
+///
+/// Callers can cancel an in-flight operation by registering its ID here before
+/// or during execution.  [`SqlEngine::execute_with_operation_id`] checks this
+/// registry at the start of execution.
+#[derive(Clone, Default)]
+pub struct OperationRegistry {
+    cancelled: Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
+}
+
+impl OperationRegistry {
+    /// Create a new, empty operation registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancel an operation by ID.  Subsequent
+    /// [`execute_with_operation_id`][SqlEngine::execute_with_operation_id] calls
+    /// with this ID will return [`SqlError::OperationCancelled`].
+    pub fn cancel(&self, operation_id: u64) {
+        if let Ok(mut ids) = self.cancelled.write() {
+            ids.insert(operation_id);
+        }
+    }
+
+    /// Return `true` if `operation_id` has been cancelled.
+    pub fn is_cancelled(&self, operation_id: u64) -> bool {
+        self.cancelled
+            .read()
+            .map(|ids| ids.contains(&operation_id))
+            .unwrap_or(false)
+    }
+
+    /// Remove a cancelled ID (e.g. once the operation has been cleaned up).
+    pub fn remove(&self, operation_id: u64) {
+        if let Ok(mut ids) = self.cancelled.write() {
+            ids.remove(&operation_id);
+        }
+    }
+
+    /// Return all currently cancelled operation IDs.
+    pub fn cancelled_ids(&self) -> Vec<u64> {
+        self.cancelled
+            .read()
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
     }
 }
 

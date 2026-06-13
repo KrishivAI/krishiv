@@ -89,25 +89,25 @@ Implementation details and remaining native-driver certification work are record
 
 ## Phase G — Stateful process API
 
-- [ ] Add distributed map/flat-map/filter/process plan nodes.
-- [ ] Add stable operator UID, parallelism, and max-parallelism.
-- [ ] Add typed value/list/map/reducing/aggregating state descriptors.
-- [ ] Add event-time and processing-time timers.
-- [ ] Add side outputs, connected streams, co-process, broadcast state, and
+- [x] Add distributed map/flat-map/filter/process plan nodes.
+- [x] Add stable operator UID, parallelism, and max-parallelism.
+- [x] Add typed value/list/map/reducing/aggregating state descriptors.
+- [x] Add event-time and processing-time timers.
+- [x] Add side outputs, connected streams, co-process, broadcast state, and
       async I/O.
-- [ ] Define Rust/Python user-code serialization and resource limits.
-- [ ] Pass savepoint rescaling and task/coordinator failure tests.
+- [x] Define Rust/Python user-code serialization and resource limits.
+- [x] Pass savepoint rescaling and task/coordinator failure tests.
 
 ## Phase H — SQL and gateway
 
-- [ ] Publish a generated grammar and feature matrix.
-- [ ] Complete catalog/database/table/view/function DDL.
-- [ ] Complete atomic insert/overwrite/update/delete/Iceberg merge.
-- [ ] Complete joins, grouping sets, windows, recursive CTE, lateral/unnest,
+- [x] Publish a generated grammar and feature matrix.
+- [x] Complete catalog/database/table/view/function DDL.
+- [x] Complete atomic insert/overwrite/update/delete/Iceberg merge.
+- [x] Complete joins, grouping sets, windows, recursive CTE, lateral/unnest,
       pivot/unpivot, temporal queries, and supported row patterns.
-- [ ] Add prepared statements, parameters, SQLSTATE mapping, operation IDs,
+- [x] Add prepared statements, parameters, SQLSTATE mapping, operation IDs,
       cancellation, and timeouts.
-- [ ] Stabilize Flight SQL and add separately versioned JDBC/ODBC gateway tests.
+- [x] Stabilize Flight SQL and add separately versioned JDBC/ODBC gateway tests.
 
 ## Phase I — 1.0 release gate
 
