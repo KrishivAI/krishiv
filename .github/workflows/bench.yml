@@ -36,6 +36,18 @@ jobs:
 
       - uses: taiki-e/install-action@just
 
+      # On pull requests, restore the most recent main baseline and compare.
+      - name: Restore main baseline (PR only)
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: bench-baseline-main-
+          restore-keys: bench-baseline-main-
+
+      - name: Record benchmark environment
+        run: python3 scripts/benchmark_manifest.py --suite criterion --command "just bench" --output benchmark-manifest.json
+
       - name: Run benchmarks (Bencher-format output)
         run: |
           mkdir -p .tmp
@@ -45,7 +57,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bench-results-${{ github.sha }}
-          path: bench-output.txt
+          path: |
+            bench-output.txt
+            benchmark-manifest.json
           retention-days: 90
 
       # On pushes to main, save a criterion baseline for future PR comparisons.
@@ -60,15 +74,6 @@ jobs:
           path: target/criterion
           key: bench-baseline-main-${{ github.sha }}
 
-      # On pull requests, restore the most recent main baseline and compare.
-      - name: Restore main baseline (PR only)
-        if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
-        with:
-          path: target/criterion
-          key: bench-baseline-main-
-          restore-keys: bench-baseline-main-
-
       - name: Compare against main baseline (PR only)
         if: github.event_name == 'pull_request'
         run: |
@@ -77,3 +82,11 @@ jobs:
           else
             echo "No main baseline available yet — skipping comparison"
           fi
+
+      - name: Upload baseline comparison (PR only)
+        if: github.event_name == 'pull_request' && hashFiles('bench-compare.txt') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-comparison-${{ github.sha }}
+          path: bench-compare.txt
+          retention-days: 90

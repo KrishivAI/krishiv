@@ -205,6 +205,16 @@ impl WindowOperatorState {
             Self::Count(_) => Ok(()),
         }
     }
+
+    /// Merge a snapshot additively (existing entries preserved).
+    fn merge_snapshot_bytes(&mut self, bytes: &[u8]) -> krishiv_state::StateResult<()> {
+        match self {
+            Self::Tumbling(op) => op.merge_snapshot_bytes(bytes),
+            Self::Sliding(op) => op.merge_snapshot_bytes(bytes),
+            Self::Session(op) => op.merge_snapshot_bytes(bytes),
+            Self::Count(_) => Ok(()),
+        }
+    }
 }
 
 // ── StreamQualityHook ─────────────────────────────────────────────────────────
@@ -459,6 +469,19 @@ impl ContinuousWindowExecutor {
             .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?;
         self.last_watermark_ms = i64::MIN;
         Ok(())
+    }
+
+    /// Merge an additional snapshot into the current window state additively.
+    ///
+    /// Used after [`restore_from_snapshot`] when this process hosts several
+    /// tasks of one job and must union their per-task checkpoint snapshots.
+    /// Existing entries are preserved; entries present in `bytes` overwrite
+    /// same-key entries (per-task snapshots of the same epoch are disjoint by
+    /// key group after a rescaled restore, and identical for duplicated keys).
+    pub fn merge_snapshot(&mut self, bytes: &[u8]) -> ExecResult<()> {
+        self.operator
+            .merge_snapshot_bytes(bytes)
+            .map_err(|e| ExecError::InvalidWindowConfig(format!("merge restore failed: {e}")))
     }
 }
 

@@ -489,6 +489,14 @@ impl Coordinator {
         self.skew_repartition_overrides.remove(job_id);
         self.streaming_advisory_partitions.remove(job_id);
         self.aqe_coalesce_hints.retain(|(jid, _), _| jid != job_id);
+        // Recovery control-plane state for the completed job.
+        self.restore_directives.remove(job_id);
+        self.pending_stop_after_savepoint.remove(job_id);
+        self.restore_notify_sent.retain(|(jid, _, _)| jid != job_id);
+        self.checkpoint_complete_sent
+            .retain(|(jid, _, _)| jid != job_id);
+        self.checkpoint_notify_sent
+            .retain(|(jid, _, _)| jid != job_id);
     }
 
     /// Convert and submit a Krishiv logical DAG through the R2 scheduler.

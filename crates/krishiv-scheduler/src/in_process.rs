@@ -292,6 +292,9 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
                 finalize_result.map_err(|e| {
                     tonic::Status::internal(format!("checkpoint finalize failed: {e}"))
                 })?;
+                // Post-commit: preserve savepoint epochs and drive
+                // stop-with-savepoint, mirroring the gRPC ack path.
+                coord.on_checkpoint_epoch_committed(&job_id, ack_epoch);
             }
         }
         Ok(tonic::Response::new(response))

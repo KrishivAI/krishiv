@@ -1306,3 +1306,89 @@ fn incremental_gc_preserves_committed_order() {
     let (_, up) = writer.plan_incremental_upload(5, b"s3", Some(3));
     assert!(up.is_empty());
 }
+
+// ── Phase 3: large-state snapshot/restore/redistribution ─────────────────
+
+/// Large-state validation: 100k keys snapshot → restore round-trips with
+/// full integrity, and key-group redistribution preserves every entry.
+#[test]
+fn large_state_snapshot_restore_and_redistribution_integrity() {
+    const KEYS: usize = 100_000;
+    let n = ns("op-large", "window");
+    let mut source = RocksDbStateBackend::in_memory().unwrap();
+
+    // Bulk-load through put_batch in chunks the way operators do.
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(KEYS);
+    let mut values: Vec<Vec<u8>> = Vec::with_capacity(KEYS);
+    for i in 0..KEYS {
+        let kb = format!("group-{i}").into_bytes();
+        let mut state_key = Vec::with_capacity(3 + 4 + kb.len() + 8);
+        state_key.extend_from_slice(b"tw:");
+        state_key.extend_from_slice(&(kb.len() as u32).to_le_bytes());
+        state_key.extend_from_slice(&kb);
+        state_key.extend_from_slice(&((i as i64 % 7) * 10_000).to_le_bytes());
+        keys.push(state_key);
+        values.push(format!("value-{i}").into_bytes());
+    }
+    for chunk in 0..(KEYS / 10_000) {
+        let batch: Vec<(&str, &str, &[u8], &[u8])> = (chunk * 10_000..(chunk + 1) * 10_000)
+            .map(|i| {
+                (
+                    n.operator_id(),
+                    n.state_name(),
+                    keys[i].as_slice(),
+                    values[i].as_slice(),
+                )
+            })
+            .collect();
+        source.put_batch(&batch).unwrap();
+    }
+
+    // Snapshot → restore round-trip preserves every entry byte-for-byte.
+    let snapshot = source.snapshot().unwrap();
+    let mut restored = RocksDbStateBackend::in_memory().unwrap();
+    restored.load_snapshot(&snapshot).unwrap();
+    let restored_keys = restored.list_keys(&n).unwrap();
+    assert_eq!(restored_keys.len(), KEYS);
+    for probe in [0usize, 1, 99_999, 50_000, 12_345] {
+        assert_eq!(
+            restored.get(&n, &keys[probe]).unwrap().unwrap(),
+            values[probe],
+            "entry {probe} must survive the round-trip"
+        );
+    }
+
+    // Redistribution across 4 tasks preserves every entry exactly once and
+    // keeps all windows of one group key on one task.
+    let parts = redistribute_snapshots(
+        &[snapshot],
+        4,
+        crate::checkpoint::rescaling::EntryRouting::WindowGroupKey,
+    )
+    .unwrap();
+    assert_eq!(parts.len(), 4);
+    let mut total = 0usize;
+    let mut group_to_task: std::collections::HashMap<Vec<u8>, usize> =
+        std::collections::HashMap::new();
+    for (task, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        for (_, _, key, _) in decode_snapshot_entries(part).unwrap() {
+            total += 1;
+            let group = crate::checkpoint::rescaling::window_group_key(&key)
+                .expect("window state key")
+                .to_vec();
+            match group_to_task.get(&group) {
+                None => {
+                    group_to_task.insert(group, task);
+                }
+                Some(owner) => assert_eq!(
+                    *owner, task,
+                    "all windows of one group key must land on one task"
+                ),
+            }
+        }
+    }
+    assert_eq!(total, KEYS, "no entry lost or duplicated by redistribution");
+}

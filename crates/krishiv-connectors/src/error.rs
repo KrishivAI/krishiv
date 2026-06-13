@@ -48,6 +48,10 @@ pub enum ConnectorError {
     /// A certification test assertion failed.
     #[error("connector certification failed: {reason}")]
     CertificationFailed { reason: String },
+    /// Two-phase commit protocol violation (non-monotonic epoch, conflicting
+    /// commit/abort decision).
+    #[error("connector transaction protocol error: {message}")]
+    Protocol { message: String },
 }
 
 /// Convenience result alias for connector operations.

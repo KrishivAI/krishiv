@@ -81,5 +81,9 @@ pub struct ExecutorHeartbeatEffects {
     /// Source-operator throttle directives (R7.2).
     pub source_throttles: Vec<ThrottleDecision>,
     pub checkpoint_commands: Vec<InitiateCheckpointCommand>,
+    /// Committed-epoch notifications driving transactional-sink commits.
+    pub checkpoint_complete_commands: Vec<krishiv_proto::CheckpointCompleteCommand>,
+    /// Restore directives driving executor-side state/offset reload.
+    pub restore_commands: Vec<krishiv_proto::RestoreFromCheckpointCommand>,
     pub lease_generation: LeaseGeneration,
 }

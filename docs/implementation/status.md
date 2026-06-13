@@ -190,6 +190,102 @@ See `docs/implementation/phase2_distributed_batch.md` for the remaining items.
 
 ---
 
+## Phase 3: streaming recovery made authoritative (2026-06-12)
+
+### Done
+
+Implemented the checkpoint **recovery** side end-to-end (the write side already
+existed) so checkpoints round-trip: write → kill → restore → resume.
+
+**Wire contracts (`krishiv-proto`)**
+- `CheckpointCompleteCommand` + `RestoreFromCheckpointCommand` in the heartbeat
+  response (proto fields 10/11) with domain structs + wire conversions.
+- `TriggerSavepointRequest.stop` (stop-with-savepoint) and
+  `RestoreJobRequest.from_savepoint`.
+
+**Coordinator (`krishiv-scheduler`)**
+- Heartbeat command queues `pending_checkpoint_complete_for_executor` /
+  `pending_restore_commands_for_executor` with per-(job, executor, epoch) dedup.
+- `RestoreDirective` global-rollback model: set on explicit restore activation AND
+  on executor loss (`handle_executor_loss_for_checkpoints`) — the in-flight
+  `AwaitingAcks` epoch aborts immediately (no ack-timeout wait) and all executors
+  of the job are directed to the last **durably** committed epoch
+  (`latest_valid_epoch` from storage; the abort overwrites the in-memory state).
+- Savepoints wired end-to-end: committed savepoint epochs copied to the immutable
+  `savepoints/` area (`create_savepoint_at_epoch`); `restore_job_from_savepoint`;
+  `stop_job_with_savepoint` cancels the job only after the durable copy succeeds.
+- **Rescaled restore**: `activate_job_restore_from_checkpoint_with_fencing`
+  redistributes operator state by key group into a sealed `epoch+1` when the
+  job's task count differs from the checkpoint (was a hard error).
+- Fixed fake `timestamp_ms: epoch * interval` in checkpoint metadata → unix time.
+
+**Executor (`krishiv-executor`)**
+- `CheckpointStateHandle` (Backend | ContinuousWindow): checkpoint acks for
+  `stream:loop:` jobs now snapshot the per-job `ContinuousWindowExecutor` —
+  previously they snapshotted the always-empty shared backend (vacuous state).
+- `restore_job_from_checkpoint`: reads epoch metadata + snapshots, rolls back
+  live loop executors (or stashes pending restores applied at lazy creation in
+  `execute_loop_fragment`), seeds the Kafka restore table, resets per-task
+  epochs, reconciles transactional sinks (commit ≤ epoch, abort > epoch).
+- `TwoPhaseSinkRegistry` + `EpochTransactionLog<TwoPhaseCommitSink>`
+  (krishiv-connectors): stage → `pre_commit(epoch)` at the barrier (before the
+  ack) → `commit_through(epoch)` on `CheckpointCompleteCommand` →
+  recover-and-commit/abort on restore. Durable-profile Kafka→Parquet rewired
+  through it (staged `.tmp`, published on completion); live offsets recorded
+  into `checkpoint_runners` (previously only set in tests) and
+  `restore_offset()` now actually seeks the broker consumer on restore.
+  Barrier-ack key-group range uses registered task ranges (was 0..32767).
+- cli heartbeat loop processes restore commands first, then completions, then
+  initiations.
+
+**State (`krishiv-state`)**
+- `redistribute_snapshots` (key-group routing via `window_group_key`,
+  minimum-watermark broadcast, `RescaleChecksum`-verified),
+  `encode_snapshot_entries`, `migrate_snapshot` (wires `StateMigrationRegistry`),
+  `create_savepoint_at_epoch`.
+
+**Dataflow (`krishiv-dataflow`)**
+- New `aligned_input` module: bounded **in-band** aligned channels +
+  `AlignedMultiInput` (blocking alignment — barriered inputs stop being polled so
+  their bounded channels backpressure upstream; timeout + epoch-mismatch typed
+  errors) + `AlignedWindowJoinDriver` (two-input join, snapshot at every aligned
+  barrier, restore). `WindowJoin::snapshot/restore` (IPC-serialized buffers +
+  watermark). Additive `merge_snapshot` on state-backed window operators and
+  `ContinuousWindowExecutor`.
+
+### Validation
+```bash
+cargo test -p krishiv-state --lib      # 316 passed (incl. 100k-key large-state)
+cargo test -p krishiv-connectors --lib # 64 passed (incl. EpochTransactionLog)
+cargo test -p krishiv-dataflow --lib   # 266 passed (incl. aligned_input suite)
+cargo test -p krishiv-executor --lib   # 197 passed (incl. phase3_recovery + 25-cycle soak)
+cargo test -p krishiv-scheduler --lib  # 302 passed (incl. loss-rollback, rescale, savepoint)
+cargo check --workspace                # clean
+cargo check -p krishiv-executor --features kafka  # clean (2PC Kafka pipeline)
+```
+New coverage: executor-loss rollback + immediate epoch abort, complete/restore
+command dedup, savepoint preserve/restore/stop, rescaled restore with
+exactly-once key placement, coordinator restart mid-epoch, full
+checkpoint→kill→restore cycle preserving window counts, post-checkpoint
+divergence rollback, 2PC barrier/complete/restore lifecycle, 8 barrier-alignment
+tests, checkpoint-under-saturation queue test, 25-cycle kill/restore soak
+(+`#[ignore]` 300-cycle long soak).
+
+### Blockers
+None. Scope notes: multi-executor data-plane partitioning for continuous jobs is
+not implemented (restore merges the union of a job's snapshots per process —
+correct for the current one-cycle-per-job dispatch); a broker-backed Kafka
+*transactional producer* (EOS into Kafka sinks) remains future work — the
+certified exactly-once sink is staged Parquet via `LocalParquetTwoPhaseCommitSink`.
+
+### Next useful task
+```bash
+cargo test -p krishiv-executor --lib -- --ignored   # 300-cycle soak
+# Then: drive AlignedWindowJoinDriver from the distributed runtime (joins in plans).
+```
+
+---
+
 ## Phase 4: typed Rust/Python user APIs (2026-06-12)
 
 ### Done
@@ -273,66 +369,6 @@ than certified.
 ```bash
 cargo test -p krishiv-connectors --test exactly_once --features exactly-once-integration
 ```
-
----
-
-## Phase 2: Distributed batch reliability — memory limits + shuffle retry (2026-06-12)
-
-### Done
-
-Phase 2 todo list created at `docs/implementation/phase2_distributed_batch.md`.
-Three concrete items implemented and tested this session:
-
-**2.1/2.2 — Production memory manager wired to DataFusion**
-
-- `SqlEngine::new_with_memory_limit(limit: Option<usize>)` — new constructor
-  that builds a `FairSpillPool` + default disk manager in DataFusion's
-  `RuntimeEnv` when a limit is supplied. Spill-capable operators (sort, hash
-  join, aggregation) spill to disk instead of growing without bound.
-- `resolve_query_memory_limit_bytes` / `query_memory_limit_from_env`
-  (`KRISHIV_QUERY_MEMORY_LIMIT_BYTES`) — env-configurable default applied to
-  every `SqlEngine::new()` call.
-- `SqlEngine::memory_limit_bytes()` accessor.
-- `SqlEngine::new()` now reads `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` on
-  construction; `SqlEngine::try_new()` and `with_in_memory_catalog()` do
-  likewise. Both constructors fall back to an unbounded pool if
-  `RuntimeEnv` construction fails.
-- Executor fragments (`krishiv-executor/src/fragment/batch.rs` and
-  `streaming.rs`) now call `new_with_memory_limit` using the task's
-  `MemoryBudget` limit (via `task_engine_memory_limit` helper in
-  `fragment/common.rs`), falling back to the env default for tasks without
-  an explicit coordinator-assigned limit. The `#[allow(unused_variables)]`
-  suppression is removed.
-
-**2.4 — Shuffle fetch retry with exponential backoff**
-
-- `FetchRetryPolicy` struct (`krishiv-shuffle/src/flight.rs`) — configurable
-  max attempts and base delay; `from_env()` reads `KRISHIV_SHUFFLE_FETCH_RETRIES`
-  and `KRISHIV_SHUFFLE_FETCH_RETRY_BASE_MS`.
-- `FlightShuffleClient::fetch_with_retry` — retries transient transport failures
-  (connection refused, stream errors) with exponential backoff up to 5 s cap;
-  `NotFound` and `InvalidInput` fail immediately without retrying so the
-  scheduler can react.
-- `read_shuffle_flight_partitions` (executor) now uses `fetch_with_retry`.
-- `tokio/time` feature added to `krishiv-shuffle/Cargo.toml`.
-
-### Validation
-```
-cargo check -p krishiv-sql              # clean
-cargo check -p krishiv-shuffle          # clean
-cargo check -p krishiv-executor         # clean
-cargo fmt --check                       # clean
-cargo test -p krishiv-sql --lib         # 274 passed
-cargo test -p krishiv-shuffle --lib     # 128 passed
-cargo test -p krishiv-executor --lib    # 186 passed
-```
-
-### Blockers
-None.
-
-### Next useful task
-```bash
-cargo test -p krishiv-scheduler --lib
 
 ---
 

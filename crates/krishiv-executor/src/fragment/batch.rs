@@ -720,11 +720,25 @@ async fn execute_memory_kafka_to_parquet(
                 message: String::from("memory Kafka source did not expose a KafkaOffset"),
             })?;
 
-        PostWriteOffsetCommitProtocol::write_flush_commit(&mut sink, &mut committer, batch, offset)
-            .await
-            .map_err(|error| ExecutorError::LocalExecution {
-                message: format!("Kafka-to-Parquet post-write commit failed: {error}"),
-            })?;
+        PostWriteOffsetCommitProtocol::write_flush_commit(
+            &mut sink,
+            &mut committer,
+            batch,
+            offset.clone(),
+        )
+        .await
+        .map_err(|error| ExecutorError::LocalExecution {
+            message: format!("Kafka-to-Parquet post-write commit failed: {error}"),
+        })?;
+
+        // Record the live offset so checkpoint barrier acks carry it into
+        // checkpoint metadata (mirrors the broker pipeline).
+        let task_id = assignment.task_id().clone();
+        runner
+            .checkpoint_runners
+            .entry(task_id.clone())
+            .or_insert_with(|| crate::runner::TaskRunner::new(task_id))
+            .kafka_source_offsets = vec![offset];
     }
 
     if committer.committed_offsets().is_empty() && row_count > 0 {
@@ -746,9 +760,8 @@ async fn execute_broker_kafka_to_parquet(
     assignment: &ExecutorTaskAssignment,
     profile: krishiv_common::DurabilityProfile,
 ) -> ExecutorResult<ExecutorTaskOutput> {
-    use krishiv_connectors::kafka::{KafkaOffset, RdkafkaKafkaSource};
-    use krishiv_connectors::parquet::ParquetSink;
-    use krishiv_connectors::{Sink, Source};
+    use krishiv_connectors::CheckpointSource;
+    use krishiv_connectors::kafka::{MultiKafkaOffset, RdkafkaKafkaSource};
 
     let (topic, partition, _, _) = parse_memory_kafka_partition(assignment.input_partitions())?;
     let sink_path = parse_parquet_sink_path(assignment.output_contract())?;
@@ -760,17 +773,190 @@ async fn execute_broker_kafka_to_parquet(
             ),
         })?;
     let group_id = format!("krishiv-{}", assignment.job_id());
-    let auto_commit = if krishiv_common::requires_manual_kafka_commit(profile) {
-        None
-    } else {
-        Some(5_000)
-    };
+    let manual_commit = krishiv_common::requires_manual_kafka_commit(profile);
+    let auto_commit = if manual_commit { None } else { Some(5_000) };
     let mut source = RdkafkaKafkaSource::new(bootstrap, group_id, topic.clone(), auto_commit, None)
         .map_err(|error| ExecutorError::LocalExecution {
             message: format!("rdkafka source for topic '{topic}': {error}"),
         })?;
+
+    // Checkpoint restore: seek the consumer to the offsets recorded by the
+    // restored checkpoint, bypassing group-managed positions.
+    let job_id_str = assignment.job_id().as_str().to_owned();
+    if let Some((_, restored)) = runner.kafka_restore_offsets.remove(&job_id_str) {
+        let for_topic: Vec<_> = restored
+            .iter()
+            .filter(|ko| ko.topic == topic)
+            .cloned()
+            .collect();
+        if !for_topic.is_empty() {
+            let multi = MultiKafkaOffset::new(for_topic);
+            source
+                .restore_offset(&multi)
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: format!("Kafka offset restore for topic '{topic}' failed: {error}"),
+                })?;
+            tracing::info!(
+                job_id = %assignment.job_id(),
+                topic = %topic,
+                partitions = multi.offsets.len(),
+                "Kafka source seeked to restored checkpoint offsets"
+            );
+        }
+        // Offsets for other topics belong to other source tasks of this job:
+        // put them back for those pipelines to consume.
+        let remaining: Vec<_> = restored
+            .into_iter()
+            .filter(|ko| ko.topic != topic)
+            .collect();
+        if !remaining.is_empty() {
+            runner
+                .kafka_restore_offsets
+                .insert(job_id_str.clone(), remaining);
+        }
+    }
+
+    if manual_commit {
+        execute_broker_kafka_two_phase(runner, assignment, source, &sink_path, &source_id, &topic)
+            .await
+    } else {
+        execute_broker_kafka_at_least_once(runner, assignment, source, &sink_path, &source_id).await
+    }
+}
+
+/// Exactly-once Kafka→Parquet for durable profiles.
+///
+/// Output is staged through a per-job `EpochTransactionLog` over a
+/// `LocalParquetTwoPhaseCommitSink`: batches accumulate in the open
+/// transaction, the checkpoint barrier prepares them as `.parquet.tmp` files,
+/// and the coordinator's `CheckpointCompleteCommand` renames them into place.
+/// Live source offsets are recorded in the task's checkpoint runner so the
+/// barrier ack carries them into checkpoint metadata — the checkpoint, not
+/// the broker's group offsets, is the recovery authority.
+#[cfg(feature = "kafka")]
+async fn execute_broker_kafka_two_phase(
+    runner: &ExecutorTaskRunner,
+    assignment: &ExecutorTaskAssignment,
+    mut source: krishiv_connectors::kafka::RdkafkaKafkaSource,
+    sink_path: &std::path::Path,
+    source_id: &str,
+    topic: &str,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use krishiv_connectors::{
+        CheckpointSource, EpochTransactionLog, LocalParquetTwoPhaseCommitSink, Source,
+        TransactionalSinkParticipant as _,
+    };
+
+    // The configured sink path is the transactional output directory: each
+    // committed file is `<epoch>-<n>.parquet`, staged as `.parquet.tmp`.
+    std::fs::create_dir_all(sink_path).map_err(|error| ExecutorError::LocalExecution {
+        message: format!(
+            "cannot create transactional parquet output dir '{}': {error}",
+            sink_path.display()
+        ),
+    })?;
+    let job_id_str = assignment.job_id().as_str().to_owned();
+    let sink_dir = sink_path.to_path_buf();
+    let participant = runner
+        .transaction_log
+        .get_or_register(&job_id_str, move || {
+            Ok(EpochTransactionLog::new(
+                LocalParquetTwoPhaseCommitSink::new(sink_dir),
+            ))
+        })
+        .map_err(|error| ExecutorError::LocalExecution {
+            message: format!("transactional parquet sink init failed: {error}"),
+        })?;
+
+    let mut row_count = 0usize;
+    let mut batch_count = 0usize;
+    let mut column_count = 0usize;
+    loop {
+        let Some(batch) =
+            source
+                .read_batch()
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: format!("broker Kafka source read failed: {error}"),
+                })?
+        else {
+            break;
+        };
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let rows = batch.num_rows() as u64;
+        wait_for_throttle(runner, source_id, rows).await;
+        row_count += batch.num_rows();
+        batch_count += 1;
+        column_count = batch.num_columns();
+
+        participant
+            .lock()
+            .map_err(|_| ExecutorError::LocalExecution {
+                message: format!(
+                    "transactional sink lock poisoned for job {job_id_str}; restart the job"
+                ),
+            })?
+            .stage(&batch)
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("Kafka-to-Parquet transactional stage failed: {error}"),
+            })?;
+
+        // Record live offsets so the next checkpoint barrier's ack carries
+        // them into the checkpoint metadata.
+        let offsets =
+            source
+                .checkpoint_offset()
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: format!("Kafka checkpoint offset read failed: {error}"),
+                })?;
+        let task_id = assignment.task_id().clone();
+        runner
+            .checkpoint_runners
+            .entry(task_id.clone())
+            .or_insert_with(|| crate::runner::TaskRunner::new(task_id))
+            .kafka_source_offsets = offsets.offsets;
+    }
+
+    if row_count > 0 {
+        let staged = participant
+            .lock()
+            .map_err(|_| ExecutorError::LocalExecution {
+                message: format!("transactional sink lock poisoned for job {job_id_str}"),
+            })?
+            .open_rows();
+        tracing::debug!(
+            job_id = %assignment.job_id(),
+            topic,
+            rows = row_count,
+            staged_open_rows = staged,
+            "Kafka-to-Parquet cycle staged rows; visibility awaits checkpoint commit"
+        );
+    }
+
+    Ok(ExecutorTaskOutput::connector_pipeline(
+        row_count,
+        batch_count,
+        column_count,
+    ))
+}
+
+/// At-least-once Kafka→Parquet for non-durable profiles (broker auto-commit).
+#[cfg(feature = "kafka")]
+async fn execute_broker_kafka_at_least_once(
+    runner: &ExecutorTaskRunner,
+    assignment: &ExecutorTaskAssignment,
+    mut source: krishiv_connectors::kafka::RdkafkaKafkaSource,
+    sink_path: &std::path::Path,
+    source_id: &str,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use krishiv_connectors::kafka::KafkaOffset;
+    use krishiv_connectors::parquet::ParquetSink;
+    use krishiv_connectors::{Sink, Source};
+
     let mut sink =
-        ParquetSink::create(&sink_path).map_err(|error| ExecutorError::LocalExecution {
+        ParquetSink::create(sink_path).map_err(|error| ExecutorError::LocalExecution {
             message: format!(
                 "parquet sink create failed for '{}': {error}",
                 sink_path.display()
@@ -796,7 +982,7 @@ async fn execute_broker_kafka_to_parquet(
             continue;
         }
         let rows = batch.num_rows() as u64;
-        wait_for_throttle(runner, &source_id, rows).await;
+        wait_for_throttle(runner, source_id, rows).await;
         row_count += batch.num_rows();
         batch_count += 1;
         column_count = batch.num_columns();

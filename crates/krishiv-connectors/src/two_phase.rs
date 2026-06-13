@@ -320,6 +320,164 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Checkpoint-aligned transaction log
+// ---------------------------------------------------------------------------
+
+/// Dyn-safe participant in checkpoint-aligned two-phase commit.
+///
+/// Lifecycle (mirrors Flink's `TwoPhaseCommitSinkFunction`):
+///
+/// 1. [`stage`] — output produced between barriers accumulates in the open
+///    transaction buffer.
+/// 2. [`pre_commit`]`(epoch)` — at the checkpoint barrier, the open buffer is
+///    durably staged under `epoch` (e.g. written as `.tmp` Parquet files).
+///    Must complete *before* the checkpoint ack so a committed checkpoint
+///    always has its sink output staged.
+/// 3. [`commit_through`]`(epoch)` — when the coordinator notifies that
+///    `epoch` is durably committed, every prepared transaction at or before
+///    `epoch` becomes visible.  Completion notifications are best-effort: a
+///    missed notification is repaired by the next one (commit-through covers
+///    earlier epochs) or by restore (recover-and-commit).
+/// 4. [`abort_after`]`(epoch)` — on restore to `epoch`, prepared transactions
+///    after it are rolled back; prepared transactions at or before it must be
+///    committed first (their data is covered by the restored checkpoint and
+///    sources resume past it).
+pub trait TransactionalSinkParticipant: Send {
+    /// Stage a batch into the open (pre-barrier) transaction buffer.
+    fn stage(&mut self, batch: &arrow::record_batch::RecordBatch) -> ConnectorResult<()>;
+
+    /// Durably prepare the open buffer under `epoch`.
+    ///
+    /// `epoch` must be greater than every previously prepared epoch.
+    fn pre_commit(&mut self, epoch: u64) -> ConnectorResult<()>;
+
+    /// Commit every prepared transaction with epoch ≤ `epoch`.
+    /// Returns the number of committed staged writes.
+    fn commit_through(&mut self, epoch: u64) -> ConnectorResult<usize>;
+
+    /// Abort every prepared transaction with epoch > `epoch` and discard the
+    /// open buffer (its data will be re-delivered by the rewound source).
+    /// Returns the number of aborted staged writes.
+    fn abort_after(&mut self, epoch: u64) -> ConnectorResult<usize>;
+
+    /// Rows currently accumulated in the open transaction buffer.
+    fn open_rows(&self) -> usize;
+
+    /// Epochs with prepared-but-uncommitted transactions, ascending.
+    fn prepared_epochs(&self) -> Vec<u64>;
+}
+
+/// Checkpoint-aligned transaction log over any [`TwoPhaseCommitSink`].
+///
+/// Buffers staged batches in memory between barriers; the buffer is bounded by
+/// the checkpoint interval (back-to-back barriers flush it).  `pre_commit`
+/// converts the buffer into durable staged writes via [`TwoPhaseCommitSink::prepare`].
+pub struct EpochTransactionLog<S: TwoPhaseCommitSink> {
+    sink: S,
+    open: Vec<arrow::record_batch::RecordBatch>,
+    prepared: std::collections::BTreeMap<u64, Vec<S::Handle>>,
+}
+
+impl<S: TwoPhaseCommitSink> EpochTransactionLog<S> {
+    pub fn new(sink: S) -> Self {
+        Self {
+            sink,
+            open: Vec::new(),
+            prepared: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Borrow the underlying sink (testing/inspection).
+    pub fn sink(&self) -> &S {
+        &self.sink
+    }
+}
+
+impl<S: TwoPhaseCommitSink> TransactionalSinkParticipant for EpochTransactionLog<S> {
+    fn stage(&mut self, batch: &arrow::record_batch::RecordBatch) -> ConnectorResult<()> {
+        if batch.num_rows() > 0 {
+            self.open.push(batch.clone());
+        }
+        Ok(())
+    }
+
+    fn pre_commit(&mut self, epoch: u64) -> ConnectorResult<()> {
+        if let Some((&max_prepared, _)) = self.prepared.iter().next_back()
+            && epoch <= max_prepared
+        {
+            return Err(ConnectorError::Protocol {
+                message: format!(
+                    "pre_commit epoch {epoch} is not greater than already prepared epoch \
+                     {max_prepared}; checkpoint epochs must be monotonic"
+                ),
+            });
+        }
+        if self.open.is_empty() {
+            return Ok(());
+        }
+        let mut handles = Vec::with_capacity(self.open.len());
+        for batch in &self.open {
+            handles.push(self.sink.prepare(epoch, batch)?);
+        }
+        // Only clear the open buffer after every prepare succeeded so a
+        // failed pre_commit can be retried for a later epoch without loss.
+        self.open.clear();
+        self.prepared.insert(epoch, handles);
+        Ok(())
+    }
+
+    fn commit_through(&mut self, epoch: u64) -> ConnectorResult<usize> {
+        let mut later = self.prepared.split_off(&(epoch.saturating_add(1)));
+        let to_commit = std::mem::take(&mut self.prepared);
+        self.prepared.append(&mut later);
+
+        let mut committed = 0usize;
+        for (txn_epoch, handles) in to_commit {
+            let mut remaining = handles.into_iter();
+            for handle in remaining.by_ref() {
+                if let Err(error) = self.sink.commit(handle.clone()) {
+                    // Re-queue the failed handle and the rest for retry —
+                    // commit is idempotent, so retrying is safe.
+                    let mut requeue = vec![handle];
+                    requeue.extend(remaining);
+                    self.prepared.insert(txn_epoch, requeue);
+                    return Err(error);
+                }
+                committed += 1;
+            }
+        }
+        Ok(committed)
+    }
+
+    fn abort_after(&mut self, epoch: u64) -> ConnectorResult<usize> {
+        self.open.clear();
+        let to_abort = self.prepared.split_off(&(epoch.saturating_add(1)));
+        let mut aborted = 0usize;
+        for (txn_epoch, handles) in to_abort {
+            let mut remaining = handles.into_iter();
+            for handle in remaining.by_ref() {
+                if let Err(error) = self.sink.abort(handle.clone()) {
+                    let mut requeue = vec![handle];
+                    requeue.extend(remaining);
+                    self.prepared.insert(txn_epoch, requeue);
+                    return Err(error);
+                }
+                aborted += 1;
+            }
+        }
+        Ok(aborted)
+    }
+
+    fn open_rows(&self) -> usize {
+        self.open.iter().map(|b| b.num_rows()).sum()
+    }
+
+    fn prepared_epochs(&self) -> Vec<u64> {
+        self.prepared.keys().copied().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +499,113 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    // ── EpochTransactionLog lifecycle ───────────────────────────────────────
+
+    #[test]
+    fn transaction_log_stage_precommit_commit_lifecycle() {
+        let mut log = EpochTransactionLog::new(InMemoryTwoPhaseCommitSink::new());
+        log.stage(&make_batch()).unwrap();
+        log.stage(&make_batch()).unwrap();
+        assert_eq!(log.open_rows(), 4);
+
+        // Barrier for epoch 1: open buffer becomes a prepared transaction.
+        log.pre_commit(1).unwrap();
+        assert_eq!(log.open_rows(), 0);
+        assert_eq!(log.prepared_epochs(), vec![1]);
+        assert_eq!(log.sink().staged_count(), 2);
+        assert!(log.sink().committed().is_empty());
+
+        // More data, barrier for epoch 2.
+        log.stage(&make_batch()).unwrap();
+        log.pre_commit(2).unwrap();
+        assert_eq!(log.prepared_epochs(), vec![1, 2]);
+
+        // Coordinator committed epoch 1: only epoch-1 output becomes visible.
+        assert_eq!(log.commit_through(1).unwrap(), 2);
+        assert_eq!(log.prepared_epochs(), vec![2]);
+        assert_eq!(log.sink().committed().len(), 2);
+        assert!(log.sink().committed().iter().all(|(e, _)| *e == 1));
+
+        // Completion for epoch 2 covers everything remaining.
+        assert_eq!(log.commit_through(2).unwrap(), 1);
+        assert!(log.prepared_epochs().is_empty());
+        assert_eq!(log.sink().committed().len(), 3);
+    }
+
+    #[test]
+    fn transaction_log_restore_commits_covered_and_aborts_later_epochs() {
+        let mut log = EpochTransactionLog::new(InMemoryTwoPhaseCommitSink::new());
+        log.stage(&make_batch()).unwrap();
+        log.pre_commit(3).unwrap();
+        log.stage(&make_batch()).unwrap();
+        log.pre_commit(4).unwrap();
+        log.stage(&make_batch()).unwrap(); // open, never prepared
+
+        // Restore to epoch 3: recover-and-commit ≤ 3, recover-and-abort > 3,
+        // and the open buffer is discarded (rewound source re-delivers it).
+        assert_eq!(log.commit_through(3).unwrap(), 1);
+        assert_eq!(log.abort_after(3).unwrap(), 1);
+        assert_eq!(log.open_rows(), 0);
+        assert!(log.prepared_epochs().is_empty());
+        assert_eq!(log.sink().committed().len(), 1);
+        assert_eq!(log.sink().staged_count(), 0);
+    }
+
+    #[test]
+    fn transaction_log_rejects_non_monotonic_pre_commit() {
+        let mut log = EpochTransactionLog::new(InMemoryTwoPhaseCommitSink::new());
+        log.stage(&make_batch()).unwrap();
+        log.pre_commit(5).unwrap();
+        log.stage(&make_batch()).unwrap();
+        let err = log.pre_commit(5).expect_err("same epoch must be rejected");
+        assert!(matches!(err, ConnectorError::Protocol { .. }));
+        let err = log.pre_commit(4).expect_err("older epoch must be rejected");
+        assert!(matches!(err, ConnectorError::Protocol { .. }));
+        // The open buffer survives a rejected pre_commit for a later barrier.
+        assert_eq!(log.open_rows(), 2);
+        log.pre_commit(6).unwrap();
+        assert_eq!(log.prepared_epochs(), vec![5, 6]);
+    }
+
+    #[test]
+    fn transaction_log_empty_barrier_prepares_nothing() {
+        let mut log = EpochTransactionLog::new(InMemoryTwoPhaseCommitSink::new());
+        log.pre_commit(1).unwrap();
+        assert!(log.prepared_epochs().is_empty());
+        assert_eq!(log.commit_through(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn transaction_log_parquet_sink_files_visible_only_after_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = EpochTransactionLog::new(LocalParquetTwoPhaseCommitSink::new(dir.path()));
+        log.stage(&make_batch()).unwrap();
+        log.pre_commit(1).unwrap();
+
+        let staged: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(staged.len(), 1);
+        assert!(
+            staged[0].ends_with(".parquet.tmp"),
+            "pre-commit output must be staged, found {staged:?}"
+        );
+
+        log.commit_through(1).unwrap();
+        let committed: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(committed.len(), 1);
+        assert!(
+            committed[0].ends_with(".parquet"),
+            "committed output must be final, found {committed:?}"
+        );
     }
 
     /// Regression: `prepare()` must report an error when `next_handle` would

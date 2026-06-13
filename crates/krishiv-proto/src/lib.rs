@@ -54,10 +54,11 @@ pub use management::{
 };
 pub use services::{CoordinatorExecutorService, ExecutorTaskService};
 pub use task::{
-    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment,
-    InitiateCheckpointCommand, InputPartition, InputPartitionDescriptor, KeyGroupRange,
-    MemoryKafkaRecord, MissingShufflePartition, OutputContract, OutputContractDescriptor,
-    OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
+    CheckpointCompleteCommand, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse,
+    ExecutorTaskAssignment, InitiateCheckpointCommand, InputPartition, InputPartitionDescriptor,
+    KeyGroupRange, MemoryKafkaRecord, MissingShufflePartition, OutputContract,
+    OutputContractDescriptor, OutputContractKind, PlanFragment, RegisterExecutorRequest,
+    RegisterExecutorResponse, RestoreFromCheckpointCommand,
     TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskStatusRequest, TaskStatusResponse,
     TaskStatusUpdate, TransportDisposition,
 };

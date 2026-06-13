@@ -330,6 +330,24 @@ pub fn executor_heartbeat_response_to_wire(
                 fencing_token: cmd.fencing_token.as_u64(),
             })
             .collect(),
+        completed_checkpoints: value
+            .checkpoint_complete_commands()
+            .iter()
+            .map(|cmd| v1::CheckpointCompleteCommand {
+                job_id: cmd.job_id.as_str().to_owned(),
+                epoch: cmd.epoch,
+                fencing_token: cmd.fencing_token.as_u64(),
+            })
+            .collect(),
+        restore_checkpoints: value
+            .restore_commands()
+            .iter()
+            .map(|cmd| v1::RestoreFromCheckpointCommand {
+                job_id: cmd.job_id.as_str().to_owned(),
+                epoch: cmd.epoch,
+                fencing_token: cmd.fencing_token.as_u64(),
+            })
+            .collect(),
         source_throttles: value
             .throttle_commands()
             .iter()
@@ -389,6 +407,44 @@ pub fn executor_heartbeat_response_from_wire(
             })
             .collect::<WireResult<Vec<_>>>()?;
         response = response.with_checkpoint_commands(cmds);
+    }
+    if !value.completed_checkpoints.is_empty() {
+        use crate::ids::{FencingToken, JobId};
+        use crate::task::CheckpointCompleteCommand;
+        let cmds = value
+            .completed_checkpoints
+            .into_iter()
+            .map(|cmd| {
+                let job_id = JobId::try_new(cmd.job_id).map_err(WireError::from_id)?;
+                let fencing_token =
+                    FencingToken::try_new(cmd.fencing_token).map_err(WireError::from_id)?;
+                Ok(CheckpointCompleteCommand {
+                    job_id,
+                    epoch: cmd.epoch,
+                    fencing_token,
+                })
+            })
+            .collect::<WireResult<Vec<_>>>()?;
+        response = response.with_checkpoint_complete_commands(cmds);
+    }
+    if !value.restore_checkpoints.is_empty() {
+        use crate::ids::{FencingToken, JobId};
+        use crate::task::RestoreFromCheckpointCommand;
+        let cmds = value
+            .restore_checkpoints
+            .into_iter()
+            .map(|cmd| {
+                let job_id = JobId::try_new(cmd.job_id).map_err(WireError::from_id)?;
+                let fencing_token =
+                    FencingToken::try_new(cmd.fencing_token).map_err(WireError::from_id)?;
+                Ok(RestoreFromCheckpointCommand {
+                    job_id,
+                    epoch: cmd.epoch,
+                    fencing_token,
+                })
+            })
+            .collect::<WireResult<Vec<_>>>()?;
+        response = response.with_restore_commands(cmds);
     }
     if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
         response = response.with_trace_context(ctx);
@@ -1626,6 +1682,7 @@ pub fn trigger_savepoint_request_to_wire(
     v1::TriggerSavepointRequest {
         job_id: value.job_id.as_str().to_owned(),
         label: value.label,
+        stop: value.stop,
     }
 }
 
@@ -1635,6 +1692,7 @@ pub fn trigger_savepoint_request_from_wire(
     Ok(crate::management::TriggerSavepointRequest {
         job_id: JobId::try_new(value.job_id).map_err(WireError::from_id)?,
         label: value.label,
+        stop: value.stop,
     })
 }
 
@@ -1663,6 +1721,7 @@ pub fn restore_job_request_to_wire(
         job_id: value.job_id.as_str().to_owned(),
         epoch: value.epoch,
         storage_path: value.storage_path,
+        from_savepoint: value.from_savepoint,
     }
 }
 
@@ -1676,6 +1735,7 @@ pub fn restore_job_request_from_wire(
         job_id: JobId::try_new(value.job_id).map_err(WireError::from_id)?,
         epoch: value.epoch,
         storage_path: value.storage_path,
+        from_savepoint: value.from_savepoint,
     })
 }
 

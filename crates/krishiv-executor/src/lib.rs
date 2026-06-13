@@ -18,6 +18,7 @@ pub mod grpc;
 pub mod grpc_client;
 pub mod runner;
 pub mod source_throttle;
+pub mod transactions;
 pub mod transport;
 
 #[cfg(test)]
@@ -39,10 +40,11 @@ pub use grpc::{
     executor_task_grpc_server,
 };
 pub use runner::{
-    ContinuousJobDrainer, ExecutorTaskOutput, ExecutorTaskOutputKind, ExecutorTaskRunReport,
-    ExecutorTaskRunner, ShuffleContext, TaskRunner,
+    CheckpointStateHandle, ContinuousJobDrainer, ExecutorTaskOutput, ExecutorTaskOutputKind,
+    ExecutorTaskRunReport, ExecutorTaskRunner, ShuffleContext, TaskRunner,
 };
 pub use source_throttle::SourceThrottleTable;
+pub use transactions::{SharedSinkParticipant, TwoPhaseSinkRegistry};
 pub use transport::{
     ExecutorConfig, ExecutorRuntime, ExecutorTransportError, GrpcCoordinatorService,
     serve_executor_task_grpc, serve_executor_task_grpc_with_listener,
