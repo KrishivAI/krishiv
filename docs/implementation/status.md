@@ -1,5 +1,195 @@
 # Krishiv Implementation Status
 
+## Phase 2 COMPLETE: All remaining roadmap items (2026-06-13)
+
+### Done
+
+**2.1 — Executor process-level memory budget + metrics**
+- `EXECUTOR_PROCESS_BUDGET` (`LazyLock<Arc<MemoryBudget>>`) — process-wide shared budget read from `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES`
+- `ProcessMemoryReservation` RAII guard — releases budget slice on drop
+- `reserve_task_engine_memory()` — allocates per-task engine limit under process budget (3 cases: no limit, full, partial/exhausted)
+- `MemoryBudget::peak_bytes()` — high-water-mark tracking via `fetch_max` on every successful reserve
+- Batch/streaming executor fragments reserve from process budget for task duration
+- `KrishivMetrics::record_operator_memory()` / `operator_memory_bytes` DashMap — per-operator memory accounting
+- Prometheus rendering for `krishiv_operator_memory_bytes{operator=…}`
+
+**2.2 — Sort/aggregator spill metrics**
+- `KrishivMetrics::record_spill(bytes, files)` — bumps `spill_bytes_total` + `spill_files_total` atomics
+- `ExternalSorter::spill_run()` and `ExternalAggregator::spill_partial_with_schema()` call `record_spill` + `record_operator_memory`
+- `SqlExecutionStats` extended with `spill_bytes: u64` + `spill_count: u64`
+- `aggregate_spill_metrics()` tree-walks DataFusion physical plan and sums `SpillExec` metrics
+- Prometheus rendering for all 3 new metrics
+
+**2.3 — Distributed write commit protocol**
+- `write_commit.rs` — staging+commit types: `WriteMode`, `WriteSpec`, `StagedFileName`, `CommitPayload`; staging paths are deterministic
+- Partitioned writes, write modes (Append/Overwrite/Upsert), staged-file naming + task-index parsing
+- API routing: `dataframe.rs`, `io.rs` write paths; flight-action `RegisterKafkaSource`
+- Proto: `ShuffleWriteConfigWire`, write fields in coordinator-executor transport
+- Scheduler: `execute_batch_sql_coordinated` extended; `batch_sql.rs` write-sink support
+- Runtime: `execute_batch_sql_sink()` in flight host; `InProcessCluster` forwarding
+
+**2.5/2.6 — Proactive shuffle invalidation + attempt fencing + restart audit + chaos tests**
+- `audit_shuffle_availability()` called from `recover_from_store()` after restart:
+  - Resets Assigned/Running tasks on unknown executors → Pending
+  - Calls `invalidate_executor_shuffle_partitions()` for succeeded shuffle from unknown executors
+- Chaos tests: `chaos_restart_converges_at_every_lifecycle_point` restarts coordinator at 4 lifecycle points
+- `restart_audit_invalidates_shuffle_from_unknown_executor` — proves re-queuing
+- `restart_audit_keeps_shuffle_from_restored_executor` — proves no false invalidation
+
+**2.8 — Skew mitigation (SaltedHashPartitioner)**
+- `SaltSpec { partition_id, salt_factor }` + `SaltedHashPartitioner`
+- `partition()` — routes via inner `HashPartitioner`, then spreads hot-bucket rows round-robin across sub-partitions
+- `total_partitions()`, `sub_partition_ids()`, `parent_of()` geometry helpers
+- 4 unit tests: layout math, hot bucket split, cold bucket pass-through, invalid spec rejection
+- Re-exported from `krishiv-shuffle` crate root
+
+**2.9 — Stage-boundary AQE + broadcast runtime rule**
+- `BroadcastRuntimeRule` (64 MiB threshold): promotes Hash/RoundRobin → Broadcast when observed ≤ threshold AND `broadcast_eligible()`; demotes Broadcast → RoundRobin when observed > threshold with clamp(ceil(bytes/128 MiB), 2, 64) buckets
+- 21 unit tests
+- Registered in `default_aqe_optimizer()` alongside `AutoPartitionRule` and `CoalesceRule`
+
+**2.10 — TPC-H benchmarks + distributed bench harness**
+- `tpch_sf10.rs`: Q10, Q18, SF1/SF10/SF100 scale ladder with `BenchmarkId`
+- `tpch_distributed.rs`: in-process distributed bench via `InProcessCluster`
+- `krishiv-bench/Cargo.toml`: added `[[bench]] name = "tpch_distributed" harness = false`
+
+**Memory-estimate admission control**
+- `cluster_available_memory_bytes()` in `heartbeat.rs` — sums (limit − used) across schedulable executors
+- Job submission queued when `memory_limit_bytes > cluster_available_memory_bytes`
+- 3 scheduler tests: queued-over-capacity, accepted-within-capacity, skipped-when-no-memory-info
+
+### Validation
+```
+cargo test -p krishiv-scheduler --lib   # 302 passed
+cargo test -p krishiv-executor --lib    # 202 passed
+cargo test -p krishiv-shuffle --lib     # 132 passed
+cargo test -p krishiv-plan --lib        # 406 passed
+cargo test -p krishiv-common --lib      # 84 passed
+cargo test -p krishiv-flight-sql --lib  # 36 passed
+```
+
+### Blockers
+None.
+
+### Next useful command
+```bash
+cargo test --workspace --lib --exclude krishiv-python
+```
+
+---
+
+## Phase 2 (cont.): Column statistics, cardinality estimation, join reordering (2026-06-12)
+
+### Done
+
+**2.7 — Column statistics, cardinality estimation, join reordering**
+
+- **`crates/krishiv-plan/src/statistics.rs`** (new):
+  - `ColumnStats` — per-column stats (row_count, null_fraction, distinct_count_estimate, min/max values)
+  - `TableStats` — per-table stats with `estimate_after_filters(&[String]) -> u64`; predicate selectivity
+    uses NDV for equality (`1/NDV`), `1/3` for range, per-column null_fraction for `IS NULL`
+  - `CardinalityEstimator` — walks a `LogicalPlan` in topological order and fills in missing
+    `estimated_rows` per node: Scan from table stats + filter selectivity; Filter at 50%;
+    Inner join via geometric-mean heuristic; Aggregate at 10% for grouped, 1 row for global;
+    Project/Exchange pass-through; Unnest ×5; Outer/semi/anti joins use preserved-side size
+  - Pre-existing `estimated_rows` on nodes are respected and not overridden
+
+- **`crates/krishiv-plan/src/optimizer/join_reorder.rs`** (new):
+  - `JoinReorderRule` — for `NodeOp::Join { Inner | Cross }` with 2 inputs and known
+    `estimated_rows`, swaps inputs when the right input is strictly smaller than the left so the
+    smaller table is on the left (outer side, driving side for sort-merge; minimises intermediate
+    result sizes in left-deep trees)
+  - Non-commutative types (Left, Right, Full, Semi, Anti) are never touched
+  - Missing estimates treated as `u64::MAX` so nodes with known size sort to the left
+
+- **`crates/krishiv-plan/src/optimizer.rs`** (updated):
+  - Declares `mod join_reorder;` and re-exports `JoinReorderRule`
+  - `default_logical_optimizer()` now runs 3 rules in order:
+    1. `PredicatePushdownRule` — push filters into scans before any cardinality reasoning
+    2. `BroadcastAutoRule` — mark small scans broadcast-eligible using `estimated_rows`
+    3. `JoinReorderRule` — reorder commutative join inputs to put smaller table on left
+
+- **`crates/krishiv-plan/src/lib.rs`** (updated):
+  - Added `pub mod statistics;`
+
+### Validation
+```
+cargo check --workspace              # clean (1 pre-existing warning in krishiv-flight-sql)
+cargo test -p krishiv-plan --lib     # 385 passed
+cargo test -p krishiv-scheduler --lib # 296 passed
+```
+
+### Blockers
+None.
+
+### Next useful tasks (Phase 2 remaining)
+- **2.3** Distributed sink stage: temp-file + coordinator-commit protocol, write modes, partitioned writes
+- **2.6** Post-restart shuffle availability audit; chaos/failure injection test suite
+- **2.8** Partition salting/range-splitting for skew mitigation
+- **2.9** BroadcastRuntimeRule AQE guarded rule
+- **2.10** Distributed benchmark harness (multi-executor in-process cluster, SF1→SF10→SF100)
+
+---
+
+## Phase 2: Distributed batch reliability — memory limits + shuffle retry (2026-06-12)
+
+### Done
+
+Phase 2 todo list created at `docs/implementation/phase2_distributed_batch.md`.
+Three concrete items implemented and tested this session:
+
+**2.1/2.2 — Production memory manager wired to DataFusion**
+
+- `SqlEngine::new_with_memory_limit(limit: Option<usize>)` — new constructor
+  that builds a `FairSpillPool` + default disk manager in DataFusion's
+  `RuntimeEnv` when a limit is supplied. Spill-capable operators (sort, hash
+  join, aggregation) spill to disk instead of growing without bound.
+- `resolve_query_memory_limit_bytes` / `query_memory_limit_from_env`
+  (`KRISHIV_QUERY_MEMORY_LIMIT_BYTES`) — env-configurable default applied to
+  every `SqlEngine::new()` call.
+- `SqlEngine::memory_limit_bytes()` accessor.
+- `SqlEngine::new()` now reads `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` on
+  construction; `SqlEngine::try_new()` and `with_in_memory_catalog()` do
+  likewise. Both constructors fall back to an unbounded pool if
+  `RuntimeEnv` construction fails.
+- Executor fragments (`krishiv-executor/src/fragment/batch.rs` and
+  `streaming.rs`) now call `new_with_memory_limit` using the task's
+  `MemoryBudget` limit (via `task_engine_memory_limit` helper in
+  `fragment/common.rs`), falling back to the env default for tasks without
+  an explicit coordinator-assigned limit. The `#[allow(unused_variables)]`
+  suppression is removed.
+
+**2.4 — Shuffle fetch retry with exponential backoff**
+
+- `FetchRetryPolicy` struct (`krishiv-shuffle/src/flight.rs`) — configurable
+  max attempts and base delay; `from_env()` reads `KRISHIV_SHUFFLE_FETCH_RETRIES`
+  and `KRISHIV_SHUFFLE_FETCH_RETRY_BASE_MS`.
+- `FlightShuffleClient::fetch_with_retry` — retries transient transport failures
+  (connection refused, stream errors) with exponential backoff up to 5 s cap;
+  `NotFound` and `InvalidInput` fail immediately without retrying so the
+  scheduler can react.
+- `read_shuffle_flight_partitions` (executor) now uses `fetch_with_retry`.
+- `tokio/time` feature added to `krishiv-shuffle/Cargo.toml`.
+
+### Validation
+```
+cargo check -p krishiv-sql              # clean
+cargo check -p krishiv-shuffle          # clean
+cargo check -p krishiv-executor         # clean
+cargo fmt --check                       # clean
+cargo test -p krishiv-sql --lib         # 274 passed
+cargo test -p krishiv-shuffle --lib     # 128 passed
+cargo test -p krishiv-executor --lib    # 186 passed
+```
+
+### Blockers
+None.
+
+### Next useful task
+See `docs/implementation/phase2_distributed_batch.md` for the remaining items.
+
+---
+
 ## Phase 3: streaming recovery made authoritative (2026-06-12)
 
 ### Done

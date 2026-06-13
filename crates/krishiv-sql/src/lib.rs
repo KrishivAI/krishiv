@@ -220,6 +220,24 @@ pub fn streaming_match_recognize_limit_from_env() -> usize {
     )
 }
 
+/// Resolve a per-engine DataFusion memory limit from a raw env var value.
+/// `None`, unparseable, and zero values all mean "no limit" (the engine runs
+/// with DataFusion's default unbounded pool).
+pub fn resolve_query_memory_limit_bytes(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// Resolve the default per-engine memory limit from the
+/// `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` environment variable.
+pub fn query_memory_limit_from_env() -> Option<usize> {
+    resolve_query_memory_limit_bytes(
+        std::env::var("KRISHIV_QUERY_MEMORY_LIMIT_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Build the DataFusion session config with a configurable parallelism level.
 ///
 /// When `target_partitions > 1`, round-robin repartitioning is enabled so
@@ -280,6 +298,11 @@ pub struct SqlEngine {
     /// Used by `krishiv_logical_plan` to annotate scan nodes for the
     /// `BroadcastAutoRule` optimizer.
     table_row_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    /// DataFusion memory pool limit in bytes for this engine, when bounded.
+    /// `None` means the default unbounded pool. When `Some`, the engine runs
+    /// with a `FairSpillPool` so sorts, hash joins, and aggregations spill to
+    /// disk under memory pressure instead of growing without bound.
+    memory_limit_bytes: Option<usize>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -308,10 +331,26 @@ impl SqlEngine {
     /// DataFusion `target_partitions` defaults to 1 (single-threaded local
     /// execution). Use [`SqlEngine::with_target_parallelism`] to override.
     pub fn new() -> Self {
+        Self::new_with_memory_limit(query_memory_limit_from_env())
+    }
+
+    /// Create a local SQL engine whose DataFusion execution memory is capped
+    /// at `memory_limit_bytes`.
+    ///
+    /// When `Some`, the engine runs with a `FairSpillPool` of that size plus
+    /// the default disk manager, so memory-intensive operators (sort, hash
+    /// join, aggregation) spill to disk under pressure and queries that cannot
+    /// spill fail with a resources-exhausted error instead of exhausting
+    /// process memory. `None` keeps DataFusion's default unbounded pool.
+    ///
+    /// Shares [`SqlEngine::new`]'s fallback behavior for window helper UDF
+    /// registration failures.
+    pub fn new_with_memory_limit(memory_limit_bytes: Option<usize>) -> Self {
         match Self::build_local(
             None,
             WindowFnRegistration::Register,
             NonZeroUsize::new(1).unwrap(),
+            memory_limit_bytes,
         ) {
             Ok(engine) => engine,
             Err(err) => {
@@ -324,8 +363,25 @@ impl SqlEngine {
                     None,
                     WindowFnRegistration::Skip,
                     NonZeroUsize::new(1).unwrap(),
+                    memory_limit_bytes,
                 )
-                .expect("SqlEngine::build_local with WindowFnRegistration::Skip is infallible")
+                .unwrap_or_else(|err| {
+                    tracing::error!(
+                        error = %err,
+                        "memory-limited DataFusion runtime construction failed; \
+                         falling back to an unbounded engine"
+                    );
+                    Self::build_local(
+                        None,
+                        WindowFnRegistration::Skip,
+                        NonZeroUsize::new(1).unwrap(),
+                        None,
+                    )
+                    .expect(
+                        "SqlEngine::build_local without a memory limit and with \
+                         WindowFnRegistration::Skip is infallible",
+                    )
+                })
             }
         }
     }
@@ -339,6 +395,7 @@ impl SqlEngine {
             None,
             WindowFnRegistration::Register,
             NonZeroUsize::new(1).unwrap(),
+            query_memory_limit_from_env(),
         )
     }
 
@@ -358,6 +415,7 @@ impl SqlEngine {
             Some(catalog),
             WindowFnRegistration::Register,
             NonZeroUsize::new(1).unwrap(),
+            query_memory_limit_from_env(),
         )
     }
 
@@ -375,6 +433,11 @@ impl SqlEngine {
     /// Return the configured `target_partitions` parallelism level.
     pub fn target_parallelism(&self) -> NonZeroUsize {
         self.target_parallelism
+    }
+
+    /// Return the DataFusion memory pool limit for this engine, if bounded.
+    pub fn memory_limit_bytes(&self) -> Option<usize> {
+        self.memory_limit_bytes
     }
 
     /// Return the current `shuffle.partitions` override, if set via `SET shuffle.partitions = N`.
@@ -419,6 +482,7 @@ impl SqlEngine {
         krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
         window_fn_registration: WindowFnRegistration,
         target_partitions: NonZeroUsize,
+        memory_limit_bytes: Option<usize>,
     ) -> SqlResult<Self> {
         // Create streaming_sources first so it can be shared with KafkaTableFactory.
         // DDL-created Kafka tables (CREATE EXTERNAL TABLE … STORED AS KAFKA) then
@@ -434,11 +498,29 @@ impl SqlEngine {
             &mut table_factories,
             streaming_sources.clone(),
         );
-        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+        let mut state_builder = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(build_single_node_session_config(target_partitions))
-            .with_table_factories(table_factories)
-            .build();
+            .with_table_factories(table_factories);
+        if let Some(limit) = memory_limit_bytes {
+            // A FairSpillPool shares the limit across concurrently running
+            // operators and lets spill-capable operators (sort, hash join,
+            // aggregation) write to the default disk manager's temp files
+            // instead of failing outright when the pool is exhausted.
+            let runtime_env = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(
+                    datafusion::execution::memory_pool::FairSpillPool::new(limit),
+                ))
+                .build_arc()
+                .map_err(|e| SqlError::DataFusion {
+                    message: format!(
+                        "failed to build memory-limited DataFusion runtime \
+                         (limit {limit} bytes): {e}"
+                    ),
+                })?;
+            state_builder = state_builder.with_runtime_env(runtime_env);
+        }
+        let state = state_builder.build();
         let context = SessionContext::new_with_state(state);
         if let Some(catalog) = &krishiv_catalog {
             context.register_catalog(
@@ -467,6 +549,7 @@ impl SqlEngine {
             plan_cache: Arc::new(Mutex::new(PlanCache::new(resolve_plan_cache_max_entries()))),
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
             table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            memory_limit_bytes,
         })
     }
 
@@ -1899,7 +1982,10 @@ impl SqlDataFrame {
     /// Execute and collect this DataFrame, also returning lightweight runtime statistics.
     ///
     /// Collects `output_rows` from DataFusion's execution metrics. `cpu_nanos`
-    /// is approximated from `elapsed_compute` when available; other fields default to 0.
+    /// is approximated from `elapsed_compute` when available. `spill_bytes`
+    /// and `spill_count` are aggregated across every operator in the physical
+    /// plan tree (sorts, hash joins, and aggregations report spills when the
+    /// memory pool forces them to disk); other fields default to 0.
     pub async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
         use datafusion::physical_plan::collect as df_collect;
 
@@ -1921,14 +2007,43 @@ impl SqlDataFrame {
             }
         }
 
+        let (spill_bytes, spill_count) = aggregate_spill_metrics(physical_plan.as_ref());
+
         Ok((
             batches,
             SqlExecutionStats {
                 output_rows,
                 cpu_nanos,
+                spill_bytes,
+                spill_count,
             },
         ))
     }
+}
+
+/// Recursively sum `spilled_bytes` and `spill_count` metrics across every
+/// operator in a physical plan tree.
+///
+/// The root node's `metrics()` only reflects the root operator; spilling
+/// happens in interior sort/join/aggregate nodes, so the whole tree must be
+/// walked to account for all disk spill activity.
+fn aggregate_spill_metrics(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> (u64, u64) {
+    let mut spill_bytes: u64 = 0;
+    let mut spill_count: u64 = 0;
+    if let Some(metrics) = plan.metrics() {
+        if let Some(bytes) = metrics.spilled_bytes() {
+            spill_bytes = spill_bytes.saturating_add(bytes as u64);
+        }
+        if let Some(count) = metrics.spill_count() {
+            spill_count = spill_count.saturating_add(count as u64);
+        }
+    }
+    for child in plan.children() {
+        let (child_bytes, child_count) = aggregate_spill_metrics(child.as_ref());
+        spill_bytes = spill_bytes.saturating_add(child_bytes);
+        spill_count = spill_count.saturating_add(child_count);
+    }
+    (spill_bytes, spill_count)
 }
 
 /// Lightweight execution statistics collected from a DataFusion physical plan.
@@ -1936,6 +2051,10 @@ impl SqlDataFrame {
 pub struct SqlExecutionStats {
     pub output_rows: u64,
     pub cpu_nanos: u64,
+    /// Total bytes spilled to disk across all operators in the plan.
+    pub spill_bytes: u64,
+    /// Number of spill events (roughly: spill files written) across all operators.
+    pub spill_count: u64,
 }
 
 fn top_level_alias_index(expression: &str) -> Option<usize> {
@@ -2312,9 +2431,11 @@ mod tests {
     use krishiv_plan::optimizer::{Cost, CostModel, Optimizer, OptimizerError, OptimizerRule};
     use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
+    use std::sync::Arc;
+
     use super::{
         SqlEngine, SqlError, explain_sql, explain_sql_optimized, explain_sql_with_cost, plan_sql,
-        referenced_table_names,
+        query_memory_limit_from_env, referenced_table_names, resolve_query_memory_limit_bytes,
     };
 
     #[tokio::test]
@@ -2452,6 +2573,61 @@ mod tests {
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             1
         );
+    }
+
+    #[test]
+    fn resolve_query_memory_limit_bytes_falls_back_for_missing_invalid_and_zero() {
+        assert_eq!(resolve_query_memory_limit_bytes(None), None);
+        assert_eq!(resolve_query_memory_limit_bytes(Some("not-a-number")), None);
+        assert_eq!(resolve_query_memory_limit_bytes(Some("0")), None);
+        assert_eq!(
+            resolve_query_memory_limit_bytes(Some("268435456")),
+            Some(268_435_456)
+        );
+        assert_eq!(resolve_query_memory_limit_bytes(Some(" 1024 ")), Some(1024));
+    }
+
+    #[tokio::test]
+    async fn memory_limited_engine_executes_queries_and_reports_limit() {
+        let engine = SqlEngine::new_with_memory_limit(Some(64 * 1024 * 1024));
+        assert_eq!(engine.memory_limit_bytes(), Some(64 * 1024 * 1024));
+
+        let dataframe = engine
+            .sql("select v from (values (3), (1), (2)) as t(v) order by v")
+            .await
+            .expect("memory-limited engine must plan queries");
+        let batches = dataframe
+            .collect()
+            .await
+            .expect("memory-limited engine must execute queries");
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            3
+        );
+    }
+
+    #[test]
+    fn memory_limited_engine_installs_bounded_pool_in_session_context() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let bounded = SqlEngine::new_with_memory_limit(Some(1_000_000));
+        let pool = Arc::clone(&bounded.context.runtime_env().memory_pool);
+        let mut reservation = MemoryConsumer::new("phase2-test").register(&pool);
+        assert!(
+            reservation.try_grow(2_000_000).is_err(),
+            "reservation above the configured limit must be rejected"
+        );
+        reservation.free();
+
+        let unbounded = SqlEngine::new_with_memory_limit(None);
+        assert_eq!(unbounded.memory_limit_bytes(), None);
+        let pool = Arc::clone(&unbounded.context.runtime_env().memory_pool);
+        let mut reservation = MemoryConsumer::new("phase2-test-unbounded").register(&pool);
+        assert!(
+            reservation.try_grow(2_000_000).is_ok(),
+            "default engine keeps DataFusion's unbounded pool"
+        );
+        reservation.free();
     }
 
     // ── GAP-RT-06: collect_with_stats uses the DataFrame's own context ──────────

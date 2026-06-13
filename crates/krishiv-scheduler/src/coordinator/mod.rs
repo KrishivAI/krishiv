@@ -7,9 +7,9 @@ use krishiv_proto::{
     AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorId, CoordinatorState,
     ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorTaskAssignment,
     HeartbeatHotKeyReport, InitiateCheckpointCommand, InitiateCheckpointRequest, JobId, JobKind,
-    JobSpec, JobState, LeaseGeneration, StageId, StreamingProgressReport, StreamingTaskState,
-    TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState, TaskStatusResponse,
-    TaskStatusUpdate, wire,
+    JobSpec, JobState, LeaseGeneration, StageId, StageState, StreamingProgressReport,
+    StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState,
+    TaskStatusResponse, TaskStatusUpdate, wire,
 };
 use krishiv_state::checkpoint::{
     CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
@@ -191,6 +191,13 @@ pub struct Coordinator {
 
     /// Per-job coordinators. Each owns its JobRecord and per-job launch decisions.
     pub(crate) job_coordinators: HashMap<JobId, Arc<crate::job_coordinator::JobCoordinator>>,
+
+    /// AQE coalesce hints produced by stage-boundary re-optimization (Phase 2.9).
+    ///
+    /// Keyed by (job_id, completed_stage_id).  Populated after a shuffle stage
+    /// completes and the CoalesceRule fires.  Consumed by `launch_assigned_task_assignments`
+    /// for the downstream stage to right-size reduce-side parallelism.
+    pub(crate) aqe_coalesce_hints: HashMap<(JobId, StageId), usize>,
 }
 
 impl fmt::Debug for Coordinator {
@@ -721,6 +728,7 @@ impl Coordinator {
             streaming_advisory_partitions: HashMap::new(),
             notify: Arc::new(Notify::new()),
             job_coordinators: HashMap::new(),
+            aqe_coalesce_hints: HashMap::new(),
         }
     }
 
@@ -946,6 +954,108 @@ impl Coordinator {
                     }
                 }
             }
+        }
+    }
+
+    /// Finalize the staged sink outputs of a job that just reached a terminal
+    /// state (Phase 2.3 distributed write commit).
+    ///
+    /// - `Succeeded`: atomically publish staged part files into the
+    ///   destination (rename, with copy+delete fallback) and remove staging.
+    ///   A publish failure demotes the job to `Failed` so callers never
+    ///   observe a succeeded job whose output was not made visible; the
+    ///   staging directory is left in place for a later retry or GC.
+    /// - `Failed` / `Cancelled`: remove staged files (tolerates already
+    ///   missing staging directories).
+    ///
+    /// Both publish and cleanup are idempotent, so re-entering this method on
+    /// duplicate terminal updates converges.
+    pub(crate) fn finalize_staged_sink_outputs(&mut self, job_id: &JobId) {
+        use krishiv_common::write_commit::{
+            SinkWriteSpec, cleanup_staged_outputs, publish_staged_outputs,
+        };
+
+        const SINK_PREFIX: &str = "object-parquet-sink:";
+
+        let (state, contracts): (JobState, Vec<String>) = {
+            let Some(jc) = self.job_coordinators.get(job_id) else {
+                return;
+            };
+            let record = jc.read_record();
+            let contracts = record
+                .spec
+                .stages()
+                .iter()
+                .flat_map(|stage| stage.tasks())
+                .filter_map(|task| task.sink_contract())
+                .filter_map(|contract| {
+                    contract
+                        .trim()
+                        .strip_prefix(SINK_PREFIX)
+                        .map(str::to_owned)
+                })
+                .collect();
+            (record.state(), contracts)
+        };
+        if contracts.is_empty() || !state.is_terminal() {
+            return;
+        }
+
+        let mut publish_failed = false;
+        for payload in contracts {
+            let spec = match SinkWriteSpec::parse(&payload) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    // An unparseable contract on a terminal job is a launch-time
+                    // bug; nothing was staged under a path we can derive.
+                    tracing::error!(job_id = %job_id, error = %error, "invalid sink contract during finalize");
+                    continue;
+                }
+            };
+            if !spec.staged {
+                // Legacy direct-write contracts commit inside the task itself.
+                continue;
+            }
+            match state {
+                JobState::Succeeded => {
+                    match publish_staged_outputs(&spec, job_id.as_str()) {
+                        Ok(outcome) => {
+                            tracing::info!(
+                                job_id = %job_id,
+                                dest = %spec.dest_path,
+                                published = outcome.published.len(),
+                                skipped_existing = outcome.skipped_existing,
+                                ignored = outcome.ignored,
+                                "published staged sink outputs"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                job_id = %job_id,
+                                dest = %spec.dest_path,
+                                error = %error,
+                                "failed to publish staged sink outputs; failing job"
+                            );
+                            publish_failed = true;
+                        }
+                    }
+                }
+                JobState::Failed | JobState::Cancelled => {
+                    if let Err(error) = cleanup_staged_outputs(&spec, job_id.as_str()) {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            dest = %spec.dest_path,
+                            error = %error,
+                            "failed to clean up staged sink outputs"
+                        );
+                    }
+                }
+                JobState::Accepted | JobState::Planning | JobState::Running => {}
+            }
+        }
+
+        if publish_failed && let Ok(mut job) = self.find_job_mut(job_id) {
+            job.state = JobState::Failed;
         }
     }
 

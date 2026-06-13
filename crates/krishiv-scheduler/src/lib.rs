@@ -48,7 +48,10 @@ pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, ExecutorHeartbeatEffects,
     ThrottleDecision,
 };
-pub use admission::{InMemoryQueueManager, QueueManager};
+pub use admission::{
+    InMemoryQueueManager, NAMESPACE_MAX_ACTIVE_JOBS_ENV, NAMESPACE_MAX_CPU_NANOS_ENV,
+    NAMESPACE_MAX_MEMORY_BYTES_ENV, NamespaceQuotaQueueManager, QueueManager,
+};
 pub use auth::{
     AuthContext, COORDINATOR_AUTH_RELOAD_INTERVAL_SECS_ENV, COORDINATOR_BEARER_TOKEN_ENV,
     COORDINATOR_BEARER_TOKEN_FILE_ENV, COORDINATOR_BEARER_TOKENS_ENV,
@@ -64,7 +67,7 @@ pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
 pub use barrier_tracker::CheckpointBarrierTracker;
 pub use batch_sql::{
     BatchSqlInlineTable, BatchSqlOutcome, BatchSqlTable, decode_inline_record_batches,
-    execute_batch_sql_coordinated, submit_batch_sql_job,
+    execute_batch_sql_coordinated, execute_batch_sql_sink_coordinated, submit_batch_sql_job,
 };
 pub use bounded_window::execute_bounded_window_coordinated;
 pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};

@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug)]
 pub struct MemoryBudget {
     used_bytes: AtomicU64,
+    /// High-water mark of `used_bytes` over the budget's lifetime.
+    peak_bytes: AtomicU64,
     limit_bytes: Option<u64>,
 }
 
@@ -25,6 +27,7 @@ impl MemoryBudget {
     pub fn unlimited() -> Arc<Self> {
         Arc::new(Self {
             used_bytes: AtomicU64::new(0),
+            peak_bytes: AtomicU64::new(0),
             limit_bytes: None,
         })
     }
@@ -33,6 +36,7 @@ impl MemoryBudget {
     pub fn limited(limit_bytes: u64) -> Arc<Self> {
         Arc::new(Self {
             used_bytes: AtomicU64::new(0),
+            peak_bytes: AtomicU64::new(0),
             limit_bytes: Some(limit_bytes),
         })
     }
@@ -55,6 +59,11 @@ impl MemoryBudget {
         self.used_bytes.load(Ordering::Relaxed)
     }
 
+    /// High-water mark of `used_bytes` over this budget's lifetime.
+    pub fn peak_bytes(&self) -> u64 {
+        self.peak_bytes.load(Ordering::Relaxed)
+    }
+
     /// Try to reserve `bytes` bytes of memory.
     ///
     /// Returns `true` if the reservation was accepted (or the budget is
@@ -62,7 +71,11 @@ impl MemoryBudget {
     /// caller should spill or return an OOM error.
     pub fn try_reserve(&self, bytes: u64) -> bool {
         let Some(limit) = self.limit_bytes else {
-            self.used_bytes.fetch_add(bytes, Ordering::Relaxed);
+            let new = self
+                .used_bytes
+                .fetch_add(bytes, Ordering::Relaxed)
+                .saturating_add(bytes);
+            self.peak_bytes.fetch_max(new, Ordering::Relaxed);
             return true;
         };
         let prev = self.used_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -71,6 +84,8 @@ impl MemoryBudget {
             self.used_bytes.fetch_sub(bytes, Ordering::Relaxed);
             false
         } else {
+            self.peak_bytes
+                .fetch_max(prev.saturating_add(bytes), Ordering::Relaxed);
             true
         }
     }
@@ -146,5 +161,31 @@ mod tests {
     fn from_limit_zero_is_unlimited() {
         let b = MemoryBudget::from_limit(Some(0));
         assert!(b.limit().is_none());
+    }
+
+    #[test]
+    fn peak_tracks_high_water_mark() {
+        let b = MemoryBudget::limited(100);
+        assert!(b.try_reserve(80));
+        b.release(80);
+        assert!(b.try_reserve(30));
+        assert_eq!(b.used_bytes(), 30);
+        assert_eq!(b.peak_bytes(), 80, "peak must survive releases");
+    }
+
+    #[test]
+    fn peak_ignores_rejected_reservations() {
+        let b = MemoryBudget::limited(100);
+        assert!(b.try_reserve(50));
+        assert!(!b.try_reserve(60)); // rejected
+        assert_eq!(b.peak_bytes(), 50);
+    }
+
+    #[test]
+    fn peak_tracked_for_unlimited_budget() {
+        let b = MemoryBudget::unlimited();
+        b.try_reserve(1000);
+        b.release(500);
+        assert_eq!(b.peak_bytes(), 1000);
     }
 }

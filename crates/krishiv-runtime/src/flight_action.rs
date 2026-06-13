@@ -40,6 +40,7 @@ pub mod tags {
     pub const EXPLAIN: &str = "explain";
     pub const EXECUTE_PLAN: &str = "execute_plan";
     pub const BATCH_SQL: &str = "batch_sql";
+    pub const BATCH_SQL_SINK: &str = "batch_sql_sink";
     pub const REGISTER_KAFKA_SOURCE: &str = "register_kafka_source";
 }
 
@@ -185,6 +186,19 @@ pub struct BatchSqlBody {
     pub is_streaming: bool,
 }
 
+/// Typed body for a batch-SQL sink write `DoAction` request (Phase 2.3).
+///
+/// The query result is written through `sink_contract` (an
+/// `object-parquet-sink:...` output contract carrying write mode and optional
+/// partition columns) using the staged commit protocol instead of being
+/// returned inline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BatchSqlSinkBody {
+    pub query: String,
+    pub tables: Vec<crate::in_process::BatchSqlTable>,
+    pub sink_contract: String,
+}
+
 /// Register a Kafka topic as a streaming SQL table on the remote coordinator.
 ///
 /// Sent by `Session::register_kafka_source` in distributed mode so the remote
@@ -211,6 +225,7 @@ pub enum KrishivFlightAction {
     Explain(ExplainBody),
     ExecutePlan(ExecutePlanBody),
     BatchSql(BatchSqlBody),
+    BatchSqlSink(BatchSqlSinkBody),
     RegisterKafkaSource(RegisterKafkaSourceBody),
 }
 
@@ -226,6 +241,7 @@ impl KrishivFlightAction {
             Self::Explain(_) => tags::EXPLAIN,
             Self::ExecutePlan(_) => tags::EXECUTE_PLAN,
             Self::BatchSql(_) => tags::BATCH_SQL,
+            Self::BatchSqlSink(_) => tags::BATCH_SQL_SINK,
             Self::RegisterKafkaSource(_) => tags::REGISTER_KAFKA_SOURCE,
         };
         action_type(tag)

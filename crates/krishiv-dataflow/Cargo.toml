@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 krishiv-ai = { path = "../krishiv-ai" }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
+krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-state = { path = "../krishiv-state" }
 serde_json = { workspace = true }

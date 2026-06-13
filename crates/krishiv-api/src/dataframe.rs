@@ -841,10 +841,120 @@ Execution statistics:
 
     // ── Write API ────────────────────────────────────────────────────────────
 
-    /// Write the result of this DataFrame to a Parquet file.
+    /// Write this DataFrame's result as a directory of Parquet part files
+    /// through the distributed sink stage (Phase 2.3 staged commit protocol).
+    ///
+    /// The query is submitted as a batch SQL job whose terminal task carries an
+    /// `object-parquet-sink` output contract. Sink tasks stage their output
+    /// under `<path>/_staging/<job_id>/`; the coordinator publishes the staged
+    /// files as `part-<task_index>-<job_id>.parquet` (optionally under Hive
+    /// `col=value` directories) only when the whole job succeeds, and removes
+    /// them on failure — the destination never exposes partial output.
+    ///
+    /// Requires a SQL-backed DataFrame (`session.sql(..)` / `read_parquet`):
+    /// the query text is what the sink job executes remotely.
+    pub(crate) fn write_parquet_sink(
+        &self,
+        path: &str,
+        mode: krishiv_common::write_commit::WriteMode,
+        partition_by: &[String],
+    ) -> Result<()> {
+        self.run_sink_write(path, mode, partition_by)?
+            .map_err(KrishivError::from)
+    }
+
+    /// Build the sink contract for `path` and submit the sink job.
+    ///
+    /// The outer error covers client-side problems (non-SQL DataFrame, bad
+    /// destination path, invalid contract); the inner result preserves the
+    /// runtime error so callers can detect `RuntimeError::Unsupported` and
+    /// fall back to client-side writes.
+    fn run_sink_write(
+        &self,
+        path: &str,
+        mode: krishiv_common::write_commit::WriteMode,
+        partition_by: &[String],
+    ) -> Result<std::result::Result<(), krishiv_runtime::RuntimeError>> {
+        use std::path::Path;
+
+        let Some(query) = self.sql_query.as_deref() else {
+            return Err(KrishivError::unsupported(
+                "sink-based parquet writes require a SQL-backed DataFrame \
+                 (created via session.sql() or read_parquet()); collect() and \
+                 write locally instead",
+            ));
+        };
+        let dest = Path::new(path);
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| KrishivError::InvalidConfig {
+                message: format!(
+                    "sink write destination '{path}' must have a parent directory"
+                ),
+            })?;
+        let dest_name = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| KrishivError::InvalidConfig {
+                message: format!("sink write destination '{path}' has no directory name"),
+            })?;
+        std::fs::create_dir_all(parent).map_err(|e| KrishivError::Runtime {
+            message: format!("failed to create sink parent directory '{}': {e}", parent.display()),
+        })?;
+
+        let spec = krishiv_common::write_commit::SinkWriteSpec::staged(
+            parent.to_string_lossy().into_owned(),
+            dest_name,
+            mode,
+            partition_by.to_vec(),
+        )
+        .map_err(|e| KrishivError::InvalidConfig {
+            message: e.to_string(),
+        })?;
+        let contract = format!("object-parquet-sink:{}", spec.contract_payload());
+
+        let tables = self
+            .registered_parquet
+            .iter()
+            .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
+            .collect::<Vec<_>>();
+        Ok(self.runtime.collect_batch_sql_sink(query, &tables, &contract))
+    }
+
+    /// Write the result of this DataFrame to Parquet.
+    ///
+    /// For distributed sessions backed by a SQL query, the write runs through
+    /// the distributed sink stage (`path` becomes a directory of
+    /// `part-*.parquet` files committed atomically on job success). Embedded
+    /// sessions — and distributed runtimes that do not support sink writes —
+    /// collect the result client-side and write a single Parquet file at
+    /// `path` (the pre-2.3 behavior).
     pub fn write_parquet(&self, path: &str) -> Result<()> {
         use std::fs::File;
         use std::path::Path;
+
+        if self.runtime.uses_remote_execution() && !self.force_local && self.sql_query.is_some() {
+            // Probe the runtime directly so an Unsupported response (e.g. an
+            // older Flight server without the batch_sql_sink action) can fall
+            // back to the legacy client-side collect-then-write path.
+            match self.run_sink_write(
+                path,
+                krishiv_common::write_commit::WriteMode::Append,
+                &[],
+            )? {
+                Ok(()) => return Ok(()),
+                Err(krishiv_runtime::RuntimeError::Unsupported { feature }) => {
+                    tracing::warn!(
+                        feature,
+                        "distributed sink write unsupported by runtime; \
+                         falling back to client-side collect-then-write"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         let result = krishiv_common::async_util::block_on(self.collect_async())?;
         let batches = result.into_batches();
