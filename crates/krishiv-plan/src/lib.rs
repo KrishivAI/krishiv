@@ -15,6 +15,7 @@ mod graph;
 pub mod lowering;
 pub mod optimizer;
 pub mod r17;
+pub mod statistics;
 pub mod streaming;
 pub mod streaming_plan;
 pub mod task_fragment;

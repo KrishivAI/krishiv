@@ -39,13 +39,13 @@ Core implementation choices:
 | `krishiv-proto` | Typed IDs and coordinator/executor wire contracts. |
 | `krishiv-shuffle` | In-memory, local disk, object-store, and Flight-oriented shuffle support. |
 | `krishiv-state` | In-memory and RocksDB-backed keyed state, TTL, migration, incremental state, and checkpoint/savepoint storage. |
-| `krishiv-connectors` | Connector traits, Parquet/Kafka/S3 paths, and lakehouse helpers (`lakehouse` feature: Iceberg/Delta/Hudi). |
+| `krishiv-connectors` | Source/sink contracts, capability and maturity metadata, Parquet/Kafka/S3 paths, and Iceberg-first lakehouse helpers. Delta/Hudi/vector integrations are optional and experimental. |
 | `krishiv-operator` | Kubernetes CRD and operator integration. |
 | `krishiv-ui` | Status API and web UI assets. |
 | `krishiv-flight-sql` | Arrow Flight SQL service. |
 | `krishiv-python` | PyO3 Python bindings. |
 | `krishiv-metrics` | Metrics, tracing, and debug report structures. |
-| `krishiv-ai` | AI/RAG and embedding support. |
+| `krishiv-ai` | Deprecated compatibility shim for optional vector sinks; not part of the standard compute-engine build. |
 | `krishiv-bench` | Benchmarks. Fault-injection/chaos tests live in `krishiv-common`'s `chaos` feature + `tests/chaos_suite.rs`. Schema registry helpers live in `krishiv-connectors`'s `schema-registry` feature. |
 
 ## Runtime Modes
@@ -126,7 +126,7 @@ Rust `krishiv` facade feature presets:
 | `bare-metal` | Alias for distributed process-managed deployments. |
 | `cluster` | Compatibility alias for `distributed`. |
 | `k8s` | Distributed support plus Kubernetes operator/CRD capability. |
-| `full` | Broad integration build for release and compatibility checks. |
+| `full` | Standard compute-engine build: distributed/Kubernetes, Kafka, and primary Iceberg support; excludes AI/vector and secondary lakehouse formats. |
 
 Rust optional integration features:
 
@@ -137,8 +137,8 @@ Rust optional integration features:
 | `etcd` | etcd-backed scheduler metadata and coordination. |
 | `kafka` | Kafka connector support. |
 | `state` | Connector/state integration. |
-| `iceberg` | Iceberg lakehouse support. |
-| `delta` | Delta lakehouse support. |
+| `iceberg` | Primary/default lakehouse platform. |
+| `delta` | Optional experimental Delta compatibility. |
 | `ui` | Operator UI integration. |
 
 Recommended Rust build commands (`just` is the project command runner):
@@ -165,10 +165,10 @@ extension features are enabled only for integration families:
 |---|---|
 | `kafka` | Kafka sources/connectors. |
 | `iceberg` | Iceberg lakehouse bindings. |
-| `ai` | Local embedding/RAG support. |
-| `vector-sinks` | Alias for AI/vector sink support. |
-| `qdrant` | Qdrant vector sink. |
-| `pgvector` | pgvector sink. |
+| `ai` | Deprecated compatibility feature for optional vector sinks; no RAG/LLM engine functionality. |
+| `vector-sinks` | Optional platform-adjacent vector sink compatibility. |
+| `qdrant` | Experimental Qdrant vector sink. |
+| `pgvector` | Experimental pgvector sink. |
 
 Recommended Python build commands:
 
@@ -176,8 +176,25 @@ Recommended Python build commands:
 maturin develop --manifest-path crates/krishiv-python/Cargo.toml
 maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features iceberg
 maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features kafka
-maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features ai,qdrant
 ```
+
+
+## Published Engine Contracts
+
+The normative Phase 1 contracts are:
+
+- `docs/contracts/engine-semantics.md` — batch/streaming semantics, delivery
+  guarantees, exactly-once matrix, metadata compatibility, operator identity,
+  and the Iceberg-first policy.
+- `docs/contracts/connectors.md` — source/sink obligations and maturity labels
+  for every in-tree connector.
+- `docs/implementation/phase-1-engine-contract.md` — implementation resolution,
+  completed contract work, and certification follow-ups.
+- `docs/implementation/phase-4-user-apis.md` — implemented Rust/Python user API
+  surface, compatibility rules, and remaining distributed/protocol work.
+
+Apache Iceberg is the primary lakehouse platform. New lakehouse correctness and
+certification work targets Iceberg before Delta Lake or Hudi.
 
 ## Durability Profiles
 

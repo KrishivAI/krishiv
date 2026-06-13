@@ -50,6 +50,11 @@ pub struct TaskSpec {
     pub sink_capabilities: Option<ConnectorCapabilityFlags>,
     shuffle_write: Option<ShuffleWriteConfig>,
     shuffle_read: Option<ShuffleReadConfig>,
+    /// Sink output contract description for terminal write tasks (e.g.
+    /// `object-parquet-sink:<base_dir>:<dest>:mode=overwrite`). When set, the
+    /// coordinator launches this task with `OutputContractKind::Sink` instead
+    /// of the default inline-record-batches contract.
+    sink_contract: Option<String>,
 }
 
 impl TaskSpec {
@@ -63,6 +68,7 @@ impl TaskSpec {
             sink_capabilities: None,
             shuffle_write: None,
             shuffle_read: None,
+            sink_contract: None,
         }
     }
 
@@ -124,5 +130,17 @@ impl TaskSpec {
     /// Shuffle read configuration, if this task reads from the shuffle store.
     pub fn shuffle_read(&self) -> Option<&ShuffleReadConfig> {
         self.shuffle_read.as_ref()
+    }
+
+    /// Attach a sink output contract description for a terminal write task.
+    #[must_use]
+    pub fn with_sink_contract(mut self, contract: impl Into<String>) -> Self {
+        self.sink_contract = Some(contract.into());
+        self
+    }
+
+    /// Sink output contract description, if this task writes to a sink.
+    pub fn sink_contract(&self) -> Option<&str> {
+        self.sink_contract.as_deref()
     }
 }

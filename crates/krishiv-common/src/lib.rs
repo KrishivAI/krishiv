@@ -19,6 +19,7 @@ pub mod production;
 pub mod stream_quality;
 pub mod test_fixtures;
 pub mod validate;
+pub mod write_commit;
 
 pub use backpressure::{BackpressureSignal, CreditGate};
 pub use durability::{

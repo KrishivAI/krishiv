@@ -294,7 +294,13 @@ pub struct KrishivMetrics {
     tasks_failed: AtomicU64,
     executor_lost: AtomicU64,
     shuffle_bytes_written: AtomicU64,
+    /// Total bytes spilled to local disk by memory-bounded operators (counter).
+    spill_bytes_total: AtomicU64,
+    /// Total spill events / spill files written (counter).
+    spill_files_total: AtomicU64,
     job_queue_depth: AtomicU64,
+    /// Peak memory observed per operator kind (gauge, keyed by operator label).
+    operator_memory_bytes: dashmap::DashMap<String, AtomicU64>,
     /// Current committed checkpoint epoch per job_id (gauge, keyed by job_id).
     checkpoint_epoch: dashmap::DashMap<String, AtomicU64>,
     /// Global low watermark in milliseconds (gauge, keyed by job_id).
@@ -384,6 +390,82 @@ impl KrishivMetrics {
     pub fn add_shuffle_bytes_written(&self, bytes: u64) {
         self.shuffle_bytes_written
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record a spill to local disk: total bytes written plus the number of
+    /// spill events (roughly one per spill file).
+    pub fn record_spill(&self, bytes: u64, files: u64) {
+        self.spill_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+        self.spill_files_total.fetch_add(files, Ordering::Relaxed);
+    }
+
+    /// Total tasks submitted.
+    pub fn tasks_submitted(&self) -> u64 {
+        self.tasks_submitted.load(Ordering::Relaxed)
+    }
+
+    /// Total tasks succeeded.
+    pub fn tasks_succeeded(&self) -> u64 {
+        self.tasks_succeeded.load(Ordering::Relaxed)
+    }
+
+    /// Total tasks failed.
+    pub fn tasks_failed(&self) -> u64 {
+        self.tasks_failed.load(Ordering::Relaxed)
+    }
+
+    /// Total executor lost events.
+    pub fn executor_lost(&self) -> u64 {
+        self.executor_lost.load(Ordering::Relaxed)
+    }
+
+    /// Total shuffle bytes written.
+    pub fn shuffle_bytes_written(&self) -> u64 {
+        self.shuffle_bytes_written.load(Ordering::Relaxed)
+    }
+
+    /// Current job queue depth.
+    pub fn job_queue_depth(&self) -> u64 {
+        self.job_queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Number of jobs with active watermark entries.
+    pub fn watermark_entry_count(&self) -> usize {
+        self.watermark_ms.len()
+    }
+
+    /// Number of jobs with active state-key entries.
+    pub fn state_key_entry_count(&self) -> usize {
+        self.state_key_count.len()
+    }
+
+    /// Total bytes spilled to disk so far.
+    pub fn spill_bytes_total(&self) -> u64 {
+        self.spill_bytes_total.load(Ordering::Relaxed)
+    }
+
+    /// Total spill events so far.
+    pub fn spill_files_total(&self) -> u64 {
+        self.spill_files_total.load(Ordering::Relaxed)
+    }
+
+    /// Record the peak memory observed for an operator kind (gauge).
+    ///
+    /// Keeps the maximum value seen per operator label so the gauge reflects
+    /// the high-water mark across all tasks in this process.
+    pub fn record_operator_memory(&self, operator: &str, bytes: u64) {
+        let entry = self
+            .operator_memory_bytes
+            .entry(operator.to_string())
+            .or_default();
+        entry.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    /// Peak memory recorded for an operator kind, if any.
+    pub fn operator_memory(&self, operator: &str) -> Option<u64> {
+        self.operator_memory_bytes
+            .get(operator)
+            .map(|v| v.load(Ordering::Relaxed))
     }
 
     /// Set job queue depth gauge.
@@ -647,6 +729,35 @@ impl KrishivMetrics {
         out.push_str("# HELP krishiv_job_queue_depth Pending jobs in admission queue\n");
         out.push_str("# TYPE krishiv_job_queue_depth gauge\n");
         out.push_str(&format!("krishiv_job_queue_depth {queue_depth}\n"));
+
+        let spill_bytes = self.spill_bytes_total.load(Ordering::Relaxed);
+        out.push_str("# HELP krishiv_spill_bytes_total Bytes spilled to local disk\n");
+        out.push_str("# TYPE krishiv_spill_bytes_total counter\n");
+        out.push_str(&format!("krishiv_spill_bytes_total {spill_bytes}\n"));
+
+        let spill_files = self.spill_files_total.load(Ordering::Relaxed);
+        out.push_str("# HELP krishiv_spill_files_total Spill events (spill files written)\n");
+        out.push_str("# TYPE krishiv_spill_files_total counter\n");
+        out.push_str(&format!("krishiv_spill_files_total {spill_files}\n"));
+
+        // ── Labeled per-operator memory gauge ────────────────────────────
+
+        let op_mem_entries: BTreeMap<String, u64> = self
+            .operator_memory_bytes
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        if !op_mem_entries.is_empty() {
+            out.push_str(
+                "# HELP krishiv_operator_memory_bytes Peak memory observed per operator kind\n",
+            );
+            out.push_str("# TYPE krishiv_operator_memory_bytes gauge\n");
+            for (operator, bytes) in &op_mem_entries {
+                out.push_str(&format!(
+                    "krishiv_operator_memory_bytes{{operator=\"{operator}\"}} {bytes}\n"
+                ));
+            }
+        }
 
         // ── Labeled checkpoint epoch gauge ───────────────────────────────
 

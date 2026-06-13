@@ -186,6 +186,7 @@ impl Literal {
         }
     }
 }
+
 impl From<&str> for Literal {
     fn from(value: &str) -> Self {
         Self::String(value.to_owned())

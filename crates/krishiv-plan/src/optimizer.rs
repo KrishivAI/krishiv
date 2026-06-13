@@ -9,13 +9,17 @@
 
 mod auto_partition;
 mod broadcast;
+mod broadcast_runtime;
 mod coalesce;
+mod join_reorder;
 mod predicate_pushdown;
 mod small_file;
 
 pub use auto_partition::AutoPartitionRule;
 pub use broadcast::{BroadcastAutoRule, DEFAULT_BROADCAST_THRESHOLD_ROWS};
+pub use broadcast_runtime::{BroadcastRuntimeRule, DEFAULT_MAX_BROADCAST_BYTES};
 pub use coalesce::{CoalesceAdvice, CoalesceRule};
+pub use join_reorder::JoinReorderRule;
 pub use predicate_pushdown::PredicatePushdownRule;
 pub use small_file::{FileStats, SmallFilePlanner, SplitPlanAdvice};
 
@@ -591,20 +595,34 @@ impl Default for AqeOptimizer {
 
 pub fn default_logical_optimizer() -> Optimizer {
     let mut optimizer = Optimizer::new();
+    // 1. Push filters into scans so that estimated_rows on scan nodes reflect
+    //    the actual filtered size before join ordering kicks in.
+    optimizer.add_rule(Box::new(PredicatePushdownRule));
+    // 2. Mark small scan nodes as broadcast-eligible (uses estimated_rows).
     optimizer.add_rule(Box::new(BroadcastAutoRule::new(
         DEFAULT_BROADCAST_THRESHOLD_ROWS,
     )));
-    optimizer.add_rule(Box::new(PredicatePushdownRule));
+    // 3. Reorder commutative join inputs so the smaller table is on the left,
+    //    minimising intermediate result sizes in left-deep join trees.
+    optimizer.add_rule(Box::new(JoinReorderRule));
     optimizer
 }
 
 /// Default AQE optimizer with guarded coalescing and the streaming guard.
 ///
-/// Includes `CoalesceRule` as a guarded rule (skipped for streaming plans).
-/// Rules that require runtime statistics will be no-ops until stats feed
-/// is wired (see `AqeOptimizer::apply`).
+/// Includes `BroadcastRuntimeRule`, `AutoPartitionRule`, and `CoalesceRule`
+/// as guarded rules (skipped for streaming plans).  Rules that require
+/// runtime statistics will be no-ops until stats feed is wired (see
+/// `AqeOptimizer::apply`).
 pub fn default_aqe_optimizer() -> AqeOptimizer {
     let mut optimizer = AqeOptimizer::new();
+    // 1. Promote/demote broadcast joins from observed sizes before bucket
+    //    counts are re-derived, so AutoPartitionRule sees the final exchange
+    //    shape (a promoted Broadcast node is no longer a Hash/RoundRobin
+    //    candidate for bucket stamping).
+    optimizer.add_guarded_rule(Box::new(BroadcastRuntimeRule::new(
+        DEFAULT_MAX_BROADCAST_BYTES,
+    )));
     optimizer.add_guarded_rule(Box::new(AutoPartitionRule::new(64)));
     optimizer.add_guarded_rule(Box::new(CoalesceRule::new(64 * 1024 * 1024)));
     optimizer

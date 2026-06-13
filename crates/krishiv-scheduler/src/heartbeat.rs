@@ -200,6 +200,31 @@ impl ExecutorRegistry {
             .collect()
     }
 
+    /// Sum of available memory across schedulable executors that report
+    /// memory capacity in their heartbeats.
+    ///
+    /// Returns `None` when no schedulable executor reports a memory limit —
+    /// callers must treat that as "capacity unknown" and skip memory-based
+    /// admission decisions rather than rejecting all work.
+    pub(crate) fn cluster_available_memory_bytes(&self) -> Option<u64> {
+        let mut total: Option<u64> = None;
+        for executor in self.executors.values() {
+            if !executor.state().can_accept_work() {
+                continue;
+            }
+            let Some(snapshot) = &executor.health_snapshot else {
+                continue;
+            };
+            let Some(limit) = snapshot.memory_limit_bytes else {
+                continue;
+            };
+            let used = snapshot.memory_used_bytes.unwrap_or(0);
+            let available = limit.saturating_sub(used);
+            total = Some(total.unwrap_or(0).saturating_add(available));
+        }
+        total
+    }
+
     pub(crate) fn find_executor(
         &self,
         executor_id: &ExecutorId,

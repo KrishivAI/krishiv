@@ -372,11 +372,42 @@ fn execute_loop_fragment(
             // Use durable state dir when the runner is configured for
             // single-node-durable or distributed-durable profiles.
             let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
-            let exec =
+            let mut exec =
                 ContinuousWindowExecutor::new_with_state_dir(plan_spec, job_state_dir.as_deref())
                     .map_err(|e| ExecutorError::InvalidAssignment {
                     message: format!("stream:loop failed to create window executor: {e}"),
                 })?;
+            // A restore directive that arrived before this job's first cycle
+            // seeds the freshly created executor with the checkpoint state.
+            if let Some((_, restored)) = runner.pending_restores.remove(job_id) {
+                let mut non_empty = restored.snapshots.iter().filter(|b| !b.is_empty());
+                if let Some(first) = non_empty.next() {
+                    exec.restore_from_snapshot(first).map_err(|e| {
+                        ExecutorError::LocalExecution {
+                            message: format!(
+                                "stream:loop restore from checkpoint epoch {} failed: {e}",
+                                restored.epoch
+                            ),
+                        }
+                    })?;
+                    for rest in non_empty {
+                        exec.merge_snapshot(rest)
+                            .map_err(|e| ExecutorError::LocalExecution {
+                                message: format!(
+                                    "stream:loop merge restore from checkpoint epoch {} \
+                                     failed: {e}",
+                                    restored.epoch
+                                ),
+                            })?;
+                    }
+                }
+                tracing::info!(
+                    job_id,
+                    epoch = restored.epoch,
+                    snapshots = restored.snapshots.len(),
+                    "seeded new continuous window executor from restored checkpoint"
+                );
+            }
             Ok::<_, ExecutorError>(Arc::new(Mutex::new(exec)))
         })?;
     let executor_arc = executor_entry.value().clone();
@@ -445,7 +476,7 @@ pub(crate) async fn execute_streaming_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
     udf_limits: ResourceLimits,
-    #[allow(unused_variables)] memory_budget: Arc<MemoryBudget>,
+    memory_budget: Arc<MemoryBudget>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     let fragment = fragment_body.as_str();
@@ -455,8 +486,15 @@ pub(crate) async fn execute_streaming_fragment(
     //   2. stream:loop: — stateful ContinuousWindowExecutor (long-lived)
     //   3. <default>    — bounded window (tumbling / sliding / session)
     if let Some(query) = crate::fragment::common::sql_query_from_fragment(fragment) {
-        // Create a new SQL engine with UDF limits for this task execution.
-        let engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
+        // Create a new SQL engine with UDF limits and the task's memory limit
+        // for this task execution. The reservation guard holds this task's
+        // share of the executor process budget until the fragment returns.
+        let (engine_memory_limit, _process_memory_reservation) =
+            crate::fragment::common::reserve_task_engine_memory(&memory_budget);
+        let engine = Arc::new(
+            krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
+                .with_udf_limits(udf_limits),
+        );
 
         // Continuous SQL queries must use execute_stream to avoid blocking and buffering forever.
         let dataframe = engine
@@ -479,6 +517,23 @@ pub(crate) async fn execute_streaming_fragment(
         let mut total_batches = 0;
         let mut column_count = 0;
 
+        let is_object_parquet_sink = assignment.output_contract().kind()
+            == krishiv_proto::OutputContractKind::Sink
+            && assignment
+                .output_contract()
+                .description()
+                .trim()
+                .starts_with(crate::runner::OBJECT_PARQUET_SINK_PREFIX);
+        // Staged sink contracts buffer the bounded stream output and run one
+        // staged write at the end (the commit protocol needs whole-task
+        // output); legacy direct contracts keep their per-batch write.
+        let is_staged_sink = is_object_parquet_sink
+            && crate::fragment::common::parse_object_parquet_sink_spec(
+                assignment.output_contract(),
+            )?
+            .staged;
+        let mut staged_buffer: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+
         while let Some(batch_res) = stream.next().await {
             let batch = batch_res.map_err(|error| ExecutorError::LocalExecution {
                 message: error.to_string(),
@@ -486,13 +541,9 @@ pub(crate) async fn execute_streaming_fragment(
 
             column_count = batch.num_columns();
 
-            if assignment.output_contract().kind() == krishiv_proto::OutputContractKind::Sink
-                && assignment
-                    .output_contract()
-                    .description()
-                    .trim()
-                    .starts_with(crate::runner::OBJECT_PARQUET_SINK_PREFIX)
-            {
+            if is_staged_sink {
+                staged_buffer.push(batch.clone());
+            } else if is_object_parquet_sink {
                 crate::fragment::common::write_object_parquet_sink(
                     assignment.output_contract(),
                     std::slice::from_ref(&batch),
@@ -504,12 +555,23 @@ pub(crate) async fn execute_streaming_fragment(
             total_batches += 1;
         }
 
+        let sink_staged_files = if is_staged_sink {
+            crate::fragment::common::write_object_parquet_sink_for_task(
+                assignment,
+                &staged_buffer,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+
         return Ok(ExecutorTaskOutput::streaming_window(
             total_rows,
             total_batches,
             column_count,
             vec![],
-        ));
+        )
+        .with_sink_staged_files(sink_staged_files));
     }
 
     // GAP-10: stream:cep: fragments use PartitionedCepMatcher for sequential

@@ -48,7 +48,10 @@ pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, ExecutorHeartbeatEffects,
     ThrottleDecision,
 };
-pub use admission::{InMemoryQueueManager, QueueManager};
+pub use admission::{
+    InMemoryQueueManager, NAMESPACE_MAX_ACTIVE_JOBS_ENV, NAMESPACE_MAX_CPU_NANOS_ENV,
+    NAMESPACE_MAX_MEMORY_BYTES_ENV, NamespaceQuotaQueueManager, QueueManager,
+};
 pub use auth::{
     AuthContext, COORDINATOR_AUTH_RELOAD_INTERVAL_SECS_ENV, COORDINATOR_BEARER_TOKEN_ENV,
     COORDINATOR_BEARER_TOKEN_FILE_ENV, COORDINATOR_BEARER_TOKENS_ENV,
@@ -64,13 +67,13 @@ pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
 pub use barrier_tracker::CheckpointBarrierTracker;
 pub use batch_sql::{
     BatchSqlInlineTable, BatchSqlOutcome, BatchSqlTable, decode_inline_record_batches,
-    execute_batch_sql_coordinated, submit_batch_sql_job,
+    execute_batch_sql_coordinated, execute_batch_sql_sink_coordinated, submit_batch_sql_job,
 };
 pub use bounded_window::execute_bounded_window_coordinated;
 pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use config::{CoordinatorConfig, JobSubmitter, TlsConfig};
-pub use coordinator::{Coordinator, OrchestratorHandles, SharedCoordinator};
+pub use coordinator::{Coordinator, OrchestratorHandles, RestoreDirective, SharedCoordinator};
 pub use coordinator_daemon::{
     CoordinatorDaemonConfig, CoordinatorSidecarFn, JobCoordinatorDaemonConfig,
     build_leader_election, build_shared_coordinator, coordinator_daemon_help,
@@ -114,6 +117,7 @@ pub use queryable_state_http::{
     QueryStateResponse, decode_key_hex, encode_key_hex, queryable_state_router,
 };
 pub use rocksdb_metadata::RocksDbMetadataStore;
+pub use store::JobHistoryRecord;
 pub use store::{
     ContinuousSnapshot, EventLogEvent, InMemoryMetadataStore, MetadataStore, NonBlockingStoreHandle,
 };

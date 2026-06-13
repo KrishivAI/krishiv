@@ -82,6 +82,13 @@ impl Coordinator {
             self.record_streaming_progress(report);
         }
         let checkpoint_commands = self.pending_initiate_checkpoints_for_executor(&executor_id);
+        // Restore directives must precede new checkpoint work on the executor:
+        // the executor processes restores before initiate commands, so command
+        // ordering here only affects the same-response case which the executor
+        // handles explicitly.
+        let restore_commands = self.pending_restore_commands_for_executor(&executor_id);
+        let checkpoint_complete_commands =
+            self.pending_checkpoint_complete_for_executor(&executor_id);
         let lease_generation = self
             .executors
             .find_executor(&executor_id)
@@ -93,6 +100,8 @@ impl Coordinator {
         Ok(ExecutorHeartbeatEffects {
             source_throttles,
             checkpoint_commands,
+            checkpoint_complete_commands,
+            restore_commands,
             lease_generation,
         })
     }
@@ -219,9 +228,103 @@ impl Coordinator {
         self.ensure_active()?;
         self.prune_executor_channel(executor_id);
         self.executors.mark_lost(executor_id)?;
+        self.handle_executor_loss_for_checkpoints(executor_id);
         self.reset_running_tasks_for_lost_executor(executor_id);
         krishiv_metrics::global_metrics().inc_executor_lost();
         Ok(())
+    }
+
+    /// Checkpoint-protocol reaction to an executor loss.
+    ///
+    /// For every checkpointed streaming job with running tasks on the lost
+    /// executor:
+    ///
+    /// 1. An in-flight `AwaitingAcks` epoch is aborted immediately — the lost
+    ///    executor can never ack it, and waiting for the full ack timeout only
+    ///    delays recovery.  Epochs already in `Committing` continue: quorum was
+    ///    reached and the storage write must run to completion.
+    /// 2. A [`RestoreDirective`] is set to the last committed epoch (global
+    ///    rollback).  All executors of the job — including survivors — must
+    ///    reload state from that epoch, because rewound sources re-deliver the
+    ///    post-checkpoint data and surviving state would double-count it.
+    ///
+    /// Must be called *before* `reset_running_tasks_for_lost_executor`, while
+    /// task→executor assignments still identify the affected jobs.
+    pub(crate) fn handle_executor_loss_for_checkpoints(&mut self, lost_id: &ExecutorId) {
+        let affected_jobs: Vec<JobId> = self
+            .checkpoint_coordinators
+            .keys()
+            .filter(|job_id| self.executor_has_running_task_in_job(lost_id, job_id))
+            .cloned()
+            .collect();
+
+        for job_id in affected_jobs {
+            let Some(coord) = self.checkpoint_coordinators.get_mut(&job_id) else {
+                continue;
+            };
+            if let CheckpointCoordinatorState::AwaitingAcks { epoch, .. } = coord.state {
+                coord.abort_epoch(&format!("executor {lost_id} lost during epoch {epoch}"));
+                self.checkpoint_notify_sent
+                    .retain(|(jid, _, e)| jid != &job_id || *e != epoch);
+                self.barrier_dispatch_sent
+                    .retain(|(jid, e)| jid != &job_id || *e != epoch);
+                tracing::warn!(
+                    job_id = %job_id,
+                    epoch,
+                    executor_id = %lost_id,
+                    "aborted in-flight checkpoint epoch after executor loss"
+                );
+            }
+
+            let Some(coord) = self.checkpoint_coordinators.get(&job_id) else {
+                continue;
+            };
+            // The rollback target is the last DURABLY committed epoch from
+            // storage — the in-memory state machine no longer rests on it
+            // after the abort above.
+            let committed = match krishiv_state::checkpoint::latest_valid_epoch(
+                coord.storage().as_ref(),
+                job_id.as_str(),
+            ) {
+                Ok(epoch) => Some(epoch),
+                Err(krishiv_state::checkpoint::CheckpointError::NoValidEpoch) => None,
+                Err(error) => {
+                    tracing::error!(
+                        job_id = %job_id,
+                        error = %error,
+                        "cannot determine last committed epoch after executor loss; \
+                         no rollback directive will be issued"
+                    );
+                    None
+                }
+            };
+            match committed {
+                Some(epoch) => {
+                    self.set_restore_directive(
+                        &job_id,
+                        RestoreDirective {
+                            epoch,
+                            fencing_token: coord.fencing_token().as_u64(),
+                        },
+                    );
+                    tracing::warn!(
+                        job_id = %job_id,
+                        epoch,
+                        executor_id = %lost_id,
+                        "executor loss in checkpointed streaming job: \
+                         directing global rollback to last committed epoch"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        executor_id = %lost_id,
+                        "executor loss in checkpointed streaming job with no \
+                         committed epoch; tasks restart from their source origin"
+                    );
+                }
+            }
+        }
     }
 
     fn prune_executor_channel(&mut self, executor_id: &ExecutorId) {
@@ -257,6 +360,7 @@ impl Coordinator {
             if in_grace_period && self.executor_has_streaming_running_tasks(lost_id) {
                 continue;
             }
+            self.handle_executor_loss_for_checkpoints(lost_id);
             self.reset_running_tasks_for_lost_executor(lost_id);
             self.prune_executor_channel(lost_id);
             evicted.push(lost_id.clone());
@@ -307,6 +411,16 @@ impl Coordinator {
                         .retain(|(jid, _, e)| jid != job_id || *e != aborted_epoch);
                     self.barrier_dispatch_sent
                         .retain(|(jid, e)| jid != job_id || *e != aborted_epoch);
+                    // A stop-with-savepoint waiting on the aborted epoch can
+                    // never fire; drop it so the operator can retry the stop.
+                    if self.pending_stop_after_savepoint.get(job_id) == Some(&aborted_epoch) {
+                        self.pending_stop_after_savepoint.remove(job_id);
+                        tracing::warn!(
+                            job_id = %job_id,
+                            epoch = aborted_epoch,
+                            "stop-with-savepoint cancelled: savepoint epoch timed out"
+                        );
+                    }
                     tracing::warn!(
                         job_id = %job_id,
                         epoch = aborted_epoch,
@@ -399,6 +513,22 @@ impl Coordinator {
             }
             if job_affected {
                 job.refresh_state();
+            }
+
+            // Invalidate shuffle partitions produced by the lost executor.
+            // Succeeded tasks that wrote shuffle data to the executor's Flight
+            // server can no longer be read — reset them to Pending so they are
+            // re-executed on a healthy executor.
+            if job.invalidate_executor_shuffle_partitions(lost_id) {
+                tracing::info!(
+                    executor_id = %lost_id,
+                    job_id = %job_id,
+                    "shuffle partitions invalidated for lost executor; affected tasks reset to Pending"
+                );
+                job_affected = true;
+            }
+
+            if job_affected {
                 jobs_to_reassign.push(job_id.clone());
             }
         }

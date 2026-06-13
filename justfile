@@ -226,6 +226,7 @@ api-inventory:
 api-diff ref="origin/main":
     python3 scripts/compare_api_surface.py --against-ref "{{ ref }}" --report target/api-change-report.json
 
+
 # Record the machine and revision used for a benchmark run.
 # Usage: just bench-manifest criterion "cargo bench -p krishiv-bench"
 bench-manifest suite command:

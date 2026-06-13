@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_common::async_util::block_on;
 use krishiv_plan::governance::{AuthProvider, PolicyHook};
-use krishiv_plan::udf::{ScalarUdf, UdfRegistry};
+use krishiv_plan::udf::{AggregateUdf, ScalarUdf, TableUdf, UdfRegistry};
 use krishiv_runtime::{
     BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobStatus,
     LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
@@ -802,6 +802,66 @@ impl Session {
             .collect()
     }
 
+    /// Register an aggregate UDAF on this session.
+    ///
+    /// The UDAF becomes available in SQL via `SELECT my_udaf(col) FROM ...`.
+    pub fn register_aggregate_udf(&self, udf: Arc<dyn AggregateUdf>) -> Result<()> {
+        let name = udf.name().to_owned();
+        if name.trim().is_empty() {
+            return Err(KrishivError::InvalidConfig {
+                message: "aggregate UDF name must not be empty".into(),
+            });
+        }
+        self.udf_registry
+            .write()
+            .map_err(|e| KrishivError::Runtime {
+                message: format!("aggregate UDF registry lock poisoned: {e}"),
+            })?
+            .register_aggregate(udf);
+        block_on(self.sql_engine.sync_aggregate_udfs()).map_err(KrishivError::from)
+    }
+
+    /// Names of aggregate UDAFs registered on this session.
+    pub fn aggregate_udf_names(&self) -> Vec<String> {
+        self.udf_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .aggregate_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Register a table UDTF on this session.
+    ///
+    /// The UDTF becomes available in SQL via `SELECT * FROM my_udtf(arg)`.
+    pub fn register_table_udf(&self, udf: Arc<dyn TableUdf>) -> Result<()> {
+        let name = udf.name().to_owned();
+        if name.trim().is_empty() {
+            return Err(KrishivError::InvalidConfig {
+                message: "table UDF name must not be empty".into(),
+            });
+        }
+        self.udf_registry
+            .write()
+            .map_err(|e| KrishivError::Runtime {
+                message: format!("table UDF registry lock poisoned: {e}"),
+            })?
+            .register_table(udf);
+        block_on(self.sql_engine.sync_table_udfs()).map_err(KrishivError::from)
+    }
+
+    /// Names of table UDTFs registered on this session.
+    pub fn table_udf_names(&self) -> Vec<String> {
+        self.udf_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .table_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Register a local Parquet path as a SQL table.
     pub fn register_parquet(
         &self,
@@ -1363,6 +1423,60 @@ impl Session {
             .await
             .map_err(KrishivError::from)?;
         Ok(self.dataframe_from_sql(sql_dataframe))
+    }
+
+    /// Create a DataFrame by reading a local CSV file with typed options.
+    pub fn read_csv_with_options(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        opts: krishiv_sql::CsvReaderOptions,
+    ) -> Result<DataFrame> {
+        krishiv_common::async_util::block_on(async move {
+            let sql_dataframe = self
+                .sql_engine
+                .read_csv_with_options(path, &opts)
+                .await
+                .map_err(KrishivError::from)?;
+            Ok(self.dataframe_from_sql(sql_dataframe))
+        })
+    }
+
+    /// Create a DataFrame by reading a local Parquet file with typed options.
+    pub fn read_parquet_with_options(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        opts: krishiv_sql::ParquetReaderOptions,
+    ) -> Result<DataFrame> {
+        krishiv_common::async_util::block_on(async move {
+            let sql_dataframe = self
+                .sql_engine
+                .read_parquet_with_options(path, &opts)
+                .await
+                .map_err(KrishivError::from)?;
+            Ok(self.dataframe_from_sql(sql_dataframe))
+        })
+    }
+
+    /// Register in-memory record batches as a named table in this session.
+    ///
+    /// Used by [`DataFrame::cache`] to materialize query results into memory.
+    pub fn register_record_batches(
+        &self,
+        name: &str,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Result<()> {
+        krishiv_common::async_util::block_on(
+            self.sql_engine
+                .register_record_batches(name, batches),
+        )
+        .map_err(KrishivError::from)
+    }
+
+    /// Deregister (drop) a named table from this session.
+    pub fn deregister_table(&self, name: &str) -> Result<()> {
+        self.sql_engine
+            .deregister_table(name)
+            .map_err(KrishivError::from)
     }
 }
 

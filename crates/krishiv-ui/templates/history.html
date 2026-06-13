@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Job History · Krishiv{% endblock %}
+{% block content %}
+<h1 class="page-heading">Job History</h1>
+{% if records.is_empty() %}
+<div class="empty">No completed jobs in history yet.</div>
+{% else %}
+<section class="section">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Job ID</th>
+          <th>Kind</th>
+          <th>State</th>
+          <th>Stages</th>
+          <th>Tasks</th>
+          <th>Succeeded</th>
+          <th>Failed</th>
+          <th>CPU (ms)</th>
+          <th>Mem Peak</th>
+          <th>Completed</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in records %}
+        <tr>
+          <td><a href="/ui/history/{{ r.job_id }}">{{ r.job_id }}</a></td>
+          <td>{{ r.job_kind }}</td>
+          <td><span class="state-dot {{ r.final_state }}">{{ r.final_state }}</span></td>
+          <td>{{ r.stage_count }}</td>
+          <td>{{ r.task_count }}</td>
+          <td>{{ r.succeeded_task_count }}</td>
+          <td>{% if r.failed_task_count > 0 %}<strong class="bad">{{ r.failed_task_count }}</strong>{% else %}{{ r.failed_task_count }}{% endif %}</td>
+          <td>{{ r.cpu_nanos / 1000000 }}</td>
+          <td>{{ r.memory_peak_task_bytes / 1048576 }} MB</td>
+          <td>{{ r.completed_at_ms }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if self.has_more() %}
+  <div class="pagination">
+    <a class="btn" href="/ui/history?offset={{ self.next_offset() }}&limit={{ limit }}">Next →</a>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

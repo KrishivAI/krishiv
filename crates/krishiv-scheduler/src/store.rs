@@ -185,11 +185,47 @@ impl ContinuousSnapshot {
     }
 }
 
+/// Immutable archive record written when a job reaches a terminal state.
+///
+/// Kept permanently so `/ui/history` can show completed jobs after they are
+/// evicted from the live coordinator snapshot. Serialized as JSON for all
+/// store backends.
+/// Maximum number of terminal-job history records retained per store. Oldest
+/// records are evicted past this bound so the archive can't grow without limit.
+pub const MAX_JOB_HISTORY: usize = 1000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobHistoryRecord {
+    pub job_id: String,
+    pub job_kind: String,
+    /// Terminal state string: "succeeded", "failed", or "cancelled".
+    pub final_state: String,
+    /// Approximate wall-clock time the job completed (UNIX ms; 0 = unknown).
+    pub completed_at_ms: u64,
+    pub stage_count: usize,
+    pub task_count: usize,
+    pub succeeded_task_count: u32,
+    pub failed_task_count: u32,
+    pub cpu_nanos: u64,
+    pub memory_peak_task_bytes: u64,
+    pub namespace_id: Option<String>,
+    pub priority: u8,
+}
+
 pub trait MetadataStore: Send + Sync {
     fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()>;
     fn events(&self) -> &[EventLogEvent];
     fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()>;
     fn jobs(&self) -> &[JobRecord];
+
+    /// Append an immutable terminal-job record to the history log.
+    fn save_job_history(&mut self, record: JobHistoryRecord) -> SchedulerResult<()>;
+
+    /// Return all history records, most-recent first.
+    fn list_job_history(&self) -> Vec<JobHistoryRecord>;
+
+    /// Look up a single history record by job_id.
+    fn get_job_history(&self, job_id: &str) -> Option<JobHistoryRecord>;
 
     /// Persist an executor descriptor so it survives coordinator restarts (R10).
     ///
@@ -247,6 +283,7 @@ pub struct InMemoryMetadataStore {
     /// Exposed via [`InMemoryMetadataStore::evicted_event_count`] for tests and
     /// metrics.
     evicted_event_count: u64,
+    history: Vec<JobHistoryRecord>,
 }
 
 impl InMemoryMetadataStore {
@@ -330,6 +367,21 @@ impl MetadataStore for InMemoryMetadataStore {
     fn remove_continuous_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
         self.continuous_snapshots.remove(job_id);
         Ok(())
+    }
+
+    fn save_job_history(&mut self, record: JobHistoryRecord) -> SchedulerResult<()> {
+        self.history.retain(|r| r.job_id != record.job_id);
+        self.history.insert(0, record);
+        self.history.truncate(MAX_JOB_HISTORY);
+        Ok(())
+    }
+
+    fn list_job_history(&self) -> Vec<JobHistoryRecord> {
+        self.history.clone()
+    }
+
+    fn get_job_history(&self, job_id: &str) -> Option<JobHistoryRecord> {
+        self.history.iter().find(|r| r.job_id == job_id).cloned()
     }
 }
 
@@ -676,6 +728,10 @@ pub(crate) struct PersistedTaskSpec {
     pub(crate) task_timeout_secs: Option<u64>,
     pub(crate) source_capabilities: Option<PersistedConnectorCapabilities>,
     pub(crate) sink_capabilities: Option<PersistedConnectorCapabilities>,
+    /// Sink output contract for terminal write tasks (Phase 2.3).
+    /// Absent in records written before this field was added.
+    #[serde(default)]
+    pub(crate) sink_contract: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -917,6 +973,7 @@ impl From<&TaskSpec> for PersistedTaskSpec {
                 .sink_capabilities
                 .as_ref()
                 .map(PersistedConnectorCapabilities::from),
+            sink_contract: value.sink_contract().map(str::to_owned),
         }
     }
 }
@@ -937,6 +994,9 @@ impl TryFrom<PersistedTaskSpec> for TaskSpec {
         }
         if let Some(caps) = value.sink_capabilities {
             spec = spec.with_sink_capabilities(ConnectorCapabilityFlags::from(caps));
+        }
+        if let Some(contract) = value.sink_contract {
+            spec = spec.with_sink_contract(contract);
         }
         Ok(spec)
     }

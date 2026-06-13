@@ -424,6 +424,8 @@ impl FlightSqlService for KrishivFlightSqlService {
                 tags::BOUNDED_WINDOW,
                 tags::EXPLAIN,
                 tags::EXECUTE_PLAN,
+                tags::BATCH_SQL,
+                tags::BATCH_SQL_SINK,
             ]
             .iter()
             .map(|tag| {
@@ -568,6 +570,24 @@ impl KrishivFlightSqlService {
                         .map_err(KrishivActionError::Status)?
                 };
                 encode_batches_ipc(&batches)
+            }
+            A::BatchSqlSink(body) => {
+                // Phase 2.3 distributed write: the result is committed through
+                // the staged sink contract instead of being returned inline.
+                use krishiv_scheduler::BatchSqlInlineTable;
+                let inline_tables: Vec<BatchSqlInlineTable> = body
+                    .tables
+                    .iter()
+                    .map(|t| BatchSqlInlineTable {
+                        table_name: t.table_name.clone(),
+                        ipc_b64: String::new(), // path-based: resolved via catalog
+                    })
+                    .collect();
+                self.host
+                    .execute_batch_sql_sink(&body.query, &inline_tables, &body.sink_contract)
+                    .await
+                    .map_err(KrishivActionError::Status)?;
+                Ok(Vec::new())
             }
             #[cfg(feature = "kafka")]
             A::RegisterKafkaSource(body) => {

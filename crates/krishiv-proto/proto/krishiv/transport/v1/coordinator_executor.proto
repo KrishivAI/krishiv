@@ -138,6 +138,23 @@ message InitiateCheckpointCommand {
   uint64 fencing_token = 3;
 }
 
+// Coordinator → executor: checkpoint epoch is durably committed.  Executors
+// commit transactional-sink output prepared at or before this epoch.
+message CheckpointCompleteCommand {
+  string job_id = 1;
+  uint64 epoch = 2;
+  uint64 fencing_token = 3;
+}
+
+// Coordinator → executor: reload job state from checkpoint `epoch`.  Executors
+// restore operator snapshots, re-seed source offsets, and abort transactional
+// sink output prepared after `epoch`.
+message RestoreFromCheckpointCommand {
+  string job_id = 1;
+  uint64 epoch = 2;
+  uint64 fencing_token = 3;
+}
+
 message ExecutorHeartbeatResponse {
   TransportVersion version = 1;
   uint64 lease_generation = 2;
@@ -151,6 +168,10 @@ message ExecutorHeartbeatResponse {
   // W3C traceparent header for distributed tracing.
   string trace_parent = 8;
   string trace_state = 9;
+  // Committed-epoch notifications driving transactional-sink commits.
+  repeated CheckpointCompleteCommand completed_checkpoints = 10;
+  // Restore directives driving executor-side state/offset reload.
+  repeated RestoreFromCheckpointCommand restore_checkpoints = 11;
 }
 
 message ShuffleWriteConfigWire {
@@ -261,6 +282,17 @@ message TaskStatusRequest {
   // W3C traceparent header for distributed tracing.
   string trace_parent = 11;
   string trace_state = 12;
+  // Shuffle partitions found missing while fetching this task's inputs.
+  // A Failed status carrying entries here asks the coordinator to recompute
+  // the producing stage instead of only retrying this consumer task.
+  repeated MissingShufflePartitionWire missing_shuffle_partitions = 13;
+}
+
+// A shuffle partition the consumer could not fetch (producer output lost).
+message MissingShufflePartitionWire {
+  // Stage that produced the missing partition.
+  string stage_id = 1;
+  uint32 partition_id = 2;
 }
 
 // Structured shuffle partition output (replaces the parallel shuffle_partition_*
@@ -300,6 +332,10 @@ message TaskOutputMetadata {
   bool has_runtime_stats = 17;
   // Hot-key reports from HeavyHittersTracker observed during shuffle write.
   repeated HeartbeatHotKeyReport hot_key_reports = 18;
+  // Staged sink files written by this task (paths relative to the sink
+  // base_dir). Populated by object-parquet sink tasks running the Phase 2.3
+  // staged commit protocol; the coordinator publishes them on job success.
+  repeated string sink_staged_files = 19;
 }
 
 message TaskCancellationRequest {
@@ -412,6 +448,9 @@ message CheckpointAckStaleFencingToken {
 message TriggerSavepointRequest {
   string job_id = 1;
   string label = 2;
+  // When true, the job is cancelled once the savepoint epoch is durably
+  // committed and preserved (stop-with-savepoint).
+  bool stop = 3;
 }
 
 message TriggerSavepointResponse {
@@ -423,6 +462,8 @@ message RestoreJobRequest {
   string job_id = 1;
   uint64 epoch = 2;
   string storage_path = 3;
+  // When true, `epoch` names a savepoint in the durable savepoints area.
+  bool from_savepoint = 4;
 }
 
 message RestoreJobResponse {

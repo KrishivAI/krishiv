@@ -144,6 +144,7 @@ impl PivotValue {
     }
 }
 
+
 /// DataFrame API backed by DataFusion for R1 local execution.
 #[derive(Clone)]
 pub struct DataFrame {
@@ -159,6 +160,9 @@ pub struct DataFrame {
     _coordinator_url: Option<String>,
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
+    /// When set, this DataFrame was produced by `cache()` / `persist()` and
+    /// the named in-memory table can be removed via `unpersist()`.
+    _cache_name: Option<String>,
     /// When true, always collect from the local DataFusion plan even in remote
     /// mode. Set for lakehouse reads (Delta, Hudi) whose table registrations
     /// live only in the local DataFusion context and cannot be forwarded to a
@@ -231,6 +235,7 @@ impl GroupedDataFrame {
         Ok(self.dataframe.with_new_ops(new_ops))
     }
 
+
     /// Count rows in each group.
     pub fn count(&self) -> Result<DataFrame> {
         self.agg(&[crate::expression::count_all().alias("count")])
@@ -255,6 +260,7 @@ impl DataFrame {
             runtime: crate::session::shared_embedded_runtime()?,
             registered_parquet: Arc::new(DashMap::new()),
             force_local: false,
+            _cache_name: None,
         })
     }
 
@@ -288,6 +294,7 @@ impl DataFrame {
             runtime,
             registered_parquet,
             force_local: false,
+            _cache_name: None,
         }
     }
 
@@ -315,6 +322,7 @@ impl DataFrame {
             runtime,
             registered_parquet,
             force_local: false,
+            _cache_name: None,
         }
     }
 
@@ -657,6 +665,7 @@ Execution statistics:
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,
+            _cache_name: None,
         }
     }
 
@@ -677,6 +686,7 @@ Execution statistics:
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,
+            _cache_name: None,
         }
     }
 
@@ -1148,10 +1158,120 @@ Execution statistics:
 
     // ── Write API ────────────────────────────────────────────────────────────
 
-    /// Write the result of this DataFrame to a Parquet file.
+    /// Write this DataFrame's result as a directory of Parquet part files
+    /// through the distributed sink stage (Phase 2.3 staged commit protocol).
+    ///
+    /// The query is submitted as a batch SQL job whose terminal task carries an
+    /// `object-parquet-sink` output contract. Sink tasks stage their output
+    /// under `<path>/_staging/<job_id>/`; the coordinator publishes the staged
+    /// files as `part-<task_index>-<job_id>.parquet` (optionally under Hive
+    /// `col=value` directories) only when the whole job succeeds, and removes
+    /// them on failure — the destination never exposes partial output.
+    ///
+    /// Requires a SQL-backed DataFrame (`session.sql(..)` / `read_parquet`):
+    /// the query text is what the sink job executes remotely.
+    pub(crate) fn write_parquet_sink(
+        &self,
+        path: &str,
+        mode: krishiv_common::write_commit::WriteMode,
+        partition_by: &[String],
+    ) -> Result<()> {
+        self.run_sink_write(path, mode, partition_by)?
+            .map_err(KrishivError::from)
+    }
+
+    /// Build the sink contract for `path` and submit the sink job.
+    ///
+    /// The outer error covers client-side problems (non-SQL DataFrame, bad
+    /// destination path, invalid contract); the inner result preserves the
+    /// runtime error so callers can detect `RuntimeError::Unsupported` and
+    /// fall back to client-side writes.
+    fn run_sink_write(
+        &self,
+        path: &str,
+        mode: krishiv_common::write_commit::WriteMode,
+        partition_by: &[String],
+    ) -> Result<std::result::Result<(), krishiv_runtime::RuntimeError>> {
+        use std::path::Path;
+
+        let Some(query) = self.sql_query.as_deref() else {
+            return Err(KrishivError::unsupported(
+                "sink-based parquet writes require a SQL-backed DataFrame \
+                 (created via session.sql() or read_parquet()); collect() and \
+                 write locally instead",
+            ));
+        };
+        let dest = Path::new(path);
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| KrishivError::InvalidConfig {
+                message: format!(
+                    "sink write destination '{path}' must have a parent directory"
+                ),
+            })?;
+        let dest_name = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| KrishivError::InvalidConfig {
+                message: format!("sink write destination '{path}' has no directory name"),
+            })?;
+        std::fs::create_dir_all(parent).map_err(|e| KrishivError::Runtime {
+            message: format!("failed to create sink parent directory '{}': {e}", parent.display()),
+        })?;
+
+        let spec = krishiv_common::write_commit::SinkWriteSpec::staged(
+            parent.to_string_lossy().into_owned(),
+            dest_name,
+            mode,
+            partition_by.to_vec(),
+        )
+        .map_err(|e| KrishivError::InvalidConfig {
+            message: e.to_string(),
+        })?;
+        let contract = format!("object-parquet-sink:{}", spec.contract_payload());
+
+        let tables = self
+            .registered_parquet
+            .iter()
+            .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
+            .collect::<Vec<_>>();
+        Ok(self.runtime.collect_batch_sql_sink(query, &tables, &contract))
+    }
+
+    /// Write the result of this DataFrame to Parquet.
+    ///
+    /// For distributed sessions backed by a SQL query, the write runs through
+    /// the distributed sink stage (`path` becomes a directory of
+    /// `part-*.parquet` files committed atomically on job success). Embedded
+    /// sessions — and distributed runtimes that do not support sink writes —
+    /// collect the result client-side and write a single Parquet file at
+    /// `path` (the pre-2.3 behavior).
     pub fn write_parquet(&self, path: &str) -> Result<()> {
         use std::fs::File;
         use std::path::Path;
+
+        if self.runtime.uses_remote_execution() && !self.force_local && self.sql_query.is_some() {
+            // Probe the runtime directly so an Unsupported response (e.g. an
+            // older Flight server without the batch_sql_sink action) can fall
+            // back to the legacy client-side collect-then-write path.
+            match self.run_sink_write(
+                path,
+                krishiv_common::write_commit::WriteMode::Append,
+                &[],
+            )? {
+                Ok(()) => return Ok(()),
+                Err(krishiv_runtime::RuntimeError::Unsupported { feature }) => {
+                    tracing::warn!(
+                        feature,
+                        "distributed sink write unsupported by runtime; \
+                         falling back to client-side collect-then-write"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         let result = krishiv_common::async_util::block_on(self.collect_async())?;
         let batches = result.into_batches();
@@ -1226,6 +1346,156 @@ Execution statistics:
         Ok(())
     }
 
+    // ── Cache / persist / temp-view ─────────────────────────────────────────
+
+    /// Materialise this DataFrame into an in-memory table and return a new
+    /// DataFrame backed by that table.
+    ///
+    /// The returned DataFrame refers to the cached table by name; calling
+    /// `unpersist()` on it removes the table from the session.
+    pub fn cache(&self) -> Result<DataFrame> {
+        self.persist_as(None)
+    }
+
+    /// Alias for [`cache`] — Spark-compatible name.
+    pub fn persist(&self) -> Result<DataFrame> {
+        self.cache()
+    }
+
+    /// Materialise this DataFrame into an in-memory table with a given name.
+    /// When `name` is `None` a unique name is generated.
+    fn persist_as(&self, name: Option<String>) -> Result<DataFrame> {
+        let batches = krishiv_common::async_util::block_on(self.collect_async())?
+            .into_batches();
+
+        // Generate a stable unique name from a counter so callers can call
+        // cache() multiple times without collisions.
+        static CACHE_CTR: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let table_name = name.unwrap_or_else(|| {
+            let n = CACHE_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("_krishiv_cache_{n}")
+        });
+
+        if let Some(ops) = &self.sql_dataframe {
+            // Register with the same SQL engine so subsequent SQL queries
+            // referencing this table see the cached data.
+            krishiv_common::async_util::block_on(
+                ops.register_batches(&table_name, batches.clone()),
+            )?;
+        }
+
+        // Build a new pre-collected DataFrame that holds the batches so
+        // callers without an SQL backend can also use collect() on the result.
+        let cached = DataFrame {
+            logical_plan: self.logical_plan.clone(),
+            sql_dataframe: self.sql_dataframe.clone(),
+            sql_query: Some(format!("SELECT * FROM \"{table_name}\"")),
+            pre_collected: Some(batches),
+            mode: self.mode,
+            jobs: self.jobs.clone(),
+            next_job_id: self.next_job_id.clone(),
+            _coordinator_url: self._coordinator_url.clone(),
+            runtime: self.runtime.clone(),
+            registered_parquet: self.registered_parquet.clone(),
+            force_local: self.force_local,
+            _cache_name: Some(table_name),
+        };
+        Ok(cached)
+    }
+
+    /// Drop the in-memory table that was created by [`cache`] / [`persist`].
+    ///
+    /// A no-op if this DataFrame was not previously cached.
+    pub fn unpersist(&self) -> Result<()> {
+        let Some(ref table_name) = self._cache_name else {
+            return Ok(());
+        };
+        let Some(ops) = &self.sql_dataframe else {
+            return Ok(());
+        };
+        krishiv_common::async_util::block_on(ops.deregister_table(table_name)).map_err(Into::into)
+    }
+
+    /// Register this DataFrame as a temporary view under `name`.
+    ///
+    /// Subsequent `session.sql("SELECT * FROM <name>")` calls will use this
+    /// DataFrame's query as a sub-plan.
+    pub fn create_or_replace_temp_view(&self, name: &str) -> Result<()> {
+        let Some(ops) = &self.sql_dataframe else {
+            return Err(KrishivError::unsupported(
+                "create_or_replace_temp_view requires an SQL-backed DataFrame",
+            ));
+        };
+        krishiv_common::async_util::block_on(ops.create_view(name, false)).map_err(Into::into)
+    }
+
+    /// Write this DataFrame to a Parquet file with typed writer options.
+    pub fn write_parquet_with_options(
+        &self,
+        path: &str,
+        opts: &krishiv_sql::ParquetWriterOptions,
+    ) -> Result<()> {
+        use std::fs::File;
+        let result = krishiv_common::async_util::block_on(self.collect_async())?;
+        let batches = result.into_batches();
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let schema = batches[0].schema();
+        let props = build_parquet_writer_props(opts)?;
+        let file = File::create(path).map_err(|e| KrishivError::Runtime {
+            message: format!("failed to create parquet file '{path}': {e}"),
+        })?;
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, schema, props).map_err(|e| {
+                KrishivError::Runtime {
+                    message: format!("failed to create parquet writer: {e}"),
+                }
+            })?;
+        for batch in &batches {
+            writer.write(batch).map_err(|e| KrishivError::Runtime {
+                message: format!("failed to write parquet batch: {e}"),
+            })?;
+        }
+        writer.close().map_err(|e| KrishivError::Runtime {
+            message: format!("failed to close parquet writer: {e}"),
+        })?;
+        Ok(())
+    }
+
+    /// Write this DataFrame to a CSV file with typed writer options.
+    pub fn write_csv_with_options(
+        &self,
+        path: &str,
+        opts: &krishiv_sql::CsvWriterOptions,
+    ) -> Result<()> {
+        use std::fs::File;
+        let result = krishiv_common::async_util::block_on(self.collect_async())?;
+        let batches = result.into_batches();
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let file = File::create(path).map_err(|e| KrishivError::Runtime {
+            message: format!("failed to create csv file '{path}': {e}"),
+        })?;
+        let delimiter = opts
+            .delimiter
+            .map(|c| c as u8)
+            .unwrap_or(b',');
+        let has_header = opts.has_header.unwrap_or(true);
+        let mut builder = arrow::csv::WriterBuilder::new()
+            .with_delimiter(delimiter)
+            .with_header(has_header);
+        let mut writer = builder.build(file);
+        for batch in &batches {
+            writer.write(batch).map_err(|e| KrishivError::Runtime {
+                message: format!("failed to write csv batch: {e}"),
+            })?;
+        }
+        Ok(())
+    }
+
     /// Insert a hash-based exchange node into the logical plan. When backed
     /// by a SQL query, works on the logical plan directly.
     #[must_use]
@@ -1265,4 +1535,38 @@ Execution statistics:
         self.logical_plan = self.logical_plan.with_node(exchange);
         self
     }
+}
+
+/// Build `parquet::file::properties::WriterProperties` from typed options.
+///
+/// Returns `None` when all options are default so the caller can pass `None`
+/// directly to `ArrowWriter::try_new`, which means "use ArrowWriter defaults".
+fn build_parquet_writer_props(
+    opts: &krishiv_sql::ParquetWriterOptions,
+) -> Result<Option<parquet::file::properties::WriterProperties>> {
+    if opts.compression.is_none() && opts.max_row_group_size.is_none() {
+        return Ok(None);
+    }
+    let mut builder = parquet::file::properties::WriterProperties::builder();
+    if let Some(ref codec_str) = opts.compression {
+        use parquet::basic::Compression;
+        let codec = match codec_str.to_lowercase().as_str() {
+            "snappy" => Compression::SNAPPY,
+            "gzip" => Compression::GZIP(Default::default()),
+            "lz4" => Compression::LZ4,
+            "zstd" => Compression::ZSTD(Default::default()),
+            "brotli" => Compression::BROTLI(Default::default()),
+            "uncompressed" | "none" => Compression::UNCOMPRESSED,
+            other => {
+                return Err(KrishivError::InvalidConfig {
+                    message: format!("unknown parquet compression codec '{other}'"),
+                });
+            }
+        };
+        builder = builder.set_compression(codec);
+    }
+    if let Some(size) = opts.max_row_group_size {
+        builder = builder.set_max_row_group_size(size);
+    }
+    Ok(Some(builder.build()))
 }

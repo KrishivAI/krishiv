@@ -322,12 +322,13 @@ async fn heartbeat_loop(
     }
 
     // Checkpoint storage and state backend.
-    // The per-task state backend (used by checkpoint RPCs) is always ephemeral; durable
-    // window-operator state is managed per-job via `runner.state_dir` (see streaming.rs).
+    // The generic per-task state backend serves non-window stateful tasks;
+    // continuous window jobs snapshot/restore their per-job loop executors
+    // (selected in `ExecutorTaskRunner::checkpoint_state_for_job`).
     let checkpoint_storage: Arc<dyn CheckpointStorage> =
         open_checkpoint_storage_from_uri(&checkpoint_uri)
             .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
-    let state_backend = Arc::new(
+    let state_backend = crate::runner::CheckpointStateHandle::from_backend(
         RocksDbStateBackend::open_for_profile(durability_profile, state_dir.as_deref())
             .map_err(|e| format!("state backend: {e}"))?,
     );
@@ -456,7 +457,7 @@ async fn heartbeat_loop(
     let shutdown = Arc::new(AtomicBool::new(false));
     let effective_slots = slots.max(1);
     let storage_for_tasks = Arc::clone(&checkpoint_storage);
-    let backend_for_tasks = Arc::clone(&state_backend);
+    let backend_for_tasks = state_backend.clone();
     // Share a single wakeup notifier across all slots so any push wakes exactly
     // one waiting slot (notify_one) without requiring per-slot channels.
     let slot_wakeup = Arc::clone(runner.inbox().wakeup());
@@ -464,7 +465,7 @@ async fn heartbeat_loop(
         let runner_loop = Arc::clone(&runner);
         let coord = Arc::clone(&coord_service);
         let storage = Arc::clone(&storage_for_tasks);
-        let backend = Arc::clone(&backend_for_tasks);
+        let backend = backend_for_tasks.clone();
         let shutdown_flag = Arc::clone(&shutdown);
         let wakeup = Arc::clone(&slot_wakeup);
         tokio::spawn(async move {
@@ -478,7 +479,7 @@ async fn heartbeat_loop(
                 // picking up the next task assignment.
                 runner_loop
                     .drain_pending_barriers(
-                        Arc::clone(&backend) as Arc<dyn krishiv_state::StateBackend>,
+                        backend.clone(),
                         Arc::clone(&storage)
                             as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
                         coord.as_ref().clone(),
@@ -559,6 +560,39 @@ async fn heartbeat_loop(
                         // Only update the shared lease after confirming the
                         // heartbeat disposition is not stale (fix: lease-generation race).
                         apply_non_stale_heartbeat_lease(runtime, &shared_lease, &heartbeat);
+                        // Restore directives first: state/offset rollback must
+                        // land before any new barrier or completion work.
+                        for cmd in heartbeat.restore_commands() {
+                            let runner_for_restore = Arc::clone(&runner);
+                            let state_for_restore = state_backend.clone();
+                            let storage_for_restore = Arc::clone(&checkpoint_storage);
+                            let cmd = cmd.clone();
+                            let restore_result = tokio::task::spawn_blocking(move || {
+                                runner_for_restore.restore_job_from_checkpoint(
+                                    &cmd,
+                                    &state_for_restore,
+                                    storage_for_restore.as_ref(),
+                                )
+                            })
+                            .await;
+                            match restore_result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => tracing::error!(
+                                    error = %error,
+                                    "restore command failed; job state may be stale until \
+                                     the next restore directive"
+                                ),
+                                Err(join_error) => tracing::error!(
+                                    error = %join_error,
+                                    "restore command task panicked"
+                                ),
+                            }
+                        }
+                        // Completion notifications: commit transactional-sink
+                        // output for durably committed epochs.
+                        for cmd in heartbeat.checkpoint_complete_commands() {
+                            runner.handle_checkpoint_complete(cmd).await;
+                        }
                         for cmd in heartbeat.checkpoint_commands() {
                             if let Ok(job_id) = JobId::try_new(cmd.job_id.as_str()) {
                                 let req = InitiateCheckpointRequest {
@@ -569,7 +603,7 @@ async fn heartbeat_loop(
                                 if let Err(error) = runner
                                     .initiate_checkpoint_for_job(
                                         &req,
-                                        Arc::clone(&state_backend) as Arc<dyn krishiv_state::StateBackend>,
+                                        state_backend.clone(),
                                         Arc::clone(&checkpoint_storage) as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
                                         coord_service.as_ref().clone(),
                                     )

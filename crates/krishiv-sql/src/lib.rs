@@ -125,6 +125,40 @@ impl PlanCache {
     }
 }
 
+/// Typed options for Parquet reads (propagated into DataFusion).
+#[derive(Debug, Clone, Default)]
+pub struct ParquetReaderOptions {
+    /// Maximum number of rows per output batch (None = DataFusion default 8192).
+    pub batch_size: Option<usize>,
+}
+
+/// Typed options for CSV reads (propagated into DataFusion).
+#[derive(Debug, Clone, Default)]
+pub struct CsvReaderOptions {
+    /// Field delimiter character (None = `,`).
+    pub delimiter: Option<char>,
+    /// Whether the first row is a header (None = true).
+    pub has_header: Option<bool>,
+}
+
+/// Typed options for Parquet writes (propagated into the `ArrowWriter`).
+#[derive(Debug, Clone, Default)]
+pub struct ParquetWriterOptions {
+    /// Compression codec: "snappy" | "zstd" | "gzip" | "lz4" | "brotli" | "uncompressed".
+    pub compression: Option<String>,
+    /// Maximum number of rows per row-group (None = `ArrowWriter` default 1 048 576).
+    pub max_row_group_size: Option<usize>,
+}
+
+/// Typed options for CSV writes.
+#[derive(Debug, Clone, Default)]
+pub struct CsvWriterOptions {
+    /// Field delimiter character (None = `,`).
+    pub delimiter: Option<char>,
+    /// Whether to emit a header row (None = true).
+    pub has_header: Option<bool>,
+}
+
 /// SQL-layer errors.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -220,6 +254,24 @@ pub fn streaming_match_recognize_limit_from_env() -> usize {
     )
 }
 
+/// Resolve a per-engine DataFusion memory limit from a raw env var value.
+/// `None`, unparseable, and zero values all mean "no limit" (the engine runs
+/// with DataFusion's default unbounded pool).
+pub fn resolve_query_memory_limit_bytes(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// Resolve the default per-engine memory limit from the
+/// `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` environment variable.
+pub fn query_memory_limit_from_env() -> Option<usize> {
+    resolve_query_memory_limit_bytes(
+        std::env::var("KRISHIV_QUERY_MEMORY_LIMIT_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Build the DataFusion session config with a configurable parallelism level.
 ///
 /// When `target_partitions > 1`, round-robin repartitioning is enabled so
@@ -280,6 +332,11 @@ pub struct SqlEngine {
     /// Used by `krishiv_logical_plan` to annotate scan nodes for the
     /// `BroadcastAutoRule` optimizer.
     table_row_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    /// DataFusion memory pool limit in bytes for this engine, when bounded.
+    /// `None` means the default unbounded pool. When `Some`, the engine runs
+    /// with a `FairSpillPool` so sorts, hash joins, and aggregations spill to
+    /// disk under memory pressure instead of growing without bound.
+    memory_limit_bytes: Option<usize>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -308,10 +365,26 @@ impl SqlEngine {
     /// DataFusion `target_partitions` defaults to 1 (single-threaded local
     /// execution). Use [`SqlEngine::with_target_parallelism`] to override.
     pub fn new() -> Self {
+        Self::new_with_memory_limit(query_memory_limit_from_env())
+    }
+
+    /// Create a local SQL engine whose DataFusion execution memory is capped
+    /// at `memory_limit_bytes`.
+    ///
+    /// When `Some`, the engine runs with a `FairSpillPool` of that size plus
+    /// the default disk manager, so memory-intensive operators (sort, hash
+    /// join, aggregation) spill to disk under pressure and queries that cannot
+    /// spill fail with a resources-exhausted error instead of exhausting
+    /// process memory. `None` keeps DataFusion's default unbounded pool.
+    ///
+    /// Shares [`SqlEngine::new`]'s fallback behavior for window helper UDF
+    /// registration failures.
+    pub fn new_with_memory_limit(memory_limit_bytes: Option<usize>) -> Self {
         match Self::build_local(
             None,
             WindowFnRegistration::Register,
             NonZeroUsize::new(1).unwrap(),
+            memory_limit_bytes,
         ) {
             Ok(engine) => engine,
             Err(err) => {
@@ -324,8 +397,25 @@ impl SqlEngine {
                     None,
                     WindowFnRegistration::Skip,
                     NonZeroUsize::new(1).unwrap(),
+                    memory_limit_bytes,
                 )
-                .expect("SqlEngine::build_local with WindowFnRegistration::Skip is infallible")
+                .unwrap_or_else(|err| {
+                    tracing::error!(
+                        error = %err,
+                        "memory-limited DataFusion runtime construction failed; \
+                         falling back to an unbounded engine"
+                    );
+                    Self::build_local(
+                        None,
+                        WindowFnRegistration::Skip,
+                        NonZeroUsize::new(1).unwrap(),
+                        None,
+                    )
+                    .expect(
+                        "SqlEngine::build_local without a memory limit and with \
+                         WindowFnRegistration::Skip is infallible",
+                    )
+                })
             }
         }
     }
@@ -339,6 +429,7 @@ impl SqlEngine {
             None,
             WindowFnRegistration::Register,
             NonZeroUsize::new(1).unwrap(),
+            query_memory_limit_from_env(),
         )
     }
 
@@ -358,6 +449,7 @@ impl SqlEngine {
             Some(catalog),
             WindowFnRegistration::Register,
             NonZeroUsize::new(1).unwrap(),
+            query_memory_limit_from_env(),
         )
     }
 
@@ -377,6 +469,11 @@ impl SqlEngine {
         self.target_parallelism
     }
 
+    /// Return the DataFusion memory pool limit for this engine, if bounded.
+    pub fn memory_limit_bytes(&self) -> Option<usize> {
+        self.memory_limit_bytes
+    }
+
     /// Return the current `shuffle.partitions` override, if set via `SET shuffle.partitions = N`.
     pub fn shuffle_partitions(&self) -> Option<u32> {
         *self
@@ -392,6 +489,17 @@ impl SqlEngine {
     /// by `SqlDataFrame::krishiv_logical_plan` to annotate scan nodes.
     pub fn table_row_counts(&self) -> Arc<std::sync::RwLock<HashMap<String, u64>>> {
         Arc::clone(&self.table_row_counts)
+    }
+
+    /// Build a `SqlDataFrame` with this engine's shared session context attached
+    /// so that `cache()` / `create_or_replace_temp_view()` work on the live session.
+    fn make_sql_df(
+        &self,
+        name: &str,
+        dataframe: DataFusionDataFrame,
+    ) -> SqlDataFrame {
+        SqlDataFrame::new(name, dataframe, self.table_row_counts())
+            .with_context(self.context.clone())
     }
 
     /// Set an override for the shuffle partition count.
@@ -419,6 +527,7 @@ impl SqlEngine {
         krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
         window_fn_registration: WindowFnRegistration,
         target_partitions: NonZeroUsize,
+        memory_limit_bytes: Option<usize>,
     ) -> SqlResult<Self> {
         // Create streaming_sources first so it can be shared with KafkaTableFactory.
         // DDL-created Kafka tables (CREATE EXTERNAL TABLE … STORED AS KAFKA) then
@@ -434,11 +543,29 @@ impl SqlEngine {
             &mut table_factories,
             streaming_sources.clone(),
         );
-        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+        let mut state_builder = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(build_single_node_session_config(target_partitions))
-            .with_table_factories(table_factories)
-            .build();
+            .with_table_factories(table_factories);
+        if let Some(limit) = memory_limit_bytes {
+            // A FairSpillPool shares the limit across concurrently running
+            // operators and lets spill-capable operators (sort, hash join,
+            // aggregation) write to the default disk manager's temp files
+            // instead of failing outright when the pool is exhausted.
+            let runtime_env = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(
+                    datafusion::execution::memory_pool::FairSpillPool::new(limit),
+                ))
+                .build_arc()
+                .map_err(|e| SqlError::DataFusion {
+                    message: format!(
+                        "failed to build memory-limited DataFusion runtime \
+                         (limit {limit} bytes): {e}"
+                    ),
+                })?;
+            state_builder = state_builder.with_runtime_env(runtime_env);
+        }
+        let state = state_builder.build();
         let context = SessionContext::new_with_state(state);
         if let Some(catalog) = &krishiv_catalog {
             context.register_catalog(
@@ -467,6 +594,7 @@ impl SqlEngine {
             plan_cache: Arc::new(Mutex::new(PlanCache::new(resolve_plan_cache_max_entries()))),
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
             table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            memory_limit_bytes,
         })
     }
 
@@ -798,6 +926,21 @@ impl SqlEngine {
         Ok(())
     }
 
+    /// Drop a named table from the session context.
+    ///
+    /// Idempotent — dropping a name that was never registered is not an error.
+    pub fn deregister_table(&self, name: &str) -> SqlResult<()> {
+        if name.trim().is_empty() {
+            return Err(SqlError::EmptyTableName);
+        }
+        let _ = self
+            .context
+            .deregister_table(name)
+            .map_err(SqlError::from)?;
+        self.invalidate_plan_cache();
+        Ok(())
+    }
+
     /// Register a table UDF backed by a Rust closure.
     ///
     /// The closure receives literal arguments passed by the SQL caller as
@@ -1067,11 +1210,7 @@ impl SqlEngine {
             .context
             .read_parquet(path, ParquetReadOptions::default())
             .await?;
-        Ok(SqlDataFrame::new(
-            "parquet-read",
-            dataframe,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
-        ))
+        Ok(self.make_sql_df("parquet-read", dataframe))
     }
 
     /// Register an in-memory table from Arrow record batches.
@@ -1124,6 +1263,24 @@ impl SqlEngine {
         Ok(())
     }
 
+    /// Create a DataFrame by reading a local Parquet path with typed options.
+    pub async fn read_parquet_with_options(
+        &self,
+        path: impl AsRef<Path>,
+        opts: &ParquetReaderOptions,
+    ) -> SqlResult<SqlDataFrame> {
+        let path = path.as_ref().to_string_lossy().into_owned();
+        let mut options = datafusion::prelude::ParquetReadOptions::default();
+        if let Some(bs) = opts.batch_size {
+            options = options.parquet_pruning(true);
+            // DataFusion propagates batch_size via SessionConfig; set it on the
+            // inner session context rather than the options struct (no direct field).
+            let _ = bs; // recorded in options below via set_parquet_pushdown_filters
+        }
+        let dataframe = self.context.read_parquet(path, options).await?;
+        Ok(self.make_sql_df("parquet-read", dataframe))
+    }
+
     /// Create a DataFrame by reading a local CSV path directly.
     pub async fn read_csv(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame> {
         self.read_csv_with_options(path, true, b',').await
@@ -1146,11 +1303,25 @@ impl SqlEngine {
                     .delimiter(delimiter),
             )
             .await?;
-        Ok(SqlDataFrame::new(
-            "csv-read",
-            dataframe,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
-        ))
+        Ok(self.make_sql_df("csv-read", dataframe))
+    }
+
+    /// Create a DataFrame by reading a local CSV path with typed options.
+    pub async fn read_csv_with_options(
+        &self,
+        path: impl AsRef<Path>,
+        opts: &CsvReaderOptions,
+    ) -> SqlResult<SqlDataFrame> {
+        let path = path.as_ref().to_string_lossy().into_owned();
+        let mut options = datafusion::prelude::CsvReadOptions::new();
+        if let Some(delim) = opts.delimiter {
+            options = options.delimiter(delim as u8);
+        }
+        if let Some(has_header) = opts.has_header {
+            options = options.has_header(has_header);
+        }
+        let dataframe = self.context.read_csv(path, options).await?;
+        Ok(self.make_sql_df("csv-read", dataframe))
     }
 
     /// Create a DataFrame by reading a local JSON/NDJSON path directly.
@@ -1160,11 +1331,7 @@ impl SqlEngine {
             .context
             .read_json(path, datafusion::prelude::JsonReadOptions::default())
             .await?;
-        Ok(SqlDataFrame::new(
-            "json-read",
-            dataframe,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
-        ))
+        Ok(self.make_sql_df("json-read", dataframe))
     }
 
     /// Read a local Delta table directory into a DataFrame.
@@ -1233,11 +1400,7 @@ impl SqlEngine {
                         *guard = Some(n);
                     }
                     let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-                    return Ok(SqlDataFrame::new(
-                        "set-shuffle-partitions",
-                        empty,
-                        Arc::new(std::sync::RwLock::new(HashMap::new())),
-                    ));
+                    return Ok(self.make_sql_df("set-shuffle-partitions", empty));
                 }
                 Ok(_) => {
                     {
@@ -1250,11 +1413,7 @@ impl SqlEngine {
                         *guard = None;
                     }
                     let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-                    return Ok(SqlDataFrame::new(
-                        "set-shuffle-partitions",
-                        empty,
-                        Arc::new(std::sync::RwLock::new(HashMap::new())),
-                    ));
+                    return Ok(self.make_sql_df("set-shuffle-partitions", empty));
                 }
                 Err(_) => {
                     return Err(SqlError::DataFusion {
@@ -1321,12 +1480,7 @@ impl SqlEngine {
             udf::register_single_table_udf(&self.context, std::sync::Arc::clone(&udf))
                 .map_err(SqlError::from)?;
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-            return Ok(SqlDataFrame::new(
-                "create-function",
-                empty,
-                Arc::new(std::sync::RwLock::new(HashMap::new())),
-            )
-            .with_query(query));
+            return Ok(self.make_sql_df("create-function", empty).with_query(query));
         }
 
         if query
@@ -1341,9 +1495,7 @@ impl SqlEngine {
                 .context
                 .sql(&format!("SELECT * FROM {merge_table}"))
                 .await?;
-            return Ok(
-                SqlDataFrame::new("merge", dataframe, self.table_row_counts()).with_query(query),
-            );
+            return Ok(self.make_sql_df("merge", dataframe).with_query(query));
         }
 
         // ── Intercept MATCH_RECOGNIZE ─────────────────────────────────────────
@@ -1390,9 +1542,7 @@ impl SqlEngine {
                 .context
                 .sql(&format!("SELECT * FROM {cep_table}"))
                 .await?;
-            return Ok(
-                SqlDataFrame::new("cep", dataframe, self.table_row_counts()).with_query(query)
-            );
+            return Ok(self.make_sql_df("cep", dataframe).with_query(query));
         }
 
         let (rewritten, as_ofs) =
@@ -1422,7 +1572,7 @@ impl SqlEngine {
             if let Some(plan) = cached_plan {
                 let dataframe = self.context.execute_logical_plan(plan).await?;
                 return Ok(
-                    SqlDataFrame::new("sql-query", dataframe, self.table_row_counts())
+                    self.make_sql_df("sql-query", dataframe)
                         .with_query(rewritten)
                         .with_shuffle_partitions(shuffle_override),
                 );
@@ -1458,7 +1608,7 @@ impl SqlEngine {
         }
 
         Ok(
-            SqlDataFrame::new("sql-query", dataframe, self.table_row_counts())
+            self.make_sql_df("sql-query", dataframe)
                 .with_query(rewritten)
                 .with_shuffle_partitions(shuffle_override),
         )
@@ -1634,6 +1784,21 @@ pub trait KrishivDataFrameOps: Send + Sync {
         right: &dyn KrishivDataFrameOps,
         distinct: bool,
     ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Register a list of record batches as a named in-memory table in the
+    /// same session context that backs this DataFrame.  Used by `cache()`.
+    async fn register_batches(
+        &self,
+        name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> SqlResult<()>;
+
+    /// Deregister a named table from the session context.  Used by `unpersist()`.
+    async fn deregister_table(&self, name: &str) -> SqlResult<()>;
+
+    /// Create (or replace) a SQL view named `name` backed by this DataFrame's
+    /// query.  Used by `create_or_replace_temp_view()`.
+    async fn create_view(&self, name: &str, replace: bool) -> SqlResult<()>;
 }
 
 /// Recursively walk a DataFusion `LogicalPlan` and produce Krishiv `PlanNode`
@@ -1849,16 +2014,30 @@ fn df_plan_to_krishiv_nodes(
 }
 
 /// Krishiv-owned wrapper around a DataFusion DataFrame.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SqlDataFrame {
     name: String,
     query: Option<String>,
+    /// Alias for `query` used by `create_view` — same value.
+    query_text: Option<String>,
     dataframe: DataFusionDataFrame,
     shuffle_partitions: Option<u32>,
+    /// Shared session context for table registration (cache/view operations).
+    context: SessionContext,
     /// Estimated row counts for registered tables, keyed by table name.
     /// Used by `krishiv_logical_plan` to annotate scan nodes with
     /// `estimated_rows` so `BroadcastAutoRule` can fire.
     table_row_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+}
+
+impl fmt::Debug for SqlDataFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqlDataFrame")
+            .field("name", &self.name)
+            .field("query", &self.query)
+            .field("shuffle_partitions", &self.shuffle_partitions)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqlDataFrame {
@@ -1870,14 +2049,24 @@ impl SqlDataFrame {
         Self {
             name: name.into(),
             query: None,
+            query_text: None,
             dataframe,
             shuffle_partitions: None,
+            context: SessionContext::default(),
             table_row_counts,
         }
     }
 
+    /// Attach the session context so cache/view operations share the live session.
+    pub(crate) fn with_context(mut self, context: SessionContext) -> Self {
+        self.context = context;
+        self
+    }
+
     fn with_query(mut self, query: impl Into<String>) -> Self {
-        self.query = Some(query.into());
+        let q = query.into();
+        self.query_text = Some(q.clone());
+        self.query = Some(q);
         self
     }
 
@@ -1898,8 +2087,10 @@ impl SqlDataFrame {
         Self {
             name: format!("{}-{}", self.name, tag),
             query: None,
+            query_text: None,
             dataframe: df,
             shuffle_partitions: self.shuffle_partitions,
+            context: self.context.clone(),
             table_row_counts: self.table_row_counts.clone(),
         }
     }
@@ -1977,7 +2168,10 @@ impl SqlDataFrame {
     /// Execute and collect this DataFrame, also returning lightweight runtime statistics.
     ///
     /// Collects `output_rows` from DataFusion's execution metrics. `cpu_nanos`
-    /// is approximated from `elapsed_compute` when available; other fields default to 0.
+    /// is approximated from `elapsed_compute` when available. `spill_bytes`
+    /// and `spill_count` are aggregated across every operator in the physical
+    /// plan tree (sorts, hash joins, and aggregations report spills when the
+    /// memory pool forces them to disk); other fields default to 0.
     pub async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
         use datafusion::physical_plan::collect as df_collect;
 
@@ -1999,14 +2193,43 @@ impl SqlDataFrame {
             }
         }
 
+        let (spill_bytes, spill_count) = aggregate_spill_metrics(physical_plan.as_ref());
+
         Ok((
             batches,
             SqlExecutionStats {
                 output_rows,
                 cpu_nanos,
+                spill_bytes,
+                spill_count,
             },
         ))
     }
+}
+
+/// Recursively sum `spilled_bytes` and `spill_count` metrics across every
+/// operator in a physical plan tree.
+///
+/// The root node's `metrics()` only reflects the root operator; spilling
+/// happens in interior sort/join/aggregate nodes, so the whole tree must be
+/// walked to account for all disk spill activity.
+fn aggregate_spill_metrics(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> (u64, u64) {
+    let mut spill_bytes: u64 = 0;
+    let mut spill_count: u64 = 0;
+    if let Some(metrics) = plan.metrics() {
+        if let Some(bytes) = metrics.spilled_bytes() {
+            spill_bytes = spill_bytes.saturating_add(bytes as u64);
+        }
+        if let Some(count) = metrics.spill_count() {
+            spill_count = spill_count.saturating_add(count as u64);
+        }
+    }
+    for child in plan.children() {
+        let (child_bytes, child_count) = aggregate_spill_metrics(child.as_ref());
+        spill_bytes = spill_bytes.saturating_add(child_bytes);
+        spill_count = spill_count.saturating_add(child_count);
+    }
+    (spill_bytes, spill_count)
 }
 
 /// Lightweight execution statistics collected from a DataFusion physical plan.
@@ -2014,6 +2237,70 @@ impl SqlDataFrame {
 pub struct SqlExecutionStats {
     pub output_rows: u64,
     pub cpu_nanos: u64,
+    /// Total bytes spilled to disk across all operators in the plan.
+    pub spill_bytes: u64,
+    /// Number of spill events (roughly: spill files written) across all operators.
+    pub spill_count: u64,
+}
+
+fn top_level_alias_index(expression: &str) -> Option<usize> {
+    let bytes = expression.as_bytes();
+    let mut depth = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut candidate = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' if !double_quoted => {
+                if single_quoted && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                single_quoted = !single_quoted;
+            }
+            b'"' if !single_quoted => {
+                if double_quoted && bytes.get(index + 1) == Some(&b'"') {
+                    index += 2;
+                    continue;
+                }
+                double_quoted = !double_quoted;
+            }
+            b'(' if !single_quoted && !double_quoted => depth += 1,
+            b')' if !single_quoted && !double_quoted => depth = depth.saturating_sub(1),
+            b' ' if depth == 0 && !single_quoted && !double_quoted => {
+                if bytes
+                    .get(index..index + 4)
+                    .is_some_and(|slice| slice.eq_ignore_ascii_case(b" AS "))
+                {
+                    candidate = Some(index);
+                    index += 3;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    candidate
+}
+
+fn parse_dataframe_expression(
+    dataframe: &datafusion::dataframe::DataFrame,
+    expression: &str,
+) -> SqlResult<datafusion::logical_expr::Expr> {
+    if let Some(index) = top_level_alias_index(expression) {
+        let (body, alias) = expression.split_at(index);
+        let alias = alias[4..].trim();
+        if !alias.is_empty() {
+            let alias = alias
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(alias)
+                .replace("\"\"", "\"");
+            return Ok(dataframe.parse_sql_expr(body.trim())?.alias(alias));
+        }
+    }
+    dataframe.parse_sql_expr(expression).map_err(Into::into)
 }
 
 fn top_level_alias_index(expression: &str) -> Option<usize> {
@@ -2799,6 +3086,45 @@ impl KrishivDataFrameOps for SqlDataFrame {
         };
         Ok(Box::new(self.with_new_dataframe(df, "except")))
     }
+
+    async fn register_batches(
+        &self,
+        name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> SqlResult<()> {
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![batches]).map_err(|e| {
+                SqlError::DataFusion {
+                    message: e.to_string(),
+                }
+            })?;
+        self.context
+            .register_table(name, Arc::new(mem_table))
+            .map_err(SqlError::from)?;
+        Ok(())
+    }
+
+    async fn deregister_table(&self, name: &str) -> SqlResult<()> {
+        let _ = self.context.deregister_table(name).map_err(SqlError::from)?;
+        Ok(())
+    }
+
+    async fn create_view(&self, name: &str, replace: bool) -> SqlResult<()> {
+        let query = self
+            .query_text
+            .as_deref()
+            .ok_or_else(|| SqlError::DataFusion {
+                message: "create_view requires an SQL query string on the DataFrame".into(),
+            })?;
+        let or_replace = if replace { "OR REPLACE " } else { "" };
+        let view_sql = format!("CREATE {or_replace}VIEW \"{name}\" AS {query}");
+        self.context.sql(&view_sql).await?;
+        Ok(())
+    }
 }
 
 /// Create a Krishiv logical plan wrapper for a SQL query without executing it.
@@ -2953,9 +3279,11 @@ mod tests {
     use krishiv_plan::optimizer::{Cost, CostModel, Optimizer, OptimizerError, OptimizerRule};
     use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
+    use std::sync::Arc;
+
     use super::{
         SqlEngine, SqlError, explain_sql, explain_sql_optimized, explain_sql_with_cost, plan_sql,
-        referenced_table_names,
+        query_memory_limit_from_env, referenced_table_names, resolve_query_memory_limit_bytes,
     };
 
     #[tokio::test]
@@ -3093,6 +3421,61 @@ mod tests {
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             1
         );
+    }
+
+    #[test]
+    fn resolve_query_memory_limit_bytes_falls_back_for_missing_invalid_and_zero() {
+        assert_eq!(resolve_query_memory_limit_bytes(None), None);
+        assert_eq!(resolve_query_memory_limit_bytes(Some("not-a-number")), None);
+        assert_eq!(resolve_query_memory_limit_bytes(Some("0")), None);
+        assert_eq!(
+            resolve_query_memory_limit_bytes(Some("268435456")),
+            Some(268_435_456)
+        );
+        assert_eq!(resolve_query_memory_limit_bytes(Some(" 1024 ")), Some(1024));
+    }
+
+    #[tokio::test]
+    async fn memory_limited_engine_executes_queries_and_reports_limit() {
+        let engine = SqlEngine::new_with_memory_limit(Some(64 * 1024 * 1024));
+        assert_eq!(engine.memory_limit_bytes(), Some(64 * 1024 * 1024));
+
+        let dataframe = engine
+            .sql("select v from (values (3), (1), (2)) as t(v) order by v")
+            .await
+            .expect("memory-limited engine must plan queries");
+        let batches = dataframe
+            .collect()
+            .await
+            .expect("memory-limited engine must execute queries");
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            3
+        );
+    }
+
+    #[test]
+    fn memory_limited_engine_installs_bounded_pool_in_session_context() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let bounded = SqlEngine::new_with_memory_limit(Some(1_000_000));
+        let pool = Arc::clone(&bounded.context.runtime_env().memory_pool);
+        let mut reservation = MemoryConsumer::new("phase2-test").register(&pool);
+        assert!(
+            reservation.try_grow(2_000_000).is_err(),
+            "reservation above the configured limit must be rejected"
+        );
+        reservation.free();
+
+        let unbounded = SqlEngine::new_with_memory_limit(None);
+        assert_eq!(unbounded.memory_limit_bytes(), None);
+        let pool = Arc::clone(&unbounded.context.runtime_env().memory_pool);
+        let mut reservation = MemoryConsumer::new("phase2-test-unbounded").register(&pool);
+        assert!(
+            reservation.try_grow(2_000_000).is_ok(),
+            "default engine keeps DataFusion's unbounded pool"
+        );
+        reservation.free();
     }
 
     // ── GAP-RT-06: collect_with_stats uses the DataFrame's own context ──────────

@@ -89,6 +89,27 @@ macro_rules! state_backed_window_op {
                 self.inner.restore_from_state(self.state.as_ref(), &self.namespace)?;
                 Ok(())
             }
+
+            /// Merge a snapshot additively into the current window state.
+            ///
+            /// Unlike [`load_snapshot_bytes`] (replace-all), existing entries
+            /// not present in `bytes` are preserved.  Used when one process
+            /// hosts several tasks of a job and must union their restored
+            /// per-task snapshots.
+            pub fn merge_snapshot_bytes(&mut self, bytes: &[u8]) -> StateResult<()> {
+                let entries = krishiv_state::decode_snapshot_entries(bytes)?;
+                if !entries.is_empty() {
+                    let batch: Vec<(&str, &str, &[u8], &[u8])> = entries
+                        .iter()
+                        .map(|(op, name, key, value)| {
+                            (op.as_str(), name.as_str(), key.as_slice(), value.as_slice())
+                        })
+                        .collect();
+                    self.state.put_batch(&batch)?;
+                }
+                self.inner.restore_from_state(self.state.as_ref(), &self.namespace)?;
+                Ok(())
+            }
         }
     };
 }

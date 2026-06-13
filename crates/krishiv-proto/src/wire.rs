@@ -13,10 +13,10 @@ use crate::ids::{
 use crate::lifecycle::{ExecutorState, TaskState};
 use crate::task::{
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment, InputPartition,
-    InputPartitionDescriptor, KeyGroupRange, MemoryKafkaRecord, OutputContract,
-    OutputContractDescriptor, OutputContractKind, PlanFragment, RegisterExecutorRequest,
-    RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest, TaskStatusRequest,
-    TaskStatusResponse, TransportDisposition,
+    InputPartitionDescriptor, KeyGroupRange, MemoryKafkaRecord, MissingShufflePartition,
+    OutputContract, OutputContractDescriptor, OutputContractKind, PlanFragment,
+    RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest,
+    TaskStatusRequest, TaskStatusResponse, TransportDisposition,
 };
 
 pub mod v1 {
@@ -330,6 +330,24 @@ pub fn executor_heartbeat_response_to_wire(
                 fencing_token: cmd.fencing_token.as_u64(),
             })
             .collect(),
+        completed_checkpoints: value
+            .checkpoint_complete_commands()
+            .iter()
+            .map(|cmd| v1::CheckpointCompleteCommand {
+                job_id: cmd.job_id.as_str().to_owned(),
+                epoch: cmd.epoch,
+                fencing_token: cmd.fencing_token.as_u64(),
+            })
+            .collect(),
+        restore_checkpoints: value
+            .restore_commands()
+            .iter()
+            .map(|cmd| v1::RestoreFromCheckpointCommand {
+                job_id: cmd.job_id.as_str().to_owned(),
+                epoch: cmd.epoch,
+                fencing_token: cmd.fencing_token.as_u64(),
+            })
+            .collect(),
         source_throttles: value
             .throttle_commands()
             .iter()
@@ -389,6 +407,44 @@ pub fn executor_heartbeat_response_from_wire(
             })
             .collect::<WireResult<Vec<_>>>()?;
         response = response.with_checkpoint_commands(cmds);
+    }
+    if !value.completed_checkpoints.is_empty() {
+        use crate::ids::{FencingToken, JobId};
+        use crate::task::CheckpointCompleteCommand;
+        let cmds = value
+            .completed_checkpoints
+            .into_iter()
+            .map(|cmd| {
+                let job_id = JobId::try_new(cmd.job_id).map_err(WireError::from_id)?;
+                let fencing_token =
+                    FencingToken::try_new(cmd.fencing_token).map_err(WireError::from_id)?;
+                Ok(CheckpointCompleteCommand {
+                    job_id,
+                    epoch: cmd.epoch,
+                    fencing_token,
+                })
+            })
+            .collect::<WireResult<Vec<_>>>()?;
+        response = response.with_checkpoint_complete_commands(cmds);
+    }
+    if !value.restore_checkpoints.is_empty() {
+        use crate::ids::{FencingToken, JobId};
+        use crate::task::RestoreFromCheckpointCommand;
+        let cmds = value
+            .restore_checkpoints
+            .into_iter()
+            .map(|cmd| {
+                let job_id = JobId::try_new(cmd.job_id).map_err(WireError::from_id)?;
+                let fencing_token =
+                    FencingToken::try_new(cmd.fencing_token).map_err(WireError::from_id)?;
+                Ok(RestoreFromCheckpointCommand {
+                    job_id,
+                    epoch: cmd.epoch,
+                    fencing_token,
+                })
+            })
+            .collect::<WireResult<Vec<_>>>()?;
+        response = response.with_restore_commands(cmds);
     }
     if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
         response = response.with_trace_context(ctx);
@@ -642,6 +698,14 @@ pub fn executor_task_assignment_from_wire(
 /// Convert a domain task status request to protobuf.
 pub fn task_status_request_to_wire(value: TaskStatusRequest) -> v1::TaskStatusRequest {
     let (trace_parent, trace_state) = trace_context_to_wire(value.trace_context());
+    let missing_shuffle_partitions = value
+        .missing_shuffle_partitions()
+        .iter()
+        .map(|m| v1::MissingShufflePartitionWire {
+            stage_id: m.stage_id().as_str().to_owned(),
+            partition_id: m.partition_id(),
+        })
+        .collect();
     v1::TaskStatusRequest {
         version: Some(transport_version_to_wire(value.version())),
         job_id: value.job_id().as_str().to_owned(),
@@ -655,6 +719,7 @@ pub fn task_status_request_to_wire(value: TaskStatusRequest) -> v1::TaskStatusRe
         output_metadata: value.output_metadata().map(task_output_metadata_to_wire),
         trace_parent,
         trace_state,
+        missing_shuffle_partitions,
     }
 }
 
@@ -683,6 +748,14 @@ pub fn task_status_request_from_wire(
     }
     if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
         request = request.with_trace_context(ctx);
+    }
+    if !value.missing_shuffle_partitions.is_empty() {
+        let mut missing = Vec::with_capacity(value.missing_shuffle_partitions.len());
+        for m in value.missing_shuffle_partitions {
+            let stage_id = StageId::try_new(m.stage_id).map_err(WireError::from_id)?;
+            missing.push(MissingShufflePartition::new(stage_id, m.partition_id));
+        }
+        request = request.with_missing_shuffle_partitions(missing);
     }
     Ok(request)
 }
@@ -792,6 +865,7 @@ fn task_output_metadata_to_wire(value: &TaskOutputMetadata) -> v1::TaskOutputMet
             .iter()
             .map(hot_key_report_to_wire)
             .collect(),
+        sink_staged_files: value.sink_staged_files().to_vec(),
     }
 }
 
@@ -868,6 +942,9 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
             .map(hot_key_report_from_wire)
             .collect::<WireResult<Vec<_>>>()?;
         meta = meta.with_hot_key_reports(reports);
+    }
+    if !value.sink_staged_files.is_empty() {
+        meta = meta.with_sink_staged_files(value.sink_staged_files);
     }
     Ok(meta)
 }
@@ -1605,6 +1682,7 @@ pub fn trigger_savepoint_request_to_wire(
     v1::TriggerSavepointRequest {
         job_id: value.job_id.as_str().to_owned(),
         label: value.label,
+        stop: value.stop,
     }
 }
 
@@ -1614,6 +1692,7 @@ pub fn trigger_savepoint_request_from_wire(
     Ok(crate::management::TriggerSavepointRequest {
         job_id: JobId::try_new(value.job_id).map_err(WireError::from_id)?,
         label: value.label,
+        stop: value.stop,
     })
 }
 
@@ -1642,6 +1721,7 @@ pub fn restore_job_request_to_wire(
         job_id: value.job_id.as_str().to_owned(),
         epoch: value.epoch,
         storage_path: value.storage_path,
+        from_savepoint: value.from_savepoint,
     }
 }
 
@@ -1655,6 +1735,7 @@ pub fn restore_job_request_from_wire(
         job_id: JobId::try_new(value.job_id).map_err(WireError::from_id)?,
         epoch: value.epoch,
         storage_path: value.storage_path,
+        from_savepoint: value.from_savepoint,
     })
 }
 
