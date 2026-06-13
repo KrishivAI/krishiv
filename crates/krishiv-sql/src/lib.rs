@@ -1283,27 +1283,7 @@ impl SqlEngine {
 
     /// Create a DataFrame by reading a local CSV path directly.
     pub async fn read_csv(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame> {
-        self.read_csv_with_options(path, true, b',').await
-    }
-
-    /// Create a DataFrame with typed CSV parsing options.
-    pub async fn read_csv_with_options(
-        &self,
-        path: impl AsRef<Path>,
-        has_header: bool,
-        delimiter: u8,
-    ) -> SqlResult<SqlDataFrame> {
-        let path = path.as_ref().to_string_lossy().into_owned();
-        let dataframe = self
-            .context
-            .read_csv(
-                path,
-                datafusion::prelude::CsvReadOptions::new()
-                    .has_header(has_header)
-                    .delimiter(delimiter),
-            )
-            .await?;
-        Ok(self.make_sql_df("csv-read", dataframe))
+        self.read_csv_with_options(path, &CsvReaderOptions::default()).await
     }
 
     /// Create a DataFrame by reading a local CSV path with typed options.
@@ -2241,66 +2221,6 @@ pub struct SqlExecutionStats {
     pub spill_bytes: u64,
     /// Number of spill events (roughly: spill files written) across all operators.
     pub spill_count: u64,
-}
-
-fn top_level_alias_index(expression: &str) -> Option<usize> {
-    let bytes = expression.as_bytes();
-    let mut depth = 0usize;
-    let mut single_quoted = false;
-    let mut double_quoted = false;
-    let mut candidate = None;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\'' if !double_quoted => {
-                if single_quoted && bytes.get(index + 1) == Some(&b'\'') {
-                    index += 2;
-                    continue;
-                }
-                single_quoted = !single_quoted;
-            }
-            b'"' if !single_quoted => {
-                if double_quoted && bytes.get(index + 1) == Some(&b'"') {
-                    index += 2;
-                    continue;
-                }
-                double_quoted = !double_quoted;
-            }
-            b'(' if !single_quoted && !double_quoted => depth += 1,
-            b')' if !single_quoted && !double_quoted => depth = depth.saturating_sub(1),
-            b' ' if depth == 0 && !single_quoted && !double_quoted => {
-                if bytes
-                    .get(index..index + 4)
-                    .is_some_and(|slice| slice.eq_ignore_ascii_case(b" AS "))
-                {
-                    candidate = Some(index);
-                    index += 3;
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    candidate
-}
-
-fn parse_dataframe_expression(
-    dataframe: &datafusion::dataframe::DataFrame,
-    expression: &str,
-) -> SqlResult<datafusion::logical_expr::Expr> {
-    if let Some(index) = top_level_alias_index(expression) {
-        let (body, alias) = expression.split_at(index);
-        let alias = alias[4..].trim();
-        if !alias.is_empty() {
-            let alias = alias
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-                .unwrap_or(alias)
-                .replace("\"\"", "\"");
-            return Ok(dataframe.parse_sql_expr(body.trim())?.alias(alias));
-        }
-    }
-    dataframe.parse_sql_expr(expression).map_err(Into::into)
 }
 
 fn top_level_alias_index(expression: &str) -> Option<usize> {

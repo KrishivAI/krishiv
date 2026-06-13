@@ -1400,9 +1400,13 @@ impl Session {
         has_header: bool,
         delimiter: u8,
     ) -> Result<DataFrame> {
+        let opts = krishiv_sql::CsvReaderOptions {
+            has_header: Some(has_header),
+            delimiter: Some(delimiter as char),
+        };
         let sql_dataframe = self
             .sql_engine
-            .read_csv_with_options(path, has_header, delimiter)
+            .read_csv_with_options(path, &opts)
             .await
             .map_err(KrishivError::from)?;
         Ok(self.dataframe_from_sql(sql_dataframe))
