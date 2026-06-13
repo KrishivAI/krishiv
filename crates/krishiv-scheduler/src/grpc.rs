@@ -191,6 +191,13 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                 if !effects.checkpoint_commands.is_empty() {
                     resp = resp.with_checkpoint_commands(effects.checkpoint_commands);
                 }
+                if !effects.checkpoint_complete_commands.is_empty() {
+                    resp = resp
+                        .with_checkpoint_complete_commands(effects.checkpoint_complete_commands);
+                }
+                if !effects.restore_commands.is_empty() {
+                    resp = resp.with_restore_commands(effects.restore_commands);
+                }
                 resp
             }
             Err(SchedulerError::UnknownExecutor { .. }) => ExecutorHeartbeatResponse::new(
@@ -323,6 +330,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                 finalize_result.map_err(|error| {
                     tonic::Status::internal(format!("checkpoint finalize failed: {error}"))
                 })?;
+                // Post-commit: preserve savepoint epochs and drive
+                // stop-with-savepoint, mirroring the sync ack path.
+                coordinator.on_checkpoint_epoch_committed(&job_id, ack_epoch);
             }
         }
 
@@ -347,12 +357,22 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
             Some(req.label)
         };
         let mut coordinator = self.coordinator.write().await;
-        let epoch = coordinator
-            .savepoint_job(&req.job_id, label)
-            .map_err(status_from_scheduler_error)?;
+        let epoch = if req.stop {
+            coordinator
+                .stop_job_with_savepoint(&req.job_id, label)
+                .map_err(status_from_scheduler_error)?
+        } else {
+            coordinator
+                .savepoint_job(&req.job_id, label)
+                .map_err(status_from_scheduler_error)?
+        };
         Ok(tonic::Response::new(TriggerSavepointResponse {
             epoch,
-            message: String::new(),
+            message: if req.stop {
+                format!("job will stop after savepoint epoch {epoch} commits")
+            } else {
+                String::new()
+            },
         }))
     }
 
@@ -373,12 +393,22 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         };
         let mut checkpoint_inner = self.coordinator.checkpoint_inner.write().await;
         let mut coordinator = self.coordinator.write().await;
-        match coordinator.activate_job_restore_from_checkpoint_with_fencing(
-            &req.job_id,
-            req.epoch,
-            &req.storage_path,
-            leader_token,
-        ) {
+        let restore_result = if req.from_savepoint {
+            coordinator.restore_job_from_savepoint(
+                &req.job_id,
+                req.epoch,
+                &req.storage_path,
+                leader_token,
+            )
+        } else {
+            coordinator.activate_job_restore_from_checkpoint_with_fencing(
+                &req.job_id,
+                req.epoch,
+                &req.storage_path,
+                leader_token,
+            )
+        };
+        match restore_result {
             Ok(_meta) => {
                 crate::coordinator_sharded::sync_checkpoint_to_inner(
                     &coordinator.checkpoint_coordinators,
@@ -667,6 +697,7 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         let domain = TriggerSavepointRequest {
             job_id,
             label: w.label,
+            stop: w.stop,
         };
         let resp = CoordinatorManagementService::trigger_savepoint(
             &self.inner,
@@ -676,7 +707,7 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         .into_inner();
         Ok(tonic::Response::new(wire::v1::TriggerSavepointResponse {
             epoch: resp.epoch,
-            message: String::new(),
+            message: resp.message,
         }))
     }
 
@@ -692,6 +723,7 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
             job_id,
             epoch: w.epoch,
             storage_path: w.storage_path,
+            from_savepoint: w.from_savepoint,
         };
         let resp = CoordinatorManagementService::restore_job(
             &self.inner,

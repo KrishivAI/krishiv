@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod connector_tests {
     use crate::*;
-    use std::any::Any;
     use std::sync::Arc;
 
     use arrow::array::Int32Array;

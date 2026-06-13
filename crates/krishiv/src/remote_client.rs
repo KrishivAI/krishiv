@@ -91,6 +91,7 @@ impl RemoteCoordinatorClient {
         let req = krishiv_proto::wire::v1::TriggerSavepointRequest {
             job_id: job_id.to_owned(),
             label: String::new(),
+            stop: false,
         };
         let request = self.request(req)?;
         self.client()?
@@ -109,6 +110,7 @@ impl RemoteCoordinatorClient {
         let req = krishiv_proto::wire::v1::TriggerSavepointRequest {
             job_id: job_id.to_owned(),
             label: label.to_owned(),
+            stop: false,
         };
         let request = self.request(req)?;
         let resp = self
@@ -130,6 +132,7 @@ impl RemoteCoordinatorClient {
             job_id: job_id.to_owned(),
             epoch,
             storage_path: storage_path.to_owned(),
+            from_savepoint: false,
         };
         let request = self.request(req)?;
         let resp = self

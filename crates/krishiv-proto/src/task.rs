@@ -619,6 +619,27 @@ pub struct InitiateCheckpointCommand {
     pub fencing_token: FencingToken,
 }
 
+/// Coordinator → executor: checkpoint epoch is durably committed (delivered
+/// via heartbeat).  Executors commit transactional-sink output prepared at or
+/// before `epoch` when they receive this command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointCompleteCommand {
+    pub job_id: JobId,
+    pub epoch: u64,
+    pub fencing_token: FencingToken,
+}
+
+/// Coordinator → executor: restore job state from checkpoint `epoch`
+/// (delivered via heartbeat).  Executors reload operator snapshots into their
+/// state backends, re-seed source offsets, and abort transactional-sink output
+/// prepared after `epoch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreFromCheckpointCommand {
+    pub job_id: JobId,
+    pub epoch: u64,
+    pub fencing_token: FencingToken,
+}
+
 /// Executor heartbeat response sent from coordinator to executor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorHeartbeatResponse {
@@ -631,6 +652,10 @@ pub struct ExecutorHeartbeatResponse {
     /// LLM throttle commands for executor-wide rate limiters (R17).
     llm_throttles: Vec<LlmThrottleCommand>,
     checkpoint_commands: Vec<InitiateCheckpointCommand>,
+    /// Committed-epoch notifications driving transactional-sink commits.
+    checkpoint_complete_commands: Vec<CheckpointCompleteCommand>,
+    /// Restore directives driving executor-side state/offset reload.
+    restore_commands: Vec<RestoreFromCheckpointCommand>,
     /// W3C trace context for distributed tracing (R8 wiring).
     trace_context: Option<TraceContext>,
 }
@@ -646,6 +671,8 @@ impl ExecutorHeartbeatResponse {
             throttle_commands: Vec::new(),
             llm_throttles: Vec::new(),
             checkpoint_commands: Vec::new(),
+            checkpoint_complete_commands: Vec::new(),
+            restore_commands: Vec::new(),
             trace_context: None,
         }
     }
@@ -696,6 +723,33 @@ impl ExecutorHeartbeatResponse {
 
     pub fn checkpoint_commands(&self) -> &[InitiateCheckpointCommand] {
         &self.checkpoint_commands
+    }
+
+    /// Attach committed-epoch notifications for transactional-sink commits.
+    #[must_use]
+    pub fn with_checkpoint_complete_commands(
+        mut self,
+        cmds: Vec<CheckpointCompleteCommand>,
+    ) -> Self {
+        self.checkpoint_complete_commands = cmds;
+        self
+    }
+
+    /// Committed-epoch notifications in this response.
+    pub fn checkpoint_complete_commands(&self) -> &[CheckpointCompleteCommand] {
+        &self.checkpoint_complete_commands
+    }
+
+    /// Attach restore directives for executor-side state/offset reload.
+    #[must_use]
+    pub fn with_restore_commands(mut self, cmds: Vec<RestoreFromCheckpointCommand>) -> Self {
+        self.restore_commands = cmds;
+        self
+    }
+
+    /// Restore directives in this response.
+    pub fn restore_commands(&self) -> &[RestoreFromCheckpointCommand] {
+        &self.restore_commands
     }
 
     /// Transport version.

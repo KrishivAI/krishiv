@@ -183,6 +183,57 @@ impl WindowJoin {
         Ok(output)
     }
 
+    /// Current watermark (max event-time seen minus lag, `i64::MIN` initially).
+    pub fn watermark_ms(&self) -> i64 {
+        self.watermark_ms
+    }
+
+    /// Total buffered rows across both inputs (observability/tests).
+    pub fn buffered_rows(&self) -> usize {
+        self.left_buf.values().map(Vec::len).sum::<usize>()
+            + self.right_buf.values().map(Vec::len).sum::<usize>()
+    }
+
+    /// Serialize the join's buffered windows and watermark to portable bytes.
+    ///
+    /// Layout (all integers little-endian):
+    /// `[u32 version=1][i64 watermark]` followed by the left then the right
+    /// buffer, each as `[u64 group_count]` then per group
+    /// `[u32 key_len][key][i64 window_start][u32 ipc_len][Arrow IPC stream]`
+    /// where the IPC stream holds the group's buffered rows as one batch.
+    pub fn snapshot(&self) -> ExecResult<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&self.watermark_ms.to_le_bytes());
+        encode_row_buf_map(&mut out, &self.left_buf)?;
+        encode_row_buf_map(&mut out, &self.right_buf)?;
+        Ok(out)
+    }
+
+    /// Replace the join's buffered windows and watermark with the contents of
+    /// a snapshot produced by [`Self::snapshot`].
+    pub fn restore(&mut self, bytes: &[u8]) -> ExecResult<()> {
+        let corrupt = |m: &str| ExecError::Arrow(format!("window join snapshot corrupt: {m}"));
+        if bytes.len() < 12 {
+            return Err(corrupt("too short"));
+        }
+        let version = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes"));
+        if version != 1 {
+            return Err(corrupt(&format!("unsupported version {version}")));
+        }
+        let watermark_ms = i64::from_le_bytes(bytes[4..12].try_into().expect("8 bytes"));
+        let mut pos = 12usize;
+        let left_buf = decode_row_buf_map(bytes, &mut pos)?;
+        let right_buf = decode_row_buf_map(bytes, &mut pos)?;
+        if pos != bytes.len() {
+            return Err(corrupt("trailing bytes"));
+        }
+        self.left_buf = left_buf;
+        self.right_buf = right_buf;
+        self.watermark_ms = watermark_ms;
+        Ok(())
+    }
+
     /// Flush everything unconditionally (end-of-stream).
     pub fn flush_all(&mut self) -> ExecResult<Vec<RecordBatch>> {
         let all_keys: Vec<(String, i64)> = self
@@ -204,6 +255,100 @@ impl WindowJoin {
         }
         Ok(output)
     }
+}
+
+// ── Snapshot helpers ─────────────────────────────────────────────────────────
+
+fn encode_row_buf_map(
+    out: &mut Vec<u8>,
+    map: &HashMap<(String, i64), Vec<RowBuf>>,
+) -> ExecResult<()> {
+    use arrow::ipc::writer::StreamWriter;
+
+    // Deterministic group order so identical state snapshots byte-identically.
+    let mut keys: Vec<&(String, i64)> = map.keys().collect();
+    keys.sort();
+
+    out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+    for key in keys {
+        let rows = &map[key];
+        // Materialise the group's buffered rows as one batch.
+        let slices: Vec<RecordBatch> = rows.iter().map(|rb| rb.batch.slice(rb.row, 1)).collect();
+        let schema = slices
+            .first()
+            .map(|b| b.schema())
+            .ok_or_else(|| ExecError::Arrow("window join snapshot: empty group".into()))?;
+        let merged = arrow::compute::concat_batches(&schema, &slices)
+            .map_err(|e| ExecError::Arrow(format!("window join snapshot concat: {e}")))?;
+        let mut ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc, &schema)
+                .map_err(|e| ExecError::Arrow(format!("window join snapshot ipc: {e}")))?;
+            writer
+                .write(&merged)
+                .map_err(|e| ExecError::Arrow(format!("window join snapshot ipc write: {e}")))?;
+            writer
+                .finish()
+                .map_err(|e| ExecError::Arrow(format!("window join snapshot ipc finish: {e}")))?;
+        }
+        let key_bytes = key.0.as_bytes();
+        out.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(key_bytes);
+        out.extend_from_slice(&key.1.to_le_bytes());
+        out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+        out.extend_from_slice(&ipc);
+    }
+    Ok(())
+}
+
+fn decode_row_buf_map(
+    bytes: &[u8],
+    pos: &mut usize,
+) -> ExecResult<HashMap<(String, i64), Vec<RowBuf>>> {
+    use arrow::ipc::reader::StreamReader;
+
+    let corrupt = |m: &str| ExecError::Arrow(format!("window join snapshot corrupt: {m}"));
+    let read = |bytes: &[u8], pos: &mut usize, n: usize| -> ExecResult<Vec<u8>> {
+        if bytes.len() < *pos + n {
+            return Err(corrupt("truncated"));
+        }
+        let v = bytes[*pos..*pos + n].to_vec();
+        *pos += n;
+        Ok(v)
+    };
+
+    let group_count =
+        u64::from_le_bytes(read(bytes, pos, 8)?.try_into().expect("8 bytes")) as usize;
+    const MAX_GROUPS: usize = 10_000_000;
+    if group_count > MAX_GROUPS {
+        return Err(corrupt("group count exceeds limit"));
+    }
+    let mut map: HashMap<(String, i64), Vec<RowBuf>> = HashMap::new();
+    for _ in 0..group_count {
+        let key_len =
+            u32::from_le_bytes(read(bytes, pos, 4)?.try_into().expect("4 bytes")) as usize;
+        let key =
+            String::from_utf8(read(bytes, pos, key_len)?).map_err(|_| corrupt("key not utf8"))?;
+        let window_start = i64::from_le_bytes(read(bytes, pos, 8)?.try_into().expect("8 bytes"));
+        let ipc_len =
+            u32::from_le_bytes(read(bytes, pos, 4)?.try_into().expect("4 bytes")) as usize;
+        let ipc = read(bytes, pos, ipc_len)?;
+        let reader = StreamReader::try_new(std::io::Cursor::new(ipc), None)
+            .map_err(|e| ExecError::Arrow(format!("window join snapshot ipc read: {e}")))?;
+        let mut rows = Vec::new();
+        for batch in reader {
+            let batch =
+                batch.map_err(|e| ExecError::Arrow(format!("window join snapshot batch: {e}")))?;
+            for row in 0..batch.num_rows() {
+                rows.push(RowBuf {
+                    batch: batch.clone(),
+                    row,
+                });
+            }
+        }
+        map.insert((key, window_start), rows);
+    }
+    Ok(map)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

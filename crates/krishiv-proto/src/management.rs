@@ -8,6 +8,9 @@ pub struct TriggerSavepointRequest {
     pub job_id: JobId,
     /// Empty string means no label.
     pub label: String,
+    /// When true, the job is cancelled once the savepoint epoch is durably
+    /// committed and preserved (stop-with-savepoint).
+    pub stop: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +25,10 @@ pub struct RestoreJobRequest {
     pub job_id: JobId,
     pub epoch: u64,
     pub storage_path: String,
+    /// When true, `epoch` names a savepoint in the durable savepoints area:
+    /// the coordinator copies it back into the active checkpoint chain before
+    /// activating the restore.
+    pub from_savepoint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

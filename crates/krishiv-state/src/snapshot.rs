@@ -98,3 +98,28 @@ pub fn decode_snapshot_entries(bytes: &[u8]) -> StateResult<Vec<SnapshotEntry>> 
 
     Ok(entries)
 }
+
+/// Encode `(op_id, state_name, key, value)` tuples into the portable snapshot
+/// format read by [`decode_snapshot_entries`].
+///
+/// This is the exact inverse of decoding: round-tripping a snapshot through
+/// `decode_snapshot_entries` → `encode_snapshot_entries` produces byte-identical
+/// output for the same entry order.  Used by key-group redistribution to build
+/// per-task snapshots from a repartitioned entry set.
+pub fn encode_snapshot_entries(entries: &[SnapshotEntry]) -> Vec<u8> {
+    let payload_len: usize = entries
+        .iter()
+        .map(|(op, name, key, value)| 32 + op.len() + name.len() + key.len() + value.len())
+        .sum();
+    let mut buf = Vec::with_capacity(12 + payload_len);
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for (op_id, state_name, key, value) in entries {
+        write_prefix(&mut buf, op_id, state_name);
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        buf.extend_from_slice(value);
+    }
+    buf
+}

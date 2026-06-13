@@ -372,11 +372,42 @@ fn execute_loop_fragment(
             // Use durable state dir when the runner is configured for
             // single-node-durable or distributed-durable profiles.
             let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
-            let exec =
+            let mut exec =
                 ContinuousWindowExecutor::new_with_state_dir(plan_spec, job_state_dir.as_deref())
                     .map_err(|e| ExecutorError::InvalidAssignment {
                     message: format!("stream:loop failed to create window executor: {e}"),
                 })?;
+            // A restore directive that arrived before this job's first cycle
+            // seeds the freshly created executor with the checkpoint state.
+            if let Some((_, restored)) = runner.pending_restores.remove(job_id) {
+                let mut non_empty = restored.snapshots.iter().filter(|b| !b.is_empty());
+                if let Some(first) = non_empty.next() {
+                    exec.restore_from_snapshot(first).map_err(|e| {
+                        ExecutorError::LocalExecution {
+                            message: format!(
+                                "stream:loop restore from checkpoint epoch {} failed: {e}",
+                                restored.epoch
+                            ),
+                        }
+                    })?;
+                    for rest in non_empty {
+                        exec.merge_snapshot(rest)
+                            .map_err(|e| ExecutorError::LocalExecution {
+                                message: format!(
+                                    "stream:loop merge restore from checkpoint epoch {} \
+                                     failed: {e}",
+                                    restored.epoch
+                                ),
+                            })?;
+                    }
+                }
+                tracing::info!(
+                    job_id,
+                    epoch = restored.epoch,
+                    snapshots = restored.snapshots.len(),
+                    "seeded new continuous window executor from restored checkpoint"
+                );
+            }
             Ok::<_, ExecutorError>(Arc::new(Mutex::new(exec)))
         })?;
     let executor_arc = executor_entry.value().clone();
