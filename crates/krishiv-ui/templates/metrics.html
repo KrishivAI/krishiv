@@ -1,81 +1,118 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Metrics · Krishiv</title>
-    <link rel="stylesheet" href="/assets/krishiv.css">
-    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
-  </head>
-  <body>
-    <main class="shell">
-      {% include "nav.html" %}
+{% extends "base.html" %}
+{% block title %}Metrics · Krishiv{% endblock %}
+{% block content %}
+<h1 class="page-heading">Metrics</h1>
+<div id="live-region" data-live-interval="15000">
+  <section class="section">
+    <h2>Scheduler</h2>
+    <div class="metrics">
+      <div class="metric">
+        <div class="label">Jobs Submitted</div>
+        <div class="value">{{ scheduler.jobs_submitted_total }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Tasks Assigned</div>
+        <div class="value">{{ scheduler.tasks_assigned_total }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Checkpoint Epochs</div>
+        <div class="value">{{ scheduler.checkpoint_epochs_total }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Current Epoch</div>
+        <div class="value">{{ scheduler.checkpoint_epoch_gauge }}</div>
+      </div>
+    </div>
+  </section>
 
-      <h1 class="page-heading">Metrics</h1>
+  <section class="section">
+    <h2>Coordinator</h2>
+    <div class="metrics">
+      <div class="metric">
+        <div class="label">Running Tasks</div>
+        <div class="value">{{ stability.running_task_count() }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Task Retries</div>
+        <div class="value {% if stability.retry_count() > 0 %}warn{% endif %}">{{ stability.retry_count() }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Failed Assignments</div>
+        <div class="value {% if stability.failed_assignments() > 0 %}bad{% endif %}">{{ stability.failed_assignments() }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Shuffle Bytes Written</div>
+        <div class="value">{{ stability.shuffle_bytes_written }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Jobs</div>
+        <div class="value">{{ jobs_count }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Executors</div>
+        <div class="value">{{ executors_count }}</div>
+      </div>
+    </div>
+  </section>
 
-      <section class="section">
-        <h2>Scheduler</h2>
-        <div class="metrics">
-          <div class="metric">
-            <div class="label">Jobs Submitted</div>
-            <div class="value">{{ scheduler.jobs_submitted_total }}</div>
-          </div>
-          <div class="metric">
-            <div class="label">Tasks Assigned</div>
-            <div class="value">{{ scheduler.tasks_assigned_total }}</div>
-          </div>
-          <div class="metric">
-            <div class="label">Checkpoint Epochs</div>
-            <div class="value">{{ scheduler.checkpoint_epochs_total }}</div>
-          </div>
-          <div class="metric">
-            <div class="label">Current Epoch</div>
-            <div class="value">{{ scheduler.checkpoint_epoch_gauge }}</div>
-          </div>
-        </div>
-      </section>
+  {% if scheduler.tasks_assigned_total > 0 %}
+  <section class="section">
+    <h2>Averages</h2>
+    <div class="metrics">
+      <div class="metric">
+        <div class="label">Avg Assignment Duration</div>
+        <div class="value">{{ avg_duration_ms }} ms</div>
+      </div>
+    </div>
+  </section>
+  {% endif %}
 
-      <section class="section">
-        <h2>Coordinator</h2>
-        <div class="metrics">
-          <div class="metric">
-            <div class="label">Running Tasks</div>
-            <div class="value">{{ stability.running_task_count() }}</div>
-          </div>
-          <div class="metric">
-            <div class="label">Task Retries</div>
-            <div class="value {% if stability.retry_count() > 0 %}warn{% endif %}">{{ stability.retry_count() }}</div>
-          </div>
-          <div class="metric">
-            <div class="label">Failed Assignments</div>
-            <div class="value {% if stability.failed_assignments() > 0 %}bad{% endif %}">{{ stability.failed_assignments() }}</div>
-          </div>
-          <div class="metric">
-            <div class="label">Shuffle Bytes Written</div>
-            <div class="value">{{ stability.shuffle_bytes_written }}</div>
-          </div>
-          <div class="metric">
-            <div class="label">Jobs</div>
-            <div class="value">{{ jobs_count }}</div>
-          </div>
-          <div class="metric">
-            <div class="label">Executors</div>
-            <div class="value">{{ executors_count }}</div>
-          </div>
-        </div>
-      </section>
+  <section class="section">
+    <h2>Global Runtime</h2>
+    <div class="metrics">
+      <div class="metric">
+        <div class="label">Tasks Submitted</div>
+        <div class="value">{{ global.tasks_submitted }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Tasks Succeeded</div>
+        <div class="value">{{ global.tasks_succeeded }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Tasks Failed</div>
+        <div class="value {% if global.tasks_failed > 0 %}bad{% endif %}">{{ global.tasks_failed }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Executor Lost</div>
+        <div class="value {% if global.executor_lost > 0 %}warn{% endif %}">{{ global.executor_lost }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Shuffle Written</div>
+        <div class="value">{{ global.shuffle_bytes_written }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Job Queue Depth</div>
+        <div class="value">{{ global.job_queue_depth }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Spill Bytes</div>
+        <div class="value {% if global.spill_bytes_total > 0 %}warn{% endif %}">{{ global.spill_bytes_total }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Spill Files</div>
+        <div class="value">{{ global.spill_files_total }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Watermark Jobs</div>
+        <div class="value">{{ global.watermark_entry_count }}</div>
+      </div>
+      <div class="metric">
+        <div class="label">State Jobs</div>
+        <div class="value">{{ global.state_key_entry_count }}</div>
+      </div>
+    </div>
+  </section>
 
-      {% if scheduler.tasks_assigned_total > 0 %}
-      <section class="section">
-        <h2>Averages</h2>
-        <div class="metrics">
-          <div class="metric">
-            <div class="label">Avg Assignment Duration</div>
-            <div class="value">{{ avg_duration_ms }} ms</div>
-          </div>
-        </div>
-      </section>
-      {% endif %}
-    </main>
-  </body>
-</html>
+  <span class="refresh-note" hidden>refreshing</span>
+</div>
+{% endblock %}

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ job_id }} · Diagnose · Krishiv{% endblock %}
+{% block content %}
+<div class="breadcrumb">
+  <a href="/ui">Jobs</a><span class="sep">/</span>
+  <a href="/ui/jobs/{{ job_id }}">{{ job_id }}</a><span class="sep">/</span>Diagnose
+</div>
+<h1 class="page-heading">Diagnose: {{ job_id }}</h1>
+<section class="section">
+  <h2>Observability Report</h2>
+  <pre class="code-block">{{ report_json }}</pre>
+</section>
+{% endblock %}

@@ -411,6 +411,39 @@ impl Coordinator {
                 self.job_inline_results.remove(&job_id);
             }
             self.queue_manager.on_job_complete(&job_id, &usage);
+
+            // Archive an immutable history record before the job is evicted.
+            if let Some(jc) = self.job_coordinators.get(&job_id) {
+                let r = jc.read_record();
+                let history = crate::store::JobHistoryRecord {
+                    job_id: job_id.as_str().to_owned(),
+                    job_kind: r.spec.kind().to_string(),
+                    final_state: state.to_string(),
+                    completed_at_ms: krishiv_common::async_util::unix_now_ms() as u64,
+                    stage_count: r.stages.len(),
+                    task_count: r.stages.iter().map(|s| s.tasks.len()).sum(),
+                    succeeded_task_count: r
+                        .stages
+                        .iter()
+                        .flat_map(|s| s.tasks.iter())
+                        .filter(|t| t.state == TaskState::Succeeded)
+                        .count() as u32,
+                    failed_task_count: r
+                        .stages
+                        .iter()
+                        .flat_map(|s| s.tasks.iter())
+                        .filter(|t| t.state == TaskState::Failed)
+                        .count() as u32,
+                    cpu_nanos: usage.cpu_nanos,
+                    memory_peak_task_bytes: usage.memory_peak_task_bytes,
+                    namespace_id: r.spec.namespace_id().map(str::to_owned),
+                    priority: r.spec.priority(),
+                };
+                if let Some(store) = &self.store {
+                    let mut guard = store.inner();
+                    let _ = guard.save_job_history(history);
+                }
+            }
         }
         if let Some(record) = self
             .job_coordinators

@@ -117,6 +117,7 @@ pub use queryable_state_http::{
     QueryStateResponse, decode_key_hex, encode_key_hex, queryable_state_router,
 };
 pub use rocksdb_metadata::RocksDbMetadataStore;
+pub use store::JobHistoryRecord;
 pub use store::{
     ContinuousSnapshot, EventLogEvent, InMemoryMetadataStore, MetadataStore, NonBlockingStoreHandle,
 };

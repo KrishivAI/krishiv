@@ -399,6 +399,46 @@ impl KrishivMetrics {
         self.spill_files_total.fetch_add(files, Ordering::Relaxed);
     }
 
+    /// Total tasks submitted.
+    pub fn tasks_submitted(&self) -> u64 {
+        self.tasks_submitted.load(Ordering::Relaxed)
+    }
+
+    /// Total tasks succeeded.
+    pub fn tasks_succeeded(&self) -> u64 {
+        self.tasks_succeeded.load(Ordering::Relaxed)
+    }
+
+    /// Total tasks failed.
+    pub fn tasks_failed(&self) -> u64 {
+        self.tasks_failed.load(Ordering::Relaxed)
+    }
+
+    /// Total executor lost events.
+    pub fn executor_lost(&self) -> u64 {
+        self.executor_lost.load(Ordering::Relaxed)
+    }
+
+    /// Total shuffle bytes written.
+    pub fn shuffle_bytes_written(&self) -> u64 {
+        self.shuffle_bytes_written.load(Ordering::Relaxed)
+    }
+
+    /// Current job queue depth.
+    pub fn job_queue_depth(&self) -> u64 {
+        self.job_queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Number of jobs with active watermark entries.
+    pub fn watermark_entry_count(&self) -> usize {
+        self.watermark_ms.len()
+    }
+
+    /// Number of jobs with active state-key entries.
+    pub fn state_key_entry_count(&self) -> usize {
+        self.state_key_count.len()
+    }
+
     /// Total bytes spilled to disk so far.
     pub fn spill_bytes_total(&self) -> u64 {
         self.spill_bytes_total.load(Ordering::Relaxed)

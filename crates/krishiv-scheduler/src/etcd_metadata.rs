@@ -210,6 +210,23 @@ impl MetadataStore for EtcdMetadataStore {
     fn remove_continuous_snapshot(&mut self, _job_id: &str) -> SchedulerResult<()> {
         Ok(())
     }
+
+    fn save_job_history(&mut self, record: crate::store::JobHistoryRecord) -> SchedulerResult<()> {
+        tracing::warn!(
+            job_id = %record.job_id,
+            "EtcdMetadataStore: job history persistence is not supported; \
+             history will not survive coordinator restart on this backend"
+        );
+        Ok(())
+    }
+
+    fn list_job_history(&self) -> Vec<crate::store::JobHistoryRecord> {
+        Vec::new()
+    }
+
+    fn get_job_history(&self, _job_id: &str) -> Option<crate::store::JobHistoryRecord> {
+        None
+    }
 }
 
 /// Load all values under `prefix` from etcd, deserializing each as `P` then
