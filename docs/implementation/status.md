@@ -1,5 +1,64 @@
 # Krishiv Implementation Status
 
+## Phase 4 COMPLETE: User-Facing APIs (2026-06-13)
+
+### Done
+
+**4.1 — Typed format-specific reader/writer option structures**
+- `ParquetReaderOptions { batch_size }`, `CsvReaderOptions { delimiter, has_header }` in `krishiv-sql`
+- `ParquetWriterOptions { compression, max_row_group_size }`, `CsvWriterOptions { delimiter, has_header }` in `krishiv-sql`
+- `SqlEngine::read_parquet_with_options`, `SqlEngine::read_csv_with_options` propagate opts to DataFusion
+- `DataFrame::write_parquet_with_options`, `DataFrame::write_csv_with_options` use `ArrowWriter` props + CSV builder
+- `Session::read_parquet_with_options`, `Session::read_csv_with_options`, `Session::register_record_batches`, `Session::deregister_table`
+- `DataFrameReader::load` parses `batch_size`, `delimiter`, `has_header` from options map and routes to typed reader methods
+- `DataFrameWriter::save` parses `compression`, `max_row_group_size`, `delimiter`, `has_header` and routes to typed writer methods
+
+**4.2 — Cache / persist / unpersist and temporary-view APIs**
+- `SqlDataFrame` carries `context: SessionContext` (populated via `make_sql_df` helper)
+- `KrishivDataFrameOps::register_batches`, `deregister_table`, `create_view` implemented on `SqlDataFrame` using `self.context`
+- `DataFrame::cache()`, `persist()`, `persist_as()`, `unpersist()` — materialise to in-memory `MemTable`, tracked via `_cache_name`
+- `DataFrame::create_or_replace_temp_view(name)` — issues `CREATE VIEW "name" AS <query>` DDL through live session
+- Static `CACHE_CTR: AtomicU64` for unique ephemeral table names
+
+**4.3 — Aggregate UDAF and table UDTF session registration**
+- `Session::register_aggregate_udf(udf)`, `Session::aggregate_udf_names()` — delegates to `UdfRegistry` + `sync_aggregate_udfs`
+- `Session::register_table_udf(udf)`, `Session::table_udf_names()` — delegates to `UdfRegistry` + `sync_table_udfs`
+- Imports updated: `AggregateUdf`, `TableUdf` in `session.rs`
+
+**4.4 — Python UDF timeout enforcement**
+- `call_python_udf` wraps `spawn_blocking` with `tokio::time::timeout` (default 30 s via `PYTHON_UDF_DEFAULT_TIMEOUT_MS`)
+- `call_python_udf_with_timeout(udf, batch, timeout_ms)` — explicit-timeout variant for tests and callers with job-specific budgets
+- Timeout message includes the `KRISHIV_PYTHON_UDF_TIMEOUT_MS` override hint
+
+**4.5 — Python bindings for new APIs**
+- `PyDataFrame::write_parquet_with_options(path, *, compression, max_row_group_size)`
+- `PyDataFrame::write_csv_with_options(path, *, delimiter, has_header)`
+- `PyDataFrame::cache()`, `persist()`, `unpersist()`, `create_or_replace_temp_view(name)`
+- `PySession::read_parquet_with_options(path, *, batch_size)`, `read_csv_with_options(path, *, delimiter, has_header)`
+- `PySession::register_record_batches(name, batches)`, `deregister_table(name)`
+- `PySession::list_aggregate_udfs()`, `list_table_udfs()`
+
+### Validation
+```
+cargo test --workspace --lib --exclude krishiv-python  # 2,913 passed, 0 failed (19 crates)
+```
+Individual crate results:
+- krishiv-api: 60 passed
+- krishiv-sql: 275 passed
+- krishiv-scheduler: 310 passed
+- krishiv-executor: 213 passed
+- All remaining crates: 2,055 passed combined
+
+### Blockers
+None.
+
+### Next useful command
+```bash
+cargo clippy --workspace --all-targets
+```
+
+---
+
 ## Phase 2 COMPLETE: All remaining roadmap items (2026-06-13)
 
 ### Done

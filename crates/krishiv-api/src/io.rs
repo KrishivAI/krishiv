@@ -54,18 +54,73 @@ impl DataFrameReader {
     }
 
     pub fn load(self, path: impl AsRef<Path>) -> Result<DataFrame> {
-        if !self.options.is_empty() {
-            return Err(KrishivError::unsupported(format!(
-                "reader options are reserved for future format-specific configuration: {:?}",
-                self.options.keys().collect::<Vec<_>>()
-            )));
-        }
-        match self.format.ok_or_else(|| KrishivError::InvalidConfig {
+        let format = self.format.ok_or_else(|| KrishivError::InvalidConfig {
             message: "reader format must be selected before load".into(),
-        })? {
-            DataFormat::Parquet => self.session.read_parquet(path),
-            DataFormat::Csv => self.session.read_csv(path),
-            DataFormat::Json => self.session.read_json(path),
+        })?;
+        match format {
+            DataFormat::Parquet => {
+                let mut opts = krishiv_sql::ParquetReaderOptions::default();
+                for (key, value) in &self.options {
+                    match key.as_str() {
+                        "batch_size" | "batchSize" => {
+                            opts.batch_size = Some(value.parse::<usize>().map_err(|_| {
+                                KrishivError::InvalidConfig {
+                                    message: format!("batch_size must be a positive integer, got '{value}'"),
+                                }
+                            })?);
+                        }
+                        other => {
+                            return Err(KrishivError::unsupported(format!(
+                                "unsupported parquet reader option '{other}'; supported: batch_size"
+                            )));
+                        }
+                    }
+                }
+                self.session.read_parquet_with_options(path, opts)
+            }
+            DataFormat::Csv => {
+                let mut opts = krishiv_sql::CsvReaderOptions::default();
+                for (key, value) in &self.options {
+                    match key.as_str() {
+                        "delimiter" | "sep" => {
+                            let mut chars = value.chars();
+                            let c = chars.next().ok_or_else(|| KrishivError::InvalidConfig {
+                                message: "delimiter must be a non-empty string".into(),
+                            })?;
+                            if chars.next().is_some() {
+                                return Err(KrishivError::InvalidConfig {
+                                    message: "delimiter must be a single character".into(),
+                                });
+                            }
+                            opts.delimiter = Some(c);
+                        }
+                        "has_header" | "hasHeader" | "header" => {
+                            opts.has_header = Some(match value.to_ascii_lowercase().as_str() {
+                                "true" | "1" | "yes" => true,
+                                "false" | "0" | "no" => false,
+                                other => return Err(KrishivError::InvalidConfig {
+                                    message: format!("has_header must be true or false, got '{other}'"),
+                                }),
+                            });
+                        }
+                        other => {
+                            return Err(KrishivError::unsupported(format!(
+                                "unsupported csv reader option '{other}'; supported: delimiter, has_header"
+                            )));
+                        }
+                    }
+                }
+                self.session.read_csv_with_options(path, opts)
+            }
+            DataFormat::Json => {
+                if !self.options.is_empty() {
+                    return Err(KrishivError::unsupported(format!(
+                        "json reader does not support options: {:?}",
+                        self.options.keys().collect::<Vec<_>>()
+                    )));
+                }
+                self.session.read_json(path)
+            }
         }
     }
 }
@@ -122,8 +177,15 @@ impl DataFrameWriter {
     }
 
     pub fn save(self, path: &str) -> Result<()> {
+        let format = self.format.ok_or_else(|| KrishivError::InvalidConfig {
+            message: "writer format must be selected before save".into(),
+        })?;
+
         let mut mode = self.mode;
         let mut partition_by = self.partition_by;
+        let mut parquet_opts = krishiv_sql::ParquetWriterOptions::default();
+        let mut csv_opts = krishiv_sql::CsvWriterOptions::default();
+
         for (key, value) in &self.options {
             match key.as_str() {
                 "mode" => {
@@ -148,31 +210,77 @@ impl DataFrameWriter {
                         });
                     }
                 }
+                "compression" => {
+                    parquet_opts.compression = Some(value.clone());
+                }
+                "max_row_group_size" | "maxRowGroupSize" => {
+                    parquet_opts.max_row_group_size =
+                        Some(value.parse::<usize>().map_err(|_| {
+                            KrishivError::InvalidConfig {
+                                message: format!(
+                                    "max_row_group_size must be a positive integer, got '{value}'"
+                                ),
+                            }
+                        })?);
+                }
+                "delimiter" | "sep" => {
+                    let mut chars = value.chars();
+                    let c = chars.next().ok_or_else(|| KrishivError::InvalidConfig {
+                        message: "delimiter must be a non-empty string".into(),
+                    })?;
+                    if chars.next().is_some() {
+                        return Err(KrishivError::InvalidConfig {
+                            message: "delimiter must be a single character".into(),
+                        });
+                    }
+                    csv_opts.delimiter = Some(c);
+                }
+                "has_header" | "hasHeader" | "header" => {
+                    csv_opts.has_header = Some(match value.to_ascii_lowercase().as_str() {
+                        "true" | "1" | "yes" => true,
+                        "false" | "0" | "no" => false,
+                        other => {
+                            return Err(KrishivError::InvalidConfig {
+                                message: format!(
+                                    "has_header must be true or false, got '{other}'"
+                                ),
+                            })
+                        }
+                    });
+                }
                 other => {
                     return Err(KrishivError::unsupported(format!(
                         "unsupported writer option '{other}'; supported options: \
-                         mode, partition_by"
+                         mode, partition_by, compression, max_row_group_size, \
+                         delimiter, has_header"
                     )));
                 }
             }
         }
 
-        let format = self.format.ok_or_else(|| KrishivError::InvalidConfig {
-            message: "writer format must be selected before save".into(),
-        })?;
         let wants_sink = mode.is_some() || !partition_by.is_empty();
+        let has_parquet_opts =
+            parquet_opts.compression.is_some() || parquet_opts.max_row_group_size.is_some();
+        let has_csv_opts = csv_opts.delimiter.is_some() || csv_opts.has_header.is_some();
+
         match format {
             DataFormat::Parquet if wants_sink => self.dataframe.write_parquet_sink(
                 path,
                 mode.unwrap_or_default(),
                 &partition_by,
             ),
+            DataFormat::Parquet if has_parquet_opts => {
+                self.dataframe.write_parquet_with_options(path, &parquet_opts)
+            }
             DataFormat::Parquet => self.dataframe.write_parquet(path),
             DataFormat::Csv | DataFormat::Json if wants_sink => {
                 Err(KrishivError::unsupported(
                     "write mode / partition_by are only supported for parquet output; \
                      csv and json writes collect client-side",
                 ))
+            }
+            DataFormat::Csv if has_csv_opts => {
+                self.dataframe.write_csv_with_options(path, &csv_opts)
             }
             DataFormat::Csv => self.dataframe.write_csv(path),
             DataFormat::Json => self.dataframe.write_json(path),
