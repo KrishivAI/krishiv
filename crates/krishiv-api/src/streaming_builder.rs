@@ -510,7 +510,7 @@ mod tests {
     use dashmap::DashMap;
     use krishiv_runtime::LocalJobRegistry;
 
-    use super::{ForeachBatchFn, StreamingOutputMode, StreamingTrigger};
+    use super::{ForeachBatchFn, StreamingTrigger};
     use crate::dataframe::DataFrame;
     use crate::session::shared_embedded_runtime;
     use crate::streaming_builder::DataStreamWriter;
