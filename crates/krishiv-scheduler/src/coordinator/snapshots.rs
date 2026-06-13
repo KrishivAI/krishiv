@@ -141,4 +141,22 @@ impl Coordinator {
             .map(|v| v.iter().collect())
             .unwrap_or_default()
     }
+
+    /// List all archived terminal-job history records (most-recent first).
+    ///
+    /// Returns an empty vec when no metadata store is attached or the backend
+    /// does not persist history (e.g. etcd).
+    pub fn list_job_history(&self) -> Vec<crate::store::JobHistoryRecord> {
+        self.store
+            .as_ref()
+            .map(|s| s.inner().list_job_history())
+            .unwrap_or_default()
+    }
+
+    /// Look up a single archived job by id.
+    pub fn get_job_history(&self, job_id: &str) -> Option<crate::store::JobHistoryRecord> {
+        self.store
+            .as_ref()
+            .and_then(|s| s.inner().get_job_history(job_id))
+    }
 }

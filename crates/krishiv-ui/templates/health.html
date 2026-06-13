@@ -8,7 +8,11 @@
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
 </head>
 <body>
-  <main class="shell">
+  <main class="shell"
+        hx-get="/ui/health"
+        hx-trigger="every 15s"
+        hx-select="main"
+        hx-swap="outerHTML">
     {% include "nav.html" %}
     <h1 class="page-heading">Cluster Health</h1>
 

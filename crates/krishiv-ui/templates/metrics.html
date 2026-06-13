@@ -8,7 +8,11 @@
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   </head>
   <body>
-    <main class="shell">
+    <main class="shell"
+          hx-get="/ui/metrics"
+          hx-trigger="every 15s"
+          hx-select="main"
+          hx-swap="outerHTML">
       {% include "nav.html" %}
 
       <h1 class="page-heading">Metrics</h1>
@@ -76,6 +80,52 @@
         </div>
       </section>
       {% endif %}
+
+      <section class="section">
+        <h2>Global Runtime</h2>
+        <div class="metrics">
+          <div class="metric">
+            <div class="label">Tasks Submitted</div>
+            <div class="value">{{ global.tasks_submitted }}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Tasks Succeeded</div>
+            <div class="value">{{ global.tasks_succeeded }}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Tasks Failed</div>
+            <div class="value {% if global.tasks_failed > 0 %}bad{% endif %}">{{ global.tasks_failed }}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Executor Lost</div>
+            <div class="value {% if global.executor_lost > 0 %}warn{% endif %}">{{ global.executor_lost }}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Shuffle Written</div>
+            <div class="value">{{ global.shuffle_bytes_written }}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Job Queue Depth</div>
+            <div class="value">{{ global.job_queue_depth }}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Spill Bytes</div>
+            <div class="value {% if global.spill_bytes_total > 0 %}warn{% endif %}">{{ global.spill_bytes_total }}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Spill Files</div>
+            <div class="value">{{ global.spill_files_total }}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Watermark Jobs</div>
+            <div class="value">{{ global.watermark_entry_count }}</div>
+          </div>
+          <div class="metric">
+            <div class="label">State Jobs</div>
+            <div class="value">{{ global.state_key_entry_count }}</div>
+          </div>
+        </div>
+      </section>
     </main>
   </body>
 </html>

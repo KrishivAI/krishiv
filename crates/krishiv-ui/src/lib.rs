@@ -22,8 +22,8 @@ use krishiv_proto::{
 };
 use krishiv_scheduler::metrics::SchedulerMetrics;
 use krishiv_scheduler::{
-    Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, NamespaceQuotaSnapshot,
-    ResourceUsage, SchedulerError, SharedCoordinator, StabilityMetrics,
+    Coordinator, ExecutorRecord, JobDetailSnapshot, JobHistoryRecord, JobSnapshot,
+    NamespaceQuotaSnapshot, ResourceUsage, SchedulerError, SharedCoordinator, StabilityMetrics,
 };
 use serde::{Deserialize, Serialize};
 
@@ -191,20 +191,29 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
             "/api/v1/jobs/{job_id}/checkpoints",
             get(api_job_checkpoints),
         )
+        .route(
+            "/api/v1/jobs/{job_id}/diagnose",
+            get(api_job_diagnose),
+        )
         .route("/api/v1/executors", get(api_executors))
         .route("/api/v1/executors/{executor_id}", get(api_executor_detail))
         .route("/api/v1/queues", get(api_queues))
         .route("/api/v1/sql", post(api_sql_execute))
+        .route("/api/v1/history", get(api_history))
+        .route("/api/v1/history/{job_id}", get(api_history_detail))
         .route("/ui", get(ui_jobs))
         .route("/ui/jobs/{job_id}", get(ui_job_detail))
         .route(
             "/ui/jobs/{job_id}/checkpoints",
             get(ui_job_checkpoints_page),
         )
+        .route("/ui/jobs/{job_id}/diagnose", get(ui_job_diagnose))
         .route("/ui/executors/{executor_id}", get(ui_executor_detail))
         .route("/ui/submit", get(ui_submit))
         .route("/ui/health", get(ui_health))
         .route("/ui/metrics", get(ui_metrics))
+        .route("/ui/history", get(ui_history))
+        .route("/ui/history/{job_id}", get(ui_history_detail))
         .with_state(state.clone());
 
     let protected = if let Some(expected) = token {
@@ -238,19 +247,28 @@ pub fn embedded_router(state: UiState) -> Router {
             "/api/v1/jobs/{job_id}/checkpoints",
             get(api_job_checkpoints),
         )
+        .route(
+            "/api/v1/jobs/{job_id}/diagnose",
+            get(api_job_diagnose),
+        )
         .route("/api/v1/executors/{executor_id}", get(api_executor_detail))
         .route("/api/v1/queues", get(api_queues))
         .route("/api/v1/sql", post(api_sql_execute))
+        .route("/api/v1/history", get(api_history))
+        .route("/api/v1/history/{job_id}", get(api_history_detail))
         .route("/ui", get(ui_jobs))
         .route("/ui/jobs/{job_id}", get(ui_job_detail))
         .route(
             "/ui/jobs/{job_id}/checkpoints",
             get(ui_job_checkpoints_page),
         )
+        .route("/ui/jobs/{job_id}/diagnose", get(ui_job_diagnose))
         .route("/ui/executors/{executor_id}", get(ui_executor_detail))
         .route("/ui/submit", get(ui_submit))
         .route("/ui/health", get(ui_health))
-        .route("/ui/metrics", get(ui_metrics));
+        .route("/ui/metrics", get(ui_metrics))
+        .route("/ui/history", get(ui_history))
+        .route("/ui/history/{job_id}", get(ui_history_detail));
 
     let protected = if let Some(expected) = resolve_ui_token().as_deref() {
         let expected = expected.to_string();
@@ -635,6 +653,20 @@ impl HealthTemplate {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GlobalMetricsView {
+    pub tasks_submitted: u64,
+    pub tasks_succeeded: u64,
+    pub tasks_failed: u64,
+    pub executor_lost: u64,
+    pub shuffle_bytes_written: u64,
+    pub job_queue_depth: u64,
+    pub spill_bytes_total: u64,
+    pub spill_files_total: u64,
+    pub watermark_entry_count: usize,
+    pub state_key_entry_count: usize,
+}
+
 #[derive(Template)]
 #[template(path = "metrics.html")]
 struct MetricsTemplate {
@@ -643,6 +675,66 @@ struct MetricsTemplate {
     jobs_count: usize,
     executors_count: usize,
     avg_duration_ms: u64,
+    global: GlobalMetricsView,
+}
+
+#[derive(Template)]
+#[template(path = "job_diagnose.html")]
+struct JobDiagnoseTemplate {
+    job_id: String,
+    report_json: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobHistoryView {
+    pub job_id: String,
+    pub job_kind: String,
+    pub final_state: String,
+    pub completed_at_ms: u64,
+    pub stage_count: usize,
+    pub task_count: usize,
+    pub succeeded_task_count: u32,
+    pub failed_task_count: u32,
+    pub cpu_nanos: u64,
+    pub memory_peak_task_bytes: u64,
+    pub namespace_id: Option<String>,
+    pub priority: u8,
+}
+
+impl JobHistoryView {
+    fn from_record(r: &JobHistoryRecord) -> Self {
+        Self {
+            job_id: r.job_id.clone(),
+            job_kind: r.job_kind.clone(),
+            final_state: r.final_state.clone(),
+            completed_at_ms: r.completed_at_ms,
+            stage_count: r.stage_count,
+            task_count: r.task_count,
+            succeeded_task_count: r.succeeded_task_count,
+            failed_task_count: r.failed_task_count,
+            cpu_nanos: r.cpu_nanos,
+            memory_peak_task_bytes: r.memory_peak_task_bytes,
+            namespace_id: r.namespace_id.clone(),
+            priority: r.priority,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobHistoryListResponse {
+    pub records: Vec<JobHistoryView>,
+}
+
+#[derive(Template)]
+#[template(path = "history.html")]
+struct HistoryTemplate {
+    records: Vec<JobHistoryView>,
+}
+
+#[derive(Template)]
+#[template(path = "history_detail.html")]
+struct HistoryDetailTemplate {
+    record: JobHistoryView,
 }
 
 #[derive(Serialize)]
@@ -837,12 +929,26 @@ async fn ui_metrics(State(state): State<UiState>) -> Result<Html<String>, UiErro
         .task_assignment_duration_ms_sum
         .checked_div(scheduler.tasks_assigned_total)
         .unwrap_or(0);
+    let gm = krishiv_metrics::global_metrics();
+    let global = GlobalMetricsView {
+        tasks_submitted: gm.tasks_submitted(),
+        tasks_succeeded: gm.tasks_succeeded(),
+        tasks_failed: gm.tasks_failed(),
+        executor_lost: gm.executor_lost(),
+        shuffle_bytes_written: gm.shuffle_bytes_written(),
+        job_queue_depth: gm.job_queue_depth(),
+        spill_bytes_total: gm.spill_bytes_total(),
+        spill_files_total: gm.spill_files_total(),
+        watermark_entry_count: gm.watermark_entry_count(),
+        state_key_entry_count: gm.state_key_entry_count(),
+    };
     let template = MetricsTemplate {
         scheduler,
         stability,
         jobs_count: snapshot.jobs.len(),
         executors_count: snapshot.executors.len(),
         avg_duration_ms: avg,
+        global,
     };
     Ok(Html(template.render()?))
 }
@@ -978,6 +1084,95 @@ async fn ui_job_checkpoints_page(
         epochs,
         latest_epoch,
     };
+    Ok(Html(template.render()?))
+}
+
+async fn api_job_diagnose(
+    State(state): State<UiState>,
+    Path(job_id_str): Path<String>,
+) -> Result<Json<serde_json::Value>, UiError> {
+    let job_id = JobId::try_new(job_id_str).map_err(|e| UiError::Id(e.to_string()))?;
+    let coordinator = state.coordinator.read().await;
+    let report = krishiv_scheduler::coordinator::observability::build_observability_report(
+        &coordinator,
+        &job_id,
+    )?;
+    let json = serde_json::to_value(&report)
+        .map_err(|e| UiError::Sql(format!("serialize error: {e}")))?;
+    Ok(Json(json))
+}
+
+async fn ui_job_diagnose(
+    State(state): State<UiState>,
+    Path(job_id_str): Path<String>,
+) -> Result<Html<String>, UiError> {
+    let job_id = JobId::try_new(job_id_str.clone()).map_err(|e| UiError::Id(e.to_string()))?;
+    let coordinator = state.coordinator.read().await;
+    let report = krishiv_scheduler::coordinator::observability::build_observability_report(
+        &coordinator,
+        &job_id,
+    )?;
+    let report_json = serde_json::to_string_pretty(&report)
+        .unwrap_or_else(|e| format!("serialize error: {e}"));
+    let template = JobDiagnoseTemplate {
+        job_id: job_id_str,
+        report_json,
+    };
+    Ok(Html(template.render()?))
+}
+
+async fn api_history(
+    State(state): State<UiState>,
+) -> Result<Json<JobHistoryListResponse>, UiError> {
+    let coordinator = state.coordinator.read().await;
+    let records = coordinator
+        .list_job_history()
+        .iter()
+        .map(JobHistoryView::from_record)
+        .collect();
+    Ok(Json(JobHistoryListResponse { records }))
+}
+
+async fn api_history_detail(
+    State(state): State<UiState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobHistoryView>, UiError> {
+    let coordinator = state.coordinator.read().await;
+    coordinator
+        .get_job_history(&job_id)
+        .map(|r| Json(JobHistoryView::from_record(&r)))
+        .ok_or_else(|| UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownJob {
+            job_id: krishiv_proto::JobId::try_new(job_id).unwrap_or_else(|_| {
+                krishiv_proto::JobId::try_new("unknown").unwrap()
+            }),
+        }))
+}
+
+async fn ui_history(State(state): State<UiState>) -> Result<Html<String>, UiError> {
+    let coordinator = state.coordinator.read().await;
+    let records = coordinator
+        .list_job_history()
+        .iter()
+        .map(JobHistoryView::from_record)
+        .collect();
+    let template = HistoryTemplate { records };
+    Ok(Html(template.render()?))
+}
+
+async fn ui_history_detail(
+    State(state): State<UiState>,
+    Path(job_id): Path<String>,
+) -> Result<Html<String>, UiError> {
+    let coordinator = state.coordinator.read().await;
+    let record = coordinator
+        .get_job_history(&job_id)
+        .map(|r| JobHistoryView::from_record(&r))
+        .ok_or_else(|| UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownJob {
+            job_id: krishiv_proto::JobId::try_new(job_id).unwrap_or_else(|_| {
+                krishiv_proto::JobId::try_new("unknown").unwrap()
+            }),
+        }))?;
+    let template = HistoryDetailTemplate { record };
     Ok(Html(template.render()?))
 }
 

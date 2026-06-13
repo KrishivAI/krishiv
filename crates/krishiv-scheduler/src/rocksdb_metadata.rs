@@ -1,8 +1,8 @@
 use crate::error::{SchedulerError, SchedulerResult};
 use crate::job::JobRecord;
 use crate::store::{
-    ContinuousSnapshot, EventLogEvent, MetadataStore, PersistedEvent, PersistedExecutorDescriptor,
-    PersistedJobRecord,
+    ContinuousSnapshot, EventLogEvent, JobHistoryRecord, MetadataStore, PersistedEvent,
+    PersistedExecutorDescriptor, PersistedJobRecord,
 };
 use krishiv_proto::{ExecutorDescriptor, ExecutorId};
 use rocksdb::{ColumnFamilyDescriptor, DB, Options};
@@ -13,12 +13,20 @@ const CF_JOBS: &str = "jobs";
 const CF_EXECUTORS: &str = "executors";
 const CF_METADATA: &str = "metadata";
 const CF_CONTINUOUS: &str = "continuous_snapshots";
+const CF_HISTORY: &str = "job_history";
 
 fn all_cfs() -> Vec<ColumnFamilyDescriptor> {
-    [CF_EVENTS, CF_JOBS, CF_EXECUTORS, CF_METADATA, CF_CONTINUOUS]
-        .iter()
-        .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
-        .collect()
+    [
+        CF_EVENTS,
+        CF_JOBS,
+        CF_EXECUTORS,
+        CF_METADATA,
+        CF_CONTINUOUS,
+        CF_HISTORY,
+    ]
+    .iter()
+    .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+    .collect()
 }
 
 /// RocksDB-backed durable metadata store for the coordinator.
@@ -32,6 +40,7 @@ pub struct RocksDbMetadataStore {
     executors: Vec<ExecutorDescriptor>,
     continuous_snapshots: std::collections::HashMap<String, ContinuousSnapshot>,
     next_event_id: u64,
+    history: Vec<JobHistoryRecord>,
 }
 
 impl RocksDbMetadataStore {
@@ -138,6 +147,23 @@ impl RocksDbMetadataStore {
             }
         }
 
+        // Load job history
+        let mut history = Vec::new();
+        {
+            let cf = db
+                .cf_handle(CF_HISTORY)
+                .ok_or_else(|| Self::store_err("missing job_history CF"))?;
+            let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+            for item in iter {
+                let (_, v) = item.map_err(Self::store_err)?;
+                if let Ok(rec) = serde_json::from_slice::<JobHistoryRecord>(&v) {
+                    history.push(rec);
+                }
+            }
+            // Most-recent first: sort descending by completed_at_ms
+            history.sort_by(|a, b| b.completed_at_ms.cmp(&a.completed_at_ms));
+        }
+
         Ok(Self {
             db,
             events,
@@ -145,6 +171,7 @@ impl RocksDbMetadataStore {
             executors,
             continuous_snapshots,
             next_event_id,
+            history,
         })
     }
 }
@@ -260,6 +287,28 @@ impl MetadataStore for RocksDbMetadataStore {
         self.db.delete_cf(&cf, job_id).map_err(Self::store_err)?;
         self.continuous_snapshots.remove(job_id);
         Ok(())
+    }
+
+    fn save_job_history(&mut self, record: JobHistoryRecord) -> SchedulerResult<()> {
+        let bytes = serde_json::to_vec(&record).map_err(Self::store_err)?;
+        let cf = self
+            .db
+            .cf_handle(CF_HISTORY)
+            .ok_or_else(|| Self::store_err("missing job_history CF"))?;
+        self.db
+            .put_cf(&cf, record.job_id.as_str(), bytes)
+            .map_err(Self::store_err)?;
+        self.history.retain(|r| r.job_id != record.job_id);
+        self.history.insert(0, record);
+        Ok(())
+    }
+
+    fn list_job_history(&self) -> Vec<JobHistoryRecord> {
+        self.history.clone()
+    }
+
+    fn get_job_history(&self, job_id: &str) -> Option<JobHistoryRecord> {
+        self.history.iter().find(|r| r.job_id == job_id).cloned()
     }
 }
 
