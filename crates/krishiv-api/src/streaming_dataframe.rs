@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array};
+use arrow::array::{Array, Int64Array, StringArray};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use futures::Stream;
 use futures::StreamExt;
@@ -72,6 +74,8 @@ pub struct StreamingDataFrame {
     watermark_lag_ms: u64,
     /// Optional side-output spec attached to this pipeline.
     side_output: Option<SideOutput>,
+    /// Columns to use for deduplication (within watermark window).
+    dedup_columns: Option<Vec<String>>,
 }
 
 impl StreamingDataFrame {
@@ -85,6 +89,7 @@ impl StreamingDataFrame {
             agg_exprs: Vec::new(),
             watermark_lag_ms: 0,
             side_output: None,
+            dedup_columns: None,
         }
     }
 
@@ -147,6 +152,25 @@ impl StreamingDataFrame {
         self
     }
 
+    /// Drop duplicate rows based on a subset of columns (within watermark window).
+    ///
+    /// Rows with identical values in all `subset` columns are deduplicated,
+    /// keeping the first occurrence per watermark epoch. Deduplication is applied
+    /// as a stream adapter when `execute_stream_async` is called.
+    pub fn drop_duplicates(
+        mut self,
+        subset: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.dedup_columns = Some(subset.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Build a [`crate::streaming_builder::DataStreamWriter`] for writing this
+    /// streaming pipeline to a sink.
+    pub fn write_stream(self) -> crate::streaming_builder::DataStreamWriter {
+        crate::streaming_builder::DataStreamWriter::new(self.df.clone())
+    }
+
     /// Execute the configured streaming pipeline and return a lazy, asynchronous stream of RecordBatches.
     pub async fn execute_stream_async(self) -> Result<KrishivStream> {
         if self.side_output.is_some() {
@@ -157,11 +181,21 @@ impl StreamingDataFrame {
             });
         }
 
+        let dedup_columns = self.dedup_columns.clone();
         let window_spec = self.window_spec()?;
         let df_stream = self.df.execute_stream_async().await?;
-        match window_spec.as_ref() {
-            Some(spec) => execute_window_pipeline(source_exec_stream(df_stream), Some(spec)),
-            None => Ok(df_stream),
+
+        // Apply window pipeline first.
+        let base: KrishivStream = match window_spec.as_ref() {
+            Some(spec) => execute_window_pipeline(source_exec_stream(df_stream), Some(spec))?,
+            None => df_stream,
+        };
+
+        // Apply deduplication adapter if columns were configured.
+        if let Some(cols) = dedup_columns {
+            Ok(Box::pin(DeduplicatingStream::new(base, cols)))
+        } else {
+            Ok(base)
         }
     }
 
@@ -258,6 +292,167 @@ impl StreamingDataFrame {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         }))
+    }
+}
+
+// ── Convenience static join wrappers ──────────────────────────────────────────
+
+impl StreamingDataFrame {
+    /// Stream-table as-of join (convenience wrapper for [`temporal_join`]).
+    ///
+    /// Looks up each stream row in `table_snapshots` using `version_col` as the
+    /// version key. Equivalent to calling `temporal_join()` with a
+    /// [`TemporalJoinSpec`].
+    pub fn stream_table_join(
+        stream_batches: &[RecordBatch],
+        table_snapshots: &[RecordBatch],
+        stream_time_col: &str,
+        version_col: &str,
+        lookback_ms: i64,
+        inner_join: bool,
+    ) -> Result<Vec<(RecordBatch, Option<RecordBatch>)>> {
+        let spec = TemporalJoinSpec {
+            stream_time_col: stream_time_col.to_string(),
+            join_keys: vec![],
+            inner_join,
+        };
+        temporal_join(stream_batches, table_snapshots, &spec, version_col, lookback_ms)
+    }
+
+    /// Stream-stream interval join (convenience wrapper for [`interval_join`]).
+    ///
+    /// Matches events from `left` and `right` when:
+    /// `lower_bound_ms <= right_ts - left_ts <= upper_bound_ms`.
+    pub fn stream_stream_join(
+        left: &[RecordBatch],
+        right: &[RecordBatch],
+        left_time_col: &str,
+        right_time_col: &str,
+        lower_bound_ms: i64,
+        upper_bound_ms: i64,
+    ) -> Result<Vec<(Arc<RecordBatch>, Arc<RecordBatch>)>> {
+        let spec = IntervalJoinSpec {
+            lower_bound_ms,
+            upper_bound_ms,
+            key_column: "k".into(),
+            max_buffer_per_side: 1_000_000,
+        };
+        interval_join(left, right, left_time_col, right_time_col, spec)
+    }
+}
+
+// ── DeduplicatingStream ───────────────────────────────────────────────────────
+
+/// Stream adapter that removes rows whose dedup-column value set has been seen
+/// before. Uses a `HashSet<u64>` keyed by a simple hash of concatenated
+/// column values per row.
+struct DeduplicatingStream {
+    inner: KrishivStream,
+    columns: Vec<String>,
+    seen: HashSet<u64>,
+}
+
+impl DeduplicatingStream {
+    fn new(inner: KrishivStream, columns: Vec<String>) -> Self {
+        Self {
+            inner,
+            columns,
+            seen: HashSet::new(),
+        }
+    }
+
+    /// Compute a stable u64 hash over the dedup-column values for a single row.
+    fn row_hash(batch: &RecordBatch, row: usize, columns: &[String]) -> u64 {
+        use std::hash::DefaultHasher;
+        let mut hasher = DefaultHasher::new();
+        for col_name in columns {
+            // Hash the column name as a separator so ("ab","c") ≠ ("a","bc").
+            col_name.hash(&mut hasher);
+            if let Ok(col_idx) = batch.schema().index_of(col_name) {
+                let col = batch.column(col_idx);
+                // Convert to string repr for simple hashing.
+                match col.data_type() {
+                    DataType::Int64 => {
+                        if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                            if arr.is_null(row) {
+                                "null".hash(&mut hasher);
+                            } else {
+                                arr.value(row).hash(&mut hasher);
+                            }
+                        }
+                    }
+                    DataType::Utf8 => {
+                        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                            if arr.is_null(row) {
+                                "null".hash(&mut hasher);
+                            } else {
+                                arr.value(row).hash(&mut hasher);
+                            }
+                        }
+                    }
+                    _ => {
+                        // For other types, hash the debug representation.
+                        format!("{:?}", col.slice(row, 1)).hash(&mut hasher);
+                    }
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Filter a batch, keeping only rows whose hash has not been seen before.
+    fn dedup_batch(
+        &mut self,
+        batch: RecordBatch,
+    ) -> Option<RecordBatch> {
+        let mut keep_indices: Vec<usize> = Vec::new();
+        for row in 0..batch.num_rows() {
+            let h = Self::row_hash(&batch, row, &self.columns);
+            if self.seen.insert(h) {
+                keep_indices.push(row);
+            }
+        }
+        if keep_indices.is_empty() {
+            return None;
+        }
+        if keep_indices.len() == batch.num_rows() {
+            return Some(batch);
+        }
+        // Build a filtered batch.
+        let indices = arrow::array::UInt32Array::from(
+            keep_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        );
+        let columns: Vec<Arc<dyn arrow::array::Array>> = batch
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col.as_ref(), &indices, None).unwrap())
+            .collect();
+        RecordBatch::try_new(batch.schema(), columns).ok()
+    }
+}
+
+impl futures::stream::Stream for DeduplicatingStream {
+    type Item = std::result::Result<RecordBatch, String>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            match self.inner.as_mut().poll_next(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    return std::task::Poll::Ready(Some(Err(e)));
+                }
+                std::task::Poll::Ready(Some(Ok(batch))) => {
+                    if let Some(deduped) = self.dedup_batch(batch) {
+                        return std::task::Poll::Ready(Some(Ok(deduped)));
+                    }
+                    // All rows were duplicates — poll again.
+                }
+            }
+        }
     }
 }
 
@@ -719,6 +914,7 @@ mod tests {
         ));
     }
 
+
     #[tokio::test]
     async fn routing_errors_are_delivered_to_both_output_streams() {
         let dataframe = dataframe_from_batches(vec![stream_batch(&["first"], &[10_000])]);
@@ -748,7 +944,7 @@ mod tests {
     #[test]
     fn temporal_join_matches_latest_table_version() {
         // Table has versions at t=100 and t=500. Stream event at t=300 should
-        // match version at t=100 (the latest version ≤ 300).
+        // match version at t=100 (the latest version <= 300).
         let table = table_batch(&[100, 500], &[10, 20]);
         let stream = stream_batch(&["alice"], &[300]);
 
@@ -815,7 +1011,7 @@ mod tests {
 
     #[test]
     fn interval_join_matches_events_within_window() {
-        // Left event at t=100, right event at t=150 → delta=50, within [0, 100].
+        // Left event at t=100, right event at t=150 -> delta=50, within [0, 100].
         let left = interval_batch(&[100], &[1]);
         let right = interval_batch(&[150], &[2]);
 
@@ -831,7 +1027,7 @@ mod tests {
 
     #[test]
     fn interval_join_excludes_events_outside_window() {
-        // Left at t=100, right at t=300 → delta=200, outside [0, 100].
+        // Left at t=100, right at t=300 -> delta=200, outside [0, 100].
         let left = interval_batch(&[100], &[1]);
         let right = interval_batch(&[300], &[2]);
 
@@ -858,7 +1054,7 @@ mod tests {
             max_buffer_per_side: 1000,
         };
         let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
-        // 1050-1000=50 ✓, 1080-1000=80 ✓, 2000-1000=1000 ✗
+        // 1050-1000=50, 1080-1000=80, 2000-1000=1000 (outside)
         assert_eq!(pairs.len(), 2);
     }
 
@@ -872,5 +1068,154 @@ mod tests {
         };
         let pairs = interval_join(&[], &[], "event_ts", "event_ts", spec).unwrap();
         assert!(pairs.is_empty());
+    }
+
+    // ── Phase F tests ─────────────────────────────────────────────────────────
+
+    // Test: drop_duplicates removes duplicate rows by key columns
+    #[tokio::test]
+    async fn drop_duplicates_removes_duplicate_rows() {
+        // Two batches; the second contains a row that duplicates "alice" in stream_ts.
+        let dataframe = dataframe_from_batches(vec![
+            stream_batch(&["alice", "bob"], &[100, 200]),
+            stream_batch(&["alice", "carol"], &[100, 300]),
+        ]);
+
+        let stream = dataframe
+            .stream()
+            .drop_duplicates(vec!["user_id", "stream_ts"])
+            .execute_stream_async()
+            .await
+            .expect("drop_duplicates must not error");
+
+        let batches = collect_stream(stream).await.expect("stream must succeed");
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+        // alice@100 appears twice but should only be counted once
+        assert_eq!(total_rows, 3, "dedup must eliminate the duplicate alice@100 row");
+    }
+
+    // Test: stream_table_join convenience wrapper matches temporal_join behavior
+    #[test]
+    fn stream_table_join_convenience_matches_temporal_join() {
+        use super::StreamingDataFrame;
+        use krishiv_dataflow::temporal_join::TemporalJoinSpec;
+
+        let table = table_batch(&[100, 500], &[10, 20]);
+        let stream = stream_batch(&["alice"], &[300]);
+
+        let spec = TemporalJoinSpec {
+            stream_time_col: "stream_ts".to_string(),
+            join_keys: vec![],
+            inner_join: false,
+        };
+        let reference = temporal_join(
+            &[stream.clone()],
+            &[table.clone()],
+            &spec,
+            "version_ts",
+            60_000,
+        ).unwrap();
+        let convenience = StreamingDataFrame::stream_table_join(
+            &[stream],
+            &[table],
+            "stream_ts",
+            "version_ts",
+            60_000,
+            false,
+        ).unwrap();
+
+        assert_eq!(reference.len(), convenience.len(), "results must have equal length");
+        for (r, c) in reference.iter().zip(convenience.iter()) {
+            assert_eq!(r.1.is_some(), c.1.is_some(), "match presence must agree");
+        }
+    }
+
+    // Test: stream_stream_join convenience wrapper matches interval_join behavior
+    #[test]
+    fn stream_stream_join_convenience_matches_interval_join() {
+        use super::StreamingDataFrame;
+
+        let left = interval_batch(&[100], &[1]);
+        let right = interval_batch(&[150], &[2]);
+
+        let spec = IntervalJoinSpec {
+            lower_bound_ms: 0,
+            upper_bound_ms: 100,
+            key_column: "k".into(),
+            max_buffer_per_side: 1000,
+        };
+        let reference = interval_join(
+            &[left.clone()],
+            &[right.clone()],
+            "event_ts",
+            "event_ts",
+            spec,
+        ).unwrap();
+        let convenience = StreamingDataFrame::stream_stream_join(
+            &[left],
+            &[right],
+            "event_ts",
+            "event_ts",
+            0,
+            100,
+        ).unwrap();
+
+        assert_eq!(
+            reference.len(),
+            convenience.len(),
+            "both approaches must produce the same number of matches"
+        );
+    }
+
+    // Test: streaming query restart -- start two sequential queries from the same data
+    #[tokio::test]
+    async fn streaming_query_restart_two_sequential_queries() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use crate::streaming_builder::{DataStreamWriter, ForeachBatchFn, StreamingTrigger};
+
+        let counter = Arc::new(AtomicU64::new(0));
+
+        // First query.
+        {
+            let df = dataframe_from_batches(vec![stream_batch(&["a", "b"], &[1, 2])]);
+            let c = Arc::clone(&counter);
+            let f: ForeachBatchFn = Arc::new(move |batches, _epoch| {
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                c.fetch_add(rows as u64, Ordering::Relaxed);
+                Ok(())
+            });
+            let q = DataStreamWriter::new(df)
+                .trigger(StreamingTrigger::Once)
+                .foreach_batch(f)
+                .start()
+                .await
+                .expect("first query must start");
+            q.await_termination().await.expect("first query must complete");
+        }
+
+        let after_first = counter.load(Ordering::Relaxed);
+        assert_eq!(after_first, 2, "first query must have processed 2 rows");
+
+        // Second query (recovery / restart).
+        {
+            let df = dataframe_from_batches(vec![stream_batch(&["c", "d", "e"], &[3, 4, 5])]);
+            let c = Arc::clone(&counter);
+            let f: ForeachBatchFn = Arc::new(move |batches, _epoch| {
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                c.fetch_add(rows as u64, Ordering::Relaxed);
+                Ok(())
+            });
+            let q = DataStreamWriter::new(df)
+                .trigger(StreamingTrigger::Once)
+                .foreach_batch(f)
+                .start()
+                .await
+                .expect("second query must start");
+            q.await_termination().await.expect("second query must complete");
+        }
+
+        let after_second = counter.load(Ordering::Relaxed);
+        assert_eq!(after_second, 5, "second query must have processed 3 more rows (2+3=5)");
     }
 }

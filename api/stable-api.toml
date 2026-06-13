@@ -39,7 +39,7 @@ exit_criteria = "One QueryHandle path with cancellation, progress, timeout, and 
 [[phases]]
 id = "F"
 name = "Structured streaming"
-status = "todo"
+status = "implemented"
 exit_criteria = "Unified bounded/unbounded relational source-to-sink API."
 
 [[phases]]
@@ -145,7 +145,7 @@ owner = "krishiv-python"
 id = "streaming.relational-source-sink"
 phase = "F"
 stability = "preview"
-rust = "partial"
+rust = "implemented"
 python = "partial"
 sql = "partial"
 owner = "krishiv-api"

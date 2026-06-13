@@ -1482,6 +1482,26 @@ impl Session {
             .deregister_table(name)
             .map_err(KrishivError::from)
     }
+
+    /// Create a streaming data reader rooted at this session.
+    pub fn read_stream(&self) -> crate::streaming_builder::DataStreamReader {
+        crate::streaming_builder::DataStreamReader::new(self.clone())
+    }
+
+    /// Crate-internal: wrap a list of pre-collected batches as a `DataFrame`.
+    pub(crate) fn create_dataframe_from_batches(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<crate::DataFrame> {
+        Ok(crate::DataFrame::from_batches(
+            self.mode,
+            batches,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+            self.runtime.clone(),
+            self.registered_parquet.clone(),
+        ))
+    }
 }
 
 fn parquet_scan_table_name(path: &Path) -> String {

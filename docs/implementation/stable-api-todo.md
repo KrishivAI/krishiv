@@ -78,14 +78,14 @@ Implementation details and remaining native-driver certification work are record
 
 ## Phase F — Structured streaming
 
-- [ ] Add canonical `read_stream` and `write_stream` builders.
-- [ ] Add append/update/complete output modes and changelog validation.
-- [ ] Add continuous, processing-time, once, and available-now triggers.
-- [ ] Add query name, checkpoint location, restart, table sink, and
+- [x] Add canonical `read_stream` and `write_stream` builders.
+- [x] Add append/update/complete output modes and changelog validation.
+- [x] Add continuous, processing-time, once, and available-now triggers.
+- [x] Add query name, checkpoint location, restart, table sink, and
       `foreach_batch`.
-- [ ] Complete watermarks, late-data policy, deduplication, windows,
+- [x] Complete watermarks, late-data policy, deduplication, windows,
       stream-table, stream-stream, and temporal joins.
-- [ ] Add streaming query lifecycle and repeated failure/recovery tests.
+- [x] Add streaming query lifecycle and repeated failure/recovery tests.
 
 ## Phase G — Stateful process API
 

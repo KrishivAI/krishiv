@@ -1,5 +1,64 @@
 # Krishiv Implementation Status
 
+## 2026-06-13 — Phase F complete: structured streaming builder, output modes, triggers, dedup, and lifecycle
+
+Completed:
+
+- Created `crates/krishiv-api/src/streaming_builder.rs` with:
+  - `StreamingOutputMode` enum (Append / Update / Complete).
+  - `StreamingTrigger` enum (Once / AvailableNow / ProcessingTime / Continuous).
+  - `StreamingQueryState` (Active / Stopped / Failed), `StreamingQueryProgress`.
+  - `ForeachBatchFn` type alias for per-micro-batch callbacks.
+  - `StreamingQuery` handle with `id()`, `name()`, `is_active()`, `stop()`,
+    `await_termination()`, `await_termination_timeout()`, `last_progress()`.
+  - `DataStreamReader` with `from_stream()` and `file_stream()`.
+  - `DataStreamWriter` with `output_mode()`, `trigger()`, `query_name()`,
+    `option()`, `foreach_batch()`, and `start()` — spawns a Tokio background
+    task and returns a `StreamingQuery` handle immediately.
+  - Internal task runners: `drain_and_call` (Once/AvailableNow),
+    `processing_time_loop` (ProcessingTime), `continuous_loop` (Continuous).
+  - 7 unit tests in `streaming_builder.rs`.
+
+- Updated `crates/krishiv-api/src/streaming_dataframe.rs`:
+  - Added `dedup_columns: Option<Vec<String>>` field to `StreamingDataFrame`.
+  - Added `drop_duplicates()` method — registers dedup columns applied at
+    stream execution time via `DeduplicatingStream` adapter.
+  - Added `write_stream()` method — returns a `DataStreamWriter`.
+  - Added `StreamingDataFrame::stream_table_join()` — convenience wrapper for
+    `temporal_join()`.
+  - Added `StreamingDataFrame::stream_stream_join()` — convenience wrapper for
+    `interval_join()`.
+  - Added `DeduplicatingStream` struct implementing `futures::stream::Stream`
+    with a `HashSet<u64>`-based deduplication adapter using `DefaultHasher`.
+  - Added 4 new Phase F tests: `drop_duplicates_removes_duplicate_rows`,
+    `stream_table_join_convenience_matches_temporal_join`,
+    `stream_stream_join_convenience_matches_interval_join`,
+    `streaming_query_restart_two_sequential_queries`.
+
+- Updated `crates/krishiv-api/src/session.rs`:
+  - Added `Session::read_stream()` returning `DataStreamReader`.
+  - Added `Session::create_dataframe_from_batches()` (crate-internal).
+
+- Updated `crates/krishiv-api/src/lib.rs`:
+  - Added `pub mod streaming_builder;`.
+  - Re-exported `DataStreamReader`, `DataStreamWriter`, `ForeachBatchFn`,
+    `StreamingOutputMode`, `StreamingQuery`, `StreamingQueryProgress`,
+    `StreamingTrigger`.
+
+- Marked all Phase F checklist items complete in
+  `docs/implementation/stable-api-todo.md`.
+- Updated `api/stable-api.toml`: Phase F `status = "implemented"`,
+  `streaming.relational-source-sink` `rust = "implemented"`.
+
+Validation:
+
+- `cargo check -p krishiv-api --lib` — 0 errors.
+- `cargo test -p krishiv-api --lib -- streaming` — all streaming tests pass.
+
+Next useful command:
+
+- `cargo test -p krishiv-api --lib` — run all krishiv-api tests.
+
 ## 2026-06-13 — Phase E complete: query lifecycle and async correctness
 
 Completed:

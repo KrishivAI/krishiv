@@ -14,6 +14,7 @@ pub mod prepared;
 pub mod query;
 pub mod session;
 pub mod stream;
+pub mod streaming_builder;
 pub mod streaming_dataframe;
 pub mod types;
 pub mod window;
@@ -49,6 +50,10 @@ pub use krishiv_connectors::{
 pub use prepared::PreparedStatement;
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
+pub use streaming_builder::{
+    DataStreamReader, DataStreamWriter, ForeachBatchFn, StreamingOutputMode, StreamingQuery,
+    StreamingQueryProgress, StreamingTrigger,
+};
 pub use streaming_dataframe::{
     KrishivStream, NamedSideOutputStream, StreamingDataFrame, StreamingOutputStreams,
 };
