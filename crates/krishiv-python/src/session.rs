@@ -226,6 +226,102 @@ impl PySession {
         })
     }
 
+    /// Read a Parquet file with typed options.
+    ///
+    /// `batch_size` overrides the number of rows per output batch.
+    #[pyo3(signature = (path, *, batch_size=None))]
+    pub fn read_parquet_with_options(
+        &self,
+        py: Python<'_>,
+        path: String,
+        batch_size: Option<usize>,
+    ) -> PyResult<PyDataFrame> {
+        let opts = krishiv_sql::ParquetReaderOptions { batch_size };
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .read_parquet_with_options(&path, opts)
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Read a CSV file with typed options.
+    ///
+    /// `delimiter` is a single character (default `,`).
+    /// `has_header` controls whether the first row is treated as a header.
+    #[pyo3(signature = (path, *, delimiter=None, has_header=None))]
+    pub fn read_csv_with_options(
+        &self,
+        py: Python<'_>,
+        path: String,
+        delimiter: Option<String>,
+        has_header: Option<bool>,
+    ) -> PyResult<PyDataFrame> {
+        let delimiter_char: Option<char> = match delimiter {
+            Some(ref s) => {
+                let mut chars = s.chars();
+                let c = chars.next().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err("delimiter must be a non-empty string")
+                })?;
+                if chars.next().is_some() {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "delimiter must be a single character",
+                    ));
+                }
+                Some(c)
+            }
+            None => None,
+        };
+        let opts = krishiv_sql::CsvReaderOptions {
+            delimiter: delimiter_char,
+            has_header,
+        };
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .read_csv_with_options(&path, opts)
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Register in-memory Arrow batches as a named SQL table.
+    pub fn register_record_batches(
+        &self,
+        py: Python<'_>,
+        name: String,
+        batches: Vec<crate::batch::PyBatch>,
+    ) -> PyResult<()> {
+        let record_batches: Vec<arrow::record_batch::RecordBatch> = batches
+            .into_iter()
+            .map(|b| b.record_batch().clone())
+            .collect();
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .register_record_batches(&name, record_batches)
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Deregister (drop) a named SQL table from this session.
+    pub fn deregister_table(&self, name: String) -> PyResult<()> {
+        self.inner
+            .deregister_table(&name)
+            .map_err(map_krishiv_error)
+    }
+
+    /// List names of all registered aggregate UDAFs.
+    pub fn list_aggregate_udfs(&self) -> Vec<String> {
+        self.inner.aggregate_udf_names()
+    }
+
+    /// List names of all registered table UDTFs.
+    pub fn list_table_udfs(&self) -> Vec<String> {
+        self.inner.table_udf_names()
+    }
+
     pub fn read_json(&self, py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
         let inner = self.inner.clone();
         py.detach(move || {

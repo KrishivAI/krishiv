@@ -199,6 +199,97 @@ impl PyDataFrame {
         py.detach(move || inner.write_json(&path).map_err(map_krishiv_error))
     }
 
+    /// Write to Parquet with typed options.
+    ///
+    /// `compression` accepts: "snappy", "gzip", "lz4", "zstd", "brotli", "uncompressed".
+    /// `max_row_group_size` sets the maximum rows per row-group.
+    #[pyo3(signature = (path, *, compression=None, max_row_group_size=None))]
+    pub fn write_parquet_with_options(
+        &self,
+        py: Python<'_>,
+        path: String,
+        compression: Option<String>,
+        max_row_group_size: Option<usize>,
+    ) -> PyResult<()> {
+        let opts = krishiv_sql::ParquetWriterOptions {
+            compression,
+            max_row_group_size,
+        };
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .write_parquet_with_options(&path, &opts)
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Write to CSV with typed options.
+    ///
+    /// `delimiter` is a single character; defaults to comma.
+    /// `has_header` controls whether a header row is emitted.
+    #[pyo3(signature = (path, *, delimiter=None, has_header=None))]
+    pub fn write_csv_with_options(
+        &self,
+        py: Python<'_>,
+        path: String,
+        delimiter: Option<String>,
+        has_header: Option<bool>,
+    ) -> PyResult<()> {
+        let delimiter_char: Option<char> = match delimiter {
+            Some(ref s) => {
+                let mut chars = s.chars();
+                let c = chars.next().ok_or_else(|| {
+                    PyRuntimeError::new_err("delimiter must be a non-empty string")
+                })?;
+                if chars.next().is_some() {
+                    return Err(PyRuntimeError::new_err(
+                        "delimiter must be a single character",
+                    ));
+                }
+                Some(c)
+            }
+            None => None,
+        };
+        let opts = krishiv_sql::CsvWriterOptions {
+            delimiter: delimiter_char,
+            has_header,
+        };
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .write_csv_with_options(&path, &opts)
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Materialise this DataFrame into an in-memory table and return a new
+    /// DataFrame backed by it. Equivalent to `persist()`.
+    pub fn cache(&self, py: Python<'_>) -> PyResult<Self> {
+        let inner = self.inner.clone();
+        py.detach(move || inner.cache().map(|inner| Self { inner }).map_err(map_krishiv_error))
+    }
+
+    /// Alias for `cache()`.
+    pub fn persist(&self, py: Python<'_>) -> PyResult<Self> {
+        self.cache(py)
+    }
+
+    /// Drop the in-memory table created by `cache()` / `persist()`.
+    /// A no-op if this DataFrame was not previously cached.
+    pub fn unpersist(&self) -> PyResult<()> {
+        self.inner.unpersist().map_err(map_krishiv_error)
+    }
+
+    /// Register this DataFrame as a temporary SQL view named `name`.
+    ///
+    /// Subsequent `session.sql("SELECT * FROM <name>")` calls resolve against
+    /// this DataFrame's query.
+    pub fn create_or_replace_temp_view(&self, name: String) -> PyResult<()> {
+        self.inner
+            .create_or_replace_temp_view(&name)
+            .map_err(map_krishiv_error)
+    }
+
     pub fn num_rows(&self, py: Python<'_>) -> PyResult<usize> {
         let inner = self.inner.clone();
         py.detach(move || {

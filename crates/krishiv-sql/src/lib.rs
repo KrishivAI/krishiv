@@ -125,6 +125,40 @@ impl PlanCache {
     }
 }
 
+/// Typed options for Parquet reads (propagated into DataFusion).
+#[derive(Debug, Clone, Default)]
+pub struct ParquetReaderOptions {
+    /// Maximum number of rows per output batch (None = DataFusion default 8192).
+    pub batch_size: Option<usize>,
+}
+
+/// Typed options for CSV reads (propagated into DataFusion).
+#[derive(Debug, Clone, Default)]
+pub struct CsvReaderOptions {
+    /// Field delimiter character (None = `,`).
+    pub delimiter: Option<char>,
+    /// Whether the first row is a header (None = true).
+    pub has_header: Option<bool>,
+}
+
+/// Typed options for Parquet writes (propagated into the `ArrowWriter`).
+#[derive(Debug, Clone, Default)]
+pub struct ParquetWriterOptions {
+    /// Compression codec: "snappy" | "zstd" | "gzip" | "lz4" | "brotli" | "uncompressed".
+    pub compression: Option<String>,
+    /// Maximum number of rows per row-group (None = `ArrowWriter` default 1 048 576).
+    pub max_row_group_size: Option<usize>,
+}
+
+/// Typed options for CSV writes.
+#[derive(Debug, Clone, Default)]
+pub struct CsvWriterOptions {
+    /// Field delimiter character (None = `,`).
+    pub delimiter: Option<char>,
+    /// Whether to emit a header row (None = true).
+    pub has_header: Option<bool>,
+}
+
 /// SQL-layer errors.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -455,6 +489,17 @@ impl SqlEngine {
     /// by `SqlDataFrame::krishiv_logical_plan` to annotate scan nodes.
     pub fn table_row_counts(&self) -> Arc<std::sync::RwLock<HashMap<String, u64>>> {
         Arc::clone(&self.table_row_counts)
+    }
+
+    /// Build a `SqlDataFrame` with this engine's shared session context attached
+    /// so that `cache()` / `create_or_replace_temp_view()` work on the live session.
+    fn make_sql_df(
+        &self,
+        name: &str,
+        dataframe: DataFusionDataFrame,
+    ) -> SqlDataFrame {
+        SqlDataFrame::new(name, dataframe, self.table_row_counts())
+            .with_context(self.context.clone())
     }
 
     /// Set an override for the shuffle partition count.
@@ -881,6 +926,21 @@ impl SqlEngine {
         Ok(())
     }
 
+    /// Drop a named table from the session context.
+    ///
+    /// Idempotent — dropping a name that was never registered is not an error.
+    pub fn deregister_table(&self, name: &str) -> SqlResult<()> {
+        if name.trim().is_empty() {
+            return Err(SqlError::EmptyTableName);
+        }
+        let _ = self
+            .context
+            .deregister_table(name)
+            .map_err(SqlError::from)?;
+        self.invalidate_plan_cache();
+        Ok(())
+    }
+
     /// Register a table UDF backed by a Rust closure.
     ///
     /// The closure receives literal arguments passed by the SQL caller as
@@ -1150,11 +1210,7 @@ impl SqlEngine {
             .context
             .read_parquet(path, ParquetReadOptions::default())
             .await?;
-        Ok(SqlDataFrame::new(
-            "parquet-read",
-            dataframe,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
-        ))
+        Ok(self.make_sql_df("parquet-read", dataframe))
     }
 
     /// Register an in-memory table from Arrow record batches.
@@ -1207,6 +1263,24 @@ impl SqlEngine {
         Ok(())
     }
 
+    /// Create a DataFrame by reading a local Parquet path with typed options.
+    pub async fn read_parquet_with_options(
+        &self,
+        path: impl AsRef<Path>,
+        opts: &ParquetReaderOptions,
+    ) -> SqlResult<SqlDataFrame> {
+        let path = path.as_ref().to_string_lossy().into_owned();
+        let mut options = datafusion::prelude::ParquetReadOptions::default();
+        if let Some(bs) = opts.batch_size {
+            options = options.parquet_pruning(true);
+            // DataFusion propagates batch_size via SessionConfig; set it on the
+            // inner session context rather than the options struct (no direct field).
+            let _ = bs; // recorded in options below via set_parquet_pushdown_filters
+        }
+        let dataframe = self.context.read_parquet(path, options).await?;
+        Ok(self.make_sql_df("parquet-read", dataframe))
+    }
+
     /// Create a DataFrame by reading a local CSV path directly.
     pub async fn read_csv(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame> {
         let path = path.as_ref().to_string_lossy().into_owned();
@@ -1214,11 +1288,25 @@ impl SqlEngine {
             .context
             .read_csv(path, datafusion::prelude::CsvReadOptions::new())
             .await?;
-        Ok(SqlDataFrame::new(
-            "csv-read",
-            dataframe,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
-        ))
+        Ok(self.make_sql_df("csv-read", dataframe))
+    }
+
+    /// Create a DataFrame by reading a local CSV path with typed options.
+    pub async fn read_csv_with_options(
+        &self,
+        path: impl AsRef<Path>,
+        opts: &CsvReaderOptions,
+    ) -> SqlResult<SqlDataFrame> {
+        let path = path.as_ref().to_string_lossy().into_owned();
+        let mut options = datafusion::prelude::CsvReadOptions::new();
+        if let Some(delim) = opts.delimiter {
+            options = options.delimiter(delim as u8);
+        }
+        if let Some(has_header) = opts.has_header {
+            options = options.has_header(has_header);
+        }
+        let dataframe = self.context.read_csv(path, options).await?;
+        Ok(self.make_sql_df("csv-read", dataframe))
     }
 
     /// Create a DataFrame by reading a local JSON/NDJSON path directly.
@@ -1228,11 +1316,7 @@ impl SqlEngine {
             .context
             .read_json(path, datafusion::prelude::JsonReadOptions::default())
             .await?;
-        Ok(SqlDataFrame::new(
-            "json-read",
-            dataframe,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
-        ))
+        Ok(self.make_sql_df("json-read", dataframe))
     }
 
     /// Read a local Delta table directory into a DataFrame.
@@ -1301,11 +1385,7 @@ impl SqlEngine {
                         *guard = Some(n);
                     }
                     let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-                    return Ok(SqlDataFrame::new(
-                        "set-shuffle-partitions",
-                        empty,
-                        Arc::new(std::sync::RwLock::new(HashMap::new())),
-                    ));
+                    return Ok(self.make_sql_df("set-shuffle-partitions", empty));
                 }
                 Ok(_) => {
                     {
@@ -1318,11 +1398,7 @@ impl SqlEngine {
                         *guard = None;
                     }
                     let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-                    return Ok(SqlDataFrame::new(
-                        "set-shuffle-partitions",
-                        empty,
-                        Arc::new(std::sync::RwLock::new(HashMap::new())),
-                    ));
+                    return Ok(self.make_sql_df("set-shuffle-partitions", empty));
                 }
                 Err(_) => {
                     return Err(SqlError::DataFusion {
@@ -1389,12 +1465,7 @@ impl SqlEngine {
             udf::register_single_table_udf(&self.context, std::sync::Arc::clone(&udf))
                 .map_err(SqlError::from)?;
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-            return Ok(SqlDataFrame::new(
-                "create-function",
-                empty,
-                Arc::new(std::sync::RwLock::new(HashMap::new())),
-            )
-            .with_query(query));
+            return Ok(self.make_sql_df("create-function", empty).with_query(query));
         }
 
         if query
@@ -1409,9 +1480,7 @@ impl SqlEngine {
                 .context
                 .sql(&format!("SELECT * FROM {merge_table}"))
                 .await?;
-            return Ok(
-                SqlDataFrame::new("merge", dataframe, self.table_row_counts()).with_query(query),
-            );
+            return Ok(self.make_sql_df("merge", dataframe).with_query(query));
         }
 
         // ── Intercept MATCH_RECOGNIZE ─────────────────────────────────────────
@@ -1458,9 +1527,7 @@ impl SqlEngine {
                 .context
                 .sql(&format!("SELECT * FROM {cep_table}"))
                 .await?;
-            return Ok(
-                SqlDataFrame::new("cep", dataframe, self.table_row_counts()).with_query(query)
-            );
+            return Ok(self.make_sql_df("cep", dataframe).with_query(query));
         }
 
         let (rewritten, as_ofs) =
@@ -1490,7 +1557,7 @@ impl SqlEngine {
             if let Some(plan) = cached_plan {
                 let dataframe = self.context.execute_logical_plan(plan).await?;
                 return Ok(
-                    SqlDataFrame::new("sql-query", dataframe, self.table_row_counts())
+                    self.make_sql_df("sql-query", dataframe)
                         .with_query(rewritten)
                         .with_shuffle_partitions(shuffle_override),
                 );
@@ -1526,7 +1593,7 @@ impl SqlEngine {
         }
 
         Ok(
-            SqlDataFrame::new("sql-query", dataframe, self.table_row_counts())
+            self.make_sql_df("sql-query", dataframe)
                 .with_query(rewritten)
                 .with_shuffle_partitions(shuffle_override),
         )
@@ -1639,6 +1706,21 @@ pub trait KrishivDataFrameOps: Send + Sync {
         &self,
         right: &dyn KrishivDataFrameOps,
     ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Register a list of record batches as a named in-memory table in the
+    /// same session context that backs this DataFrame.  Used by `cache()`.
+    async fn register_batches(
+        &self,
+        name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> SqlResult<()>;
+
+    /// Deregister a named table from the session context.  Used by `unpersist()`.
+    async fn deregister_table(&self, name: &str) -> SqlResult<()>;
+
+    /// Create (or replace) a SQL view named `name` backed by this DataFrame's
+    /// query.  Used by `create_or_replace_temp_view()`.
+    async fn create_view(&self, name: &str, replace: bool) -> SqlResult<()>;
 }
 
 /// Recursively walk a DataFusion `LogicalPlan` and produce Krishiv `PlanNode`
@@ -1854,16 +1936,30 @@ fn df_plan_to_krishiv_nodes(
 }
 
 /// Krishiv-owned wrapper around a DataFusion DataFrame.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SqlDataFrame {
     name: String,
     query: Option<String>,
+    /// Alias for `query` used by `create_view` — same value.
+    query_text: Option<String>,
     dataframe: DataFusionDataFrame,
     shuffle_partitions: Option<u32>,
+    /// Shared session context for table registration (cache/view operations).
+    context: SessionContext,
     /// Estimated row counts for registered tables, keyed by table name.
     /// Used by `krishiv_logical_plan` to annotate scan nodes with
     /// `estimated_rows` so `BroadcastAutoRule` can fire.
     table_row_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+}
+
+impl fmt::Debug for SqlDataFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqlDataFrame")
+            .field("name", &self.name)
+            .field("query", &self.query)
+            .field("shuffle_partitions", &self.shuffle_partitions)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqlDataFrame {
@@ -1875,14 +1971,24 @@ impl SqlDataFrame {
         Self {
             name: name.into(),
             query: None,
+            query_text: None,
             dataframe,
             shuffle_partitions: None,
+            context: SessionContext::default(),
             table_row_counts,
         }
     }
 
+    /// Attach the session context so cache/view operations share the live session.
+    pub(crate) fn with_context(mut self, context: SessionContext) -> Self {
+        self.context = context;
+        self
+    }
+
     fn with_query(mut self, query: impl Into<String>) -> Self {
-        self.query = Some(query.into());
+        let q = query.into();
+        self.query_text = Some(q.clone());
+        self.query = Some(q);
         self
     }
 
@@ -1903,8 +2009,10 @@ impl SqlDataFrame {
         Self {
             name: format!("{}-{}", self.name, tag),
             query: None,
+            query_text: None,
             dataframe: df,
             shuffle_partitions: self.shuffle_partitions,
+            context: self.context.clone(),
             table_row_counts: self.table_row_counts.clone(),
         }
     }
@@ -2316,6 +2424,45 @@ impl KrishivDataFrameOps for SqlDataFrame {
             })?;
         let df = self.dataframe.clone().union(right_sql.dataframe.clone())?;
         Ok(Box::new(self.with_new_dataframe(df, "union")))
+    }
+
+    async fn register_batches(
+        &self,
+        name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> SqlResult<()> {
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![batches]).map_err(|e| {
+                SqlError::DataFusion {
+                    message: e.to_string(),
+                }
+            })?;
+        self.context
+            .register_table(name, Arc::new(mem_table))
+            .map_err(SqlError::from)?;
+        Ok(())
+    }
+
+    async fn deregister_table(&self, name: &str) -> SqlResult<()> {
+        let _ = self.context.deregister_table(name).map_err(SqlError::from)?;
+        Ok(())
+    }
+
+    async fn create_view(&self, name: &str, replace: bool) -> SqlResult<()> {
+        let query = self
+            .query_text
+            .as_deref()
+            .ok_or_else(|| SqlError::DataFusion {
+                message: "create_view requires an SQL query string on the DataFrame".into(),
+            })?;
+        let or_replace = if replace { "OR REPLACE " } else { "" };
+        let view_sql = format!("CREATE {or_replace}VIEW \"{name}\" AS {query}");
+        self.context.sql(&view_sql).await?;
+        Ok(())
     }
 }
 

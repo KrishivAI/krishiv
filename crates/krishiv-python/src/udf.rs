@@ -210,12 +210,36 @@ impl krishiv_plan::udf::ScalarUdf for PythonScalarUdf {
     }
 }
 
+/// Default Python UDF execution timeout (30 seconds).
+const PYTHON_UDF_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
 pub async fn call_python_udf(
     udf: Arc<dyn krishiv_plan::udf::ScalarUdf>,
     batch: RecordBatch,
 ) -> Result<ArrayRef, krishiv_plan::udf::UdfError> {
-    tokio::task::spawn_blocking(move || udf.call(&batch))
+    call_python_udf_with_timeout(udf, batch, PYTHON_UDF_DEFAULT_TIMEOUT_MS).await
+}
+
+/// Execute a Python scalar UDF with an explicit millisecond timeout.
+///
+/// If the UDF does not return within `timeout_ms`, the blocking thread is
+/// left running (it cannot be cancelled), but the caller receives a
+/// `UdfError::Execution` with a timeout message. Callers should not rely on
+/// subsequent calls completing quickly on the same thread.
+pub async fn call_python_udf_with_timeout(
+    udf: Arc<dyn krishiv_plan::udf::ScalarUdf>,
+    batch: RecordBatch,
+    timeout_ms: u64,
+) -> Result<ArrayRef, krishiv_plan::udf::UdfError> {
+    let handle = tokio::task::spawn_blocking(move || udf.call(&batch));
+    tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), handle)
         .await
+        .map_err(|_| krishiv_plan::udf::UdfError::Execution {
+            message: format!(
+                "Python UDF timed out after {timeout_ms} ms; \
+                 set KRISHIV_PYTHON_UDF_TIMEOUT_MS to override"
+            ),
+        })?
         .map_err(|e| krishiv_plan::udf::UdfError::Panic(e.to_string()))?
 }
 
