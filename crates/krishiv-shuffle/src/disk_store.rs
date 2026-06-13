@@ -241,31 +241,42 @@ impl ShuffleStore for LocalDiskShuffleStore {
             use parquet::arrow::ArrowWriter;
             use std::sync::atomic::{AtomicU64, Ordering};
 
+            // ENOSPC (errno 28) or StorageFull — surface as DiskFull so callers
+            // know not to retry the write indefinitely.
+            fn wrap_io_err(e: std::io::Error, path: &std::path::Path) -> ShuffleError {
+                if e.kind() == std::io::ErrorKind::StorageFull
+                    || e.raw_os_error() == Some(28)
+                {
+                    ShuffleError::DiskFull {
+                        path: path.to_string_lossy().into_owned(),
+                        source: e,
+                    }
+                } else {
+                    io_err(e.to_string())
+                }
+            }
+
             // Use a process-local counter for unique temp file names.
             static TMP_CTR: AtomicU64 = AtomicU64::new(1);
             let tmp_suffix = TMP_CTR.fetch_add(1, Ordering::Relaxed);
 
             if let Some(parent) = final_path.parent() {
                 std::fs::create_dir_all(parent)
-                    .map_err(|e| io_err(format!("failed to create partition dir: {e}")))?;
+                    .map_err(|e| wrap_io_err(e, final_path.parent().unwrap()))?;
             }
 
             // Phase 1 (continued): Write to a temp file alongside the final path.
             let tmp_path = final_path.with_extension(format!("tmp.{tmp_suffix}"));
             {
-                let tmp_file = std::fs::File::create(&tmp_path).map_err(|e| {
-                    io_err(format!(
-                        "failed to create temp partition file '{}': {e}",
-                        tmp_path.display()
-                    ))
-                })?;
+                let tmp_file = std::fs::File::create(&tmp_path)
+                    .map_err(|e| wrap_io_err(e, &tmp_path))?;
                 let schema = partition.schema.clone();
                 let mut writer = ArrowWriter::try_new(tmp_file, schema, Some(writer_props))
                     .map_err(|e| io_err(format!("failed to create Parquet writer: {e}")))?;
                 for batch in &partition.batches {
-                    writer
-                        .write(batch)
-                        .map_err(|e| io_err(format!("failed to write Parquet batch: {e}")))?;
+                    writer.write(batch).map_err(|e| {
+                        io_err(format!("failed to write Parquet batch: {e}"))
+                    })?;
                 }
                 // S4: Sync temp file to durable storage before commit.
                 let tmp_file = writer
@@ -273,7 +284,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
                     .map_err(|e| io_err(format!("failed to finalize Parquet writer: {e}")))?;
                 tmp_file
                     .sync_all()
-                    .map_err(|e| io_err(format!("failed to fsync temp file: {e}")))?;
+                    .map_err(|e| wrap_io_err(e, &tmp_path))?;
             }
 
             // Compute BLAKE3 hash over the written Parquet bytes so write-time
@@ -283,19 +294,15 @@ impl ShuffleStore for LocalDiskShuffleStore {
             let hash = compute_hash_bytes(&parquet_bytes);
             let tmp_hash_path = final_hash_path.with_extension(format!("blake3.tmp.{tmp_suffix}"));
             {
-                let mut hash_file = std::fs::File::create(&tmp_hash_path).map_err(|e| {
-                    io_err(format!(
-                        "failed to create temp partition hash file '{}': {e}",
-                        tmp_hash_path.display()
-                    ))
-                })?;
+                let mut hash_file = std::fs::File::create(&tmp_hash_path)
+                    .map_err(|e| wrap_io_err(e, &tmp_hash_path))?;
                 use std::io::Write;
                 hash_file
                     .write_all(encode_hash(&hash).as_bytes())
-                    .map_err(|e| io_err(format!("failed to write temp partition hash: {e}")))?;
+                    .map_err(|e| wrap_io_err(e, &tmp_hash_path))?;
                 hash_file
                     .sync_all()
-                    .map_err(|e| io_err(format!("failed to fsync temp partition hash: {e}")))?;
+                    .map_err(|e| wrap_io_err(e, &tmp_hash_path))?;
             }
 
             // Phase 2: Re-acquire the lock and commit via rename only if our token

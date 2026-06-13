@@ -111,7 +111,118 @@ impl Coordinator {
         // Start the re-attach grace period.
         self.ticks_since_restart = 0;
         self.recovering = true;
+
+        // Phase 2.6: post-restart shuffle availability audit. Shuffle outputs
+        // whose producing executor is not present in the restored registry can
+        // never be fetched (the executor will never be evicted either, since
+        // the heartbeat clock only tracks registered executors). Invalidate
+        // them now so producers re-run before consumers fail their fetches.
+        let audited = self.audit_shuffle_availability();
+        if audited > 0 {
+            tracing::warn!(
+                jobs_affected = audited,
+                "post-restart shuffle audit invalidated unavailable partitions; producers re-queued"
+            );
+        }
         Ok(())
+    }
+
+    /// Audit shuffle availability across all non-terminal jobs.
+    ///
+    /// For every Succeeded task that produced remote (Flight-served) shuffle
+    /// partitions, verify the producing executor is still known to the
+    /// executor registry. Unknown producers — executors whose descriptors
+    /// were not restored or that re-registered under a new identity — have
+    /// their partitions marked Failed and their tasks reset to Pending.
+    ///
+    /// Registered-but-silent executors are deliberately left alone here: the
+    /// re-attach grace period gives them time to reconnect, and the heartbeat
+    /// timeout eviction path invalidates their shuffle output if they never do.
+    ///
+    /// Returns the number of jobs with invalidated partitions.
+    pub fn audit_shuffle_availability(&mut self) -> usize {
+        let known_executors: std::collections::HashSet<ExecutorId> = self
+            .executors
+            .list()
+            .iter()
+            .map(|record| record.executor_id().clone())
+            .collect();
+
+        let job_ids: Vec<JobId> = self.job_coordinators.keys().cloned().collect();
+        let mut jobs_affected = 0usize;
+        for job_id in &job_ids {
+            let Ok(mut job) = self.find_job_mut(job_id) else {
+                continue;
+            };
+            if job.state().is_terminal() {
+                continue;
+            }
+            let mut affected = false;
+
+            // 1. Assigned/Running tasks pointing at executors that no longer
+            //    exist can never receive a launch or report status — reset
+            //    them to Pending so the orchestration loop can re-place them.
+            for stage in job.stages_mut() {
+                let mut stage_affected = false;
+                for task in stage.tasks_mut() {
+                    let unknown = task
+                        .assigned_executor()
+                        .is_some_and(|id| !known_executors.contains(id));
+                    if unknown && matches!(task.state(), TaskState::Assigned | TaskState::Running) {
+                        task.state = TaskState::Pending;
+                        task.assigned_executor = None;
+                        task.clear_launch_in_flight();
+                        stage_affected = true;
+                        affected = true;
+                    }
+                }
+                if stage_affected {
+                    stage.refresh_state();
+                }
+            }
+            if affected {
+                job.refresh_state();
+            }
+
+            // 2. Succeeded producers of remote shuffle output whose executor
+            //    is gone — their partitions are unfetchable; re-run them.
+            let mut unknown_producers: Vec<ExecutorId> = Vec::new();
+            for stage in job.stages() {
+                for task in stage.tasks() {
+                    if task.state() != TaskState::Succeeded {
+                        continue;
+                    }
+                    let Some(executor_id) = task.assigned_executor() else {
+                        continue;
+                    };
+                    if known_executors.contains(executor_id)
+                        || unknown_producers.contains(executor_id)
+                    {
+                        continue;
+                    }
+                    let has_remote_shuffle = task.output_metadata().is_some_and(|m| {
+                        m.shuffle_partitions()
+                            .iter()
+                            .any(|p| !p.flight_endpoint.is_empty())
+                    });
+                    if has_remote_shuffle {
+                        unknown_producers.push(executor_id.clone());
+                    }
+                }
+            }
+            for executor_id in &unknown_producers {
+                if job.invalidate_executor_shuffle_partitions(executor_id) {
+                    affected = true;
+                }
+            }
+            if affected {
+                jobs_affected += 1;
+            }
+        }
+        if jobs_affected > 0 {
+            self.notify.notify_waiters();
+        }
+        jobs_affected
     }
 
     /// Reload one job record from the attached metadata store into memory.

@@ -22,7 +22,28 @@ impl Coordinator {
 
         // Admission control: compute live quota snapshot then ask the queue manager.
         let quota = self.namespace_quota_snapshot(spec.namespace_id());
-        let outcome = self.queue_manager.admit(&spec, &quota);
+        let mut outcome = self.queue_manager.admit(&spec, &quota);
+
+        // Memory-estimate admission: when the job declares a memory ask and the
+        // cluster reports memory capacity via heartbeats, queue the job if its
+        // ask exceeds what is currently available across schedulable executors.
+        // Unknown capacity (no executor reports a memory limit) skips the check
+        // so clusters without memory reporting are unaffected.
+        if matches!(outcome, SubmitOutcome::Accepted)
+            && let Some(ask) = spec.memory_limit_bytes()
+            && ask > 0
+            && let Some(available) = self.executors.cluster_available_memory_bytes()
+            && ask > available
+        {
+            tracing::warn!(
+                job_id = %spec.job_id(),
+                memory_ask = ask,
+                cluster_available = available,
+                "job memory ask exceeds available cluster memory; queueing"
+            );
+            outcome = SubmitOutcome::Queued { position: 0 };
+        }
+
         if let SubmitOutcome::Queued { .. } = &outcome {
             if krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile) {
                 return Err(SchedulerError::InvalidJob {
@@ -182,6 +203,9 @@ impl Coordinator {
             .unwrap_or_default();
         let terminal_state = update.state();
         let executor_id_for_circuit = update.executor_id().clone();
+        // Save before update is moved.
+        let missing_partitions: Vec<krishiv_proto::MissingShufflePartition> =
+            update.missing_shuffle_partitions().to_vec();
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
 
         if outcome == TaskUpdateOutcome::Duplicate {
@@ -245,18 +269,104 @@ impl Coordinator {
             self.executors.reset_task_failures(&executor_id_for_circuit);
         }
 
+        // Re-queue the producing stage when the consumer reports missing partitions.
+        // This handles the case where a producer executor's shuffle data is lost
+        // (disk failure, eviction, restart) after the produce stage already succeeded.
+        if terminal_state == TaskState::Failed && !missing_partitions.is_empty() {
+            tracing::warn!(
+                job_id = %job_id,
+                stage_id = %stage_id,
+                missing_count = missing_partitions.len(),
+                "consumer task reported missing upstream shuffle partitions; invalidating producers"
+            );
+            let producers_affected = if let Ok(mut job) = self.find_job_mut(&job_id) {
+                job.invalidate_specific_shuffle_partitions(&missing_partitions)
+            } else {
+                false
+            };
+            if producers_affected {
+                self.notify.notify_waiters();
+            }
+        }
+
         if terminal_state == TaskState::Succeeded && !inline_ipc.is_empty() {
             self.job_inline_results
                 .entry(job_id.clone())
                 .or_default()
                 .extend(inline_ipc);
         }
+
+        // AQE stage-boundary re-optimization (Phase 2.9).
+        //
+        // When a shuffle stage completes, collect per-task serialized_bytes and
+        // run the default AQE optimizer so downstream stage launch can use the
+        // `coalesced_partition_count` hint to right-size reduce parallelism.
+        if terminal_state == TaskState::Succeeded {
+            let stage_just_succeeded = self
+                .job_coordinators
+                .get(&job_id)
+                .map(|jc| {
+                    let r = jc.read_record();
+                    r.stages
+                        .iter()
+                        .find(|s| s.stage_id() == &stage_id)
+                        .is_some_and(|s| s.state == StageState::Succeeded)
+                })
+                .unwrap_or(false);
+            if stage_just_succeeded {
+                let stats = self
+                    .job_coordinators
+                    .get(&job_id)
+                    .map(|jc| jc.read_record().collect_stage_runtime_stats(&stage_id))
+                    .unwrap_or_default();
+                if !stats.is_empty() && stats.iter().any(|s| s.serialized_bytes > 0) {
+                    let aqe = krishiv_plan::optimizer::default_aqe_optimizer();
+                    let placeholder = krishiv_plan::PhysicalPlan::new(
+                        job_id.as_str(),
+                        krishiv_plan::ExecutionKind::Batch,
+                    );
+                    match aqe.apply(placeholder, &stats) {
+                        Ok((plan, applied)) if !applied.is_empty() => {
+                            if let Some(hint) = plan.coalesced_partition_count() {
+                                tracing::info!(
+                                    job_id = %job_id,
+                                    stage_id = %stage_id,
+                                    coalesced_partition_count = hint,
+                                    applied_rules = ?applied,
+                                    "AQE stage-boundary re-optimization: coalesce hint stored"
+                                );
+                                // Store the hint for the next stage launch.
+                                self.aqe_coalesce_hints
+                                    .insert((job_id.clone(), stage_id.clone()), hint);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                job_id = %job_id,
+                                stage_id = %stage_id,
+                                error = %e,
+                                "AQE stage-boundary re-optimization skipped"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if is_continuous_cycle && terminal_state == TaskState::Succeeded {
             self.complete_continuous_input_cycle(&job_id, &task_id);
         } else if is_continuous_cycle && terminal_state == TaskState::Failed {
             self.continuous_input_cycles.remove(&job_id);
             self.job_input_partitions.remove(&job_id);
         }
+
+        // Phase 2.3 distributed write commit: when this update drove the job
+        // to a terminal state, publish staged sink outputs (job success) or
+        // clean up staging (failure/cancel). Runs before the state snapshot
+        // below so a publish failure demotes the job to Failed prior to
+        // persistence and GC bookkeeping.
+        self.finalize_staged_sink_outputs(&job_id);
 
         // Snapshot the job's current state and resource usage after the update.
         let (is_terminal, usage, state, job_name, namespace) = self
@@ -378,6 +488,7 @@ impl Coordinator {
         // that finish before their next task-launch cycle consumes the entry.
         self.skew_repartition_overrides.remove(job_id);
         self.streaming_advisory_partitions.remove(job_id);
+        self.aqe_coalesce_hints.retain(|(jid, _), _| jid != job_id);
         // Recovery control-plane state for the completed job.
         self.restore_directives.remove(job_id);
         self.pending_stop_after_savepoint.remove(job_id);

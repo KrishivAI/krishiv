@@ -113,6 +113,75 @@ pub async fn execute_batch_sql_coordinated(
     }
 }
 
+/// Execute a batch SQL write job whose terminal task writes through a sink
+/// contract (Phase 2.3 distributed writes) instead of returning rows inline.
+///
+/// `sink_contract` is the full output contract description, e.g.
+/// `object-parquet-sink:<base_dir>:<dest>:mode=overwrite:partition_by=c`.
+/// The executor stages output under `<dest>/_staging/<job_id>/`; on job
+/// success the coordinator publishes the staged files into the destination,
+/// and on failure it removes them. Returns the job id once the job has
+/// reached `Succeeded`.
+pub async fn execute_batch_sql_sink_coordinated(
+    coordinator: &SharedCoordinator,
+    query: &str,
+    tables: &[BatchSqlInlineTable],
+    sink_contract: &str,
+) -> SchedulerResult<JobId> {
+    let job_id =
+        submit_batch_sql_job_inner(coordinator, query, tables, false, Some(sink_contract)).await?;
+
+    let notify = {
+        let coord = coordinator.read().await;
+        coord.notify.clone()
+    };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            let _ = coordinator.write().await.cancel_job(&job_id);
+            return Err(SchedulerError::Transport {
+                message: format!("batch SQL sink job {job_id} timed out after 300s"),
+            });
+        }
+
+        let state = {
+            let coord = coordinator.read().await;
+            coord.job_snapshot(&job_id).map(|s| s.state())?
+        };
+
+        match state {
+            JobState::Succeeded => {
+                // Sink jobs do not return inline results; drop any that the
+                // executor reported alongside the staged write.
+                let _ = coordinator.write().await.take_job_inline_results(&job_id);
+                return Ok(job_id);
+            }
+            JobState::Failed | JobState::Cancelled => {
+                return Err(SchedulerError::Transport {
+                    message: format!("batch SQL sink job {job_id} finished in state {state:?}"),
+                });
+            }
+            JobState::Accepted | JobState::Planning | JobState::Running => {
+                let state_changed = notify.notified();
+                let recheck_state = {
+                    let coord = coordinator.read().await;
+                    coord.job_snapshot(&job_id).map(|s| s.state())?
+                };
+                if matches!(
+                    recheck_state,
+                    JobState::Accepted | JobState::Planning | JobState::Running
+                ) {
+                    tokio::select! {
+                        _ = state_changed => {}
+                        _ = tokio::time::sleep_until(deadline) => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Submit a batch SQL job and return immediately with the `JobId`.
 ///
 /// The background orchestration loop drives task dispatch.  The caller
@@ -123,6 +192,16 @@ pub async fn submit_batch_sql_job(
     query: &str,
     tables: &[BatchSqlInlineTable],
     is_streaming: bool,
+) -> SchedulerResult<JobId> {
+    submit_batch_sql_job_inner(coordinator, query, tables, is_streaming, None).await
+}
+
+async fn submit_batch_sql_job_inner(
+    coordinator: &SharedCoordinator,
+    query: &str,
+    tables: &[BatchSqlInlineTable],
+    is_streaming: bool,
+    sink_contract: Option<&str>,
 ) -> SchedulerResult<JobId> {
     use base64::Engine as _;
 
@@ -142,7 +221,16 @@ pub async fn submit_batch_sql_job(
     })?;
 
     let fragment = format!("sql: {query}");
-    let stage = StageSpec::new(stage_id, "batch-sql").with_task(TaskSpec::new(task_id, fragment));
+    let mut task = TaskSpec::new(task_id, fragment);
+    if let Some(contract) = sink_contract {
+        if contract.trim().is_empty() {
+            return Err(SchedulerError::InvalidJob {
+                message: String::from("batch SQL sink contract cannot be empty"),
+            });
+        }
+        task = task.with_sink_contract(contract.trim());
+    }
+    let stage = StageSpec::new(stage_id, "batch-sql").with_task(task);
     let job_kind = if is_streaming {
         JobKind::Streaming
     } else {

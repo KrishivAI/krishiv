@@ -117,6 +117,29 @@ pub trait ExecutionRuntime: Send + Sync {
         is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>>;
 
+    /// Execute a batch SQL write whose result is committed through a sink
+    /// output contract (Phase 2.3 distributed writes) instead of being
+    /// collected back to the client.
+    ///
+    /// `sink_contract` is a full output contract description such as
+    /// `object-parquet-sink:<base>:<dest>:mode=overwrite:partition_by=c`.
+    /// Sink tasks stage part files under `<dest>/_staging/<job_id>/` and the
+    /// coordinator publishes them atomically when the job succeeds, so the
+    /// destination never exposes partial output.
+    ///
+    /// The default implementation rejects the call; runtimes that can submit
+    /// sink jobs (in-process cluster, Flight `batch_sql_sink` action) override it.
+    fn collect_batch_sql_sink(
+        &self,
+        _query: &str,
+        _tables: &[BatchTableRegistration],
+        _sink_contract: &str,
+    ) -> RuntimeResult<()> {
+        Err(RuntimeError::unsupported(
+            "this execution runtime does not support distributed sink writes",
+        ))
+    }
+
     /// Explain a SQL query (plan metadata only).
     fn explain_sql(&self, query: &str) -> RuntimeResult<String>;
 
@@ -238,6 +261,16 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
     ) -> RuntimeResult<Vec<RecordBatch>> {
         self.cluster
             .collect_batch_sql(query, &tables_to_batch_sql(tables), is_streaming)
+    }
+
+    fn collect_batch_sql_sink(
+        &self,
+        query: &str,
+        tables: &[BatchTableRegistration],
+        sink_contract: &str,
+    ) -> RuntimeResult<()> {
+        self.cluster
+            .execute_batch_sql_sink(query, &tables_to_batch_sql(tables), sink_contract)
     }
 
     fn explain_sql(&self, query: &str) -> RuntimeResult<String> {
@@ -442,6 +475,25 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
                 Err(e) => Err(e),
             }
         })
+    }
+
+    fn collect_batch_sql_sink(
+        &self,
+        query: &str,
+        tables: &[BatchTableRegistration],
+        sink_contract: &str,
+    ) -> RuntimeResult<()> {
+        use crate::flight_action::{BatchSqlSinkBody, KrishivFlightAction};
+        use krishiv_common::async_util::block_on;
+        // No SQL-comment fallback for sink writes: the staged commit protocol
+        // requires a server that understands the typed action, otherwise the
+        // write would silently degrade to an uncommitted path.
+        let action = KrishivFlightAction::BatchSqlSink(BatchSqlSinkBody {
+            query: query.to_owned(),
+            tables: tables_to_batch_sql(tables),
+            sink_contract: sink_contract.to_owned(),
+        });
+        block_on(async { self.pool.do_action(&action).await.map(|_| ()) })
     }
 
     fn explain_sql(&self, query: &str) -> RuntimeResult<String> {

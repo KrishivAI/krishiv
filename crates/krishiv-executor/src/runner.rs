@@ -14,8 +14,9 @@ use krishiv_plan::udf::ResourceLimits;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
     CoordinatorExecutorService, ExecutorTaskAssignment, FencingToken, InitiateCheckpointRequest,
-    InputPartitionDescriptor, JobId, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskRuntimeStats,
-    TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
+    InputPartitionDescriptor, JobId, MissingShufflePartition, StageId, TaskAttemptRef, TaskId,
+    TaskOutputMetadata, TaskRuntimeStats, TaskState, TaskStatusRequest, TaskStatusResponse,
+    TransportDisposition,
 };
 use krishiv_sql::SqlEngine;
 use krishiv_state::StateBackend;
@@ -62,6 +63,29 @@ pub(crate) fn format_failure_message(fragment: &str, error: &str) -> String {
         buf.push('…');
     }
     buf
+}
+
+/// Extract missing shuffle partition references from a task execution error.
+///
+/// When `read_shuffle_flight_partitions` encounters a `NotFound` gRPC status on an
+/// Arrow Flight call, it returns `ExecutorError::ShufflePartitionMissing`.  This
+/// helper converts that into the wire-level `MissingShufflePartition` list so the
+/// coordinator can re-schedule the producing task.
+fn collect_missing_shuffle_partitions(error: &ExecutorError) -> Vec<MissingShufflePartition> {
+    match error {
+        ExecutorError::ShufflePartitionMissing {
+            stage_id,
+            partition_id,
+            ..
+        } => {
+            if let Ok(sid) = StageId::try_new(stage_id.clone()) {
+                vec![MissingShufflePartition::new(sid, *partition_id)]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 pub(crate) const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
@@ -225,6 +249,10 @@ pub struct ExecutorTaskOutput {
     pub(crate) watermark_ms: Option<i64>,
     /// Hot-key reports from `HeavyHittersTracker` observed during shuffle write.
     pub(crate) hot_key_reports: Vec<krishiv_proto::HeartbeatHotKeyReport>,
+    /// Staged sink files (relative to the sink base_dir) written under the
+    /// Phase 2.3 staged commit protocol. Empty for non-sink and legacy
+    /// direct-write sink tasks.
+    pub(crate) sink_staged_files: Vec<String>,
     /// EMA-based partition bucket recommendation from `StreamingPartitionAdvisor`.
     /// `None` for non-streaming tasks; `Some(n)` when the advisor has observed
     /// enough data to suggest a bucket count for the next streaming cycle.
@@ -248,6 +276,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
         }
@@ -269,6 +298,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
         }
@@ -285,6 +315,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
         }
@@ -304,6 +335,7 @@ impl ExecutorTaskOutput {
             record_batches: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
         }
@@ -326,6 +358,7 @@ impl ExecutorTaskOutput {
             record_batches,
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
         }
@@ -344,6 +377,17 @@ impl ExecutorTaskOutput {
     pub(crate) fn with_record_batches(mut self, batches: Vec<RecordBatch>) -> Self {
         self.record_batches = batches;
         self
+    }
+
+    /// Attach staged sink file paths (Phase 2.3 staged commit protocol).
+    pub(crate) fn with_sink_staged_files(mut self, files: Vec<String>) -> Self {
+        self.sink_staged_files = files;
+        self
+    }
+
+    /// Staged sink files written by this task (empty for non-staged tasks).
+    pub fn sink_staged_files(&self) -> &[String] {
+        &self.sink_staged_files
     }
 
     /// Attach the maximum event-time watermark reached by this streaming task.
@@ -430,6 +474,9 @@ impl ExecutorTaskOutput {
         }
         if !self.hot_key_reports.is_empty() {
             meta = meta.with_hot_key_reports(self.hot_key_reports.clone());
+        }
+        if !self.sink_staged_files.is_empty() {
+            meta = meta.with_sink_staged_files(self.sink_staged_files.clone());
         }
         meta
     }
@@ -1282,6 +1329,7 @@ impl ExecutorTaskRunner {
                 "executor accepted assignment",
                 coordinator,
                 None,
+                Vec::new(),
             )
             .await?;
         crate::fragment::common::ensure_status_accepted_or_duplicate(
@@ -1321,6 +1369,7 @@ impl ExecutorTaskRunner {
                     "task cancelled by coordinator request",
                     coordinator,
                     None,
+                    Vec::new(),
                 )
                 .await?;
             return Ok(ExecutorTaskRunReport::new(
@@ -1405,8 +1454,18 @@ impl ExecutorTaskRunner {
                 let error_text = error.to_string();
                 let message =
                     format_failure_message(assignment.plan_fragment().description(), &error_text);
+                // Detect missing upstream shuffle partitions so the coordinator can
+                // re-queue the producing task instead of only retrying this consumer.
+                let missing = collect_missing_shuffle_partitions(&error);
                 let failed = self
-                    .send_task_status(&assignment, TaskState::Failed, message, coordinator, None)
+                    .send_task_status(
+                        &assignment,
+                        TaskState::Failed,
+                        message,
+                        coordinator,
+                        None,
+                        missing,
+                    )
                     .await?;
                 crate::fragment::common::ensure_status_accepted_or_duplicate(
                     failed.disposition(),
@@ -1445,6 +1504,7 @@ impl ExecutorTaskRunner {
                 terminal_message,
                 coordinator,
                 Some(output.to_task_output_metadata()),
+                Vec::new(),
             )
             .await?;
         crate::fragment::common::ensure_status_accepted_or_duplicate(
@@ -1504,6 +1564,7 @@ impl ExecutorTaskRunner {
         message: impl Into<String>,
         coordinator: &S,
         output_metadata: Option<TaskOutputMetadata>,
+        missing_partitions: Vec<MissingShufflePartition>,
     ) -> Result<TaskStatusResponse, tonic::Status>
     where
         S: CoordinatorExecutorService,
@@ -1524,6 +1585,9 @@ impl ExecutorTaskRunner {
         .with_message(message);
         if let Some(output_metadata) = output_metadata {
             request = request.with_output_metadata(output_metadata);
+        }
+        if !missing_partitions.is_empty() {
+            request = request.with_missing_shuffle_partitions(missing_partitions);
         }
 
         const MAX_RETRIES: u8 = 3;

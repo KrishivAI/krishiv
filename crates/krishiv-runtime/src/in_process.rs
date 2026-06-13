@@ -336,7 +336,42 @@ impl InProcessStreamingRuntime {
         } else {
             JobKind::Batch
         };
-        self.run_terminal_task(&fragment, kind, tables, Vec::new())
+        self.run_terminal_task(&fragment, kind, tables, Vec::new(), None)
+    }
+
+    /// Execute a batch SQL write whose terminal task writes through a sink
+    /// contract (Phase 2.3 distributed writes) instead of returning rows.
+    ///
+    /// `sink_contract` is the full output contract description, e.g.
+    /// `object-parquet-sink:<base>:<dest>:mode=overwrite:partition_by=c`.
+    /// The executor stages part files under `<dest>/_staging/<job_id>/` and
+    /// the coordinator publishes them atomically when the job succeeds (or
+    /// removes them on failure), so the destination never exposes partial
+    /// output.
+    pub fn execute_batch_sql_sink(
+        &self,
+        query: &str,
+        tables: &[BatchSqlTable],
+        sink_contract: &str,
+    ) -> RuntimeResult<()> {
+        let sink_contract = sink_contract.trim();
+        if sink_contract.is_empty() {
+            return Err(RuntimeError::InvalidState {
+                message: String::from("batch SQL sink contract cannot be empty"),
+            });
+        }
+        let fragment = format!("sql: {query}");
+        // Sink writes always run through the coordinator job lifecycle: the
+        // staged-commit publish is driven by the coordinator's terminal task
+        // update, so the inline fast path must not be used here.
+        self.run_terminal_task(
+            &fragment,
+            JobKind::Batch,
+            tables,
+            Vec::new(),
+            Some(sink_contract),
+        )
+        .map(|_| ())
     }
 
     /// Drain a locally registered continuous streaming job and return newly
@@ -448,6 +483,7 @@ impl InProcessStreamingRuntime {
         kind: JobKind,
         tables: &[BatchSqlTable],
         stream_partitions: Vec<InputPartition>,
+        sink_contract: Option<&str>,
     ) -> RuntimeResult<Vec<RecordBatch>> {
         let job_id = self.next_job_id()?;
         let task_id = TaskId::try_new("task-0").map_err(|e| RuntimeError::InvalidState {
@@ -456,10 +492,12 @@ impl InProcessStreamingRuntime {
         let stage_id = StageId::try_new("stage-0").map_err(|e| RuntimeError::InvalidState {
             message: e.to_string(),
         })?;
-        let job_spec = JobSpec::new(job_id.clone(), fragment.to_string(), kind).with_stage(
-            StageSpec::new(stage_id, "stage-0")
-                .with_task(TaskSpec::new(task_id.clone(), fragment.to_string())),
-        );
+        let mut task_spec = TaskSpec::new(task_id.clone(), fragment.to_string());
+        if let Some(contract) = sink_contract {
+            task_spec = task_spec.with_sink_contract(contract);
+        }
+        let job_spec = JobSpec::new(job_id.clone(), fragment.to_string(), kind)
+            .with_stage(StageSpec::new(stage_id, "stage-0").with_task(task_spec));
 
         {
             let mut coord = self

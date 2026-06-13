@@ -23,7 +23,7 @@ pub use dataframe::{
 };
 pub use error::{KrishivError, Result};
 pub use expression::{Expr, Literal, avg, col, count, count_all, lit, max, min, sum};
-pub use io::{DataFormat, DataFrameReader, DataFrameWriter};
+pub use io::{DataFormat, DataFrameReader, DataFrameWriter, WriteMode};
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
 pub use streaming_dataframe::{

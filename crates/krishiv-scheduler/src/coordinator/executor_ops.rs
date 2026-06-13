@@ -513,6 +513,22 @@ impl Coordinator {
             }
             if job_affected {
                 job.refresh_state();
+            }
+
+            // Invalidate shuffle partitions produced by the lost executor.
+            // Succeeded tasks that wrote shuffle data to the executor's Flight
+            // server can no longer be read — reset them to Pending so they are
+            // re-executed on a healthy executor.
+            if job.invalidate_executor_shuffle_partitions(lost_id) {
+                tracing::info!(
+                    executor_id = %lost_id,
+                    job_id = %job_id,
+                    "shuffle partitions invalidated for lost executor; affected tasks reset to Pending"
+                );
+                job_affected = true;
+            }
+
+            if job_affected {
                 jobs_to_reassign.push(job_id.clone());
             }
         }

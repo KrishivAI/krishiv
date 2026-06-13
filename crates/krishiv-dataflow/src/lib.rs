@@ -36,6 +36,9 @@ pub enum ExecError {
     /// A memory budget was exceeded — caller should spill or abort the operator.
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
+    /// A spill file could not be written or read.
+    #[error("spill error: {0}")]
+    Spill(String),
 }
 
 impl From<arrow::error::ArrowError> for ExecError {
@@ -71,6 +74,7 @@ pub mod queue;
 pub mod schema_normalize;
 pub mod side_output;
 pub mod sort;
+mod spill;
 pub mod temporal_join;
 #[cfg(test)]
 mod watermark_e2e;
@@ -82,7 +86,7 @@ pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, HeavyHittersTracker,
     HotKeyReport, RateLimiter, SinkLatencyTracker, StreamingPartitionAdvisor, ThrottleCommand,
 };
-pub use aggregate::{AggExpr, AggFunction, LocalAggregator};
+pub use aggregate::{AggExpr, AggFunction, ExternalAggregator, LocalAggregator};
 pub use aligned_input::{
     AlignedEvent, AlignedInputMessage, AlignedInputReceiver, AlignedInputSender, AlignedMultiInput,
     AlignedWindowJoinDriver, aligned_channel,
@@ -105,7 +109,7 @@ pub use queue::{
     OperatorQueueSender, operator_queue,
 };
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
-pub use sort::{SortKey, SortedBatchMerger, sort_batch};
+pub use sort::{ExternalSorter, SortKey, SortedBatchMerger, sort_batch};
 pub use window::{
     CountWindowOperator, CountWindowSpec, MultiSourceWatermarkState, SessionWindowOperator,
     SessionWindowSpec, SlidingWindowOperator, SlidingWindowSpec, StateBackedSessionWindowOperator,

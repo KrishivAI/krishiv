@@ -676,6 +676,10 @@ pub(crate) struct PersistedTaskSpec {
     pub(crate) task_timeout_secs: Option<u64>,
     pub(crate) source_capabilities: Option<PersistedConnectorCapabilities>,
     pub(crate) sink_capabilities: Option<PersistedConnectorCapabilities>,
+    /// Sink output contract for terminal write tasks (Phase 2.3).
+    /// Absent in records written before this field was added.
+    #[serde(default)]
+    pub(crate) sink_contract: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -917,6 +921,7 @@ impl From<&TaskSpec> for PersistedTaskSpec {
                 .sink_capabilities
                 .as_ref()
                 .map(PersistedConnectorCapabilities::from),
+            sink_contract: value.sink_contract().map(str::to_owned),
         }
     }
 }
@@ -937,6 +942,9 @@ impl TryFrom<PersistedTaskSpec> for TaskSpec {
         }
         if let Some(caps) = value.sink_capabilities {
             spec = spec.with_sink_capabilities(ConnectorCapabilityFlags::from(caps));
+        }
+        if let Some(contract) = value.sink_contract {
+            spec = spec.with_sink_contract(contract);
         }
         Ok(spec)
     }

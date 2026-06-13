@@ -147,6 +147,11 @@ pub struct TaskOutputMetadata {
     watermark_ms: Option<i64>,
     /// Hot-key reports from `HeavyHittersTracker` observed during shuffle write.
     hot_key_reports: Vec<HeartbeatHotKeyReport>,
+    /// Staged sink files written by this task (paths relative to the sink
+    /// base_dir). Populated by object-parquet sink tasks running the staged
+    /// commit protocol (Phase 2.3); the coordinator publishes these into the
+    /// destination once the whole job succeeds.
+    sink_staged_files: Vec<String>,
 }
 
 impl TaskOutputMetadata {
@@ -167,6 +172,7 @@ impl TaskOutputMetadata {
             inline_record_batch_ipc: Vec::new(),
             watermark_ms: None,
             hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
         }
     }
 
@@ -194,6 +200,18 @@ impl TaskOutputMetadata {
     /// Hot-key reports.
     pub fn hot_key_reports(&self) -> &[HeartbeatHotKeyReport] {
         &self.hot_key_reports
+    }
+
+    /// Attach staged sink file paths (relative to the sink base_dir).
+    #[must_use]
+    pub fn with_sink_staged_files(mut self, files: Vec<String>) -> Self {
+        self.sink_staged_files = files;
+        self
+    }
+
+    /// Staged sink files written by this task, if it ran a staged sink write.
+    pub fn sink_staged_files(&self) -> &[String] {
+        &self.sink_staged_files
     }
 
     /// Output kind label.

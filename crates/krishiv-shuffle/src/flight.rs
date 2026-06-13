@@ -278,6 +278,88 @@ pub async fn serve(
     Ok((local_addr, handle))
 }
 
+/// Default number of fetch attempts (1 initial try + 3 retries).
+pub const DEFAULT_FETCH_MAX_ATTEMPTS: u32 = 4;
+/// Default base delay between fetch retries; doubles per attempt.
+pub const DEFAULT_FETCH_RETRY_BASE_MS: u64 = 100;
+/// Upper bound on a single retry backoff delay.
+const FETCH_RETRY_MAX_DELAY_MS: u64 = 5_000;
+
+/// Retry policy for shuffle partition fetches over Flight.
+///
+/// Transient transport failures (connection refused, stream resets, decode
+/// truncation) are retried with exponential backoff. `NotFound` (the
+/// partition does not exist — typically the producer executor died and its
+/// output is gone) and `InvalidInput` (malformed endpoint) fail immediately
+/// so the scheduler can react instead of the consumer spinning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchRetryPolicy {
+    /// Total attempts including the first one. Values below 1 behave as 1.
+    pub max_attempts: u32,
+    /// Backoff before retry `n` is `base_delay_ms * 2^(n-1)`, capped at 5 s.
+    pub base_delay_ms: u64,
+}
+
+impl Default for FetchRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_FETCH_MAX_ATTEMPTS,
+            base_delay_ms: DEFAULT_FETCH_RETRY_BASE_MS,
+        }
+    }
+}
+
+impl FetchRetryPolicy {
+    /// Resolve a policy from raw env-var values. `None`, unparseable, and
+    /// zero attempt counts fall back to the defaults; `base_delay_ms` of 0 is
+    /// allowed (retry without sleeping, useful in tests).
+    pub fn resolve(raw_max_attempts: Option<&str>, raw_base_delay_ms: Option<&str>) -> Self {
+        let max_attempts = raw_max_attempts
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_FETCH_MAX_ATTEMPTS);
+        let base_delay_ms = raw_base_delay_ms
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_FETCH_RETRY_BASE_MS);
+        Self {
+            max_attempts,
+            base_delay_ms,
+        }
+    }
+
+    /// Resolve the policy from `KRISHIV_SHUFFLE_FETCH_RETRIES` (total
+    /// attempts) and `KRISHIV_SHUFFLE_FETCH_RETRY_BASE_MS`.
+    pub fn from_env() -> Self {
+        Self::resolve(
+            std::env::var("KRISHIV_SHUFFLE_FETCH_RETRIES")
+                .ok()
+                .as_deref(),
+            std::env::var("KRISHIV_SHUFFLE_FETCH_RETRY_BASE_MS")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// Backoff delay before retrying after failed attempt number `attempt`
+    /// (1-based).
+    fn delay_after_attempt(&self, attempt: u32) -> std::time::Duration {
+        let factor = 1u64 << attempt.saturating_sub(1).min(16);
+        std::time::Duration::from_millis(
+            self.base_delay_ms
+                .saturating_mul(factor)
+                .min(FETCH_RETRY_MAX_DELAY_MS),
+        )
+    }
+}
+
+/// `true` when a fetch failure is plausibly transient and worth retrying.
+fn is_retryable_fetch_error(error: &io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+    )
+}
+
 /// Client for fetching shuffle partitions over Arrow Flight.
 pub struct FlightShuffleClient;
 
@@ -337,6 +419,46 @@ impl FlightShuffleClient {
             .try_collect()
             .await?;
         Ok(batches)
+    }
+
+    /// Fetch one shuffle partition, retrying transient failures per `policy`.
+    ///
+    /// Permanent failures — `NotFound` (missing partition) and
+    /// `InvalidInput` (malformed endpoint) — are returned immediately without
+    /// retrying. All other errors are retried with exponential backoff until
+    /// `policy.max_attempts` is exhausted; the last error is returned.
+    pub async fn fetch_with_retry(
+        endpoint: impl Into<String>,
+        job_id: &str,
+        stage_id: &str,
+        partition_id: u32,
+        policy: FetchRetryPolicy,
+    ) -> io::Result<Vec<RecordBatch>> {
+        let endpoint: String = endpoint.into();
+        let max_attempts = policy.max_attempts.max(1);
+        let mut attempt = 1u32;
+        loop {
+            match Self::fetch(endpoint.clone(), job_id, stage_id, partition_id).await {
+                Ok(batches) => return Ok(batches),
+                Err(error) if attempt < max_attempts && is_retryable_fetch_error(&error) => {
+                    let delay = policy.delay_after_attempt(attempt);
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        job_id,
+                        stage_id,
+                        partition_id,
+                        attempt,
+                        max_attempts,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "transient shuffle fetch failure; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Push a shuffle partition to a remote shuffle Flight server.
@@ -484,6 +606,137 @@ mod tests {
         assert!(
             matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
             "expected NotFound, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_retry_policy_resolves_defaults_and_overrides() {
+        assert_eq!(
+            FetchRetryPolicy::resolve(None, None),
+            FetchRetryPolicy::default()
+        );
+        assert_eq!(
+            FetchRetryPolicy::resolve(Some("garbage"), Some("garbage")),
+            FetchRetryPolicy::default()
+        );
+        // Zero attempts is meaningless; falls back to the default.
+        assert_eq!(
+            FetchRetryPolicy::resolve(Some("0"), None).max_attempts,
+            DEFAULT_FETCH_MAX_ATTEMPTS
+        );
+        let policy = FetchRetryPolicy::resolve(Some("7"), Some("250"));
+        assert_eq!(policy.max_attempts, 7);
+        assert_eq!(policy.base_delay_ms, 250);
+        // Zero base delay is allowed (retry without sleeping).
+        assert_eq!(FetchRetryPolicy::resolve(None, Some("0")).base_delay_ms, 0);
+    }
+
+    #[test]
+    fn fetch_retry_backoff_doubles_and_caps() {
+        let policy = FetchRetryPolicy {
+            max_attempts: 10,
+            base_delay_ms: 100,
+        };
+        assert_eq!(policy.delay_after_attempt(1).as_millis(), 100);
+        assert_eq!(policy.delay_after_attempt(2).as_millis(), 200);
+        assert_eq!(policy.delay_after_attempt(3).as_millis(), 400);
+        // Caps at 5 s no matter how many attempts have failed.
+        assert_eq!(policy.delay_after_attempt(30).as_millis(), 5_000);
+    }
+
+    #[test]
+    fn fetch_error_retryability_classification() {
+        let transient = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        assert!(is_retryable_fetch_error(&transient));
+        let decode = std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated stream");
+        assert!(is_retryable_fetch_error(&decode));
+        let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "partition gone");
+        assert!(!is_retryable_fetch_error(&missing));
+        let bad_endpoint = std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad url");
+        assert!(!is_retryable_fetch_error(&bad_endpoint));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_with_retry_recovers_after_server_becomes_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+
+        let batch = make_test_batch();
+        let id = PartitionId {
+            job_id: "job-retry-1".to_owned(),
+            stage_id: "s0".to_owned(),
+            partition: 0,
+        };
+        let partition = ShufflePartition {
+            id: id.clone(),
+            schema: batch.schema(),
+            batches: vec![batch.clone()],
+        };
+        store.register_partition_lease(id.clone(), 1).await.unwrap();
+        store.write_partition(partition, 1).await.unwrap();
+
+        // Reserve a port, then drop the listener so the first fetch attempt
+        // gets connection-refused; start the real server on that port while
+        // the client is backing off.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let server_store = Arc::clone(&store);
+        let server_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            serve(addr, server_store).await
+        });
+
+        let policy = FetchRetryPolicy {
+            max_attempts: 10,
+            base_delay_ms: 100,
+        };
+        let result =
+            FlightShuffleClient::fetch_with_retry(addr.to_string(), "job-retry-1", "s0", 0, policy)
+                .await;
+
+        if let Ok(Ok((_, handle))) = server_task.await {
+            handle.abort();
+        }
+
+        let batches = result.expect("fetch must succeed once the server is up");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_with_retry_fails_fast_on_missing_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (local_addr, server_handle) = serve(addr, Arc::clone(&store)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let policy = FetchRetryPolicy {
+            max_attempts: 5,
+            base_delay_ms: 200,
+        };
+        let started = std::time::Instant::now();
+        let result = FlightShuffleClient::fetch_with_retry(
+            local_addr.to_string(),
+            "missing",
+            "s0",
+            0,
+            policy,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        server_handle.abort();
+
+        assert!(
+            matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+            "expected NotFound, got: {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "NotFound must fail fast without backoff sleeps; took {elapsed:?}"
         );
     }
 }
