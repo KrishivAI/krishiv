@@ -40,17 +40,21 @@
 
 ### Validation
 ```
-cargo test -p krishiv-api --lib    # 60 passed
-cargo test -p krishiv-sql --lib    # 275 passed
-cargo test -p krishiv-scheduler --lib  # 310 passed
+cargo test --workspace --lib --exclude krishiv-python  # 2,913 passed, 0 failed (19 crates)
 ```
+Individual crate results:
+- krishiv-api: 60 passed
+- krishiv-sql: 275 passed
+- krishiv-scheduler: 310 passed
+- krishiv-executor: 213 passed
+- All remaining crates: 2,055 passed combined
 
 ### Blockers
 None.
 
 ### Next useful command
 ```bash
-cargo test --workspace --lib --exclude krishiv-python
+cargo clippy --workspace --all-targets
 ```
 
 ---
