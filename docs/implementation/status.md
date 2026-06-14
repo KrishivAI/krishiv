@@ -224,7 +224,43 @@ Validation:
 - `cargo check -p krishiv-api --features "iceberg-catalog"` — 0 errors.
 - `cargo test -p krishiv-sql --features "iceberg-datafusion,local-catalog" iceberg_catalog_tests` — 4/4 passed.
 
-Next: Wire SQL DELETE/UPDATE/MERGE for Iceberg tables through `crates/krishiv-connectors/src/lakehouse/dml.rs`.
+---
+
+## 2026-06-14 — DELETE/UPDATE SQL interception for Iceberg tables
+
+Completed:
+
+- `crates/krishiv-sql/src/lib.rs`: Added `DELETE FROM <table> [WHERE …]` and
+  `UPDATE <table> SET … [WHERE …]` interception in `SqlEngine::sql()` (gated on
+  `iceberg-datafusion + local-catalog`). When the target table is found in a
+  registered `KrishivCatalog`, routes to copy-on-write DML in krishiv-connectors:
+  - `DELETE FROM ns.tbl WHERE pred` → `iceberg_delete_where` → `deleted_rows: i64`
+  - `UPDATE ns.tbl SET col = expr [WHERE pred]` → `iceberg_update_where` → `updated_rows: i64`
+  - Falls through to DataFusion when no matching Iceberg catalog is registered.
+
+- New private helpers:
+  - `parse_dml_delete` — regex parser for DELETE statements
+  - `parse_dml_update` — regex parser for UPDATE statements (optional WHERE)
+  - `split_set_assignments` — comma splitter with balanced-parenthesis support
+  - `resolve_iceberg_table` — maps `ns.tbl` / `cat.ns.tbl` to `(Arc<dyn Catalog>, TableIdent)`
+
+- `api/stable-api.toml`: `lakehouse.iceberg-atomic-dml` changed from `sql = "partial"` to
+  `sql = "implemented"`. Completes Phase H exit criterion: "complete Iceberg DML".
+
+- 10 new tests: 4 unit (parser/splitter), 2 integration (DELETE + UPDATE on empty Iceberg tables).
+
+Validation:
+- `cargo check --workspace` — 0 errors.
+- `cargo check --tests -p krishiv-sql --features "iceberg-datafusion,local-catalog"` — 0 errors.
+- `cargo test -p krishiv-sql --features "iceberg-datafusion,local-catalog" iceberg_catalog_tests` — 12/12 passed.
+
+Known limitations (iceberg 0.9.1 API gaps, unchanged):
+- `overwrite_table_pub` uses drop+recreate (no public overwrite snapshot in 0.9.1).
+- `remove_orphan_files` handles `file://` paths only.
+- `expire_snapshots` logs the count but does not call the removal API yet.
+
+Next: All J1–J6 Iceberg phases and the DELETE/UPDATE/CALL SQL surfaces are now implemented.
+Run `cargo test -p krishiv-sql` for a full pass, or continue with Phase K work.
 
 ---
 
