@@ -347,6 +347,11 @@ pub struct SqlEngine {
     /// with a `FairSpillPool` so sorts, hash joins, and aggregations spill to
     /// disk under memory pressure instead of growing without bound.
     memory_limit_bytes: Option<usize>,
+    /// Iceberg catalogs registered via `with_iceberg_catalog`, keyed by their
+    /// DataFusion catalog name. Stored so that `CALL system.<proc>` statements
+    /// can dispatch maintenance operations to the right catalog.
+    #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+    iceberg_catalogs: Arc<std::sync::RwLock<Vec<(Arc<catalog::unified::KrishivCatalog>, String)>>>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -605,6 +610,8 @@ impl SqlEngine {
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
             table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             memory_limit_bytes,
+            #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+            iceberg_catalogs: Arc::new(std::sync::RwLock::new(Vec::new())),
         })
     }
 
@@ -1041,6 +1048,35 @@ impl SqlEngine {
     /// Shared Krishiv catalog backing this engine, if configured.
     pub fn krishiv_catalog(&self) -> Option<&Arc<RwLock<InMemoryCatalog>>> {
         self.krishiv_catalog.as_ref()
+    }
+
+    /// Register an Iceberg [`KrishivCatalog`] as a DataFusion catalog provider.
+    ///
+    /// Tables in the catalog are resolved automatically by DataFusion when SQL
+    /// queries reference `<catalog_name>.<namespace>.<table>`. The bridge uses
+    /// `plan_files()` to enumerate Parquet files and wraps them in a
+    /// `ListingTable`, giving DataFusion native projection/filter pushdown.
+    ///
+    /// Multiple catalogs can be registered under different names.
+    #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+    #[must_use]
+    pub fn with_iceberg_catalog(
+        self,
+        catalog: std::sync::Arc<catalog::unified::KrishivCatalog>,
+        catalog_name: impl Into<String>,
+    ) -> Self {
+        let catalog_name = catalog_name.into();
+        let bridge = catalog::iceberg_catalog_bridge::IcebergCatalogBridge::new(
+            Arc::clone(&catalog),
+            catalog_name.clone(),
+        );
+        self.context
+            .register_catalog(catalog_name.clone(), Arc::new(bridge));
+        self.iceberg_catalogs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((catalog, catalog_name));
+        self
     }
 
     /// Share a session UDF registry so scalar UDFs are visible in SQL.
@@ -1488,6 +1524,131 @@ impl SqlEngine {
             return Ok(self.make_sql_df("merge", dataframe).with_query(query));
         }
 
+        // ── Intercept CALL system.<proc> ──────────────────────────────────────
+        // Route Iceberg maintenance procedures to registered KrishivCatalogs.
+        #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+        if trimmed.to_ascii_uppercase().starts_with("CALL SYSTEM.") {
+            let result = self.dispatch_call_system(trimmed).await?;
+            let call_table = next_ephemeral_name("call_result");
+            lakehouse::register_scan_batches(&self.context, &call_table, vec![result]).await?;
+            let dataframe = self
+                .context
+                .sql(&format!("SELECT * FROM {call_table}"))
+                .await?;
+            return Ok(self.make_sql_df("call", dataframe).with_query(query));
+        }
+
+        // ── Intercept DELETE FROM <iceberg-table> [WHERE …] ──────────────────
+        // Route to copy-on-write iceberg_delete_where when the table is tracked
+        // by a registered KrishivCatalog. Falls through to DataFusion otherwise.
+        #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+        if trimmed.to_ascii_uppercase().starts_with("DELETE FROM ") {
+            if let Some((table_ref, predicate)) = parse_dml_delete(trimmed) {
+                if let Some((iceberg_catalog, table_ident)) =
+                    self.resolve_iceberg_table(&table_ref)
+                {
+                    use arrow::array::{ArrayRef, Int64Array};
+                    use arrow::datatypes::{DataType, Field, Schema};
+                    let (deleted, _) =
+                        krishiv_connectors::lakehouse::dml::iceberg_delete_where(
+                            iceberg_catalog,
+                            &table_ident,
+                            &predicate,
+                            &self.context,
+                        )
+                        .await
+                        .map_err(|e| SqlError::DataFusion {
+                            message: e.to_string(),
+                        })?;
+                    let schema = Arc::new(Schema::new(vec![Field::new(
+                        "deleted_rows",
+                        DataType::Int64,
+                        false,
+                    )]));
+                    let array: ArrayRef =
+                        Arc::new(Int64Array::from(vec![deleted as i64]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(|e| {
+                            SqlError::DataFusion {
+                                message: e.to_string(),
+                            }
+                        })?;
+                    let res_table = next_ephemeral_name("delete_result");
+                    lakehouse::register_scan_batches(
+                        &self.context,
+                        &res_table,
+                        vec![batch],
+                    )
+                    .await?;
+                    let dataframe = self
+                        .context
+                        .sql(&format!("SELECT * FROM {res_table}"))
+                        .await?;
+                    return Ok(
+                        self.make_sql_df("delete", dataframe).with_query(query)
+                    );
+                }
+            }
+        }
+
+        // ── Intercept UPDATE <iceberg-table> SET … [WHERE …] ─────────────────
+        #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+        if trimmed.to_ascii_uppercase().starts_with("UPDATE ") {
+            if let Some((table_ref, set_clause, predicate)) = parse_dml_update(trimmed) {
+                if let Some((iceberg_catalog, table_ident)) =
+                    self.resolve_iceberg_table(&table_ref)
+                {
+                    use arrow::array::{ArrayRef, Int64Array};
+                    use arrow::datatypes::{DataType, Field, Schema};
+                    let assignments = split_set_assignments(&set_clause);
+                    let borrowed: Vec<(&str, &str)> = assignments
+                        .iter()
+                        .map(|(c, e)| (c.as_str(), e.as_str()))
+                        .collect();
+                    let pred = predicate.as_deref();
+                    let (updated, _) =
+                        krishiv_connectors::lakehouse::dml::iceberg_update_where(
+                            iceberg_catalog,
+                            &table_ident,
+                            &borrowed,
+                            pred,
+                            &self.context,
+                        )
+                        .await
+                        .map_err(|e| SqlError::DataFusion {
+                            message: e.to_string(),
+                        })?;
+                    let schema = Arc::new(Schema::new(vec![Field::new(
+                        "updated_rows",
+                        DataType::Int64,
+                        false,
+                    )]));
+                    let array: ArrayRef =
+                        Arc::new(Int64Array::from(vec![updated as i64]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(|e| {
+                            SqlError::DataFusion {
+                                message: e.to_string(),
+                            }
+                        })?;
+                    let res_table = next_ephemeral_name("update_result");
+                    lakehouse::register_scan_batches(
+                        &self.context,
+                        &res_table,
+                        vec![batch],
+                    )
+                    .await?;
+                    let dataframe = self
+                        .context
+                        .sql(&format!("SELECT * FROM {res_table}"))
+                        .await?;
+                    return Ok(
+                        self.make_sql_df("update", dataframe).with_query(query)
+                    );
+                }
+            }
+        }
+
         // ── Intercept MATCH_RECOGNIZE ─────────────────────────────────────────
         // DataFusion does not parse MATCH_RECOGNIZE. Route it through the CEP
         // path: parse → run PatternMatcher on the source table → return results.
@@ -1638,6 +1799,158 @@ impl SqlEngine {
         }
         let df = self.sql(query).await?;
         Ok(TaggedQueryResult { operation_id, inner: df })
+    }
+
+    /// Resolve a SQL table reference to an `(Arc<dyn Catalog>, TableIdent)` pair
+    /// from the registered Iceberg catalogs.
+    ///
+    /// Accepts 2-part (`ns.tbl`) and 3-part (`cat.ns.tbl`) references.
+    /// Returns `None` when no catalog is registered or the reference is ambiguous.
+    #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+    fn resolve_iceberg_table(
+        &self,
+        table_ref: &str,
+    ) -> Option<(Arc<dyn iceberg::Catalog + Send + Sync>, iceberg::TableIdent)>
+    {
+        let parts: Vec<&str> = table_ref.splitn(3, '.').collect();
+        let (catalog_arc, ns_str, table_str) = {
+            let guard = self
+                .iceberg_catalogs
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.is_empty() {
+                return None;
+            }
+            match parts.len() {
+                2 => {
+                    let (cat, _) = guard.first()?;
+                    (Arc::clone(cat), parts[0], parts[1])
+                }
+                3 => {
+                    let cat_name = parts[0];
+                    let (cat, _) = guard.iter().find(|(_, n)| n == cat_name)?;
+                    (Arc::clone(cat), parts[1], parts[2])
+                }
+                _ => return None,
+            }
+        };
+        let ns = iceberg::NamespaceIdent::from_vec(vec![ns_str.to_string()]).ok()?;
+        let ident = iceberg::TableIdent::new(ns, table_str.to_string());
+        Some((catalog_arc.as_iceberg(), ident))
+    }
+
+    /// Dispatch a `CALL system.<proc>(...)` statement to the appropriate
+    /// Iceberg maintenance function on the first registered KrishivCatalog.
+    #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+    async fn dispatch_call_system(&self, stmt: &str) -> SqlResult<RecordBatch> {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let upper = stmt.to_ascii_uppercase();
+        const PREFIX: &str = "CALL SYSTEM.";
+        let upper_after = &upper[PREFIX.len()..];
+        let orig_after = &stmt[PREFIX.len()..];
+
+        let paren = upper_after.find('(').ok_or_else(|| SqlError::DataFusion {
+            message: format!("CALL: missing '(' in: {stmt}"),
+        })?;
+        let proc_name = upper_after[..paren].trim();
+
+        let args_raw = orig_after[paren + 1..]
+            .trim_end_matches(';')
+            .trim()
+            .trim_end_matches(')')
+            .trim();
+        let args = call_args_from_str(args_raw);
+
+        let iceberg_catalog = {
+            let guard = self
+                .iceberg_catalogs
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            guard
+                .first()
+                .ok_or_else(|| SqlError::DataFusion {
+                    message: "CALL system: no Iceberg catalog registered".to_string(),
+                })?
+                .0
+                .as_iceberg()
+        };
+
+        let table_ref = args.first().ok_or_else(|| SqlError::DataFusion {
+            message: format!("CALL {proc_name}: table reference argument is required"),
+        })?;
+        let table_ident = iceberg_table_ident(table_ref)?;
+
+        let count: i64 = match proc_name {
+            "EXPIRE_SNAPSHOTS" => {
+                let dur_s = args.get(1).ok_or_else(|| SqlError::DataFusion {
+                    message: "CALL expire_snapshots: duration argument is required".to_string(),
+                })?;
+                let older_than = parse_call_duration(dur_s)?;
+                let retain_last = args
+                    .get(2)
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+                krishiv_connectors::lakehouse::maintenance::expire_snapshots(
+                    iceberg_catalog,
+                    &table_ident,
+                    older_than,
+                    retain_last,
+                )
+                .await
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })? as i64
+            }
+            "REMOVE_ORPHAN_FILES" => {
+                let dur_s = args.get(1).ok_or_else(|| SqlError::DataFusion {
+                    message: "CALL remove_orphan_files: duration argument is required".to_string(),
+                })?;
+                let older_than = parse_call_duration(dur_s)?;
+                krishiv_connectors::lakehouse::maintenance::remove_orphan_files(
+                    iceberg_catalog,
+                    &table_ident,
+                    older_than,
+                )
+                .await
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })? as i64
+            }
+            "COMPACT_DATA_FILES" => {
+                let target_bytes = args
+                    .get(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(128 * 1024 * 1024);
+                krishiv_connectors::lakehouse::maintenance::compact_data_files(
+                    iceberg_catalog,
+                    &table_ident,
+                    target_bytes,
+                )
+                .await
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })? as i64
+            }
+            other => {
+                return Err(SqlError::Unsupported {
+                    feature: format!("CALL system.{other}: unknown procedure"),
+                });
+            }
+        };
+
+        let col = match proc_name {
+            "EXPIRE_SNAPSHOTS" => "expired_snapshots",
+            "REMOVE_ORPHAN_FILES" => "removed_files",
+            "COMPACT_DATA_FILES" => "rewritten_files",
+            _ => "result",
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(col, DataType::Int64, false)]));
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
+        RecordBatch::try_new(schema, vec![array]).map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })
     }
 }
 
@@ -3148,6 +3461,201 @@ impl KrishivDataFrameOps for SqlDataFrame {
         self.context.sql(&view_sql).await?;
         Ok(())
     }
+
+}
+
+// ── CALL-system helpers ───────────────────────────────────────────────────────
+
+/// Extract positional arguments from the body of a `CALL` statement.
+///
+/// Handles single-quoted string literals and bare integers.
+/// `'catalog.ns.table', '7 days', 5` → `["catalog.ns.table", "7 days", "5"]`
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn call_args_from_str(s: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut after_str = false;
+    for ch in s.chars() {
+        if after_str {
+            if ch == ',' {
+                after_str = false;
+            }
+            continue;
+        }
+        if in_str {
+            if ch == '\'' {
+                in_str = false;
+                after_str = true;
+                args.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(ch);
+            }
+        } else if ch == '\'' {
+            in_str = true;
+        } else if ch == ',' {
+            let t = cur.trim().to_string();
+            if !t.is_empty() {
+                args.push(t);
+            }
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    let t = cur.trim().to_string();
+    if !t.is_empty() {
+        args.push(t);
+    }
+    args
+}
+
+/// Parse an Iceberg `TableIdent` from a dotted string.
+///
+/// Accepts:
+/// - `"namespace.table"` — single-level namespace
+/// - `"catalog.namespace.table"` — catalog prefix is ignored (catalog is
+///   selected by registration order, not by name, in the CALL dispatch)
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn iceberg_table_ident(table_ref: &str) -> SqlResult<iceberg::TableIdent> {
+    let parts: Vec<&str> = table_ref.splitn(3, '.').collect();
+    match parts.len() {
+        2 => {
+            let ns = iceberg::NamespaceIdent::from_vec(vec![parts[0].to_string()])
+                .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+            Ok(iceberg::TableIdent::new(ns, parts[1].to_string()))
+        }
+        3 => {
+            let ns = iceberg::NamespaceIdent::from_vec(vec![parts[1].to_string()])
+                .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+            Ok(iceberg::TableIdent::new(ns, parts[2].to_string()))
+        }
+        _ => Err(SqlError::DataFusion {
+            message: format!(
+                "invalid table reference '{table_ref}': expected 'ns.table' or 'cat.ns.table'"
+            ),
+        }),
+    }
+}
+
+/// Parse a human-readable duration string into a [`chrono::Duration`].
+///
+/// Accepted formats: `"N days"`, `"N day"`, `"N hours"`, `"N hour"`,
+/// `"N weeks"`, `"N week"`, `"N minutes"`, `"N minute"`.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn parse_call_duration(s: &str) -> SqlResult<chrono::Duration> {
+    let s = s.trim();
+    let mut it = s.splitn(2, ' ');
+    let n: i64 = it
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| SqlError::DataFusion {
+            message: format!("invalid duration value in '{s}'"),
+        })?;
+    let unit = it.next().unwrap_or("").trim().to_ascii_lowercase();
+    match unit.trim_end_matches('s') {
+        "day" => Ok(chrono::Duration::days(n)),
+        "hour" => Ok(chrono::Duration::hours(n)),
+        "week" => Ok(chrono::Duration::weeks(n)),
+        "minute" | "min" => Ok(chrono::Duration::minutes(n)),
+        _ => Err(SqlError::DataFusion {
+            message: format!("unknown duration unit '{unit}' in '{s}'"),
+        }),
+    }
+}
+
+// ── Iceberg DML helpers ───────────────────────────────────────────────────────
+
+/// Parse `DELETE FROM <table> [WHERE <predicate>]` into `(table_ref, predicate)`.
+///
+/// Returns `None` when the statement does not match the expected shape.
+/// A missing WHERE clause is treated as `"TRUE"` (delete all rows).
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn parse_dml_delete(stmt: &str) -> Option<(String, String)> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static WITH_WHERE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)^\s*DELETE\s+FROM\s+(\S+)\s+WHERE\s+([\s\S]+?)\s*;?\s*$").unwrap()
+    });
+    static NO_WHERE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)^\s*DELETE\s+FROM\s+(\S+)\s*;?\s*$").unwrap()
+    });
+
+    if let Some(cap) = WITH_WHERE.captures(stmt) {
+        let table = cap.get(1)?.as_str().to_string();
+        let pred = cap.get(2)?.as_str().trim().to_string();
+        Some((table, pred))
+    } else if let Some(cap) = NO_WHERE.captures(stmt) {
+        let table = cap.get(1)?.as_str().to_string();
+        Some((table, "TRUE".to_string()))
+    } else {
+        None
+    }
+}
+
+/// Parse `UPDATE <table> SET <assignments> [WHERE <predicate>]` into
+/// `(table_ref, set_clause, Option<predicate>)`.
+///
+/// Returns `None` when the statement does not match.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn parse_dml_update(stmt: &str) -> Option<(String, String, Option<String>)> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static UPDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?is)^\s*UPDATE\s+(\S+)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]+?))?\s*;?\s*$",
+        )
+        .unwrap()
+    });
+
+    let cap = UPDATE_RE.captures(stmt)?;
+    let table = cap.get(1)?.as_str().to_string();
+    let set_clause = cap.get(2)?.as_str().trim().to_string();
+    let predicate = cap.get(3).map(|m| m.as_str().trim().to_string());
+    Some((table, set_clause, predicate))
+}
+
+/// Split a SQL SET clause (`col1 = expr1, col2 = expr2`) into assignment pairs.
+///
+/// Handles commas inside balanced parentheses (e.g. `CONCAT(a, b)`).
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn split_set_assignments(set_clause: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    let bytes = set_clause.as_bytes();
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                push_set_pair(&mut pairs, &set_clause[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    push_set_pair(&mut pairs, &set_clause[start..]);
+    pairs
+}
+
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn push_set_pair(pairs: &mut Vec<(String, String)>, s: &str) {
+    let s = s.trim();
+    if let Some(eq) = s.find('=') {
+        let col = s[..eq]
+            .trim()
+            .trim_matches('`')
+            .trim_matches('"')
+            .to_string();
+        let expr = s[eq + 1..].trim().to_string();
+        if !col.is_empty() && !expr.is_empty() {
+            pairs.push((col, expr));
+        }
+    }
 }
 
 /// Create a Krishiv logical plan wrapper for a SQL query without executing it.
@@ -3990,4 +4498,214 @@ mod streaming_match_recognize_limit_tests {
         assert_eq!(resolve_streaming_match_recognize_limit(Some("0")), 100_000);
     }
 }
+
+#[cfg(all(test, feature = "iceberg-datafusion", feature = "local-catalog"))]
+mod iceberg_catalog_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::catalog::unified::KrishivCatalog;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_iceberg_catalog_registers_under_given_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let engine = SqlEngine::new().with_iceberg_catalog(catalog, "mycat");
+        let catalog_names = engine.context.catalog_names();
+        assert!(
+            catalog_names.contains(&"mycat".to_string()),
+            "iceberg catalog 'mycat' must be registered; got: {catalog_names:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn call_system_no_catalog_returns_error() {
+        let engine = SqlEngine::new();
+        let err = engine
+            .sql("CALL system.expire_snapshots('myns.orders', '7 days', 1)")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no Iceberg catalog"),
+            "expected 'no Iceberg catalog' in error, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn call_system_unknown_procedure_returns_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let engine = SqlEngine::new().with_iceberg_catalog(catalog, "mycat");
+        let err = engine
+            .sql("CALL system.frobnicate_table('myns.orders')")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown procedure"),
+            "expected 'unknown procedure' in error, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn call_system_expire_snapshots_returns_count() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        catalog
+            .create_table("myns", "orders", schema, "")
+            .await
+            .unwrap();
+        let engine = SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
+        let df = engine
+            .sql("CALL system.expire_snapshots('myns.orders', '7 days', 1)")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let schema = batches[0].schema();
+        assert_eq!(
+            schema.field(0).name(),
+            "expired_snapshots",
+            "result column must be 'expired_snapshots'"
+        );
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, 0, "fresh table has no snapshots to expire");
+    }
+
+    // ── DELETE / UPDATE helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_dml_delete_with_where() {
+        let (tbl, pred) = super::parse_dml_delete("DELETE FROM myns.orders WHERE id = 5")
+            .expect("must parse");
+        assert_eq!(tbl, "myns.orders");
+        assert_eq!(pred, "id = 5");
+    }
+
+    #[test]
+    fn parse_dml_delete_without_where() {
+        let (tbl, pred) = super::parse_dml_delete("DELETE FROM myns.orders")
+            .expect("must parse");
+        assert_eq!(tbl, "myns.orders");
+        assert_eq!(pred, "TRUE");
+    }
+
+    #[test]
+    fn parse_dml_update_with_where() {
+        let (tbl, set, pred) =
+            super::parse_dml_update("UPDATE myns.orders SET price = price * 2 WHERE id = 1")
+                .expect("must parse");
+        assert_eq!(tbl, "myns.orders");
+        assert!(set.contains("price * 2"), "set clause: {set}");
+        assert_eq!(pred.unwrap(), "id = 1");
+    }
+
+    #[test]
+    fn parse_dml_update_without_where() {
+        let (tbl, set, pred) =
+            super::parse_dml_update("UPDATE myns.orders SET status = 'active'")
+                .expect("must parse");
+        assert_eq!(tbl, "myns.orders");
+        assert!(set.contains("'active'"), "set clause: {set}");
+        assert!(pred.is_none());
+    }
+
+    #[test]
+    fn split_set_assignments_basic() {
+        let pairs = super::split_set_assignments("a = 1, b = 'hello', c = c + 1");
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], ("a".to_string(), "1".to_string()));
+        assert_eq!(pairs[1], ("b".to_string(), "'hello'".to_string()));
+        assert_eq!(pairs[2], ("c".to_string(), "c + 1".to_string()));
+    }
+
+    #[test]
+    fn split_set_assignments_function_with_comma() {
+        let pairs = super::split_set_assignments("name = CONCAT(first, ' ', last), age = 5");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "name");
+        assert!(pairs[0].1.starts_with("CONCAT("), "got: {}", pairs[0].1);
+        assert_eq!(pairs[1], ("age".to_string(), "5".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_from_iceberg_table_removes_rows() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        catalog
+            .create_table("myns", "orders", schema, "")
+            .await
+            .unwrap();
+        let engine =
+            SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
+        // DELETE with no WHERE on an empty table returns 0 deleted rows.
+        let df = engine
+            .sql("DELETE FROM myns.orders WHERE id = 99")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "deleted_rows");
+        let deleted = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(deleted, 0, "empty table: no rows to delete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_iceberg_table_returns_updated_count() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "status", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        catalog
+            .create_table("myns", "customers", schema, "")
+            .await
+            .unwrap();
+        let engine =
+            SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
+        let df = engine
+            .sql("UPDATE myns.customers SET status = 'active' WHERE id = 1")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "updated_rows");
+        let updated = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(updated, 0, "empty table: no rows to update");
+    }
+}
+
 pub mod kafka_table;

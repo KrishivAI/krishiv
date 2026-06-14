@@ -20,10 +20,19 @@ krishiv-state = { path = "../krishiv-state" }
 krishiv-dataflow = { path = "../krishiv-dataflow" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse", "hudi"] }
 krishiv-sql = { path = "../krishiv-sql" }
+# iceberg feature deps — pulled in only when local-catalog or iceberg-datafusion are requested
+iceberg = { workspace = true, optional = true }
 parquet = { workspace = true }
 
 [features]
 kafka = ["krishiv-connectors/kafka"]
+# Enable Iceberg catalog integration (registers KrishivCatalog as DataFusion catalog provider).
+iceberg-catalog = [
+    "dep:iceberg",
+    "krishiv-sql/local-catalog",
+    "krishiv-sql/iceberg-datafusion",
+    "krishiv-connectors/iceberg",
+]
 
 [dev-dependencies]
 krishiv-common = { path = "../krishiv-common" }

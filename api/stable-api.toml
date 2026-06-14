@@ -120,7 +120,7 @@ phase = "D"
 stability = "experimental"
 rust = "implemented"
 python = "implemented"
-sql = "partial"
+sql = "implemented"
 owner = "krishiv-connectors"
 
 [[capabilities]]

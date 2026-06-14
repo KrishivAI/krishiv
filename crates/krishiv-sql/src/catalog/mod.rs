@@ -8,6 +8,33 @@ pub use iceberg_rest::{
     GenericRestCatalog, IcebergCatalogClient, IcebergTableId, LoadedIcebergTable, RestCatalogConfig,
 };
 
+// ── Unified Iceberg catalog backends (Phase J1-J4) ──────────────────────────
+// Each module is gated behind its own feature so a build that does not need a
+// given backend never pulls its dependency tree (sqlx, iceberg-catalog-rest…).
+#[cfg(feature = "local-catalog")]
+pub mod local_catalog;
+#[cfg(feature = "local-catalog")]
+pub mod unified;
+#[cfg(feature = "postgres-catalog")]
+pub mod postgres_catalog;
+#[cfg(feature = "rest-catalog")]
+pub mod rest_catalog_wrapper;
+#[cfg(feature = "iceberg-datafusion")]
+pub mod iceberg_table_provider;
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+pub mod iceberg_catalog_bridge;
+
+#[cfg(feature = "local-catalog")]
+pub use local_catalog::LocalCatalog;
+#[cfg(feature = "local-catalog")]
+pub use unified::KrishivCatalog;
+#[cfg(feature = "postgres-catalog")]
+pub use postgres_catalog::PostgresCatalog;
+#[cfg(feature = "rest-catalog")]
+pub use rest_catalog_wrapper::KrishivRestCatalog;
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+pub use iceberg_catalog_bridge::IcebergCatalogBridge;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -51,10 +78,30 @@ pub enum CatalogError {
     /// The server explicitly does not advertise a required endpoint.
     #[error("catalog server does not support {operation}")]
     UnsupportedOperation { operation: String },
+    /// A filesystem / object-store I/O error.
+    #[error("I/O error: {0}")]
+    Io(String),
+    /// An error surfaced by the underlying Iceberg library.
+    #[error("Iceberg error: {0}")]
+    Iceberg(String),
+    /// An optimistic-concurrency commit lost a race with another writer.
+    #[error("concurrency conflict: {message}")]
+    ConcurrencyConflict { message: String },
+    /// A requested namespace was not found.
+    #[error("namespace not found: '{name}'")]
+    NamespaceNotFound { name: String },
 }
 
 /// Convenience result alias for catalog operations.
 pub type CatalogResult<T> = Result<T, CatalogError>;
+
+/// Alias used by the unified-catalog backends (J1-J4).
+///
+/// The file-system, Postgres, and REST catalog implementations all report
+/// failures through [`CatalogError`]; this alias gives those modules the
+/// `LakehouseError` name used throughout the lakehouse subsystem without
+/// introducing a second error type at the crate boundary.
+pub type LakehouseError = CatalogError;
 
 // ---------------------------------------------------------------------------
 // FieldType
