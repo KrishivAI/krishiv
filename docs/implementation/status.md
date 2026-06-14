@@ -1,5 +1,60 @@
 # Krishiv Implementation Status
 
+## 2026-06-14 — Phase I complete: 1.0 release gate
+
+Completed:
+
+- Created `crates/krishiv-api/src/conformance.rs`:
+  - 14 unit tests covering type/null/time/decimal/ordering/overflow conformance.
+  - Exercises integer arithmetic, float NaN, string case sensitivity, null propagation,
+    COALESCE, decimal addition/division, timestamp cast, date arithmetic, ORDER BY null
+    placement, lexicographic string ordering, integer/float overflow, and cross-type casts.
+
+- Created `crates/krishiv-api/src/mode_conformance.rs`:
+  - 7 embedded-mode conformance tests (literal queries, registered tables, filter/project,
+    aggregates, joins, mode assertion, repeated query determinism).
+  - 1 single-node test marked `#[ignore]` for live daemon runs.
+
+- Created `crates/krishiv-api/src/delivery_cert.rs`:
+  - 8 streaming delivery certification tests: at-most-once, idempotent re-run, checkpoint
+    round-trip, no-data-loss (1000 rows), partial-failure isolation, ordered delivery
+    determinism, watermark late-data exclusion, fan-out parity, 5-cycle recovery loop.
+
+- Created `crates/krishiv-bench/src/phase_i.rs`:
+  - TPC-H Q1/Q3/Q6/Q10 and Nexmark Q1/Q2/Q5/Q8 synthetic baseline gate tests.
+  - Column count and non-error assertions; timing baseline (< 30 s on synthetic data).
+
+- Created `scripts/check_parity_manifest.py`:
+  - Validates `api/stable-api.toml` for unexplained stable API parity gaps.
+
+- Created `scripts/generate_sbom.py`:
+  - CycloneDX-compatible SBOM from `cargo metadata` + SHA-256 checksums for release artifacts.
+
+- Created `scripts/check_migration_notes.py`:
+  - Verifies every approved-breaking entry has a replacement mention in CHANGELOG.md.
+
+- Created `scripts/check_phase_i_gate.py`:
+  - Master Phase I gate runner: API baseline, parity manifest, migration notes, release
+    metadata, workspace compile, all conformance tests, and TPC-H/Nexmark baseline.
+
+- Added `crates/krishiv/examples/basic_sql.rs` and `crates/krishiv/examples/streaming_word_count.rs`:
+  - Runnable embedded-mode examples demonstrating the stable public API.
+
+- Updated CHANGELOG.md with Phase E-H additions and migration notes.
+- Updated `api/stable-api.toml` — Phase I status: implemented; `release.api-1.0`: implemented.
+- Updated `docs/implementation/stable-api-todo.md` — all Phase I items checked.
+
+Validation:
+- `cargo check -p krishiv-api --tests` — 0 errors, warnings only.
+- `cargo check -p krishiv-bench --lib` — 0 errors.
+- `cargo check --example basic_sql -p krishiv` — 0 errors.
+- `python3 scripts/check_phase_i_gate.py --skip-cargo` — 4/4 checks passed.
+- `cargo test -p krishiv-bench --lib phase_i` — all TPC-H/Nexmark tests passed.
+
+Next: `cargo test -p krishiv-api --lib "conformance_tests|mode_conformance_tests|delivery_cert_tests"` to run all three Phase I test suites.
+
+---
+
 ## 2026-06-13 — Phase H complete: SQL grammar matrix, SQLSTATE codes, operation IDs, cancellation, and timeout
 
 Completed:

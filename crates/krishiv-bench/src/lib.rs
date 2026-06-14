@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-
 //! Shared support code for the Krishiv benchmark suite.
 //!
 //! The [`tpch`] module holds the TPC-H query texts, the Parquet table set each
@@ -7,6 +6,8 @@
 //! variables. Both the embedded (`tpch_sf10`) and distributed
 //! (`tpch_distributed`) bench targets consume these definitions so the two
 //! harnesses always measure identical workloads.
+
+pub mod phase_i;
 
 pub mod tpch {
     //! TPC-H query texts, per-query table sets, and the scale-factor ladder.

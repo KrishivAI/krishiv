@@ -57,7 +57,7 @@ exit_criteria = "Published grammar, complete Iceberg DML, prepared statements, a
 [[phases]]
 id = "I"
 name = "1.0 stability gate"
-status = "todo"
+status = "implemented"
 exit_criteria = "Compatibility, parity, semantics, modes, durability, packaging, and performance gates pass."
 
 [[capabilities]]
@@ -172,9 +172,9 @@ owner = "krishiv-sql"
 id = "release.api-1.0"
 phase = "I"
 stability = "preview"
-rust = "blocked"
-python = "blocked"
-sql = "blocked"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
 owner = "repository"
 
 [[capabilities]]

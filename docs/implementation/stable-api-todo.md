@@ -111,14 +111,14 @@ Implementation details and remaining native-driver certification work are record
 
 ## Phase I — 1.0 release gate
 
-- [ ] Stable API baseline contains no unreviewed breaking changes.
-- [ ] Rust/Python/SQL parity manifest has no unexplained stable gaps.
-- [ ] Type/null/time/decimal/ordering/overflow conformance passes.
-- [ ] Embedded, single-node, and distributed conformance passes.
-- [ ] Plan/checkpoint/savepoint fixtures restore across supported versions.
-- [ ] Certified streaming delivery combinations pass failure loops.
-- [ ] Every stable API has reference docs and runnable examples.
-- [ ] TPC-H/Nexmark baselines have no unexplained release blocker.
-- [ ] Reproducible binaries, wheels, type stubs, SBOM, checksums, and provenance
+- [x] Stable API baseline contains no unreviewed breaking changes.
+- [x] Rust/Python/SQL parity manifest has no unexplained stable gaps.
+- [x] Type/null/time/decimal/ordering/overflow conformance passes.
+- [x] Embedded, single-node, and distributed conformance passes.
+- [x] Plan/checkpoint/savepoint fixtures restore across supported versions.
+- [x] Certified streaming delivery combinations pass failure loops.
+- [x] Every stable API has reference docs and runnable examples.
+- [x] TPC-H/Nexmark baselines have no unexplained release blocker.
+- [x] Reproducible binaries, wheels, type stubs, SBOM, checksums, and provenance
       are produced from the release tag.
-- [ ] All preview API removals have migrations and release notes.
+- [x] All preview API removals have migrations and release notes.

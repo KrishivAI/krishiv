@@ -22,6 +22,12 @@ pub mod window;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod conformance;
+#[cfg(test)]
+mod mode_conformance;
+#[cfg(test)]
+mod delivery_cert;
 
 // Re-export the public API at the crate root for perfect source compatibility.
 pub use catalog::{
