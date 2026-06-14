@@ -56,6 +56,8 @@ arrow = { version = "58.3.0", features = ["prettyprint", "ipc_compression", "csv
 arrow-flight = { version = "58.3.0", features = ["flight-sql-experimental"] }
 pyo3 = { version = "0.28.3", features = ["experimental-async"] }
 iceberg = "0.9.1"
+iceberg-catalog-rest = "0.9.1"
+iceberg-datafusion = "0.9.1"
 async-trait = "0.1"
 bytes = "1"
 object_store = "0.13.2"

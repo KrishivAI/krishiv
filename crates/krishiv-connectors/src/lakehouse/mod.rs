@@ -10,10 +10,14 @@ mod as_of;
 pub mod connector_registry;
 mod delta;
 mod delta_lake;
+#[cfg(feature = "iceberg")]
+pub mod dml;
 mod hudi;
 mod iceberg_fs;
 mod iceberg_native;
 mod local_delta;
+#[cfg(feature = "iceberg")]
+pub mod maintenance;
 mod partition_spec;
 mod two_phase;
 
