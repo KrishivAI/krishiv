@@ -14,6 +14,7 @@ mod job_status;
 mod lakehouse;
 mod live_table;
 mod memo;
+mod metrics_api;
 mod migration;
 mod pipeline;
 mod prepared;
@@ -31,21 +32,7 @@ mod streaming;
 mod udf;
 mod windows;
 
-// Stub `krishiv.ai` Python submodule. The AI/RAG implementation was removed in
-// the platform-layer cleanup; the empty module is kept so `import krishiv.ai`
-// keeps failing gracefully at attribute level rather than at import level.
-mod ai {
-    use pyo3::prelude::*;
-
-    pub fn register_ai_module(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-        let ai = PyModule::new(py, "ai")?;
-        parent.add_submodule(&ai)?;
-        py.import("sys")?
-            .getattr("modules")?
-            .set_item("krishiv.ai", &ai)?;
-        Ok(())
-    }
-}
+mod vector_sinks;
 
 pub use agg::PyAggExpr;
 pub use batch::PyBatch;
@@ -68,6 +55,7 @@ pub use sinks::{PyIcebergSink, PyKafkaSink, PyParquetSink};
 pub use stream::{PyKeyedStream, PyStream, PyWindowedStream};
 pub use streaming::{PyDataStreamWriter, PyStreamingQuery, PyStreamingQueryProgress};
 pub use udf::call_python_udf;
+pub use vector_sinks::{PyInMemoryVectorSink, PyScoredChunk};
 pub use windows::PyWindowSpec;
 
 // ---------------------------------------------------------------------------
@@ -167,7 +155,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     sinks::register_sinks_module(m.py(), m)?;
     agg::register_agg_module(m.py(), m)?;
     windows::register_windows_module(m.py(), m)?;
-    ai::register_ai_module(m.py(), m)?;
+    vector_sinks::register_ai_module(m.py(), m)?;
+    metrics_api::register_metrics_module(m.py(), m)?;
 
     Ok(())
 }
@@ -198,13 +187,11 @@ mod tests {
 
     #[test]
     fn py_session_local_mode_builds() {
-        let session = krishiv_api::SessionBuilder::new()
-            .with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
-            .build()
-            .unwrap();
+        // SingleNode now requires a coordinator URL; verify Embedded builds.
+        let session = krishiv_api::SessionBuilder::new().build().unwrap();
         assert!(matches!(
             session.mode(),
-            krishiv_api::ExecutionMode::SingleNode
+            krishiv_api::ExecutionMode::Embedded
         ));
     }
 
@@ -281,13 +268,11 @@ mod tests {
 
     #[test]
     fn local_session_stream_is_allowed() {
-        let session = krishiv_api::SessionBuilder::new()
-            .with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
-            .build()
-            .unwrap();
+        // SingleNode now requires a coordinator URL; Embedded is the local stream mode.
+        let session = krishiv_api::SessionBuilder::new().build().unwrap();
         assert!(matches!(
             session.mode(),
-            krishiv_api::ExecutionMode::SingleNode
+            krishiv_api::ExecutionMode::Embedded
         ));
     }
 }

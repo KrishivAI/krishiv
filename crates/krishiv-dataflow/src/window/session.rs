@@ -287,7 +287,7 @@ impl SessionWindowOperator {
                 && let Some(budget) = &self.memory_budget
                 && !budget.try_reserve(128)
             {
-                return Err(ExecError::ResourceExhausted(format!(
+                return Err(ExecError::Oom(format!(
                     "session window exceeded memory budget ({} bytes used, limit {} bytes)",
                     budget.used_bytes(),
                     budget.limit().unwrap_or(0),

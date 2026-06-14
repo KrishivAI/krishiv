@@ -26,8 +26,4 @@ impl Namespace {
         &self.state_name
     }
 
-    /// Composite name used for logging and column-family mapping.
-    pub fn column_family_name(&self) -> String {
-        format!("{}:{}", self.operator_id, self.state_name)
-    }
 }

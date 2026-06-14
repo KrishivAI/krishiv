@@ -45,10 +45,6 @@ impl PyStream {
         }
     }
 
-    pub fn from_pipeline_struct(pipeline: StreamPipeline) -> Self {
-        Self { pipeline }
-    }
-
     /// Build a stream from session-registered memory batches (`memory:<name>` source).
     pub fn from_memory(
         session: std::sync::Arc<krishiv_api::Session>,
@@ -125,23 +121,6 @@ impl PyStream {
     /// Tumbling window duration in seconds (multiplied by 1000 for the engine).
     pub fn tumbling_window(&self, window_secs: u64) -> PyResult<PyWindowedStream> {
         self.tumbling_window_ms(window_secs.saturating_mul(1000))
-    }
-
-    fn _tumbling_window_secs_body(&self, window_secs: u64) -> PyResult<PyWindowedStream> {
-        ensure_watermark_before_window(
-            &self.pipeline.watermark_column,
-            self.pipeline.max_lateness_ms,
-        )?;
-        let window_ms = window_secs.saturating_mul(1000);
-        let pipeline = self
-            .pipeline
-            .with_window(crate::pipeline::WindowDescriptor {
-                kind: WindowKind::Tumbling,
-                size_ms: window_ms,
-                slide_ms: None,
-                gap_ms: None,
-            });
-        Ok(new_windowed_stream(pipeline))
     }
 
     pub fn __repr__(&self) -> String {

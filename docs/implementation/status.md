@@ -1,5 +1,250 @@
 # Krishiv Implementation Status
 
+## 2026-06-14 — Deep clean of `krishiv-dataflow` crate
+
+Completed:
+
+- **Removed 6 dead module files** (2697 lines total):
+  - `barrier_align.rs`, `coalesce_partitions.rs`, `lookup_join.rs`, `sort.rs`, `window_join.rs`, `aligned_input.rs`.
+- **Stripped dead operator types** from `src/join.rs`:
+  - Removed `HashJoin`, `BroadcastJoin`, `BuiltBroadcastJoin`, `StreamTableJoin`, `SortMergeJoin`, `NestedLoopJoin`.
+  - Kept `AggKey`, `extract_agg_key`, `JoinKind`, `CompositeKey` (used by `aggregate.rs`, `process_fn.rs`, `window/`).
+- **Removed `ExternalAggregator`** (struct, impl, Drop) from `src/aggregate.rs` — zero internal/external usage after `sort` module removal.
+- **Removed `spill.rs`** module + `ExecError::Spill` variant — sole production consumer was `ExternalAggregator`.
+- **Renamed `ExecError::ResourceExhausted` → `Oom`** — `session.rs` reference updated.
+- **Removed dead re-exports from `lib.rs`**: 6 module declarations, ~30 type re-exports, 7 test functions.
+- **Cleaned unused imports** from `aggregate.rs`, `session.rs`.
+
+Validation:
+- `cargo check -p krishiv-dataflow` — 0 errors, 0 warnings.
+
+Completed:
+
+- **Removed `BoundedWindowRequest` struct + `From` impl** from `flight_action.rs`
+  — `pub` struct but never re-exported or referenced anywhere in the workspace.
+- **Removed `action_tags` re-export alias** from `lib.rs` — never referenced
+  via `krishiv_runtime::action_tags` or `use.*action_tags`. The underlying
+  `flight_action::tags` module remains accessible at its canonical path.
+- **Gated `execute_windowed_in_process` with `#[cfg(test)]`** in `in_process.rs`
+  — the `pub` function was only called from tests; removed from `lib.rs` re-export.
+- **Gated `fragment_from_local_spec` with `#[cfg(test)]`** in `in_process_cluster.rs`
+  — only used by 3 local test functions; removed from `lib.rs` re-export.
+- **Removed unused `async-trait` dependency** from `Cargo.toml` — not directly
+  used (only `tonic::async_trait` in test code).
+- **Removed unused `krishiv-state` dependency** from `Cargo.toml` — zero
+  references in any source file.
+
+`tempfile` dev-dependency was initially removed but restored: the
+`integration_distributed.rs` integration test uses `tempfile::tempdir()`.
+
+Validation:
+- `cargo check -p krishiv-runtime --lib` — 0 errors, 0 warnings.
+- `cargo test -p krishiv-runtime --lib` — 314/314 passed, 0 failures.
+
+---
+
+## 2026-06-14 — Python API gap fill (Iteration 2)
+
+Continuing from Iteration 1 which added G5–G14, G16. This iteration adds:
+
+### G1 — Aggregate UDF (UDAF) and Table UDF (UDTF) bridges
+
+**`crates/krishiv-python/src/udf.rs`**:
+- `PythonAggregateUdf`: wraps three Python callables (`accumulate`, `finalize`, `merge`) that
+  operate on `bytes` state, bridging to `krishiv_plan::udf::AggregateUdf`
+- `PythonTableUdf`: wraps a Python callable that returns a `pyarrow.RecordBatch`
+- `build_python_aggregate_udf` / `build_python_table_udf` factory helpers
+
+**`crates/krishiv-python/src/session.rs`**:
+- `Session.register_aggregate_udf(name, accumulate_fn, finalize_fn, merge_fn, *, input_types, output_type)` — Python UDAF
+- `Session.register_table_udf(name, callable, *, output_types)` — Python UDTF
+
+### G14 — Metrics dependency fix
+
+**`crates/krishiv-python/Cargo.toml`**: Added `krishiv-metrics` dependency (was missing, causing compile failure of `metrics_api.rs`).
+
+### G17 — `krishiv.ai` vector sink bindings
+
+**`crates/krishiv-python/src/vector_sinks.rs`** (new file):
+- `InMemoryVectorSink`: Python class wrapping `krishiv_connectors::vector::InMemoryVectorSink`
+- Methods: `upsert_batch(doc_ids, vectors, payloads, epoch)`, `delete_by_ids(ids)`, `query_nearest(vector, top_k, filter)`
+- `ScoredChunk`: Python class for query results with `doc_id`, `chunk_index`, `text`, `score`, `payload()` attrs
+- Registers as the `krishiv.ai` submodule (replaces the empty stub)
+
+**`crates/krishiv-python/Cargo.toml`**: Added `vector-sinks` to `krishiv-connectors` features.
+
+### Validation
+
+```
+cargo check -p krishiv-python --no-default-features  # Finished dev profile, 0 errors
+cargo test -p krishiv-python --lib --no-default-features  # (in progress)
+```
+
+### Remaining gaps
+
+- **G3** (state_ttl for process functions) — requires `StateTtlConfig` exposure
+- **G12** (state TTL binding in process API) — tied to G3
+- **G13** (Kinesis/Pulsar additional sources) — large scope
+- **G15** (JWT auth provider) — needs `krishiv-scheduler` dep
+- **SQL P→S** (dml.delete, dml.update, ddl.create_table_as) — requires engine work
+
+---
+
+## 2026-06-14 — Deep clean of `krishiv-state` crate
+
+Completed:
+
+- **Removed dead code items** from `crates/krishiv-state/src/`:
+  - `ReplayBundle` struct and `generate_replay_bundle` function — zero external
+    or internal usage outside their own module + tests.
+  - `Namespace::column_family_name()` method — only used in one test. No other
+    crate or module referenced it.
+  - `RocksDbStateBackend::in_memory()` — inlined into `ephemeral()`. All 48 call
+    sites replaced with `new()`.
+  - `RocksDbStateBackend::key_group_range()` — zero external usage.
+  - `SnapshotIncomplete` error variant — defined in `StateError` but never
+    constructed anywhere in the codebase.
+- **Removed 24 duplicate tests** from `crates/krishiv-state/src/tests.rs`:
+  - All `redb_ephemeral_*` tests (8) that duplicated the `state_*` equivalents.
+  - Redundant `redb_*` backend tests (7: put/get/delete, snapshot, file-backed,
+    overwrite, clear_namespace, namespace_isolated, list_keys, snapshot
+    roundtrip, load_snapshot replaces state) — all covered by primary tests
+    or `rocksdb_backend.rs` module tests.
+  - `rocks_snapshot_round_trips` — duplicate of `in_memory_snapshot_round_trips`
+    and `rocksdb_snapshot_roundtrip`.
+  - `redb_put_batch_get_batch_roundtrip` — duplicate of
+    `in_memory_put_batch_get_batch_roundtrip`.
+  - `redb_ephemeral_survives_reopen` — duplicate of
+    `rocksdb_open_persists_across_reopen`.
+  - `redb_ephemeral_state_inspector_reads_without_mutation` — covered by
+    `state_inspector_is_read_only` + `state_inspector_key_count_and_namespaces`.
+- **Removed test** `state_backend_exposes_full_key_group_range_by_default` from
+  `tests/key_group.rs` (accompanies removed `key_group_range()` method).
+- **Removed test** `namespace_column_family_name_format` from `tests.rs`.
+- **Fix**: `p0_7_redb_load_snapshot_incomplete_returns_error` updated to match
+  `SnapshotCorrupt` only (removed `SnapshotIncomplete` arm).
+
+Validation:
+- `CXXFLAGS="-include cstdint" cargo check -p krishiv-state` — 0 errors, 0 warnings.
+- `CXXFLAGS="-include cstdint" cargo test -p krishiv-state` — 296/296 unit + 3/3
+  integration tests passed, 0 failures.
+
+---
+
+## 2026-06-14 — Deep clean of `krishiv-plan` crate
+
+Completed:
+
+- **Removed 4 dead modules** from `crates/krishiv-plan/src/`:
+  - `statistics` — `ColumnStats`, `TableStats`, `CardinalityEstimator` (zero external usage; doc-only reference in join_reorder removed)
+  - `streaming` — `TemporalJoinSpec`, `IntervalJoinSpec`, `SideOutput` (zero external usage)
+  - `streaming_plan` — `logical_plan_for_window`, `physical_plan_for_window` (zero external usage)
+  - `r17` — `VectorSinkPlanConfig` (re-exported but zero external usage; removed re-export too)
+- **Made `lowering` module private** (`mod lowering` instead of `pub mod lowering`) — no external crate uses `krishiv_plan::lowering`, only internal from `task_fragment.rs`.
+- **Removed dead doc link** in `join_reorder.rs` referencing the removed `CardinalityEstimator`.
+
+Validation:
+- `cargo check -p krishiv-plan` — 0 errors, 0 warnings.
+- `cargo check --workspace` — 0 new errors or warnings (only pre-existing warnings in `krishiv-python` and `krishiv-flight-sql`).
+
+## 2026-06-14 — Python API gap fill (Iteration 1)
+
+Implemented missing Python bindings identified from the Rust/Python/SQL matrix:
+
+**`crates/krishiv-python/src/dataframe.rs`** — new `PyDataFrame` methods:
+- `schema()` → `list[(name, arrow_type)]` — inspect column names and Arrow types
+- `columns()` → `list[str]` — column names shortcut
+- `describe()` → `DataFrame` — summary statistics (count/mean/stddev/min/max)
+- `join(right, on, *, how="inner")` — equi-join with all 8 join types including
+  `left_semi`, `right_semi`, `left_anti`, `right_anti`
+- `join_on(right, left_on, right_on, *, how)` — join with asymmetric key lists
+- `repartition(num_partitions, key_columns=[])` — hash / round-robin repartition
+- `collect_with_stats()` → `(QueryResult, {"output_rows", "cpu_nanos"})` — stats
+- `order_by(columns)` — ascending sort alias for `sort()`
+- `alias(name)` — rename DataFrame for SQL references
+
+**`crates/krishiv-python/src/session.rs`** — new `PySession` methods:
+- `list_tables()` → `list[str]` — all registered tables and views
+- `table_exists(name)` → `bool`
+- `create_view(name, query)` — register a named SQL view
+- `drop_table(name)` — deregister a table or view
+- `is_streaming_query(sql)` → `bool` — detect unbounded sources before execution
+- `close_unbounded_input(name)` → `bool` — signal EOF on an unbounded stream
+- `register_kafka_source(name, brokers, topic, *, group_id, schema)` — register
+  Kafka topic as a SQL streaming table (feature-gated: `kafka`)
+
+Validation:
+- `cargo check -p krishiv-python` — 0 errors.
+- `cargo test -p krishiv-python --lib` — running.
+
+Remaining Python gaps (see gap matrix):
+- G1: `register_aggregate_udf` / `register_table_udf`
+- G3: `SessionBuilder` options (`target_parallelism`, `shuffle_partitions`, `state_ttl`)
+- G12: State TTL binding for process functions
+- G13: Kinesis / Pulsar / Cassandra / ES / HBase / S3 source bindings
+- G14: Metrics/observability Python surface
+- G15: JWT auth provider
+- G17: `krishiv.ai` vector sinks beyond empty stub
+
+---
+
+## 2026-06-14 — Deep clean of `krishiv-common` crate
+
+Completed:
+
+- **Removed 3 dead hash functions** from `crates/krishiv-common/src/hash.rs`:
+  `sha256_bytes`, `sha256_dedup_key`, `sha256_hex_multi` — zero external usage.
+- **Removed dead function** `target_bytes_per_partition` from
+  `crates/krishiv-common/src/partition.rs` — zero external usage.
+  Kept `TARGET_BYTES_PER_PARTITION` constant (used by 5 other crates).
+- **Removed dead methods** `BackpressureSignal::is_paused()` and
+  `BackpressureSignal::is_clear()` from `crates/krishiv-common/src/backpressure.rs`
+  — zero external usage.
+- **Removed 6 unused re-exports** from `crates/krishiv-common/src/lib.rs`:
+  `CreditGate`, `MetadataDurability`, `DurabilityProfileSpec`,
+  `DurabilityProfileParseError`, `ALLOW_LEGACY_FRAGMENTS_ENV`,
+  `DURABILITY_PROFILE_ENV` — zero external imports via `krishiv_common::`.
+- **Removed unused `hex` dependency** from
+  `crates/krishiv-common/Cargo.toml` — was only used by removed `sha256_bytes`.
+- **Consolidated tests** in `hash.rs` — removed tests depending on deleted
+  functions; kept `sha256_hex_deterministic` and `is_safe_identifier` coverage.
+
+Validation:
+
+- `cargo check -p krishiv-common --all-features` — 0 errors, 0 warnings.
+- `cargo test -p krishiv-common --all-features` — 95/95 passed (80 unit + 12
+  integration + 3 doctests), 0 failures.
+- `CXXFLAGS="-include cstdint" cargo check --workspace` — 0 new errors or
+  warnings (only pre-existing warnings in `krishiv-python` and
+  `krishiv-flight-sql`).
+
+---
+
+## 2026-06-14 — Deep clean of `krishiv-ai` crate
+
+Completed:
+
+- **Removed `crates/krishiv-ai/src/vector_sinks.rs`** — orphaned file: never
+  declared as a module in `lib.rs` (no `mod vector_sinks;`), never compiled.
+- **Removed duplicate re-exports in `crates/krishiv-ai/src/lib.rs`** — the
+  explicit `pub use krishiv_connectors::PgvectorSink` and
+  `pub use krishiv_connectors::QdrantSink` were redundant: the wildcard
+  `pub use krishiv_connectors::vector::*` already re-exports both (they are
+  `pub use` in `krishiv-connectors::vector::mod.rs` under feature gates).
+- **Fixed stale doc comments in `crates/krishiv-common/src/validate.rs`** —
+  two references to the old `krishiv_ai::vector_sinks::validate_identifier`
+  path (which never existed at runtime due to the orphaned module) updated
+  to `krishiv_connectors::vector::validate_identifier`.
+
+Validation:
+- `cargo check -p krishiv-ai` (default features) — 0 errors, 0 warnings.
+- `cargo check -p krishiv-ai --all-features` — 0 errors, 0 warnings.
+- `cargo check --workspace` — 0 new errors, 0 new warnings.
+
+Next: verify with `cargo test --workspace` if needed.
+
+---
+
 ## 2026-06-14 — Python parity complete: Phases D/F/G/H Python bindings
 
 Completed:

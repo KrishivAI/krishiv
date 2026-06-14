@@ -33,12 +33,9 @@ pub enum ExecError {
     /// A CEP pattern matching error occurred.
     #[error("cep error: {0}")]
     Cep(String),
-    /// A memory budget was exceeded — caller should spill or abort the operator.
-    #[error("resource exhausted: {0}")]
-    ResourceExhausted(String),
-    /// A spill file could not be written or read.
-    #[error("spill error: {0}")]
-    Spill(String),
+    /// A memory budget was exceeded — caller should abort the operator.
+    #[error("oom: {0}")]
+    Oom(String),
 }
 
 impl From<arrow::error::ArrowError> for ExecError {
@@ -58,17 +55,13 @@ pub use krishiv_plan::JoinType;
 
 pub mod adaptive;
 pub mod aggregate;
-pub mod aligned_input;
-pub mod barrier_align;
 pub mod broadcast_state;
 pub mod cep;
-pub mod coalesce_partitions;
 pub mod connected_streams;
 pub mod continuous;
 pub mod interval_join;
 pub mod join;
 pub mod live_table;
-pub mod lookup_join;
 pub mod memo;
 pub mod operator_config;
 pub mod operator_runtime;
@@ -76,36 +69,21 @@ pub mod process_fn;
 pub mod queue;
 pub mod schema_normalize;
 pub mod side_output;
-pub mod sort;
-mod spill;
 pub mod state_descriptor;
 pub mod temporal_join;
 #[cfg(test)]
 mod watermark_e2e;
 pub mod watermark_util;
 pub mod window;
-pub mod window_join;
 
 pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, HeavyHittersTracker,
     HotKeyReport, RateLimiter, SinkLatencyTracker, StreamingPartitionAdvisor, ThrottleCommand,
 };
-pub use aggregate::{AggExpr, AggFunction, ExternalAggregator, LocalAggregator};
-pub use aligned_input::{
-    AlignedEvent, AlignedInputMessage, AlignedInputReceiver, AlignedInputSender, AlignedMultiInput,
-    AlignedWindowJoinDriver, aligned_channel,
-};
-pub use coalesce_partitions::{CoalescePartitionsOperator, coalesce_partition_batches};
+pub use aggregate::{AggExpr, AggFunction};
 pub use continuous::ContinuousWindowExecutor;
-pub use join::{
-    BroadcastJoin, BuiltBroadcastJoin, HashJoin, NestedLoopJoin, SortMergeJoin, StreamTableJoin,
-};
-pub use lookup_join::{
-    InMemoryLookupSource, LookupError, LookupJoin, LookupJoinSpec, LookupSource, LookupValue,
-};
 pub use operator_runtime::{
-    LocalWindowKindBridge, LocalWindowParams, execute_bounded_window, execute_streaming_window,
-    local_spec_to_window_execution,
+    execute_bounded_window, execute_streaming_window,
 };
 pub use broadcast_state::{
     BroadcastContext, BroadcastProcessExecutor, BroadcastProcessFunction, BroadcastStateDescriptor,
@@ -121,14 +99,12 @@ pub use queue::{
     OperatorQueueSender, operator_queue,
 };
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
-pub use sort::{ExternalSorter, SortKey, SortedBatchMerger, sort_batch};
 pub use window::{
     CountWindowOperator, CountWindowSpec, MultiSourceWatermarkState, SessionWindowOperator,
     SessionWindowSpec, SlidingWindowOperator, SlidingWindowSpec, StateBackedSessionWindowOperator,
     StateBackedSlidingWindowOperator, StateBackedTumblingWindowOperator, TumblingWindowOperator,
     TumblingWindowSpec, WatermarkState,
 };
-pub use window_join::{WindowJoin, WindowJoinSpec};
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -152,8 +128,6 @@ mod tests {
         assert_eq!(physical.nodes()[0].id(), "physical:scan");
     }
 
-    // ── HashJoin tests ────────────────────────────────────────────────────────
-
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
@@ -161,174 +135,10 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::{
-        AggExpr, AggFunction, BroadcastJoin, ExecError, HashJoin, LocalAggregator,
+        AggExpr, AggFunction, ExecError,
         TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
     };
-
-    fn make_int32_batch(
-        key_name: &str,
-        keys: Vec<i32>,
-        val_name: &str,
-        vals: Vec<i32>,
-    ) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(key_name, DataType::Int32, false),
-            Field::new(val_name, DataType::Int32, false),
-        ]));
-        let k = Arc::new(Int32Array::from(keys));
-        let v = Arc::new(Int32Array::from(vals));
-        RecordBatch::try_new(schema, vec![k, v]).unwrap()
-    }
-
-    fn make_int32_keyed_batch(key_name: &str, keys: Vec<i32>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            key_name,
-            DataType::Int32,
-            false,
-        )]));
-        let k = Arc::new(Int32Array::from(keys));
-        RecordBatch::try_new(schema, vec![k]).unwrap()
-    }
-
-    #[test]
-    fn hash_join_inner_produces_correct_rows() {
-        // left: id=[1,2,3], val=[10,20,30]
-        // right: id=[2,3,4], rval=[200,300,400]
-        // inner join on id → rows (2,200) and (3,300)
-        let left = make_int32_batch("id", vec![1, 2, 3], "val", vec![10, 20, 30]);
-        let right = make_int32_batch("id", vec![2, 3, 4], "rval", vec![200, 300, 400]);
-
-        let join = HashJoin::new("id", "id");
-        let result = join.join(&left, &right).unwrap();
-
-        // Should have 2 rows.
-        assert_eq!(result.num_rows(), 2);
-
-        // Schema: id (left), val, rval (right key excluded).
-        assert_eq!(result.schema().fields().len(), 3);
-        assert_eq!(result.schema().field(0).name(), "id");
-        assert_eq!(result.schema().field(1).name(), "val");
-        assert_eq!(result.schema().field(2).name(), "rval");
-
-        let ids = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let vals = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let rvals = result
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-
-        // Collect (id, val, rval) pairs.
-        let mut rows: Vec<(i32, i32, i32)> = (0..result.num_rows())
-            .map(|i| (ids.value(i), vals.value(i), rvals.value(i)))
-            .collect();
-        rows.sort();
-
-        assert_eq!(rows, vec![(2, 20, 200), (3, 30, 300)]);
-    }
-
-    #[test]
-    fn hash_join_no_match_produces_empty_result() {
-        let left = make_int32_batch("id", vec![1, 2], "val", vec![10, 20]);
-        let right = make_int32_batch("id", vec![3, 4], "rval", vec![30, 40]);
-
-        let join = HashJoin::new("id", "id");
-        let result = join.join(&left, &right).unwrap();
-
-        assert_eq!(result.num_rows(), 0);
-        // Schema still correct.
-        assert_eq!(result.schema().fields().len(), 3);
-    }
-
-    #[test]
-    fn hash_join_output_schema_excludes_right_join_key() {
-        let left = make_int32_batch("left_id", vec![1], "a", vec![10]);
-        let right = make_int32_batch("right_id", vec![1], "b", vec![100]);
-
-        let join = HashJoin::new("left_id", "right_id");
-        let result = join.join(&left, &right).unwrap();
-
-        let schema = result.schema();
-        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        // right_id should NOT be in the output.
-        assert!(!field_names.contains(&"right_id"));
-        assert!(field_names.contains(&"left_id"));
-        assert!(field_names.contains(&"a"));
-        assert!(field_names.contains(&"b"));
-    }
-
-    #[test]
-    fn hash_join_unsupported_key_type_returns_error() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Date32, false),
-            Field::new("val", DataType::Int32, false),
-        ]));
-        let id_col = Arc::new(arrow::array::Date32Array::from(vec![1i32]));
-        let val_col = Arc::new(Int32Array::from(vec![10i32]));
-        let left = RecordBatch::try_new(schema.clone(), vec![id_col, val_col]).unwrap();
-        // Build a right batch with Date32 key too.
-        let right_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Date32, false)]));
-        let right_id = Arc::new(arrow::array::Date32Array::from(vec![1i32]));
-        let right_date = RecordBatch::try_new(right_schema, vec![right_id]).unwrap();
-
-        let join = HashJoin::new("id", "id");
-        let err = join.join(&left, &right_date).unwrap_err();
-        assert!(
-            matches!(err, ExecError::UnsupportedType(_)),
-            "expected UnsupportedType, got {err}"
-        );
-    }
-
-    // ── BroadcastJoin tests ───────────────────────────────────────────────────
-
-    #[test]
-    fn broadcast_join_produces_same_result_as_hash_join() {
-        let left = make_int32_batch("id", vec![1, 2, 3], "val", vec![10, 20, 30]);
-        let right = make_int32_batch("id", vec![2, 3, 4], "rval", vec![200, 300, 400]);
-
-        let hash_join = HashJoin::new("id", "id");
-        let hash_result = hash_join.join(&left, &right).unwrap();
-
-        let broadcast = BroadcastJoin::new("id").build(Arc::new(right)).unwrap();
-        let broadcast_result = broadcast.probe(&left).unwrap();
-
-        assert_eq!(hash_result.num_rows(), broadcast_result.num_rows());
-        assert_eq!(hash_result.schema(), broadcast_result.schema());
-    }
-
-    #[test]
-    fn broadcast_join_probe_side_larger() {
-        // broadcast (build): 3 rows with id=[1,2,3]
-        // probe: 5 rows with id=[1,1,2,3,4]
-        // expected matches: rows with id=1 (×2), id=2, id=3 → 4 matches
-        let broadcast = make_int32_keyed_batch("id", vec![1, 2, 3]);
-        let probe = make_int32_keyed_batch("id", vec![1, 1, 2, 3, 4]);
-
-        let built = BroadcastJoin::new("id").build(Arc::new(broadcast)).unwrap();
-        let result = built.probe(&probe).unwrap();
-
-        // id=1 matches twice, id=2 once, id=3 once → 4 rows
-        assert_eq!(result.num_rows(), 4);
-    }
-
-    #[test]
-    fn broadcast_join_empty_probe_returns_empty() {
-        let broadcast = make_int32_keyed_batch("id", vec![1, 2, 3]);
-        let probe = make_int32_keyed_batch("id", vec![]);
-
-        let built = BroadcastJoin::new("id").build(Arc::new(broadcast)).unwrap();
-        let result = built.probe(&probe).unwrap();
-
-        assert_eq!(result.num_rows(), 0);
-    }
+    use crate::aggregate::LocalAggregator;
 
     // ── LocalAggregator tests ─────────────────────────────────────────────────
 
@@ -833,7 +643,7 @@ mod tests {
 
     use super::{
         MultiSourceWatermarkState, SessionWindowOperator, SessionWindowSpec, SlidingWindowOperator,
-        SlidingWindowSpec, StreamTableJoin,
+        SlidingWindowSpec,
     };
 
     #[test]
@@ -1061,49 +871,6 @@ mod tests {
                 "avg of 10,30 should be 20, got {avg}"
             );
         }
-    }
-
-    // ── StreamTableJoin tests ─────────────────────────────────────────────────
-
-    fn make_table() -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("label", DataType::Utf8, false),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-                Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
-            ],
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn stream_table_join_inner_join() {
-        let mut join = StreamTableJoin::new(make_table(), "key");
-        let stream = make_stream_batch_i64(vec!["a", "b", "z"], vec![1, 2, 3], vec![10, 20, 30]);
-        let result = join.process_batch(&stream).unwrap();
-        // "z" has no match — only 2 output rows
-        assert_eq!(result.num_rows(), 2);
-        let labels = result
-            .column_by_name("label")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let mut label_vals: Vec<&str> = (0..result.num_rows()).map(|i| labels.value(i)).collect();
-        label_vals.sort();
-        assert_eq!(label_vals, vec!["alpha", "beta"]);
-    }
-
-    #[test]
-    fn stream_table_join_no_matches_returns_empty() {
-        let mut join = StreamTableJoin::new(make_table(), "key");
-        let stream = make_stream_batch_i64(vec!["x", "y"], vec![1, 2], vec![10, 20]);
-        let result = join.process_batch(&stream).unwrap();
-        assert_eq!(result.num_rows(), 0);
     }
 
     // ── R7.2 OperatorQueue tests ─────────────────────────────────────────────

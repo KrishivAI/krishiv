@@ -82,14 +82,6 @@ pub struct ContinuousDrainBody {
     pub job_id: String,
 }
 
-/// Request-only bounded-window action body (no response fields).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BoundedWindowRequest {
-    pub topic: String,
-    pub spec: WindowExecutionSpec,
-    pub batches_b64: String,
-}
-
 /// Full bounded-window body including optional server-populated response fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BoundedWindowBody {
@@ -110,17 +102,6 @@ impl BoundedWindowBody {
             topic,
             spec,
             batches_b64,
-            response_watermark_ms: None,
-        }
-    }
-}
-
-impl From<BoundedWindowRequest> for BoundedWindowBody {
-    fn from(req: BoundedWindowRequest) -> Self {
-        Self {
-            topic: req.topic,
-            spec: req.spec,
-            batches_b64: req.batches_b64,
             response_watermark_ms: None,
         }
     }

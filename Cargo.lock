@@ -5349,7 +5349,6 @@ name = "krishiv-common"
 version = "0.1.0"
 dependencies = [
  "arrow 58.3.0",
- "hex",
  "krishiv-connectors",
  "krishiv-operator",
  "krishiv-plan",
@@ -5497,7 +5496,6 @@ dependencies = [
 name = "krishiv-metrics"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "dashmap",
  "http 1.4.1",
  "opentelemetry",
@@ -5569,7 +5567,6 @@ dependencies = [
  "proptest",
  "prost 0.14.3",
  "prost-build 0.14.3",
- "prost-types 0.14.3",
  "protoc-bin-vendored",
  "serde",
  "thiserror 1.0.69",
@@ -5584,21 +5581,19 @@ name = "krishiv-python"
 version = "0.1.0"
 dependencies = [
  "arrow 58.3.0",
- "dashmap",
  "futures",
  "krishiv-ai",
  "krishiv-api",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-dataflow",
+ "krishiv-metrics",
  "krishiv-plan",
- "krishiv-runtime",
  "krishiv-sql",
  "krishiv-state",
  "parquet 58.3.0",
  "pyo3",
  "pyo3-arrow",
- "sha2 0.10.9",
  "tokio",
 ]
 
@@ -5608,7 +5603,6 @@ version = "0.1.0"
 dependencies = [
  "arrow 58.3.0",
  "arrow-flight",
- "async-trait",
  "base64 0.22.1",
  "dashmap",
  "futures",
@@ -5620,7 +5614,6 @@ dependencies = [
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-sql",
- "krishiv-state",
  "parquet 58.3.0",
  "reqwest 0.13.4",
  "serde",

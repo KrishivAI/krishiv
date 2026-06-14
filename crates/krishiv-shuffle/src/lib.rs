@@ -43,7 +43,7 @@ pub fn validate_safe_id(id: &str, label: &str) -> ShuffleResult<()> {
 // Re-export the public API at the crate root for source compatibility.
 pub use compression::{CompressionCodec, ShuffleCompression};
 pub use disk_store::LocalDiskShuffleStore;
-pub use error::{ShuffleError, ShuffleResult, StoreResult};
+pub use error::{ShuffleError, ShuffleResult};
 pub use krishiv_common::durability::{DurabilityProfile, ShuffleDurability};
 pub use local_store::LocalShuffleStore;
 pub use memory_store::InMemoryShuffleStore;

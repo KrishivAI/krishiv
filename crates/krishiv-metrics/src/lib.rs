@@ -191,13 +191,6 @@ pub fn init(config: MetricsConfig) -> Result<MetricsHandle, MetricsError> {
 
 /// **Beta API**: may change between minor releases.
 ///
-/// Shuts down the OTel tracer provider by dropping the handle (the `Drop` impl does the work).
-pub fn shutdown(handle: MetricsHandle) {
-    handle.shutdown();
-}
-
-/// **Beta API**: may change between minor releases.
-///
 /// Returns the W3C `traceparent` header value for the currently active `tracing` span,
 /// or `None` when no span is active.
 ///
@@ -1079,56 +1072,6 @@ impl KrishivMetrics {
     }
 }
 
-// ── Structured span field conventions ───────────────────────────────────────
-
-/// Mandated `tracing::Span` field key for job id.
-pub const SPAN_JOB_ID: &str = "krishiv.job_id";
-/// Mandated `tracing::Span` field key for stage id.
-pub const SPAN_STAGE_ID: &str = "krishiv.stage_id";
-/// Mandated `tracing::Span` field key for task id.
-pub const SPAN_TASK_ID: &str = "krishiv.task_id";
-/// Mandated `tracing::Span` field key for epoch.
-pub const SPAN_EPOCH: &str = "krishiv.epoch";
-/// Mandated `tracing::Span` field key for attempt id.
-pub const SPAN_ATTEMPT_ID: &str = "krishiv.attempt_id";
-/// Mandated `tracing::Span` field key for snapshot id.
-pub const SPAN_SNAPSHOT_ID: &str = "krishiv.snapshot_id";
-/// Mandated `tracing::Span` field key for executor id.
-pub const SPAN_EXECUTOR_ID: &str = "krishiv.executor_id";
-/// Mandated `tracing::Span` field key for connector source id.
-pub const SPAN_SOURCE_ID: &str = "krishiv.source_id";
-/// Mandated `tracing::Span` field key for connector sink id.
-pub const SPAN_SINK_ID: &str = "krishiv.sink_id";
-
-/// Record the standard Krishiv span fields on a `tracing::Span`.
-///
-/// Call this when entering an async operation so downstream logs and traces
-/// carry consistent structured fields.
-pub fn record_span_fields(
-    span: &tracing::Span,
-    job_id: Option<&str>,
-    stage_id: Option<&str>,
-    task_id: Option<&str>,
-    epoch: Option<u64>,
-    attempt_id: Option<u32>,
-) {
-    if let Some(id) = job_id {
-        span.record(SPAN_JOB_ID, id);
-    }
-    if let Some(id) = stage_id {
-        span.record(SPAN_STAGE_ID, id);
-    }
-    if let Some(id) = task_id {
-        span.record(SPAN_TASK_ID, id);
-    }
-    if let Some(e) = epoch {
-        span.record(SPAN_EPOCH, e);
-    }
-    if let Some(a) = attempt_id {
-        span.record(SPAN_ATTEMPT_ID, a);
-    }
-}
-
 // ── W3C tracestate propagation ─────────────────────────────────────────────
 
 /// Returns the W3C `tracestate` header value for the currently active `tracing` span,
@@ -1163,7 +1106,7 @@ mod tests {
     #[test]
     fn shutdown_does_not_panic() {
         let handle = init(MetricsConfig::default()).expect("init");
-        shutdown(handle);
+        handle.shutdown();
     }
 
     #[test]
@@ -1532,42 +1475,6 @@ mod tests {
     }
 
     // ── traceparent / tracestate generation ──────────────────────────────────
-
-    #[test]
-    fn current_traceparent_inside_span_returns_none_when_no_span() {
-        let tp = current_traceparent();
-        assert!(tp.is_none(), "outside a span, traceparent must be None");
-    }
-
-    // ── Span field constants ─────────────────────────────────────────────────
-
-    #[test]
-    fn span_field_constants_are_snake_case_dotted() {
-        assert_eq!(SPAN_JOB_ID, "krishiv.job_id");
-        assert_eq!(SPAN_STAGE_ID, "krishiv.stage_id");
-        assert_eq!(SPAN_TASK_ID, "krishiv.task_id");
-        assert_eq!(SPAN_EPOCH, "krishiv.epoch");
-        assert_eq!(SPAN_ATTEMPT_ID, "krishiv.attempt_id");
-        assert_eq!(SPAN_SNAPSHOT_ID, "krishiv.snapshot_id");
-        assert_eq!(SPAN_EXECUTOR_ID, "krishiv.executor_id");
-        assert_eq!(SPAN_SOURCE_ID, "krishiv.source_id");
-        assert_eq!(SPAN_SINK_ID, "krishiv.sink_id");
-    }
-
-    #[test]
-    fn record_span_fields_applies_all_fields() {
-        let span = tracing::info_span!("test_op");
-        record_span_fields(&span, Some("j1"), Some("s1"), Some("t1"), Some(42), Some(3));
-        let _e = span.enter();
-        // Fields are recorded on the span; no panic = pass.
-    }
-
-    #[test]
-    fn record_span_fields_with_none_does_not_panic() {
-        let span = tracing::info_span!("minimal_op");
-        record_span_fields(&span, None, None, None, None, None);
-        let _e = span.enter();
-    }
 
     // ── MetricsError Display ────────────────────────────────────────────────
 

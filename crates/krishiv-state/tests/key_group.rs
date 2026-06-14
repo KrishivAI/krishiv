@@ -20,16 +20,7 @@ fn parallelism_four_covers_all_groups() {
 }
 
 #[test]
-fn state_backend_exposes_full_key_group_range_by_default() {
-    let backend = RocksDbStateBackend::ephemeral().unwrap();
-    let range = backend.key_group_range();
-    assert_eq!(*range.start(), 0);
-    assert_eq!(*range.end(), NUM_KEY_GROUPS - 1);
-}
-
-#[test]
 fn put_get_roundtrip_with_key_group_prefix_in_redb() {
-    use krishiv_state::RocksDbStateBackend;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.redb");
     let mut backend = RocksDbStateBackend::open(&path).unwrap();

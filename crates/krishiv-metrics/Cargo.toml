@@ -23,10 +23,9 @@ tracing-opentelemetry = { workspace = true }
 tonic.workspace = true
 dashmap = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-chrono = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true }
 
 [lints]

@@ -754,7 +754,8 @@ impl InProcessStreamingRuntime {
     }
 }
 
-/// Run windowed aggregation via a session-scoped cluster (preferred).
+/// Run windowed aggregation via a session-scoped cluster. (tests only)
+#[cfg(test)]
 pub fn execute_windowed_in_process(
     cluster: &crate::InProcessCluster,
     topic: &str,

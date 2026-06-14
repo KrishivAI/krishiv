@@ -58,38 +58,6 @@ impl PyProcessContext {
     }
 }
 
-// Helper: call Python function and collect the context outputs.
-// Returns (emitted_batches, event_timers, processing_timers).
-fn call_python_with_ctx<F>(
-    callable: &Py<PyAny>,
-    args_fn: F,
-) -> ExecResult<(Vec<RecordBatch>, Vec<(String, i64)>, Vec<(String, i64)>)>
-where
-    F: for<'py> FnOnce(Python<'py>, Py<PyProcessContext>) -> PyResult<()>,
-{
-    Python::attach(|py| {
-        let bridge_ctx = Py::new(
-            py,
-            PyProcessContext {
-                emitted: Vec::new(),
-                event_timers: Vec::new(),
-                processing_timers: Vec::new(),
-            },
-        )
-        .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
-
-        args_fn(py, bridge_ctx.clone_ref(py))
-            .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
-
-        let inner = bridge_ctx.borrow(py);
-        Ok((
-            inner.emitted.clone(),
-            inner.event_timers.clone(),
-            inner.processing_timers.clone(),
-        ))
-    })
-}
-
 // ── Bridge: Python object → Rust ProcessFunction ─────────────────────────────
 
 struct PyProcessFunctionBridge {

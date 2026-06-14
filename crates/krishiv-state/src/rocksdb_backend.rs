@@ -25,18 +25,6 @@ impl RocksDbStateBackend {
         Ok(Self { db, _tempdir: None })
     }
 
-    /// Create an ephemeral database backed by a temp directory.
-    pub fn in_memory() -> StateResult<Self> {
-        let dir = tempfile::tempdir().map_err(db_err)?;
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        let db = DB::open(&opts, dir.path()).map_err(db_err)?;
-        Ok(Self {
-            db,
-            _tempdir: Some(dir),
-        })
-    }
-
     pub fn ephemeral() -> StateResult<Self> {
         if krishiv_common::requires_file_backed_state(krishiv_common::resolve_durability_profile())
         {
@@ -45,7 +33,14 @@ impl RocksDbStateBackend {
                 source: None,
             });
         }
-        Self::in_memory()
+        let dir = tempfile::tempdir().map_err(db_err)?;
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, dir.path()).map_err(db_err)?;
+        Ok(Self {
+            db,
+            _tempdir: Some(dir),
+        })
     }
 
     /// Open state storage appropriate for the durability profile.
@@ -64,14 +59,8 @@ impl RocksDbStateBackend {
         }
     }
 
-    /// Ergonomic alias for `ephemeral()` — suitable for unit tests and embedded use.
     pub fn new() -> StateResult<Self> {
         Self::ephemeral()
-    }
-
-    /// Full key range owned by this backend (single-node always owns all key groups).
-    pub fn key_group_range(&self) -> std::ops::RangeInclusive<u16> {
-        0..=(crate::key_group::NUM_KEY_GROUPS - 1)
     }
 
     /// Total number of keys stored across all namespaces.

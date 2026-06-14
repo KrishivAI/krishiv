@@ -709,7 +709,7 @@ mod tests {
         use crate::rocksdb_backend::RocksDbStateBackend;
 
         let ns = Namespace::new("op", "window");
-        let mut source = RocksDbStateBackend::in_memory().unwrap();
+        let mut source = RocksDbStateBackend::new().unwrap();
         for i in 0..40 {
             source
                 .put(
@@ -727,7 +727,7 @@ mod tests {
             if part.is_empty() {
                 continue;
             }
-            let mut target = RocksDbStateBackend::in_memory().unwrap();
+            let mut target = RocksDbStateBackend::new().unwrap();
             target.load_snapshot(part).unwrap();
             for key in target.list_keys(&ns).unwrap() {
                 let value = target.get(&ns, &key).unwrap().unwrap();

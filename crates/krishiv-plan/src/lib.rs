@@ -12,12 +12,8 @@ pub mod cep;
 pub mod expression;
 pub mod governance;
 mod graph;
-pub mod lowering;
+mod lowering;
 pub mod optimizer;
-pub mod r17;
-pub mod statistics;
-pub mod streaming;
-pub mod streaming_plan;
 pub mod task_fragment;
 pub mod udf;
 pub mod window;
@@ -27,7 +23,6 @@ pub use expression::{
     ScalarValue, SortDirection, TimeUnit,
 };
 pub use graph::lower_to_physical;
-pub use r17::VectorSinkPlanConfig;
 pub use task_fragment::{
     TASK_FRAGMENT_VERSION, TypedTaskFragment, encode_typed_task_fragment,
     execution_kind_from_fragment, task_body_for_profile, validate_job_fragments,

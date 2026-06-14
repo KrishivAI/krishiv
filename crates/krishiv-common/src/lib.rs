@@ -21,16 +21,14 @@ pub mod test_fixtures;
 pub mod validate;
 pub mod write_commit;
 
-pub use backpressure::{BackpressureSignal, CreditGate};
+pub use backpressure::BackpressureSignal;
 pub use durability::{
-    CheckpointDurability, DurabilityProfile, DurabilityProfileParseError, DurabilityProfileSpec,
-    MetadataDurability, ShuffleDurability, StateDurability,
+    CheckpointDurability, DurabilityProfile, ShuffleDurability, StateDurability,
 };
 pub use memory_budget::MemoryBudget;
 pub use panic_util::panic_payload_to_string;
 pub use production::{
-    ALLOW_ANONYMOUS_HTTP_ENV, ALLOW_LEGACY_FRAGMENTS_ENV, DURABILITY_PROFILE_ENV,
-    NativeScalarUdfPolicy, PRODUCTION_ENV, allow_anonymous_http_override,
+    ALLOW_ANONYMOUS_HTTP_ENV, NativeScalarUdfPolicy, PRODUCTION_ENV, allow_anonymous_http_override,
     allow_legacy_task_fragments, allows_alpha_api, allows_memory_checkpoint_uri,
     allows_remote_sql_comment_fallback, allows_unbounded_shuffle_store,
     forbids_simulation_connectors, is_production_mode, profile_forbids_native_scalar_udfs,

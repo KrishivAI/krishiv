@@ -3,10 +3,7 @@
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_plan::{
-    PlanError,
-    window::{WindowExecutionSpec, WindowKind, encode_stream_fragment},
-};
+use krishiv_plan::window::{WindowExecutionSpec, WindowKind};
 
 use krishiv_scheduler::MetadataStore;
 
@@ -288,7 +285,9 @@ impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
         }
     }
 }
-pub fn fragment_from_local_spec(spec: &LocalWindowExecutionSpec) -> Result<String, PlanError> {
+#[cfg(test)]
+pub fn fragment_from_local_spec(spec: &LocalWindowExecutionSpec) -> Result<String, krishiv_plan::PlanError> {
+    use krishiv_plan::window::encode_stream_fragment;
     encode_stream_fragment(&local_spec_to_plan_spec(spec))
 }
 

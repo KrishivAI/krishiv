@@ -49,15 +49,6 @@ impl BackpressureSignal {
         }
     }
 
-    /// `true` if the producer should pause entirely.
-    pub fn is_paused(&self) -> bool {
-        matches!(self, Self::Pause)
-    }
-
-    /// `true` when no backpressure is signalled.
-    pub fn is_clear(&self) -> bool {
-        matches!(self, Self::None)
-    }
 }
 
 /// Shared credit gate between a producer and consumer operator.

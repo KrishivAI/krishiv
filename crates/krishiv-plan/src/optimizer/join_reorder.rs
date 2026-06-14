@@ -10,10 +10,7 @@
 //! are commutative and can be safely reordered.
 //!
 //! **Important**: the rule operates on `estimated_rows` annotations that must
-//! already be present on the plan nodes.  Use [`CardinalityEstimator::annotate_plan`]
-//! to populate those estimates before running this rule.
-//!
-//! [`CardinalityEstimator::annotate_plan`]: crate::statistics::CardinalityEstimator::annotate_plan
+//! already be present on the plan nodes.
 
 use std::collections::HashMap;
 

@@ -202,14 +202,15 @@ pub struct ReportConnectorMetrics {
     pub sink_commit_epoch: Option<u64>,
 }
 
-// ── Constructors / defaults ─────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl ObservabilityReport {
-    pub fn new(coordinator_id: impl Into<String>) -> Self {
-        let generated_at = chrono::Utc::now().to_rfc3339();
-        Self {
-            generated_at,
-            coordinator_id: coordinator_id.into(),
+    #[test]
+    fn empty_report_serializes_to_valid_json() {
+        let report = ObservabilityReport {
+            generated_at: String::new(),
+            coordinator_id: "coord-1".into(),
             job: ReportJob {
                 job_id: String::new(),
                 job_name: String::new(),
@@ -227,23 +228,8 @@ impl ObservabilityReport {
             streaming_state: None,
             recent_events: Vec::new(),
             connector_metrics: None,
-        }
-    }
-
-    /// Serialize to pretty-printed JSON.
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_report_serializes_to_valid_json() {
-        let report = ObservabilityReport::new("coord-1");
-        let json = report.to_json().expect("should serialize");
+        };
+        let json = serde_json::to_string_pretty(&report).expect("should serialize");
         assert!(json.contains("coordinator_id"));
         assert!(json.contains("coord-1"));
         assert!(json.contains("generated_at"));
@@ -251,7 +237,27 @@ mod tests {
 
     #[test]
     fn report_with_stages_and_executors_serializes() {
-        let mut report = ObservabilityReport::new("coord-1");
+        let mut report = ObservabilityReport {
+            generated_at: String::new(),
+            coordinator_id: "coord-1".into(),
+            job: ReportJob {
+                job_id: String::new(),
+                job_name: String::new(),
+                job_kind: String::new(),
+                state: String::new(),
+                submitted_at_ms: 0,
+                priority: 128,
+                namespace_id: None,
+                elapsed_ms: 0,
+            },
+            stages: Vec::new(),
+            executors: Vec::new(),
+            checkpoint: None,
+            shuffle_partitions: None,
+            streaming_state: None,
+            recent_events: Vec::new(),
+            connector_metrics: None,
+        };
         report.stages.push(ReportStage {
             stage_id: "stage-0".into(),
             stage_name: "sql-stage".into(),
@@ -294,7 +300,7 @@ mod tests {
             memory_limit_bytes: Some(4_294_967_296),
         });
 
-        let json = report.to_json().expect("should serialize");
+        let json = serde_json::to_string_pretty(&report).expect("should serialize");
         assert!(json.contains("stage-0"));
         assert!(json.contains("exec-1"));
         assert!(json.contains("health"));
@@ -302,7 +308,27 @@ mod tests {
 
     #[test]
     fn report_with_checkpoint_serializes() {
-        let mut report = ObservabilityReport::new("coord-1");
+        let mut report = ObservabilityReport {
+            generated_at: String::new(),
+            coordinator_id: "coord-1".into(),
+            job: ReportJob {
+                job_id: String::new(),
+                job_name: String::new(),
+                job_kind: String::new(),
+                state: String::new(),
+                submitted_at_ms: 0,
+                priority: 128,
+                namespace_id: None,
+                elapsed_ms: 0,
+            },
+            stages: Vec::new(),
+            executors: Vec::new(),
+            checkpoint: None,
+            shuffle_partitions: None,
+            streaming_state: None,
+            recent_events: Vec::new(),
+            connector_metrics: None,
+        };
         report.checkpoint = Some(ReportCheckpoint {
             latest_epoch: 42,
             fencing_token: 7,
@@ -330,7 +356,7 @@ mod tests {
             },
         });
 
-        let json = report.to_json().expect("should serialize");
+        let json = serde_json::to_string_pretty(&report).expect("should serialize");
         assert!(json.contains("fencing_token"));
         assert!(json.contains("kafka-0"));
         assert!(json.contains("15000"));
@@ -339,7 +365,27 @@ mod tests {
 
     #[test]
     fn report_with_streaming_state_serializes() {
-        let mut report = ObservabilityReport::new("coord-1");
+        let mut report = ObservabilityReport {
+            generated_at: String::new(),
+            coordinator_id: "coord-1".into(),
+            job: ReportJob {
+                job_id: String::new(),
+                job_name: String::new(),
+                job_kind: String::new(),
+                state: String::new(),
+                submitted_at_ms: 0,
+                priority: 128,
+                namespace_id: None,
+                elapsed_ms: 0,
+            },
+            stages: Vec::new(),
+            executors: Vec::new(),
+            checkpoint: None,
+            shuffle_partitions: None,
+            streaming_state: None,
+            recent_events: Vec::new(),
+            connector_metrics: None,
+        };
         report.streaming_state = Some(ReportStreamingState {
             low_watermark_ms: 1_620_000_000_000,
             source_watermarks: {
@@ -357,14 +403,34 @@ mod tests {
             state_bytes: 50_000_000,
         });
 
-        let json = report.to_json().expect("should serialize");
+        let json = serde_json::to_string_pretty(&report).expect("should serialize");
         assert!(json.contains("low_watermark_ms"));
         assert!(json.contains("5000000"));
     }
 
     #[test]
     fn report_with_recent_events_serializes() {
-        let mut report = ObservabilityReport::new("coord-1");
+        let mut report = ObservabilityReport {
+            generated_at: String::new(),
+            coordinator_id: "coord-1".into(),
+            job: ReportJob {
+                job_id: String::new(),
+                job_name: String::new(),
+                job_kind: String::new(),
+                state: String::new(),
+                submitted_at_ms: 0,
+                priority: 128,
+                namespace_id: None,
+                elapsed_ms: 0,
+            },
+            stages: Vec::new(),
+            executors: Vec::new(),
+            checkpoint: None,
+            shuffle_partitions: None,
+            streaming_state: None,
+            recent_events: Vec::new(),
+            connector_metrics: None,
+        };
         report.recent_events.push(ReportEvent {
             timestamp_ms: 1_700_000_000_000,
             event_kind: "TaskFailed".into(),
@@ -374,7 +440,7 @@ mod tests {
             task_id: Some("task-3".into()),
         });
 
-        let json = report.to_json().expect("should serialize");
+        let json = serde_json::to_string_pretty(&report).expect("should serialize");
         assert!(json.contains("TaskFailed"));
         assert!(json.contains("job-a"));
     }

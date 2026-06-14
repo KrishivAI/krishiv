@@ -3,7 +3,7 @@
 //! Consolidates validation logic from:
 //! - `krishiv-shuffle::validate_safe_id` (blocklist approach)
 //! - `krishiv-runtime::flight_protocol::{is_safe_identifier, is_safe_path, is_safe_base64}` (allowlist approach)
-//! - `krishiv-ai::vector_sinks::validate_identifier` (strict SQL identifier)
+//! - `krishiv-connectors::vector::validate_identifier` (strict SQL identifier)
 //!
 //! All crates that validate untrusted identifiers should import from here.
 
@@ -99,7 +99,7 @@ pub fn is_safe_base64(s: &str) -> bool {
 /// with a letter or underscore, and only allows alphanumeric + underscore.
 ///
 /// This is the canonical replacement for
-/// `krishiv_ai::vector_sinks::validate_identifier`.
+/// `krishiv_connectors::vector::validate_identifier`.
 ///
 /// ```
 /// use krishiv_common::validate::validate_sql_identifier;

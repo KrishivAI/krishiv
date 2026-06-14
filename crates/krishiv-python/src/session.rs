@@ -31,6 +31,32 @@ fn build_embedded_session() -> PyResult<PySession> {
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+fn build_session_with_opts(
+    mut builder: krishiv_api::SessionBuilder,
+    target_parallelism: Option<usize>,
+    shuffle_partitions: Option<u32>,
+    state_ttl_ms: Option<u64>,
+) -> PyResult<PySession> {
+    if let Some(n) = target_parallelism {
+        let nz = std::num::NonZeroUsize::new(n)
+            .ok_or_else(|| PyRuntimeError::new_err("target_parallelism must be > 0"))?;
+        builder = builder.with_target_parallelism(nz);
+    }
+    if let Some(n) = shuffle_partitions {
+        builder = builder.with_shuffle_partitions(n);
+    }
+    if let Some(ttl) = state_ttl_ms {
+        builder = builder.with_state_ttl(krishiv_api::StateTtlConfig::new(ttl));
+    }
+    builder
+        .build()
+        .map(|s| PySession {
+            inner: Arc::new(s),
+            state_migrations: SharedStateMigrationRegistry::new(),
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 // Uses crate::RUNTIME as the Tokio fallback rather than krishiv_common's FALLBACK_RUNTIME
 // because the python crate owns its own runtime handle for PyO3 thread safety.
 //
@@ -128,34 +154,62 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
+    /// Create an in-process embedded session.
+    ///
+    /// ``target_parallelism`` — number of parallel partitions for batch queries
+    ///   (default: 1 for embedded mode).
+    /// ``shuffle_partitions`` — bucket count for hash/round-robin exchanges
+    ///   (default: derived from target_parallelism).
     #[classmethod]
-    pub fn embedded(_cls: &Bound<'_, PyType>) -> PyResult<Self> {
-        build_embedded_session()
+    #[pyo3(signature = (*, target_parallelism = None, shuffle_partitions = None, state_ttl_ms = None))]
+    pub fn embedded(
+        _cls: &Bound<'_, PyType>,
+        target_parallelism: Option<usize>,
+        shuffle_partitions: Option<u32>,
+        state_ttl_ms: Option<u64>,
+    ) -> PyResult<Self> {
+        build_session_with_opts(
+            krishiv_api::SessionBuilder::new(),
+            target_parallelism,
+            shuffle_partitions,
+            state_ttl_ms,
+        )
     }
 
+    /// Alias for :py:meth:`embedded` — runs locally without a daemon.
     #[classmethod]
-    pub fn local(_cls: &Bound<'_, PyType>) -> PyResult<Self> {
-        // `local()` means "run locally without a daemon" — that is Embedded mode.
-        // SingleNode mode now requires a coordinator Flight URL (daemon connection).
-        // Users who want to connect to a local daemon should use Session.connect(url).
-        build_embedded_session()
+    #[pyo3(signature = (*, target_parallelism = None, shuffle_partitions = None, state_ttl_ms = None))]
+    pub fn local(
+        _cls: &Bound<'_, PyType>,
+        target_parallelism: Option<usize>,
+        shuffle_partitions: Option<u32>,
+        state_ttl_ms: Option<u64>,
+    ) -> PyResult<Self> {
+        build_session_with_opts(
+            krishiv_api::SessionBuilder::new(),
+            target_parallelism,
+            shuffle_partitions,
+            state_ttl_ms,
+        )
     }
 
-    #[classmethod]
-    #[pyo3(signature = (url, *, grpc_url = None))]
     /// Create a session connected to a remote coordinator.
     ///
     /// All SQL queries are routed to the remote coordinator. Use
-    /// `Session.embedded()` or `Session.local()` for local execution.
+    /// :py:meth:`embedded` or :py:meth:`local` for local execution.
     ///
-    /// ``grpc_url`` is an optional separate gRPC control-plane address
-    /// (e.g. ``"http://host:9090"``) used for job status and operator
-    /// introspection.  When omitted, the Flight SQL ``url`` serves both
-    /// data-plane and control-plane traffic.
+    /// ``grpc_url`` — optional separate gRPC control-plane address.
+    /// ``target_parallelism`` / ``shuffle_partitions`` — performance tuning.
+    /// ``state_ttl_ms`` — state eviction TTL in milliseconds (0 = no eviction).
+    #[classmethod]
+    #[pyo3(signature = (url, *, grpc_url = None, target_parallelism = None, shuffle_partitions = None, state_ttl_ms = None))]
     pub fn connect(
         _cls: &Bound<'_, PyType>,
         url: String,
         grpc_url: Option<String>,
+        target_parallelism: Option<usize>,
+        shuffle_partitions: Option<u32>,
+        state_ttl_ms: Option<u64>,
     ) -> PyResult<Self> {
         let mut builder = krishiv_api::SessionBuilder::new()
             .with_coordinator(url)
@@ -163,13 +217,7 @@ impl PySession {
         if let Some(g) = grpc_url {
             builder = builder.with_coordinator_grpc(g);
         }
-        builder
-            .build()
-            .map(|s| Self {
-                inner: Arc::new(s),
-                state_migrations: SharedStateMigrationRegistry::new(),
-            })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        build_session_with_opts(builder, target_parallelism, shuffle_partitions, state_ttl_ms)
     }
 
     /// Build a session from environment variables.
@@ -555,6 +603,50 @@ impl PySession {
         self.inner.scalar_udf_names()
     }
 
+    /// Register a Python aggregate UDF (UDAF).
+    ///
+    /// The three callables must have the signatures:
+    /// - `accumulate(state: bytes, batch: dict[str, list]) -> bytes`
+    /// - `finalize(state: bytes) -> int | float | str | bool | bytes | None`
+    /// - `merge(state_a: bytes, state_b: bytes) -> bytes`
+    #[pyo3(signature = (name, accumulate_fn, finalize_fn, merge_fn, *, input_types, output_type, output_name=None))]
+    pub fn register_aggregate_udf(
+        &self,
+        py: Python<'_>,
+        name: String,
+        accumulate_fn: Py<PyAny>,
+        finalize_fn: Py<PyAny>,
+        merge_fn: Py<PyAny>,
+        input_types: Bound<'_, PyDict>,
+        output_type: String,
+        output_name: Option<String>,
+    ) -> PyResult<()> {
+        let udf = crate::udf::build_python_aggregate_udf(
+            py, name, accumulate_fn, finalize_fn, merge_fn, &input_types, &output_type, output_name,
+        )?;
+        self.inner
+            .register_aggregate_udf(udf)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Register a Python table UDF (UDTF).
+    ///
+    /// The callable has signature:
+    /// `fn(args: list[int | float | str | bool | bytes | None]) -> pyarrow.RecordBatch`
+    #[pyo3(signature = (name, callable, *, output_types))]
+    pub fn register_table_udf(
+        &self,
+        py: Python<'_>,
+        name: String,
+        callable: Py<PyAny>,
+        output_types: Bound<'_, PyDict>,
+    ) -> PyResult<()> {
+        let udf = crate::udf::build_python_table_udf(py, name, callable, &output_types)?;
+        self.inner
+            .register_table_udf(udf)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     pub fn live_table(&self, name: String, query: String) -> PyResult<PyLiveTable> {
         crate::live_table::create_live_table(name, query)
     }
@@ -695,6 +787,91 @@ impl PySession {
                 })
                 .map_err(map_krishiv_error)
         })
+    }
+
+    /// Return all registered table and view names.
+    pub fn list_tables(&self) -> PyResult<Vec<String>> {
+        self.inner.list_tables().map_err(map_krishiv_error)
+    }
+
+    /// Return ``True`` if a table or view named ``name`` is registered.
+    pub fn table_exists(&self, name: String) -> PyResult<bool> {
+        self.inner.table_exists(&name).map_err(map_krishiv_error)
+    }
+
+    /// Create (or replace) a named SQL view backed by ``query``.
+    ///
+    /// The view is queryable as ``SELECT * FROM <name>`` in subsequent SQL calls.
+    pub fn create_view(&self, name: String, query: String) -> PyResult<()> {
+        self.inner
+            .create_view(&name, &query)
+            .map_err(map_krishiv_error)
+    }
+
+    /// Drop the table or view named ``name``.
+    pub fn drop_table(&self, name: String) -> PyResult<()> {
+        self.inner.drop_table(&name).map_err(map_krishiv_error)
+    }
+
+    /// Return ``True`` if ``query`` references at least one unbounded (streaming) source.
+    pub fn is_streaming_query(&self, query: String) -> PyResult<bool> {
+        self.inner
+            .is_streaming_query(&query)
+            .map_err(map_krishiv_error)
+    }
+
+    /// Signal that no more batches will be pushed to the unbounded table ``name``.
+    ///
+    /// Returns ``True`` if the table existed and was successfully closed,
+    /// ``False`` if it was already closed or not found.
+    pub fn close_unbounded_input(&self, name: String) -> PyResult<bool> {
+        self.inner
+            .close_unbounded_input(&name)
+            .map_err(map_krishiv_error)
+    }
+
+    /// Register a Kafka topic as a streaming SQL table named ``name``.
+    ///
+    /// ``brokers``   — comma-separated broker addresses (e.g. ``"localhost:9092"``).
+    /// ``topic``     — Kafka topic name.
+    /// ``group_id``  — consumer group id (default ``"krishiv-default"``).
+    /// ``schema``    — optional ``Schema`` subclass; defaults to ``value: Utf8``.
+    ///
+    /// Requires the ``kafka`` feature (``pip install krishiv[kafka]``).
+    #[pyo3(signature = (name, brokers, topic, *, group_id = "krishiv-default", schema = None))]
+    pub fn register_kafka_source(
+        &self,
+        #[allow(unused_variables)] py: Python<'_>,
+        name: String,
+        brokers: String,
+        topic: String,
+        group_id: &str,
+        schema: Option<Py<pyo3::types::PyType>>,
+    ) -> PyResult<()> {
+        #[cfg(not(feature = "kafka"))]
+        {
+            let _ = (name, brokers, topic, group_id, schema);
+            return Err(crate::errors::ConnectorError::new_err(
+                "Kafka support requires the `kafka` feature (pip install krishiv[kafka])",
+            ));
+        }
+        #[cfg(feature = "kafka")]
+        {
+            use arrow::datatypes::{DataType, Field, Schema};
+            use std::sync::Arc;
+            let arrow_schema: arrow::datatypes::SchemaRef = if let Some(cls) = schema {
+                crate::schema::PySchema::arrow_schema_from_class(cls.bind(py))?
+            } else {
+                Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]))
+            };
+            let inner = self.inner.clone();
+            let group_id = group_id.to_string();
+            py.detach(move || {
+                inner
+                    .register_kafka_source(&name, arrow_schema, &brokers, &topic, &group_id)
+                    .map_err(map_krishiv_error)
+            })
+        }
     }
 }
 

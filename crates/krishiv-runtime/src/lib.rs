@@ -37,10 +37,10 @@ pub use flight_action::{
     BatchSqlSinkBody, BoundedWindowBody, ContinuousDrainBody, ContinuousPushBody,
     ContinuousRegisterBody, ExplainBody, KrishivFlightAction, RegisterKafkaSourceBody,
     RegisterParquetBody, action_type, decode_batches, decode_schema_ipc_b64, encode_batches,
-    encode_schema_ipc_b64, strip_action_type, tags as action_tags,
+    encode_schema_ipc_b64, strip_action_type,
 };
-pub use in_process::{BatchSqlTable, InProcessStreamingRuntime, execute_windowed_in_process};
-pub use in_process_cluster::{InProcessCluster, fragment_from_local_spec, plan_spec_to_local};
+pub use in_process::{BatchSqlTable, InProcessStreamingRuntime};
+pub use in_process_cluster::{InProcessCluster, plan_spec_to_local};
 pub use local_streaming::{
     LocalWindowExecutionSpec, LocalWindowKind, execute_streaming_window, execute_windowed_stream,
 };

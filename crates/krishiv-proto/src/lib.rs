@@ -30,8 +30,7 @@ pub mod wire;
 mod tests;
 
 pub use checkpoint::{
-    AbortCheckpointRequest, CheckpointAckRequest, CheckpointAckResponse,
-    CheckpointInitiateResponse, CheckpointSourceOffset, InitiateCheckpointRequest,
+    CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset, InitiateCheckpointRequest,
 };
 pub use executor::{
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat,

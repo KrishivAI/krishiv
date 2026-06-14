@@ -13,19 +13,17 @@ path = "src/lib.rs"
 [dependencies]
 krishiv-api = { path = "../krishiv-api" }
 krishiv-common = { path = "../krishiv-common" }
-krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse", "schema-registry", "iceberg", "hudi"] }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse", "schema-registry", "iceberg", "hudi", "vector-sinks"] }
 krishiv-dataflow = { path = "../krishiv-dataflow" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-state = { path = "../krishiv-state" }
 krishiv-ai = { path = "../krishiv-ai", optional = true }
+krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-plan = { path = "../krishiv-plan" }
-krishiv-runtime = { path = "../krishiv-runtime" }
-dashmap = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 pyo3 = { workspace = true }
 pyo3-arrow = "0.17"
-sha2 = { workspace = true }
 tokio = { workspace = true }
 futures.workspace = true
 

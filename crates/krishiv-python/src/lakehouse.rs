@@ -420,12 +420,12 @@ impl PyMemoryLakehouseTable {
 }
 
 fn py_to_lakehouse_value(py: Python<'_>, value: Py<PyAny>) -> PyResult<LakehouseValue> {
-    use pyo3::types::{PyBool, PyFloat, PyInt, PyNone, PyString};
+    use pyo3::types::PyBool;
     let bound = value.bind(py);
     if bound.is_none() {
         return Ok(LakehouseValue::Null);
     }
-    if let Ok(b) = bound.downcast::<PyBool>() {
+    if let Ok(b) = bound.cast::<PyBool>() {
         return Ok(LakehouseValue::Boolean(b.is_true()));
     }
     if let Ok(i) = bound.extract::<i64>() {

@@ -33,21 +33,6 @@ pub struct CheckpointAckRequest {
     pub snapshot_path: Option<String>,
 }
 
-/// Coordinator → Executor: abort the in-progress checkpoint epoch E.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AbortCheckpointRequest {
-    pub job_id: JobId,
-    pub epoch: u64,
-}
-
-/// Response to `InitiateCheckpointRequest`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CheckpointInitiateResponse {
-    Accepted,
-    StaleEpoch { current_epoch: u64 },
-    JobNotFound,
-}
-
 /// Response to `CheckpointAckRequest`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointAckResponse {

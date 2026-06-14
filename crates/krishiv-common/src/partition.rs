@@ -24,16 +24,6 @@ const PARTITION_KEY_HASH_DOMAIN: &[u8] = b"krishiv.partition-key.v1\0";
 /// this via durability profile or explicit config.
 pub const TARGET_BYTES_PER_PARTITION: u64 = 128 * 1024 * 1024;
 
-/// Return the target bytes per partition for a given data volume estimate.
-///
-/// When `profile` is `Some`, the profile may supply an override. When `None`,
-/// the default [`TARGET_BYTES_PER_PARTITION`] (128 MiB) is returned.
-#[must_use]
-pub fn target_bytes_per_partition(_profile: Option<&str>) -> u64 {
-    // Future: look up profile override from durability profile config.
-    TARGET_BYTES_PER_PARTITION
-}
-
 /// A shard index produced by the SHA-256 keyed-semantics partitioner.
 ///
 /// Intentionally not `From<usize>` or `Into<usize>`: callers must name `.0`

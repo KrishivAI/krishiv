@@ -507,6 +507,124 @@ impl PyDataFrame {
         crate::streaming::PyDataStreamWriter::new(self.inner.clone())
     }
 
+    /// Return the schema as a list of `(column_name, arrow_type)` pairs.
+    ///
+    /// Example::
+    ///
+    ///     df.schema()  # => [("id", "Int64"), ("name", "Utf8")]
+    pub fn schema(&self) -> PyResult<Vec<(String, String)>> {
+        self.inner
+            .schema()
+            .map(|s| {
+                s.fields()
+                    .iter()
+                    .map(|f| (f.name().clone(), f.data_type().to_string()))
+                    .collect()
+            })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Return column names.
+    pub fn columns(&self) -> PyResult<Vec<String>> {
+        self.inner
+            .schema()
+            .map(|s| s.fields().iter().map(|f| f.name().clone()).collect())
+            .map_err(map_krishiv_error)
+    }
+
+    /// Compute summary statistics (count, mean, stddev, min, max per column).
+    pub fn describe(&self, py: Python<'_>) -> PyResult<Self> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .describe()
+                .map(|inner| Self { inner })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Join this DataFrame with `right`.
+    ///
+    /// `on` — list of column names to join on (same name on both sides).
+    /// `how` — join type: ``"inner"`` (default), ``"left"``, ``"right"``,
+    ///   ``"full"``, ``"left_semi"``, ``"right_semi"``, ``"left_anti"``,
+    ///   ``"right_anti"``.
+    #[pyo3(signature = (right, on, *, how = "inner"))]
+    pub fn join(&self, right: &PyDataFrame, on: Vec<String>, how: &str) -> PyResult<Self> {
+        let left_on: Vec<&str> = on.iter().map(String::as_str).collect();
+        let right_on: Vec<&str> = on.iter().map(String::as_str).collect();
+        self.inner
+            .join(&right.inner, how, &left_on, &right_on)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Join using separate left and right key column lists.
+    ///
+    /// Supports the same ``how`` values as :meth:`join`.
+    #[pyo3(signature = (right, left_on, right_on, *, how = "inner"))]
+    pub fn join_on(
+        &self,
+        right: &PyDataFrame,
+        left_on: Vec<String>,
+        right_on: Vec<String>,
+        how: &str,
+    ) -> PyResult<Self> {
+        let left_refs: Vec<&str> = left_on.iter().map(String::as_str).collect();
+        let right_refs: Vec<&str> = right_on.iter().map(String::as_str).collect();
+        self.inner
+            .join(&right.inner, how, &left_refs, &right_refs)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Repartition the DataFrame into `num_partitions` partitions.
+    ///
+    /// `key_columns` — optional list of columns to hash-partition by.
+    /// When empty, round-robin partitioning is used.
+    #[pyo3(signature = (num_partitions, key_columns = Vec::new()))]
+    pub fn repartition(&self, num_partitions: u32, key_columns: Vec<String>) -> Self {
+        let refs: Vec<&str> = key_columns.iter().map(String::as_str).collect();
+        Self {
+            inner: self.inner.clone().repartition(num_partitions, &refs),
+        }
+    }
+
+    /// Collect and return both the result and execution stats.
+    ///
+    /// Returns ``(QueryResult, {"output_rows": int, "cpu_nanos": int})``.
+    pub fn collect_with_stats(&self, py: Python<'_>) -> PyResult<(PyQueryResult, Py<pyo3::types::PyDict>)> {
+        let inner = self.inner.clone();
+        let (result, stats) = py
+            .detach(move || {
+                inner
+                    .collect_with_stats()
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            })?;
+        let stats_dict = pyo3::types::PyDict::new(py);
+        stats_dict.set_item("output_rows", stats.output_rows)?;
+        stats_dict.set_item("cpu_nanos", stats.cpu_nanos)?;
+        Ok((PyQueryResult::new(result), stats_dict.unbind()))
+    }
+
+    /// Sort ascending by `columns` (alias for ``sort`` with all-ascending order).
+    pub fn order_by(&self, columns: Vec<String>) -> PyResult<Self> {
+        let descending = vec![false; columns.len()];
+        let refs = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner
+            .sort(&refs, &descending)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Assign an alias to this DataFrame (for use in SQL references).
+    pub fn alias(&self, name: String) -> PyResult<Self> {
+        self.inner
+            .alias(&name)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
     pub fn __repr__(&self) -> String {
         format!("DataFrame(plan={})", self.inner.explain_logical())
     }

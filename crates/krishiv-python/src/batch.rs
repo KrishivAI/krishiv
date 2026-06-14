@@ -21,12 +21,6 @@ impl PyBatch {
         }
     }
 
-    pub fn empty() -> Self {
-        Self::from_record_batch(RecordBatch::new_empty(Arc::new(
-            arrow::datatypes::Schema::empty(),
-        )))
-    }
-
     pub fn record_batch(&self) -> &RecordBatch {
         &self.batch
     }

@@ -93,5 +93,4 @@ pub const MAX_SHUFFLE_TICKET_LEN: usize = 65_536;
 /// Convenience alias for `Result<T, ShuffleError>`.
 pub type ShuffleResult<T> = Result<T, ShuffleError>;
 
-/// Convenience result alias for `ShuffleStore` operations.
-pub type StoreResult<T> = ShuffleResult<T>;
+
