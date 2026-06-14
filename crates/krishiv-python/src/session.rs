@@ -451,6 +451,50 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
+    // ── SQL gateway methods ───────────────────────────────────────────────────
+
+    /// Execute a SQL query with a wall-clock timeout.
+    ///
+    /// Raises ``RuntimeError`` if the query does not complete within
+    /// ``timeout_ms`` milliseconds.
+    ///
+    /// ## Example
+    ///
+    /// ```python
+    /// df = session.sql_with_timeout("SELECT sleep(10)", timeout_ms=100)
+    /// ```
+    pub fn sql_with_timeout(
+        &self,
+        py: Python<'_>,
+        query: String,
+        timeout_ms: u64,
+    ) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            block_on_async(inner.sql_with_timeout_async(&query, timeout_ms))
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Execute SQL async with a timeout.
+    pub async fn sql_with_timeout_async(
+        &self,
+        query: String,
+        timeout_ms: u64,
+    ) -> PyResult<PyDataFrame> {
+        self.inner
+            .sql_with_timeout_async(&query, timeout_ms)
+            .await
+            .map(|df| PyDataFrame { inner: df })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Create an :class:`OperationRegistry` tied to this session for operation-level cancellation.
+    pub fn operation_registry(&self) -> PyOperationRegistry {
+        PyOperationRegistry::new()
+    }
+
     pub fn jobs(&self) -> Vec<PyJobStatus> {
         self.inner
             .jobs()
@@ -651,6 +695,61 @@ impl PySession {
                 })
                 .map_err(map_krishiv_error)
         })
+    }
+}
+
+// ── PyOperationRegistry ───────────────────────────────────────────────────────
+
+/// Thread-safe registry of cancelled operation IDs.
+///
+/// Pass to :py:meth:`Session.operation_registry` and call :py:meth:`cancel`
+/// to abort in-flight queries identified by a numeric operation ID.
+///
+/// ## Example
+///
+/// ```python
+/// registry = session.operation_registry()
+/// registry.cancel(42)
+/// assert registry.is_cancelled(42)
+/// registry.remove(42)  # clean up once the operation has finished
+/// ```
+#[pyclass(name = "OperationRegistry")]
+pub struct PyOperationRegistry {
+    inner: krishiv_sql::OperationRegistry,
+}
+
+impl PyOperationRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: krishiv_sql::OperationRegistry::new(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyOperationRegistry {
+    /// Mark ``operation_id`` as cancelled.
+    fn cancel(&self, operation_id: u64) {
+        self.inner.cancel(operation_id);
+    }
+
+    /// Return ``True`` if ``operation_id`` has been cancelled.
+    fn is_cancelled(&self, operation_id: u64) -> bool {
+        self.inner.is_cancelled(operation_id)
+    }
+
+    /// Remove ``operation_id`` from the registry (after the operation finishes).
+    fn remove(&self, operation_id: u64) {
+        self.inner.remove(operation_id);
+    }
+
+    /// Return all currently cancelled operation IDs.
+    fn cancelled_ids(&self) -> Vec<u64> {
+        self.inner.cancelled_ids()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("OperationRegistry(cancelled={:?})", self.inner.cancelled_ids())
     }
 }
 

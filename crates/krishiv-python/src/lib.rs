@@ -17,6 +17,7 @@ mod memo;
 mod migration;
 mod pipeline;
 mod prepared;
+mod process_api;
 mod query_handle;
 mod query_result;
 mod relation;
@@ -26,6 +27,7 @@ mod sinks;
 mod sources;
 mod stream;
 mod stream_exec;
+mod streaming;
 mod udf;
 mod windows;
 
@@ -56,13 +58,15 @@ pub use expression::PyColumn;
 pub use job_status::PyJobStatus;
 pub use live_table::{PyChangeFeedIter, PyLiveTable};
 pub use prepared::PyPreparedStatement;
+pub use process_api::{PyListState, PyMapState, PyProcessContext, PyValueState};
 pub use query_handle::PyQueryHandle;
 pub use query_result::PyQueryResult;
 pub use relation::PyRelation;
 pub use schema::PySchema;
-pub use session::PySession;
+pub use session::{PyOperationRegistry, PySession};
 pub use sinks::{PyIcebergSink, PyKafkaSink, PyParquetSink};
 pub use stream::{PyKeyedStream, PyStream, PyWindowedStream};
+pub use streaming::{PyDataStreamWriter, PyStreamingQuery, PyStreamingQueryProgress};
 pub use udf::call_python_udf;
 pub use windows::PyWindowSpec;
 
@@ -143,6 +147,22 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<lakehouse::PyHudiWriteResult>()?;
     m.add_class::<lakehouse::PySchemaRegistryConfig>()?;
     m.add_class::<lakehouse::PyIcebergRestCatalog>()?;
+    m.add_class::<lakehouse::PyMemoryLakehouseTable>()?;
+
+    // Streaming write (Phase F parity)
+    m.add_class::<streaming::PyStreamingQueryProgress>()?;
+    m.add_class::<streaming::PyStreamingQuery>()?;
+    m.add_class::<streaming::PyDataStreamWriter>()?;
+
+    // Process function / stateful operator (Phase G parity)
+    m.add_class::<process_api::PyProcessContext>()?;
+    m.add_class::<process_api::PyValueState>()?;
+    m.add_class::<process_api::PyListState>()?;
+    m.add_class::<process_api::PyMapState>()?;
+    m.add_function(wrap_pyfunction!(process_api::apply_process_function, m)?)?;
+
+    // SQL gateway (Phase H parity)
+    m.add_class::<session::PyOperationRegistry>()?;
 
     sinks::register_sinks_module(m.py(), m)?;
     agg::register_agg_module(m.py(), m)?;

@@ -235,7 +235,7 @@ pub struct DataStreamWriter {
 }
 
 impl DataStreamWriter {
-    pub(crate) fn new(df: crate::DataFrame) -> Self {
+    pub fn new(df: crate::DataFrame) -> Self {
         Self {
             df,
             output_mode: StreamingOutputMode::Append,

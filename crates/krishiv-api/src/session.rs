@@ -1061,6 +1061,29 @@ impl Session {
         Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
+    /// Execute a SQL query with a wall-clock timeout.
+    ///
+    /// Returns `KrishivError::Runtime` if the query does not produce a result
+    /// within `timeout_ms` milliseconds.
+    pub async fn sql_with_timeout_async(
+        &self,
+        query: impl AsRef<str> + Send,
+        timeout_ms: u64,
+    ) -> Result<DataFrame> {
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        tokio::time::timeout(timeout, self.sql_async(query))
+            .await
+            .map_err(|_| KrishivError::Runtime {
+                message: format!("SQL query timed out after {timeout_ms}ms"),
+            })?
+    }
+
+    /// Synchronous variant of [`sql_with_timeout_async`].
+    pub fn sql_with_timeout(&self, query: impl AsRef<str>, timeout_ms: u64) -> Result<DataFrame> {
+        let query = query.as_ref().to_owned();
+        block_on(self.sql_with_timeout_async(query, timeout_ms))
+    }
+
     /// Execute SQL on the local `SqlEngine` only (embedded / single-node path).
     ///
     /// Never routes to a remote Flight endpoint, even in distributed mode.

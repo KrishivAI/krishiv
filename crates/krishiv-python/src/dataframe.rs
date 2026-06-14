@@ -492,6 +492,21 @@ impl PyDataFrame {
         })
     }
 
+    /// Create a :class:`DataStreamWriter` for writing this DataFrame as a streaming sink.
+    ///
+    /// ## Example
+    ///
+    /// ```python
+    /// writer = df.write_stream()
+    /// writer.output_mode("append")
+    /// writer.trigger("processing_time", 1000)
+    /// query = writer.start()
+    /// query.await_termination(timeout_ms=30_000)
+    /// ```
+    pub fn write_stream(&self) -> crate::streaming::PyDataStreamWriter {
+        crate::streaming::PyDataStreamWriter::new(self.inner.clone())
+    }
+
     pub fn __repr__(&self) -> String {
         format!("DataFrame(plan={})", self.inner.explain_logical())
     }
@@ -576,7 +591,15 @@ impl PyGroupedDataFrame {
 
 #[pyclass(name = "DataFrameStream")]
 pub struct PyDataFrameStream {
-    stream: std::sync::Arc<tokio::sync::Mutex<krishiv_api::KrishivStream>>,
+    pub(crate) stream: std::sync::Arc<tokio::sync::Mutex<krishiv_api::KrishivStream>>,
+}
+
+impl PyDataFrameStream {
+    pub(crate) fn from_stream(stream: krishiv_api::KrishivStream) -> Self {
+        Self {
+            stream: std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
+        }
+    }
 }
 
 #[pymethods]

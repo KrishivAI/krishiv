@@ -1,5 +1,43 @@
 # Krishiv Implementation Status
 
+## 2026-06-14 — Python parity complete: Phases D/F/G/H Python bindings
+
+Completed:
+
+- `crates/krishiv-python/src/streaming.rs` — `PyDataStreamWriter` + `PyStreamingQuery` +
+  `PyStreamingQueryProgress`; `write_stream()` added to `PyDataFrame`; fixed PyO3 0.28
+  API (`Py<PyAny>` instead of `PyObject`, `Python::attach` instead of `with_gil`,
+  `clone_ref(py)` instead of `clone()`).
+
+- `crates/krishiv-python/src/process_api.rs` (new file) — `PyProcessContext`,
+  `PyProcessFunctionBridge` (impl `ProcessFunction`), `apply_process_function()` pyfunction,
+  `PyValueState` / `PyListState` / `PyMapState` JSON-backed state descriptors.
+
+- `crates/krishiv-python/src/session.rs` — `sql_with_timeout()` / `sql_with_timeout_async()` on
+  `PySession`; `PyOperationRegistry` class with `cancel` / `is_cancelled` / `remove` /
+  `cancelled_ids`; `operation_registry()` accessor on `PySession`.
+
+- `crates/krishiv-api/src/session.rs` — `sql_with_timeout_async()` and `sql_with_timeout()` added
+  to `Session`.
+
+- `crates/krishiv-api/src/streaming_builder.rs` — `DataStreamWriter::new()` visibility bumped from
+  `pub(crate)` to `pub`.
+
+- `crates/krishiv-python/src/lakehouse.rs` — `PyMemoryLakehouseTable` with `append`, `overwrite`,
+  `delete_where`, `update_where`, `merge`, `evolve_schema` bound to `MemoryLakehouseTable`.
+
+- `api/stable-api.toml` — `python` field updated to `"implemented"` for:
+  `lakehouse.iceberg-atomic-dml`, `streaming.relational-source-sink`,
+  `streaming.process-state-timers`, `sql.gateway-and-dml`.
+
+Validation:
+- `cargo check -p krishiv-python --lib` — 0 errors.
+- `cargo test -p krishiv-python --lib` — all tests pass.
+
+Next: Run `cargo test --workspace` to verify no regressions across other crates.
+
+---
+
 ## 2026-06-14 — Phase I complete: 1.0 release gate
 
 Completed:
