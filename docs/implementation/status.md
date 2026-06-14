@@ -189,9 +189,42 @@ Completed:
 Validation:
 - `cargo check --tests -p krishiv-connectors --features "iceberg"` — 0 errors (previously 27).
 - `cargo check -p krishiv-sql --features "local-catalog,iceberg-datafusion"` — 0 errors.
-- `cargo check -p krishiv-api --features "iceberg-catalog"` — running (background).
+- `cargo check -p krishiv-api --features "iceberg-catalog"` — 0 errors.
 
-Next: Wire `CALL system.expire_snapshots(...)`, `CALL system.compact_data_files(...)`, and SQL `DELETE/UPDATE/MERGE` interception into `krishiv-sql/src/lib.rs`.
+---
+
+## 2026-06-14 — CALL system.<proc> interception and IcebergNativeTwoPhaseCommit test fix
+
+Completed:
+
+- `crates/krishiv-sql/src/lib.rs`: Added `CALL system.<proc>` interception in `SqlEngine::sql()`
+  (gated on `iceberg-datafusion + local-catalog`) that dispatches to:
+  - `CALL system.expire_snapshots('ns.tbl', '7 days', retain_last)` → `expired_snapshots` i64
+  - `CALL system.remove_orphan_files('ns.tbl', '1 day')` → `removed_files` i64
+  - `CALL system.compact_data_files('ns.tbl', target_bytes)` → `rewritten_files` i64
+  
+  Implementation: private `dispatch_call_system()` method in `impl SqlEngine`; helper functions
+  `call_args_from_str()`, `iceberg_table_ident()`, `parse_call_duration()` at module level.
+  Result returned as a single-row `RecordBatch` registered as an ephemeral DataFusion table.
+
+- `crates/krishiv-connectors/src/lakehouse/iceberg_native.rs`: Made `catalog`, `ident`,
+  `pending` fields and `StagedEntry` struct `pub(crate)` so tests in `crate::certification`
+  can access them without violating Rust's privacy rules.
+
+- 4 new tests in `iceberg_catalog_tests` module:
+  - `call_system_no_catalog_returns_error`
+  - `call_system_unknown_procedure_returns_error`
+  - `call_system_expire_snapshots_returns_count` — creates Iceberg table, calls expire, asserts `expired_snapshots == 0`
+  - `with_iceberg_catalog_registers_under_given_name` (existing)
+
+Validation:
+- `cargo check --workspace` — 0 errors.
+- `cargo check -p krishiv-sql --features "iceberg-datafusion,local-catalog"` — 0 errors.
+- `cargo check --tests -p krishiv-connectors --features "iceberg"` — 0 errors.
+- `cargo check -p krishiv-api --features "iceberg-catalog"` — 0 errors.
+- `cargo test -p krishiv-sql --features "iceberg-datafusion,local-catalog" iceberg_catalog_tests` — 4/4 passed.
+
+Next: Wire SQL DELETE/UPDATE/MERGE for Iceberg tables through `crates/krishiv-connectors/src/lakehouse/dml.rs`.
 
 ---
 
