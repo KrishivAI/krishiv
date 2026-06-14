@@ -443,10 +443,13 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandGetDbSchemas,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        self.authenticate_request(&request)?;
         let flight_descriptor = request.into_inner();
         let ticket_bytes = query.as_any().encode_to_vec();
         let schema = query.into_builder().schema();
-        let ticket = Ticket { ticket: ticket_bytes.into() };
+        let ticket = Ticket {
+            ticket: ticket_bytes.into(),
+        };
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
         let info = FlightInfo::new()
             .try_with_schema(&schema)
@@ -460,20 +463,26 @@ impl FlightSqlService for KrishivFlightSqlService {
     async fn do_get_schemas(
         &self,
         query: CommandGetDbSchemas,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        self.authenticate_request(&request)?;
         let mut builder = query.into_builder();
         builder.append("krishiv", "default");
         for (catalog, schema, _) in self.host.list_catalog_tables() {
             builder.append(&catalog, &schema);
         }
         let schema = builder.schema();
-        let batch = builder.build().map_err(|e| Status::internal(e.to_string()))?;
+        let batch = builder
+            .build()
+            .map_err(|e| Status::internal(e.to_string()))?;
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(futures::stream::once(futures::future::ready(
-                Ok::<_, arrow_flight::error::FlightError>(batch),
-            )))
+            .build(futures::stream::once(futures::future::ready(Ok::<
+                _,
+                arrow_flight::error::FlightError,
+            >(
+                batch
+            ))))
             .map_err(Status::from);
         Ok(Response::new(Box::pin(stream)))
     }
@@ -484,10 +493,13 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandGetTables,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        self.authenticate_request(&request)?;
         let flight_descriptor = request.into_inner();
         let ticket_bytes = query.as_any().encode_to_vec();
         let schema = query.into_builder().schema();
-        let ticket = Ticket { ticket: ticket_bytes.into() };
+        let ticket = Ticket {
+            ticket: ticket_bytes.into(),
+        };
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
         let info = FlightInfo::new()
             .try_with_schema(&schema)
@@ -501,8 +513,9 @@ impl FlightSqlService for KrishivFlightSqlService {
     async fn do_get_tables(
         &self,
         query: CommandGetTables,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        self.authenticate_request(&request)?;
         let mut builder = query.into_builder();
         for (catalog, schema, table) in self.host.list_catalog_tables() {
             builder
@@ -510,12 +523,17 @@ impl FlightSqlService for KrishivFlightSqlService {
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
         let schema = builder.schema();
-        let batch = builder.build().map_err(|e| Status::internal(e.to_string()))?;
+        let batch = builder
+            .build()
+            .map_err(|e| Status::internal(e.to_string()))?;
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(futures::stream::once(futures::future::ready(
-                Ok::<_, arrow_flight::error::FlightError>(batch),
-            )))
+            .build(futures::stream::once(futures::future::ready(Ok::<
+                _,
+                arrow_flight::error::FlightError,
+            >(
+                batch
+            ))))
             .map_err(Status::from);
         Ok(Response::new(Box::pin(stream)))
     }
@@ -787,7 +805,9 @@ fn count_sql_params(sql: &str) -> usize {
 /// Build a parameter schema with `n` nullable `Utf8` fields named `p1 … pN`.
 fn build_param_schema(n: usize) -> Schema {
     let fields: Vec<arrow::datatypes::Field> = (1..=n)
-        .map(|i| arrow::datatypes::Field::new(format!("p{i}"), arrow::datatypes::DataType::Utf8, true))
+        .map(|i| {
+            arrow::datatypes::Field::new(format!("p{i}"), arrow::datatypes::DataType::Utf8, true)
+        })
         .collect();
     Schema::new(fields)
 }
@@ -809,8 +829,8 @@ fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, Status> {
 /// is not partially replaced before `$1`.
 fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
     use arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow::datatypes::DataType;
 
@@ -1682,8 +1702,7 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
 
-        let schema =
-            Arc::new(Schema::new(vec![Field::new("p1", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("p1", DataType::Utf8, true)]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(StringArray::from(vec!["O'Brien"])) as Arc<dyn arrow::array::Array>],
@@ -1751,7 +1770,10 @@ mod tests {
         let result = svc
             .get_flight_info_schemas(query, Request::new(descriptor))
             .await;
-        assert!(result.is_ok(), "get_flight_info_schemas must not be unimplemented");
+        assert!(
+            result.is_ok(),
+            "get_flight_info_schemas must not be unimplemented"
+        );
         let info = result.unwrap().into_inner();
         assert_eq!(info.endpoint.len(), 1, "must return one endpoint");
     }
@@ -1787,7 +1809,10 @@ mod tests {
         let result = svc
             .get_flight_info_tables(query, Request::new(descriptor))
             .await;
-        assert!(result.is_ok(), "get_flight_info_tables must not be unimplemented");
+        assert!(
+            result.is_ok(),
+            "get_flight_info_tables must not be unimplemented"
+        );
         let info = result.unwrap().into_inner();
         assert_eq!(info.endpoint.len(), 1, "must return one endpoint");
     }
@@ -1849,7 +1874,11 @@ mod tests {
         let tables = host.list_catalog_tables();
         assert_eq!(tables.len(), 2);
         // All entries use "krishiv" catalog and "default" schema
-        assert!(tables.iter().all(|(cat, schema, _)| cat == "krishiv" && schema == "default"));
+        assert!(
+            tables
+                .iter()
+                .all(|(cat, schema, _)| cat == "krishiv" && schema == "default")
+        );
         let names: Vec<_> = tables.iter().map(|(_, _, t)| t.as_str()).collect();
         assert!(names.contains(&"orders"));
         assert!(names.contains(&"customers"));

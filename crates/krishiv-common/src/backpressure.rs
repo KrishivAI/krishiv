@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Backpressure signal attached to a task output or operator boundary.
 ///
-/// Carried in [`ExecutorTaskOutput`] so the coordinator knows whether to
+/// Carried in executor task output metadata so the coordinator knows whether to
 /// schedule more work (or wait) at the upstream edge of this operator.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum BackpressureSignal {
@@ -48,7 +48,6 @@ impl BackpressureSignal {
             Self::None
         }
     }
-
 }
 
 /// Shared credit gate between a producer and consumer operator.

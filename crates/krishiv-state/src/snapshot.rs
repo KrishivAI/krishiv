@@ -21,7 +21,7 @@ pub fn read_lp_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
 ///
 /// Each segment is encoded as an 8-byte little-endian length followed by the
 /// UTF-8 bytes of the string.  This is the shared prefix encoding used by
-/// both `RedbStateBackend::redb_key` and `RedbStateBackend::redb_prefix`.
+/// both `RocksDbStateBackend::redb_key` and `RocksDbStateBackend::redb_prefix`.
 pub fn write_prefix(buf: &mut Vec<u8>, op_id: &str, name: &str) {
     let op = op_id.as_bytes();
     let nm = name.as_bytes();
@@ -33,7 +33,7 @@ pub fn write_prefix(buf: &mut Vec<u8>, op_id: &str, name: &str) {
 
 /// Decode a snapshot byte buffer into `(op_id, state_name, key, value)` tuples.
 ///
-/// Both `InMemoryStateBackend::load_snapshot` and `RedbStateBackend::load_snapshot`
+/// Both `InMemoryStateBackend::load_snapshot` and `RocksDbStateBackend::load_snapshot`
 /// share this parsing logic to avoid duplication.
 ///
 /// Expected format:

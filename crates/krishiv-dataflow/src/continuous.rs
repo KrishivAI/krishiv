@@ -250,7 +250,7 @@ impl ContinuousWindowExecutor {
     /// Create a new continuous executor with an optional persistent state directory.
     ///
     /// - `state_dir = None` → ephemeral (dev-local, same as [`new`])
-    /// - `state_dir = Some(path)` → file-backed Fjall state under `path/` (single-node-durable
+    /// - `state_dir = Some(path)` → file-backed RocksDB state under `path/` (single-node-durable
     ///   or distributed-durable); survives executor restart
     pub fn new_with_state_dir(
         spec: WindowExecutionSpec,

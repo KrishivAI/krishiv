@@ -44,7 +44,11 @@ mod phase_i_tests {
                 Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0])),
                 Arc::new(Float64Array::from(vec![100.0, 200.0, 300.0])),
                 Arc::new(Float64Array::from(vec![0.05, 0.10, 0.00])),
-                Arc::new(StringArray::from(vec!["1998-01-01", "1997-06-15", "1996-03-10"])),
+                Arc::new(StringArray::from(vec![
+                    "1998-01-01",
+                    "1997-06-15",
+                    "1996-03-10",
+                ])),
                 Arc::new(Int64Array::from(vec![1, 2, 3])),
                 Arc::new(Int64Array::from(vec![10, 20, 30])),
             ],
@@ -64,7 +68,11 @@ mod phase_i_tests {
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3])),
                 Arc::new(Int64Array::from(vec![100, 200, 300])),
-                Arc::new(StringArray::from(vec!["1995-01-01", "1994-06-01", "1993-03-01"])),
+                Arc::new(StringArray::from(vec![
+                    "1995-01-01",
+                    "1994-06-01",
+                    "1993-03-01",
+                ])),
                 Arc::new(Float64Array::from(vec![1000.0, 2000.0, 3000.0])),
                 Arc::new(Int64Array::from(vec![0, 1, 0])),
             ],
@@ -139,12 +147,30 @@ mod phase_i_tests {
         )
         .unwrap();
 
-        engine.register_record_batches("lineitem", vec![lineitem]).await.unwrap();
-        engine.register_record_batches("orders", vec![orders]).await.unwrap();
-        engine.register_record_batches("customer", vec![customer]).await.unwrap();
-        engine.register_record_batches("nation", vec![nation]).await.unwrap();
-        engine.register_record_batches("supplier", vec![supplier]).await.unwrap();
-        engine.register_record_batches("region", vec![region]).await.unwrap();
+        engine
+            .register_record_batches("lineitem", vec![lineitem])
+            .await
+            .unwrap();
+        engine
+            .register_record_batches("orders", vec![orders])
+            .await
+            .unwrap();
+        engine
+            .register_record_batches("customer", vec![customer])
+            .await
+            .unwrap();
+        engine
+            .register_record_batches("nation", vec![nation])
+            .await
+            .unwrap();
+        engine
+            .register_record_batches("supplier", vec![supplier])
+            .await
+            .unwrap();
+        engine
+            .register_record_batches("region", vec![region])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -154,7 +180,7 @@ mod phase_i_tests {
         let df = e.sql(crate::tpch::Q1).await.expect("Q1 must not error");
         let batches = df.collect().await.expect("Q1 collect");
         assert!(
-            !batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0),
+            !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0),
             "Q1 returned no data"
         );
         // Schema: l_returnflag, l_linestatus, sum_qty, sum_base_price, count_order
@@ -234,9 +260,18 @@ mod phase_i_tests {
         )
         .unwrap();
 
-        engine.register_record_batches("bid", vec![bids]).await.unwrap();
-        engine.register_record_batches("auction", vec![auctions]).await.unwrap();
-        engine.register_record_batches("person", vec![persons]).await.unwrap();
+        engine
+            .register_record_batches("bid", vec![bids])
+            .await
+            .unwrap();
+        engine
+            .register_record_batches("auction", vec![auctions])
+            .await
+            .unwrap();
+        engine
+            .register_record_batches("person", vec![persons])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

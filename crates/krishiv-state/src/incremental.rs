@@ -1,6 +1,6 @@
 //! Incremental checkpoint manifest tracking (R16 S6.1).
 //!
-//! Tracks changed state file segments between epochs. For `RedbStateBackend` this
+//! Tracks changed state file segments between epochs. For `RocksDbStateBackend` this
 //! records snapshot blob hashes rather than RocksDB SST files.
 
 use serde::{Deserialize, Serialize};

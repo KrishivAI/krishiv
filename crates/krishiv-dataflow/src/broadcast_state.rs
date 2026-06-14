@@ -195,13 +195,13 @@ impl BroadcastProcessExecutor {
     }
 
     /// Serialize state to a snapshot blob.
-    pub fn snapshot(&self) -> Vec<u8> {
+    pub fn snapshot(&self) -> ExecResult<Vec<u8>> {
         let snap = BroadcastSnapshot {
             keyed_state: self.keyed_state.clone(),
             broadcast_state: self.broadcast_state.clone(),
             current_watermark_ms: self.current_watermark_ms,
         };
-        serde_json::to_vec(&snap).unwrap_or_default()
+        serde_json::to_vec(&snap).map_err(|e| crate::ExecError::InvalidInput(e.to_string()))
     }
 
     /// Restore state from a snapshot blob.
@@ -351,7 +351,7 @@ mod tests {
         let keyed = keyed_batch(&["alice"]);
         exec.process_keyed_batch(&keyed, 100).unwrap();
 
-        let snap = exec.snapshot();
+        let snap = exec.snapshot().unwrap();
 
         // Restore into a new executor.
         let func2 = RuleCheckerFn::new();

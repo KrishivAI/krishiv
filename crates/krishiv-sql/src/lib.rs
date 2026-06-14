@@ -46,7 +46,9 @@ pub use cep_sql::{
 };
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
 
-pub use grammar::{FeatureEntry, FeatureStatus, feature_matrix, features_by_status, features_for_category};
+pub use grammar::{
+    FeatureEntry, FeatureStatus, feature_matrix, features_by_status, features_for_category,
+};
 pub use sqlstate::{SqlStateError, sqlstate_for};
 pub use streaming::{ContinuousInputError, ContinuousTableInput};
 
@@ -508,13 +510,19 @@ impl SqlEngine {
 
     /// Build a `SqlDataFrame` with this engine's shared session context attached
     /// so that `cache()` / `create_or_replace_temp_view()` work on the live session.
-    fn make_sql_df(
-        &self,
-        name: &str,
-        dataframe: DataFusionDataFrame,
-    ) -> SqlDataFrame {
+    fn make_sql_df(&self, name: &str, dataframe: DataFusionDataFrame) -> SqlDataFrame {
         SqlDataFrame::new(name, dataframe, self.table_row_counts())
             .with_context(self.context.clone())
+    }
+
+    /// Attach SQL text and execution kind derived from registered streaming sources.
+    fn attach_query_metadata(&self, df: SqlDataFrame, query: &str) -> SqlDataFrame {
+        let kind = if self.is_streaming_query(query).unwrap_or(false) {
+            ExecutionKind::Streaming
+        } else {
+            ExecutionKind::Batch
+        };
+        df.with_query(query).with_execution_kind(kind)
     }
 
     /// Set an override for the shuffle partition count.
@@ -1329,7 +1337,8 @@ impl SqlEngine {
 
     /// Create a DataFrame by reading a local CSV path directly.
     pub async fn read_csv(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame> {
-        self.read_csv_with_options(path, &CsvReaderOptions::default()).await
+        self.read_csv_with_options(path, &CsvReaderOptions::default())
+            .await
     }
 
     /// Create a DataFrame by reading a local CSV path with typed options.
@@ -1506,7 +1515,9 @@ impl SqlEngine {
             udf::register_single_table_udf(&self.context, std::sync::Arc::clone(&udf))
                 .map_err(SqlError::from)?;
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-            return Ok(self.make_sql_df("create-function", empty).with_query(query));
+            return Ok(
+                self.attach_query_metadata(self.make_sql_df("create-function", empty), query)
+            );
         }
 
         if query
@@ -1521,7 +1532,7 @@ impl SqlEngine {
                 .context
                 .sql(&format!("SELECT * FROM {merge_table}"))
                 .await?;
-            return Ok(self.make_sql_df("merge", dataframe).with_query(query));
+            return Ok(self.attach_query_metadata(self.make_sql_df("merge", dataframe), query));
         }
 
         // ── Intercept CALL system.<proc> ──────────────────────────────────────
@@ -1535,7 +1546,7 @@ impl SqlEngine {
                 .context
                 .sql(&format!("SELECT * FROM {call_table}"))
                 .await?;
-            return Ok(self.make_sql_df("call", dataframe).with_query(query));
+            return Ok(self.attach_query_metadata(self.make_sql_df("call", dataframe), query));
         }
 
         // ── Intercept DELETE FROM <iceberg-table> [WHERE …] ──────────────────
@@ -1544,48 +1555,40 @@ impl SqlEngine {
         #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
         if trimmed.to_ascii_uppercase().starts_with("DELETE FROM ") {
             if let Some((table_ref, predicate)) = parse_dml_delete(trimmed) {
-                if let Some((iceberg_catalog, table_ident)) =
-                    self.resolve_iceberg_table(&table_ref)
+                if let Some((iceberg_catalog, table_ident)) = self.resolve_iceberg_table(&table_ref)
                 {
                     use arrow::array::{ArrayRef, Int64Array};
                     use arrow::datatypes::{DataType, Field, Schema};
-                    let (deleted, _) =
-                        krishiv_connectors::lakehouse::dml::iceberg_delete_where(
-                            iceberg_catalog,
-                            &table_ident,
-                            &predicate,
-                            &self.context,
-                        )
-                        .await
-                        .map_err(|e| SqlError::DataFusion {
-                            message: e.to_string(),
-                        })?;
+                    let (deleted, _) = krishiv_connectors::lakehouse::dml::iceberg_delete_where(
+                        iceberg_catalog,
+                        &table_ident,
+                        &predicate,
+                        &self.context,
+                    )
+                    .await
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
                     let schema = Arc::new(Schema::new(vec![Field::new(
                         "deleted_rows",
                         DataType::Int64,
                         false,
                     )]));
-                    let array: ArrayRef =
-                        Arc::new(Int64Array::from(vec![deleted as i64]));
-                    let batch =
-                        RecordBatch::try_new(schema, vec![array]).map_err(|e| {
-                            SqlError::DataFusion {
-                                message: e.to_string(),
-                            }
-                        })?;
+                    let array: ArrayRef = Arc::new(Int64Array::from(vec![deleted as i64]));
+                    let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| {
+                        SqlError::DataFusion {
+                            message: e.to_string(),
+                        }
+                    })?;
                     let res_table = next_ephemeral_name("delete_result");
-                    lakehouse::register_scan_batches(
-                        &self.context,
-                        &res_table,
-                        vec![batch],
-                    )
-                    .await?;
+                    lakehouse::register_scan_batches(&self.context, &res_table, vec![batch])
+                        .await?;
                     let dataframe = self
                         .context
                         .sql(&format!("SELECT * FROM {res_table}"))
                         .await?;
                     return Ok(
-                        self.make_sql_df("delete", dataframe).with_query(query)
+                        self.attach_query_metadata(self.make_sql_df("delete", dataframe), query)
                     );
                 }
             }
@@ -1595,8 +1598,7 @@ impl SqlEngine {
         #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
         if trimmed.to_ascii_uppercase().starts_with("UPDATE ") {
             if let Some((table_ref, set_clause, predicate)) = parse_dml_update(trimmed) {
-                if let Some((iceberg_catalog, table_ident)) =
-                    self.resolve_iceberg_table(&table_ref)
+                if let Some((iceberg_catalog, table_ident)) = self.resolve_iceberg_table(&table_ref)
                 {
                     use arrow::array::{ArrayRef, Int64Array};
                     use arrow::datatypes::{DataType, Field, Schema};
@@ -1606,44 +1608,37 @@ impl SqlEngine {
                         .map(|(c, e)| (c.as_str(), e.as_str()))
                         .collect();
                     let pred = predicate.as_deref();
-                    let (updated, _) =
-                        krishiv_connectors::lakehouse::dml::iceberg_update_where(
-                            iceberg_catalog,
-                            &table_ident,
-                            &borrowed,
-                            pred,
-                            &self.context,
-                        )
-                        .await
-                        .map_err(|e| SqlError::DataFusion {
-                            message: e.to_string(),
-                        })?;
+                    let (updated, _) = krishiv_connectors::lakehouse::dml::iceberg_update_where(
+                        iceberg_catalog,
+                        &table_ident,
+                        &borrowed,
+                        pred,
+                        &self.context,
+                    )
+                    .await
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
                     let schema = Arc::new(Schema::new(vec![Field::new(
                         "updated_rows",
                         DataType::Int64,
                         false,
                     )]));
-                    let array: ArrayRef =
-                        Arc::new(Int64Array::from(vec![updated as i64]));
-                    let batch =
-                        RecordBatch::try_new(schema, vec![array]).map_err(|e| {
-                            SqlError::DataFusion {
-                                message: e.to_string(),
-                            }
-                        })?;
+                    let array: ArrayRef = Arc::new(Int64Array::from(vec![updated as i64]));
+                    let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| {
+                        SqlError::DataFusion {
+                            message: e.to_string(),
+                        }
+                    })?;
                     let res_table = next_ephemeral_name("update_result");
-                    lakehouse::register_scan_batches(
-                        &self.context,
-                        &res_table,
-                        vec![batch],
-                    )
-                    .await?;
+                    lakehouse::register_scan_batches(&self.context, &res_table, vec![batch])
+                        .await?;
                     let dataframe = self
                         .context
                         .sql(&format!("SELECT * FROM {res_table}"))
                         .await?;
                     return Ok(
-                        self.make_sql_df("update", dataframe).with_query(query)
+                        self.attach_query_metadata(self.make_sql_df("update", dataframe), query)
                     );
                 }
             }
@@ -1693,7 +1688,7 @@ impl SqlEngine {
                 .context
                 .sql(&format!("SELECT * FROM {cep_table}"))
                 .await?;
-            return Ok(self.make_sql_df("cep", dataframe).with_query(query));
+            return Ok(self.attach_query_metadata(self.make_sql_df("cep", dataframe), query));
         }
 
         let (rewritten, as_ofs) =
@@ -1722,11 +1717,11 @@ impl SqlEngine {
                 .cloned();
             if let Some(plan) = cached_plan {
                 let dataframe = self.context.execute_logical_plan(plan).await?;
-                return Ok(
+                return Ok(self.attach_query_metadata(
                     self.make_sql_df("sql-query", dataframe)
-                        .with_query(rewritten)
                         .with_shuffle_partitions(shuffle_override),
-                );
+                    &rewritten,
+                ));
             }
         }
 
@@ -1758,11 +1753,11 @@ impl SqlEngine {
             }
         }
 
-        Ok(
+        Ok(self.attach_query_metadata(
             self.make_sql_df("sql-query", dataframe)
-                .with_query(rewritten)
                 .with_shuffle_partitions(shuffle_override),
-        )
+            &rewritten,
+        ))
     }
 
     /// Execute a SQL query with a timeout.
@@ -1798,7 +1793,10 @@ impl SqlEngine {
             return Err(SqlError::OperationCancelled { operation_id });
         }
         let df = self.sql(query).await?;
-        Ok(TaggedQueryResult { operation_id, inner: df })
+        Ok(TaggedQueryResult {
+            operation_id,
+            inner: df,
+        })
     }
 
     /// Resolve a SQL table reference to an `(Arc<dyn Catalog>, TableIdent)` pair
@@ -1810,8 +1808,7 @@ impl SqlEngine {
     fn resolve_iceberg_table(
         &self,
         table_ref: &str,
-    ) -> Option<(Arc<dyn iceberg::Catalog + Send + Sync>, iceberg::TableIdent)>
-    {
+    ) -> Option<(Arc<dyn iceberg::Catalog + Send + Sync>, iceberg::TableIdent)> {
         let parts: Vec<&str> = table_ref.splitn(3, '.').collect();
         let (catalog_arc, ns_str, table_str) = {
             let guard = self
@@ -2183,11 +2180,7 @@ pub trait KrishivDataFrameOps: Send + Sync {
 
     /// Register a list of record batches as a named in-memory table in the
     /// same session context that backs this DataFrame.  Used by `cache()`.
-    async fn register_batches(
-        &self,
-        name: &str,
-        batches: Vec<RecordBatch>,
-    ) -> SqlResult<()>;
+    async fn register_batches(&self, name: &str, batches: Vec<RecordBatch>) -> SqlResult<()>;
 
     /// Deregister a named table from the session context.  Used by `unpersist()`.
     async fn deregister_table(&self, name: &str) -> SqlResult<()>;
@@ -2416,6 +2409,7 @@ pub struct SqlDataFrame {
     query: Option<String>,
     /// Alias for `query` used by `create_view` — same value.
     query_text: Option<String>,
+    execution_kind: ExecutionKind,
     dataframe: DataFusionDataFrame,
     shuffle_partitions: Option<u32>,
     /// Shared session context for table registration (cache/view operations).
@@ -2446,6 +2440,7 @@ impl SqlDataFrame {
             name: name.into(),
             query: None,
             query_text: None,
+            execution_kind: ExecutionKind::Batch,
             dataframe,
             shuffle_partitions: None,
             context: SessionContext::default(),
@@ -2463,6 +2458,11 @@ impl SqlDataFrame {
         let q = query.into();
         self.query_text = Some(q.clone());
         self.query = Some(q);
+        self
+    }
+
+    fn with_execution_kind(mut self, kind: ExecutionKind) -> Self {
+        self.execution_kind = kind;
         self
     }
 
@@ -2484,6 +2484,7 @@ impl SqlDataFrame {
             name: format!("{}-{}", self.name, tag),
             query: None,
             query_text: None,
+            execution_kind: self.execution_kind,
             dataframe: df,
             shuffle_partitions: self.shuffle_partitions,
             context: self.context.clone(),
@@ -2508,7 +2509,7 @@ impl SqlDataFrame {
         let mut counter = 0usize;
         let (nodes, _root_id) = df_plan_to_krishiv_nodes(df_plan, &counts, &mut counter);
 
-        let mut plan = LogicalPlan::new(self.name.clone(), ExecutionKind::Batch);
+        let mut plan = LogicalPlan::new(self.name.clone(), self.execution_kind);
         for node in nodes {
             plan = plan.with_node(node);
         }
@@ -3423,11 +3424,7 @@ impl KrishivDataFrameOps for SqlDataFrame {
         Ok(Box::new(self.with_new_dataframe(df, "except")))
     }
 
-    async fn register_batches(
-        &self,
-        name: &str,
-        batches: Vec<RecordBatch>,
-    ) -> SqlResult<()> {
+    async fn register_batches(&self, name: &str, batches: Vec<RecordBatch>) -> SqlResult<()> {
         let schema = batches
             .first()
             .map(|b| b.schema())
@@ -3445,7 +3442,10 @@ impl KrishivDataFrameOps for SqlDataFrame {
     }
 
     async fn deregister_table(&self, name: &str) -> SqlResult<()> {
-        let _ = self.context.deregister_table(name).map_err(SqlError::from)?;
+        let _ = self
+            .context
+            .deregister_table(name)
+            .map_err(SqlError::from)?;
         Ok(())
     }
 
@@ -3461,7 +3461,6 @@ impl KrishivDataFrameOps for SqlDataFrame {
         self.context.sql(&view_sql).await?;
         Ok(())
     }
-
 }
 
 // ── CALL-system helpers ───────────────────────────────────────────────────────
@@ -3521,13 +3520,21 @@ fn iceberg_table_ident(table_ref: &str) -> SqlResult<iceberg::TableIdent> {
     let parts: Vec<&str> = table_ref.splitn(3, '.').collect();
     match parts.len() {
         2 => {
-            let ns = iceberg::NamespaceIdent::from_vec(vec![parts[0].to_string()])
-                .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+            let ns =
+                iceberg::NamespaceIdent::from_vec(vec![parts[0].to_string()]).map_err(|e| {
+                    SqlError::DataFusion {
+                        message: e.to_string(),
+                    }
+                })?;
             Ok(iceberg::TableIdent::new(ns, parts[1].to_string()))
         }
         3 => {
-            let ns = iceberg::NamespaceIdent::from_vec(vec![parts[1].to_string()])
-                .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+            let ns =
+                iceberg::NamespaceIdent::from_vec(vec![parts[1].to_string()]).map_err(|e| {
+                    SqlError::DataFusion {
+                        message: e.to_string(),
+                    }
+                })?;
             Ok(iceberg::TableIdent::new(ns, parts[2].to_string()))
         }
         _ => Err(SqlError::DataFusion {
@@ -3578,9 +3585,8 @@ fn parse_dml_delete(stmt: &str) -> Option<(String, String)> {
     static WITH_WHERE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?is)^\s*DELETE\s+FROM\s+(\S+)\s+WHERE\s+([\s\S]+?)\s*;?\s*$").unwrap()
     });
-    static NO_WHERE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?is)^\s*DELETE\s+FROM\s+(\S+)\s*;?\s*$").unwrap()
-    });
+    static NO_WHERE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)^\s*DELETE\s+FROM\s+(\S+)\s*;?\s*$").unwrap());
 
     if let Some(cap) = WITH_WHERE.captures(stmt) {
         let table = cap.get(1)?.as_str().to_string();
@@ -3604,10 +3610,8 @@ fn parse_dml_update(stmt: &str) -> Option<(String, String, Option<String>)> {
     use std::sync::LazyLock;
 
     static UPDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"(?is)^\s*UPDATE\s+(\S+)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]+?))?\s*;?\s*$",
-        )
-        .unwrap()
+        Regex::new(r"(?is)^\s*UPDATE\s+(\S+)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]+?))?\s*;?\s*$")
+            .unwrap()
     });
 
     let cap = UPDATE_RE.captures(stmt)?;
@@ -4357,6 +4361,41 @@ mod udtf_ddl_tests {
         );
     }
 
+    #[tokio::test]
+    async fn krishiv_logical_plan_kind_is_streaming_for_streaming_source() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let engine = SqlEngine::new();
+        engine.register_streaming_source_name("events").unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("user_id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2])),
+                Arc::new(Int64Array::from(vec![10i64, 20])),
+            ],
+        )
+        .unwrap();
+        engine
+            .register_record_batches("events", vec![batch])
+            .await
+            .unwrap();
+        let df = engine
+            .sql("SELECT ts, user_id FROM events WHERE ts > 0")
+            .await
+            .expect("streaming sql");
+        assert_eq!(
+            df.krishiv_logical_plan().kind(),
+            super::ExecutionKind::Streaming
+        );
+    }
+
     #[test]
     fn is_streaming_query_true_after_source_registered() {
         let engine = SqlEngine::new();
@@ -4587,16 +4626,15 @@ mod iceberg_catalog_tests {
 
     #[test]
     fn parse_dml_delete_with_where() {
-        let (tbl, pred) = super::parse_dml_delete("DELETE FROM myns.orders WHERE id = 5")
-            .expect("must parse");
+        let (tbl, pred) =
+            super::parse_dml_delete("DELETE FROM myns.orders WHERE id = 5").expect("must parse");
         assert_eq!(tbl, "myns.orders");
         assert_eq!(pred, "id = 5");
     }
 
     #[test]
     fn parse_dml_delete_without_where() {
-        let (tbl, pred) = super::parse_dml_delete("DELETE FROM myns.orders")
-            .expect("must parse");
+        let (tbl, pred) = super::parse_dml_delete("DELETE FROM myns.orders").expect("must parse");
         assert_eq!(tbl, "myns.orders");
         assert_eq!(pred, "TRUE");
     }
@@ -4613,9 +4651,8 @@ mod iceberg_catalog_tests {
 
     #[test]
     fn parse_dml_update_without_where() {
-        let (tbl, set, pred) =
-            super::parse_dml_update("UPDATE myns.orders SET status = 'active'")
-                .expect("must parse");
+        let (tbl, set, pred) = super::parse_dml_update("UPDATE myns.orders SET status = 'active'")
+            .expect("must parse");
         assert_eq!(tbl, "myns.orders");
         assert!(set.contains("'active'"), "set clause: {set}");
         assert!(pred.is_none());
@@ -4655,8 +4692,7 @@ mod iceberg_catalog_tests {
             .create_table("myns", "orders", schema, "")
             .await
             .unwrap();
-        let engine =
-            SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
+        let engine = SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
         // DELETE with no WHERE on an empty table returns 0 deleted rows.
         let df = engine
             .sql("DELETE FROM myns.orders WHERE id = 99")
@@ -4690,8 +4726,7 @@ mod iceberg_catalog_tests {
             .create_table("myns", "customers", schema, "")
             .await
             .unwrap();
-        let engine =
-            SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
+        let engine = SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
         let df = engine
             .sql("UPDATE myns.customers SET status = 'active' WHERE id = 1")
             .await

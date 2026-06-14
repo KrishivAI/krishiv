@@ -64,19 +64,9 @@ impl WatermarkE2ePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::barrier_align::BarrierAligner;
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
-    use std::time::Duration;
-
-    fn batch(v: i32) -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
-            vec![Arc::new(Int32Array::from(vec![v]))],
-        )
-        .unwrap()
-    }
 
     #[test]
     fn watermark_propagation_e2e() {
@@ -85,9 +75,5 @@ mod tests {
         assert!(pipe.effective_watermark() > i64::MIN);
         assert!(!pipe.side_router.is_late(&pipe.watermark, 950));
         assert!(pipe.side_router.is_late(&pipe.watermark, 700));
-        let mut aligner = BarrierAligner::new(2, Duration::from_secs(1)).unwrap();
-        aligner.buffer_data(0, batch(1));
-        assert!(!aligner.on_barrier(0, 1).unwrap());
-        assert!(aligner.on_barrier(1, 1).unwrap());
     }
 }

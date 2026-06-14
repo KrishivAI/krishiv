@@ -1,5 +1,36 @@
 # Krishiv Implementation Status
 
+## 2026-06-14 — Cross-crate audit: bugs, dead code, docs, and tests
+
+Completed a parallel audit and applied high-impact fixes across core crates:
+
+- **`krishiv-api`**: `uses_remote_execution()` typo; `KRISHIV_SHUFFLE_PARTITIONS` env (legacy alias); remote `execute_stream_async` passes streaming flag; conformance tests aligned with DataFusion 53.
+- **`krishiv-sql`**: `SqlDataFrame` carries `ExecutionKind::Streaming` when SQL references registered streaming sources (`attach_query_metadata`).
+- **`krishiv-common`**: `write_commit::move_file` only copy-falls-back on cross-device rename; expanded crate docs; backpressure doc link fixed.
+- **`krishiv-dataflow`**: `MemoCache` LRU promotion on hit; removed dead `JoinKind` / `pre_agg_indices`; `watermark_e2e` test no longer references removed `barrier_align`; temporal join `upsert_version_encoded`; broadcast snapshot returns `Result`.
+- **`krishiv-state`**: TTL `load_snapshot` uses watermark-aware clock; Redb→RocksDB stale comments fixed.
+- **`krishiv-metrics`**: `remove_job` clears `source_offset_lag` and `streaming_rows`.
+- **`krishiv-shuffle`**: `delete_job_partitions` clears `content_hashes`.
+- **`krishiv-flight-sql`**: auth on catalog `GetDbSchemas` / `GetTables` RPCs.
+- **`krishiv-bench`**: fixed tautological TPC-H Q1 assertion.
+- **`krishiv` examples**: updated to current `QueryResult` struct API and facade prelude.
+
+### Validation
+
+```
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-common --lib          # 80/80
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-dataflow --lib       # 218/218
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-metrics --lib        # 67/67
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-shuffle --lib         # 132/132
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-state --lib           # 296/296
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-sql --lib             # 295/295
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-api --lib             # 122/122
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-flight-sql --lib      # 49/49
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-bench --lib           # 9/9
+```
+
+---
+
 ## 2026-06-14 — G16 + G17: Flight SQL prepared-parameter binding and catalog introspection
 
 ### G16 — Prepared statement `$N` parameter binding

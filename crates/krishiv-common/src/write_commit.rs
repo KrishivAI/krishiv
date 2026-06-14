@@ -328,11 +328,11 @@ pub fn final_part_file_name(task_index: usize, job_id: &str) -> String {
 
 /// Parse a staged file name back into `(task_id, attempt)`.
 fn parse_staged_file_name(name: &str) -> Result<(String, u32), WriteCommitError> {
-    let stem = name
-        .strip_suffix(".parquet")
-        .ok_or_else(|| WriteCommitError::InvalidStagedFileName {
-            name: name.to_owned(),
-        })?;
+    let stem =
+        name.strip_suffix(".parquet")
+            .ok_or_else(|| WriteCommitError::InvalidStagedFileName {
+                name: name.to_owned(),
+            })?;
     let (task, attempt) =
         stem.rsplit_once('-')
             .ok_or_else(|| WriteCommitError::InvalidStagedFileName {
@@ -592,11 +592,12 @@ fn move_file(from: &Path, to: &Path) -> Result<(), WriteCommitError> {
     }
     match std::fs::rename(from, to) {
         Ok(()) => Ok(()),
-        Err(_) => {
+        Err(rename_err) if rename_err.kind() == io::ErrorKind::CrossesDevices => {
             std::fs::copy(from, to).map_err(|e| WriteCommitError::io(to, e))?;
             std::fs::remove_file(from).map_err(|e| WriteCommitError::io(from, e))?;
             Ok(())
         }
+        Err(rename_err) => Err(WriteCommitError::io(from, rename_err)),
     }
 }
 
@@ -621,7 +622,10 @@ fn remove_dir_all_tolerant(path: &Path) -> Result<(), WriteCommitError> {
 ///   deletes its own output (`Overwrite`).
 ///
 /// On success the staging directory for the job is removed.
-pub fn publish_staged_outputs(spec: &SinkWriteSpec, job_id: &str) -> Result<PublishOutcome, WriteCommitError> {
+pub fn publish_staged_outputs(
+    spec: &SinkWriteSpec,
+    job_id: &str,
+) -> Result<PublishOutcome, WriteCommitError> {
     let dest_dir = Path::new(&spec.base_dir).join(&spec.dest_path);
     let staging_dir = Path::new(&spec.base_dir).join(spec.staging_dir_rel(job_id));
 
@@ -766,7 +770,10 @@ mod tests {
         assert!(spec.staged);
         assert_eq!(spec.mode, WriteMode::Overwrite);
         assert_eq!(spec.partition_by, vec!["country", "year"]);
-        assert_eq!(SinkWriteSpec::parse(&spec.contract_payload()).unwrap(), spec);
+        assert_eq!(
+            SinkWriteSpec::parse(&spec.contract_payload()).unwrap(),
+            spec
+        );
     }
 
     #[test]
@@ -787,8 +794,7 @@ mod tests {
 
     #[test]
     fn staging_paths_are_deterministic() {
-        let spec =
-            SinkWriteSpec::staged("/base", "out", WriteMode::Append, vec![]).unwrap();
+        let spec = SinkWriteSpec::staged("/base", "out", WriteMode::Append, vec![]).unwrap();
         assert_eq!(spec.staging_dir_rel("job-7"), "out/_staging/job-7");
         assert_eq!(
             spec.staged_file_rel("job-7", "", "task-3", 2),

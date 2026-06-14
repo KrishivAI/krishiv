@@ -1,3 +1,5 @@
+//! Tokio/blocking bridge and wall-clock helpers for sync call sites.
+
 use std::future::Future;
 use std::sync::OnceLock;
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
@@ -24,8 +26,9 @@ fn fallback_runtime() -> &'static tokio::runtime::Runtime {
 ///    so the current worker thread can be borrowed without starving the
 ///    runtime.
 /// 2. If called inside a current-thread (single-threaded) Tokio runtime,
-///    `block_in_place` would panic, so call `block_on` on the current handle
-///    directly. The future must not depend on the caller's task-local data.
+///    drive `fut` on the lazily-initialised fallback multi-thread runtime.
+///    Calling `Handle::block_on` on the current-thread runtime would panic
+///    because the caller's task cannot block its own worker.
 /// 3. If no Tokio runtime is active in the calling thread, drive `fut` on a
 ///    lazily-initialised multi-thread fallback runtime. The fallback is
 ///    deliberately lazy because constructing a runtime while another runtime

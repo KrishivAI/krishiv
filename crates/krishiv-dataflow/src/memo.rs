@@ -51,8 +51,11 @@ impl MemoCache {
     }
 
     pub fn lookup(&self, key: [u8; 32]) -> Option<RecordBatch> {
-        let inner = self.inner.lock().ok()?;
-        inner.map.get(&key).cloned()
+        let mut inner = self.inner.lock().ok()?;
+        let batch = inner.map.get(&key).cloned()?;
+        inner.order.retain(|k| k != &key);
+        inner.order.push_back(key);
+        Some(batch)
     }
 
     pub fn store(&self, key: [u8; 32], batch: RecordBatch) -> Result<(), ExecError> {
@@ -139,6 +142,20 @@ mod tests {
         cache.store(k3, batch(3)).unwrap();
         assert!(cache.lookup_or_miss(k1).is_none());
         assert!(cache.lookup_or_miss(k3).is_some());
+    }
+
+    #[test]
+    fn memo_lru_lookup_promotes_key() {
+        let cache = MemoCache::new(2);
+        let k1 = [1u8; 32];
+        let k2 = [2u8; 32];
+        let k3 = [3u8; 32];
+        cache.store(k1, batch(1)).unwrap();
+        cache.store(k2, batch(2)).unwrap();
+        assert!(cache.lookup_or_miss(k1).is_some());
+        cache.store(k3, batch(3)).unwrap();
+        assert!(cache.lookup_or_miss(k1).is_some());
+        assert!(cache.lookup_or_miss(k2).is_none());
     }
 
     #[test]
