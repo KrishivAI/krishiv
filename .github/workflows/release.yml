@@ -1,35 +1,374 @@
 name: Release
 
+# Triggers on stable releases (v1.2.3) and pre-releases (v1.2.3-rc.1, v1.2.3-beta.1).
+# Pre-release tags produce a GitHub pre-release and skip PyPI/crates.io publish.
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.92"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/krishiv
+  CXXFLAGS: "-include cstdint"
 
 permissions:
   contents: write
+  packages: write
+  id-token: write
 
 jobs:
-  build-release:
+  # ── 1. Validate release readiness ───────────────────────────────────────────
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract version metadata
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          IS_PRE=false
+          if [[ "$TAG" == *"-rc."* ]] || [[ "$TAG" == *"-beta."* ]] || [[ "$TAG" == *"-alpha."* ]]; then
+            IS_PRE=true
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRE}" >> "$GITHUB_OUTPUT"
+          echo "Tag=${TAG} Version=${VERSION} PreRelease=${IS_PRE}"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Validate tag and project metadata
+        run: python3 scripts/check_release.py --tag "${GITHUB_REF_NAME}"
+      - name: Validate API parity manifest
+        run: python3 scripts/check_parity_manifest.py
+      - name: Validate migration notes
+        if: steps.meta.outputs.is_prerelease == 'false'
+        run: python3 scripts/check_migration_notes.py
+
+  # ── 2a. Cargo binaries (multi-platform) ─────────────────────────────────────
+  #
+  #  Targets:
+  #    x86_64-unknown-linux-musl   — statically linked, portable Linux binary
+  #    aarch64-apple-darwin        — native macOS M1/M2/M3 binary
+  #
+  #  aarch64 Linux is covered by the Docker multi-platform image below.
+  build-binary:
+    name: Binary (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            extra_sys_deps: musl-tools
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            extra_sys_deps: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: binary-${{ matrix.target }}
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev pkg-config cmake lld ${{ matrix.extra_sys_deps }}
+      - name: Build
+        run: cargo build -p krishiv --release --features full --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          NAME="krishiv-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/krishiv" "dist/${NAME}/"
+          cp README.md LICENSE "dist/${NAME}/"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          sha256sum "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.tar.gz*
+          retention-days: 7
+
+  # ── 2b. Python wheels (maturin, multi-platform) ──────────────────────────────
+  #
+  #  Matrix:
+  #    Linux x86_64  – manylinux container via maturin-action (multiple Pythons)
+  #    Linux aarch64 – manylinux container + QEMU
+  #    macOS arm64   – native macos-14 runner
+  #    macOS x86_64  – native macos-13 runner
+  #
+  #  --find-interpreter builds wheels for all Python versions found on the runner.
+  build-wheels:
+    name: Wheel (${{ matrix.os }} / ${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+          - os: macos-14
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - os: macos-13
+            target: x86_64-apple-darwin
+            manylinux: "off"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          command: build
+          args: --release --out dist/ --find-interpreter
+          manifest-path: crates/krishiv-python/pyproject.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          retention-days: 7
+
+  # ── 2c. Docker images (multi-platform via buildx) ────────────────────────────
+  #
+  #  Variants pushed to ghcr.io:
+  #    k8s   — coordinator + operator, thin-LTO build (default tag, no suffix)
+  #    full  — all optional features (kafka, iceberg, etcd, delta, etc.)
+  docker:
+    name: Docker (${{ matrix.variant }})
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: k8s
+            features: k8s
+            profile: release-k8s
+            tag_suffix: ""
+          - variant: full
+            features: full
+            profile: release-k8s
+            tag_suffix: "-full"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: suffix=${{ matrix.tag_suffix }},onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.is_prerelease == 'false' }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.build
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            FEATURES=${{ matrix.features }}
+            PROFILE=${{ matrix.profile }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=docker-${{ matrix.variant }}
+          cache-to: type=gha,scope=docker-${{ matrix.variant }},mode=max
+
+  # ── 2d. Helm chart — package and push to OCI registry ───────────────────────
+  helm:
+    name: Helm Chart
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.92.0
-      - name: Install system dependencies
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.0
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stamp Chart.yaml with release version
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld protobuf-compiler
-      - name: Validate tag and project metadata
-        run: python3 scripts/check_release.py --tag "${GITHUB_REF_NAME}"
-      - name: Build standard engine binary
-        run: cargo build -p krishiv --release --features full
-      - name: Package and checksum
+          VERSION="${{ needs.validate.outputs.version }}"
+          sed -i "s/^version:.*/version: ${VERSION}/" k8s/helm/krishiv/Chart.yaml
+          sed -i 's/^appVersion:.*/appVersion: "'"${VERSION}"'"/' k8s/helm/krishiv/Chart.yaml
+      - name: Package
         run: |
-          mkdir -p dist/krishiv-${GITHUB_REF_NAME}-x86_64-linux
-          cp target/release/krishiv README.md LICENSE dist/krishiv-${GITHUB_REF_NAME}-x86_64-linux/
-          tar -C dist -czf dist/krishiv-${GITHUB_REF_NAME}-x86_64-linux.tar.gz krishiv-${GITHUB_REF_NAME}-x86_64-linux
-          sha256sum dist/krishiv-${GITHUB_REF_NAME}-x86_64-linux.tar.gz > dist/krishiv-${GITHUB_REF_NAME}-x86_64-linux.tar.gz.sha256
+          mkdir -p dist/helm
+          helm package k8s/helm/krishiv --destination dist/helm
+      - name: Push chart to OCI registry
+        run: helm push dist/helm/krishiv-*.tgz oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: dist/helm/*.tgz
+          retention-days: 7
+
+  # ── 3. Generate SBOM ────────────────────────────────────────────────────────
+  sbom:
+    name: SBOM
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Generate SBOM
+        run: |
+          python3 scripts/generate_sbom.py \
+            --output sbom-${{ needs.validate.outputs.version }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom-*.json
+          retention-days: 7
+
+  # ── 4. GitHub Release ────────────────────────────────────────────────────────
+  github-release:
+    name: GitHub Release
+    needs: [validate, build-binary, build-wheels, docker, helm, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist/
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist/wheels/
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: helm-chart
+          path: dist/helm/
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist/
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: ${{ needs.validate.outputs.is_prerelease == 'true' }}
           files: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/wheels/*.whl
+            dist/helm/*.tgz
+            dist/sbom-*.json
+
+  # ── 5a. Publish Python wheel to PyPI (stable releases only) ─────────────────
+  #
+  #  Requires: PyPI trusted publisher configured for this repo + environment.
+  #  Setup: https://docs.pypi.org/trusted-publishers/adding-a-publisher/
+  publish-pypi:
+    name: Publish PyPI
+    needs: [validate, github-release]
+    if: needs.validate.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-publish
+      url: https://pypi.org/project/krishiv/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist/
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  # ── 5b. Publish Rust crates to crates.io (stable releases only) ─────────────
+  #
+  #  Requires: CARGO_REGISTRY_TOKEN secret + "crates-publish" environment.
+  #  Crates are published in topological (dependency) order with a delay
+  #  between each to allow crates.io index propagation.
+  publish-crates:
+    name: Publish Crates.io
+    needs: [validate, github-release]
+    if: needs.validate.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    environment: crates-publish
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld
+      - name: Publish crates in topological order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -e
+          CRATES=(
+            krishiv-common
+            krishiv-proto
+            krishiv-metrics
+            krishiv-plan
+            krishiv-dataflow
+            krishiv-state
+            krishiv-shuffle
+            krishiv-connectors
+            krishiv-sql
+            krishiv-scheduler
+            krishiv-executor
+            krishiv-runtime
+            krishiv-api
+            krishiv-flight-sql
+            krishiv-operator
+            krishiv-ui
+            krishiv-python
+            krishiv
+          )
+          for crate in "${CRATES[@]}"; do
+            echo "==> Publishing $crate"
+            cargo publish -p "$crate" --no-verify || echo "WARNING: $crate publish failed (may already exist at this version)"
+            sleep 30
+          done

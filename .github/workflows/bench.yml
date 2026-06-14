@@ -1,44 +1,37 @@
 name: Benchmarks
 
+# Only run on main branch pushes and manual dispatch — not on every PR —
+# to avoid burning runner minutes on benchmark noise.
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.92"
   TMPDIR: .tmp
+  CXXFLAGS: "-include cstdint"
 
 jobs:
   bench:
+    name: TPC-H / Nexmark
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
-
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
       - name: Install system deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libssl-dev pkg-config cmake lld
-
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld
       - uses: taiki-e/install-action@just
 
-      # On pull requests, restore the most recent main baseline and compare.
-      - name: Restore main baseline (PR only)
-        if: github.event_name == 'pull_request'
+      - name: Restore main baseline
         uses: actions/cache/restore@v4
         with:
           path: target/criterion
@@ -46,15 +39,18 @@ jobs:
           restore-keys: bench-baseline-main-
 
       - name: Record benchmark environment
-        run: python3 scripts/benchmark_manifest.py --suite criterion --command "just bench" --output benchmark-manifest.json
+        run: |
+          python3 scripts/benchmark_manifest.py \
+            --suite criterion \
+            --command "just bench" \
+            --output benchmark-manifest.json
 
-      - name: Run benchmarks (Bencher-format output)
+      - name: Run benchmarks
         run: |
           mkdir -p .tmp
           just bench | tee bench-output.txt
 
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: bench-results-${{ github.sha }}
           path: |
@@ -62,31 +58,10 @@ jobs:
             benchmark-manifest.json
           retention-days: 90
 
-      # On pushes to main, save a criterion baseline for future PR comparisons.
-      - name: Save baseline (main branch only)
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      - name: Save main baseline
         run: just bench-save main
 
-      - name: Cache criterion baselines (main branch only)
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: actions/cache/save@v4
+      - uses: actions/cache/save@v4
         with:
           path: target/criterion
           key: bench-baseline-main-${{ github.sha }}
-
-      - name: Compare against main baseline (PR only)
-        if: github.event_name == 'pull_request'
-        run: |
-          if [ -d target/criterion/main ]; then
-            just bench-compare main 2>&1 | tee bench-compare.txt || true
-          else
-            echo "No main baseline available yet — skipping comparison"
-          fi
-
-      - name: Upload baseline comparison (PR only)
-        if: github.event_name == 'pull_request' && hashFiles('bench-compare.txt') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-comparison-${{ github.sha }}
-          path: bench-compare.txt
-          retention-days: 90
