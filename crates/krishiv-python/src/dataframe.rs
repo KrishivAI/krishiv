@@ -284,6 +284,11 @@ impl PyDataFrame {
             .map_err(map_krishiv_error)
     }
 
+    /// Alias for `except_all` that avoids the Python `except` keyword conflict.
+    pub fn except_(&self, right: &PyDataFrame) -> PyResult<Self> {
+        self.except_all(right)
+    }
+
     pub fn pivot(
         &self,
         groups: Vec<PyColumn>,
@@ -689,6 +694,36 @@ impl PyGroupedDataFrame {
         let aggregates = aggregates
             .into_iter()
             .map(|column| column.inner)
+            .collect::<Vec<_>>();
+        self.dataframe
+            .group_by(&self.group_exprs)
+            .agg_grouping(grouping, &aggregates)
+            .map(|inner| PyDataFrame { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Apply explicit `GROUPING SETS` — each inner list defines one grouping set.
+    ///
+    /// ## Example
+    /// ```python
+    /// df.group_by(["region"]).agg_grouping_sets(
+    ///     sets=[[col("region"), col("product")], [col("region")]],
+    ///     aggregates=[sum("amount").alias("total")],
+    /// )
+    /// ```
+    pub fn agg_grouping_sets(
+        &self,
+        sets: Vec<Vec<PyColumn>>,
+        aggregates: Vec<PyColumn>,
+    ) -> PyResult<PyDataFrame> {
+        let grouping = krishiv_api::GroupingSpec::Sets(
+            sets.into_iter()
+                .map(|set| set.into_iter().map(|c| c.inner).collect())
+                .collect(),
+        );
+        let aggregates = aggregates
+            .into_iter()
+            .map(|c| c.inner)
             .collect::<Vec<_>>();
         self.dataframe
             .group_by(&self.group_exprs)

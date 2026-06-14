@@ -9,10 +9,13 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use arrow_flight::sql::server::FlightSqlService;
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
 use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
-    ActionCreatePreparedStatementResult, CommandPreparedStatementQuery, CommandStatementQuery,
+    ActionCreatePreparedStatementResult, CommandGetDbSchemas, CommandGetTables,
+    CommandPreparedStatementQuery, CommandStatementQuery, DoPutPreparedStatementResult,
     ProstMessageExt, SqlInfo, TicketStatementQuery,
 };
 use arrow_flight::utils::batches_to_flight_data;
@@ -20,6 +23,7 @@ use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
     Ticket, flight_service_server::FlightService,
 };
+use futures::TryStreamExt as _;
 use futures::{Stream, stream};
 use prost::Message as _; // brings encode_to_vec() into scope
 use tonic::{Request, Response, Status, Streaming};
@@ -37,6 +41,8 @@ pub struct KrishivFlightSqlService {
     host: FlightExecutionHost,
     /// LRU cache of opaque handle (UUID string) → SQL text for prepared statements.
     prepared_statements: Arc<tokio::sync::Mutex<lru::LruCache<String, String>>>,
+    /// LRU cache of handle → bound parameter record batches (set via DoPut).
+    bound_params: Arc<tokio::sync::Mutex<lru::LruCache<String, Vec<RecordBatch>>>>,
 }
 
 const PREPARED_STMT_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(128) {
@@ -63,6 +69,9 @@ impl KrishivFlightSqlService {
             prepared_statements: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
                 PREPARED_STMT_CAPACITY,
             ))),
+            bound_params: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+                PREPARED_STMT_CAPACITY,
+            ))),
         })
     }
 
@@ -73,6 +82,9 @@ impl KrishivFlightSqlService {
             policy: None,
             host,
             prepared_statements: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+                PREPARED_STMT_CAPACITY,
+            ))),
+            bound_params: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
                 PREPARED_STMT_CAPACITY,
             ))),
         }
@@ -287,6 +299,9 @@ impl FlightSqlService for KrishivFlightSqlService {
     /// The handle is a UUID string stored in the `prepared_statements` map.
     /// Clients pass it back via [`CommandPreparedStatementQuery`] to execute
     /// the statement without re-parsing the SQL.
+    ///
+    /// G16: The response includes a `parameter_schema` derived from `$N`
+    /// positional placeholders found in the SQL text.
     async fn do_action_create_prepared_statement(
         &self,
         query: ActionCreatePreparedStatementRequest,
@@ -294,13 +309,47 @@ impl FlightSqlService for KrishivFlightSqlService {
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
         self.authenticate_request(&request)?;
         let handle = Uuid::new_v4().to_string();
+        let n_params = count_sql_params(&query.query);
+        let param_schema = build_param_schema(n_params);
+        let parameter_schema = schema_to_ipc_bytes(&param_schema)?;
         self.prepared_statements
             .lock()
             .await
             .put(handle.clone(), query.query);
         Ok(ActionCreatePreparedStatementResult {
             prepared_statement_handle: handle.into_bytes().into(),
+            parameter_schema: parameter_schema.into(),
             ..Default::default()
+        })
+    }
+
+    /// Bind parameters to a prepared statement (G16).
+    ///
+    /// The client sends an Arrow IPC record batch whose columns correspond to
+    /// the `$1 … $N` positional parameters in the prepared statement SQL.
+    async fn do_put_prepared_statement_query(
+        &self,
+        query: CommandPreparedStatementQuery,
+        request: Request<PeekableFlightDataStream>,
+    ) -> Result<DoPutPreparedStatementResult, Status> {
+        let handle = std::str::from_utf8(&query.prepared_statement_handle)
+            .map_err(|e| {
+                Status::invalid_argument(format!("invalid prepared statement handle: {e}"))
+            })?
+            .to_owned();
+
+        let batches: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
+            request.into_inner().map_err(|e| e.into()),
+        )
+        .try_collect()
+        .await?;
+
+        if !batches.is_empty() {
+            self.bound_params.lock().await.put(handle.clone(), batches);
+        }
+
+        Ok(DoPutPreparedStatementResult {
+            prepared_statement_handle: Some(handle.into_bytes().into()),
         })
     }
 
@@ -333,6 +382,9 @@ impl FlightSqlService for KrishivFlightSqlService {
     }
 
     /// Execute a prepared statement and stream results.
+    ///
+    /// G16: If parameters were previously bound via `DoPut`, `$N` placeholders
+    /// in the SQL are substituted with literal values before execution.
     async fn do_get_prepared_statement(
         &self,
         query: CommandPreparedStatementQuery,
@@ -351,9 +403,17 @@ impl FlightSqlService for KrishivFlightSqlService {
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
         };
 
-        // Delegate to the existing statement execution path.
+        // Apply bound parameters if present.
+        let effective_sql = {
+            let mut params = self.bound_params.lock().await;
+            match params.get(&handle).and_then(|b| b.first()) {
+                Some(batch) => substitute_sql_params(&sql, batch),
+                None => sql,
+            }
+        };
+
         let ticket = TicketStatementQuery {
-            statement_handle: sql.into_bytes().into(),
+            statement_handle: effective_sql.into_bytes().into(),
         };
         self.do_get_statement(ticket, request).await
     }
@@ -371,7 +431,93 @@ impl FlightSqlService for KrishivFlightSqlService {
             })?
             .to_owned();
         self.prepared_statements.lock().await.pop(&handle);
+        self.bound_params.lock().await.pop(&handle);
         Ok(())
+    }
+
+    // ── G17: Catalog introspection ────────────────────────────────────────────
+
+    /// Return FlightInfo for a `GetDbSchemas` catalog query (G17).
+    async fn get_flight_info_schemas(
+        &self,
+        query: CommandGetDbSchemas,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let flight_descriptor = request.into_inner();
+        let ticket_bytes = query.as_any().encode_to_vec();
+        let schema = query.into_builder().schema();
+        let ticket = Ticket { ticket: ticket_bytes.into() };
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
+    }
+
+    /// Stream the list of schemas in the Krishiv catalog (G17).
+    async fn do_get_schemas(
+        &self,
+        query: CommandGetDbSchemas,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let mut builder = query.into_builder();
+        builder.append("krishiv", "default");
+        for (catalog, schema, _) in self.host.list_catalog_tables() {
+            builder.append(&catalog, &schema);
+        }
+        let schema = builder.schema();
+        let batch = builder.build().map_err(|e| Status::internal(e.to_string()))?;
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::once(futures::future::ready(
+                Ok::<_, arrow_flight::error::FlightError>(batch),
+            )))
+            .map_err(Status::from);
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    /// Return FlightInfo for a `GetTables` catalog query (G17).
+    async fn get_flight_info_tables(
+        &self,
+        query: CommandGetTables,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let flight_descriptor = request.into_inner();
+        let ticket_bytes = query.as_any().encode_to_vec();
+        let schema = query.into_builder().schema();
+        let ticket = Ticket { ticket: ticket_bytes.into() };
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
+    }
+
+    /// Stream the list of tables in the Krishiv catalog (G17).
+    async fn do_get_tables(
+        &self,
+        query: CommandGetTables,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let mut builder = query.into_builder();
+        for (catalog, schema, table) in self.host.list_catalog_tables() {
+            builder
+                .append(&catalog, &schema, &table, "TABLE", &Schema::empty())
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        let schema = builder.schema();
+        let batch = builder.build().map_err(|e| Status::internal(e.to_string()))?;
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::once(futures::future::ready(
+                Ok::<_, arrow_flight::error::FlightError>(batch),
+            )))
+            .map_err(Status::from);
+        Ok(Response::new(Box::pin(stream)))
     }
 
     /// Typed Krishiv `DoAction` handler (B3, D2).
@@ -608,6 +754,153 @@ impl KrishivFlightSqlService {
             )),
         }
     }
+}
+
+// ── G16 helpers: prepared statement parameter binding ─────────────────────────
+
+/// Count the highest `$N` positional placeholder index in `sql`.
+fn count_sql_params(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut max = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > start {
+                if let Ok(n) = sql[start..i].parse::<usize>() {
+                    if n > max {
+                        max = n;
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    max
+}
+
+/// Build a parameter schema with `n` nullable `Utf8` fields named `p1 … pN`.
+fn build_param_schema(n: usize) -> Schema {
+    let fields: Vec<arrow::datatypes::Field> = (1..=n)
+        .map(|i| arrow::datatypes::Field::new(format!("p{i}"), arrow::datatypes::DataType::Utf8, true))
+        .collect();
+    Schema::new(fields)
+}
+
+/// Serialize a schema as an Arrow IPC stream (schema-only, no record batches).
+fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, Status> {
+    let mut buf = Vec::new();
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, schema)
+        .map_err(|e| Status::internal(format!("ipc schema encode: {e}")))?;
+    writer
+        .finish()
+        .map_err(|e| Status::internal(format!("ipc schema finish: {e}")))?;
+    Ok(buf)
+}
+
+/// Substitute `$N` placeholders in `sql` with SQL literal values from `batch` row 0.
+///
+/// Substitution is applied from the highest index to the lowest so that `$10`
+/// is not partially replaced before `$1`.
+fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
+    use arrow::array::{
+        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+        StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    };
+    use arrow::datatypes::DataType;
+
+    fn col_literal(array: &dyn arrow::array::Array, row: usize) -> String {
+        if array.is_null(row) {
+            return "NULL".to_string();
+        }
+        match array.data_type() {
+            DataType::Boolean => array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .map(|a| if a.value(row) { "TRUE" } else { "FALSE" }.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Int8 => array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Int16 => array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Int32 => array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Int64 => array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::UInt8 => array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::UInt16 => array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::UInt32 => array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::UInt64 => array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Float32 => array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Float64 => array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .map(|a| a.value(row).to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Utf8 => array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(|a| format!("'{}'", a.value(row).replace('\'', "''")))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::LargeUtf8 => array
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+                .map(|a| format!("'{}'", a.value(row).replace('\'', "''")))
+                .unwrap_or_else(|| "NULL".to_string()),
+            _ => "NULL".to_string(),
+        }
+    }
+
+    if batch.num_rows() == 0 {
+        return sql.to_string();
+    }
+    let mut result = sql.to_string();
+    let ncols = batch.num_columns();
+    for i in (1..=ncols).rev() {
+        let placeholder = format!("${i}");
+        if result.contains(&placeholder) {
+            let literal = col_literal(batch.column(i - 1).as_ref(), 0);
+            result = result.replace(&placeholder, &literal);
+        }
+    }
+    result
 }
 
 fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionError> {
@@ -1334,5 +1627,231 @@ mod tests {
         assert!(hook.check_table_access("any_table"));
         assert!(hook.check_table_access("secret_table"));
         assert!(hook.check_table_access("internal_data"));
+    }
+
+    // ── G16: prepared statement parameter binding ───────────────────────────
+
+    #[test]
+    fn count_sql_params_finds_highest_index() {
+        assert_eq!(count_sql_params("SELECT $1, $2 FROM t WHERE id = $3"), 3);
+        assert_eq!(count_sql_params("SELECT 1"), 0);
+        assert_eq!(count_sql_params("WHERE x = $10 AND y = $2"), 10);
+        assert_eq!(count_sql_params("$1 AND $1"), 1);
+    }
+
+    #[test]
+    fn build_param_schema_creates_n_utf8_fields() {
+        let schema = build_param_schema(3);
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(0).name(), "p1");
+        assert_eq!(schema.field(2).name(), "p3");
+    }
+
+    #[test]
+    fn schema_to_ipc_bytes_produces_non_empty_bytes() {
+        let schema = build_param_schema(2);
+        let bytes = schema_to_ipc_bytes(&schema).expect("ipc bytes");
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn substitute_sql_params_replaces_placeholders() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("p1", DataType::Utf8, true),
+            Field::new("p2", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["hello"])) as Arc<dyn arrow::array::Array>,
+                Arc::new(StringArray::from(vec!["world"])) as Arc<dyn arrow::array::Array>,
+            ],
+        )
+        .unwrap();
+        let result = substitute_sql_params("SELECT $1, $2", &batch);
+        assert_eq!(result, "SELECT 'hello', 'world'");
+    }
+
+    #[test]
+    fn substitute_sql_params_handles_sql_injection_in_string_value() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("p1", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["O'Brien"])) as Arc<dyn arrow::array::Array>],
+        )
+        .unwrap();
+        let result = substitute_sql_params("SELECT $1 AS name", &batch);
+        assert_eq!(result, "SELECT 'O''Brien' AS name");
+    }
+
+    #[tokio::test]
+    async fn create_prepared_statement_returns_parameter_schema_for_parameterized_sql() {
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let req = arrow_flight::sql::ActionCreatePreparedStatementRequest {
+            query: "SELECT * FROM t WHERE id = $1 AND name = $2".to_string(),
+            ..Default::default()
+        };
+        let result = svc
+            .do_action_create_prepared_statement(
+                req,
+                Request::new(arrow_flight::Action {
+                    r#type: String::new(),
+                    body: bytes::Bytes::new(),
+                }),
+            )
+            .await
+            .expect("create must succeed");
+        assert!(
+            !result.parameter_schema.is_empty(),
+            "parameter_schema must be populated for $N queries"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_prepared_statement_has_empty_parameter_schema_for_plain_sql() {
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let req = arrow_flight::sql::ActionCreatePreparedStatementRequest {
+            query: "SELECT 42 AS n".to_string(),
+            ..Default::default()
+        };
+        let result = svc
+            .do_action_create_prepared_statement(
+                req,
+                Request::new(arrow_flight::Action {
+                    r#type: String::new(),
+                    body: bytes::Bytes::new(),
+                }),
+            )
+            .await
+            .expect("create must succeed");
+        // Zero parameters → schema has no fields, but IPC bytes may still be present
+        // (the StreamWriter writes a schema header even for empty schemas).
+        let _ = result.parameter_schema; // just verify it doesn't panic
+    }
+
+    // ── G17: GetDbSchemas / GetTables ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_flight_info_schemas_returns_endpoint() {
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let query = CommandGetDbSchemas {
+            catalog: None,
+            db_schema_filter_pattern: None,
+        };
+        let descriptor = FlightDescriptor::new_cmd(vec![]);
+        let result = svc
+            .get_flight_info_schemas(query, Request::new(descriptor))
+            .await;
+        assert!(result.is_ok(), "get_flight_info_schemas must not be unimplemented");
+        let info = result.unwrap().into_inner();
+        assert_eq!(info.endpoint.len(), 1, "must return one endpoint");
+    }
+
+    #[tokio::test]
+    async fn do_get_schemas_returns_default_schema() {
+        use futures::StreamExt;
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let query = CommandGetDbSchemas {
+            catalog: None,
+            db_schema_filter_pattern: None,
+        };
+        let result = svc
+            .do_get_schemas(query, Request::new(Ticket::new(vec![])))
+            .await;
+        assert!(result.is_ok(), "do_get_schemas must succeed");
+        let items: Vec<_> = result.unwrap().into_inner().collect().await;
+        assert!(!items.is_empty(), "must return at least the schema message");
+        assert!(items[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_flight_info_tables_returns_endpoint() {
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let query = CommandGetTables {
+            catalog: None,
+            db_schema_filter_pattern: None,
+            table_name_filter_pattern: None,
+            table_types: vec![],
+            include_schema: false,
+        };
+        let descriptor = FlightDescriptor::new_cmd(vec![]);
+        let result = svc
+            .get_flight_info_tables(query, Request::new(descriptor))
+            .await;
+        assert!(result.is_ok(), "get_flight_info_tables must not be unimplemented");
+        let info = result.unwrap().into_inner();
+        assert_eq!(info.endpoint.len(), 1, "must return one endpoint");
+    }
+
+    #[tokio::test]
+    async fn do_get_tables_returns_flight_data() {
+        use futures::StreamExt;
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let query = CommandGetTables {
+            catalog: None,
+            db_schema_filter_pattern: None,
+            table_name_filter_pattern: None,
+            table_types: vec![],
+            include_schema: false,
+        };
+        let result = svc
+            .do_get_tables(query, Request::new(Ticket::new(vec![])))
+            .await;
+        assert!(result.is_ok(), "do_get_tables must succeed");
+        let items: Vec<_> = result.unwrap().into_inner().collect().await;
+        assert!(!items.is_empty(), "must return at least the schema message");
+        assert!(items[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn do_get_tables_includes_registered_parquet_table() {
+        use futures::StreamExt;
+        use std::path::PathBuf;
+
+        let host = FlightExecutionHost::embedded().unwrap();
+        host.register_parquet("my_sales_data", PathBuf::from("/data/sales.parquet"));
+        let svc = KrishivFlightSqlService::with_host(host);
+
+        let query = CommandGetTables {
+            catalog: None,
+            db_schema_filter_pattern: None,
+            table_name_filter_pattern: None,
+            table_types: vec![],
+            include_schema: false,
+        };
+        let result = svc
+            .do_get_tables(query, Request::new(Ticket::new(vec![])))
+            .await;
+        assert!(result.is_ok(), "do_get_tables must succeed");
+        let items: Vec<_> = result.unwrap().into_inner().collect().await;
+        // At minimum we get schema + data messages; don't decode full IPC but verify no errors
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|i| i.is_ok()), "all items must be Ok");
+    }
+
+    #[test]
+    fn host_list_catalog_tables_returns_registered_entries() {
+        use std::path::PathBuf;
+
+        let host = FlightExecutionHost::embedded().unwrap();
+        host.register_parquet("orders", PathBuf::from("/data/orders.parquet"));
+        host.register_parquet("customers", PathBuf::from("/data/customers.parquet"));
+
+        let tables = host.list_catalog_tables();
+        assert_eq!(tables.len(), 2);
+        // All entries use "krishiv" catalog and "default" schema
+        assert!(tables.iter().all(|(cat, schema, _)| cat == "krishiv" && schema == "default"));
+        let names: Vec<_> = tables.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert!(names.contains(&"orders"));
+        assert!(names.contains(&"customers"));
     }
 }

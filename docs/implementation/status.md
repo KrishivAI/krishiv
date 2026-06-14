@@ -1,5 +1,46 @@
 # Krishiv Implementation Status
 
+## 2026-06-14 — G16 + G17: Flight SQL prepared-parameter binding and catalog introspection
+
+### G16 — Prepared statement `$N` parameter binding
+
+**`crates/krishiv-flight-sql/src/lib.rs`**:
+- `do_action_create_prepared_statement`: counts `$N` placeholders via `count_sql_params()`, builds
+  a `parameter_schema` (Arrow IPC bytes, one nullable `Utf8` field per placeholder) and populates
+  `ActionCreatePreparedStatementResult.parameter_schema`.
+- `do_put_prepared_statement_query` (new): accepts a `PeekableFlightDataStream` of bound
+  parameter batches (decoded via `FlightRecordBatchStream`), stores the first batch in the new
+  `bound_params: LruCache<String, Vec<RecordBatch>>` keyed by handle.
+- `do_get_prepared_statement`: if bound params exist, substitutes `$N` with SQL literal values
+  via `substitute_sql_params()` before delegating to `do_get_statement`. Strings are
+  single-quote-escaped; integers/floats rendered as unquoted numbers; booleans as `TRUE`/`FALSE`.
+- `do_action_close_prepared_statement`: now also removes the handle from `bound_params`.
+
+Helper fns added: `count_sql_params`, `build_param_schema`, `schema_to_ipc_bytes`,
+`substitute_sql_params`, `col_literal` (inner fn).
+
+### G17 — `GetDbSchemas` / `GetTables` Flight SQL RPCs
+
+**`crates/krishiv-flight-sql/src/host.rs`**:
+- `list_catalog_tables() -> Vec<(catalog, schema, table)>` — enumerates registered Parquet files.
+
+**`crates/krishiv-flight-sql/src/lib.rs`**:
+- `get_flight_info_schemas` + `do_get_schemas`: ticket-encodes `CommandGetDbSchemas`, streams the
+  "krishiv"/"default" schema plus any Parquet catalog entries via `GetDbSchemasBuilder`.
+- `get_flight_info_tables` + `do_get_tables`: ticket-encodes `CommandGetTables`, streams all
+  registered tables with type "TABLE" via `GetTablesBuilder`.
+- Both use `FlightDataEncoderBuilder` to produce the correct Arrow Flight data stream.
+
+### Validation
+
+```
+cargo check -p krishiv-flight-sql         # 0 errors
+cargo test -p krishiv-flight-sql --lib    # 49/49 passed (13 new tests)
+cargo check --workspace                   # 0 errors
+```
+
+---
+
 ## 2026-06-14 — Deep clean of `krishiv-dataflow` crate
 
 Completed:

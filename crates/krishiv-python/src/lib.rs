@@ -52,7 +52,10 @@ pub use relation::PyRelation;
 pub use schema::PySchema;
 pub use session::{PyOperationRegistry, PySession};
 pub use sinks::{PyIcebergSink, PyKafkaSink, PyParquetSink};
-pub use stream::{PyKeyedStream, PyStream, PyWindowedStream};
+pub use stream::{
+    PyBroadcastStream, PyConnectedStreams, PyKeyedStream, PyMultiSourceWatermarkSpec, PyStream,
+    PyWindowedStream,
+};
 pub use streaming::{PyDataStreamWriter, PyStreamingQuery, PyStreamingQueryProgress};
 pub use udf::call_python_udf;
 pub use vector_sinks::{PyInMemoryVectorSink, PyScoredChunk};
@@ -89,6 +92,10 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<stream::PyStream>()?;
     m.add_class::<stream::PyKeyedStream>()?;
     m.add_class::<stream::PyWindowedStream>()?;
+    m.add_class::<stream::PyConnectedStreams>()?;
+    m.add_class::<stream::PyMultiSourceWatermarkSpec>()?;
+    m.add_class::<stream::PyBroadcastStream>()?;
+    m.add_class::<stream::PyBroadcastContext>()?;
     m.add_class::<batch::PyBatch>()?;
     m.add_class::<query_result::PyQueryResult>()?;
     m.add_class::<query_result::PyQueryResultIter>()?;
@@ -119,6 +126,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sources::read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(sources::read_kafka, m)?)?;
     m.add_function(wrap_pyfunction!(sources::read_iceberg, m)?)?;
+    m.add_function(wrap_pyfunction!(sources::read_kinesis, m)?)?;
+    m.add_function(wrap_pyfunction!(sources::read_pulsar, m)?)?;
     m.add_function(wrap_pyfunction!(batch::make_example_batch, m)?)?;
     m.add_function(wrap_pyfunction!(migration::register_state_migration, m)?)?;
     m.add_function(wrap_pyfunction!(migration::state_migration, m)?)?;

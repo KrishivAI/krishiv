@@ -214,3 +214,165 @@ fn read_iceberg_impl(
         0,
     ))
 }
+
+// ── G13: Kinesis source ───────────────────────────────────────────────────────
+
+/// Read batches from an Amazon Kinesis Data Stream.
+///
+/// **Feature gate**: requires the `kinesis` feature (`pip install krishiv[kinesis]`).
+///
+/// Reads up to `max_batches` record batches from the specified shard and
+/// registers them as an in-memory stream named `stream_name`.
+///
+/// Schema: `sequence_number Utf8`, `partition_key Utf8`, `data Binary`,
+/// `arrival_timestamp_ms Int64`.
+///
+/// `start_position` — one of `"trim_horizon"` (default), `"latest"`,
+///   `"after:<seq>"`, or `"at:<seq>"`.
+#[pyfunction]
+#[pyo3(signature = (session, stream_name, region, *, shard_id="shardId-000000000000", start_position="trim_horizon", max_batches=10, batch_size=100))]
+pub fn read_kinesis(
+    py: Python<'_>,
+    session: &PySession,
+    stream_name: String,
+    region: String,
+    shard_id: &str,
+    start_position: &str,
+    max_batches: usize,
+    batch_size: i32,
+) -> PyResult<PyStream> {
+    #[cfg(not(feature = "kinesis"))]
+    {
+        let _ = (session, stream_name, region, shard_id, start_position, max_batches, batch_size);
+        return Err(ConnectorError::new_err(
+            "Kinesis support requires the `kinesis` feature (pip install krishiv[kinesis])",
+        ));
+    }
+    #[cfg(feature = "kinesis")]
+    {
+        use krishiv_connectors::kinesis::{KinesisConfig, KinesisSource, ShardPosition};
+
+        let start = match start_position {
+            "trim_horizon" | "TrimHorizon" => ShardPosition::TrimHorizon,
+            "latest" | "Latest" => ShardPosition::Latest,
+            s if s.starts_with("after:") => ShardPosition::AfterSequenceNumber(s[6..].to_string()),
+            s if s.starts_with("at:") => ShardPosition::AtSequenceNumber(s[3..].to_string()),
+            other => {
+                return Err(ConnectorError::new_err(format!(
+                    "unknown start_position '{other}'; expected trim_horizon, latest, after:<seq>, or at:<seq>"
+                )));
+            }
+        };
+        let cfg = KinesisConfig {
+            stream_name: stream_name.clone(),
+            region,
+            shard_id: shard_id.to_string(),
+            start,
+            batch_size,
+        };
+        let inner = session.inner.clone();
+        let name = stream_name.clone();
+        let batches = py
+            .detach(move || {
+                crate::session::block_on_async(async move {
+                    let mut src = KinesisSource::new(cfg).await.map_err(|e| {
+                        krishiv_api::KrishivError::Runtime { message: e.to_string() }
+                    })?;
+                    let mut collected = Vec::new();
+                    for _ in 0..max_batches {
+                        match src.next_batch().await {
+                            Ok(Some(batch)) => collected.push(batch),
+                            Ok(None) => break,
+                            Err(e) => {
+                                return Err(krishiv_api::KrishivError::Runtime {
+                                    message: e.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    inner
+                        .register_memory_stream(&name, collected)
+                        .map_err(krishiv_api::KrishivError::from)?;
+                    Ok::<_, krishiv_api::KrishivError>(())
+                })
+            })
+            .map_err(crate::errors::map_krishiv_error)?;
+        let _ = batches;
+        Ok(PyStream::from_pipeline(
+            session.inner.clone(),
+            format!("memory:{stream_name}"),
+            String::new(),
+            0,
+        ))
+    }
+}
+
+// ── G14: Pulsar source ────────────────────────────────────────────────────────
+
+/// Read batches from an Apache Pulsar topic.
+///
+/// **Feature gate**: requires the `pulsar` feature (`pip install krishiv[pulsar]`).
+///
+/// Reads up to `max_batches` record batches from the specified topic and
+/// registers them as an in-memory stream named after the `topic`.
+///
+/// Schema: `topic Utf8`, `partition_key Utf8 (nullable)`, `publish_time_ms Int64`,
+/// `data Binary`.
+#[pyfunction]
+#[pyo3(signature = (session, broker_url, topic, *, subscription="krishiv-default", max_batches=10, batch_size=100))]
+pub fn read_pulsar(
+    py: Python<'_>,
+    session: &PySession,
+    broker_url: String,
+    topic: String,
+    subscription: &str,
+    max_batches: usize,
+    batch_size: usize,
+) -> PyResult<PyStream> {
+    #[cfg(not(feature = "pulsar"))]
+    {
+        let _ = (session, broker_url, topic, subscription, max_batches, batch_size);
+        return Err(ConnectorError::new_err(
+            "Pulsar support requires the `pulsar` feature (pip install krishiv[pulsar])",
+        ));
+    }
+    #[cfg(feature = "pulsar")]
+    {
+        use krishiv_connectors::pulsar_connector::{PulsarConfig, PulsarSource};
+
+        let cfg = PulsarConfig::new(&broker_url, &topic)
+            .with_subscription(subscription);
+        let inner = session.inner.clone();
+        let name = topic.clone();
+        py.detach(move || {
+            crate::session::block_on_async(async move {
+                let mut src = PulsarSource::connect(cfg).await.map_err(|e| {
+                    krishiv_api::KrishivError::Runtime { message: e.to_string() }
+                })?;
+                let mut collected = Vec::new();
+                for _ in 0..max_batches {
+                    match src.next_batch(batch_size).await {
+                        Ok(Some(batch)) => collected.push(batch),
+                        Ok(None) => break,
+                        Err(e) => {
+                            return Err(krishiv_api::KrishivError::Runtime {
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                }
+                inner
+                    .register_memory_stream(&name, collected)
+                    .map_err(krishiv_api::KrishivError::from)
+            })
+        })
+        .map_err(crate::errors::map_krishiv_error)?;
+
+        Ok(PyStream::from_pipeline(
+            session.inner.clone(),
+            format!("memory:{topic}"),
+            String::new(),
+            0,
+        ))
+    }
+}

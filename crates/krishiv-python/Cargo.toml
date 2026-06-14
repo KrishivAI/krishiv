@@ -26,12 +26,18 @@ pyo3 = { workspace = true }
 pyo3-arrow = "0.17"
 tokio = { workspace = true }
 futures.workspace = true
+jsonwebtoken.workspace = true
+serde_json.workspace = true
+constant_time_eq.workspace = true
+serde = { workspace = true }
 
 [features]
 default = []
 extension-module = ["pyo3/extension-module"]
 kafka = ["krishiv-connectors/kafka", "krishiv-api/kafka"]
 iceberg = ["krishiv-connectors/iceberg"]
+kinesis = ["krishiv-connectors/kinesis"]
+pulsar = ["krishiv-connectors/pulsar-source"]
 ai = ["dep:krishiv-ai", "krishiv-ai/vector-sinks"]
 vector-sinks = ["ai", "krishiv-ai/vector-sinks"]
 qdrant = ["dep:krishiv-ai", "krishiv-ai/qdrant"]

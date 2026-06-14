@@ -130,6 +130,20 @@ impl FlightExecutionHost {
         self.catalog.insert(table.to_owned(), path.into());
     }
 
+    /// Return all registered catalog tables as (catalog, schema, table_name) tuples.
+    ///
+    /// Used by the Flight SQL catalog handlers (`GetDbSchemas`, `GetTables`) to
+    /// list the tables registered in this host's client-side Parquet catalog.
+    pub(crate) fn list_catalog_tables(&self) -> Vec<(String, String, String)> {
+        let mut entries: Vec<(String, String, String)> = self
+            .catalog
+            .iter()
+            .map(|e| ("krishiv".to_string(), "default".to_string(), e.key().clone()))
+            .collect();
+        entries.sort();
+        entries
+    }
+
     // -------------------------------------------------------------------------
     // Execution methods — dispatched by backend variant.
     // -------------------------------------------------------------------------

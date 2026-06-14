@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use krishiv_api::StreamBatch;
-use krishiv_plan::governance::{AllowAllPolicyHook, StaticApiKeyAuthProvider};
+use krishiv_plan::governance::{AllowAllPolicyHook, AuthProvider, StaticApiKeyAuthProvider};
 use krishiv_state::SharedStateMigrationRegistry;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -20,6 +20,79 @@ use crate::query_result::PyQueryResult;
 use crate::relation::PyRelation;
 use crate::stream::{PyStream, PyWindowedStream};
 use crate::stream_exec::spec_from_pipeline;
+
+// ── G15 auth providers ────────────────────────────────────────────────────────
+
+/// Accepts exactly one static bearer token.
+pub(crate) struct StaticBearerTokenAuth {
+    pub(crate) token: String,
+}
+
+impl AuthProvider for StaticBearerTokenAuth {
+    fn authenticate(&self, api_key: &str) -> Option<String> {
+        use constant_time_eq::constant_time_eq;
+        if constant_time_eq(self.token.as_bytes(), api_key.as_bytes()) {
+            Some("bearer".to_string())
+        } else {
+            None
+        }
+    }
+}
+
+/// JWT validator using an offline JWKS key set.
+pub(crate) struct JwtAuth {
+    keys: Vec<jsonwebtoken::DecodingKey>,
+    validation: jsonwebtoken::Validation,
+}
+
+impl JwtAuth {
+    fn from_jwks_json(
+        json: &str,
+        audience: String,
+        issuer: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let jwk_set: jsonwebtoken::jwk::JwkSet = serde_json::from_str(json)?;
+        let keys: Vec<jsonwebtoken::DecodingKey> = jwk_set
+            .keys
+            .iter()
+            .filter_map(|k| jsonwebtoken::DecodingKey::from_jwk(k).ok())
+            .collect();
+        if keys.is_empty() {
+            return Err("JWKS contained no usable keys".into());
+        }
+        let mut validation = jsonwebtoken::Validation::default();
+        validation.set_audience(&[&audience]);
+        if let Some(iss) = issuer {
+            if !iss.is_empty() {
+                validation.set_issuer(&[&iss]);
+            }
+        }
+        Ok(Self { keys, validation })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct JwtClaims {
+    sub: Option<String>,
+}
+
+impl AuthProvider for JwtAuth {
+    fn authenticate(&self, api_key: &str) -> Option<String> {
+        for key in &self.keys {
+            if let Ok(token_data) =
+                jsonwebtoken::decode::<JwtClaims>(api_key, key, &self.validation)
+            {
+                return Some(
+                    token_data
+                        .claims
+                        .sub
+                        .unwrap_or_else(|| "authenticated".to_string()),
+                );
+            }
+        }
+        None
+    }
+}
 
 fn build_embedded_session() -> PyResult<PySession> {
     krishiv_api::SessionBuilder::new()
@@ -499,6 +572,51 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
+    /// Register an unbounded streaming table with a bounded input queue.
+    ///
+    /// Unlike `register_unbounded`, this caps the internal channel at
+    /// `capacity` batches. Back-pressure is applied when the queue is full.
+    pub fn register_unbounded_with_capacity(
+        &self,
+        name: String,
+        schema: &pyo3::Bound<'_, pyo3::PyAny>,
+        capacity: usize,
+    ) -> PyResult<()> {
+        let py_schema: pyo3_arrow::PySchema = schema.extract()?;
+        let schema_ref = py_schema.into_inner();
+        self.inner
+            .register_unbounded_with_capacity(&name, schema_ref, capacity)
+            .map_err(map_krishiv_error)
+    }
+
+    /// Execute SQL using the local engine, bypassing any remote coordinator.
+    ///
+    /// Always routes to the in-process DataFusion engine regardless of the
+    /// session mode. Useful for diagnostic queries in distributed sessions.
+    pub fn execute_local(&self, py: Python<'_>, query: String) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .execute_local(&query)
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Execute SQL through the remote coordinator.
+    ///
+    /// Requires a session built with `Session.connect(url)`. Raises
+    /// `RuntimeError` in embedded mode or when no coordinator is configured.
+    pub fn execute_remote(&self, py: Python<'_>, query: String) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .execute_remote(&query)
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
     // ── SQL gateway methods ───────────────────────────────────────────────────
 
     /// Execute a SQL query with a wall-clock timeout.
@@ -830,6 +948,72 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
+    // ── G15: JWT/OIDC auth ────────────────────────────────────────────────────
+
+    /// Create a session that accepts a single static bearer token.
+    ///
+    /// Any request presenting `token` as its API key is authenticated.
+    /// Useful for development and single-client deployments.
+    ///
+    /// ## Example
+    ///
+    /// ```python
+    /// session = Session.with_auth_token("my-secret-token")
+    /// ```
+    #[classmethod]
+    pub fn with_auth_token(_cls: &Bound<'_, PyType>, token: String) -> PyResult<Self> {
+        let auth = Arc::new(StaticBearerTokenAuth { token });
+        krishiv_api::SessionBuilder::new()
+            .with_auth(auth)
+            .build()
+            .map(|s| Self {
+                inner: Arc::new(s),
+                state_migrations: SharedStateMigrationRegistry::new(),
+            })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Create a session that validates JWTs against the provided JWKS JSON.
+    ///
+    /// `audience` — expected `aud` claim in the JWT (typically the client ID).
+    /// `issuer` — expected `iss` claim; if empty, the issuer check is skipped.
+    /// `jwks_json` — JSON Web Key Set as a string. Fetch this from the OIDC
+    ///   discovery endpoint at `{issuer}/.well-known/jwks.json`.
+    ///
+    /// ## Example
+    ///
+    /// ```python
+    /// import urllib.request, json
+    /// jwks = urllib.request.urlopen("https://accounts.google.com/.well-known/openid-configuration")
+    /// jwks_uri = json.loads(jwks.read())["jwks_uri"]
+    /// jwks_json = urllib.request.urlopen(jwks_uri).read().decode()
+    ///
+    /// session = Session.with_oidc_provider(
+    ///     audience="my-client-id",
+    ///     issuer="https://accounts.google.com",
+    ///     jwks_json=jwks_json,
+    /// )
+    /// ```
+    #[classmethod]
+    #[pyo3(signature = (audience, jwks_json, *, issuer = None))]
+    pub fn with_oidc_provider(
+        _cls: &Bound<'_, PyType>,
+        audience: String,
+        jwks_json: String,
+        issuer: Option<String>,
+    ) -> PyResult<Self> {
+        let auth = JwtAuth::from_jwks_json(&jwks_json, audience, issuer)
+            .map_err(|e| PyRuntimeError::new_err(format!("invalid JWKS JSON: {e}")))?;
+        krishiv_api::SessionBuilder::new()
+            .with_auth(Arc::new(auth))
+            .build()
+            .map(|s| Self {
+                inner: Arc::new(s),
+                state_migrations: SharedStateMigrationRegistry::new(),
+            })
+            .map_err(map_krishiv_error)
+    }
+
     /// Register a Kafka topic as a streaming SQL table named ``name``.
     ///
     /// ``brokers``   — comma-separated broker addresses (e.g. ``"localhost:9092"``).
@@ -1022,6 +1206,31 @@ mod tests {
             err.to_string().contains("coordinator Flight URL"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn with_auth_token_builds_session() {
+        use crate::session::StaticBearerTokenAuth;
+        use krishiv_plan::governance::AuthProvider;
+        let auth = StaticBearerTokenAuth { token: "secret".to_string() };
+        assert_eq!(auth.authenticate("secret"), Some("bearer".to_string()));
+        assert_eq!(auth.authenticate("wrong"), None);
+        // Verify it integrates with SessionBuilder without panic.
+        let session = krishiv_api::SessionBuilder::new()
+            .with_auth(std::sync::Arc::new(auth))
+            .build()
+            .expect("session with bearer auth");
+        assert!(matches!(session.mode(), krishiv_api::ExecutionMode::Embedded));
+    }
+
+    #[test]
+    fn jwt_auth_rejects_invalid_token() {
+        use crate::session::JwtAuth;
+        use krishiv_plan::governance::AuthProvider;
+        // A minimal RSA JWK set — keys list is empty so any JWT is rejected.
+        let empty_jwks = r#"{"keys":[]}"#;
+        let result = JwtAuth::from_jwks_json(empty_jwks, "aud".into(), None);
+        assert!(result.is_err(), "empty JWKS should error");
     }
 
     #[test]

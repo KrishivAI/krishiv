@@ -24,7 +24,7 @@ fn agg_descriptor_to_expr(desc: &AggDescriptor) -> AggExpr {
     }
 }
 
-async fn resolve_input_batches(
+pub(crate) async fn resolve_input_batches(
     pipeline: &StreamPipeline,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, krishiv_api::KrishivError> {
     if let Some(name) = pipeline.source_id.strip_prefix("memory:") {
