@@ -37,8 +37,8 @@ pub mod native {
 
     const VERSION_HINT: &str = "version-hint.text";
 
-    struct StagedEntry {
-        data_files: Vec<iceberg::spec::DataFile>,
+    pub(crate) struct StagedEntry {
+        pub(crate) data_files: Vec<iceberg::spec::DataFile>,
     }
 
     /// Iceberg-native two-phase commit backed by the local filesystem.
@@ -48,11 +48,11 @@ pub mod native {
     /// iceberg-spec table metadata (manifests + `table-metadata.json`) so that
     /// no partially committed snapshot is ever visible to readers.
     pub struct IcebergNativeTwoPhaseCommit {
-        catalog: Arc<MemoryCatalog>,
-        ident: TableIdent,
+        pub(crate) catalog: Arc<MemoryCatalog>,
+        pub(crate) ident: TableIdent,
         /// Absolute local root path (no URI prefix).
         root: PathBuf,
-        pending: Mutex<HashMap<i64, StagedEntry>>,
+        pub(crate) pending: Mutex<HashMap<i64, StagedEntry>>,
         snap_counter: AtomicI64,
     }
 
