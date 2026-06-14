@@ -60,14 +60,17 @@ pub mod adaptive;
 pub mod aggregate;
 pub mod aligned_input;
 pub mod barrier_align;
+pub mod broadcast_state;
 pub mod cep;
 pub mod coalesce_partitions;
+pub mod connected_streams;
 pub mod continuous;
 pub mod interval_join;
 pub mod join;
 pub mod live_table;
 pub mod lookup_join;
 pub mod memo;
+pub mod operator_config;
 pub mod operator_runtime;
 pub mod process_fn;
 pub mod queue;
@@ -75,6 +78,7 @@ pub mod schema_normalize;
 pub mod side_output;
 pub mod sort;
 mod spill;
+pub mod state_descriptor;
 pub mod temporal_join;
 #[cfg(test)]
 mod watermark_e2e;
@@ -103,7 +107,15 @@ pub use operator_runtime::{
     LocalWindowKindBridge, LocalWindowParams, execute_bounded_window, execute_streaming_window,
     local_spec_to_window_execution,
 };
-pub use process_fn::{ProcessContext, ProcessFunction, ProcessFunctionExecutor};
+pub use broadcast_state::{
+    BroadcastContext, BroadcastProcessExecutor, BroadcastProcessFunction, BroadcastStateDescriptor,
+};
+pub use connected_streams::{CoProcessExecutor, CoProcessFunction, ConnectedStreams};
+pub use operator_config::{OperatorConfig, OperatorUid};
+pub use process_fn::{
+    ProcessContext, ProcessFunction, ProcessFunctionExecutor, TimerEntry, TimerKind,
+};
+pub use state_descriptor::{ListState, MapState, ReducingState, StateError, StateValue, ValueState};
 pub use queue::{
     OperatorMessage, OperatorQueueError, OperatorQueueMetrics, OperatorQueueReceiver,
     OperatorQueueSender, operator_queue,

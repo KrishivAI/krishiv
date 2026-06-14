@@ -1,132 +1,166 @@
-//! Typed, engine-neutral DataFrame expressions.
+//! Typed, engine-neutral DataFrame expressions backed by the versioned plan AST.
 
-/// A validated SQL expression used by the public DataFrame API.
-///
-/// Krishiv keeps DataFusion types out of the public API. Expressions therefore
-/// carry a SQL representation that is parsed by the SQL crate at the lazy
-/// transformation boundary.
+use krishiv_plan::PlanError;
+pub use krishiv_plan::expression::{
+    AggregateFunction, BinaryOperator, EXPRESSION_FORMAT_VERSION, ExprDataType, ExprField,
+    IntervalUnit, NullOrdering, ScalarValue, SortDirection, TimeUnit,
+};
+
+/// Public expression wrapper around Krishiv's structured, versioned AST.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Expr {
-    sql: String,
+    node: krishiv_plan::expression::Expr,
+    rendered_sql: String,
 }
 
 impl Expr {
-    /// Construct an advanced expression from SQL text.
+    pub fn from_node(node: krishiv_plan::expression::Expr) -> Self {
+        let rendered_sql = node.to_sql();
+        Self { node, rendered_sql }
+    }
+    pub fn node(&self) -> &krishiv_plan::expression::Expr {
+        &self.node
+    }
+    pub fn into_node(self) -> krishiv_plan::expression::Expr {
+        self.node
+    }
+    /// Explicit preview escape hatch for advanced SQL not represented by the AST.
     pub fn raw(sql: impl Into<String>) -> Self {
-        Self { sql: sql.into() }
+        Self::from_node(krishiv_plan::expression::Expr::raw(sql))
     }
-
-    /// Return the SQL representation consumed by the engine.
+    /// SQL rendering used only for compatibility and diagnostics.
     pub fn as_sql(&self) -> &str {
-        &self.sql
+        &self.rendered_sql
     }
-
-    /// Assign an output name to this expression.
+    pub fn normalize_json(&self) -> Result<String, PlanError> {
+        self.node.normalize_json()
+    }
+    pub fn encode_versioned(&self) -> Result<Vec<u8>, PlanError> {
+        self.node.encode_versioned()
+    }
+    pub fn decode_versioned(bytes: &[u8]) -> Result<Self, PlanError> {
+        krishiv_plan::expression::Expr::decode_versioned(bytes).map(Self::from_node)
+    }
     pub fn alias(self, name: &str) -> Self {
-        Self::raw(format!("{} AS {}", self.sql, quote_identifier(name)))
+        Self::from_node(self.node.alias(name))
     }
-
     pub fn eq(self, right: Expr) -> Self {
-        self.binary("=", right)
+        self.binary(BinaryOperator::Eq, right)
     }
-
     pub fn not_eq(self, right: Expr) -> Self {
-        self.binary("<>", right)
+        self.binary(BinaryOperator::NotEq, right)
     }
-
     pub fn gt(self, right: Expr) -> Self {
-        self.binary(">", right)
+        self.binary(BinaryOperator::Gt, right)
     }
-
     pub fn gt_eq(self, right: Expr) -> Self {
-        self.binary(">=", right)
+        self.binary(BinaryOperator::GtEq, right)
     }
-
     pub fn lt(self, right: Expr) -> Self {
-        self.binary("<", right)
+        self.binary(BinaryOperator::Lt, right)
     }
-
     pub fn lt_eq(self, right: Expr) -> Self {
-        self.binary("<=", right)
+        self.binary(BinaryOperator::LtEq, right)
     }
-
     pub fn and(self, right: Expr) -> Self {
-        self.binary("AND", right)
+        self.binary(BinaryOperator::And, right)
     }
-
     pub fn or(self, right: Expr) -> Self {
-        self.binary("OR", right)
+        self.binary(BinaryOperator::Or, right)
     }
-
     pub fn plus(self, right: Expr) -> Self {
-        self.binary("+", right)
+        self.binary(BinaryOperator::Plus, right)
     }
-
     pub fn minus(self, right: Expr) -> Self {
-        self.binary("-", right)
+        self.binary(BinaryOperator::Minus, right)
     }
-
     pub fn multiply(self, right: Expr) -> Self {
-        self.binary("*", right)
+        self.binary(BinaryOperator::Multiply, right)
     }
-
     pub fn divide(self, right: Expr) -> Self {
-        self.binary("/", right)
+        self.binary(BinaryOperator::Divide, right)
     }
-
     pub fn is_null(self) -> Self {
-        Self::raw(format!("({} IS NULL)", self.sql))
+        Self::from_node(krishiv_plan::expression::Expr::IsNull {
+            expression: Box::new(self.node),
+            negated: false,
+        })
     }
-
     pub fn is_not_null(self) -> Self {
-        Self::raw(format!("({} IS NOT NULL)", self.sql))
+        Self::from_node(krishiv_plan::expression::Expr::IsNull {
+            expression: Box::new(self.node),
+            negated: true,
+        })
     }
-
+    pub fn cast(self, data_type: ExprDataType) -> Self {
+        Self::from_node(self.node.cast(data_type))
+    }
+    pub fn try_cast(self, data_type: ExprDataType) -> Self {
+        Self::from_node(self.node.try_cast(data_type))
+    }
     pub fn asc(self) -> Self {
-        Self::raw(format!("{} ASC", self.sql))
+        Self::from_node(krishiv_plan::expression::Expr::Sort {
+            expression: Box::new(self.node),
+            direction: SortDirection::Ascending,
+            nulls: NullOrdering::First,
+        })
     }
-
     pub fn desc(self) -> Self {
-        Self::raw(format!("{} DESC", self.sql))
+        Self::from_node(krishiv_plan::expression::Expr::Sort {
+            expression: Box::new(self.node),
+            direction: SortDirection::Descending,
+            nulls: NullOrdering::Last,
+        })
     }
-
-    fn binary(self, op: &str, right: Expr) -> Self {
-        Self::raw(format!("({} {op} {})", self.sql, right.sql))
+    pub fn over(self, partition_by: Vec<Expr>, order_by: Vec<Expr>) -> Self {
+        Self::from_node(self.node.over(
+            partition_by.into_iter().map(Expr::into_node).collect(),
+            order_by.into_iter().map(Expr::into_node).collect(),
+        ))
+    }
+    fn binary(self, op: BinaryOperator, right: Expr) -> Self {
+        Self::from_node(self.node.binary(op, right.node))
     }
 }
 
-/// Reference a column using a safely quoted identifier.
 pub fn col(name: &str) -> Expr {
-    Expr::raw(quote_identifier(name))
+    Expr::from_node(krishiv_plan::expression::Expr::column(name))
 }
-
-/// Construct a typed SQL literal.
 pub fn lit(value: impl Into<Literal>) -> Expr {
-    Expr::raw(value.into().to_sql())
+    Expr::from_node(krishiv_plan::expression::Expr::literal(
+        value.into().into_scalar(),
+    ))
 }
-
 pub fn count(expr: Expr) -> Expr {
-    Expr::raw(format!("COUNT({})", expr.sql))
+    aggregate(AggregateFunction::Count, Some(expr))
 }
-
 pub fn count_all() -> Expr {
-    Expr::raw("COUNT(*)")
+    aggregate(AggregateFunction::Count, None)
 }
-
 pub fn sum(expr: Expr) -> Expr {
-    Expr::raw(format!("SUM({})", expr.sql))
+    aggregate(AggregateFunction::Sum, Some(expr))
 }
-
 pub fn avg(expr: Expr) -> Expr {
-    Expr::raw(format!("AVG({})", expr.sql))
+    aggregate(AggregateFunction::Avg, Some(expr))
 }
-
 pub fn min(expr: Expr) -> Expr {
-    Expr::raw(format!("MIN({})", expr.sql))
+    aggregate(AggregateFunction::Min, Some(expr))
 }
-
 pub fn max(expr: Expr) -> Expr {
-    Expr::raw(format!("MAX({})", expr.sql))
+    aggregate(AggregateFunction::Max, Some(expr))
+}
+pub fn function(name: impl Into<String>, arguments: Vec<Expr>) -> Expr {
+    Expr::from_node(krishiv_plan::expression::Expr::function(
+        name,
+        arguments.into_iter().map(Expr::into_node).collect(),
+    ))
+}
+fn aggregate(function: AggregateFunction, expression: Option<Expr>) -> Expr {
+    Expr::from_node(krishiv_plan::expression::Expr::Aggregate {
+        function,
+        expression: expression.map(|value| Box::new(value.node)),
+        distinct: false,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,17 +171,18 @@ pub enum Literal {
     UInt64(u64),
     Float64(f64),
     String(String),
+    Binary(Vec<u8>),
 }
-
 impl Literal {
-    fn to_sql(&self) -> String {
+    fn into_scalar(self) -> ScalarValue {
         match self {
-            Self::Null => "NULL".into(),
-            Self::Boolean(value) => value.to_string().to_ascii_uppercase(),
-            Self::Int64(value) => value.to_string(),
-            Self::UInt64(value) => value.to_string(),
-            Self::Float64(value) => value.to_string(),
-            Self::String(value) => format!("'{}'", value.replace('\'', "''")),
+            Self::Null => ScalarValue::Null,
+            Self::Boolean(v) => ScalarValue::Boolean(v),
+            Self::Int64(v) => ScalarValue::Int64(v),
+            Self::UInt64(v) => ScalarValue::UInt64(v),
+            Self::Float64(v) => ScalarValue::float64(v),
+            Self::String(v) => ScalarValue::Utf8(v),
+            Self::Binary(v) => ScalarValue::Binary(v),
         }
     }
 }
@@ -192,27 +227,45 @@ impl From<f64> for Literal {
         Self::Float64(value)
     }
 }
-
-fn quote_identifier(name: &str) -> String {
-    name.split('.')
-        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(".")
+impl From<Vec<u8>> for Literal {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Binary(value)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn identifiers_and_literals_are_escaped() {
         assert_eq!(col("orders.user\"id").as_sql(), "\"orders\".\"user\"\"id\"");
         assert_eq!(lit("O'Reilly").as_sql(), "'O''Reilly'");
     }
-
     #[test]
     fn typed_expression_builds_parenthesized_predicate() {
         let expr = col("amount").gt(lit(10)).and(col("active").eq(lit(true)));
         assert_eq!(expr.as_sql(), "((\"amount\" > 10) AND (\"active\" = TRUE))");
+    }
+    #[test]
+    fn versioned_ast_round_trip() {
+        let expr = sum(col("amount")).alias("total");
+        let bytes = expr.encode_versioned().unwrap();
+        assert_eq!(Expr::decode_versioned(&bytes).unwrap(), expr);
+        assert!(expr.normalize_json().unwrap().contains("aggregate"));
+    }
+    #[test]
+    fn nested_types_are_structured() {
+        let ty = ExprDataType::List(Box::new(ExprDataType::Struct(vec![ExprField {
+            name: "value".into(),
+            data_type: ExprDataType::Decimal128 {
+                precision: 12,
+                scale: 2,
+            },
+            nullable: true,
+        }])));
+        assert_eq!(
+            col("items").cast(ty).node().to_sql(),
+            "CAST(\"items\" AS ARRAY<STRUCT<\"value\": DECIMAL(12, 2)>>)"
+        );
     }
 }

@@ -41,6 +41,7 @@ pub mod two_phase_parquet_s3;
 pub mod capabilities;
 pub mod config;
 pub mod error;
+pub mod io_contract;
 pub mod offset;
 pub mod quality;
 pub mod registry;
@@ -53,6 +54,8 @@ pub mod vector;
 
 #[cfg(test)]
 mod tests;
+
+pub mod certification;
 
 // Root re-exports for perfect compatibility
 pub use capabilities::{ConnectorCapabilities, ConnectorMaturity, DeliveryGuarantee};
@@ -93,8 +96,9 @@ pub use cdc::CdcOffsetTracker;
 #[cfg(feature = "lakehouse")]
 pub use lakehouse::{
     AsOfSpec, DeltaEntry, DeltaObjectStoreReader, DeltaOp, DeltaStore, DeltaTableHandle,
-    DeltaWriteMode, HudiCowWriter, HudiObjectStoreReader, HudiObjectStoreWriter, HudiQueryType,
-    HudiSnapshotReader, HudiWriteResult, IcebergFsTable, IcebergScanOptions, IcebergTableRef,
+    DeltaWriteMode, DistributedIcebergCommitCoordinator, HudiCowWriter, HudiObjectStoreReader,
+    HudiObjectStoreWriter, HudiQueryType, HudiSnapshotReader, HudiWriteResult, IcebergFsTable,
+    IcebergReference, IcebergReferenceKind, IcebergScanOptions, IcebergTableRef,
     IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY, LakehouseError, LakehouseResult,
     LakehouseTable, MemoryDeltaStore, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable,
     MergeDeltaResult, MultiWriterGuard, PartitionField, PartitionSpecResolver,
@@ -105,3 +109,9 @@ pub use lakehouse::{
 };
 #[cfg(all(feature = "lakehouse", feature = "kafka"))]
 pub use lakehouse::{KafkaDeltaStore, RdkafkaDeltaStore};
+
+pub use io_contract::{
+    DatabaseIoOptions, FileFormat, FileLayout, IoCapabilities, IoConnectorKind, KafkaIoOptions,
+    SchemaEvolutionMode, SortDirection as FileSortDirection, SortField, WriteDistribution,
+    WriteMode,
+};

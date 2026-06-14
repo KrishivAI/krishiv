@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -34,6 +35,8 @@ pub struct MemoryIcebergTwoPhaseCommit {
     table: Arc<MemoryLakehouseTable>,
     staged: tokio::sync::Mutex<Vec<StagedSnapshot>>,
     committed_offsets: tokio::sync::Mutex<BTreeMap<String, i64>>,
+    committed: tokio::sync::Mutex<BTreeMap<i64, i64>>,
+    next_stage_id: AtomicI64,
 }
 
 impl MemoryIcebergTwoPhaseCommit {
@@ -42,6 +45,8 @@ impl MemoryIcebergTwoPhaseCommit {
             table,
             staged: tokio::sync::Mutex::new(Vec::new()),
             committed_offsets: tokio::sync::Mutex::new(BTreeMap::new()),
+            committed: tokio::sync::Mutex::new(BTreeMap::new()),
+            next_stage_id: AtomicI64::new(1),
         }
     }
 
@@ -53,9 +58,8 @@ impl MemoryIcebergTwoPhaseCommit {
 #[async_trait]
 impl IcebergTwoPhaseCommit for MemoryIcebergTwoPhaseCommit {
     async fn prepare(&self, batches: Vec<RecordBatch>) -> Result<StagedSnapshot, LakehouseError> {
-        let snap = self.table.current_snapshot_id().await?.unwrap_or(0) + 1;
         let staged = StagedSnapshot {
-            snapshot_id: snap,
+            snapshot_id: self.next_stage_id.fetch_add(1, Ordering::Relaxed),
             batches,
         };
         self.staged.lock().await.push(staged.clone());
@@ -67,18 +71,42 @@ impl IcebergTwoPhaseCommit for MemoryIcebergTwoPhaseCommit {
         staged: StagedSnapshot,
         kafka_offsets: BTreeMap<String, i64>,
     ) -> Result<i64, LakehouseError> {
-        self.table.append(staged.batches).await?;
-        *self.committed_offsets.lock().await = kafka_offsets;
-        self.staged
+        if let Some(snapshot_id) = self
+            .committed
             .lock()
             .await
-            .retain(|s| s.snapshot_id != staged.snapshot_id);
-        self.table
-            .current_snapshot_id()
-            .await?
-            .ok_or_else(|| LakehouseError::Concurrency {
-                message: "snapshot missing after commit".to_string(),
-            })
+            .get(&staged.snapshot_id)
+            .copied()
+        {
+            return Ok(snapshot_id);
+        }
+        let mut pending = self.staged.lock().await;
+        if !pending
+            .iter()
+            .any(|candidate| candidate.snapshot_id == staged.snapshot_id)
+        {
+            return Err(LakehouseError::Concurrency {
+                message: format!(
+                    "staged snapshot {} is unknown or aborted",
+                    staged.snapshot_id
+                ),
+            });
+        }
+        self.table.append(staged.batches).await?;
+        let snapshot_id =
+            self.table
+                .current_snapshot_id()
+                .await?
+                .ok_or_else(|| LakehouseError::Concurrency {
+                    message: "snapshot missing after commit".to_string(),
+                })?;
+        *self.committed_offsets.lock().await = kafka_offsets;
+        pending.retain(|candidate| candidate.snapshot_id != staged.snapshot_id);
+        self.committed
+            .lock()
+            .await
+            .insert(staged.snapshot_id, snapshot_id);
+        Ok(snapshot_id)
     }
 
     async fn abort(&self, staged: StagedSnapshot) -> Result<(), LakehouseError> {
@@ -86,6 +114,124 @@ impl IcebergTwoPhaseCommit for MemoryIcebergTwoPhaseCommit {
             .lock()
             .await
             .retain(|s| s.snapshot_id != staged.snapshot_id);
+        Ok(())
+    }
+}
+
+/// Coordinator-owned commit aggregation for one distributed write epoch.
+///
+/// Task outputs remain invisible until all expected task attempts have staged
+/// successfully. The coordinator then prepares and commits one combined
+/// Iceberg snapshot. Aborting an epoch drops every staged task output.
+pub struct DistributedIcebergCommitCoordinator {
+    committer: Arc<dyn IcebergTwoPhaseCommit>,
+    expected_tasks: usize,
+    epochs: tokio::sync::Mutex<BTreeMap<u64, BTreeMap<u32, Vec<RecordBatch>>>>,
+    committed_epochs: tokio::sync::Mutex<BTreeMap<u64, i64>>,
+    commit_lock: tokio::sync::Mutex<()>,
+}
+
+impl DistributedIcebergCommitCoordinator {
+    pub fn new(
+        committer: Arc<dyn IcebergTwoPhaseCommit>,
+        expected_tasks: usize,
+    ) -> Result<Self, LakehouseError> {
+        if expected_tasks == 0 {
+            return Err(LakehouseError::Concurrency {
+                message: "distributed commit requires at least one task".into(),
+            });
+        }
+        Ok(Self {
+            committer,
+            expected_tasks,
+            epochs: tokio::sync::Mutex::new(BTreeMap::new()),
+            committed_epochs: tokio::sync::Mutex::new(BTreeMap::new()),
+            commit_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    pub async fn stage_task(
+        &self,
+        epoch: u64,
+        task_id: u32,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(), LakehouseError> {
+        if self.committed_epochs.lock().await.contains_key(&epoch) {
+            return Err(LakehouseError::Concurrency {
+                message: format!("epoch {epoch} is already committed"),
+            });
+        }
+        let mut epochs = self.epochs.lock().await;
+        let tasks = epochs.entry(epoch).or_default();
+        if tasks.insert(task_id, batches).is_some() {
+            return Err(LakehouseError::Concurrency {
+                message: format!("duplicate task {task_id} for epoch {epoch}"),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn commit_epoch(
+        &self,
+        epoch: u64,
+        offsets: BTreeMap<String, i64>,
+    ) -> Result<i64, LakehouseError> {
+        // Serialize epoch publication so concurrent retries observe the same
+        // committed snapshot instead of racing the staged-task removal.
+        let _commit_guard = self.commit_lock.lock().await;
+        if let Some(snapshot) = self.committed_epochs.lock().await.get(&epoch).copied() {
+            return Ok(snapshot);
+        }
+        let tasks = {
+            let mut epochs = self.epochs.lock().await;
+            let tasks = epochs
+                .get(&epoch)
+                .ok_or_else(|| LakehouseError::Concurrency {
+                    message: format!("epoch {epoch} has no staged tasks"),
+                })?;
+            if tasks.len() != self.expected_tasks {
+                return Err(LakehouseError::Concurrency {
+                    message: format!(
+                        "epoch {epoch} has {} of {} required tasks",
+                        tasks.len(),
+                        self.expected_tasks
+                    ),
+                });
+            }
+            epochs
+                .remove(&epoch)
+                .ok_or_else(|| LakehouseError::Concurrency {
+                    message: format!("epoch {epoch} disappeared during commit"),
+                })?
+        };
+        let batches = tasks.values().flatten().cloned().collect::<Vec<_>>();
+        let staged = match self.committer.prepare(batches).await {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.epochs.lock().await.insert(epoch, tasks);
+                return Err(error);
+            }
+        };
+        match self.committer.commit(staged.clone(), offsets).await {
+            Ok(snapshot) => {
+                self.committed_epochs.lock().await.insert(epoch, snapshot);
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let _ = self.committer.abort(staged).await;
+                self.epochs.lock().await.insert(epoch, tasks);
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn abort_epoch(&self, epoch: u64) -> Result<(), LakehouseError> {
+        if self.committed_epochs.lock().await.contains_key(&epoch) {
+            return Err(LakehouseError::Concurrency {
+                message: format!("cannot abort committed epoch {epoch}"),
+            });
+        }
+        self.epochs.lock().await.remove(&epoch);
         Ok(())
     }
 }
@@ -139,6 +285,32 @@ mod tests {
         let snap = tpc.commit(staged, offsets.clone()).await.unwrap();
         assert!(snap >= 1);
         assert_eq!(tpc.committed_kafka_offsets().await, offsets);
+    }
+
+    #[tokio::test]
+    async fn distributed_commit_is_atomic_and_idempotent() {
+        let table = table();
+        let committer = Arc::new(MemoryIcebergTwoPhaseCommit::new(table.clone()));
+        let coordinator = Arc::new(DistributedIcebergCommitCoordinator::new(committer, 2).unwrap());
+        coordinator.stage_task(7, 0, vec![batch(1)]).await.unwrap();
+        assert!(coordinator.commit_epoch(7, BTreeMap::new()).await.is_err());
+        assert!(table.current_snapshot_id().await.unwrap().is_none());
+        coordinator.stage_task(7, 1, vec![batch(2)]).await.unwrap();
+        let first_attempt = Arc::clone(&coordinator);
+        let concurrent_retry = Arc::clone(&coordinator);
+        let (first, retry) = tokio::join!(
+            first_attempt.commit_epoch(7, BTreeMap::new()),
+            concurrent_retry.commit_epoch(7, BTreeMap::new())
+        );
+        assert_eq!(first.unwrap(), retry.unwrap());
+        let rows: usize = table
+            .scan(&Default::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 2);
     }
 
     #[tokio::test]

@@ -42,14 +42,15 @@ enum RelationKind {
 
 // ── PyRelation ────────────────────────────────────────────────────────────────
 
-/// Unified batch and streaming DataFrame.
+/// Compatibility wrapper for the legacy unified batch and streaming relation API.
 ///
-/// Exposed to Python as `DataFrame`.  Construct via:
+/// Exposed to Python as `Relation`. New relational features are implemented on
+/// the canonical `DataFrame` class. Construct this compatibility type via:
 ///   - `Session.sql(query)` — batch SQL
 ///   - `Session.read_parquet(path)` — batch from file
 ///   - `Session.from_source(name)` — unbounded streaming
 ///   - `Session.from_bounded_stream(name, batches)` — bounded streaming
-#[pyclass(name = "DataFrame", unsendable)]
+#[pyclass(name = "Relation", unsendable)]
 pub struct PyRelation {
     kind: RelationKind,
     _cached: Mutex<Option<PyQueryResult>>,
@@ -285,9 +286,9 @@ impl PyRelation {
 
     pub fn __repr__(&self) -> String {
         match &self.kind {
-            RelationKind::Batch(df) => format!("DataFrame(plan={})", df.explain_logical()),
+            RelationKind::Batch(df) => format!("Relation(plan={})", df.explain_logical()),
             RelationKind::Stream(p) => format!(
-                "DataFrame[streaming](source={}, key={:?})",
+                "Relation[streaming](source={}, key={:?})",
                 p.source_id, p.key_columns
             ),
         }

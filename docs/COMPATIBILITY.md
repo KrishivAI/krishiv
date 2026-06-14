@@ -4,6 +4,14 @@ Krishiv is pre-1.0 software. This policy separates public API compatibility from
 durable-data compatibility so users can evaluate upgrades without assuming that
 every surface has the same stability.
 
+## Public API stabilization
+
+The pre-1.0 migration from the current preview surface to the intended stable
+Rust, Python, and SQL contracts follows
+[`implementation/stable-public-api-plan.md`](implementation/stable-public-api-plan.md)
+and [ADR-0002](decisions/0002-public-api-shape-and-execution-semantics.md).
+Items are not stable merely because they are public today.
+
 ## Compatibility classes
 
 | Surface | Current contract | Upgrade expectation |

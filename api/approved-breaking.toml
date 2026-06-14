@@ -1,0 +1,7 @@
+# Breaking or semantic public API changes require an entry with the exact ID
+# emitted by scripts/compare_api_surface.py, a reason, and a replacement.
+#
+# [[breaking]]
+# id = "python-public.json:/classes/DataFrame/methods/old_method"
+# reason = "Removed before 1.0 because the operation performed hidden I/O."
+# replacement = "DataFrame.new_method"

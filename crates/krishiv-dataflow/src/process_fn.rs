@@ -9,7 +9,8 @@
 //!
 //! # Design
 //! - State is `Vec<u8>` (serialised by the user). The runtime doesn't inspect it.
-//! - Timers fire at `fire_time_ms ≤ watermark_ms`.
+//! - Event-time timers fire at `fire_time_ms ≤ watermark_ms`.
+//! - Processing-time timers fire at `fire_time_ms ≤ processing_time_ms`.
 //! - Output is collected as a `Vec<RecordBatch>` (one per `emit_record` call).
 //! - The executor is single-threaded (no `Arc<Mutex<…>>`); async variants can
 //!   wrap it in a task.
@@ -17,8 +18,28 @@
 use std::collections::{BTreeMap, HashMap};
 
 use arrow::record_batch::RecordBatch;
+use serde::{Deserialize, Serialize};
 
 use crate::ExecResult;
+
+// ── TimerKind ─────────────────────────────────────────────────────────────────
+
+/// Discriminates between event-time and processing-time timers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimerKind {
+    /// Fires when the event-time watermark reaches `fire_time_ms`.
+    EventTime,
+    /// Fires when the wall-clock processing time reaches `fire_time_ms`.
+    ProcessingTime,
+}
+
+/// A timer registration entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimerEntry {
+    pub key: String,
+    pub fire_time_ms: i64,
+    pub kind: TimerKind,
+}
 
 // ── ProcessContext ────────────────────────────────────────────────────────────
 
@@ -28,12 +49,14 @@ use crate::ExecResult;
 pub struct ProcessContext<'a> {
     /// Current event-time watermark in milliseconds.
     pub watermark_ms: i64,
+    /// Current wall-clock processing time in milliseconds.
+    pub processing_time_ms: i64,
     /// Serialisable per-key state blob (empty on first access for a key).
     pub state: &'a mut Vec<u8>,
     /// Collected output batches; the function appends here via [`emit`][Self::emit].
     pub output: &'a mut Vec<RecordBatch>,
     /// Timers to register; collected and merged into the global timer map.
-    pub(crate) timers_to_register: &'a mut Vec<(String, i64)>,
+    pub(crate) timers_to_register: &'a mut Vec<TimerEntry>,
 }
 
 impl<'a> ProcessContext<'a> {
@@ -42,11 +65,34 @@ impl<'a> ProcessContext<'a> {
         self.output.push(batch);
     }
 
-    /// Register a timer to fire when the watermark reaches `fire_time_ms`.
+    /// Register an event-time timer to fire when the watermark reaches `fire_time_ms`.
     ///
     /// Registering the same `(key, fire_time_ms)` pair twice is idempotent.
+    pub fn register_event_time_timer(&mut self, key: impl Into<String>, fire_time_ms: i64) {
+        self.timers_to_register.push(TimerEntry {
+            key: key.into(),
+            fire_time_ms,
+            kind: TimerKind::EventTime,
+        });
+    }
+
+    /// Register a processing-time timer to fire when processing time reaches `fire_time_ms`.
+    ///
+    /// Registering the same `(key, fire_time_ms)` pair twice is idempotent.
+    pub fn register_processing_time_timer(&mut self, key: impl Into<String>, fire_time_ms: i64) {
+        self.timers_to_register.push(TimerEntry {
+            key: key.into(),
+            fire_time_ms,
+            kind: TimerKind::ProcessingTime,
+        });
+    }
+
+    /// Register a timer to fire when the watermark reaches `fire_time_ms`.
+    ///
+    /// Deprecated: use [`register_event_time_timer`][Self::register_event_time_timer] instead.
+    /// Kept for backward compatibility.
     pub fn register_timer(&mut self, key: impl Into<String>, fire_time_ms: i64) {
-        self.timers_to_register.push((key.into(), fire_time_ms));
+        self.register_event_time_timer(key, fire_time_ms);
     }
 }
 
@@ -63,7 +109,7 @@ pub trait ProcessFunction: Send {
     /// `row` is the row index within it.
     ///
     /// The function may read and write `ctx.state` and call `ctx.emit` and
-    /// `ctx.register_timer`.
+    /// `ctx.register_event_time_timer` / `ctx.register_processing_time_timer`.
     fn on_event(
         &mut self,
         key: &str,
@@ -72,7 +118,8 @@ pub trait ProcessFunction: Send {
         ctx: &mut ProcessContext<'_>,
     ) -> ExecResult<()>;
 
-    /// Called when a timer fires (watermark ≥ `fire_time_ms`).
+    /// Called when a timer fires (watermark ≥ `fire_time_ms` for event-time
+    /// timers, or processing_time ≥ `fire_time_ms` for processing-time timers).
     ///
     /// The function may emit output and register new timers.
     fn on_timer(
@@ -81,6 +128,17 @@ pub trait ProcessFunction: Send {
         fire_time_ms: i64,
         ctx: &mut ProcessContext<'_>,
     ) -> ExecResult<()>;
+}
+
+// ── Snapshot helpers ──────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct ExecutorSnapshot {
+    /// Per-key state map: key → base64-encoded raw bytes.
+    state: HashMap<String, Vec<u8>>,
+    /// Pending timers.
+    timers: Vec<TimerEntry>,
+    current_watermark_ms: i64,
 }
 
 // ── ProcessFunctionExecutor ───────────────────────────────────────────────────
@@ -93,8 +151,10 @@ pub struct ProcessFunctionExecutor {
     key_column: String,
     /// Per-key state: `key_str → Vec<u8>`.
     state: HashMap<String, Vec<u8>>,
-    /// Timer map: `fire_time_ms → Set<key_str>`.
-    timers: BTreeMap<i64, Vec<String>>,
+    /// Event-time timer map: `fire_time_ms → Set<key_str>`.
+    event_timers: BTreeMap<i64, Vec<String>>,
+    /// Processing-time timer map: `fire_time_ms → Set<key_str>`.
+    processing_timers: BTreeMap<i64, Vec<String>>,
     current_watermark_ms: i64,
 }
 
@@ -104,7 +164,8 @@ impl ProcessFunctionExecutor {
             func,
             key_column: key_column.into(),
             state: HashMap::new(),
-            timers: BTreeMap::new(),
+            event_timers: BTreeMap::new(),
+            processing_timers: BTreeMap::new(),
             current_watermark_ms: i64::MIN,
         }
     }
@@ -115,6 +176,16 @@ impl ProcessFunctionExecutor {
         batch: &RecordBatch,
         watermark_ms: i64,
     ) -> ExecResult<Vec<RecordBatch>> {
+        self.process_batch_with_processing_time(batch, watermark_ms, watermark_ms)
+    }
+
+    /// Process one input batch with explicit processing-time support.
+    pub fn process_batch_with_processing_time(
+        &mut self,
+        batch: &RecordBatch,
+        watermark_ms: i64,
+        processing_time_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
         self.current_watermark_ms = self.current_watermark_ms.max(watermark_ms);
 
         let key_idx = batch
@@ -123,7 +194,7 @@ impl ProcessFunctionExecutor {
             .map_err(|_| crate::ExecError::ColumnNotFound(self.key_column.clone()))?;
 
         let mut output = Vec::new();
-        let mut timers_to_register: Vec<(String, i64)> = Vec::new();
+        let mut timers_to_register: Vec<TimerEntry> = Vec::new();
 
         for row in 0..batch.num_rows() {
             let key = crate::join::extract_agg_key(batch, key_idx, row)?;
@@ -132,6 +203,7 @@ impl ProcessFunctionExecutor {
 
             let mut ctx = ProcessContext {
                 watermark_ms,
+                processing_time_ms,
                 state: key_state,
                 output: &mut output,
                 timers_to_register: &mut timers_to_register,
@@ -140,40 +212,46 @@ impl ProcessFunctionExecutor {
             self.func.on_event(&key_str, batch, row, &mut ctx)?;
         }
 
-        for (key, fire_time) in timers_to_register {
-            let bucket = self.timers.entry(fire_time).or_default();
-            if !bucket.contains(&key) {
-                bucket.push(key);
-            }
-        }
+        self.merge_timer_registrations(timers_to_register);
 
         Ok(output)
     }
 
-    /// Fire all timers with `fire_time_ms ≤ watermark_ms`.
+    /// Fire all timers with `fire_time_ms ≤ watermark_ms` (event-time) and
+    /// `fire_time_ms ≤ processing_time_ms` (processing-time).
     ///
     /// Returns all output batches emitted by timer callbacks.
     pub fn fire_timers(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
+        self.fire_timers_with_processing_time(watermark_ms, watermark_ms)
+    }
+
+    /// Fire timers with explicit processing-time threshold.
+    pub fn fire_timers_with_processing_time(
+        &mut self,
+        watermark_ms: i64,
+        processing_time_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
         self.current_watermark_ms = self.current_watermark_ms.max(watermark_ms);
 
         let mut output = Vec::new();
-        let mut timers_to_register: Vec<(String, i64)> = Vec::new();
+        let mut timers_to_register: Vec<TimerEntry> = Vec::new();
 
-        // Collect fired timer keys (all timers with fire_time ≤ watermark).
-        let fired_times: Vec<i64> = self
-            .timers
+        // Fire event-time timers (fire_time ≤ watermark_ms).
+        let fired_event_times: Vec<i64> = self
+            .event_timers
             .range(..=watermark_ms)
             .map(|(&t, _)| t)
             .collect();
 
-        for fire_time in fired_times {
-            let Some(keys) = self.timers.remove(&fire_time) else {
+        for fire_time in fired_event_times {
+            let Some(keys) = self.event_timers.remove(&fire_time) else {
                 continue;
             };
             for key in keys {
                 let key_state = self.state.entry(key.clone()).or_default();
                 let mut ctx = ProcessContext {
                     watermark_ms,
+                    processing_time_ms,
                     state: key_state,
                     output: &mut output,
                     timers_to_register: &mut timers_to_register,
@@ -182,14 +260,56 @@ impl ProcessFunctionExecutor {
             }
         }
 
-        for (key, fire_time) in timers_to_register {
-            let bucket = self.timers.entry(fire_time).or_default();
-            if !bucket.contains(&key) {
-                bucket.push(key);
+        // Fire processing-time timers (fire_time ≤ processing_time_ms).
+        let fired_proc_times: Vec<i64> = self
+            .processing_timers
+            .range(..=processing_time_ms)
+            .map(|(&t, _)| t)
+            .collect();
+
+        for fire_time in fired_proc_times {
+            let Some(keys) = self.processing_timers.remove(&fire_time) else {
+                continue;
+            };
+            for key in keys {
+                let key_state = self.state.entry(key.clone()).or_default();
+                let mut ctx = ProcessContext {
+                    watermark_ms,
+                    processing_time_ms,
+                    state: key_state,
+                    output: &mut output,
+                    timers_to_register: &mut timers_to_register,
+                };
+                self.func.on_timer(&key, fire_time, &mut ctx)?;
             }
         }
 
+        self.merge_timer_registrations(timers_to_register);
+
         Ok(output)
+    }
+
+    /// Merge newly registered timers into the executor's timer maps.
+    fn merge_timer_registrations(&mut self, timers: Vec<TimerEntry>) {
+        for entry in timers {
+            match entry.kind {
+                TimerKind::EventTime => {
+                    let bucket = self.event_timers.entry(entry.fire_time_ms).or_default();
+                    if !bucket.contains(&entry.key) {
+                        bucket.push(entry.key);
+                    }
+                }
+                TimerKind::ProcessingTime => {
+                    let bucket = self
+                        .processing_timers
+                        .entry(entry.fire_time_ms)
+                        .or_default();
+                    if !bucket.contains(&entry.key) {
+                        bucket.push(entry.key);
+                    }
+                }
+            }
+        }
     }
 
     /// Return the current watermark.
@@ -202,9 +322,68 @@ impl ProcessFunctionExecutor {
         &self.state
     }
 
-    /// Return pending timer count.
+    /// Return total pending timer count (event-time + processing-time).
     pub fn pending_timer_count(&self) -> usize {
-        self.timers.values().map(|v| v.len()).sum()
+        let et: usize = self.event_timers.values().map(|v| v.len()).sum();
+        let pt: usize = self.processing_timers.values().map(|v| v.len()).sum();
+        et + pt
+    }
+
+    /// Serialize operator state and pending timers to a snapshot blob.
+    ///
+    /// The snapshot can later be passed to [`restore`][Self::restore] to
+    /// reconstruct the executor's state (minus the `ProcessFunction` itself).
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut timers: Vec<TimerEntry> = Vec::new();
+        for (&fire_time, keys) in &self.event_timers {
+            for key in keys {
+                timers.push(TimerEntry {
+                    key: key.clone(),
+                    fire_time_ms: fire_time,
+                    kind: TimerKind::EventTime,
+                });
+            }
+        }
+        for (&fire_time, keys) in &self.processing_timers {
+            for key in keys {
+                timers.push(TimerEntry {
+                    key: key.clone(),
+                    fire_time_ms: fire_time,
+                    kind: TimerKind::ProcessingTime,
+                });
+            }
+        }
+
+        let snap = ExecutorSnapshot {
+            state: self.state.clone(),
+            timers,
+            current_watermark_ms: self.current_watermark_ms,
+        };
+        serde_json::to_vec(&snap).unwrap_or_default()
+    }
+
+    /// Restore operator state and pending timers from a snapshot blob.
+    ///
+    /// The `ProcessFunction` itself is not serialised; only state and timers
+    /// are restored. Multiple task snapshots can be merged by calling
+    /// `restore` repeatedly — state keys from later calls overwrite earlier
+    /// ones, and timers are merged idempotently.
+    pub fn restore(&mut self, bytes: &[u8]) -> ExecResult<()> {
+        let snap: ExecutorSnapshot = serde_json::from_slice(bytes)
+            .map_err(|e| crate::ExecError::InvalidInput(e.to_string()))?;
+
+        // Merge state (later calls override earlier ones for the same key).
+        for (k, v) in snap.state {
+            self.state.insert(k, v);
+        }
+
+        // Advance watermark monotonically.
+        self.current_watermark_ms = self.current_watermark_ms.max(snap.current_watermark_ms);
+
+        // Merge timers idempotently.
+        self.merge_timer_registrations(snap.timers);
+
+        Ok(())
     }
 }
 
@@ -330,5 +509,155 @@ mod tests {
         let count_col = fired[0].column_by_name("count").unwrap();
         let count = count_col.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(count.value(0), 3, "count should be 3 across batches");
+    }
+
+    // ── G: processing-time timer test ────────────────────────────────────────
+
+    struct ProcessingTimerFn {
+        fired: bool,
+    }
+
+    impl ProcessFunction for ProcessingTimerFn {
+        fn on_event(
+            &mut self,
+            key: &str,
+            _batch: &RecordBatch,
+            _row: usize,
+            ctx: &mut ProcessContext<'_>,
+        ) -> ExecResult<()> {
+            // Register a processing-time timer 50ms from now.
+            ctx.register_processing_time_timer(key, ctx.processing_time_ms + 50);
+            Ok(())
+        }
+
+        fn on_timer(
+            &mut self,
+            _key: &str,
+            _fire_time_ms: i64,
+            _ctx: &mut ProcessContext<'_>,
+        ) -> ExecResult<()> {
+            self.fired = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn processing_time_timer_fires_at_threshold() {
+        let func = ProcessingTimerFn { fired: false };
+        let mut exec = ProcessFunctionExecutor::new("id", Box::new(func));
+
+        // Register timer at processing_time = 100 + 50 = 150.
+        exec.process_batch_with_processing_time(&int_batch(&[1]), 0, 100)
+            .unwrap();
+
+        // Fire at processing_time = 140 — should NOT fire.
+        let out = exec.fire_timers_with_processing_time(0, 140).unwrap();
+        assert!(
+            out.is_empty(),
+            "timer at 150 should not fire at proc_time=140"
+        );
+        assert_eq!(exec.pending_timer_count(), 1);
+
+        // Fire at processing_time = 150 — should fire.
+        let out = exec.fire_timers_with_processing_time(0, 150).unwrap();
+        // Timer fires (no output batch in this impl, but pending count drops).
+        assert_eq!(
+            exec.pending_timer_count(),
+            0,
+            "timer should have been consumed"
+        );
+        let _ = out; // no output expected from ProcessingTimerFn
+    }
+
+    // ── G: snapshot/restore test ──────────────────────────────────────────────
+
+    struct StatefulFn;
+
+    impl ProcessFunction for StatefulFn {
+        fn on_event(
+            &mut self,
+            _key: &str,
+            _batch: &RecordBatch,
+            _row: usize,
+            _ctx: &mut ProcessContext<'_>,
+        ) -> ExecResult<()> {
+            Ok(())
+        }
+
+        fn on_timer(
+            &mut self,
+            _key: &str,
+            _fire_time_ms: i64,
+            _ctx: &mut ProcessContext<'_>,
+        ) -> ExecResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_state_and_timers() {
+        let func = CountAndTimerFn::new();
+        let mut exec = ProcessFunctionExecutor::new("id", Box::new(func));
+
+        exec.process_batch(&int_batch(&[1, 2]), 100).unwrap();
+        // Two keys → two event-time timers at 110.
+        assert_eq!(exec.pending_timer_count(), 2);
+
+        let snap = exec.snapshot();
+
+        // Create a new executor and restore into it.
+        let func2 = CountAndTimerFn::new();
+        let mut exec2 = ProcessFunctionExecutor::new("id", Box::new(func2));
+        exec2.restore(&snap).unwrap();
+
+        assert_eq!(
+            exec2.pending_timer_count(),
+            2,
+            "restored timer count must match"
+        );
+        assert_eq!(
+            exec2.watermark_ms(),
+            exec.watermark_ms(),
+            "restored watermark must match"
+        );
+    }
+
+    #[test]
+    fn rescaling_restore_merges_snapshots() {
+        // Simulate two parallel task snapshots being merged into one executor.
+        let func_a = CountAndTimerFn::new();
+        let mut exec_a = ProcessFunctionExecutor::new("id", Box::new(func_a));
+        // Task A handles key 1.
+        exec_a.process_batch(&int_batch(&[1]), 100).unwrap();
+        let snap_a = exec_a.snapshot();
+
+        let func_b = CountAndTimerFn::new();
+        let mut exec_b = ProcessFunctionExecutor::new("id", Box::new(func_b));
+        // Task B handles key 2.
+        exec_b.process_batch(&int_batch(&[2]), 200).unwrap();
+        let snap_b = exec_b.snapshot();
+
+        // Merged executor.
+        let func_merged = CountAndTimerFn::new();
+        let mut exec_merged = ProcessFunctionExecutor::new("id", Box::new(func_merged));
+        exec_merged.restore(&snap_a).unwrap();
+        exec_merged.restore(&snap_b).unwrap();
+
+        // Should have 2 pending timers (one per key) and watermark = max(100, 200) = 200.
+        assert_eq!(
+            exec_merged.pending_timer_count(),
+            2,
+            "merged timers from both tasks"
+        );
+        assert_eq!(
+            exec_merged.watermark_ms(),
+            200,
+            "watermark must be max of both tasks"
+        );
+        assert_eq!(
+            exec_merged.state_map().len(),
+            2,
+            "state from both tasks must be present"
+        );
     }
 }

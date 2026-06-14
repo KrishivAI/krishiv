@@ -28,10 +28,12 @@ pub mod catalog;
 pub mod cep_sql;
 mod connector_table;
 pub mod create_function_ddl;
+pub mod grammar;
 mod lakehouse;
 pub mod live_table;
 pub mod pivot_sql;
 pub mod recursive_cte;
+pub mod sqlstate;
 pub mod subquery;
 pub mod unnest_sql;
 
@@ -44,6 +46,8 @@ pub use cep_sql::{
 };
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
 
+pub use grammar::{FeatureEntry, FeatureStatus, feature_matrix, features_by_status, features_for_category};
+pub use sqlstate::{SqlStateError, sqlstate_for};
 pub use streaming::{ContinuousInputError, ContinuousTableInput};
 
 /// SQL result alias.
@@ -184,6 +188,12 @@ pub enum SqlError {
     /// Access denied by auth or policy check.
     #[error("access denied: {reason}")]
     AccessDenied { reason: String },
+    /// A running operation was cancelled by the caller.
+    #[error("operation {operation_id} was cancelled")]
+    OperationCancelled { operation_id: u64 },
+    /// A query exceeded its configured execution timeout.
+    #[error("query timed out after {timeout_ms} ms")]
+    Timeout { timeout_ms: u64 },
 }
 
 impl From<datafusion::error::DataFusionError> for SqlError {
@@ -1283,12 +1293,7 @@ impl SqlEngine {
 
     /// Create a DataFrame by reading a local CSV path directly.
     pub async fn read_csv(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame> {
-        let path = path.as_ref().to_string_lossy().into_owned();
-        let dataframe = self
-            .context
-            .read_csv(path, datafusion::prelude::CsvReadOptions::new())
-            .await?;
-        Ok(self.make_sql_df("csv-read", dataframe))
+        self.read_csv_with_options(path, &CsvReaderOptions::default()).await
     }
 
     /// Create a DataFrame by reading a local CSV path with typed options.
@@ -1598,6 +1603,99 @@ impl SqlEngine {
                 .with_shuffle_partitions(shuffle_override),
         )
     }
+
+    /// Execute a SQL query with a timeout.
+    ///
+    /// Returns [`SqlError::Timeout`] if `timeout_ms` elapses before the query
+    /// produces a result.  The underlying DataFusion task is abandoned (not
+    /// cancelled at the engine level) when the timeout fires; its resources are
+    /// released when the spawned task eventually completes.
+    pub async fn execute_with_timeout(
+        &self,
+        query: impl AsRef<str> + Send,
+        timeout_ms: u64,
+    ) -> SqlResult<SqlDataFrame> {
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        tokio::time::timeout(timeout, self.sql(query))
+            .await
+            .map_err(|_| SqlError::Timeout { timeout_ms })?
+    }
+
+    /// Execute a SQL query tagged with a caller-supplied operation ID.
+    ///
+    /// The operation ID is recorded in the returned [`TaggedQueryResult`] and
+    /// can be used to correlate logs, metrics, and cancellation requests.
+    /// If `cancelled_ids` contains `operation_id` before execution begins the
+    /// function returns [`SqlError::OperationCancelled`] immediately.
+    pub async fn execute_with_operation_id(
+        &self,
+        operation_id: u64,
+        query: impl AsRef<str> + Send,
+        cancelled_ids: &OperationRegistry,
+    ) -> SqlResult<TaggedQueryResult> {
+        if cancelled_ids.is_cancelled(operation_id) {
+            return Err(SqlError::OperationCancelled { operation_id });
+        }
+        let df = self.sql(query).await?;
+        Ok(TaggedQueryResult { operation_id, inner: df })
+    }
+}
+
+/// A query result annotated with the operation ID that produced it.
+pub struct TaggedQueryResult {
+    /// The caller-supplied operation ID.
+    pub operation_id: u64,
+    /// The underlying SQL DataFrame.
+    pub inner: SqlDataFrame,
+}
+
+/// Registry of cancelled operation IDs.
+///
+/// Callers can cancel an in-flight operation by registering its ID here before
+/// or during execution.  [`SqlEngine::execute_with_operation_id`] checks this
+/// registry at the start of execution.
+#[derive(Clone, Default)]
+pub struct OperationRegistry {
+    cancelled: Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
+}
+
+impl OperationRegistry {
+    /// Create a new, empty operation registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancel an operation by ID.  Subsequent
+    /// [`execute_with_operation_id`][SqlEngine::execute_with_operation_id] calls
+    /// with this ID will return [`SqlError::OperationCancelled`].
+    pub fn cancel(&self, operation_id: u64) {
+        if let Ok(mut ids) = self.cancelled.write() {
+            ids.insert(operation_id);
+        }
+    }
+
+    /// Return `true` if `operation_id` has been cancelled.
+    pub fn is_cancelled(&self, operation_id: u64) -> bool {
+        self.cancelled
+            .read()
+            .map(|ids| ids.contains(&operation_id))
+            .unwrap_or(false)
+    }
+
+    /// Remove a cancelled ID (e.g. once the operation has been cleaned up).
+    pub fn remove(&self, operation_id: u64) {
+        if let Ok(mut ids) = self.cancelled.write() {
+            ids.remove(&operation_id);
+        }
+    }
+
+    /// Return all currently cancelled operation IDs.
+    pub fn cancelled_ids(&self) -> Vec<u64> {
+        self.cancelled
+            .read()
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Extract the table name from a `CREATE EXTERNAL TABLE <name> ...` DDL statement.
@@ -1619,6 +1717,13 @@ pub(crate) fn extract_create_external_table_name(query: &str) -> Option<String> 
 /// behind a stable trait so that `krishiv-api` and other callers are not
 /// forced to depend on DataFusion types.  `datafusion` stays an implementation
 /// detail inside `krishiv-sql`; a future engine swap only requires a new impl.
+/// Engine-neutral grouping-set mode for canonical DataFrame aggregation.
+pub enum GroupingMode<'a> {
+    Sets(Vec<Vec<&'a krishiv_plan::expression::Expr>>),
+    Cube(Vec<&'a krishiv_plan::expression::Expr>),
+    Rollup(Vec<&'a krishiv_plan::expression::Expr>),
+}
+
 #[async_trait::async_trait]
 pub trait KrishivDataFrameOps: Send + Sync {
     /// Execute and collect all result batches.
@@ -1645,23 +1750,62 @@ pub trait KrishivDataFrameOps: Send + Sync {
     async fn select(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Select arbitrary SQL expressions.
-    async fn select_exprs(&self, expressions: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+    async fn select_exprs(
+        &self,
+        expressions: &[&krishiv_plan::expression::Expr],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Group by expressions and compute aggregate expressions.
     async fn aggregate(
         &self,
-        group_exprs: &[&str],
-        aggregate_exprs: &[&str],
+        group_exprs: &[&krishiv_plan::expression::Expr],
+        aggregate_exprs: &[&krishiv_plan::expression::Expr],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Aggregate using GROUPING SETS, CUBE, or ROLLUP.
+    async fn aggregate_grouping(
+        &self,
+        grouping: GroupingMode<'_>,
+        aggregate_exprs: &[&krishiv_plan::expression::Expr],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Pivot known values into aggregate columns.
+    async fn pivot(
+        &self,
+        group_exprs: &[&krishiv_plan::expression::Expr],
+        pivot_column: &krishiv_plan::expression::Expr,
+        aggregate_expr: &krishiv_plan::expression::Expr,
+        values: &[(krishiv_plan::expression::ScalarValue, String)],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Unpivot columns into name/value rows while preserving other columns.
+    async fn unpivot(
+        &self,
+        columns: &[&str],
+        name_column: &str,
+        value_column: &str,
     ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Filter rows by a SQL predicate expression.
     async fn filter(&self, predicate: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Filter rows using the engine-owned typed expression AST.
+    async fn filter_expr(
+        &self,
+        predicate: &krishiv_plan::expression::Expr,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Limit the number of rows.
     async fn limit(&self, n: usize) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Remove duplicate rows.
     async fn distinct(&self) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Drop rows with nulls in selected columns; an empty list checks all columns.
+    async fn drop_nulls(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Bernoulli-sample rows.
+    async fn sample(&self, fraction: f64) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Sort by columns with optional descending flags.
     async fn sort(
@@ -1705,6 +1849,23 @@ pub trait KrishivDataFrameOps: Send + Sync {
     async fn union(
         &self,
         right: &dyn KrishivDataFrameOps,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    async fn union_distinct(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    async fn intersect(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+        distinct: bool,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    async fn except(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+        distinct: bool,
     ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
     /// Register a list of record batches as a named in-memory table in the
@@ -2225,6 +2386,301 @@ fn parse_dataframe_expression(
     dataframe.parse_sql_expr(expression).map_err(Into::into)
 }
 
+/// Parse the stable SQL-expression subset into the same engine-owned AST used by Rust and Python.
+pub fn parse_public_expression(sql: &str) -> SqlResult<krishiv_plan::expression::Expr> {
+    let dialect = GenericDialect {};
+    let mut parser =
+        Parser::new(&dialect)
+            .try_with_sql(sql)
+            .map_err(|error| SqlError::Unsupported {
+                feature: format!("public expression parse: {error}"),
+            })?;
+    let expression = parser.parse_expr().map_err(|error| SqlError::Unsupported {
+        feature: format!("public expression parse: {error}"),
+    })?;
+    sqlparser_expression_to_public(&expression)
+}
+
+fn sqlparser_expression_to_public(
+    expression: &datafusion::sql::sqlparser::ast::Expr,
+) -> SqlResult<krishiv_plan::expression::Expr> {
+    use datafusion::sql::sqlparser::ast::{BinaryOperator as SqlOperator, Expr as SqlExpr, Value};
+    use krishiv_plan::expression::{BinaryOperator, Expr, ScalarValue};
+
+    Ok(match expression {
+        SqlExpr::Identifier(identifier) => Expr::Column {
+            path: vec![identifier.value.clone()],
+        },
+        SqlExpr::CompoundIdentifier(identifiers) => Expr::Column {
+            path: identifiers
+                .iter()
+                .map(|identifier| identifier.value.clone())
+                .collect(),
+        },
+        SqlExpr::Nested(expression) => sqlparser_expression_to_public(expression)?,
+        SqlExpr::IsNull(expression) => Expr::IsNull {
+            expression: Box::new(sqlparser_expression_to_public(expression)?),
+            negated: false,
+        },
+        SqlExpr::IsNotNull(expression) => Expr::IsNull {
+            expression: Box::new(sqlparser_expression_to_public(expression)?),
+            negated: true,
+        },
+        SqlExpr::BinaryOp { left, op, right } => Expr::Binary {
+            left: Box::new(sqlparser_expression_to_public(left)?),
+            op: match op {
+                SqlOperator::Eq => BinaryOperator::Eq,
+                SqlOperator::NotEq => BinaryOperator::NotEq,
+                SqlOperator::Gt => BinaryOperator::Gt,
+                SqlOperator::GtEq => BinaryOperator::GtEq,
+                SqlOperator::Lt => BinaryOperator::Lt,
+                SqlOperator::LtEq => BinaryOperator::LtEq,
+                SqlOperator::And => BinaryOperator::And,
+                SqlOperator::Or => BinaryOperator::Or,
+                SqlOperator::Plus => BinaryOperator::Plus,
+                SqlOperator::Minus => BinaryOperator::Minus,
+                SqlOperator::Multiply => BinaryOperator::Multiply,
+                SqlOperator::Divide => BinaryOperator::Divide,
+                other => {
+                    return Err(SqlError::Unsupported {
+                        feature: format!("public expression operator {other}"),
+                    });
+                }
+            },
+            right: Box::new(sqlparser_expression_to_public(right)?),
+        },
+        SqlExpr::Value(value) => Expr::Literal {
+            value: match &value.value {
+                Value::Null => ScalarValue::Null,
+                Value::Boolean(value) => ScalarValue::Boolean(*value),
+                Value::SingleQuotedString(value) => ScalarValue::Utf8(value.clone()),
+                Value::Number(value, _)
+                    if value.contains('.') || value.contains('e') || value.contains('E') =>
+                {
+                    ScalarValue::float64(value.parse::<f64>().map_err(|error| {
+                        SqlError::Unsupported {
+                            feature: format!("numeric expression literal: {error}"),
+                        }
+                    })?)
+                }
+                Value::Number(value, _) => {
+                    ScalarValue::Int64(value.parse::<i64>().map_err(|error| {
+                        SqlError::Unsupported {
+                            feature: format!("integer expression literal: {error}"),
+                        }
+                    })?)
+                }
+                other => {
+                    return Err(SqlError::Unsupported {
+                        feature: format!("public expression literal {other}"),
+                    });
+                }
+            },
+        },
+        other => {
+            return Err(SqlError::Unsupported {
+                feature: format!("public expression node {other}"),
+            });
+        }
+    })
+}
+
+fn public_data_type_to_arrow(
+    data_type: &krishiv_plan::expression::ExprDataType,
+) -> arrow::datatypes::DataType {
+    use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit};
+    use krishiv_plan::expression::{ExprDataType, IntervalUnit as PublicIntervalUnit};
+
+    match data_type {
+        ExprDataType::Null => DataType::Null,
+        ExprDataType::Boolean => DataType::Boolean,
+        ExprDataType::Int64 => DataType::Int64,
+        ExprDataType::UInt64 => DataType::UInt64,
+        ExprDataType::Float64 => DataType::Float64,
+        ExprDataType::Utf8 => DataType::Utf8,
+        ExprDataType::Binary => DataType::Binary,
+        ExprDataType::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
+        ExprDataType::Date32 => DataType::Date32,
+        ExprDataType::Timestamp { unit, timezone } => DataType::Timestamp(
+            match unit {
+                krishiv_plan::expression::TimeUnit::Second => TimeUnit::Second,
+                krishiv_plan::expression::TimeUnit::Millisecond => TimeUnit::Millisecond,
+                krishiv_plan::expression::TimeUnit::Microsecond => TimeUnit::Microsecond,
+                krishiv_plan::expression::TimeUnit::Nanosecond => TimeUnit::Nanosecond,
+            },
+            timezone.clone().map(Into::into),
+        ),
+        ExprDataType::Interval { unit } => DataType::Interval(match unit {
+            PublicIntervalUnit::YearMonth => IntervalUnit::YearMonth,
+            PublicIntervalUnit::DayTime => IntervalUnit::DayTime,
+            PublicIntervalUnit::MonthDayNano => IntervalUnit::MonthDayNano,
+        }),
+        ExprDataType::List(element) => DataType::List(Arc::new(Field::new(
+            "item",
+            public_data_type_to_arrow(element),
+            true,
+        ))),
+        ExprDataType::Map { key, value } => DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", public_data_type_to_arrow(key), false)),
+                        Arc::new(Field::new("value", public_data_type_to_arrow(value), true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        ),
+        ExprDataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|field| {
+                    Arc::new(Field::new(
+                        &field.name,
+                        public_data_type_to_arrow(&field.data_type),
+                        field.nullable,
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+    }
+}
+
+fn public_scalar_to_datafusion(
+    value: &krishiv_plan::expression::ScalarValue,
+) -> Option<datafusion::common::ScalarValue> {
+    use datafusion::common::ScalarValue;
+    use krishiv_plan::expression::{ScalarValue as PublicScalar, TimeUnit};
+
+    Some(match value {
+        PublicScalar::Null => ScalarValue::Null,
+        PublicScalar::Boolean(value) => ScalarValue::Boolean(Some(*value)),
+        PublicScalar::Int64(value) => ScalarValue::Int64(Some(*value)),
+        PublicScalar::UInt64(value) => ScalarValue::UInt64(Some(*value)),
+        PublicScalar::Float64(bits) => ScalarValue::Float64(Some(f64::from_bits(*bits))),
+        PublicScalar::Utf8(value) => ScalarValue::Utf8(Some(value.clone())),
+        PublicScalar::Binary(value) => ScalarValue::Binary(Some(value.clone())),
+        PublicScalar::Decimal128 {
+            value,
+            precision,
+            scale,
+        } => ScalarValue::Decimal128(Some(*value), *precision, *scale),
+        PublicScalar::Date32(value) => ScalarValue::Date32(Some(*value)),
+        PublicScalar::Timestamp {
+            value,
+            unit,
+            timezone,
+        } => {
+            let timezone = timezone.clone().map(Into::into);
+            match unit {
+                TimeUnit::Second => ScalarValue::TimestampSecond(Some(*value), timezone),
+                TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(*value), timezone),
+                TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(*value), timezone),
+                TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(*value), timezone),
+            }
+        }
+        PublicScalar::Interval { .. } => return None,
+    })
+}
+
+/// Lower the versioned engine-owned expression contract into a DataFusion expression.
+///
+/// Ordinary nodes are lowered structurally. `RawSql`, generic function calls, aggregate
+/// calls, and interval literals intentionally use DataFusion's SQL analyzer as the
+/// compatibility/preview path until those families receive dedicated typed nodes.
+fn lower_public_expression(
+    dataframe: &datafusion::dataframe::DataFrame,
+    expression: &krishiv_plan::expression::Expr,
+) -> SqlResult<datafusion::logical_expr::Expr> {
+    expression
+        .validate()
+        .map_err(|error| SqlError::Unsupported {
+            feature: format!("invalid public expression: {error}"),
+        })?;
+    use datafusion::logical_expr::{Expr as DataFusionExpr, Operator, binary_expr, cast, try_cast};
+    use krishiv_plan::expression::{BinaryOperator, Expr};
+
+    Ok(match expression {
+        Expr::Column { path } if path.len() == 1 => datafusion::prelude::col(&path[0]),
+        Expr::Column { .. } => parse_dataframe_expression(dataframe, &expression.to_sql())?,
+        Expr::Literal { value } => match public_scalar_to_datafusion(value) {
+            Some(value) => DataFusionExpr::Literal(value, None),
+            None => parse_dataframe_expression(dataframe, &expression.to_sql())?,
+        },
+        Expr::Alias { expression, name } => {
+            lower_public_expression(dataframe, expression)?.alias(name)
+        }
+        Expr::Binary { left, op, right } => binary_expr(
+            lower_public_expression(dataframe, left)?,
+            match op {
+                BinaryOperator::Eq => Operator::Eq,
+                BinaryOperator::NotEq => Operator::NotEq,
+                BinaryOperator::Gt => Operator::Gt,
+                BinaryOperator::GtEq => Operator::GtEq,
+                BinaryOperator::Lt => Operator::Lt,
+                BinaryOperator::LtEq => Operator::LtEq,
+                BinaryOperator::And => Operator::And,
+                BinaryOperator::Or => Operator::Or,
+                BinaryOperator::Plus => Operator::Plus,
+                BinaryOperator::Minus => Operator::Minus,
+                BinaryOperator::Multiply => Operator::Multiply,
+                BinaryOperator::Divide => Operator::Divide,
+            },
+            lower_public_expression(dataframe, right)?,
+        ),
+        Expr::IsNull {
+            expression,
+            negated,
+        } => {
+            let expression = lower_public_expression(dataframe, expression)?;
+            if *negated {
+                expression.is_not_null()
+            } else {
+                expression.is_null()
+            }
+        }
+        Expr::Cast {
+            expression,
+            data_type,
+            safe,
+        } => {
+            let expression = lower_public_expression(dataframe, expression)?;
+            let data_type = public_data_type_to_arrow(data_type);
+            if *safe {
+                try_cast(expression, data_type)
+            } else {
+                cast(expression, data_type)
+            }
+        }
+        Expr::Sort { .. } => {
+            return Err(SqlError::Unsupported {
+                feature: "standalone sort expressions are only valid inside windows or order_by"
+                    .into(),
+            });
+        }
+        Expr::Aggregate { .. }
+        | Expr::Function { .. }
+        | Expr::Window { .. }
+        | Expr::RawSql { .. } => parse_dataframe_expression(dataframe, &expression.to_sql())?,
+    })
+}
+
+fn sql_dataframe<'a>(
+    dataframe: &'a dyn KrishivDataFrameOps,
+    operation: &str,
+) -> SqlResult<&'a SqlDataFrame> {
+    dataframe
+        .as_any()
+        .downcast_ref::<SqlDataFrame>()
+        .ok_or_else(|| SqlError::DataFusion {
+            message: format!("right DataFrame must be SqlDataFrame for {operation}"),
+        })
+}
+
 #[async_trait::async_trait]
 impl KrishivDataFrameOps for SqlDataFrame {
     async fn collect(&self) -> SqlResult<Vec<RecordBatch>> {
@@ -2267,10 +2723,13 @@ impl KrishivDataFrameOps for SqlDataFrame {
         Ok(Box::new(self.with_new_dataframe(df, "select")))
     }
 
-    async fn select_exprs(&self, expressions: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+    async fn select_exprs(
+        &self,
+        expressions: &[&krishiv_plan::expression::Expr],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
         let expressions = expressions
             .iter()
-            .map(|expression| parse_dataframe_expression(&self.dataframe, expression))
+            .map(|expression| lower_public_expression(&self.dataframe, expression))
             .collect::<Result<Vec<_>, _>>()?;
         let df = self.dataframe.clone().select(expressions)?;
         Ok(Box::new(self.with_new_dataframe(df, "select_exprs")))
@@ -2278,8 +2737,8 @@ impl KrishivDataFrameOps for SqlDataFrame {
 
     async fn aggregate(
         &self,
-        group_exprs: &[&str],
-        aggregate_exprs: &[&str],
+        group_exprs: &[&krishiv_plan::expression::Expr],
+        aggregate_exprs: &[&krishiv_plan::expression::Expr],
     ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
         if aggregate_exprs.is_empty() {
             return Err(SqlError::Unsupported {
@@ -2288,11 +2747,11 @@ impl KrishivDataFrameOps for SqlDataFrame {
         }
         let group_exprs = group_exprs
             .iter()
-            .map(|expression| parse_dataframe_expression(&self.dataframe, expression))
+            .map(|expression| lower_public_expression(&self.dataframe, expression))
             .collect::<Result<Vec<_>, _>>()?;
         let aggregate_exprs = aggregate_exprs
             .iter()
-            .map(|expression| parse_dataframe_expression(&self.dataframe, expression))
+            .map(|expression| lower_public_expression(&self.dataframe, expression))
             .collect::<Result<Vec<_>, _>>()?;
         let df = self
             .dataframe
@@ -2301,10 +2760,152 @@ impl KrishivDataFrameOps for SqlDataFrame {
         Ok(Box::new(self.with_new_dataframe(df, "aggregate")))
     }
 
+    async fn aggregate_grouping(
+        &self,
+        grouping: GroupingMode<'_>,
+        aggregate_exprs: &[&krishiv_plan::expression::Expr],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        if aggregate_exprs.is_empty() {
+            return Err(SqlError::Unsupported {
+                feature: "grouping aggregation requires at least one aggregate expression".into(),
+            });
+        }
+        let lower = |expression: &&krishiv_plan::expression::Expr| {
+            lower_public_expression(&self.dataframe, expression)
+        };
+        let group = match grouping {
+            GroupingMode::Sets(sets) => datafusion::logical_expr::grouping_set(
+                sets.into_iter()
+                    .map(|set| set.iter().map(lower).collect::<Result<Vec<_>, _>>())
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            GroupingMode::Cube(expressions) => datafusion::logical_expr::cube(
+                expressions
+                    .iter()
+                    .map(lower)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            GroupingMode::Rollup(expressions) => datafusion::logical_expr::rollup(
+                expressions
+                    .iter()
+                    .map(lower)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        };
+        let aggregates = aggregate_exprs
+            .iter()
+            .map(lower)
+            .collect::<Result<Vec<_>, _>>()?;
+        let df = self.dataframe.clone().aggregate(vec![group], aggregates)?;
+        Ok(Box::new(self.with_new_dataframe(df, "aggregate_grouping")))
+    }
+
+    async fn pivot(
+        &self,
+        group_exprs: &[&krishiv_plan::expression::Expr],
+        pivot_column: &krishiv_plan::expression::Expr,
+        aggregate_expr: &krishiv_plan::expression::Expr,
+        values: &[(krishiv_plan::expression::ScalarValue, String)],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        use krishiv_plan::expression::Expr as PublicExpr;
+        let (function, input, distinct) = match aggregate_expr {
+            PublicExpr::Aggregate {
+                function,
+                expression: Some(input),
+                distinct,
+            } => (*function, input.as_ref(), *distinct),
+            _ => {
+                return Err(SqlError::Unsupported {
+                    feature: "pivot requires an aggregate expression with one input".into(),
+                });
+            }
+        };
+        if values.is_empty() {
+            return Err(SqlError::Unsupported {
+                feature: "pivot requires at least one value".into(),
+            });
+        }
+        let group_exprs = group_exprs
+            .iter()
+            .map(|expression| lower_public_expression(&self.dataframe, expression))
+            .collect::<Result<Vec<_>, _>>()?;
+        let aggregates = values
+            .iter()
+            .map(|(value, alias)| {
+                let conditional = PublicExpr::raw(format!(
+                    "CASE WHEN {} = {} THEN {} END",
+                    pivot_column.to_sql(),
+                    value.to_sql_literal(),
+                    input.to_sql()
+                ));
+                let aggregate = PublicExpr::Aggregate {
+                    function,
+                    expression: Some(Box::new(conditional)),
+                    distinct,
+                }
+                .alias(alias);
+                lower_public_expression(&self.dataframe, &aggregate)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let dataframe = self.dataframe.clone().aggregate(group_exprs, aggregates)?;
+        Ok(Box::new(self.with_new_dataframe(dataframe, "pivot")))
+    }
+
+    async fn unpivot(
+        &self,
+        columns: &[&str],
+        name_column: &str,
+        value_column: &str,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        if columns.is_empty() {
+            return Err(SqlError::Unsupported {
+                feature: "unpivot requires at least one column".into(),
+            });
+        }
+        let retained = self
+            .dataframe
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .filter(|name| !columns.contains(name))
+            .collect::<Vec<_>>();
+        let mut branches = Vec::with_capacity(columns.len());
+        for column in columns {
+            let mut expressions = retained
+                .iter()
+                .map(|name| datafusion::logical_expr::col(*name))
+                .collect::<Vec<_>>();
+            expressions
+                .push(datafusion::logical_expr::lit((*column).to_owned()).alias(name_column));
+            expressions.push(datafusion::logical_expr::col(*column).alias(value_column));
+            branches.push(self.dataframe.clone().select(expressions)?);
+        }
+        let mut branches = branches.into_iter();
+        let Some(mut dataframe) = branches.next() else {
+            return Err(SqlError::Unsupported {
+                feature: "unpivot requires at least one branch".into(),
+            });
+        };
+        for branch in branches {
+            dataframe = dataframe.union(branch)?;
+        }
+        Ok(Box::new(self.with_new_dataframe(dataframe, "unpivot")))
+    }
+
     async fn filter(&self, predicate: &str) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
         let expr = self.dataframe.parse_sql_expr(predicate)?;
         let df = self.dataframe.clone().filter(expr)?;
         Ok(Box::new(self.with_new_dataframe(df, "filter")))
+    }
+
+    async fn filter_expr(
+        &self,
+        predicate: &krishiv_plan::expression::Expr,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let expr = lower_public_expression(&self.dataframe, predicate)?;
+        let df = self.dataframe.clone().filter(expr)?;
+        Ok(Box::new(self.with_new_dataframe(df, "filter_expr")))
     }
 
     async fn limit(&self, n: usize) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
@@ -2315,6 +2916,45 @@ impl KrishivDataFrameOps for SqlDataFrame {
     async fn distinct(&self) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
         let df = self.dataframe.clone().distinct()?;
         Ok(Box::new(self.with_new_dataframe(df, "distinct")))
+    }
+
+    async fn drop_nulls(&self, columns: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let columns = if columns.is_empty() {
+            self.dataframe
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>()
+        } else {
+            columns.to_vec()
+        };
+        let mut predicate: Option<datafusion::logical_expr::Expr> = None;
+        for column in columns {
+            let next = datafusion::logical_expr::col(column).is_not_null();
+            predicate = Some(match predicate {
+                Some(current) => current.and(next),
+                None => next,
+            });
+        }
+        let df = match predicate {
+            Some(predicate) => self.dataframe.clone().filter(predicate)?,
+            None => self.dataframe.clone(),
+        };
+        Ok(Box::new(self.with_new_dataframe(df, "drop_nulls")))
+    }
+
+    async fn sample(&self, fraction: f64) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        if !(0.0..=1.0).contains(&fraction) {
+            return Err(SqlError::Unsupported {
+                feature: "sample fraction must be between 0 and 1".into(),
+            });
+        }
+        let predicate = self
+            .dataframe
+            .parse_sql_expr(&format!("random() < {fraction}"))?;
+        let df = self.dataframe.clone().filter(predicate)?;
+        Ok(Box::new(self.with_new_dataframe(df, "sample")))
     }
 
     async fn sort(
@@ -2424,6 +3064,50 @@ impl KrishivDataFrameOps for SqlDataFrame {
             })?;
         let df = self.dataframe.clone().union(right_sql.dataframe.clone())?;
         Ok(Box::new(self.with_new_dataframe(df, "union")))
+    }
+
+    async fn union_distinct(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let right = sql_dataframe(right, "union_distinct")?;
+        let df = self
+            .dataframe
+            .clone()
+            .union_distinct(right.dataframe.clone())?;
+        Ok(Box::new(self.with_new_dataframe(df, "union_distinct")))
+    }
+
+    async fn intersect(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+        distinct: bool,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let right = sql_dataframe(right, "intersect")?;
+        let df = if distinct {
+            self.dataframe
+                .clone()
+                .intersect_distinct(right.dataframe.clone())?
+        } else {
+            self.dataframe.clone().intersect(right.dataframe.clone())?
+        };
+        Ok(Box::new(self.with_new_dataframe(df, "intersect")))
+    }
+
+    async fn except(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+        distinct: bool,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let right = sql_dataframe(right, "except")?;
+        let df = if distinct {
+            self.dataframe
+                .clone()
+                .except_distinct(right.dataframe.clone())?
+        } else {
+            self.dataframe.clone().except(right.dataframe.clone())?
+        };
+        Ok(Box::new(self.with_new_dataframe(df, "except")))
     }
 
     async fn register_batches(
@@ -2565,6 +3249,46 @@ pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn typed_expression_ast_matches_raw_sql_execution() {
+        use krishiv_plan::expression::{BinaryOperator, Expr, ScalarValue};
+
+        let engine = SqlEngine::new();
+        let dataframe = engine
+            .sql("SELECT 11 AS amount, TRUE AS active")
+            .await
+            .unwrap();
+        let predicate = Expr::column("amount")
+            .binary(BinaryOperator::Gt, Expr::literal(ScalarValue::Int64(10)))
+            .binary(BinaryOperator::And, Expr::column("active"));
+        let parsed = super::parse_public_expression("amount > 10 AND active").unwrap();
+        assert_eq!(
+            predicate.normalize_json().unwrap(),
+            parsed.normalize_json().unwrap()
+        );
+
+        let typed = super::KrishivDataFrameOps::filter_expr(&dataframe, &predicate)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let raw = super::KrishivDataFrameOps::filter(&dataframe, &predicate.to_sql())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(typed, raw);
+        assert_eq!(
+            typed
+                .iter()
+                .map(arrow::record_batch::RecordBatch::num_rows)
+                .sum::<usize>(),
+            1
+        );
+    }
+
     #[test]
     fn dataframe_alias_parser_ignores_nested_as_tokens() {
         assert_eq!(super::top_level_alias_index("CAST(value AS BIGINT)"), None);

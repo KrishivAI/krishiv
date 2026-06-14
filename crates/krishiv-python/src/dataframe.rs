@@ -4,6 +4,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use crate::errors::map_krishiv_error;
+use crate::expression::PyColumn;
 use crate::query_result::PyQueryResult;
 
 #[pyclass(name = "DataFrame")]
@@ -106,6 +107,7 @@ impl PyDataFrame {
             .map_err(map_krishiv_error)
     }
 
+    /// Select raw SQL expressions. This is a preview compatibility escape hatch.
     pub fn select_exprs(&self, expressions: Vec<String>) -> PyResult<Self> {
         let expressions = expressions
             .into_iter()
@@ -113,6 +115,24 @@ impl PyDataFrame {
             .collect::<Vec<_>>();
         self.inner
             .select_exprs(&expressions)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn select_columns(&self, expressions: Vec<PyColumn>) -> PyResult<Self> {
+        let expressions = expressions
+            .into_iter()
+            .map(|column| column.inner)
+            .collect::<Vec<_>>();
+        self.inner
+            .select_exprs(&expressions)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn filter_column(&self, predicate: PyColumn) -> PyResult<Self> {
+        self.inner
+            .filter_expr(predicate.inner)
             .map(|inner| Self { inner })
             .map_err(map_krishiv_error)
     }
@@ -127,6 +147,33 @@ impl PyDataFrame {
     pub fn limit(&self, n: usize) -> PyResult<Self> {
         self.inner
             .limit(n)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn boundedness(&self) -> &'static str {
+        match self.inner.boundedness() {
+            krishiv_api::Boundedness::Bounded => "bounded",
+            krishiv_api::Boundedness::Unbounded => "unbounded",
+        }
+    }
+
+    pub fn is_bounded(&self) -> bool {
+        self.inner.is_bounded()
+    }
+
+    #[pyo3(signature = (columns=Vec::new()))]
+    pub fn drop_nulls(&self, columns: Vec<String>) -> PyResult<Self> {
+        let columns = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner
+            .drop_nulls(&columns)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn sample(&self, fraction: f64) -> PyResult<Self> {
+        self.inner
+            .sample(fraction)
             .map(|inner| Self { inner })
             .map_err(map_krishiv_error)
     }
@@ -177,11 +224,156 @@ impl PyDataFrame {
             .map_err(map_krishiv_error)
     }
 
+    /// Group by raw SQL expressions. This is a preview compatibility escape hatch.
     pub fn group_by(&self, expressions: Vec<String>) -> PyGroupedDataFrame {
         PyGroupedDataFrame {
             dataframe: self.inner.clone(),
-            group_exprs: expressions,
+            group_exprs: expressions
+                .into_iter()
+                .map(krishiv_api::Expr::raw)
+                .collect(),
         }
+    }
+
+    pub fn group_by_columns(&self, expressions: Vec<PyColumn>) -> PyGroupedDataFrame {
+        PyGroupedDataFrame {
+            dataframe: self.inner.clone(),
+            group_exprs: expressions.into_iter().map(|column| column.inner).collect(),
+        }
+    }
+
+    pub fn union(&self, right: &PyDataFrame) -> PyResult<Self> {
+        self.inner
+            .union(&right.inner)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn union_distinct(&self, right: &PyDataFrame) -> PyResult<Self> {
+        self.inner
+            .union_distinct(&right.inner)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn intersect(&self, right: &PyDataFrame) -> PyResult<Self> {
+        self.inner
+            .intersect(&right.inner)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn intersect_distinct(&self, right: &PyDataFrame) -> PyResult<Self> {
+        self.inner
+            .intersect_distinct(&right.inner)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn except_all(&self, right: &PyDataFrame) -> PyResult<Self> {
+        self.inner
+            .except(&right.inner)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn except_distinct(&self, right: &PyDataFrame) -> PyResult<Self> {
+        self.inner
+            .except_distinct(&right.inner)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn pivot(
+        &self,
+        groups: Vec<PyColumn>,
+        pivot_column: PyColumn,
+        aggregate: PyColumn,
+        values: Vec<(PyColumn, String)>,
+    ) -> PyResult<Self> {
+        let groups = groups
+            .into_iter()
+            .map(|column| column.inner)
+            .collect::<Vec<_>>();
+        let values = values
+            .into_iter()
+            .map(|(column, alias)| match column.inner.into_node() {
+                krishiv_plan::expression::Expr::Literal { value } => {
+                    Ok(krishiv_api::PivotValue::new(value, alias))
+                }
+                _ => Err(PyRuntimeError::new_err(
+                    "pivot values must be created with lit()",
+                )),
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        self.inner
+            .pivot(&groups, pivot_column.inner, aggregate.inner, &values)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn unpivot(
+        &self,
+        columns: Vec<String>,
+        name_column: String,
+        value_column: String,
+    ) -> PyResult<Self> {
+        let columns = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner
+            .unpivot(&columns, &name_column, &value_column)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    #[pyo3(signature = (path, format, *, mode = "error", partition_by = Vec::new(), max_rows_per_file = None))]
+    pub fn write_file(
+        &self,
+        py: Python<'_>,
+        path: String,
+        format: String,
+        mode: &str,
+        partition_by: Vec<String>,
+        max_rows_per_file: Option<usize>,
+    ) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let mode = match mode {
+            "error" | "error_if_exists" => krishiv_api::WriteMode::ErrorIfExists,
+            "append" => krishiv_api::WriteMode::Append,
+            "overwrite" => krishiv_api::WriteMode::Overwrite,
+            "ignore" => krishiv_api::WriteMode::Ignore,
+            "dynamic_overwrite" => krishiv_api::WriteMode::DynamicOverwrite,
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "unsupported write mode '{other}'"
+                )));
+            }
+        };
+        let format = match format.to_ascii_lowercase().as_str() {
+            "parquet" => krishiv_api::DataFormat::Parquet,
+            "csv" => krishiv_api::DataFormat::Csv,
+            "json" | "ndjson" => krishiv_api::DataFormat::Json,
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "unsupported format '{other}'"
+                )));
+            }
+        };
+        py.detach(move || {
+            inner
+                .write()
+                .file_options(krishiv_api::FileWriteOptions {
+                    format,
+                    mode,
+                    layout: krishiv_api::FileLayout {
+                        partition_by,
+                        max_rows_per_file,
+                        ..krishiv_api::FileLayout::default()
+                    },
+                    schema_evolution: krishiv_api::SchemaEvolutionMode::Strict,
+                })
+                .and_then(|writer| writer.save(&path))
+                .map_err(map_krishiv_error)
+        })
     }
 
     pub fn write_parquet(&self, py: Python<'_>, path: String) -> PyResult<()> {
@@ -300,6 +492,21 @@ impl PyDataFrame {
         })
     }
 
+    /// Create a :class:`DataStreamWriter` for writing this DataFrame as a streaming sink.
+    ///
+    /// ## Example
+    ///
+    /// ```python
+    /// writer = df.write_stream()
+    /// writer.output_mode("append")
+    /// writer.trigger("processing_time", 1000)
+    /// query = writer.start()
+    /// query.await_termination(timeout_ms=30_000)
+    /// ```
+    pub fn write_stream(&self) -> crate::streaming::PyDataStreamWriter {
+        crate::streaming::PyDataStreamWriter::new(self.inner.clone())
+    }
+
     pub fn __repr__(&self) -> String {
         format!("DataFrame(plan={})", self.inner.explain_logical())
     }
@@ -308,18 +515,13 @@ impl PyDataFrame {
 #[pyclass(name = "GroupedDataFrame")]
 pub struct PyGroupedDataFrame {
     dataframe: krishiv_api::DataFrame,
-    group_exprs: Vec<String>,
+    group_exprs: Vec<krishiv_api::Expr>,
 }
 
 #[pymethods]
 impl PyGroupedDataFrame {
     pub fn agg(&self, expressions: Vec<String>) -> PyResult<PyDataFrame> {
-        let groups = self
-            .group_exprs
-            .iter()
-            .cloned()
-            .map(krishiv_api::Expr::raw)
-            .collect::<Vec<_>>();
+        let groups = self.group_exprs.clone();
         let aggregates = expressions
             .into_iter()
             .map(krishiv_api::Expr::raw)
@@ -331,13 +533,54 @@ impl PyGroupedDataFrame {
             .map_err(map_krishiv_error)
     }
 
-    pub fn count(&self) -> PyResult<PyDataFrame> {
-        let groups = self
-            .group_exprs
-            .iter()
-            .cloned()
-            .map(krishiv_api::Expr::raw)
+    pub fn agg_columns(&self, expressions: Vec<PyColumn>) -> PyResult<PyDataFrame> {
+        let aggregates = expressions
+            .into_iter()
+            .map(|column| column.inner)
             .collect::<Vec<_>>();
+        self.dataframe
+            .group_by(&self.group_exprs)
+            .agg(&aggregates)
+            .map(|inner| PyDataFrame { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn cube(&self, groups: Vec<PyColumn>, aggregates: Vec<PyColumn>) -> PyResult<PyDataFrame> {
+        let grouping = krishiv_api::GroupingSpec::Cube(
+            groups.into_iter().map(|column| column.inner).collect(),
+        );
+        let aggregates = aggregates
+            .into_iter()
+            .map(|column| column.inner)
+            .collect::<Vec<_>>();
+        self.dataframe
+            .group_by(&self.group_exprs)
+            .agg_grouping(grouping, &aggregates)
+            .map(|inner| PyDataFrame { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn rollup(
+        &self,
+        groups: Vec<PyColumn>,
+        aggregates: Vec<PyColumn>,
+    ) -> PyResult<PyDataFrame> {
+        let grouping = krishiv_api::GroupingSpec::Rollup(
+            groups.into_iter().map(|column| column.inner).collect(),
+        );
+        let aggregates = aggregates
+            .into_iter()
+            .map(|column| column.inner)
+            .collect::<Vec<_>>();
+        self.dataframe
+            .group_by(&self.group_exprs)
+            .agg_grouping(grouping, &aggregates)
+            .map(|inner| PyDataFrame { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn count(&self) -> PyResult<PyDataFrame> {
+        let groups = self.group_exprs.clone();
         self.dataframe
             .group_by(&groups)
             .count()
@@ -348,7 +591,15 @@ impl PyGroupedDataFrame {
 
 #[pyclass(name = "DataFrameStream")]
 pub struct PyDataFrameStream {
-    stream: std::sync::Arc<tokio::sync::Mutex<krishiv_api::KrishivStream>>,
+    pub(crate) stream: std::sync::Arc<tokio::sync::Mutex<krishiv_api::KrishivStream>>,
+}
+
+impl PyDataFrameStream {
+    pub(crate) fn from_stream(stream: krishiv_api::KrishivStream) -> Self {
+        Self {
+            stream: std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
+        }
+    }
 }
 
 #[pymethods]
@@ -379,5 +630,36 @@ impl PyDataFrameStream {
             Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
             None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err("")),
         }
+    }
+}
+
+#[cfg(test)]
+mod phase_c_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_python_dataframe_matches_rust_relational_results() {
+        let session = krishiv_api::Session::builder().build().unwrap();
+        let left = PyDataFrame {
+            inner: session.sql("SELECT 1 AS id UNION ALL SELECT 2").unwrap(),
+        };
+        let right = PyDataFrame {
+            inner: session.sql("SELECT 2 AS id").unwrap(),
+        };
+        assert!(left.is_bounded());
+        let python = left
+            .intersect_distinct(&right)
+            .unwrap()
+            .inner
+            .collect()
+            .unwrap();
+        let rust = session
+            .sql("SELECT 1 AS id UNION ALL SELECT 2")
+            .unwrap()
+            .intersect_distinct(&session.sql("SELECT 2 AS id").unwrap())
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(python.row_count(), rust.row_count());
     }
 }

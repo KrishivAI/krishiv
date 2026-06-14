@@ -9,12 +9,16 @@ mod agg;
 mod batch;
 mod dataframe;
 mod errors;
+mod expression;
 mod job_status;
 mod lakehouse;
 mod live_table;
 mod memo;
 mod migration;
 mod pipeline;
+mod prepared;
+mod process_api;
+mod query_handle;
 mod query_result;
 mod relation;
 mod schema;
@@ -23,6 +27,7 @@ mod sinks;
 mod sources;
 mod stream;
 mod stream_exec;
+mod streaming;
 mod udf;
 mod windows;
 
@@ -49,14 +54,19 @@ pub use errors::{
     AuthorizationError, CheckpointError, ConnectorError, KrishivError, ModeError, QueryError,
     SchemaError, UdfError,
 };
+pub use expression::PyColumn;
 pub use job_status::PyJobStatus;
 pub use live_table::{PyChangeFeedIter, PyLiveTable};
+pub use prepared::PyPreparedStatement;
+pub use process_api::{PyListState, PyMapState, PyProcessContext, PyValueState};
+pub use query_handle::PyQueryHandle;
 pub use query_result::PyQueryResult;
 pub use relation::PyRelation;
 pub use schema::PySchema;
-pub use session::PySession;
+pub use session::{PyOperationRegistry, PySession};
 pub use sinks::{PyIcebergSink, PyKafkaSink, PyParquetSink};
 pub use stream::{PyKeyedStream, PyStream, PyWindowedStream};
+pub use streaming::{PyDataStreamWriter, PyStreamingQuery, PyStreamingQueryProgress};
 pub use udf::call_python_udf;
 pub use windows::PyWindowSpec;
 
@@ -83,8 +93,11 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<session::PySession>()?;
     m.add_class::<dataframe::PyDataFrame>()?;
+    m.add_class::<prepared::PyPreparedStatement>()?;
+    m.add_class::<expression::PyColumn>()?;
     m.add_class::<dataframe::PyGroupedDataFrame>()?;
     m.add_class::<dataframe::PyDataFrameStream>()?;
+    m.add_class::<query_handle::PyQueryHandle>()?;
     m.add_class::<stream::PyStream>()?;
     m.add_class::<stream::PyKeyedStream>()?;
     m.add_class::<stream::PyWindowedStream>()?;
@@ -103,6 +116,17 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sinks::PyParquetSink>()?;
     m.add_class::<sinks::PyKafkaSink>()?;
     m.add_class::<sinks::PyIcebergSink>()?;
+
+    m.add_function(wrap_pyfunction!(expression::col, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::lit, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::expr, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::count, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::count_all, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::sum, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::avg, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::min, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::max, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::call_function, m)?)?;
 
     m.add_function(wrap_pyfunction!(sources::read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(sources::read_kafka, m)?)?;
@@ -123,6 +147,22 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<lakehouse::PyHudiWriteResult>()?;
     m.add_class::<lakehouse::PySchemaRegistryConfig>()?;
     m.add_class::<lakehouse::PyIcebergRestCatalog>()?;
+    m.add_class::<lakehouse::PyMemoryLakehouseTable>()?;
+
+    // Streaming write (Phase F parity)
+    m.add_class::<streaming::PyStreamingQueryProgress>()?;
+    m.add_class::<streaming::PyStreamingQuery>()?;
+    m.add_class::<streaming::PyDataStreamWriter>()?;
+
+    // Process function / stateful operator (Phase G parity)
+    m.add_class::<process_api::PyProcessContext>()?;
+    m.add_class::<process_api::PyValueState>()?;
+    m.add_class::<process_api::PyListState>()?;
+    m.add_class::<process_api::PyMapState>()?;
+    m.add_function(wrap_pyfunction!(process_api::apply_process_function, m)?)?;
+
+    // SQL gateway (Phase H parity)
+    m.add_class::<session::PyOperationRegistry>()?;
 
     sinks::register_sinks_module(m.py(), m)?;
     agg::register_agg_module(m.py(), m)?;

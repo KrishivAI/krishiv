@@ -10,3 +10,4 @@ a new ADR that links to the old one.
 ## Index
 
 - [0001: Record architecture decisions](0001-record-architecture-decisions.md)
+- [0002: Public API shape and execution semantics](0002-public-api-shape-and-execution-semantics.md)

@@ -37,8 +37,8 @@ pub use iceberg_fs::IcebergFsTable;
 pub use iceberg_native::IcebergNativeTwoPhaseCommit;
 pub use partition_spec::{PartitionField, PartitionSpecResolver, PartitionSpecVersion};
 pub use two_phase::{
-    IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY, MemoryIcebergTwoPhaseCommit, StagedSnapshot,
-    kafka_offsets_json, parse_kafka_offsets_json,
+    DistributedIcebergCommitCoordinator, IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY,
+    MemoryIcebergTwoPhaseCommit, StagedSnapshot, kafka_offsets_json, parse_kafka_offsets_json,
 };
 
 // ---------------------------------------------------------------------------
@@ -176,6 +176,46 @@ pub struct SchemaField {
     pub data_type: String,
 }
 
+/// Iceberg named-reference kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcebergReferenceKind {
+    Branch,
+    Tag,
+}
+
+/// Named branch or tag pinned to a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcebergReference {
+    pub name: String,
+    pub snapshot_id: i64,
+    pub kind: IcebergReferenceKind,
+}
+
+/// Scalar values supported by row-level Iceberg mutations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LakehouseValue {
+    Boolean(bool),
+    Int32(i32),
+    Int64(i64),
+    Float64(f64),
+    Utf8(String),
+    Null,
+}
+
+/// Equality predicate used by row-level delete and update operations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LakehousePredicate {
+    pub column: String,
+    pub equals: LakehouseValue,
+}
+
+/// Constant assignment used by row-level updates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LakehouseAssignment {
+    pub column: String,
+    pub value: LakehouseValue,
+}
+
 // ---------------------------------------------------------------------------
 // LakehouseTable trait
 // ---------------------------------------------------------------------------
@@ -195,6 +235,45 @@ pub trait LakehouseTable: Send + Sync {
     #[doc = "**Beta API**: may change between minor releases."]
     async fn append(&self, batches: Vec<RecordBatch>) -> Result<(), LakehouseError>;
 
+    /// Atomically replace the visible table contents with `batches`.
+    async fn overwrite(&self, _batches: Vec<RecordBatch>) -> Result<(), LakehouseError> {
+        Err(LakehouseError::Iceberg(
+            "overwrite is not implemented by this table backend".into(),
+        ))
+    }
+
+    async fn delete_where(&self, _predicate: &LakehousePredicate) -> Result<(), LakehouseError> {
+        Err(LakehouseError::Iceberg(
+            "row-level delete is not implemented by this table backend".into(),
+        ))
+    }
+
+    async fn update_where(
+        &self,
+        _predicate: &LakehousePredicate,
+        _assignments: &[LakehouseAssignment],
+    ) -> Result<(), LakehouseError> {
+        Err(LakehouseError::Iceberg(
+            "row-level update is not implemented by this table backend".into(),
+        ))
+    }
+
+    async fn merge(
+        &self,
+        _batches: Vec<RecordBatch>,
+        _key_columns: &[String],
+    ) -> Result<(), LakehouseError> {
+        Err(LakehouseError::Iceberg(
+            "merge is not implemented by this table backend".into(),
+        ))
+    }
+
+    async fn evolve_schema(&self, _schema: SchemaVersion) -> Result<(), LakehouseError> {
+        Err(LakehouseError::SchemaConflict {
+            message: "schema evolution is not implemented by this table backend".into(),
+        })
+    }
+
     #[doc = "**Beta API**: may change between minor releases."]
     async fn current_snapshot_id(&self) -> Result<Option<i64>, LakehouseError>;
 }
@@ -207,6 +286,7 @@ pub trait LakehouseTable: Send + Sync {
 struct SnapshotLayer {
     snapshot_id: i64,
     batches: Vec<RecordBatch>,
+    replace_all: bool,
 }
 
 #[derive(Debug, Default)]
@@ -230,18 +310,25 @@ impl MemoryLakehouseTableState {
     }
 
     fn batches_up_to_snapshot(&self, snapshot_id: i64) -> Vec<RecordBatch> {
-        self.layers
+        let eligible = self
+            .layers
             .iter()
             .filter(|layer| layer.snapshot_id <= snapshot_id)
+            .collect::<Vec<_>>();
+        let start = eligible
+            .iter()
+            .rposition(|layer| layer.replace_all)
+            .unwrap_or(0);
+        eligible[start..]
+            .iter()
             .flat_map(|layer| layer.batches.iter().cloned())
             .collect()
     }
 
     fn all_batches(&self) -> Vec<RecordBatch> {
-        self.layers
-            .iter()
-            .flat_map(|layer| layer.batches.iter().cloned())
-            .collect()
+        self.current_snapshot_id()
+            .map(|snapshot| self.batches_up_to_snapshot(snapshot))
+            .unwrap_or_default()
     }
 
     fn append_layer(&mut self, batches: Vec<RecordBatch>) -> i64 {
@@ -250,6 +337,19 @@ impl MemoryLakehouseTableState {
         self.layers.push(SnapshotLayer {
             snapshot_id,
             batches,
+            replace_all: false,
+        });
+        self.maybe_compact();
+        snapshot_id
+    }
+
+    fn replace_layer(&mut self, batches: Vec<RecordBatch>) -> i64 {
+        self.last_snapshot_id += 1;
+        let snapshot_id = self.last_snapshot_id;
+        self.layers.push(SnapshotLayer {
+            snapshot_id,
+            batches,
+            replace_all: true,
         });
         self.maybe_compact();
         snapshot_id
@@ -266,32 +366,29 @@ impl MemoryLakehouseTableState {
         if self.layers.len() <= max {
             return;
         }
-        // Merge the oldest (len - max + 1) layers into a single compacted layer.
-        let to_merge = self.layers.len() - max + 1;
-        let compacted_snapshot_id = self.layers[0].snapshot_id;
-        let merged_batches: Vec<RecordBatch> = self
-            .layers
-            .drain(..to_merge)
-            .flat_map(|l| l.batches)
-            .collect();
-        self.layers.insert(
-            0,
-            SnapshotLayer {
-                snapshot_id: compacted_snapshot_id,
-                batches: merged_batches,
-            },
-        );
+        // Compact the currently visible state into one replacement snapshot.
+        // Historical snapshots older than the compaction boundary are intentionally
+        // expired, matching Iceberg snapshot expiration semantics.
+        let merged_batches = self.all_batches();
+        let compacted_snapshot_id = self.last_snapshot_id;
+        self.layers.clear();
+        self.layers.push(SnapshotLayer {
+            snapshot_id: compacted_snapshot_id,
+            batches: merged_batches,
+            replace_all: true,
+        });
     }
 }
 
 #[doc = "**Beta API**: may change between minor releases."]
 pub struct MemoryLakehouseTable {
     table_ref: IcebergTableRef,
-    schema_version: SchemaVersion,
+    schema_version: tokio::sync::RwLock<SchemaVersion>,
     state: tokio::sync::Mutex<MemoryLakehouseTableState>,
     /// Active partition spec; mutations via `add_partition_field` / `drop_partition_field`
     /// affect which partition path is computed on the next `append`.
     partition_spec: tokio::sync::Mutex<PartitionSpecResolver>,
+    references: tokio::sync::RwLock<std::collections::BTreeMap<String, IcebergReference>>,
 }
 
 impl MemoryLakehouseTable {
@@ -316,9 +413,10 @@ impl MemoryLakehouseTable {
         };
         Self {
             table_ref,
-            schema_version,
+            schema_version: tokio::sync::RwLock::new(schema_version),
             state: tokio::sync::Mutex::new(state),
             partition_spec: tokio::sync::Mutex::new(PartitionSpecResolver::new(0)),
+            references: tokio::sync::RwLock::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -357,6 +455,45 @@ impl MemoryLakehouseTable {
         self.partition_spec.lock().await.active_fields().to_vec()
     }
 
+    pub async fn create_reference(
+        &self,
+        name: impl Into<String>,
+        snapshot_id: i64,
+        kind: IcebergReferenceKind,
+    ) -> Result<(), LakehouseError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(LakehouseError::Iceberg(
+                "reference name must be non-empty".into(),
+            ));
+        }
+        if !self
+            .state
+            .lock()
+            .await
+            .layers
+            .iter()
+            .any(|layer| layer.snapshot_id == snapshot_id)
+        {
+            return Err(LakehouseError::NotFound {
+                table: format!("snapshot {snapshot_id}"),
+            });
+        }
+        self.references.write().await.insert(
+            name.clone(),
+            IcebergReference {
+                name,
+                snapshot_id,
+                kind,
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn reference(&self, name: &str) -> Option<IcebergReference> {
+        self.references.read().await.get(name).cloned()
+    }
+
     /// Atomically verify the guard's expected snapshot and append batches.
     ///
     /// Holds the table mutex across the precondition check and snapshot commit so
@@ -389,7 +526,7 @@ impl LakehouseTable for MemoryLakehouseTable {
     }
 
     async fn schema(&self) -> Result<SchemaVersion, LakehouseError> {
-        Ok(self.schema_version.clone())
+        Ok(self.schema_version.read().await.clone())
     }
 
     async fn scan(&self, opts: &IcebergScanOptions) -> Result<Vec<RecordBatch>, LakehouseError> {
@@ -484,9 +621,257 @@ impl LakehouseTable for MemoryLakehouseTable {
         Ok(())
     }
 
+    async fn overwrite(&self, batches: Vec<RecordBatch>) -> Result<(), LakehouseError> {
+        self.state.lock().await.replace_layer(batches);
+        Ok(())
+    }
+
+    async fn delete_where(&self, predicate: &LakehousePredicate) -> Result<(), LakehouseError> {
+        let current = self.state.lock().await.all_batches();
+        let rewritten = current
+            .iter()
+            .map(|batch| filter_mutation_rows(batch, predicate, false))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.state.lock().await.replace_layer(rewritten);
+        Ok(())
+    }
+
+    async fn update_where(
+        &self,
+        predicate: &LakehousePredicate,
+        assignments: &[LakehouseAssignment],
+    ) -> Result<(), LakehouseError> {
+        let current = self.state.lock().await.all_batches();
+        let rewritten = current
+            .iter()
+            .map(|batch| update_mutation_rows(batch, predicate, assignments))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.state.lock().await.replace_layer(rewritten);
+        Ok(())
+    }
+
+    async fn merge(
+        &self,
+        batches: Vec<RecordBatch>,
+        key_columns: &[String],
+    ) -> Result<(), LakehouseError> {
+        if key_columns.is_empty() {
+            return Err(LakehouseError::SchemaConflict {
+                message: "merge requires at least one key column".into(),
+            });
+        }
+        let incoming_keys = collect_keys(&batches, key_columns)?;
+        let current = self.state.lock().await.all_batches();
+        let mut rewritten = current
+            .iter()
+            .map(|batch| filter_keys(batch, key_columns, &incoming_keys))
+            .collect::<Result<Vec<_>, _>>()?;
+        rewritten.extend(batches);
+        self.state.lock().await.replace_layer(rewritten);
+        Ok(())
+    }
+
+    async fn evolve_schema(&self, schema: SchemaVersion) -> Result<(), LakehouseError> {
+        let current = self.schema_version.read().await;
+        for field in &current.fields {
+            let replacement = schema
+                .fields
+                .iter()
+                .find(|candidate| candidate.id == field.id)
+                .ok_or_else(|| LakehouseError::SchemaConflict {
+                    message: format!("schema evolution cannot remove field '{}'", field.name),
+                })?;
+            if replacement.name != field.name
+                || replacement.data_type != field.data_type
+                || (!field.required && replacement.required)
+            {
+                return Err(LakehouseError::SchemaConflict {
+                    message: format!("incompatible evolution for field '{}'", field.name),
+                });
+            }
+        }
+        drop(current);
+        *self.schema_version.write().await = schema;
+        Ok(())
+    }
+
     async fn current_snapshot_id(&self) -> Result<Option<i64>, LakehouseError> {
         Ok(self.state.lock().await.current_snapshot_id())
     }
+}
+
+fn predicate_matches(
+    batch: &RecordBatch,
+    row: usize,
+    predicate: &LakehousePredicate,
+) -> Result<bool, LakehouseError> {
+    use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
+    let index =
+        batch
+            .schema()
+            .index_of(&predicate.column)
+            .map_err(|_| LakehouseError::SchemaConflict {
+                message: format!("unknown mutation column '{}'", predicate.column),
+            })?;
+    let array = batch.column(index);
+    if array.is_null(row) {
+        return Ok(matches!(predicate.equals, LakehouseValue::Null));
+    }
+    Ok(match &predicate.equals {
+        LakehouseValue::Boolean(value) => array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .is_some_and(|array| array.value(row) == *value),
+        LakehouseValue::Int32(value) => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .is_some_and(|array| array.value(row) == *value),
+        LakehouseValue::Int64(value) => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .is_some_and(|array| array.value(row) == *value),
+        LakehouseValue::Float64(value) => array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .is_some_and(|array| array.value(row) == *value),
+        LakehouseValue::Utf8(value) => array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .is_some_and(|array| array.value(row) == value),
+        LakehouseValue::Null => false,
+    })
+}
+
+fn filter_mutation_rows(
+    batch: &RecordBatch,
+    predicate: &LakehousePredicate,
+    retain_matches: bool,
+) -> Result<RecordBatch, LakehouseError> {
+    let mask = (0..batch.num_rows())
+        .map(|row| {
+            predicate_matches(batch, row, predicate).map(|matched| matched == retain_matches)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    arrow::compute::filter_record_batch(batch, &arrow::array::BooleanArray::from(mask))
+        .map_err(|error| LakehouseError::Io(error.to_string()))
+}
+
+fn constant_array(
+    value: &LakehouseValue,
+    data_type: &arrow::datatypes::DataType,
+    len: usize,
+) -> Result<arrow::array::ArrayRef, LakehouseError> {
+    use arrow::array::{
+        BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, new_null_array,
+    };
+    let array: arrow::array::ArrayRef = match (value, data_type) {
+        (LakehouseValue::Null, data_type) => new_null_array(data_type, len),
+        (LakehouseValue::Boolean(value), arrow::datatypes::DataType::Boolean) => {
+            std::sync::Arc::new(BooleanArray::from(vec![Some(*value); len]))
+        }
+        (LakehouseValue::Int32(value), arrow::datatypes::DataType::Int32) => {
+            std::sync::Arc::new(Int32Array::from(vec![Some(*value); len]))
+        }
+        (LakehouseValue::Int64(value), arrow::datatypes::DataType::Int64) => {
+            std::sync::Arc::new(Int64Array::from(vec![Some(*value); len]))
+        }
+        (LakehouseValue::Float64(value), arrow::datatypes::DataType::Float64) => {
+            std::sync::Arc::new(Float64Array::from(vec![Some(*value); len]))
+        }
+        (LakehouseValue::Utf8(value), arrow::datatypes::DataType::Utf8) => {
+            std::sync::Arc::new(StringArray::from(vec![Some(value.as_str()); len]))
+        }
+        _ => {
+            return Err(LakehouseError::SchemaConflict {
+                message: format!("assignment value is incompatible with {data_type}"),
+            });
+        }
+    };
+    Ok(array)
+}
+
+fn update_mutation_rows(
+    batch: &RecordBatch,
+    predicate: &LakehousePredicate,
+    assignments: &[LakehouseAssignment],
+) -> Result<RecordBatch, LakehouseError> {
+    let matches = (0..batch.num_rows())
+        .map(|row| predicate_matches(batch, row, predicate))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut columns = batch.columns().to_vec();
+    for assignment in assignments {
+        let index = batch.schema().index_of(&assignment.column).map_err(|_| {
+            LakehouseError::SchemaConflict {
+                message: format!("unknown assignment column '{}'", assignment.column),
+            }
+        })?;
+        let replacement = constant_array(
+            &assignment.value,
+            batch.schema().field(index).data_type(),
+            batch.num_rows(),
+        )?;
+        let original_data = columns[index].to_data();
+        let replacement_data = replacement.to_data();
+        let mut mutable = arrow::array::MutableArrayData::new(
+            vec![&original_data, &replacement_data],
+            false,
+            batch.num_rows(),
+        );
+        for (row, matched) in matches.iter().enumerate() {
+            mutable.extend(usize::from(*matched), row, row + 1);
+        }
+        columns[index] = arrow::array::make_array(mutable.freeze());
+    }
+    RecordBatch::try_new(batch.schema(), columns)
+        .map_err(|error| LakehouseError::Io(error.to_string()))
+}
+
+fn row_key(batch: &RecordBatch, row: usize, columns: &[String]) -> Result<String, LakehouseError> {
+    columns
+        .iter()
+        .map(|column| {
+            let index =
+                batch
+                    .schema()
+                    .index_of(column)
+                    .map_err(|_| LakehouseError::SchemaConflict {
+                        message: format!("unknown merge key column '{column}'"),
+                    })?;
+            arrow::util::display::array_value_to_string(batch.column(index), row)
+                .map_err(|error| LakehouseError::Io(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.join("\u{1f}"))
+}
+
+fn collect_keys(
+    batches: &[RecordBatch],
+    columns: &[String],
+) -> Result<std::collections::BTreeSet<String>, LakehouseError> {
+    let mut keys = std::collections::BTreeSet::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let key = row_key(batch, row, columns)?;
+            if !keys.insert(key.clone()) {
+                return Err(LakehouseError::Concurrency {
+                    message: format!("merge source contains duplicate key '{key}'"),
+                });
+            }
+        }
+    }
+    Ok(keys)
+}
+
+fn filter_keys(
+    batch: &RecordBatch,
+    columns: &[String],
+    excluded: &std::collections::BTreeSet<String>,
+) -> Result<RecordBatch, LakehouseError> {
+    let mask = (0..batch.num_rows())
+        .map(|row| row_key(batch, row, columns).map(|key| !excluded.contains(&key)))
+        .collect::<Result<Vec<_>, _>>()?;
+    arrow::compute::filter_record_batch(batch, &arrow::array::BooleanArray::from(mask))
+        .map_err(|error| LakehouseError::Io(error.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -855,6 +1240,55 @@ mod tests {
     }
 
     // ── MemoryLakehouseTable compaction ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn memory_iceberg_row_level_dml_and_schema_evolution() {
+        let table = MemoryLakehouseTable::new(make_table_ref(), make_schema_version());
+        table.append(vec![make_batch(vec![1, 2, 3])]).await.unwrap();
+        table
+            .update_where(
+                &LakehousePredicate {
+                    column: "x".into(),
+                    equals: LakehouseValue::Int64(2),
+                },
+                &[LakehouseAssignment {
+                    column: "x".into(),
+                    value: LakehouseValue::Int64(20),
+                }],
+            )
+            .await
+            .unwrap();
+        table
+            .delete_where(&LakehousePredicate {
+                column: "x".into(),
+                equals: LakehouseValue::Int64(1),
+            })
+            .await
+            .unwrap();
+        table
+            .merge(vec![make_batch(vec![20, 4])], &["x".into()])
+            .await
+            .unwrap();
+        let rows: usize = table
+            .scan(&IcebergScanOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 3);
+
+        let mut evolved = make_schema_version();
+        evolved.schema_id = 2;
+        evolved.fields.push(SchemaField {
+            id: 2,
+            name: "note".into(),
+            required: false,
+            data_type: "string".into(),
+        });
+        table.evolve_schema(evolved.clone()).await.unwrap();
+        assert_eq!(table.schema().await.unwrap().schema_id, 2);
+    }
 
     #[tokio::test]
     async fn memory_table_compaction_preserves_all_rows() {

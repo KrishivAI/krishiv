@@ -214,8 +214,18 @@ bench-compare name:
 # Validate repository scripts, local documentation links, and release metadata.
 project-check:
     python3 -m unittest discover -s scripts/tests -v
+    python3 scripts/check_api_surface.py
     python3 scripts/check_markdown_links.py
     python3 scripts/check_release.py
+
+# Regenerate checked-in Rust, Python, and SQL public API inventories.
+api-inventory:
+    python3 scripts/check_api_surface.py --write
+
+# Classify public API changes against a Git ref (default: origin/main).
+api-diff ref="origin/main":
+    python3 scripts/compare_api_surface.py --against-ref "{{ ref }}" --report target/api-change-report.json
+
 
 # Record the machine and revision used for a benchmark run.
 # Usage: just bench-manifest criterion "cargo bench -p krishiv-bench"

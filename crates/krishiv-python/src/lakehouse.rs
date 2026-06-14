@@ -223,6 +223,225 @@ fn catalog_config_error(error: krishiv_sql::catalog::CatalogError) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
+// ── PyMemoryLakehouseTable — Iceberg DML ─────────────────────────────────────
+
+use krishiv_connectors::lakehouse::{
+    IcebergTableRef, LakehouseAssignment, LakehousePredicate, LakehouseValue, MemoryLakehouseTable,
+    SchemaField, SchemaVersion,
+};
+
+/// An in-memory Iceberg table that supports atomic DML operations.
+///
+/// Supports ``append``, ``overwrite``, ``delete_where``, ``update_where``,
+/// ``merge``, and ``evolve_schema``.
+///
+/// ## Example
+///
+/// ```python
+/// import krishiv
+///
+/// table = krishiv.MemoryLakehouseTable("catalog", "db", "events")
+/// table.overwrite(batch)
+/// table.delete_where(column="user_id", value=42)
+/// table.evolve_schema(schema_id=2, fields=[{"id": 1, "name": "id", "required": True, "data_type": "int"}])
+/// ```
+#[pyclass(name = "MemoryLakehouseTable")]
+pub struct PyMemoryLakehouseTable {
+    inner: Arc<MemoryLakehouseTable>,
+}
+
+#[pymethods]
+impl PyMemoryLakehouseTable {
+    /// Create a new in-memory Iceberg table.
+    ///
+    /// ``catalog``, ``namespace``, ``table`` form the qualified table identifier.
+    /// ``schema_id`` is the initial schema version integer.
+    #[new]
+    #[pyo3(signature = (catalog, namespace, table, schema_id=1))]
+    pub fn new(catalog: String, namespace: String, table: String, schema_id: i32) -> Self {
+        let table_ref = IcebergTableRef::new(catalog, namespace, table);
+        let schema_version = SchemaVersion {
+            schema_id,
+            fields: Vec::new(),
+        };
+        Self {
+            inner: Arc::new(MemoryLakehouseTable::new(table_ref, schema_version)),
+        }
+    }
+
+    /// Append ``batch`` to the table.
+    pub fn append(&self, batch: &crate::batch::PyBatch) -> PyResult<()> {
+        RUNTIME
+            .block_on(
+                krishiv_connectors::lakehouse::LakehouseTable::append(
+                    self.inner.as_ref(),
+                    vec![batch.record_batch().clone()],
+                ),
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Atomically replace all table contents with ``batch``.
+    pub fn overwrite(&self, batch: &crate::batch::PyBatch) -> PyResult<()> {
+        RUNTIME
+            .block_on(
+                krishiv_connectors::lakehouse::LakehouseTable::overwrite(
+                    self.inner.as_ref(),
+                    vec![batch.record_batch().clone()],
+                ),
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Delete rows where ``column == value``.
+    ///
+    /// ``value`` may be a Python ``int``, ``float``, ``bool``, ``str``, or ``None``.
+    pub fn delete_where(&self, py: Python<'_>, column: String, value: Py<PyAny>) -> PyResult<()> {
+        let lv = py_to_lakehouse_value(py, value)?;
+        RUNTIME
+            .block_on(
+                krishiv_connectors::lakehouse::LakehouseTable::delete_where(
+                    self.inner.as_ref(),
+                    &LakehousePredicate {
+                        column,
+                        equals: lv,
+                    },
+                ),
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Update rows matching ``predicate_column == predicate_value``, setting
+    /// ``assign_column = assign_value``.
+    pub fn update_where(
+        &self,
+        py: Python<'_>,
+        predicate_column: String,
+        predicate_value: Py<PyAny>,
+        assign_column: String,
+        assign_value: Py<PyAny>,
+    ) -> PyResult<()> {
+        let pred_val = py_to_lakehouse_value(py, predicate_value)?;
+        let assign_val = py_to_lakehouse_value(py, assign_value)?;
+        RUNTIME
+            .block_on(
+                krishiv_connectors::lakehouse::LakehouseTable::update_where(
+                    self.inner.as_ref(),
+                    &LakehousePredicate {
+                        column: predicate_column,
+                        equals: pred_val,
+                    },
+                    &[LakehouseAssignment {
+                        column: assign_column,
+                        value: assign_val,
+                    }],
+                ),
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Upsert ``batch`` into the table using ``key_columns`` to identify matching rows.
+    pub fn merge(&self, batch: &crate::batch::PyBatch, key_columns: Vec<String>) -> PyResult<()> {
+        RUNTIME
+            .block_on(
+                krishiv_connectors::lakehouse::LakehouseTable::merge(
+                    self.inner.as_ref(),
+                    vec![batch.record_batch().clone()],
+                    &key_columns,
+                ),
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Evolve the table schema to a new version.
+    ///
+    /// ``fields`` is a list of dicts with keys ``id`` (int), ``name`` (str),
+    /// ``required`` (bool), and ``data_type`` (str).
+    #[pyo3(signature = (schema_id, fields))]
+    pub fn evolve_schema(
+        &self,
+        schema_id: i32,
+        fields: Vec<std::collections::HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<()> {
+        let schema_fields: Vec<SchemaField> = Python::attach(|py| {
+            fields
+                .into_iter()
+                .map(|f| {
+                    Ok(SchemaField {
+                        id: f
+                            .get("id")
+                            .ok_or_else(|| PyRuntimeError::new_err("field missing 'id'"))?
+                            .extract::<i32>(py)?,
+                        name: f
+                            .get("name")
+                            .ok_or_else(|| PyRuntimeError::new_err("field missing 'name'"))?
+                            .extract::<String>(py)?,
+                        required: f
+                            .get("required")
+                            .map(|v| v.extract::<bool>(py))
+                            .transpose()?
+                            .unwrap_or(false),
+                        data_type: f
+                            .get("data_type")
+                            .ok_or_else(|| PyRuntimeError::new_err("field missing 'data_type'"))?
+                            .extract::<String>(py)?,
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })?;
+
+        RUNTIME
+            .block_on(
+                krishiv_connectors::lakehouse::LakehouseTable::evolve_schema(
+                    self.inner.as_ref(),
+                    SchemaVersion {
+                        schema_id,
+                        fields: schema_fields,
+                    },
+                ),
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Return the current snapshot ID, or ``None`` if no data has been written.
+    pub fn current_snapshot_id(&self) -> PyResult<Option<i64>> {
+        RUNTIME
+            .block_on(
+                krishiv_connectors::lakehouse::LakehouseTable::current_snapshot_id(
+                    self.inner.as_ref(),
+                ),
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn __repr__(&self) -> String {
+        "MemoryLakehouseTable".to_string()
+    }
+}
+
+fn py_to_lakehouse_value(py: Python<'_>, value: Py<PyAny>) -> PyResult<LakehouseValue> {
+    use pyo3::types::{PyBool, PyFloat, PyInt, PyNone, PyString};
+    let bound = value.bind(py);
+    if bound.is_none() {
+        return Ok(LakehouseValue::Null);
+    }
+    if let Ok(b) = bound.downcast::<PyBool>() {
+        return Ok(LakehouseValue::Boolean(b.is_true()));
+    }
+    if let Ok(i) = bound.extract::<i64>() {
+        return Ok(LakehouseValue::Int64(i));
+    }
+    if let Ok(f) = bound.extract::<f64>() {
+        return Ok(LakehouseValue::Float64(f));
+    }
+    if let Ok(s) = bound.extract::<String>() {
+        return Ok(LakehouseValue::Utf8(s));
+    }
+    Err(PyRuntimeError::new_err(
+        "unsupported value type: expected int, float, bool, str, or None",
+    ))
+}
+
 #[cfg(test)]
 mod catalog_tests {
     use super::*;

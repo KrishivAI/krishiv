@@ -15,6 +15,8 @@ use crate::errors::{UdfError as PyUdfError, map_krishiv_error};
 use crate::job_status::PyJobStatus;
 use crate::live_table::PyLiveTable;
 use crate::pipeline::StreamPipeline;
+use crate::query_handle::PyQueryHandle;
+use crate::query_result::PyQueryResult;
 use crate::relation::PyRelation;
 use crate::stream::{PyStream, PyWindowedStream};
 use crate::stream_exec::spec_from_pipeline;
@@ -71,6 +73,59 @@ impl PySession {
     #[new]
     pub fn new() -> PyResult<Self> {
         build_embedded_session()
+    }
+
+    pub fn table(&self, name: String) -> PyResult<PyDataFrame> {
+        let identifier = krishiv_api::TableIdentifier::new(name).map_err(map_krishiv_error)?;
+        self.inner
+            .table(&identifier)
+            .map(|inner| PyDataFrame { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    #[pyo3(signature = (path, format, *, header = true, delimiter = ','))]
+    pub fn read_file(
+        &self,
+        py: Python<'_>,
+        path: String,
+        format: String,
+        header: bool,
+        delimiter: char,
+    ) -> PyResult<PyDataFrame> {
+        let session = Arc::clone(&self.inner);
+        py.detach(move || {
+            let reader = session.read();
+            let reader = match format.to_ascii_lowercase().as_str() {
+                "parquet" => reader.parquet(krishiv_api::ParquetReadOptions::default()),
+                "csv" => {
+                    if !delimiter.is_ascii() {
+                        return Err(PyRuntimeError::new_err("delimiter must be one ASCII byte"));
+                    }
+                    reader.csv(krishiv_api::CsvReadOptions {
+                        has_header: header,
+                        delimiter: delimiter as u8,
+                        ..krishiv_api::CsvReadOptions::default()
+                    })
+                }
+                "json" | "ndjson" => reader.json(krishiv_api::JsonReadOptions::default()),
+                other => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "unsupported format '{other}'"
+                    )));
+                }
+            };
+            reader
+                .load(path)
+                .map(|inner| PyDataFrame { inner })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    pub fn prepare(&self, sql: String) -> PyResult<crate::prepared::PyPreparedStatement> {
+        self.inner
+            .prepare(sql)
+            .map(|inner| crate::prepared::PyPreparedStatement { inner })
+            .map_err(map_krishiv_error)
     }
 
     #[classmethod]
@@ -193,17 +248,41 @@ impl PySession {
         })
     }
 
-    pub fn sql_async(&self, py: Python<'_>, query: String) -> PyResult<PyDataFrame> {
+    /// Execute a SQL query asynchronously, returning a Python coroutine.
+    ///
+    /// The coroutine resolves to a ``QueryResult`` when ``await``-ed::
+    ///
+    ///     result = await session.sql_async("SELECT 1 AS n")
+    ///     print(result.pretty())
+    ///
+    /// Cancellation is propagated from the asyncio task through the
+    /// ``QueryHandle`` cancel channel to the Tokio executor.
+    pub async fn sql_async(&self, query: String) -> PyResult<PyQueryResult> {
         let inner = self.inner.clone();
-        py.detach(move || {
-            block_on_async(async move {
-                inner
-                    .sql_async(&query)
-                    .await
-                    .map(|df| PyDataFrame { inner: df })
-            })
+        // Spawn the plan build + collect on the embedded Tokio runtime.
+        // JoinHandle::poll works from asyncio context; see query_handle.rs.
+        let join = crate::RUNTIME.spawn(async move {
+            let df = inner.sql_async(&query).await?;
+            df.collect_async().await
+        });
+        join.await
+            .map_err(|e| PyRuntimeError::new_err(format!("query task panicked: {e}")))?
+            .map(PyQueryResult::new)
             .map_err(map_krishiv_error)
-        })
+    }
+
+    /// Submit a SQL query and return a ``QueryHandle`` for lifecycle management.
+    ///
+    /// The handle gives access to status, progress, and cancellation.
+    /// ``await handle.collect_async()`` retrieves the result::
+    ///
+    ///     handle = session.submit_async("SELECT count(*) FROM t")
+    ///     print(handle.status())  # "running"
+    ///     result = await handle.collect_async()
+    pub fn submit_async(&self, py: Python<'_>, query: String) -> PyResult<PyQueryHandle> {
+        let df = self.inner.sql(&query).map_err(map_krishiv_error)?;
+        let handle = py.detach(move || df.submit_async());
+        Ok(PyQueryHandle::new(handle))
     }
 
     pub fn read_parquet(&self, py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
@@ -372,6 +451,50 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
+    // ── SQL gateway methods ───────────────────────────────────────────────────
+
+    /// Execute a SQL query with a wall-clock timeout.
+    ///
+    /// Raises ``RuntimeError`` if the query does not complete within
+    /// ``timeout_ms`` milliseconds.
+    ///
+    /// ## Example
+    ///
+    /// ```python
+    /// df = session.sql_with_timeout("SELECT sleep(10)", timeout_ms=100)
+    /// ```
+    pub fn sql_with_timeout(
+        &self,
+        py: Python<'_>,
+        query: String,
+        timeout_ms: u64,
+    ) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            block_on_async(inner.sql_with_timeout_async(&query, timeout_ms))
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Execute SQL async with a timeout.
+    pub async fn sql_with_timeout_async(
+        &self,
+        query: String,
+        timeout_ms: u64,
+    ) -> PyResult<PyDataFrame> {
+        self.inner
+            .sql_with_timeout_async(&query, timeout_ms)
+            .await
+            .map(|df| PyDataFrame { inner: df })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Create an :class:`OperationRegistry` tied to this session for operation-level cancellation.
+    pub fn operation_registry(&self) -> PyOperationRegistry {
+        PyOperationRegistry::new()
+    }
+
     pub fn jobs(&self) -> Vec<PyJobStatus> {
         self.inner
             .jobs()
@@ -481,10 +604,11 @@ impl PySession {
         })
     }
 
-    /// Create a unified DataFrame backed by SQL (batch).
+    /// Create a legacy unified `Relation` backed by batch SQL.
     ///
-    /// Equivalent to `sql()` but returns a `DataFrame` usable in both batch
-    /// and streaming contexts via `SessionExt`-style API.
+    /// New batch code should use `sql()`, which returns the canonical
+    /// `DataFrame`. This method remains while streaming-only relation behavior
+    /// migrates to the canonical API.
     pub fn dataframe(&self, py: Python<'_>, query: String) -> PyResult<PyRelation> {
         let inner = self.inner.clone();
         py.detach(move || {
@@ -571,6 +695,61 @@ impl PySession {
                 })
                 .map_err(map_krishiv_error)
         })
+    }
+}
+
+// ── PyOperationRegistry ───────────────────────────────────────────────────────
+
+/// Thread-safe registry of cancelled operation IDs.
+///
+/// Pass to :py:meth:`Session.operation_registry` and call :py:meth:`cancel`
+/// to abort in-flight queries identified by a numeric operation ID.
+///
+/// ## Example
+///
+/// ```python
+/// registry = session.operation_registry()
+/// registry.cancel(42)
+/// assert registry.is_cancelled(42)
+/// registry.remove(42)  # clean up once the operation has finished
+/// ```
+#[pyclass(name = "OperationRegistry")]
+pub struct PyOperationRegistry {
+    inner: krishiv_sql::OperationRegistry,
+}
+
+impl PyOperationRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: krishiv_sql::OperationRegistry::new(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyOperationRegistry {
+    /// Mark ``operation_id`` as cancelled.
+    fn cancel(&self, operation_id: u64) {
+        self.inner.cancel(operation_id);
+    }
+
+    /// Return ``True`` if ``operation_id`` has been cancelled.
+    fn is_cancelled(&self, operation_id: u64) -> bool {
+        self.inner.is_cancelled(operation_id)
+    }
+
+    /// Remove ``operation_id`` from the registry (after the operation finishes).
+    fn remove(&self, operation_id: u64) {
+        self.inner.remove(operation_id);
+    }
+
+    /// Return all currently cancelled operation IDs.
+    fn cancelled_ids(&self) -> Vec<u64> {
+        self.inner.cancelled_ids()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("OperationRegistry(cancelled={:?})", self.inner.cancelled_ids())
     }
 }
 

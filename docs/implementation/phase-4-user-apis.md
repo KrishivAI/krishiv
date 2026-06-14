@@ -59,3 +59,11 @@ The local Rust and Python API slice is implemented when focused SQL/API/Python
 checks pass. Distributed writes, remote progress/cancellation, JDBC/ODBC, and
 prepared statements remain explicit follow-up work rather than undocumented
 claims.
+
+## Stable API continuation
+
+Phase 4 added a preview API slice; it did not freeze that slice as the final
+1.0 contract. The canonical API identity, sync/async rules, expression AST,
+language parity, query lifecycle, structured streaming, and release gates are
+defined in [`stable-public-api-plan.md`](stable-public-api-plan.md) and
+[ADR-0002](../decisions/0002-public-api-shape-and-execution-semantics.md).

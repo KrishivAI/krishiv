@@ -1038,6 +1038,17 @@ impl Session {
         )
     }
 
+    pub(crate) fn dataframe_from_batches(&self, batches: Vec<RecordBatch>) -> DataFrame {
+        DataFrame::from_batches(
+            self.mode,
+            batches,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+            self.runtime.clone(),
+            self.registered_parquet.clone(),
+        )
+    }
+
     /// Create a DataFrame from a SQL query.
     pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         block_on(self.sql_async(query))
@@ -1048,6 +1059,29 @@ impl Session {
         let query = query.as_ref().to_owned();
         let sql_dataframe = self.sql_engine.sql(&query).await?;
         Ok(self.dataframe_from_sql(sql_dataframe))
+    }
+
+    /// Execute a SQL query with a wall-clock timeout.
+    ///
+    /// Returns `KrishivError::Runtime` if the query does not produce a result
+    /// within `timeout_ms` milliseconds.
+    pub async fn sql_with_timeout_async(
+        &self,
+        query: impl AsRef<str> + Send,
+        timeout_ms: u64,
+    ) -> Result<DataFrame> {
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        tokio::time::timeout(timeout, self.sql_async(query))
+            .await
+            .map_err(|_| KrishivError::Runtime {
+                message: format!("SQL query timed out after {timeout_ms}ms"),
+            })?
+    }
+
+    /// Synchronous variant of [`sql_with_timeout_async`].
+    pub fn sql_with_timeout(&self, query: impl AsRef<str>, timeout_ms: u64) -> Result<DataFrame> {
+        let query = query.as_ref().to_owned();
+        block_on(self.sql_with_timeout_async(query, timeout_ms))
     }
 
     /// Execute SQL on the local `SqlEngine` only (embedded / single-node path).
@@ -1380,10 +1414,22 @@ impl Session {
 
     /// Asynchronously create a DataFrame by reading a local CSV file.
     pub async fn read_csv_async(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame> {
-        let path = path.as_ref();
+        self.read_csv_with_options_async(path, true, b',').await
+    }
+
+    pub async fn read_csv_with_options_async(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        has_header: bool,
+        delimiter: u8,
+    ) -> Result<DataFrame> {
+        let opts = krishiv_sql::CsvReaderOptions {
+            has_header: Some(has_header),
+            delimiter: Some(delimiter as char),
+        };
         let sql_dataframe = self
             .sql_engine
-            .read_csv(path)
+            .read_csv_with_options(path, &opts)
             .await
             .map_err(KrishivError::from)?;
         Ok(self.dataframe_from_sql(sql_dataframe))
@@ -1458,6 +1504,26 @@ impl Session {
         self.sql_engine
             .deregister_table(name)
             .map_err(KrishivError::from)
+    }
+
+    /// Create a streaming data reader rooted at this session.
+    pub fn read_stream(&self) -> crate::streaming_builder::DataStreamReader {
+        crate::streaming_builder::DataStreamReader::new(self.clone())
+    }
+
+    /// Crate-internal: wrap a list of pre-collected batches as a `DataFrame`.
+    pub(crate) fn create_dataframe_from_batches(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<crate::DataFrame> {
+        Ok(crate::DataFrame::from_batches(
+            self.mode,
+            batches,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+            self.runtime.clone(),
+            self.registered_parquet.clone(),
+        ))
     }
 }
 
