@@ -167,7 +167,31 @@ Validation:
 - `cargo check -p krishiv-connectors --features "iceberg"` — 0 errors.
 - `cargo check --tests -p krishiv-connectors --features "iceberg"` — 0 errors (background; pending confirmation).
 
-Next: Wire `CALL system.expire_snapshots(...)`, `CALL system.compact_data_files(...)`, and SQL `DELETE/UPDATE/MERGE` interception into `krishiv-sql/src/lib.rs`; integrate `KrishivCatalog` into the main `Session` API.
+---
+
+## 2026-06-14 — Iceberg catalog wired into SqlEngine and SessionBuilder
+
+Completed:
+
+- `crates/krishiv-sql/src/lib.rs`: Added `SqlEngine::with_iceberg_catalog(catalog, name)` builder
+  method (gated on `iceberg-datafusion + local-catalog`). Creates an `IcebergCatalogBridge`
+  and registers it as a DataFusion catalog provider so tables resolve as `<name>.<ns>.<table>`.
+  Includes a regression test `iceberg_catalog_tests::with_iceberg_catalog_registers_under_given_name`.
+
+- `crates/krishiv-api/Cargo.toml`: Added `iceberg-catalog` feature that enables
+  `krishiv-sql/local-catalog`, `krishiv-sql/iceberg-datafusion`, `krishiv-connectors/iceberg`,
+  and `dep:iceberg`.
+
+- `crates/krishiv-api/src/session.rs`: Added `SessionBuilder::with_iceberg_catalog(catalog, name)`
+  builder method (gated on `iceberg-catalog` feature). Accumulated catalogs are wired into
+  `SqlEngine::with_iceberg_catalog` during `build()`.
+
+Validation:
+- `cargo check --tests -p krishiv-connectors --features "iceberg"` — 0 errors (previously 27).
+- `cargo check -p krishiv-sql --features "local-catalog,iceberg-datafusion"` — 0 errors.
+- `cargo check -p krishiv-api --features "iceberg-catalog"` — running (background).
+
+Next: Wire `CALL system.expire_snapshots(...)`, `CALL system.compact_data_files(...)`, and SQL `DELETE/UPDATE/MERGE` interception into `krishiv-sql/src/lib.rs`.
 
 ---
 
