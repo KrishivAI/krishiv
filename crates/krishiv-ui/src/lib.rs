@@ -184,6 +184,12 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
         .route("/assets/krishiv.css", get(stylesheet))
         .route("/assets/krishiv-live.js", get(live_js))
         .route("/assets/krishiv-sql.js", get(sql_js))
+        // Alias under /ui/assets/ so the paths work through a path-prefix reverse
+        // proxy (e.g. code-server /proxy/PORT/) where root-relative /assets/ URLs
+        // resolve outside the proxied subtree.
+        .route("/ui/assets/krishiv.css", get(stylesheet))
+        .route("/ui/assets/krishiv-live.js", get(live_js))
+        .route("/ui/assets/krishiv-sql.js", get(sql_js))
         .route("/api/v1/openapi.json", get(openapi_json));
 
     let protected = Router::new()
@@ -243,6 +249,9 @@ pub fn embedded_router(state: UiState) -> Router {
         .route("/assets/krishiv.css", get(stylesheet))
         .route("/assets/krishiv-live.js", get(live_js))
         .route("/assets/krishiv-sql.js", get(sql_js))
+        .route("/ui/assets/krishiv.css", get(stylesheet))
+        .route("/ui/assets/krishiv-live.js", get(live_js))
+        .route("/ui/assets/krishiv-sql.js", get(sql_js))
         .route("/api/v1/openapi.json", get(openapi_json));
 
     let protected = Router::new()
@@ -2069,7 +2078,7 @@ mod tests {
             let body = String::from_utf8(body.to_vec()).unwrap();
             assert!(!body.contains("unpkg.com"), "{uri} still references a CDN");
             assert!(
-                body.contains("/assets/krishiv-live.js"),
+                body.contains("assets/krishiv-live.js"),
                 "{uri} missing vendored live script"
             );
         }

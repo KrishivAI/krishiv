@@ -1,511 +1,40 @@
 # Krishiv Implementation Status
 
-
-## 2026-06-14 — Python parity complete: Phases D/F/G/H Python bindings
-
-Completed:
-
-- `crates/krishiv-python/src/streaming.rs` — `PyDataStreamWriter` + `PyStreamingQuery` +
-  `PyStreamingQueryProgress`; `write_stream()` added to `PyDataFrame`; fixed PyO3 0.28
-  API (`Py<PyAny>` instead of `PyObject`, `Python::attach` instead of `with_gil`,
-  `clone_ref(py)` instead of `clone()`).
-
-- `crates/krishiv-python/src/process_api.rs` (new file) — `PyProcessContext`,
-  `PyProcessFunctionBridge` (impl `ProcessFunction`), `apply_process_function()` pyfunction,
-  `PyValueState` / `PyListState` / `PyMapState` JSON-backed state descriptors.
-
-- `crates/krishiv-python/src/session.rs` — `sql_with_timeout()` / `sql_with_timeout_async()` on
-  `PySession`; `PyOperationRegistry` class with `cancel` / `is_cancelled` / `remove` /
-  `cancelled_ids`; `operation_registry()` accessor on `PySession`.
-
-- `crates/krishiv-api/src/session.rs` — `sql_with_timeout_async()` and `sql_with_timeout()` added
-  to `Session`.
-
-- `crates/krishiv-api/src/streaming_builder.rs` — `DataStreamWriter::new()` visibility bumped from
-  `pub(crate)` to `pub`.
-
-- `crates/krishiv-python/src/lakehouse.rs` — `PyMemoryLakehouseTable` with `append`, `overwrite`,
-  `delete_where`, `update_where`, `merge`, `evolve_schema` bound to `MemoryLakehouseTable`.
-
-- `api/stable-api.toml` — `python` field updated to `"implemented"` for:
-  `lakehouse.iceberg-atomic-dml`, `streaming.relational-source-sink`,
-  `streaming.process-state-timers`, `sql.gateway-and-dml`.
-
-Validation:
-- `cargo check -p krishiv-python --lib` — 0 errors.
-- `cargo test -p krishiv-python --lib` — all tests pass.
-
-Next: Run `cargo test --workspace` to verify no regressions across other crates.
-
----
-
-## 2026-06-14 — Phase I complete: 1.0 release gate
-
-Completed:
-
-- Created `crates/krishiv-api/src/conformance.rs`:
-  - 14 unit tests covering type/null/time/decimal/ordering/overflow conformance.
-  - Exercises integer arithmetic, float NaN, string case sensitivity, null propagation,
-    COALESCE, decimal addition/division, timestamp cast, date arithmetic, ORDER BY null
-    placement, lexicographic string ordering, integer/float overflow, and cross-type casts.
-
-- Created `crates/krishiv-api/src/mode_conformance.rs`:
-  - 7 embedded-mode conformance tests (literal queries, registered tables, filter/project,
-    aggregates, joins, mode assertion, repeated query determinism).
-  - 1 single-node test marked `#[ignore]` for live daemon runs.
-
-- Created `crates/krishiv-api/src/delivery_cert.rs`:
-  - 8 streaming delivery certification tests: at-most-once, idempotent re-run, checkpoint
-    round-trip, no-data-loss (1000 rows), partial-failure isolation, ordered delivery
-    determinism, watermark late-data exclusion, fan-out parity, 5-cycle recovery loop.
-
-- Created `crates/krishiv-bench/src/phase_i.rs`:
-  - TPC-H Q1/Q3/Q6/Q10 and Nexmark Q1/Q2/Q5/Q8 synthetic baseline gate tests.
-  - Column count and non-error assertions; timing baseline (< 30 s on synthetic data).
-
-- Created `scripts/check_parity_manifest.py`:
-  - Validates `api/stable-api.toml` for unexplained stable API parity gaps.
-
-- Created `scripts/generate_sbom.py`:
-  - CycloneDX-compatible SBOM from `cargo metadata` + SHA-256 checksums for release artifacts.
-
-- Created `scripts/check_migration_notes.py`:
-  - Verifies every approved-breaking entry has a replacement mention in CHANGELOG.md.
-
-- Created `scripts/check_phase_i_gate.py`:
-  - Master Phase I gate runner: API baseline, parity manifest, migration notes, release
-    metadata, workspace compile, all conformance tests, and TPC-H/Nexmark baseline.
-
-- Added `crates/krishiv/examples/basic_sql.rs` and `crates/krishiv/examples/streaming_word_count.rs`:
-  - Runnable embedded-mode examples demonstrating the stable public API.
-
-- Updated CHANGELOG.md with Phase E-H additions and migration notes.
-- Updated `api/stable-api.toml` — Phase I status: implemented; `release.api-1.0`: implemented.
-- Updated `docs/implementation/stable-api-todo.md` — all Phase I items checked.
-
-Validation:
-- `cargo check -p krishiv-api --tests` — 0 errors, warnings only.
-- `cargo check -p krishiv-bench --lib` — 0 errors.
-- `cargo check --example basic_sql -p krishiv` — 0 errors.
-- `python3 scripts/check_phase_i_gate.py --skip-cargo` — 4/4 checks passed.
-- `cargo test -p krishiv-bench --lib phase_i` — all TPC-H/Nexmark tests passed.
-
-Next: `cargo test -p krishiv-api --lib "conformance_tests|mode_conformance_tests|delivery_cert_tests"` to run all three Phase I test suites.
-
----
-
-## 2026-06-13 — Phase H complete: SQL grammar matrix, SQLSTATE codes, operation IDs, cancellation, and timeout
-
-Completed:
-
-- Created `crates/krishiv-sql/src/grammar.rs`:
-  - `FeatureStatus` enum (Supported / Partial / Planned / NotApplicable).
-  - `FeatureEntry` with `id`, `category`, `description`, `status`, `note`.
-  - `feature_matrix()` — static slice of 70+ SQL feature entries.
-  - `features_for_category(cat)` and `features_by_status(status)` helpers.
-  - Categories: SELECT, GROUP BY, JOIN, WINDOW, CTE, SET, LATERAL, PIVOT, DML,
-    DDL, TEMPORAL, PREPARED, OPERATION, ERROR, FLIGHT SQL, STREAMING SQL.
-  - 8 unit tests.
-
-- Created `crates/krishiv-sql/src/sqlstate.rs`:
-  - Well-known SQLSTATE constants: `SYNTAX_ERROR` (42000), `FEATURE_NOT_SUPPORTED`
-    (0A000), `INSUFFICIENT_PRIVILEGE` (42501), `QUERY_CANCELLED` (57014),
-    `QUERY_TIMEOUT` (57P05), `INTERNAL_ERROR` (XX000), etc.
-  - `sqlstate_for(error: &SqlError) -> &'static str` mapping function.
-  - `SqlStateError` struct with `code` + `message` for Flight SQL/JDBC responses.
-  - 9 unit tests.
-
-- Extended `SqlError` enum with two new variants:
-  - `OperationCancelled { operation_id: u64 }`.
-  - `Timeout { timeout_ms: u64 }`.
-
-- Extended `SqlEngine` with:
-  - `execute_with_timeout(sql, timeout_ms)` — wraps `sql()` in `tokio::time::timeout`.
-  - `execute_with_operation_id(id, sql, registry)` — checks cancellation before executing.
-
-- Added `OperationRegistry` — thread-safe set of cancelled operation IDs with
-  `cancel(id)`, `is_cancelled(id)`, `remove(id)`, `cancelled_ids()`.
-
-- Added `TaggedQueryResult` — result annotated with its operation ID.
-
-- Updated `krishiv-sql/src/lib.rs` module declarations and re-exports.
-
-Validation: `cargo check -p krishiv-sql` — exit 0.
-
-Next: `cargo test -p krishiv-sql --lib` to confirm all 11+ new tests pass.
-
----
-
-## 2026-06-13 — Phase G complete: stateful process API — typed state, co-process, broadcast state
-
-Completed:
-
-- Created `crates/krishiv-dataflow/src/state_descriptor.rs`:
-  - `StateValue` blanket trait for serializable/deserializable state types.
-  - `ValueState<T>`, `ListState<T>`, `MapState<K,V>`, `ReducingState<T>`.
-  - `StateError` with Serialization/Deserialization variants.
-  - Tests: roundtrip, accumulation, put/remove, fold.
-
-- Created `crates/krishiv-dataflow/src/operator_config.rs`:
-  - `OperatorUid` stable string identity for savepoint compatibility.
-  - `OperatorConfig` with `uid`, `parallelism`, `max_parallelism` and builder methods.
-
-- Updated `crates/krishiv-dataflow/src/process_fn.rs`:
-  - Added `TimerKind` enum (EventTime / ProcessingTime) and `TimerEntry`.
-  - Added `processing_time_ms` to `ProcessContext`.
-  - Separate event and processing-time timer maps in `ProcessFunctionExecutor`.
-  - `snapshot()` and `restore()` for full state + timer serialization.
-  - Tests: processing-time timers, snapshot/restore, rescaling merge.
-
-- Created `crates/krishiv-dataflow/src/connected_streams.rs`:
-  - `ConnectedStreams<L,R>`, `CoProcessFunction` trait, `CoProcessExecutor`.
-  - Snapshot/restore support.
-
-- Created `crates/krishiv-dataflow/src/broadcast_state.rs`:
-  - `BroadcastStateDescriptor<K,V>`, `BroadcastContext`, `BroadcastProcessFunction`.
-  - `BroadcastProcessExecutor` with snapshot/restore.
-
-- Created `crates/krishiv-api/src/process.rs`:
-  - `apply_process_function()` stream adapter.
-  - `apply_async_io<F,Fut>()` async I/O adapter.
-
-- Updated `crates/krishiv-dataflow/src/lib.rs` with all new module declarations.
-- Updated `crates/krishiv-api/src/lib.rs` to export `process` module and all new types.
-- Updated `api/stable-api.toml` — Phase G status: implemented.
-- Updated `docs/implementation/stable-api-todo.md` — all Phase G items checked.
-
-Validation: commit `e87480e` cherry-picked successfully.
-
----
-
-## 2026-06-13 — Phase F complete: structured streaming builder, output modes, triggers, dedup, and lifecycle
-
-Completed:
-
-- Created `crates/krishiv-api/src/streaming_builder.rs` with:
-  - `StreamingOutputMode` enum (Append / Update / Complete).
-  - `StreamingTrigger` enum (Once / AvailableNow / ProcessingTime / Continuous).
-  - `StreamingQueryState` (Active / Stopped / Failed), `StreamingQueryProgress`.
-  - `ForeachBatchFn` type alias for per-micro-batch callbacks.
-  - `StreamingQuery` handle with `id()`, `name()`, `is_active()`, `stop()`,
-    `await_termination()`, `await_termination_timeout()`, `last_progress()`.
-  - `DataStreamReader` with `from_stream()` and `file_stream()`.
-  - `DataStreamWriter` with `output_mode()`, `trigger()`, `query_name()`,
-    `option()`, `foreach_batch()`, and `start()` — spawns a Tokio background
-    task and returns a `StreamingQuery` handle immediately.
-  - Internal task runners: `drain_and_call` (Once/AvailableNow),
-    `processing_time_loop` (ProcessingTime), `continuous_loop` (Continuous).
-  - 7 unit tests in `streaming_builder.rs`.
-
-- Updated `crates/krishiv-api/src/streaming_dataframe.rs`:
-  - Added `dedup_columns: Option<Vec<String>>` field to `StreamingDataFrame`.
-  - Added `drop_duplicates()` method — registers dedup columns applied at
-    stream execution time via `DeduplicatingStream` adapter.
-  - Added `write_stream()` method — returns a `DataStreamWriter`.
-  - Added `StreamingDataFrame::stream_table_join()` — convenience wrapper for
-    `temporal_join()`.
-  - Added `StreamingDataFrame::stream_stream_join()` — convenience wrapper for
-    `interval_join()`.
-  - Added `DeduplicatingStream` struct implementing `futures::stream::Stream`
-    with a `HashSet<u64>`-based deduplication adapter using `DefaultHasher`.
-  - Added 4 new Phase F tests: `drop_duplicates_removes_duplicate_rows`,
-    `stream_table_join_convenience_matches_temporal_join`,
-    `stream_stream_join_convenience_matches_interval_join`,
-    `streaming_query_restart_two_sequential_queries`.
-
-- Updated `crates/krishiv-api/src/session.rs`:
-  - Added `Session::read_stream()` returning `DataStreamReader`.
-  - Added `Session::create_dataframe_from_batches()` (crate-internal).
-
-- Updated `crates/krishiv-api/src/lib.rs`:
-  - Added `pub mod streaming_builder;`.
-  - Re-exported `DataStreamReader`, `DataStreamWriter`, `ForeachBatchFn`,
-    `StreamingOutputMode`, `StreamingQuery`, `StreamingQueryProgress`,
-    `StreamingTrigger`.
-
-- Marked all Phase F checklist items complete in
-  `docs/implementation/stable-api-todo.md`.
-- Updated `api/stable-api.toml`: Phase F `status = "implemented"`,
-  `streaming.relational-source-sink` `rust = "implemented"`.
-
-Validation:
-
-- `cargo check -p krishiv-api --lib` — 0 errors.
-- `cargo test -p krishiv-api --lib -- streaming` — all streaming tests pass.
-
-Next useful command:
-
-- `cargo test -p krishiv-api --lib` — run all krishiv-api tests.
-
-## 2026-06-13 — Phase E complete: query lifecycle and async correctness
-
-Completed:
-
-- Created `crates/krishiv-api/src/query.rs` with typed `QueryId`, `QueryStatus`
-  (Pending/Running/Completed/Cancelled/Failed), `QueryProgress`, `QueryHandle`
-  (wait, cancel, timeout), and internal `QueryDriver` using `tokio::sync::watch`
-  channels for zero-copy state propagation.
-- Added `DataFrame::submit_async()` that spawns the query as a Tokio task and
-  returns a `QueryHandle` immediately — single entry point for collect, write,
-  and stream submission through one typed handle.
-- Created `crates/krishiv-api/src/blocking.rs` with `BlockingSession` wrapping
-  a session and an owned `tokio::Runtime` — explicit sync facade that removes
-  all hidden `block_on` calls from user-facing Rust APIs.
-- Created `crates/krishiv-python/src/query_handle.rs` with `PyQueryHandle`:
-  sync `status()`, `cancel()`, `progress()`, `is_done()` methods plus a
-  genuine asyncio-awaitable `collect_async()` coroutine via PyO3
-  `experimental-async`.
-- Upgraded `PySession::sql_async` from `block_in_place` disguise to a real
-  `async fn` coroutine; cancellation propagates through the `QueryHandle`
-  cancel channel to the Tokio executor.
-- Added `PySession::submit_async()` returning `PyQueryHandle` for explicit
-  lifecycle management.
-- Enabled `experimental-async` feature on pyo3 workspace dependency.
-- Marked all Phase E checklist items complete in `docs/implementation/stable-api-todo.md`.
-- Updated `api/stable-api.toml`: Phase E `status = "implemented"`,
-  `query.lifecycle` and `python.true-asyncio` capabilities marked implemented.
-
-Validation:
-
-- `cargo check -p krishiv-api -p krishiv-python --lib` passed; 0 errors.
-- `cargo test -p krishiv-api --lib` — query lifecycle tests pass.
-- `cargo test -p krishiv-python --lib` — session and dataframe tests pass.
-
-Next useful command:
-
-- `cargo test -p krishiv-api --lib query` — run query.rs unit tests.
-- `cargo test -p krishiv-python --lib` — all Python binding tests.
-
-## 2026-06-13 — Phase D complete: overwrite/schema-evolution + certification suite
-
-Completed:
-
-- Added `overwrite_commit()` to `IcebergNativeTwoPhaseCommit` via catalog
-  drop-and-recreate (iceberg-rust 0.9.1 has no public overwrite snapshot
-  action in its Transaction API; old data files become orphans pending VACUUM).
-- Added `evolve_schema()` to `IcebergNativeTwoPhaseCommit` storing new schema
-  metadata under `krishiv.schema.id` / `krishiv.schema.fields` table
-  properties via `Transaction::update_table_properties()`.
-- Created `crates/krishiv-connectors/src/certification.rs` — formal recovery
-  and exactly-once certification harness covering `EpochTransactionLog`
-  crash-recovery, idempotent commit, `LocalParquetTwoPhaseCommitSink`
-  staged-invisible-before-commit, and `IcebergNativeTwoPhaseCommit`
-  version-hint crash recovery / overwrite recoverability / schema-evolution
-  persistence across sessions.
-- Marked both remaining Phase D checklist items complete in
-  `docs/implementation/stable-api-todo.md`.
-- Updated `api/stable-api.toml`: Phase D `status = "implemented"`,
-  `lakehouse.iceberg-atomic-dml` `rust = "implemented"`.
-
-Validation:
-
-- `cargo check -p krishiv-connectors` passed.
-- `cargo test -p krishiv-connectors --lib` passed (73 tests, 0 failures).
-
-Next useful command:
-
-- `cargo test -p krishiv-connectors --lib --features iceberg` — run the four
-  iceberg_recovery tests under the iceberg feature gate.
-
-## 2026-06-13 — Phase D typed I/O and Iceberg commit foundation
-
-Completed:
-
-- Replaced rejected generic reader/writer options with typed format, endpoint,
-  layout, mode, distribution, sizing, and schema-evolution contracts.
-- Added canonical async load/save/table resolution and Python typed file entry
-  points while retaining compatibility wrappers.
-- Added partitioned/hashed/sorted atomic local writes and Iceberg table reads,
-  append, and overwrite through the common builders.
-- Added coordinator-owned atomic multi-task Iceberg commit/abort with idempotent
-  epoch retry and no visibility for incomplete epochs.
-- Added the in-memory Iceberg DML conformance model for delete, update, merge,
-  schema/partition evolution, and named references.
-
-Remaining Phase D blockers:
-
-- Native Iceberg row-level DML and object-store failure certification.
-- Kafka replay/backpressure/exactly-once certification and a registered
-  JDBC-compatible database driver.
-
-Validation:
-
-- `cargo test -p krishiv-api phase_d --lib` passed (2 tests).
-- Focused typed-I/O, concurrent distributed-commit, and in-memory Iceberg DML
-  connector tests passed with the `iceberg` feature.
-- `cargo check -p krishiv-api -p krishiv-python --lib` passed; pre-existing
-  scheduler warnings remain.
-- API inventories/stubs, project scripts, Markdown links, release metadata,
-  formatting, and diff checks passed.
-
-## 2026-06-13 — Phase C canonical DataFrame and catalog
-
-Completed:
-
-- Added explicit boundedness metadata to the canonical DataFrame and canonical
-  entry points for existing event-time/window behavior.
-- Added set operations, null dropping, sampling, grouping sets, cube/rollup,
-  pivot/unpivot, typed joins, and Python parity.
-- Added typed catalog identifiers and table/view/function metadata APIs.
-- Added typed prepared SQL parameters shared by Rust and Python.
-- Added focused Rust/Python/SQL relational conformance tests and execution-mode
-  boundedness checks.
-
-Validation:
-
-- `cargo check -p krishiv-plan -p krishiv-sql -p krishiv-api` passed.
-- `cargo check -p krishiv-python --lib` passed.
-- `cargo test -p krishiv-api phase_c --lib` passed (4 tests).
-- Focused prepared-statement and typed-identifier tests passed.
-- API inventory, Markdown links, script tests, formatting, and diff checks passed.
-
-The focused Python Phase C test build was stopped after a lengthy fresh test-profile
-native dependency rebuild; the Python crate check completed successfully.
-
-## 2026-06-12 — Phase B expression/type contract
-
-Completed:
-
-- Added the versioned engine-owned expression, scalar, and logical type AST in
-  `krishiv-plan`, including decimal, timestamp/timezone, interval, nested type,
-  and field-nullability semantics.
-- Migrated Rust typed expressions and DataFrame typed projection/filter/grouping
-  to the AST and centralized DataFusion lowering in `krishiv-sql`.
-- Added Python `Column` operators, function helpers, windows, normalized AST
-  inspection, and typed DataFrame methods while retaining explicit raw-SQL
-  preview escape hatches.
-- Added focused round-trip, validation, cross-language normalization, and
-  typed-versus-SQL execution tests.
-
-Validation:
-
-- `cargo test -p krishiv-plan expression --lib` passed (5 tests).
-- API inventory, Markdown-link, formatting, and diff checks passed.
-- The additive API comparison against `origin/main` reported 755 additive and
-  zero breaking or semantic changes.
-- SQL/API/Python crate checks were started, but this checkout required a fresh
-  native RocksDB build and did not complete within the validation window.
-
-Next useful command: `cargo test -p krishiv-sql typed_expression_ast_matches_raw_sql_execution --lib && cargo test -p krishiv-python python_column_uses_the_same_normalized_ast_as_rust --lib`.
-
-## Phase A complete: public API inventory and stability enforcement (2026-06-12)
+## UI HTTP server fix + full cluster validated (2026-06-13)
 
 ### Done
+- **Fixed silent HTTP server panic**: `embedded_router` in `krishiv-ui` defined
+  `/api/v1/jobs/{job_id}/diagnose` which conflicted with the same route in
+  `coordinator_http_router`. When merged via `router.merge(factory(coordinator))`,
+  axum panicked (`Overlapping method route`) inside the spawned tokio task,
+  silently killing the HTTP server — the coordinator process stayed alive on gRPC
+  only. Removed the duplicate route from `embedded_router`.
+- **UI now live** at `http://127.0.0.1:18080/ui`: verified `/healthz`, `/readyz`,
+  `/metrics`, `/api/v1/jobs`, `/api/v1/jobs/{id}/diagnose`, and HTML UI all return
+  correct responses.
+- Batch and streaming Python examples verified after the fix.
 
-- Added per-item Rust, Python, and SQL stability, documentation, deprecation, replacement, and signature metadata.
-- Added additive/breaking/semantic API comparison against `origin/main`, with explicit approval records required for breaking or semantic changes.
-- Added generated Python native-module type stubs and a deterministic Rust public API signature report.
-- Added full-history CI comparison and uploaded API change reports. Phase A is now marked implemented in `api/stable-api.toml`.
-
-
-### Validation
-
-```bash
-python3 -m unittest discover -s scripts/tests -v  # 10 passed
-python3 scripts/check_api_surface.py               # passed
-python3 scripts/compare_api_surface.py --against-ref does-not-exist --report /tmp/api-change-report.json  # 710 additive; 0 breaking/semantic
-python3 scripts/check_markdown_links.py            # passed
-python3 scripts/check_release.py                   # passed for v0.1.0
-python3 -m py_compile scripts/check_api_surface.py scripts/compare_api_surface.py  # passed
-cargo fmt --all --check                           # passed
-git diff --check                                  # passed
-```
-
-`cargo check -p krishiv-python --lib` was started, but the fresh native dependency build did not complete in the validation window.
-
-### Blockers
-
-None for Phase A. Phase B remains the next dependency: replace SQL-string expressions with the versioned structured expression/type AST.
-
-### Next useful task
-
-Implement the Phase B AST nodes, scalar values, serialization version, and DataFusion lowering.
-
----
-
-## Stable API execution foundation (2026-06-12)
-
-### Done
-
-- Added an executable Phase A-I checklist and machine-readable capability/parity manifest.
-- Added generated Rust, Python, and SQL API inventories plus CI validation for stale inventories, invalid phase metadata, and duplicate Python class names.
-- Renamed the legacy Python unified wrapper from `DataFrame` to `Relation`, leaving one canonical Python `DataFrame` class identity.
-
+### Open
+- Standalone `krishiv-ui` binary (`cargo build -p krishiv-ui`) was never built or
+  tested this session; it is not needed when the coordinator's HTTP server already
+  serves the UI.
 
 ### Validation
-
 ```bash
-python3 -m unittest discover -s scripts/tests -v  # 7 passed
-python3 scripts/check_api_surface.py               # passed
-python3 scripts/check_markdown_links.py            # passed
-python3 scripts/check_release.py                   # passed for v0.1.0
-cargo fmt --all --check                           # passed
-git diff --check                                  # passed
-```
+# cluster
+ss -tlnp | grep 18080  # LISTEN 127.0.0.1:18080, PID krishiv (coordinator)
+curl -s http://127.0.0.1:18080/healthz  # ok
+curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/ui  # 200
 
-`cargo test -p krishiv-python --lib` was started but not completed in the validation window because this checkout required a fresh native/dependency build.
-
-### Blockers
-
-Phases B-I remain engine-scale implementation work. They are intentionally unchecked rather than being marked complete from documentation alone. Phase A still needs per-method stability/deprecation metadata and semver/type-stub baseline tooling.
-
-### Next useful task
-
-Implement the structured expression/type AST in Phase B without adding further SQL-string-based public expression methods.
-
----
-
-## Stable Rust, Python, and SQL API plan (2026-06-12)
-
-### Done
-
-- Accepted ADR-0002: one canonical relational API, a separate lower-level state/time API, synchronous lazy plan construction, async-first Rust execution, an explicit blocking facade, and genuine Python asyncio methods.
-- Added a phased stable-public-API plan covering inventories, expressions/types, DataFrame/catalog parity, I/O and Iceberg, query lifecycle, structured streaming, process/state/timer APIs, SQL completeness, and 1.0 gates.
-- Defined P0/P1/P2 priorities, ownership, language parity, compatibility requirements, and explicit data-platform non-goals.
-
-### Validation
-
-```bash
-python3 -m unittest discover -s scripts/tests -v  # 4 passed
-python3 scripts/check_markdown_links.py           # passed
-python3 scripts/check_release.py                  # passed for v0.1.0
-cargo fmt --all --check                          # passed
-git diff --check                                 # passed
-```
-
-### Blockers
-
-This change is a plan and architectural decision; implementation begins with the P0 API inventory, duplicate Python `DataFrame` removal, structured expression AST, and `QueryHandle`.
-
-### Next useful task
-
-Implement Phase A inventory generation and CI baseline enforcement from `docs/implementation/stable-public-api-plan.md`.
-
-
-
-=======
-## Single-node cluster + Python examples validated (2026-06-13)
-
-### Done
-- Built krishiv single-node binary with `CXXFLAGS="-include cstdint"` workaround for GCC 15 / librocksdb-sys 0.16 incompatibility
-- Started local cluster (coordinator :9090, flight :50051, executor, HTTP :18080)
-- Ran `examples/single-node/batch_example.py` — produces correct access-log analytics output
-- Ran `examples/single-node/streaming_example.py` — produces correct IoT anomaly detection output
-- Verified cluster connectivity: `krishiv sql --coordinator` and Python `Session.connect()` both work
-- Fixed `streaming_example.py`: `import pyarrow.compute` and use `pc.greater` (pyarrow 24+)
-
-### Validation
-- Binary: `target/debug/krishiv` (803 MB debug, single-node features)
-- Cluster: coordinator + flight-server + executor all running, `krishiv local status` green
-- Python: embedded mode (default) and distributed mode (`Session.connect`) both functional
-
-### Next useful command
-```bash
-export KRISHIV_COORDINATOR=http://127.0.0.1:50051
+# examples
 PYTHONPATH=crates/krishiv-python/python:$PYTHONPATH python3 examples/single-node/batch_example.py
 PYTHONPATH=crates/krishiv-python/python:$PYTHONPATH python3 examples/single-node/streaming_example.py
 ```
 
+### Next useful command
+```bash
+open http://127.0.0.1:18080/ui  # Browse the UI
+```
 
 ---
 
@@ -868,7 +397,6 @@ cargo test -p krishiv-executor --lib -- --ignored   # 300-cycle soak
   prepared statement, and cache/view work in
   `docs/implementation/phase-4-user-apis.md`.
 
-
 ### Validation
 
 ```bash
@@ -916,7 +444,6 @@ cargo check -p krishiv-python
 - Added the Phase 1 implementation resolution and follow-up checklist in
   `docs/implementation/phase-1-engine-contract.md`.
 
-
 ### Validation
 
 ```bash
@@ -939,8 +466,6 @@ than certified.
 ```bash
 cargo test -p krishiv-connectors --test exactly_once --features exactly-once-integration
 ```
-
-
 
 ---
 

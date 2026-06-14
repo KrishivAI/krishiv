@@ -464,7 +464,6 @@ pub fn coordinator_http_router(
             "/api/v1/continuous-drain",
             post(crate::continuous_stream_http::api_continuous_drain),
         )
-        .route("/api/v1/jobs/{job_id}/diagnose", get(api_job_diagnose))
         .with_state(coordinator.clone());
 
     let protected = if http_auth_required(config) {
@@ -599,42 +598,6 @@ async fn api_executor_reset(
         axum::http::StatusCode::OK,
         Json(serde_json::json!({"reset": true, "executor_id": executor_id_str})),
     )
-}
-
-/// Structured observability report for production diagnosis (GAP-OB-07).
-async fn api_job_diagnose(
-    State(coordinator): State<SharedCoordinator>,
-    axum::extract::Path(job_id_str): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    use axum::http::StatusCode;
-    use krishiv_proto::JobId;
-
-    let job_id = match JobId::try_new(&job_id_str) {
-        Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid job id"})),
-            )
-                .into_response();
-        }
-    };
-
-    let report = {
-        let coord = coordinator.read().await;
-        match crate::coordinator::observability::build_observability_report(&coord, &job_id) {
-            Ok(report) => report,
-            Err(e) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-                    .into_response();
-            }
-        }
-    };
-
-    Json(report).into_response()
 }
 
 async fn readyz(
