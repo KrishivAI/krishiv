@@ -203,9 +203,7 @@ mod tests {
     mod iceberg_recovery {
         use std::collections::BTreeMap;
 
-        use crate::lakehouse::{SchemaField, SchemaVersion};
-        use crate::lakehouse::iceberg_native::IcebergNativeTwoPhaseCommit;
-        use crate::lakehouse::two_phase::IcebergTwoPhaseCommit;
+        use crate::lakehouse::{IcebergNativeTwoPhaseCommit, IcebergTwoPhaseCommit, SchemaField, SchemaVersion};
 
         fn schema_version() -> SchemaVersion {
             SchemaVersion {
