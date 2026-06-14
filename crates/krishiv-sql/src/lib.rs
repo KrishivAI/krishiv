@@ -1043,6 +1043,30 @@ impl SqlEngine {
         self.krishiv_catalog.as_ref()
     }
 
+    /// Register an Iceberg [`KrishivCatalog`] as a DataFusion catalog provider.
+    ///
+    /// Tables in the catalog are resolved automatically by DataFusion when SQL
+    /// queries reference `<catalog_name>.<namespace>.<table>`. The bridge uses
+    /// `plan_files()` to enumerate Parquet files and wraps them in a
+    /// `ListingTable`, giving DataFusion native projection/filter pushdown.
+    ///
+    /// Multiple catalogs can be registered under different names.
+    #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+    #[must_use]
+    pub fn with_iceberg_catalog(
+        self,
+        catalog: std::sync::Arc<catalog::unified::KrishivCatalog>,
+        catalog_name: impl Into<String>,
+    ) -> Self {
+        let bridge = catalog::iceberg_catalog_bridge::IcebergCatalogBridge::new(
+            catalog,
+            catalog_name.into(),
+        );
+        self.context
+            .register_catalog(bridge.catalog_name().to_string(), Arc::new(bridge));
+        self
+    }
+
     /// Share a session UDF registry so scalar UDFs are visible in SQL.
     #[must_use]
     pub fn with_udf_registry(
@@ -3990,4 +4014,26 @@ mod streaming_match_recognize_limit_tests {
         assert_eq!(resolve_streaming_match_recognize_limit(Some("0")), 100_000);
     }
 }
+
+#[cfg(all(test, feature = "iceberg-datafusion", feature = "local-catalog"))]
+mod iceberg_catalog_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::catalog::unified::KrishivCatalog;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_iceberg_catalog_registers_under_given_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let engine = SqlEngine::new().with_iceberg_catalog(catalog, "mycat");
+        // Catalog must appear in DataFusion's catalog list.
+        let catalog_names = engine.context.catalog_names();
+        assert!(
+            catalog_names.contains(&"mycat".to_string()),
+            "iceberg catalog 'mycat' must be registered; got: {catalog_names:?}"
+        );
+    }
+}
+
 pub mod kafka_table;
