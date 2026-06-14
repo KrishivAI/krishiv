@@ -85,7 +85,10 @@ mod tests {
 
         // Second call for the same epoch — nothing left to commit.
         let second = log.commit_through(3).unwrap();
-        assert_eq!(second, 0, "re-committing an already-committed epoch is a no-op");
+        assert_eq!(
+            second, 0,
+            "re-committing an already-committed epoch is a no-op"
+        );
         assert_eq!(
             log.sink().committed().len(),
             1,
@@ -169,17 +172,16 @@ mod tests {
         // Staging file exists.
         assert!(handle.staging_path.exists(), "staging file must exist");
         // Final file does not yet exist.
-        assert!(!handle.final_path.exists(), "final file must not exist before commit");
+        assert!(
+            !handle.final_path.exists(),
+            "final file must not exist before commit"
+        );
 
         // Count .parquet files (not .tmp).
         let parquet_count = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "parquet")
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
             .count();
         assert_eq!(parquet_count, 0, "no committed parquet files before commit");
 
@@ -188,13 +190,12 @@ mod tests {
         let parquet_count_after = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "parquet")
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
             .count();
-        assert_eq!(parquet_count_after, 1, "exactly one committed parquet file after commit");
+        assert_eq!(
+            parquet_count_after, 1,
+            "exactly one committed parquet file after commit"
+        );
     }
 
     // ── IcebergNativeTwoPhaseCommit recovery (iceberg feature only) ──────────
@@ -203,7 +204,9 @@ mod tests {
     mod iceberg_recovery {
         use std::collections::BTreeMap;
 
-        use crate::lakehouse::{IcebergNativeTwoPhaseCommit, IcebergTwoPhaseCommit, SchemaField, SchemaVersion};
+        use crate::lakehouse::{
+            IcebergNativeTwoPhaseCommit, IcebergTwoPhaseCommit, SchemaField, SchemaVersion,
+        };
 
         fn schema_version() -> SchemaVersion {
             SchemaVersion {
@@ -218,9 +221,9 @@ mod tests {
         }
 
         fn batch(values: Vec<i64>) -> arrow::record_batch::RecordBatch {
-            use std::sync::Arc;
             use arrow::array::Int64Array;
             use arrow::datatypes::{DataType, Field, Schema};
+            use std::sync::Arc;
             let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
             arrow::record_batch::RecordBatch::try_new(
                 schema,

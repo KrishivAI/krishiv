@@ -43,14 +43,15 @@ fn decode_map(raw: &[u8]) -> Result<HashMap<String, serde_json::Value>, StateErr
     if raw.is_empty() {
         return Ok(HashMap::new());
     }
-    serde_json::from_slice(raw)
-        .map_err(|e| StateError::Deserialization(e.to_string()))
+    serde_json::from_slice(raw).map_err(|e| StateError::Deserialization(e.to_string()))
 }
 
 /// Serialise a `HashMap<String, serde_json::Value>` back to the raw state buffer.
-fn encode_map(raw: &mut Vec<u8>, map: HashMap<String, serde_json::Value>) -> Result<(), StateError> {
-    let bytes = serde_json::to_vec(&map)
-        .map_err(|e| StateError::Serialization(e.to_string()))?;
+fn encode_map(
+    raw: &mut Vec<u8>,
+    map: HashMap<String, serde_json::Value>,
+) -> Result<(), StateError> {
+    let bytes = serde_json::to_vec(&map).map_err(|e| StateError::Serialization(e.to_string()))?;
     *raw = bytes;
     Ok(())
 }
@@ -89,8 +90,8 @@ impl<T: StateValue> ValueState<T> {
     /// Serialise and write the value back into the raw state buffer.
     pub fn set(&self, raw: &mut Vec<u8>, value: &T) -> Result<(), StateError> {
         let mut map = decode_map(raw)?;
-        let v = serde_json::to_value(value)
-            .map_err(|e| StateError::Serialization(e.to_string()))?;
+        let v =
+            serde_json::to_value(value).map_err(|e| StateError::Serialization(e.to_string()))?;
         map.insert(self.key.clone(), v);
         encode_map(raw, map)
     }
@@ -144,8 +145,7 @@ impl<T: StateValue> ListState<T> {
             None => Vec::new(),
         };
         list.push(item);
-        let v = serde_json::to_value(list)
-            .map_err(|e| StateError::Serialization(e.to_string()))?;
+        let v = serde_json::to_value(list).map_err(|e| StateError::Serialization(e.to_string()))?;
         map.insert(self.key.clone(), v);
         encode_map(raw, map)
     }
@@ -199,8 +199,8 @@ impl<K: StateValue + std::hash::Hash + Eq, V: StateValue> MapState<K, V> {
             None => HashMap::new(),
         };
         inner.insert(k, v);
-        let json_val = serde_json::to_value(inner)
-            .map_err(|e| StateError::Serialization(e.to_string()))?;
+        let json_val =
+            serde_json::to_value(inner).map_err(|e| StateError::Serialization(e.to_string()))?;
         outer.insert(self.key.clone(), json_val);
         encode_map(raw, outer)
     }
@@ -214,8 +214,8 @@ impl<K: StateValue + std::hash::Hash + Eq, V: StateValue> MapState<K, V> {
             None => return Ok(()),
         };
         inner.remove(k);
-        let json_val = serde_json::to_value(inner)
-            .map_err(|e| StateError::Serialization(e.to_string()))?;
+        let json_val =
+            serde_json::to_value(inner).map_err(|e| StateError::Serialization(e.to_string()))?;
         outer.insert(self.key.clone(), json_val);
         encode_map(raw, outer)
     }
@@ -231,13 +231,15 @@ impl<K: StateValue + std::hash::Hash + Eq, V: StateValue> MapState<K, V> {
 
 // ── ReducingState ─────────────────────────────────────────────────────────────
 
+type ReducerFn<T> = Arc<dyn Fn(&T, &T) -> T + Send + Sync>;
+
 /// Reducing state descriptor.
 ///
 /// Folds incoming values with a combining function, storing only a single
 /// accumulated value. Equivalent to Flink's `ReducingState`.
 pub struct ReducingState<T: StateValue> {
     key: String,
-    reducer: Arc<dyn Fn(&T, &T) -> T + Send + Sync>,
+    reducer: ReducerFn<T>,
 }
 
 impl<T: StateValue> ReducingState<T> {
@@ -278,8 +280,8 @@ impl<T: StateValue> ReducingState<T> {
             }
             None => value,
         };
-        let json_val = serde_json::to_value(&new_val)
-            .map_err(|e| StateError::Serialization(e.to_string()))?;
+        let json_val =
+            serde_json::to_value(&new_val).map_err(|e| StateError::Serialization(e.to_string()))?;
         map.insert(self.key.clone(), json_val);
         encode_map(raw, map)
     }

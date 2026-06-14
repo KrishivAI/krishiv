@@ -508,6 +508,7 @@ pub struct JwtAuthProvider {
 struct JwtClaims {
     sub: String,
     #[serde(default)]
+    #[allow(dead_code)]
     krishiv_role: Option<String>,
 }
 

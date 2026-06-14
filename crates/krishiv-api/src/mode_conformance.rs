@@ -76,7 +76,8 @@ mod mode_conformance_tests {
         session
             .register_record_batches("vals", vec![make_batch(&[1, 2, 3, 4, 5])])
             .unwrap();
-        let mut vals = collect_i64_from_session(&session, "SELECT v * 2 AS v2 FROM vals WHERE v > 2");
+        let mut vals =
+            collect_i64_from_session(&session, "SELECT v * 2 AS v2 FROM vals WHERE v > 2");
         vals.sort_unstable();
         assert_eq!(vals, vec![6, 8, 10]);
     }
@@ -93,10 +94,30 @@ mod mode_conformance_tests {
         let result = df.collect().unwrap();
         let batches = result.batches();
         let b = &batches[0];
-        let cnt = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
-        let s = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
-        let lo = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
-        let hi = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        let cnt = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let s = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let lo = b
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let hi = b
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
         assert_eq!(cnt, 3);
         assert_eq!(s, 600);
         assert_eq!(lo, 100);
@@ -118,8 +139,20 @@ mod mode_conformance_tests {
         let result = df.collect().unwrap();
         let batches = result.batches();
         let b = &batches[0];
-        let avs: Vec<i64> = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec();
-        let bvs: Vec<i64> = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec();
+        let avs: Vec<i64> = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        let bvs: Vec<i64> = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
         assert_eq!(avs, vec![1, 1, 2, 2]);
         assert_eq!(bvs, vec![10, 20, 10, 20]);
     }

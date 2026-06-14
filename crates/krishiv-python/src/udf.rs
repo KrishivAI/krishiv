@@ -461,42 +461,77 @@ impl std::fmt::Debug for PythonAggregateUdf {
     }
 }
 
-fn batch_to_py_dict(py: Python<'_>, batch: &RecordBatch) -> Result<Py<PyDict>, krishiv_plan::udf::UdfError> {
+fn batch_to_py_dict(
+    py: Python<'_>,
+    batch: &RecordBatch,
+) -> Result<Py<PyDict>, krishiv_plan::udf::UdfError> {
     let dict = PyDict::new(py);
     for (idx, field) in batch.schema().fields().iter().enumerate() {
         let col = batch.column(idx);
         let py_list = match field.data_type() {
             DataType::Int8 => {
                 let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
-                PyList::new(py, arr.iter().map(|v| v.map(|x| x as i64))).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() })?.into_any()
+                PyList::new(py, arr.iter().map(|v| v.map(|x| x as i64)))
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: e.to_string(),
+                    })?
+                    .into_any()
             }
             DataType::Int16 => {
                 let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
-                PyList::new(py, arr.iter().map(|v| v.map(|x| x as i64))).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() })?.into_any()
+                PyList::new(py, arr.iter().map(|v| v.map(|x| x as i64)))
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: e.to_string(),
+                    })?
+                    .into_any()
             }
             DataType::Int32 => {
                 let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-                PyList::new(py, arr.iter().map(|v| v.map(|x| x as i64))).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() })?.into_any()
+                PyList::new(py, arr.iter().map(|v| v.map(|x| x as i64)))
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: e.to_string(),
+                    })?
+                    .into_any()
             }
             DataType::Int64 => {
                 let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                PyList::new(py, arr.iter()).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() })?.into_any()
+                PyList::new(py, arr.iter())
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: e.to_string(),
+                    })?
+                    .into_any()
             }
             DataType::Float32 => {
                 let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-                PyList::new(py, arr.iter().map(|v| v.map(|x| x as f64))).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() })?.into_any()
+                PyList::new(py, arr.iter().map(|v| v.map(|x| x as f64)))
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: e.to_string(),
+                    })?
+                    .into_any()
             }
             DataType::Float64 => {
                 let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                PyList::new(py, arr.iter()).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() })?.into_any()
+                PyList::new(py, arr.iter())
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: e.to_string(),
+                    })?
+                    .into_any()
             }
             DataType::Boolean => {
                 let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-                PyList::new(py, arr.iter()).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() })?.into_any()
+                PyList::new(py, arr.iter())
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: e.to_string(),
+                    })?
+                    .into_any()
             }
             DataType::Utf8 => {
                 let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-                PyList::new(py, arr.iter()).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() })?.into_any()
+                PyList::new(py, arr.iter())
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: e.to_string(),
+                    })?
+                    .into_any()
             }
             dt => {
                 return Err(krishiv_plan::udf::UdfError::InvalidArgument {
@@ -504,12 +539,19 @@ fn batch_to_py_dict(py: Python<'_>, batch: &RecordBatch) -> Result<Py<PyDict>, k
                 });
             }
         };
-        dict.set_item(field.name(), py_list).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() })?;
+        dict.set_item(field.name(), py_list).map_err(|e| {
+            krishiv_plan::udf::UdfError::Execution {
+                message: e.to_string(),
+            }
+        })?;
     }
     Ok(dict.unbind())
 }
 
-fn py_to_scalar(py: Python<'_>, obj: &Py<PyAny>) -> Result<krishiv_plan::udf::ScalarValue, krishiv_plan::udf::UdfError> {
+fn py_to_scalar(
+    py: Python<'_>,
+    obj: &Py<PyAny>,
+) -> Result<krishiv_plan::udf::ScalarValue, krishiv_plan::udf::UdfError> {
     let bound = obj.bind(py);
     if bound.is_none() {
         return Ok(krishiv_plan::udf::ScalarValue::Null);
@@ -530,7 +572,14 @@ fn py_to_scalar(py: Python<'_>, obj: &Py<PyAny>) -> Result<krishiv_plan::udf::Sc
         return Ok(krishiv_plan::udf::ScalarValue::Bytes(v));
     }
     Err(krishiv_plan::udf::UdfError::Execution {
-        message: format!("unsupported Python scalar type returned from UDAF finalize: {}", bound.get_type().name().map(|s| s.to_string()).unwrap_or_else(|_| "unknown".into())),
+        message: format!(
+            "unsupported Python scalar type returned from UDAF finalize: {}",
+            bound
+                .get_type()
+                .name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "unknown".into())
+        ),
     })
 }
 
@@ -547,39 +596,61 @@ impl krishiv_plan::udf::AggregateUdf for PythonAggregateUdf {
         &self.output_field
     }
 
-    fn accumulate(&self, state: &mut krishiv_plan::udf::AggState, batch: &RecordBatch) -> Result<(), krishiv_plan::udf::UdfError> {
+    fn accumulate(
+        &self,
+        state: &mut krishiv_plan::udf::AggState,
+        batch: &RecordBatch,
+    ) -> Result<(), krishiv_plan::udf::UdfError> {
         Python::attach(|py| {
             let py_state = PyBytes::new(py, &state.data);
             let py_batch = batch_to_py_dict(py, batch)?;
-            let result = self.accumulate_fn.call1(py, (py_state, py_batch.bind(py))).map_err(|e| {
-                krishiv_plan::udf::UdfError::Execution { message: format!("UDAF accumulate failed: {e}") }
-            })?;
+            let result = self
+                .accumulate_fn
+                .call1(py, (py_state, py_batch.bind(py)))
+                .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                    message: format!("UDAF accumulate failed: {e}"),
+                })?;
             state.data = result.extract::<Vec<u8>>(py).map_err(|e| {
-                krishiv_plan::udf::UdfError::Execution { message: format!("UDAF accumulate must return bytes: {e}") }
+                krishiv_plan::udf::UdfError::Execution {
+                    message: format!("UDAF accumulate must return bytes: {e}"),
+                }
             })?;
             Ok(())
         })
     }
 
-    fn finalize(&self, state: krishiv_plan::udf::AggState) -> Result<krishiv_plan::udf::ScalarValue, krishiv_plan::udf::UdfError> {
+    fn finalize(
+        &self,
+        state: krishiv_plan::udf::AggState,
+    ) -> Result<krishiv_plan::udf::ScalarValue, krishiv_plan::udf::UdfError> {
         Python::attach(|py| {
             let py_state = PyBytes::new(py, &state.data);
             let result = self.finalize_fn.call1(py, (py_state,)).map_err(|e| {
-                krishiv_plan::udf::UdfError::Execution { message: format!("UDAF finalize failed: {e}") }
+                krishiv_plan::udf::UdfError::Execution {
+                    message: format!("UDAF finalize failed: {e}"),
+                }
             })?;
             py_to_scalar(py, &result)
         })
     }
 
-    fn merge(&self, a: krishiv_plan::udf::AggState, b: krishiv_plan::udf::AggState) -> Result<krishiv_plan::udf::AggState, krishiv_plan::udf::UdfError> {
+    fn merge(
+        &self,
+        a: krishiv_plan::udf::AggState,
+        b: krishiv_plan::udf::AggState,
+    ) -> Result<krishiv_plan::udf::AggState, krishiv_plan::udf::UdfError> {
         Python::attach(|py| {
             let py_a = PyBytes::new(py, &a.data);
             let py_b = PyBytes::new(py, &b.data);
             let result = self.merge_fn.call1(py, (py_a, py_b)).map_err(|e| {
-                krishiv_plan::udf::UdfError::Execution { message: format!("UDAF merge failed: {e}") }
+                krishiv_plan::udf::UdfError::Execution {
+                    message: format!("UDAF merge failed: {e}"),
+                }
             })?;
             let data = result.extract::<Vec<u8>>(py).map_err(|e| {
-                krishiv_plan::udf::UdfError::Execution { message: format!("UDAF merge must return bytes: {e}") }
+                krishiv_plan::udf::UdfError::Execution {
+                    message: format!("UDAF merge must return bytes: {e}"),
+                }
             })?;
             Ok(krishiv_plan::udf::AggState { data })
         })
@@ -656,15 +727,27 @@ impl krishiv_plan::udf::TableUdf for PythonTableUdf {
         &self.output_schema
     }
 
-    fn call(&self, args: &[krishiv_plan::udf::ScalarValue]) -> Result<RecordBatch, krishiv_plan::udf::UdfError> {
+    fn call(
+        &self,
+        args: &[krishiv_plan::udf::ScalarValue],
+    ) -> Result<RecordBatch, krishiv_plan::udf::UdfError> {
         Python::attach(|py| {
             let py_args: Vec<Py<PyAny>> = args
                 .iter()
-                .map(|v| scalar_to_py(py, v).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() }))
+                .map(|v| {
+                    scalar_to_py(py, v).map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: e.to_string(),
+                    })
+                })
                 .collect::<Result<_, _>>()?;
-            let py_list = PyList::new(py, &py_args).map_err(|e| krishiv_plan::udf::UdfError::Execution { message: e.to_string() })?;
+            let py_list =
+                PyList::new(py, &py_args).map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                    message: e.to_string(),
+                })?;
             let result = self.callable.call1(py, (py_list,)).map_err(|e| {
-                krishiv_plan::udf::UdfError::Execution { message: format!("UDTF call failed: {e}") }
+                krishiv_plan::udf::UdfError::Execution {
+                    message: format!("UDTF call failed: {e}"),
+                }
             })?;
             let batch: RecordBatch = result
                 .extract::<pyo3_arrow::PyRecordBatch>(py)

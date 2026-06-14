@@ -25,5 +25,4 @@ impl Namespace {
     pub fn state_name(&self) -> &str {
         &self.state_name
     }
-
 }

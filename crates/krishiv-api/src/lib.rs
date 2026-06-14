@@ -21,25 +21,24 @@ pub mod types;
 pub mod window;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod conformance;
+#[cfg(test)]
+mod delivery_cert;
 #[cfg(test)]
 mod mode_conformance;
 #[cfg(test)]
-mod delivery_cert;
+mod tests;
 
 // Re-export the public API at the crate root for perfect source compatibility.
+pub use blocking::BlockingSession;
 pub use catalog::{
     FunctionIdentifier, FunctionMetadata, Identifier, Namespace, TableIdentifier, TableMetadata,
     ViewIdentifier,
 };
-pub use blocking::BlockingSession;
 pub use dataframe::{
     Boundedness, DataFrame, ExecutionResult, ExplainMode, GroupedDataFrame, GroupingSpec, JoinType,
     PivotValue, QueryExecutionStats,
 };
-pub use query::{QueryCompletion, QueryHandle, QueryId, QueryProgress, QueryStatus};
 pub use error::{KrishivError, Result};
 pub use expression::{
     AggregateFunction as ExprAggregateFunction, BinaryOperator as ExprBinaryOperator,
@@ -56,6 +55,7 @@ pub use krishiv_connectors::{
 };
 pub use prepared::PreparedStatement;
 pub use process::{apply_async_io, apply_process_function};
+pub use query::{QueryCompletion, QueryHandle, QueryId, QueryProgress, QueryStatus};
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
 pub use streaming_builder::{
@@ -75,10 +75,9 @@ pub use window::{
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use arrow::record_batch::RecordBatch;
 pub use krishiv_dataflow::{
-    AggExpr, AggFunction,
-    BroadcastContext, BroadcastProcessExecutor, BroadcastProcessFunction, BroadcastStateDescriptor,
-    CoProcessExecutor, CoProcessFunction, ConnectedStreams,
-    ListState, MapState, OperatorConfig, OperatorUid, ProcessContext, ProcessFunction,
+    AggExpr, AggFunction, BroadcastContext, BroadcastProcessExecutor, BroadcastProcessFunction,
+    BroadcastStateDescriptor, CoProcessExecutor, CoProcessFunction, ConnectedStreams, ListState,
+    MapState, OperatorConfig, OperatorUid, ProcessContext, ProcessFunction,
     ProcessFunctionExecutor, ReducingState, StateError, StateValue, TimerEntry, TimerKind,
     ValueState,
 };

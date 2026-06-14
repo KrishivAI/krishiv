@@ -144,7 +144,6 @@ impl PivotValue {
     }
 }
 
-
 /// DataFrame API backed by DataFusion for R1 local execution.
 #[derive(Clone)]
 pub struct DataFrame {
@@ -234,7 +233,6 @@ impl GroupedDataFrame {
             krishiv_common::async_util::block_on(ops.aggregate_grouping(grouping, &aggregates))?;
         Ok(self.dataframe.with_new_ops(new_ops))
     }
-
 
     /// Count rows in each group.
     pub fn count(&self) -> Result<DataFrame> {
@@ -1198,6 +1196,7 @@ Execution statistics:
     ///
     /// Requires a SQL-backed DataFrame (`session.sql(..)` / `read_parquet`):
     /// the query text is what the sink job executes remotely.
+    #[allow(dead_code)]
     pub(crate) fn write_parquet_sink(
         &self,
         path: &str,
@@ -1234,9 +1233,7 @@ Execution statistics:
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| KrishivError::InvalidConfig {
-                message: format!(
-                    "sink write destination '{path}' must have a parent directory"
-                ),
+                message: format!("sink write destination '{path}' must have a parent directory"),
             })?;
         let dest_name = dest
             .file_name()
@@ -1246,7 +1243,10 @@ Execution statistics:
                 message: format!("sink write destination '{path}' has no directory name"),
             })?;
         std::fs::create_dir_all(parent).map_err(|e| KrishivError::Runtime {
-            message: format!("failed to create sink parent directory '{}': {e}", parent.display()),
+            message: format!(
+                "failed to create sink parent directory '{}': {e}",
+                parent.display()
+            ),
         })?;
 
         let spec = krishiv_common::write_commit::SinkWriteSpec::staged(
@@ -1265,7 +1265,9 @@ Execution statistics:
             .iter()
             .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
-        Ok(self.runtime.collect_batch_sql_sink(query, &tables, &contract))
+        Ok(self
+            .runtime
+            .collect_batch_sql_sink(query, &tables, &contract))
     }
 
     /// Write the result of this DataFrame to Parquet.
@@ -1284,11 +1286,7 @@ Execution statistics:
             // Probe the runtime directly so an Unsupported response (e.g. an
             // older Flight server without the batch_sql_sink action) can fall
             // back to the legacy client-side collect-then-write path.
-            match self.run_sink_write(
-                path,
-                krishiv_common::write_commit::WriteMode::Append,
-                &[],
-            )? {
+            match self.run_sink_write(path, krishiv_common::write_commit::WriteMode::Append, &[])? {
                 Ok(()) => return Ok(()),
                 Err(krishiv_runtime::RuntimeError::Unsupported { feature }) => {
                     tracing::warn!(
@@ -1393,13 +1391,11 @@ Execution statistics:
     /// Materialise this DataFrame into an in-memory table with a given name.
     /// When `name` is `None` a unique name is generated.
     fn persist_as(&self, name: Option<String>) -> Result<DataFrame> {
-        let batches = krishiv_common::async_util::block_on(self.collect_async())?
-            .into_batches();
+        let batches = krishiv_common::async_util::block_on(self.collect_async())?.into_batches();
 
         // Generate a stable unique name from a counter so callers can call
         // cache() multiple times without collisions.
-        static CACHE_CTR: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(1);
+        static CACHE_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let table_name = name.unwrap_or_else(|| {
             let n = CACHE_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             format!("_krishiv_cache_{n}")
@@ -1507,12 +1503,9 @@ Execution statistics:
         let file = File::create(path).map_err(|e| KrishivError::Runtime {
             message: format!("failed to create csv file '{path}': {e}"),
         })?;
-        let delimiter = opts
-            .delimiter
-            .map(|c| c as u8)
-            .unwrap_or(b',');
+        let delimiter = opts.delimiter.map(|c| c as u8).unwrap_or(b',');
         let has_header = opts.has_header.unwrap_or(true);
-        let mut builder = arrow::csv::WriterBuilder::new()
+        let builder = arrow::csv::WriterBuilder::new()
             .with_delimiter(delimiter)
             .with_header(has_header);
         let mut writer = builder.build(file);
@@ -1593,8 +1586,6 @@ fn build_parquet_writer_props(
         };
         builder = builder.set_compression(codec);
     }
-    if let Some(size) = opts.max_row_group_size {
-        builder = builder.set_max_row_group_size(size);
-    }
+    builder = builder.set_max_row_group_row_count(opts.max_row_group_size);
     Ok(Some(builder.build()))
 }

@@ -75,8 +75,7 @@ pub struct StreamingQueryProgress {
 
 /// Callback invoked per micro-batch. Receives the accumulated batches and the
 /// current epoch counter.
-pub type ForeachBatchFn =
-    Arc<dyn Fn(Vec<RecordBatch>, i64) -> Result<()> + Send + Sync>;
+pub type ForeachBatchFn = Arc<dyn Fn(Vec<RecordBatch>, i64) -> Result<()> + Send + Sync>;
 
 // ── StreamingQuery handle ─────────────────────────────────────────────────────
 
@@ -203,7 +202,11 @@ impl DataStreamReader {
     /// streaming source DataFrame.
     pub fn from_stream(self, stream: crate::stream::Stream) -> Result<crate::DataFrame> {
         // Materialise the in-memory batches from a bounded stream.
-        let batches: Vec<RecordBatch> = stream.batches().iter().map(|sb| sb.batch().clone()).collect();
+        let batches: Vec<RecordBatch> = stream
+            .batches()
+            .iter()
+            .map(|sb| sb.batch().clone())
+            .collect();
         self.session.create_dataframe_from_batches(batches)
     }
 
@@ -211,10 +214,7 @@ impl DataStreamReader {
     ///
     /// For our purposes, streaming reads from files means scanning available
     /// data at query time (the batch read turned streaming).
-    pub fn file_stream(
-        self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<crate::DataFrame> {
+    pub fn file_stream(self, path: impl AsRef<std::path::Path>) -> Result<crate::DataFrame> {
         self.session.read_parquet(path)
     }
 }
@@ -292,8 +292,7 @@ impl DataStreamWriter {
         let (state_tx, state_rx) = tokio::sync::watch::channel(StreamingQueryState::Active);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
-        let last_progress: Arc<Mutex<Option<StreamingQueryProgress>>> =
-            Arc::new(Mutex::new(None));
+        let last_progress: Arc<Mutex<Option<StreamingQueryProgress>>> = Arc::new(Mutex::new(None));
 
         let progress_ref = Arc::clone(&last_progress);
         let foreach_fn = self.foreach_batch_fn;
@@ -305,9 +304,14 @@ impl DataStreamWriter {
         let cancel_rx_task = cancel_rx;
 
         tokio::spawn(async move {
-            let result =
-                run_streaming_task(base_stream, trigger, foreach_fn, cancel_rx_task, progress_ref)
-                    .await;
+            let result = run_streaming_task(
+                base_stream,
+                trigger,
+                foreach_fn,
+                cancel_rx_task,
+                progress_ref,
+            )
+            .await;
             let final_state = match result {
                 Ok(()) => StreamingQueryState::Stopped,
                 Err(e) => StreamingQueryState::Failed(e.to_string()),
@@ -367,7 +371,13 @@ async fn drain_and_call(
         f(batches, epoch)?;
     }
 
-    update_progress(progress, epoch, input_rows, output_rows, Some("AvailableNow"));
+    update_progress(
+        progress,
+        epoch,
+        input_rows,
+        output_rows,
+        Some("AvailableNow"),
+    );
     Ok(())
 }
 
@@ -602,15 +612,12 @@ mod tests {
         // stop() + await should not hang; AvailableNow drains the bounded stream quickly
         query.stop();
         // Await termination with timeout to ensure we don't hang
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            async {
-                // The AvailableNow trigger drains the bounded stream very quickly.
-                // After stop() the cancel flag is set; either the query already
-                // finished or it will finish on its next cancel check.
-                tokio::task::yield_now().await;
-            },
-        )
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // The AvailableNow trigger drains the bounded stream very quickly.
+            // After stop() the cancel flag is set; either the query already
+            // finished or it will finish on its next cancel check.
+            tokio::task::yield_now().await;
+        })
         .await
         .expect("no hang after stop()");
     }
@@ -647,10 +654,7 @@ mod tests {
     // Test 5: AvailableNow trigger drains and stops
     #[tokio::test]
     async fn available_now_drains_and_stops() {
-        let df = dataframe_from_batches(vec![
-            simple_batch(&[1]),
-            simple_batch(&[2, 3]),
-        ]);
+        let df = dataframe_from_batches(vec![simple_batch(&[1]), simple_batch(&[2, 3])]);
 
         let total_rows = Arc::new(AtomicU64::new(0));
         let rows_clone = Arc::clone(&total_rows);

@@ -102,9 +102,9 @@ impl PyQueryHandle {
         // Take the handle out of the Option before the first await point.
         let handle = {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            guard.take().ok_or_else(|| {
-                PyRuntimeError::new_err("QueryHandle has already been consumed")
-            })?
+            guard
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("QueryHandle has already been consumed"))?
         };
         // Spawn actual collection on the embedded Tokio runtime so the Tokio
         // futures (watch::Receiver::changed) run in the right executor context.
@@ -123,9 +123,9 @@ impl PyQueryHandle {
     pub fn collect(&self, py: Python<'_>) -> PyResult<PyQueryResult> {
         let handle = {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            guard.take().ok_or_else(|| {
-                PyRuntimeError::new_err("QueryHandle has already been consumed")
-            })?
+            guard
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("QueryHandle has already been consumed"))?
         };
         py.detach(move || {
             crate::session::block_on_async(handle.wait())

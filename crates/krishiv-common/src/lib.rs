@@ -22,9 +22,7 @@ pub mod validate;
 pub mod write_commit;
 
 pub use backpressure::BackpressureSignal;
-pub use durability::{
-    CheckpointDurability, DurabilityProfile, ShuffleDurability, StateDurability,
-};
+pub use durability::{CheckpointDurability, DurabilityProfile, ShuffleDurability, StateDurability};
 pub use memory_budget::MemoryBudget;
 pub use panic_util::panic_payload_to_string;
 pub use production::{

@@ -31,7 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         schema,
         vec![
             Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Carol", "Dave", "Eve"])),
+            Arc::new(StringArray::from(vec![
+                "Alice", "Bob", "Carol", "Dave", "Eve",
+            ])),
             Arc::new(Int64Array::from(vec![85, 92, 78, 95, 88])),
         ],
     )?;
@@ -66,7 +68,8 @@ fn print_result(result: QueryResult) {
             for batch in &batches {
                 let schema = batch.schema();
                 // Print header
-                let headers: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+                let headers: Vec<&str> =
+                    schema.fields().iter().map(|f| f.name().as_str()).collect();
                 println!("{}", headers.join(" | "));
                 println!("{}", "─".repeat(headers.join(" | ").len()));
                 // Print rows

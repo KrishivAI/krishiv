@@ -124,10 +124,8 @@ impl CepOperator {
             // can safely release because it was reserved at insertion time.
             let evicting_new_unreserved = stalest == inserted_key && !budget_reserved;
             self.states.remove(&stalest);
-            if !evicting_new_unreserved {
-                if let Some(budget) = &self.memory_budget {
-                    budget.release(256);
-                }
+            if !evicting_new_unreserved && let Some(budget) = &self.memory_budget {
+                budget.release(256);
             }
         }
         result

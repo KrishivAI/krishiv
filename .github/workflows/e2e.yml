@@ -1,0 +1,90 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    paths:
+      - "crates/krishiv-operator/**"
+      - "crates/krishiv-scheduler/**"
+      - "crates/krishiv-executor/**"
+      - ".github/workflows/e2e.yml"
+
+env:
+  RUST_VERSION: "1.92"
+  CXXFLAGS: "-include cstdint"
+
+jobs:
+  # ── Kubernetes failover test via kind ────────────────────────────────────────
+  kind-e2e:
+    name: Kubernetes E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: kind-e2e
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld
+      - name: Install kind
+        run: |
+          curl -sSLo ./kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
+          chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+      - name: Install kubectl
+        run: |
+          curl -sSLo ./kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+          chmod +x ./kubectl && sudo mv ./kubectl /usr/local/bin/kubectl
+      - run: kind create cluster --name krishiv-e2e --wait 60s
+      - run: cargo build -p krishiv-operator -p krishiv-scheduler --release
+      - name: Run failover integration test
+        env:
+          KRISHIV_E2E_KIND_CLUSTER: "true"
+          KUBECONFIG: ${{ env.HOME }}/.kube/config
+        run: cargo test -p krishiv-operator failover_stale_coordinator --release -- --nocapture
+      - name: Collect kind logs on failure
+        if: failure()
+        run: |
+          kind export logs ./kind-logs --name krishiv-e2e
+          tar -czf kind-logs.tar.gz ./kind-logs
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: kind-logs
+          path: kind-logs.tar.gz
+      - if: always()
+        run: kind delete cluster --name krishiv-e2e
+
+  # ── Bare-metal distributed cluster smoke tests ───────────────────────────────
+  bare-metal-e2e:
+    name: Bare-Metal E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bare-metal-e2e
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld
+      - name: Build cluster binaries
+        run: |
+          cargo build -p krishiv-scheduler --bin krishiv-clusterd
+          cargo build -p krishiv-executor
+      - name: Distributed scheduler integration tests
+        run: cargo test -p krishiv-scheduler --test distributed_e2e
+      - name: Distributed scheduler barrier tests
+        run: cargo test -p krishiv-scheduler --lib barrier
+      - name: Verify systemd service units present
+        run: |
+          test -f deploy/systemd/krishiv-clusterd.service
+          test -f deploy/systemd/krishiv-executor@.service

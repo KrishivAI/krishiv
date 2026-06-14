@@ -142,11 +142,7 @@ impl KrishivCatalog {
     }
 
     /// Load a table by `namespace` and `table` name.
-    pub async fn load_table(
-        &self,
-        namespace: &str,
-        table: &str,
-    ) -> Result<Table, CatalogError> {
+    pub async fn load_table(&self, namespace: &str, table: &str) -> Result<Table, CatalogError> {
         let catalog = self.as_iceberg();
         let ident = TableIdent::new(parse_namespace(namespace)?, table.to_string());
         catalog

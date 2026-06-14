@@ -114,7 +114,8 @@ impl SchemaProvider for IcebergSchemaBridge {
     }
 
     fn table_names(&self) -> Vec<String> {
-        IcebergCatalogBridge::block_on(self.catalog.list_tables(&self.namespace)).unwrap_or_default()
+        IcebergCatalogBridge::block_on(self.catalog.list_tables(&self.namespace))
+            .unwrap_or_default()
     }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {

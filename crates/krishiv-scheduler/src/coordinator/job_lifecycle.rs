@@ -87,8 +87,8 @@ impl Coordinator {
         // failures during rolling executor restarts.
         let executors = self.executors.schedulable_executors();
         let job_id = spec.job_id().clone();
-        let job_name = spec.name().to_owned();
-        let namespace = spec
+        let _job_name = spec.name().to_owned();
+        let _namespace = spec
             .namespace_id()
             .map(|s| s.to_owned())
             .unwrap_or_default();
@@ -141,7 +141,7 @@ impl Coordinator {
     #[tracing::instrument(level = "info", skip(self), fields(job_id = %job_id))]
     pub fn cancel_job(&mut self, job_id: &JobId) -> SchedulerResult<()> {
         self.ensure_active()?;
-        let (job_name, namespace) = {
+        let (_job_name, _namespace) = {
             let job = self.find_job(job_id)?;
             let name = job.spec.name().to_owned();
             let ns = job
@@ -369,7 +369,7 @@ impl Coordinator {
         self.finalize_staged_sink_outputs(&job_id);
 
         // Snapshot the job's current state and resource usage after the update.
-        let (is_terminal, usage, state, job_name, namespace) = self
+        let (is_terminal, usage, state, _job_name, _namespace) = self
             .job_coordinators
             .get(&job_id)
             .map(|jc| {

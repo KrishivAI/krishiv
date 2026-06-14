@@ -12,10 +12,10 @@ pub mod iceberg_scan {
     use std::sync::Arc;
 
     use datafusion::catalog::TableProvider;
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::datasource::listing::{
         ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
     };
-    use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::error::{DataFusionError, Result as DfResult};
     use datafusion::execution::SessionStateBuilder;
     use datafusion::prelude::SessionContext;
@@ -81,7 +81,10 @@ pub mod iceberg_scan {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        Ok(tasks.iter().map(|t| local_path(t.data_file_path())).collect())
+        Ok(tasks
+            .iter()
+            .map(|t| local_path(t.data_file_path()))
+            .collect())
     }
 
     /// Convert a file URI (file:///path) to a local path string; leave S3/GCS
@@ -100,9 +103,7 @@ pub mod iceberg_scan {
             use arrow::datatypes::{Schema, SchemaRef};
             use datafusion::datasource::MemTable;
             let empty_schema: SchemaRef = Arc::new(Schema::empty());
-            return Ok(Arc::new(
-                MemTable::try_new(empty_schema, vec![vec![]])?,
-            ));
+            return Ok(Arc::new(MemTable::try_new(empty_schema, vec![vec![]])?));
         }
 
         // Use the first file path as the listing root; DataFusion globs for *.parquet.
@@ -116,9 +117,7 @@ pub mod iceberg_scan {
 
         // Build a temporary session state to infer the schema.
         let state = SessionStateBuilder::new().with_default_features().build();
-        let schema = listing_options
-            .infer_schema(&state, &listing_url)
-            .await?;
+        let schema = listing_options.infer_schema(&state, &listing_url).await?;
 
         let config = ListingTableConfig::new(listing_url)
             .with_listing_options(listing_options)
