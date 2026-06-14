@@ -28,8 +28,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ]));
 
     let words = vec![
-        "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog",
-        "the", "fox", "the", "dog",
+        "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "the", "fox", "the",
+        "dog",
     ];
     let doc_ids: Vec<i64> = (0..words.len() as i64).map(|i| i % 3).collect();
 

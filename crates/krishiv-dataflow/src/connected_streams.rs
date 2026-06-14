@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 
-use crate::process_fn::{ProcessContext, TimerEntry, TimerKind};
 use crate::ExecResult;
+use crate::process_fn::{ProcessContext, TimerEntry, TimerKind};
 
 // ── ConnectedStreams ───────────────────────────────────────────────────────────
 

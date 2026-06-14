@@ -220,7 +220,7 @@ impl Coordinator {
     pub fn savepoint_job(&mut self, job_id: &JobId, label: Option<String>) -> SchedulerResult<u64> {
         self.ensure_active()?;
         let running = self.running_task_count_for_job(job_id);
-        let res = match self.checkpoint_coordinators.get_mut(job_id) {
+        match self.checkpoint_coordinators.get_mut(job_id) {
             None => Err(SchedulerError::InvalidJob {
                 message: format!(
                     "no checkpoint coordinator for job {job_id}; job must be streaming with checkpoint config"
@@ -232,9 +232,7 @@ impl Coordinator {
                     .initiate_savepoint(label)
                     .map_err(|e| SchedulerError::InvalidJob { message: e })
             }
-        };
-
-        res
+        }
     }
 
     /// Trigger a savepoint and stop the job once the savepoint epoch commits.
@@ -648,7 +646,7 @@ impl Coordinator {
             )
             .map_err(|e| invalid(format!("rescale snapshot write for task {task_id}: {e}")))?;
             manifest.insert_bytes(
-                &format!("{}/{}/state.bin", operator_id, task_id.as_str()),
+                format!("{}/{}/state.bin", operator_id, task_id.as_str()),
                 bytes,
             );
             new_refs.push(OperatorSnapshotRef {

@@ -11,29 +11,29 @@ pub use iceberg_rest::{
 // ── Unified Iceberg catalog backends (Phase J1-J4) ──────────────────────────
 // Each module is gated behind its own feature so a build that does not need a
 // given backend never pulls its dependency tree (sqlx, iceberg-catalog-rest…).
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+pub mod iceberg_catalog_bridge;
+#[cfg(feature = "iceberg-datafusion")]
+pub mod iceberg_table_provider;
 #[cfg(feature = "local-catalog")]
 pub mod local_catalog;
-#[cfg(feature = "local-catalog")]
-pub mod unified;
 #[cfg(feature = "postgres-catalog")]
 pub mod postgres_catalog;
 #[cfg(feature = "rest-catalog")]
 pub mod rest_catalog_wrapper;
-#[cfg(feature = "iceberg-datafusion")]
-pub mod iceberg_table_provider;
-#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
-pub mod iceberg_catalog_bridge;
+#[cfg(feature = "local-catalog")]
+pub mod unified;
 
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+pub use iceberg_catalog_bridge::IcebergCatalogBridge;
 #[cfg(feature = "local-catalog")]
 pub use local_catalog::LocalCatalog;
-#[cfg(feature = "local-catalog")]
-pub use unified::KrishivCatalog;
 #[cfg(feature = "postgres-catalog")]
 pub use postgres_catalog::PostgresCatalog;
 #[cfg(feature = "rest-catalog")]
 pub use rest_catalog_wrapper::KrishivRestCatalog;
-#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
-pub use iceberg_catalog_bridge::IcebergCatalogBridge;
+#[cfg(feature = "local-catalog")]
+pub use unified::KrishivCatalog;
 
 use std::collections::BTreeMap;
 use std::fmt;

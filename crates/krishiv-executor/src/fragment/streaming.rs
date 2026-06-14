@@ -556,11 +556,8 @@ pub(crate) async fn execute_streaming_fragment(
         }
 
         let sink_staged_files = if is_staged_sink {
-            crate::fragment::common::write_object_parquet_sink_for_task(
-                assignment,
-                &staged_buffer,
-            )
-            .await?
+            crate::fragment::common::write_object_parquet_sink_for_task(assignment, &staged_buffer)
+                .await?
         } else {
             Vec::new()
         };

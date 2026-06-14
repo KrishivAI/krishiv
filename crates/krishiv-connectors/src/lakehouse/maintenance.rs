@@ -43,9 +43,7 @@ pub async fn expire_snapshots(
     let mut all_snapshots: Vec<SnapshotRef> = metadata.snapshots().cloned().collect();
     all_snapshots.sort_by_key(|s| std::cmp::Reverse(s.timestamp_ms()));
 
-    let current_id = metadata
-        .current_snapshot()
-        .map(|s| s.snapshot_id());
+    let current_id = metadata.current_snapshot().map(|s| s.snapshot_id());
 
     let mut kept = 0usize;
     let mut to_expire: Vec<i64> = Vec::new();
@@ -172,16 +170,16 @@ pub async fn remove_orphan_files(
         }
 
         // Check age via filesystem metadata.
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if let Ok(modified) = meta.modified() {
-                use std::time::SystemTime;
-                let modified_ms = modified
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                if modified_ms > cutoff_ms {
-                    continue; // Too new — leave it.
-                }
+        if let Ok(meta) = std::fs::metadata(&path)
+            && let Ok(modified) = meta.modified()
+        {
+            use std::time::SystemTime;
+            let modified_ms = modified
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if modified_ms > cutoff_ms {
+                continue; // Too new — leave it.
             }
         }
 
@@ -282,13 +280,17 @@ pub async fn compact_data_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use iceberg::io::LocalFsStorageFactory;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{NestedField, PrimitiveType, Type};
     use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation};
+    use std::collections::HashMap;
 
-    async fn empty_catalog_table() -> (Arc<dyn Catalog + Send + Sync>, TableIdent, tempfile::TempDir) {
+    async fn empty_catalog_table() -> (
+        Arc<dyn Catalog + Send + Sync>,
+        TableIdent,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let warehouse = url::Url::from_file_path(dir.path()).unwrap().to_string();
         let catalog = Arc::new(
@@ -329,14 +331,9 @@ mod tests {
     #[tokio::test]
     async fn expire_snapshots_fresh_table_returns_zero() {
         let (catalog, ident, _dir) = empty_catalog_table().await;
-        let removed = expire_snapshots(
-            catalog,
-            &ident,
-            Duration::days(7),
-            1,
-        )
-        .await
-        .unwrap();
+        let removed = expire_snapshots(catalog, &ident, Duration::days(7), 1)
+            .await
+            .unwrap();
         assert_eq!(removed, 0, "fresh table has no old snapshots");
     }
 }

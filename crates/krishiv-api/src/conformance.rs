@@ -51,10 +51,7 @@ mod conformance_tests {
     #[tokio::test]
     async fn string_comparison_is_case_sensitive() {
         let e = engine();
-        let df = e
-            .sql("SELECT 'ABC' = 'abc' AS v")
-            .await
-            .unwrap();
+        let df = e.sql("SELECT 'ABC' = 'abc' AS v").await.unwrap();
         let batches = df.collect().await.unwrap();
         let col = batches[0]
             .column(0)
@@ -98,10 +95,7 @@ mod conformance_tests {
     #[tokio::test]
     async fn coalesce_returns_first_non_null() {
         let e = engine();
-        let df = e
-            .sql("SELECT COALESCE(NULL, NULL, 42) AS v")
-            .await
-            .unwrap();
+        let df = e.sql("SELECT COALESCE(NULL, NULL, 42) AS v").await.unwrap();
         let batches = df.collect().await.unwrap();
         let col = batches[0]
             .column(0)
@@ -198,13 +192,9 @@ mod conformance_tests {
         e.register_record_batches(
             "t",
             vec![{
-                use std::sync::Arc;
                 use arrow::datatypes::{Field, Schema};
-                let schema = Arc::new(Schema::new(vec![Field::new(
-                    "v",
-                    DataType::Int64,
-                    true,
-                )]));
+                use std::sync::Arc;
+                let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
                 let arr: Int64Array = vec![Some(2), None, Some(1)].into_iter().collect();
                 arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
             }],
@@ -230,13 +220,9 @@ mod conformance_tests {
         e.register_record_batches(
             "s",
             vec![{
-                use std::sync::Arc;
                 use arrow::datatypes::{Field, Schema};
-                let schema = Arc::new(Schema::new(vec![Field::new(
-                    "v",
-                    DataType::Utf8,
-                    false,
-                )]));
+                use std::sync::Arc;
+                let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
                 let arr = StringArray::from(vec!["banana", "apple", "cherry"]);
                 arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
             }],
@@ -270,12 +256,11 @@ mod conformance_tests {
                 let col = batches[0].column(0);
                 // Wrapping: value should be i64::MIN or NULL, not a positive number.
                 if !col.is_null(0) {
-                    let v = col
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap()
-                        .value(0);
-                    assert!(v < 0 || v == i64::MAX, "overflow produced unexpected value: {v}");
+                    let v = col.as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+                    assert!(
+                        v < 0 || v == i64::MAX,
+                        "overflow produced unexpected value: {v}"
+                    );
                 }
             }
         }
@@ -302,10 +287,7 @@ mod conformance_tests {
     #[tokio::test]
     async fn cast_string_to_integer_succeeds() {
         let e = engine();
-        let df = e
-            .sql("SELECT CAST('42' AS BIGINT) AS v")
-            .await
-            .unwrap();
+        let df = e.sql("SELECT CAST('42' AS BIGINT) AS v").await.unwrap();
         let batches = df.collect().await.unwrap();
         let col = batches[0]
             .column(0)
@@ -318,10 +300,7 @@ mod conformance_tests {
     #[tokio::test]
     async fn cast_integer_to_string_succeeds() {
         let e = engine();
-        let df = e
-            .sql("SELECT CAST(42 AS VARCHAR) AS v")
-            .await
-            .unwrap();
+        let df = e.sql("SELECT CAST(42 AS VARCHAR) AS v").await.unwrap();
         let batches = df.collect().await.unwrap();
         let col = batches[0]
             .column(0)

@@ -11,9 +11,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use krishiv_connectors::vector::{
-    EmbeddingBatch, InMemoryVectorSink, PayloadValue, VectorSink,
-};
+use krishiv_connectors::vector::{EmbeddingBatch, InMemoryVectorSink, PayloadValue, VectorSink};
 
 fn map_sink_err(e: krishiv_connectors::vector::VectorSinkError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -49,7 +47,10 @@ impl PyScoredChunk {
     }
 
     pub fn __repr__(&self) -> String {
-        format!("ScoredChunk(doc_id={:?}, score={})", self.doc_id, self.score)
+        format!(
+            "ScoredChunk(doc_id={:?}, score={})",
+            self.doc_id, self.score
+        )
     }
 }
 

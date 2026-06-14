@@ -113,11 +113,9 @@ impl ShuffleStore for SpillableShuffleBackend {
         // releasing for them would underflow the counter.
         let was_in_memory = self.inner.is_partition_in_memory(id).await;
         let result = self.inner.read_partition(id).await?;
-        if was_in_memory {
-            if let Some(ref p) = result {
-                let bytes = crate::compression::partition_memory_bytes(p);
-                self.budget.release(bytes as u64);
-            }
+        if was_in_memory && let Some(ref p) = result {
+            let bytes = crate::compression::partition_memory_bytes(p);
+            self.budget.release(bytes as u64);
         }
         Ok(result)
     }

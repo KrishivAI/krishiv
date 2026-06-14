@@ -244,9 +244,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
             // ENOSPC (errno 28) or StorageFull — surface as DiskFull so callers
             // know not to retry the write indefinitely.
             fn wrap_io_err(e: std::io::Error, path: &std::path::Path) -> ShuffleError {
-                if e.kind() == std::io::ErrorKind::StorageFull
-                    || e.raw_os_error() == Some(28)
-                {
+                if e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
                     ShuffleError::DiskFull {
                         path: path.to_string_lossy().into_owned(),
                         source: e,
@@ -268,23 +266,21 @@ impl ShuffleStore for LocalDiskShuffleStore {
             // Phase 1 (continued): Write to a temp file alongside the final path.
             let tmp_path = final_path.with_extension(format!("tmp.{tmp_suffix}"));
             {
-                let tmp_file = std::fs::File::create(&tmp_path)
-                    .map_err(|e| wrap_io_err(e, &tmp_path))?;
+                let tmp_file =
+                    std::fs::File::create(&tmp_path).map_err(|e| wrap_io_err(e, &tmp_path))?;
                 let schema = partition.schema.clone();
                 let mut writer = ArrowWriter::try_new(tmp_file, schema, Some(writer_props))
                     .map_err(|e| io_err(format!("failed to create Parquet writer: {e}")))?;
                 for batch in &partition.batches {
-                    writer.write(batch).map_err(|e| {
-                        io_err(format!("failed to write Parquet batch: {e}"))
-                    })?;
+                    writer
+                        .write(batch)
+                        .map_err(|e| io_err(format!("failed to write Parquet batch: {e}")))?;
                 }
                 // S4: Sync temp file to durable storage before commit.
                 let tmp_file = writer
                     .into_inner()
                     .map_err(|e| io_err(format!("failed to finalize Parquet writer: {e}")))?;
-                tmp_file
-                    .sync_all()
-                    .map_err(|e| wrap_io_err(e, &tmp_path))?;
+                tmp_file.sync_all().map_err(|e| wrap_io_err(e, &tmp_path))?;
             }
 
             // Compute BLAKE3 hash over the written Parquet bytes so write-time

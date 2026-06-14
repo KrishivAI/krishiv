@@ -198,14 +198,12 @@ impl Catalog for PostgresCatalog {
         let name = namespace.inner().join(".");
         let props = serde_json::to_value(&properties)
             .map_err(|e| iceberg_err(format!("serialize: {e}")))?;
-        sqlx::query(
-            "UPDATE krishiv_namespaces SET properties = $2 WHERE namespace_name = $1",
-        )
-        .bind(&name)
-        .bind(&props)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| iceberg_err(format!("update_namespace: {e}")))?;
+        sqlx::query("UPDATE krishiv_namespaces SET properties = $2 WHERE namespace_name = $1")
+            .bind(&name)
+            .bind(&props)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| iceberg_err(format!("update_namespace: {e}")))?;
         Ok(())
     }
 
@@ -259,7 +257,11 @@ impl Catalog for PostgresCatalog {
         // Serialise and write metadata.json to the warehouse.
         let metadata_json = serde_json::to_string_pretty(&metadata)
             .map_err(|e| iceberg_err(format!("serialize metadata: {e}")))?;
-        let metadata_location = format!("{}/metadata/00000-{}.metadata.json", location, uuid::Uuid::new_v4());
+        let metadata_location = format!(
+            "{}/metadata/00000-{}.metadata.json",
+            location,
+            uuid::Uuid::new_v4()
+        );
 
         let output = self
             .file_io
@@ -311,8 +313,8 @@ impl Catalog for PostgresCatalog {
         .await
         .map_err(|e| iceberg_err(format!("load_table query: {e}")))?;
 
-        let metadata_location =
-            metadata_location.ok_or_else(|| iceberg_err(format!("table not found: {}", table.name())))?;
+        let metadata_location = metadata_location
+            .ok_or_else(|| iceberg_err(format!("table not found: {}", table.name())))?;
 
         // Read the metadata JSON from the warehouse.
         let input = self
@@ -322,7 +324,10 @@ impl Catalog for PostgresCatalog {
         let bytes = {
             use iceberg::io::InputFile;
             use tokio::io::AsyncReadExt;
-            let mut reader = input.reader().await.map_err(|e| iceberg_err(e.to_string()))?;
+            let mut reader = input
+                .reader()
+                .await
+                .map_err(|e| iceberg_err(e.to_string()))?;
             let mut buf = Vec::new();
             reader
                 .read_to_end(&mut buf)
@@ -345,14 +350,12 @@ impl Catalog for PostgresCatalog {
 
     async fn drop_table(&self, table: &TableIdent) -> IcebergResult<()> {
         let ns = table.namespace().inner().join(".");
-        sqlx::query(
-            "DELETE FROM krishiv_tables WHERE namespace = $1 AND table_name = $2",
-        )
-        .bind(&ns)
-        .bind(table.name())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| iceberg_err(format!("drop_table: {e}")))?;
+        sqlx::query("DELETE FROM krishiv_tables WHERE namespace = $1 AND table_name = $2")
+            .bind(&ns)
+            .bind(table.name())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| iceberg_err(format!("drop_table: {e}")))?;
         Ok(())
     }
 
@@ -426,8 +429,8 @@ impl Catalog for PostgresCatalog {
         .await
         .map_err(|e| iceberg_err(format!("update_table read: {e}")))?;
 
-        let current_location =
-            current_location.ok_or_else(|| iceberg_err(format!("table not found: {}", ident.name())))?;
+        let current_location = current_location
+            .ok_or_else(|| iceberg_err(format!("table not found: {}", ident.name())))?;
 
         // Load current table, apply commit requirements & updates.
         let table = self.load_table(&ident).await?;
@@ -466,12 +469,18 @@ impl Catalog for PostgresCatalog {
         {
             use iceberg::io::OutputFile;
             use tokio::io::AsyncWriteExt;
-            let mut writer = output.writer().await.map_err(|e| iceberg_err(e.to_string()))?;
+            let mut writer = output
+                .writer()
+                .await
+                .map_err(|e| iceberg_err(e.to_string()))?;
             writer
                 .write_all(new_metadata_json.as_bytes())
                 .await
                 .map_err(|e| iceberg_err(format!("write: {e}")))?;
-            writer.shutdown().await.map_err(|e| iceberg_err(e.to_string()))?;
+            writer
+                .shutdown()
+                .await
+                .map_err(|e| iceberg_err(e.to_string()))?;
         }
 
         // Atomic CAS update — if another writer updated concurrently, this returns 0 rows.
@@ -584,7 +593,12 @@ mod tests {
         let ident = TableIdent::new(ns.clone(), "orders".to_string());
         let loaded = catalog.load_table(&ident).await.unwrap();
         assert!(
-            loaded.metadata().current_schema().as_ref().field_id_by_name("id").is_some()
+            loaded
+                .metadata()
+                .current_schema()
+                .as_ref()
+                .field_id_by_name("id")
+                .is_some()
         );
         assert!(catalog.table_exists(&ident).await.unwrap());
 
@@ -622,7 +636,9 @@ mod tests {
             .updates(vec![])
             .requirements(vec![])
             .build();
-        c1.update_table(commit1).await.expect("first commit should succeed");
+        c1.update_table(commit1)
+            .await
+            .expect("first commit should succeed");
 
         // c2 now tries to commit on stale version — should fail with conflict.
         let commit2 = TableCommit::builder()

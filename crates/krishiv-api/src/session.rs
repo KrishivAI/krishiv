@@ -440,6 +440,7 @@ impl SessionBuilder {
         let parallelism = self.target_parallelism.unwrap_or_else(|| {
             std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(1).unwrap())
         });
+        #[cfg_attr(not(feature = "iceberg-catalog"), allow(unused_mut))]
         let mut sql_engine = SqlEngine::new()
             .with_target_parallelism(parallelism)
             .with_udf_registry(Arc::clone(&udf_registry))
@@ -1519,11 +1520,8 @@ impl Session {
         name: &str,
         batches: Vec<arrow::record_batch::RecordBatch>,
     ) -> Result<()> {
-        krishiv_common::async_util::block_on(
-            self.sql_engine
-                .register_record_batches(name, batches),
-        )
-        .map_err(KrishivError::from)
+        krishiv_common::async_util::block_on(self.sql_engine.register_record_batches(name, batches))
+            .map_err(KrishivError::from)
     }
 
     /// Deregister (drop) a named table from this session.

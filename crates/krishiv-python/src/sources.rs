@@ -243,7 +243,15 @@ pub fn read_kinesis(
 ) -> PyResult<PyStream> {
     #[cfg(not(feature = "kinesis"))]
     {
-        let _ = (session, stream_name, region, shard_id, start_position, max_batches, batch_size);
+        let _ = (
+            session,
+            stream_name,
+            region,
+            shard_id,
+            start_position,
+            max_batches,
+            batch_size,
+        );
         return Err(ConnectorError::new_err(
             "Kinesis support requires the `kinesis` feature (pip install krishiv[kinesis])",
         ));
@@ -276,7 +284,9 @@ pub fn read_kinesis(
             .detach(move || {
                 crate::session::block_on_async(async move {
                     let mut src = KinesisSource::new(cfg).await.map_err(|e| {
-                        krishiv_api::KrishivError::Runtime { message: e.to_string() }
+                        krishiv_api::KrishivError::Runtime {
+                            message: e.to_string(),
+                        }
                     })?;
                     let mut collected = Vec::new();
                     for _ in 0..max_batches {
@@ -331,7 +341,14 @@ pub fn read_pulsar(
 ) -> PyResult<PyStream> {
     #[cfg(not(feature = "pulsar"))]
     {
-        let _ = (session, broker_url, topic, subscription, max_batches, batch_size);
+        let _ = (
+            session,
+            broker_url,
+            topic,
+            subscription,
+            max_batches,
+            batch_size,
+        );
         return Err(ConnectorError::new_err(
             "Pulsar support requires the `pulsar` feature (pip install krishiv[pulsar])",
         ));
@@ -340,14 +357,15 @@ pub fn read_pulsar(
     {
         use krishiv_connectors::pulsar_connector::{PulsarConfig, PulsarSource};
 
-        let cfg = PulsarConfig::new(&broker_url, &topic)
-            .with_subscription(subscription);
+        let cfg = PulsarConfig::new(&broker_url, &topic).with_subscription(subscription);
         let inner = session.inner.clone();
         let name = topic.clone();
         py.detach(move || {
             crate::session::block_on_async(async move {
                 let mut src = PulsarSource::connect(cfg).await.map_err(|e| {
-                    krishiv_api::KrishivError::Runtime { message: e.to_string() }
+                    krishiv_api::KrishivError::Runtime {
+                        message: e.to_string(),
+                    }
                 })?;
                 let mut collected = Vec::new();
                 for _ in 0..max_batches {

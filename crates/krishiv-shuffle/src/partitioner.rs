@@ -540,9 +540,10 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
         RecordBatch::try_new(
             schema,
-            vec![Arc::new(Int64Array::from_iter_values(
-                std::iter::repeat_n(42i64, rows as usize),
-            ))],
+            vec![Arc::new(Int64Array::from_iter_values(std::iter::repeat_n(
+                42i64,
+                rows as usize,
+            )))],
         )
         .unwrap()
     }

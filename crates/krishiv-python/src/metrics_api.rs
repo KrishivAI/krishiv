@@ -15,9 +15,7 @@ use pyo3::types::PyDict;
 ///     print(text[:200])
 #[pyfunction]
 pub fn render_prometheus(py: Python<'_>) -> PyResult<String> {
-    py.detach(|| {
-        Ok(krishiv_metrics::global_metrics().render_prometheus())
-    })
+    py.detach(|| Ok(krishiv_metrics::global_metrics().render_prometheus()))
 }
 
 /// Return a snapshot of the current global Krishiv metrics as a plain dict.

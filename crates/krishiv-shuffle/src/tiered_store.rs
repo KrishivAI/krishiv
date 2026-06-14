@@ -52,9 +52,8 @@ impl ShuffleStore for TieredShuffleStore {
         // Try local disk first. Only fall through on a clean miss (Ok(None));
         // propagate real errors rather than silently falling back to remote
         // and potentially returning corrupt data to the caller.
-        match self.local.read_partition(id).await? {
-            Some(part) => return Ok(Some(part)),
-            None => {}
+        if let Some(part) = self.local.read_partition(id).await? {
+            return Ok(Some(part));
         }
 
         // Local miss after executor restart or eviction; fall back to the
@@ -68,9 +67,8 @@ impl ShuffleStore for TieredShuffleStore {
 
     async fn stream_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShuffleStream>> {
         // Same fall-through policy as read_partition: only on clean miss.
-        match self.local.stream_partition(id).await? {
-            Some(stream) => return Ok(Some(stream)),
-            None => {}
+        if let Some(stream) = self.local.stream_partition(id).await? {
+            return Ok(Some(stream));
         }
 
         tracing::info!(

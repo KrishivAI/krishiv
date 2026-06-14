@@ -255,9 +255,13 @@ impl PyKeyedStream {
 
     /// Apply per-source watermark lags to this keyed multi-source stream.
     pub fn with_multi_source_watermark(&self, spec: &PyMultiSourceWatermarkSpec) -> PyKeyedStream {
-        let stream = PyStream { pipeline: self.pipeline.clone() };
+        let stream = PyStream {
+            pipeline: self.pipeline.clone(),
+        };
         let updated = stream.with_multi_source_watermark(spec);
-        PyKeyedStream { pipeline: updated.pipeline }
+        PyKeyedStream {
+            pipeline: updated.pipeline,
+        }
     }
 
     pub fn __repr__(&self) -> String {
@@ -471,9 +475,15 @@ impl krishiv_api::CoProcessFunction for PyCoProcessBridge {
                     inner.processing_timers.clone(),
                 ))
             })?;
-        for b in emitted { ctx.emit(b); }
-        for (k, t) in event_timers { ctx.register_event_time_timer(&k, t); }
-        for (k, t) in processing_timers { ctx.register_processing_time_timer(&k, t); }
+        for b in emitted {
+            ctx.emit(b);
+        }
+        for (k, t) in event_timers {
+            ctx.register_event_time_timer(&k, t);
+        }
+        for (k, t) in processing_timers {
+            ctx.register_processing_time_timer(&k, t);
+        }
         Ok(())
     }
 }
@@ -509,9 +519,15 @@ fn dispatch_co_event(
                 inner.processing_timers.clone(),
             ))
         })?;
-    for b in emitted { ctx.emit(b); }
-    for (k, t) in event_timers { ctx.register_event_time_timer(&k, t); }
-    for (k, t) in processing_timers { ctx.register_processing_time_timer(&k, t); }
+    for b in emitted {
+        ctx.emit(b);
+    }
+    for (k, t) in event_timers {
+        ctx.register_event_time_timer(&k, t);
+    }
+    for (k, t) in processing_timers {
+        ctx.register_processing_time_timer(&k, t);
+    }
     Ok(())
 }
 
@@ -557,8 +573,8 @@ impl PyConnectedStreams {
         let left_pipeline = self.left.clone();
         let right_pipeline = self.right.clone();
 
-        let out_batches = py
-            .detach(move || -> PyResult<Vec<arrow::record_batch::RecordBatch>> {
+        let out_batches =
+            py.detach(move || -> PyResult<Vec<arrow::record_batch::RecordBatch>> {
                 let left_batches = crate::session::block_on_async(
                     crate::stream_exec::resolve_input_batches(&left_pipeline),
                 )
@@ -569,7 +585,11 @@ impl PyConnectedStreams {
                 )
                 .map_err(crate::errors::map_krishiv_error)?;
 
-                let bridge = PyCoProcessBridge { on_stream1, on_stream2, on_timer };
+                let bridge = PyCoProcessBridge {
+                    on_stream1,
+                    on_stream2,
+                    on_timer,
+                };
                 let mut executor =
                     krishiv_api::CoProcessExecutor::new(&key_column, Box::new(bridge));
 
@@ -594,7 +614,9 @@ impl PyConnectedStreams {
             })?;
 
         let stream = futures::stream::iter(out_batches.into_iter().map(Ok::<_, String>));
-        Ok(crate::dataframe::PyDataFrameStream::from_stream(Box::pin(stream)))
+        Ok(crate::dataframe::PyDataFrameStream::from_stream(Box::pin(
+            stream,
+        )))
     }
 
     pub fn __repr__(&self) -> String {
@@ -702,15 +724,22 @@ impl krishiv_api::BroadcastProcessFunction for PyBroadcastBridge {
         let key_owned = key.to_owned();
         let batch_clone = batch.clone();
         let emitted = pyo3::Python::attach(|py| -> krishiv_dataflow::ExecResult<_> {
-            let bridge_ctx = pyo3::Py::new(py, PyBroadcastContext { emitted: Vec::new() })
-                .map_err(|e| krishiv_dataflow::ExecError::InvalidInput(e.to_string()))?;
+            let bridge_ctx = pyo3::Py::new(
+                py,
+                PyBroadcastContext {
+                    emitted: Vec::new(),
+                },
+            )
+            .map_err(|e| krishiv_dataflow::ExecError::InvalidInput(e.to_string()))?;
             let py_batch = PyBatch::from_record_batch(batch_clone);
             self.on_keyed
                 .call1(py, (&key_owned, py_batch, row, bridge_ctx.clone_ref(py)))
                 .map_err(|e| krishiv_dataflow::ExecError::InvalidInput(e.to_string()))?;
             Ok(bridge_ctx.borrow(py).emitted.clone())
         })?;
-        for b in emitted { ctx.emit(b); }
+        for b in emitted {
+            ctx.emit(b);
+        }
         Ok(())
     }
 
@@ -722,15 +751,22 @@ impl krishiv_api::BroadcastProcessFunction for PyBroadcastBridge {
     ) -> krishiv_dataflow::ExecResult<()> {
         let batch_clone = batch.clone();
         let emitted = pyo3::Python::attach(|py| -> krishiv_dataflow::ExecResult<_> {
-            let bridge_ctx = pyo3::Py::new(py, PyBroadcastContext { emitted: Vec::new() })
-                .map_err(|e| krishiv_dataflow::ExecError::InvalidInput(e.to_string()))?;
+            let bridge_ctx = pyo3::Py::new(
+                py,
+                PyBroadcastContext {
+                    emitted: Vec::new(),
+                },
+            )
+            .map_err(|e| krishiv_dataflow::ExecError::InvalidInput(e.to_string()))?;
             let py_batch = PyBatch::from_record_batch(batch_clone);
             self.on_broadcast
                 .call1(py, (py_batch, row, bridge_ctx.clone_ref(py)))
                 .map_err(|e| krishiv_dataflow::ExecError::InvalidInput(e.to_string()))?;
             Ok(bridge_ctx.borrow(py).emitted.clone())
         })?;
-        for b in emitted { ctx.emit(b); }
+        for b in emitted {
+            ctx.emit(b);
+        }
         Ok(())
     }
 }
@@ -765,8 +801,8 @@ impl PyBroadcastStream {
         let broadcast_pipeline = self.pipeline.clone();
         let keyed_pipeline = keyed.pipeline.clone();
 
-        let out_batches = py.detach(
-            move || -> PyResult<Vec<arrow::record_batch::RecordBatch>> {
+        let out_batches =
+            py.detach(move || -> PyResult<Vec<arrow::record_batch::RecordBatch>> {
                 let broadcast_batches = crate::session::block_on_async(
                     crate::stream_exec::resolve_input_batches(&broadcast_pipeline),
                 )
@@ -777,7 +813,10 @@ impl PyBroadcastStream {
                 )
                 .map_err(crate::errors::map_krishiv_error)?;
 
-                let bridge = PyBroadcastBridge { on_keyed, on_broadcast };
+                let bridge = PyBroadcastBridge {
+                    on_keyed,
+                    on_broadcast,
+                };
                 let mut executor =
                     krishiv_api::BroadcastProcessExecutor::new(&key_column, Box::new(bridge));
 
@@ -795,11 +834,12 @@ impl PyBroadcastStream {
                     emitted.extend(out);
                 }
                 Ok(emitted)
-            },
-        )?;
+            })?;
 
         let stream = futures::stream::iter(out_batches.into_iter().map(Ok::<_, String>));
-        Ok(crate::dataframe::PyDataFrameStream::from_stream(Box::pin(stream)))
+        Ok(crate::dataframe::PyDataFrameStream::from_stream(Box::pin(
+            stream,
+        )))
     }
 
     pub fn __repr__(&self) -> String {

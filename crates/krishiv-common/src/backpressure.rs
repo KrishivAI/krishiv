@@ -48,7 +48,6 @@ impl BackpressureSignal {
             Self::None
         }
     }
-
 }
 
 /// Shared credit gate between a producer and consumer operator.

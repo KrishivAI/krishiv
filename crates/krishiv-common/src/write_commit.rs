@@ -328,11 +328,11 @@ pub fn final_part_file_name(task_index: usize, job_id: &str) -> String {
 
 /// Parse a staged file name back into `(task_id, attempt)`.
 fn parse_staged_file_name(name: &str) -> Result<(String, u32), WriteCommitError> {
-    let stem = name
-        .strip_suffix(".parquet")
-        .ok_or_else(|| WriteCommitError::InvalidStagedFileName {
-            name: name.to_owned(),
-        })?;
+    let stem =
+        name.strip_suffix(".parquet")
+            .ok_or_else(|| WriteCommitError::InvalidStagedFileName {
+                name: name.to_owned(),
+            })?;
     let (task, attempt) =
         stem.rsplit_once('-')
             .ok_or_else(|| WriteCommitError::InvalidStagedFileName {
@@ -621,7 +621,10 @@ fn remove_dir_all_tolerant(path: &Path) -> Result<(), WriteCommitError> {
 ///   deletes its own output (`Overwrite`).
 ///
 /// On success the staging directory for the job is removed.
-pub fn publish_staged_outputs(spec: &SinkWriteSpec, job_id: &str) -> Result<PublishOutcome, WriteCommitError> {
+pub fn publish_staged_outputs(
+    spec: &SinkWriteSpec,
+    job_id: &str,
+) -> Result<PublishOutcome, WriteCommitError> {
     let dest_dir = Path::new(&spec.base_dir).join(&spec.dest_path);
     let staging_dir = Path::new(&spec.base_dir).join(spec.staging_dir_rel(job_id));
 
@@ -676,16 +679,16 @@ pub fn publish_staged_outputs(spec: &SinkWriteSpec, job_id: &str) -> Result<Publ
 
     // Detect final-name collisions between distinct task ids up front.
     let mut index_owner: BTreeMap<(String, usize), String> = BTreeMap::new();
-    for ((hive_path, task_id), _) in &winners {
+    for (hive_path, task_id) in winners.keys() {
         let index = task_index_from_task_id(task_id);
-        if let Some(owner) = index_owner.get(&(hive_path.clone(), index)) {
-            if owner != task_id {
-                return Err(WriteCommitError::FinalNameCollision {
-                    first: owner.clone(),
-                    second: task_id.clone(),
-                    index,
-                });
-            }
+        if let Some(owner) = index_owner.get(&(hive_path.clone(), index))
+            && owner != task_id
+        {
+            return Err(WriteCommitError::FinalNameCollision {
+                first: owner.clone(),
+                second: task_id.clone(),
+                index,
+            });
         }
         index_owner.insert((hive_path.clone(), index), task_id.clone());
     }
@@ -766,7 +769,10 @@ mod tests {
         assert!(spec.staged);
         assert_eq!(spec.mode, WriteMode::Overwrite);
         assert_eq!(spec.partition_by, vec!["country", "year"]);
-        assert_eq!(SinkWriteSpec::parse(&spec.contract_payload()).unwrap(), spec);
+        assert_eq!(
+            SinkWriteSpec::parse(&spec.contract_payload()).unwrap(),
+            spec
+        );
     }
 
     #[test]
@@ -787,8 +793,7 @@ mod tests {
 
     #[test]
     fn staging_paths_are_deterministic() {
-        let spec =
-            SinkWriteSpec::staged("/base", "out", WriteMode::Append, vec![]).unwrap();
+        let spec = SinkWriteSpec::staged("/base", "out", WriteMode::Append, vec![]).unwrap();
         assert_eq!(spec.staging_dir_rel("job-7"), "out/_staging/job-7");
         assert_eq!(
             spec.staged_file_rel("job-7", "", "task-3", 2),

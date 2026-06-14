@@ -157,10 +157,7 @@ impl StreamingDataFrame {
     /// Rows with identical values in all `subset` columns are deduplicated,
     /// keeping the first occurrence per watermark epoch. Deduplication is applied
     /// as a stream adapter when `execute_stream_async` is called.
-    pub fn drop_duplicates(
-        mut self,
-        subset: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn drop_duplicates(mut self, subset: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.dedup_columns = Some(subset.into_iter().map(Into::into).collect());
         self
     }
@@ -316,7 +313,13 @@ impl StreamingDataFrame {
             join_keys: vec![],
             inner_join,
         };
-        temporal_join(stream_batches, table_snapshots, &spec, version_col, lookback_ms)
+        temporal_join(
+            stream_batches,
+            table_snapshots,
+            &spec,
+            version_col,
+            lookback_ms,
+        )
     }
 
     /// Stream-stream interval join (convenience wrapper for [`interval_join`]).
@@ -401,10 +404,7 @@ impl DeduplicatingStream {
     }
 
     /// Filter a batch, keeping only rows whose hash has not been seen before.
-    fn dedup_batch(
-        &mut self,
-        batch: RecordBatch,
-    ) -> Option<RecordBatch> {
+    fn dedup_batch(&mut self, batch: RecordBatch) -> Option<RecordBatch> {
         let mut keep_indices: Vec<usize> = Vec::new();
         for row in 0..batch.num_rows() {
             let h = Self::row_hash(&batch, row, &self.columns);
@@ -914,7 +914,6 @@ mod tests {
         ));
     }
 
-
     #[tokio::test]
     async fn routing_errors_are_delivered_to_both_output_streams() {
         let dataframe = dataframe_from_batches(vec![stream_batch(&["first"], &[10_000])]);
@@ -1092,7 +1091,10 @@ mod tests {
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
         // alice@100 appears twice but should only be counted once
-        assert_eq!(total_rows, 3, "dedup must eliminate the duplicate alice@100 row");
+        assert_eq!(
+            total_rows, 3,
+            "dedup must eliminate the duplicate alice@100 row"
+        );
     }
 
     // Test: stream_table_join convenience wrapper matches temporal_join behavior
@@ -1115,7 +1117,8 @@ mod tests {
             &spec,
             "version_ts",
             60_000,
-        ).unwrap();
+        )
+        .unwrap();
         let convenience = StreamingDataFrame::stream_table_join(
             &[stream],
             &[table],
@@ -1123,9 +1126,14 @@ mod tests {
             "version_ts",
             60_000,
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert_eq!(reference.len(), convenience.len(), "results must have equal length");
+        assert_eq!(
+            reference.len(),
+            convenience.len(),
+            "results must have equal length"
+        );
         for (r, c) in reference.iter().zip(convenience.iter()) {
             assert_eq!(r.1.is_some(), c.1.is_some(), "match presence must agree");
         }
@@ -1151,7 +1159,8 @@ mod tests {
             "event_ts",
             "event_ts",
             spec,
-        ).unwrap();
+        )
+        .unwrap();
         let convenience = StreamingDataFrame::stream_stream_join(
             &[left],
             &[right],
@@ -1159,7 +1168,8 @@ mod tests {
             "event_ts",
             0,
             100,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(
             reference.len(),
@@ -1171,8 +1181,8 @@ mod tests {
     // Test: streaming query restart -- start two sequential queries from the same data
     #[tokio::test]
     async fn streaming_query_restart_two_sequential_queries() {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use crate::streaming_builder::{DataStreamWriter, ForeachBatchFn, StreamingTrigger};
+        use std::sync::atomic::{AtomicU64, Ordering};
 
         let counter = Arc::new(AtomicU64::new(0));
 
@@ -1191,7 +1201,9 @@ mod tests {
                 .start()
                 .await
                 .expect("first query must start");
-            q.await_termination().await.expect("first query must complete");
+            q.await_termination()
+                .await
+                .expect("first query must complete");
         }
 
         let after_first = counter.load(Ordering::Relaxed);
@@ -1212,10 +1224,15 @@ mod tests {
                 .start()
                 .await
                 .expect("second query must start");
-            q.await_termination().await.expect("second query must complete");
+            q.await_termination()
+                .await
+                .expect("second query must complete");
         }
 
         let after_second = counter.load(Ordering::Relaxed);
-        assert_eq!(after_second, 5, "second query must have processed 3 more rows (2+3=5)");
+        assert_eq!(
+            after_second, 5,
+            "second query must have processed 3 more rows (2+3=5)"
+        );
     }
 }

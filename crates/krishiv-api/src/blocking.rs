@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use tokio::runtime::Runtime;
 
+use crate::DataFrame;
 use crate::error::{KrishivError, Result};
 use crate::session::{Session, SessionBuilder};
 use crate::types::QueryResult;
-use crate::DataFrame;
 
 /// Synchronous session backed by an owned Tokio runtime.
 ///

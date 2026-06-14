@@ -325,11 +325,12 @@ pub(crate) async fn write_object_parquet_sink_for_task(
         ),
     })?;
 
-    let slices = split_batches_by_partition_columns(batches, &spec.partition_by).map_err(
-        |error| ExecutorError::LocalExecution {
-            message: format!("staged sink partition split failed: {error}"),
-        },
-    )?;
+    let slices =
+        split_batches_by_partition_columns(batches, &spec.partition_by).map_err(|error| {
+            ExecutorError::LocalExecution {
+                message: format!("staged sink partition split failed: {error}"),
+            }
+        })?;
 
     let job_id = assignment.job_id().as_str();
     let task_id = assignment.task_id().as_str();
@@ -484,6 +485,7 @@ static EXECUTOR_PROCESS_BUDGET: std::sync::LazyLock<Arc<krishiv_common::MemoryBu
     });
 
 /// Process-wide executor memory budget (test and metrics inspection).
+#[allow(dead_code)]
 pub(crate) fn executor_process_budget() -> &'static Arc<krishiv_common::MemoryBudget> {
     &EXECUTOR_PROCESS_BUDGET
 }
@@ -709,13 +711,8 @@ mod tests {
         }
 
         fn staged_spec(base: &Path, mode: WriteMode) -> SinkWriteSpec {
-            SinkWriteSpec::staged(
-                base.to_string_lossy().into_owned(),
-                "out",
-                mode,
-                Vec::new(),
-            )
-            .unwrap()
+            SinkWriteSpec::staged(base.to_string_lossy().into_owned(), "out", mode, Vec::new())
+                .unwrap()
         }
 
         fn people_batch() -> RecordBatch {
@@ -748,10 +745,7 @@ mod tests {
         #[test]
         fn sink_contract_mode_parsing() {
             assert_eq!(WriteMode::parse("append").unwrap(), WriteMode::Append);
-            assert_eq!(
-                WriteMode::parse("Overwrite").unwrap(),
-                WriteMode::Overwrite
-            );
+            assert_eq!(WriteMode::parse("Overwrite").unwrap(), WriteMode::Overwrite);
             assert_eq!(
                 WriteMode::parse("errorifexists").unwrap(),
                 WriteMode::ErrorIfExists
@@ -810,7 +804,10 @@ mod tests {
                 std::fs::read_to_string(base.join("out/part-1-job-1.parquet")).unwrap(),
                 "one"
             );
-            assert!(!base.join("out/_staging").exists(), "staging must be removed");
+            assert!(
+                !base.join("out/_staging").exists(),
+                "staging must be removed"
+            );
         }
 
         #[test]
@@ -873,7 +870,11 @@ mod tests {
             let base = temp.path();
             stage_file(base, "out/_staging/job-5/task-0-1.parquet", "fresh");
             stage_file(base, "out/part-0-old-job.parquet", "stale");
-            stage_file(base, "out/country=US/part-0-old-job.parquet", "stale-nested");
+            stage_file(
+                base,
+                "out/country=US/part-0-old-job.parquet",
+                "stale-nested",
+            );
 
             let spec = staged_spec(base, WriteMode::Overwrite);
             let outcome = publish_staged_outputs(&spec, "job-5").unwrap();
@@ -1049,9 +1050,7 @@ mod tests {
             assert!(!temp.path().join("out/_staging").exists());
 
             // The published partition file is a readable Parquet object.
-            let us_file = temp
-                .path()
-                .join("out/country=US/part-0-job-sink-1.parquet");
+            let us_file = temp.path().join("out/country=US/part-0-job-sink-1.parquet");
             let file = std::fs::File::open(&us_file).unwrap();
             let reader =
                 parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
