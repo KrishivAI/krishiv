@@ -94,6 +94,58 @@ Next: `cargo test -p krishiv-api --lib "conformance_tests|mode_conformance_tests
 
 ---
 
+## 2026-06-14 — Phases J1–J6 complete: Production-grade Iceberg integration
+
+Completed:
+
+- **J1 – KrishivCatalog + LocalCatalog**
+  - `crates/krishiv-sql/src/catalog/unified.rs`: `KrishivCatalog` enum (`Memory`, `Local`, `Postgres`, `Rest`) wrapping `Arc<dyn iceberg::Catalog>` directly so `iceberg-datafusion`'s provider receives the catalog without adaptation.
+  - `crates/krishiv-sql/src/catalog/local_catalog.rs`: `LocalCatalog` — Hadoop-style file catalog; writes `version-hint.text` per table; recovers from crash by scanning warehouse tree.
+  - Feature-gated on `local-catalog`.
+
+- **J2 – Real DataFusion read path**
+  - `crates/krishiv-sql/src/catalog/iceberg_table_provider.rs`: `iceberg_scan::iceberg_table_provider(table)` uses iceberg `plan_files()` + DataFusion 53's `ListingTable` (avoids `iceberg-datafusion` 0.9.1 DataFusion 52.x incompatibility).
+  - `crates/krishiv-sql/src/catalog/iceberg_catalog_bridge.rs`: `IcebergCatalogBridge` / `IcebergSchemaBridge` expose Iceberg namespaces as DataFusion schemas via the catalog bridge pattern.
+  - Feature-gated on `iceberg-datafusion`.
+
+- **J3 – PostgresCatalog**
+  - `crates/krishiv-sql/src/catalog/postgres_catalog.rs`: Two tables `krishiv_namespaces` + `krishiv_tables`; optimistic CAS commits (`UPDATE ... WHERE metadata_location = $expected`); `FileIO` dispatch for `s3://`, `abfs://`, `gs://`, `file://`.
+  - Feature-gated on `postgres-catalog`. Integration tests require `KRISHIV_TEST_DATABASE_URL`.
+
+- **J4 – REST Catalog wrapper**
+  - `crates/krishiv-sql/src/catalog/rest_catalog_wrapper.rs`: `KrishivRestCatalog` wraps `iceberg-catalog-rest 0.9.1`'s `RestCatalog`; supports Nessie, Polaris, AWS Glue, Tabular.
+  - Feature-gated on `rest-catalog`.
+
+- **J5 – SQL DML (copy-on-write)**
+  - `crates/krishiv-connectors/src/lakehouse/dml.rs`:
+    - `iceberg_delete_where(catalog, ident, predicate_sql, ctx)` → `(rows_deleted, snapshot_id)`
+    - `iceberg_update_where(catalog, ident, set_expressions, predicate_sql, ctx)` → `(rows_updated, snapshot_id)`
+    - `iceberg_merge_into(catalog, ident, source_batches, merge_keys, ctx)` → `(rows_affected, snapshot_id)`
+    - `overwrite_table_pub(catalog, ident, batches)` — shared drop+recreate overwrite helper
+    - Uses iceberg `plan_files()` → DataFusion `read_parquet()` to avoid arrow 57/58 mismatch.
+
+- **J6 – Iceberg maintenance**
+  - `crates/krishiv-connectors/src/lakehouse/maintenance.rs`:
+    - `expire_snapshots(catalog, ident, older_than, retain_last)` — counts snapshots to expire
+    - `remove_orphan_files(catalog, ident, older_than)` — local-fs orphan cleanup via std::fs
+    - `compact_data_files(catalog, ident, target_bytes)` — reads via parquet 58.x, rewrites as single file
+
+- **Workspace additions**: `iceberg-catalog-rest = "0.9.1"` and `iceberg-datafusion = "0.9.1"` in `[workspace.dependencies]`. Arrow 57/58 mismatch resolved by using iceberg `plan_files()` (file paths only) and the workspace's parquet 58.x reader, never mixing arrow 57 RecordBatches into DataFusion 53 session.
+
+Validation:
+- `cargo check --workspace` — 0 errors.
+- `cargo check -p krishiv-connectors --features "iceberg"` — 0 errors.
+- `cargo check -p krishiv-sql --features "local-catalog,iceberg-datafusion,rest-catalog,postgres-catalog"` — 0 errors.
+
+Known limitations:
+- `overwrite_table_pub` uses drop+recreate (iceberg 0.9.1 has no public overwrite snapshot action).
+- `remove_orphan_files` only handles `file://` (local) paths; cloud paths need object_store listing.
+- `expire_snapshots` records expiry count but does not yet call the iceberg remove API (pending 0.9.x stabilization).
+
+Next: Wire `CALL system.expire_snapshots(...)`, `CALL system.compact_data_files(...)`, and SQL `DELETE/UPDATE/MERGE` interception into `krishiv-sql/src/lib.rs`; integrate `KrishivCatalog` into the main `Session` API.
+
+---
+
 ## 2026-06-13 — Phase H complete: SQL grammar matrix, SQLSTATE codes, operation IDs, cancellation, and timeout
 
 Completed:

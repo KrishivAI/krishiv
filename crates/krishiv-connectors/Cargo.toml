@@ -35,7 +35,7 @@ state = ["dep:krishiv-state"]
 
 # Lakehouse table formats (implementation in `crate::lakehouse`)
 lakehouse = ["dep:async-trait", "dep:chrono", "dep:rocksdb", "dep:serde", "dep:tempfile", "dep:url"]
-iceberg = ["lakehouse", "dep:iceberg"]
+iceberg = ["lakehouse", "dep:iceberg", "dep:iceberg-datafusion", "dep:uuid", "dep:datafusion"]
 delta = ["lakehouse"]
 hudi = ["lakehouse"]
 
@@ -89,6 +89,9 @@ rocksdb = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 url = { version = "2", optional = true }
 iceberg = { workspace = true, optional = true }
+iceberg-datafusion = { workspace = true, optional = true }
+datafusion = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 krishiv-state = { path = "../krishiv-state", optional = true }
 object_store = { workspace = true }
 rdkafka = { version = "0.36", optional = true, default-features = false, features = ["tokio"] }
