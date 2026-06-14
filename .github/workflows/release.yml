@@ -1,15 +1,13 @@
 name: Release
 
-# Tag push  → full release pipeline (stable or pre-release).
-# Branch push to release/** → build all artifacts as a pre-release draft,
-#   skipping strict tag validation and registry publish steps.
+# Triggered when a GitHub Release is published (via UI or gh CLI).
+# Workflow:
+#   1. git tag v0.2.0 && git push origin v0.2.0    (or: just release 0.2.0 && git push)
+#   2. GitHub → Releases → Draft a new release → select tag → set notes / pre-release flag
+#   3. Click Publish → this workflow fires, builds all artifacts, uploads to the release
 on:
-  push:
-    branches: ["release/**"]
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+"
+  release:
+    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,47 +29,29 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
-      is_tag: ${{ steps.meta.outputs.is_tag }}
     steps:
       - uses: actions/checkout@v4
       - name: Extract version metadata
         id: meta
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            TAG="${GITHUB_REF_NAME}"
-            VERSION="${TAG#v}"
-            IS_PRE=false
-            if [[ "$TAG" == *"-rc."* ]] || [[ "$TAG" == *"-beta."* ]] || [[ "$TAG" == *"-alpha."* ]]; then
-              IS_PRE=true
-            fi
-            echo "is_tag=true"  >> "$GITHUB_OUTPUT"
-          else
-            # Branch push: release/v0.2 → version 0.2-dev+<sha>
-            BRANCH="${GITHUB_REF_NAME#release/}"
-            VERSION="${BRANCH}-dev.$(git rev-parse --short HEAD)"
-            IS_PRE=true
-            echo "is_tag=false" >> "$GITHUB_OUTPUT"
-          fi
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          IS_PRE="${{ github.event.release.prerelease }}"
           echo "version=${VERSION}"      >> "$GITHUB_OUTPUT"
           echo "is_prerelease=${IS_PRE}" >> "$GITHUB_OUTPUT"
-          echo "Tag/Branch=${GITHUB_REF_NAME}  Version=${VERSION}  Pre=${IS_PRE}"
+          echo "Tag=${TAG}  Version=${VERSION}  PreRelease=${IS_PRE}"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - name: Validate tag and project metadata (tag push only)
-        if: github.ref_type == 'tag'
-        run: python3 scripts/check_release.py --tag "${GITHUB_REF_NAME}"
+      - name: Validate tag and project metadata
+        run: python3 scripts/check_release.py --tag "${{ github.event.release.tag_name }}"
       - name: Validate API parity manifest
         run: python3 scripts/check_parity_manifest.py
-      - name: Validate migration notes (stable tag only)
-        if: github.ref_type == 'tag' && steps.meta.outputs.is_prerelease == 'false'
+      - name: Validate migration notes (stable only)
+        if: github.event.release.prerelease == false
         run: python3 scripts/check_migration_notes.py
 
   # ── 2a. Cargo binaries ──────────────────────────────────────────────────────
-  #
-  #  x86_64-unknown-linux-musl  — statically linked; runs on any glibc-free Linux
-  #  aarch64-apple-darwin       — native macOS M1/M2/M3
-  #  aarch64 Linux is covered by the Docker multi-platform image.
   build-binary:
     name: Binary (${{ matrix.target }})
     needs: validate
@@ -120,10 +100,6 @@ jobs:
           retention-days: 7
 
   # ── 2b. Python wheels (maturin, multi-platform) ──────────────────────────────
-  #
-  #  Linux x86_64 / aarch64 → manylinux container (PyPI-compatible)
-  #  macOS arm64 / x86_64   → native runners
-  #  --find-interpreter builds one wheel per Python version found on the runner.
   build-wheels:
     name: Wheel (${{ matrix.os }} / ${{ matrix.target }})
     needs: validate
@@ -163,12 +139,6 @@ jobs:
           retention-days: 7
 
   # ── 2c. Docker images (multi-platform via buildx) ────────────────────────────
-  #
-  #  k8s  → coordinator + operator; default deployment target
-  #  full → all optional features (kafka, iceberg, etcd, delta, qdrant, …)
-  #
-  #  On tag:    ghcr.io/ORG/krishiv:v1.2.3 and :latest (stable only)
-  #  On branch: ghcr.io/ORG/krishiv:release-v0.2-dev (no :latest)
   docker:
     name: Docker (${{ matrix.variant }})
     needs: validate
@@ -203,8 +173,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ needs.validate.outputs.is_prerelease == 'false' && github.ref_type == 'tag' }}
-            type=raw,value=${{ needs.validate.outputs.version }},enable=${{ github.ref_type == 'branch' }}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.is_prerelease == 'false' }}
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -271,9 +240,11 @@ jobs:
           path: sbom-*.json
           retention-days: 7
 
-  # ── 4. GitHub Release ────────────────────────────────────────────────────────
-  github-release:
-    name: GitHub Release
+  # ── 4. Upload artifacts to the GitHub Release ────────────────────────────────
+  # The release already exists (publishing it triggered this workflow).
+  # This job attaches the built artifacts to it.
+  upload-assets:
+    name: Upload Release Assets
     needs: [validate, build-binary, build-wheels, docker, helm, sbom]
     runs-on: ubuntu-latest
     permissions:
@@ -299,11 +270,6 @@ jobs:
           path: dist/
       - uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          prerelease: ${{ needs.validate.outputs.is_prerelease == 'true' }}
-          draft: ${{ needs.validate.outputs.is_tag == 'false' }}
-          tag_name: ${{ needs.validate.outputs.is_tag == 'false' && format('dev-{0}', needs.validate.outputs.version) || github.ref_name }}
-          name: ${{ needs.validate.outputs.is_tag == 'false' && format('Dev build {0}', needs.validate.outputs.version) || '' }}
           files: |
             dist/*.tar.gz
             dist/*.sha256
@@ -311,15 +277,11 @@ jobs:
             dist/helm/*.tgz
             dist/sbom-*.json
 
-  # ── 5a. Publish Python wheels to PyPI (stable tag only) ─────────────────────
-  #
-  #  Requires: PyPI trusted publisher configured at
-  #    pypi.org → krishiv → Settings → Publishing → Add trusted publisher
-  #    (GitHub Actions, repo: this repo, workflow: release.yml, env: pypi-publish)
+  # ── 5a. Publish Python wheels to PyPI (stable only) ─────────────────────────
   publish-pypi:
     name: Publish PyPI
-    needs: [validate, github-release]
-    if: github.ref_type == 'tag' && needs.validate.outputs.is_prerelease == 'false'
+    needs: [validate, upload-assets]
+    if: needs.validate.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     environment:
       name: pypi-publish
@@ -336,15 +298,11 @@ jobs:
         with:
           packages-dir: dist/
 
-  # ── 5b. Publish crates to crates.io (stable tag only) ───────────────────────
-  #
-  #  17 publishable crates (krishiv-bench, krishiv-ai, krishiv-python excluded).
-  #  Published in topological order with 30 s delay for crates.io index propagation.
-  #  Requires: CARGO_REGISTRY_TOKEN secret in the "crates-publish" environment.
+  # ── 5b. Publish crates to crates.io (stable only) ───────────────────────────
   publish-crates:
     name: Publish Crates.io
-    needs: [validate, github-release]
-    if: github.ref_type == 'tag' && needs.validate.outputs.is_prerelease == 'false'
+    needs: [validate, upload-assets]
+    if: needs.validate.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     environment: crates-publish
     steps:

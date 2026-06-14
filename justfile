@@ -234,11 +234,13 @@ bench-manifest suite command:
 
 # ── Release ───────────────────────────────────────────────────────────────────
 
-# Bump workspace + Helm chart to VERSION, commit, and tag.
-# Triggers the GitHub Actions release pipeline when pushed.
-# Usage: VERSION=0.2.0 just release
+# Bump workspace + Helm chart to VERSION, commit, tag, and push.
+# After pushing, go to GitHub → Releases → Draft a new release → select
+# tag v{{ version }} → fill in release notes → Publish.
+# Publishing the release triggers the CI pipeline (builds artifacts, Docker, Helm, PyPI, crates.io).
+# Usage: just release 0.2.0
 release version=env_var_or_default("VERSION", ""):
-    @if [ -z "{{ version }}" ]; then echo "ERROR: set VERSION env var or pass as arg: just release 0.2.0"; exit 1; fi
+    @if [ -z "{{ version }}" ]; then echo "ERROR: pass version: just release 0.2.0"; exit 1; fi
     sed -i 's/^version = ".*"/version = "{{ version }}"/' Cargo.toml
     sed -i 's/^version:.*/version: {{ version }}/' k8s/helm/krishiv/Chart.yaml
     sed -i 's/^appVersion:.*/appVersion: "{{ version }}"/' k8s/helm/krishiv/Chart.yaml
@@ -246,14 +248,22 @@ release version=env_var_or_default("VERSION", ""):
     git add Cargo.toml Cargo.lock k8s/helm/krishiv/Chart.yaml
     git commit -m "chore: bump version to {{ version }}"
     git tag -a "v{{ version }}" -m "Release v{{ version }}"
-    @echo "✓ tagged v{{ version }} — push with: git push && git push origin v{{ version }}"
+    git push
+    git push origin "v{{ version }}"
+    @echo ""
+    @echo "✓ pushed v{{ version }}"
+    @echo "→ Next: GitHub → Releases → Draft a new release → tag v{{ version }} → Publish"
+    @echo "  Or:    gh release create v{{ version }} --generate-notes [--prerelease]"
 
-# Tag a release candidate without bumping version.
-# Usage: VERSION=0.2.0 RC=1 just release-rc
+# Tag and push a release candidate (does not bump version).
+# Usage: just release-rc 0.2.0        → v0.2.0-rc.1
+#        RC=2 just release-rc 0.2.0   → v0.2.0-rc.2
 release-rc version=env_var_or_default("VERSION", "") rc=env_var_or_default("RC", "1"):
-    @if [ -z "{{ version }}" ]; then echo "ERROR: set VERSION"; exit 1; fi
+    @if [ -z "{{ version }}" ]; then echo "ERROR: pass version: just release-rc 0.2.0"; exit 1; fi
     git tag -a "v{{ version }}-rc.{{ rc }}" -m "Release candidate v{{ version }}-rc.{{ rc }}"
-    @echo "✓ tagged v{{ version }}-rc.{{ rc }} — push with: git push origin v{{ version }}-rc.{{ rc }}"
+    git push origin "v{{ version }}-rc.{{ rc }}"
+    @echo "✓ pushed v{{ version }}-rc.{{ rc }}"
+    @echo "→ Next: gh release create v{{ version }}-rc.{{ rc }} --prerelease --generate-notes"
 
 # Dry-run: verify all 17 publishable crates pass packaging checks without uploading.
 publish-dry-run:
