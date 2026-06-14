@@ -1,5 +1,6 @@
 # Krishiv Implementation Status
 
+
 ## 2026-06-14 — Python parity complete: Phases D/F/G/H Python bindings
 
 Completed:
@@ -480,6 +481,30 @@ This change is a plan and architectural decision; implementation begins with the
 
 Implement Phase A inventory generation and CI baseline enforcement from `docs/implementation/stable-public-api-plan.md`.
 
+
+
+=======
+## Single-node cluster + Python examples validated (2026-06-13)
+
+### Done
+- Built krishiv single-node binary with `CXXFLAGS="-include cstdint"` workaround for GCC 15 / librocksdb-sys 0.16 incompatibility
+- Started local cluster (coordinator :9090, flight :50051, executor, HTTP :18080)
+- Ran `examples/single-node/batch_example.py` — produces correct access-log analytics output
+- Ran `examples/single-node/streaming_example.py` — produces correct IoT anomaly detection output
+- Verified cluster connectivity: `krishiv sql --coordinator` and Python `Session.connect()` both work
+- Fixed `streaming_example.py`: `import pyarrow.compute` and use `pc.greater` (pyarrow 24+)
+
+### Validation
+- Binary: `target/debug/krishiv` (803 MB debug, single-node features)
+- Cluster: coordinator + flight-server + executor all running, `krishiv local status` green
+- Python: embedded mode (default) and distributed mode (`Session.connect`) both functional
+
+### Next useful command
+```bash
+export KRISHIV_COORDINATOR=http://127.0.0.1:50051
+PYTHONPATH=crates/krishiv-python/python:$PYTHONPATH python3 examples/single-node/batch_example.py
+PYTHONPATH=crates/krishiv-python/python:$PYTHONPATH python3 examples/single-node/streaming_example.py
+```
 
 
 ---

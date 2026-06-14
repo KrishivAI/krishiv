@@ -3,6 +3,7 @@
 
 import os
 import pyarrow as pa
+import pyarrow.compute as pc
 import krishiv as ks
 
 def main():
@@ -30,7 +31,7 @@ def main():
     pa_batches = [pa.record_batch(b.to_arrow()) for b in results]
     table = pa.Table.from_batches(pa_batches)
     
-    anomalies = table.filter(pa.compute.greater(table["temperature"], 90.0))
+    anomalies = table.filter(pc.greater(table["temperature"], 90.0))
     
     print("\nIdentified Critical Anomalies (Temperature > 90.0):")
     print(anomalies)

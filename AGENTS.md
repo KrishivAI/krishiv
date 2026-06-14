@@ -56,6 +56,32 @@ Use the current codebase as the source of truth. The minimal docs are:
 - Preserve user changes in a dirty worktree; never revert work you did not make
   unless explicitly asked.
 
+## Build Notes (GCC 15)
+
+- librocksdb-sys 0.16 (used by rocksdb 0.22) fails to compile with GCC 15
+  (`uint64_t` not declared). Prepend `CXXFLAGS="-include cstdint"` to any
+  `cargo build` / `just build-*` command that links rocksdb:
+  ```bash
+  CXXFLAGS="-include cstdint" just build-single-node
+  CXXFLAGS="-include cstdint" cargo build -p krishiv --no-default-features --features single-node
+  ```
+
+## Python Examples
+
+```bash
+# Embedded mode (no cluster needed):
+PYTHONPATH=crates/krishiv-python/python:$PYTHONPATH python3 examples/single-node/batch_example.py
+PYTHONPATH=crates/krishiv-python/python:$PYTHONPATH python3 examples/single-node/streaming_example.py
+
+# Cluster mode (after `krishiv local start`):
+export KRISHIV_COORDINATOR=http://127.0.0.1:50051
+PYTHONPATH=crates/krishiv-python/python:$PYTHONPATH python3 -c "
+import krishiv as ks
+session = ks.Session.connect('http://127.0.0.1:50051')
+print(session.sql('SELECT 42 as answer').collect().pretty())
+"
+```
+
 ## Skill Source
 
 The repo-local Krishiv skill lives at:
