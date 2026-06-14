@@ -48,6 +48,10 @@ pub struct SessionBuilder {
     shuffle_partitions: Option<u32>,
     /// User-visible session properties propagated to the built session.
     config: std::collections::BTreeMap<String, String>,
+    /// Iceberg catalogs to register with the DataFusion session, each with a
+    /// catalog name. Accumulated by `with_iceberg_catalog`.
+    #[cfg(feature = "iceberg-catalog")]
+    iceberg_catalogs: Vec<(Arc<krishiv_sql::catalog::unified::KrishivCatalog>, String)>,
 }
 
 impl fmt::Debug for SessionBuilder {
@@ -89,6 +93,8 @@ impl Default for SessionBuilder {
             remote_execution_explicit: false,
             shuffle_partitions: None,
             config: std::collections::BTreeMap::new(),
+            #[cfg(feature = "iceberg-catalog")]
+            iceberg_catalogs: Vec::new(),
         }
     }
 }
@@ -381,6 +387,23 @@ impl SessionBuilder {
         self
     }
 
+    /// Register an Iceberg catalog to be attached to the DataFusion session.
+    ///
+    /// Tables in `catalog` are resolved as `<catalog_name>.<namespace>.<table>` in SQL
+    /// queries. Multiple catalogs can be registered under different names.
+    ///
+    /// Requires the `iceberg-catalog` feature.
+    #[cfg(feature = "iceberg-catalog")]
+    #[must_use]
+    pub fn with_iceberg_catalog(
+        mut self,
+        catalog: Arc<krishiv_sql::catalog::unified::KrishivCatalog>,
+        catalog_name: impl Into<String>,
+    ) -> Self {
+        self.iceberg_catalogs.push((catalog, catalog_name.into()));
+        self
+    }
+
     pub fn build(self) -> Result<Session> {
         // R12: Validate that coordinator_url and local_cluster_grpc point to the
         // same coordinator when both are set. The two fields serve different
@@ -417,10 +440,14 @@ impl SessionBuilder {
         let parallelism = self.target_parallelism.unwrap_or_else(|| {
             std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(1).unwrap())
         });
-        let sql_engine = SqlEngine::new()
+        let mut sql_engine = SqlEngine::new()
             .with_target_parallelism(parallelism)
             .with_udf_registry(Arc::clone(&udf_registry))
             .with_shuffle_partitions(self.shuffle_partitions);
+        #[cfg(feature = "iceberg-catalog")]
+        for (catalog, name) in self.iceberg_catalogs {
+            sql_engine = sql_engine.with_iceberg_catalog(catalog, name);
+        }
         let local_cluster = match self.in_process_cluster {
             Some(cluster) => cluster,
             None => Arc::new(InProcessCluster::new().map_err(|e| KrishivError::Runtime {

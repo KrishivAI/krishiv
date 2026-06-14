@@ -5313,6 +5313,7 @@ dependencies = [
  "async-trait",
  "dashmap",
  "futures",
+ "iceberg",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-dataflow",
