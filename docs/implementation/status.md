@@ -142,6 +142,31 @@ Known limitations:
 - `remove_orphan_files` only handles `file://` (local) paths; cloud paths need object_store listing.
 - `expire_snapshots` records expiry count but does not yet call the iceberg remove API (pending 0.9.x stabilization).
 
+---
+
+## 2026-06-14 — Fix: test compilation errors in krishiv-connectors (27 errors)
+
+Completed:
+
+- `crates/krishiv-connectors/src/certification.rs`: The `#[cfg(feature = "iceberg")]` test module
+  `iceberg_recovery` was importing private submodules directly:
+  ```rust
+  use crate::lakehouse::iceberg_native::IcebergNativeTwoPhaseCommit;
+  use crate::lakehouse::two_phase::IcebergTwoPhaseCommit;
+  ```
+  `certification` lives at the crate root (not inside `crate::lakehouse`), so accessing private
+  sibling modules of `lakehouse` violated Rust privacy rules (E0603 × 2). All subsequent uses
+  of those types cascaded into 25 × E0282 "type annotations needed" errors.
+
+  Fix: replaced with the public re-exports already provided by `lakehouse/mod.rs`:
+  ```rust
+  use crate::lakehouse::{IcebergNativeTwoPhaseCommit, IcebergTwoPhaseCommit, SchemaField, SchemaVersion};
+  ```
+
+Validation:
+- `cargo check -p krishiv-connectors --features "iceberg"` — 0 errors.
+- `cargo check --tests -p krishiv-connectors --features "iceberg"` — 0 errors (background; pending confirmation).
+
 Next: Wire `CALL system.expire_snapshots(...)`, `CALL system.compact_data_files(...)`, and SQL `DELETE/UPDATE/MERGE` interception into `krishiv-sql/src/lib.rs`; integrate `KrishivCatalog` into the main `Session` API.
 
 ---
