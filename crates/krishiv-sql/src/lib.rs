@@ -1538,6 +1538,117 @@ impl SqlEngine {
             return Ok(self.make_sql_df("call", dataframe).with_query(query));
         }
 
+        // ── Intercept DELETE FROM <iceberg-table> [WHERE …] ──────────────────
+        // Route to copy-on-write iceberg_delete_where when the table is tracked
+        // by a registered KrishivCatalog. Falls through to DataFusion otherwise.
+        #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+        if trimmed.to_ascii_uppercase().starts_with("DELETE FROM ") {
+            if let Some((table_ref, predicate)) = parse_dml_delete(trimmed) {
+                if let Some((iceberg_catalog, table_ident)) =
+                    self.resolve_iceberg_table(&table_ref)
+                {
+                    use arrow::array::{ArrayRef, Int64Array};
+                    use arrow::datatypes::{DataType, Field, Schema};
+                    let (deleted, _) =
+                        krishiv_connectors::lakehouse::dml::iceberg_delete_where(
+                            iceberg_catalog,
+                            &table_ident,
+                            &predicate,
+                            &self.context,
+                        )
+                        .await
+                        .map_err(|e| SqlError::DataFusion {
+                            message: e.to_string(),
+                        })?;
+                    let schema = Arc::new(Schema::new(vec![Field::new(
+                        "deleted_rows",
+                        DataType::Int64,
+                        false,
+                    )]));
+                    let array: ArrayRef =
+                        Arc::new(Int64Array::from(vec![deleted as i64]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(|e| {
+                            SqlError::DataFusion {
+                                message: e.to_string(),
+                            }
+                        })?;
+                    let res_table = next_ephemeral_name("delete_result");
+                    lakehouse::register_scan_batches(
+                        &self.context,
+                        &res_table,
+                        vec![batch],
+                    )
+                    .await?;
+                    let dataframe = self
+                        .context
+                        .sql(&format!("SELECT * FROM {res_table}"))
+                        .await?;
+                    return Ok(
+                        self.make_sql_df("delete", dataframe).with_query(query)
+                    );
+                }
+            }
+        }
+
+        // ── Intercept UPDATE <iceberg-table> SET … [WHERE …] ─────────────────
+        #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+        if trimmed.to_ascii_uppercase().starts_with("UPDATE ") {
+            if let Some((table_ref, set_clause, predicate)) = parse_dml_update(trimmed) {
+                if let Some((iceberg_catalog, table_ident)) =
+                    self.resolve_iceberg_table(&table_ref)
+                {
+                    use arrow::array::{ArrayRef, Int64Array};
+                    use arrow::datatypes::{DataType, Field, Schema};
+                    let assignments = split_set_assignments(&set_clause);
+                    let borrowed: Vec<(&str, &str)> = assignments
+                        .iter()
+                        .map(|(c, e)| (c.as_str(), e.as_str()))
+                        .collect();
+                    let pred = predicate.as_deref();
+                    let (updated, _) =
+                        krishiv_connectors::lakehouse::dml::iceberg_update_where(
+                            iceberg_catalog,
+                            &table_ident,
+                            &borrowed,
+                            pred,
+                            &self.context,
+                        )
+                        .await
+                        .map_err(|e| SqlError::DataFusion {
+                            message: e.to_string(),
+                        })?;
+                    let schema = Arc::new(Schema::new(vec![Field::new(
+                        "updated_rows",
+                        DataType::Int64,
+                        false,
+                    )]));
+                    let array: ArrayRef =
+                        Arc::new(Int64Array::from(vec![updated as i64]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(|e| {
+                            SqlError::DataFusion {
+                                message: e.to_string(),
+                            }
+                        })?;
+                    let res_table = next_ephemeral_name("update_result");
+                    lakehouse::register_scan_batches(
+                        &self.context,
+                        &res_table,
+                        vec![batch],
+                    )
+                    .await?;
+                    let dataframe = self
+                        .context
+                        .sql(&format!("SELECT * FROM {res_table}"))
+                        .await?;
+                    return Ok(
+                        self.make_sql_df("update", dataframe).with_query(query)
+                    );
+                }
+            }
+        }
+
         // ── Intercept MATCH_RECOGNIZE ─────────────────────────────────────────
         // DataFusion does not parse MATCH_RECOGNIZE. Route it through the CEP
         // path: parse → run PatternMatcher on the source table → return results.
@@ -1688,6 +1799,44 @@ impl SqlEngine {
         }
         let df = self.sql(query).await?;
         Ok(TaggedQueryResult { operation_id, inner: df })
+    }
+
+    /// Resolve a SQL table reference to an `(Arc<dyn Catalog>, TableIdent)` pair
+    /// from the registered Iceberg catalogs.
+    ///
+    /// Accepts 2-part (`ns.tbl`) and 3-part (`cat.ns.tbl`) references.
+    /// Returns `None` when no catalog is registered or the reference is ambiguous.
+    #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+    fn resolve_iceberg_table(
+        &self,
+        table_ref: &str,
+    ) -> Option<(Arc<dyn iceberg::Catalog + Send + Sync>, iceberg::TableIdent)>
+    {
+        let parts: Vec<&str> = table_ref.splitn(3, '.').collect();
+        let (catalog_arc, ns_str, table_str) = {
+            let guard = self
+                .iceberg_catalogs
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.is_empty() {
+                return None;
+            }
+            match parts.len() {
+                2 => {
+                    let (cat, _) = guard.first()?;
+                    (Arc::clone(cat), parts[0], parts[1])
+                }
+                3 => {
+                    let cat_name = parts[0];
+                    let (cat, _) = guard.iter().find(|(_, n)| n == cat_name)?;
+                    (Arc::clone(cat), parts[1], parts[2])
+                }
+                _ => return None,
+            }
+        };
+        let ns = iceberg::NamespaceIdent::from_vec(vec![ns_str.to_string()]).ok()?;
+        let ident = iceberg::TableIdent::new(ns, table_str.to_string());
+        Some((catalog_arc.as_iceberg(), ident))
     }
 
     /// Dispatch a `CALL system.<proc>(...)` statement to the appropriate
@@ -3415,6 +3564,100 @@ fn parse_call_duration(s: &str) -> SqlResult<chrono::Duration> {
     }
 }
 
+// ── Iceberg DML helpers ───────────────────────────────────────────────────────
+
+/// Parse `DELETE FROM <table> [WHERE <predicate>]` into `(table_ref, predicate)`.
+///
+/// Returns `None` when the statement does not match the expected shape.
+/// A missing WHERE clause is treated as `"TRUE"` (delete all rows).
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn parse_dml_delete(stmt: &str) -> Option<(String, String)> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static WITH_WHERE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)^\s*DELETE\s+FROM\s+(\S+)\s+WHERE\s+([\s\S]+?)\s*;?\s*$").unwrap()
+    });
+    static NO_WHERE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)^\s*DELETE\s+FROM\s+(\S+)\s*;?\s*$").unwrap()
+    });
+
+    if let Some(cap) = WITH_WHERE.captures(stmt) {
+        let table = cap.get(1)?.as_str().to_string();
+        let pred = cap.get(2)?.as_str().trim().to_string();
+        Some((table, pred))
+    } else if let Some(cap) = NO_WHERE.captures(stmt) {
+        let table = cap.get(1)?.as_str().to_string();
+        Some((table, "TRUE".to_string()))
+    } else {
+        None
+    }
+}
+
+/// Parse `UPDATE <table> SET <assignments> [WHERE <predicate>]` into
+/// `(table_ref, set_clause, Option<predicate>)`.
+///
+/// Returns `None` when the statement does not match.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn parse_dml_update(stmt: &str) -> Option<(String, String, Option<String>)> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static UPDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?is)^\s*UPDATE\s+(\S+)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]+?))?\s*;?\s*$",
+        )
+        .unwrap()
+    });
+
+    let cap = UPDATE_RE.captures(stmt)?;
+    let table = cap.get(1)?.as_str().to_string();
+    let set_clause = cap.get(2)?.as_str().trim().to_string();
+    let predicate = cap.get(3).map(|m| m.as_str().trim().to_string());
+    Some((table, set_clause, predicate))
+}
+
+/// Split a SQL SET clause (`col1 = expr1, col2 = expr2`) into assignment pairs.
+///
+/// Handles commas inside balanced parentheses (e.g. `CONCAT(a, b)`).
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn split_set_assignments(set_clause: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    let bytes = set_clause.as_bytes();
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                push_set_pair(&mut pairs, &set_clause[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    push_set_pair(&mut pairs, &set_clause[start..]);
+    pairs
+}
+
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn push_set_pair(pairs: &mut Vec<(String, String)>, s: &str) {
+    let s = s.trim();
+    if let Some(eq) = s.find('=') {
+        let col = s[..eq]
+            .trim()
+            .trim_matches('`')
+            .trim_matches('"')
+            .to_string();
+        let expr = s[eq + 1..].trim().to_string();
+        if !col.is_empty() && !expr.is_empty() {
+            pairs.push((col, expr));
+        }
+    }
+}
+
 /// Create a Krishiv logical plan wrapper for a SQL query without executing it.
 pub fn plan_sql(query: impl Into<String>) -> SqlResult<SqlPlan> {
     let query = query.into();
@@ -4338,6 +4581,130 @@ mod iceberg_catalog_tests {
             .unwrap()
             .value(0);
         assert_eq!(count, 0, "fresh table has no snapshots to expire");
+    }
+
+    // ── DELETE / UPDATE helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_dml_delete_with_where() {
+        let (tbl, pred) = super::parse_dml_delete("DELETE FROM myns.orders WHERE id = 5")
+            .expect("must parse");
+        assert_eq!(tbl, "myns.orders");
+        assert_eq!(pred, "id = 5");
+    }
+
+    #[test]
+    fn parse_dml_delete_without_where() {
+        let (tbl, pred) = super::parse_dml_delete("DELETE FROM myns.orders")
+            .expect("must parse");
+        assert_eq!(tbl, "myns.orders");
+        assert_eq!(pred, "TRUE");
+    }
+
+    #[test]
+    fn parse_dml_update_with_where() {
+        let (tbl, set, pred) =
+            super::parse_dml_update("UPDATE myns.orders SET price = price * 2 WHERE id = 1")
+                .expect("must parse");
+        assert_eq!(tbl, "myns.orders");
+        assert!(set.contains("price * 2"), "set clause: {set}");
+        assert_eq!(pred.unwrap(), "id = 1");
+    }
+
+    #[test]
+    fn parse_dml_update_without_where() {
+        let (tbl, set, pred) =
+            super::parse_dml_update("UPDATE myns.orders SET status = 'active'")
+                .expect("must parse");
+        assert_eq!(tbl, "myns.orders");
+        assert!(set.contains("'active'"), "set clause: {set}");
+        assert!(pred.is_none());
+    }
+
+    #[test]
+    fn split_set_assignments_basic() {
+        let pairs = super::split_set_assignments("a = 1, b = 'hello', c = c + 1");
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], ("a".to_string(), "1".to_string()));
+        assert_eq!(pairs[1], ("b".to_string(), "'hello'".to_string()));
+        assert_eq!(pairs[2], ("c".to_string(), "c + 1".to_string()));
+    }
+
+    #[test]
+    fn split_set_assignments_function_with_comma() {
+        let pairs = super::split_set_assignments("name = CONCAT(first, ' ', last), age = 5");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "name");
+        assert!(pairs[0].1.starts_with("CONCAT("), "got: {}", pairs[0].1);
+        assert_eq!(pairs[1], ("age".to_string(), "5".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_from_iceberg_table_removes_rows() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        catalog
+            .create_table("myns", "orders", schema, "")
+            .await
+            .unwrap();
+        let engine =
+            SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
+        // DELETE with no WHERE on an empty table returns 0 deleted rows.
+        let df = engine
+            .sql("DELETE FROM myns.orders WHERE id = 99")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "deleted_rows");
+        let deleted = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(deleted, 0, "empty table: no rows to delete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_iceberg_table_returns_updated_count() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "status", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        catalog
+            .create_table("myns", "customers", schema, "")
+            .await
+            .unwrap();
+        let engine =
+            SqlEngine::new().with_iceberg_catalog(Arc::clone(&catalog), "mycat");
+        let df = engine
+            .sql("UPDATE myns.customers SET status = 'active' WHERE id = 1")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "updated_rows");
+        let updated = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(updated, 0, "empty table: no rows to update");
     }
 }
 
