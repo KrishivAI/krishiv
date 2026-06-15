@@ -385,8 +385,7 @@ impl OperatorCliConfig {
                         .map_err(|_| format!("invalid socket address: {value}"))?;
                 }
                 "--coordinator-endpoint" => {
-                    config.coordinator_endpoint =
-                        next_arg(&mut args, "--coordinator-endpoint")?;
+                    config.coordinator_endpoint = next_arg(&mut args, "--coordinator-endpoint")?;
                 }
                 "--help" | "-h" => config.help = true,
                 unknown => return Err(format!("unknown option: {unknown}\n\n{}", Self::help())),
@@ -541,7 +540,10 @@ mod tests {
         let controller = config.clone().into_controller_config().unwrap();
 
         assert_eq!(config.coordinator_endpoint, "http://coord.example:9090");
-        assert_eq!(controller.coordinator_endpoint(), "http://coord.example:9090");
+        assert_eq!(
+            controller.coordinator_endpoint(),
+            "http://coord.example:9090"
+        );
     }
 
     #[test]

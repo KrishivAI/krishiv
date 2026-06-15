@@ -57,10 +57,7 @@ impl SourceDriver for CsvSourceDriver {
         Ok(())
     }
 
-    fn open<'a>(
-        &'a self,
-        config: &'a ConnectorConfig,
-    ) -> OpenSourceFuture<'a> {
+    fn open<'a>(&'a self, config: &'a ConnectorConfig) -> OpenSourceFuture<'a> {
         Box::pin(async move {
             let path = require_path(config)?;
             let mut opts = CsvOptions::default();

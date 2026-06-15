@@ -715,9 +715,11 @@ impl DeadLetterSink {
         let mut new_cols: Vec<std::sync::Arc<dyn arrow::array::Array>> =
             rejected_batch.columns().to_vec();
         new_cols.push(std::sync::Arc::new(error_col));
-        let dlq_batch = arrow::record_batch::RecordBatch::try_new(new_schema, new_cols)
-            .map_err(|e| ConnectorError::Schema {
-                message: format!("failed to build dead-letter batch: {e}"),
+        let dlq_batch =
+            arrow::record_batch::RecordBatch::try_new(new_schema, new_cols).map_err(|e| {
+                ConnectorError::Schema {
+                    message: format!("failed to build dead-letter batch: {e}"),
+                }
             })?;
 
         secondary.write_batch_dyn(dlq_batch).await?;

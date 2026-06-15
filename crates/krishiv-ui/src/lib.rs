@@ -131,10 +131,7 @@ impl IntoResponse for UiError {
 /// whitespace at the start/end of the file contents is stripped so a
 /// trailing newline in a Secret does not break the comparison.
 fn effective_ui_bearer_token(state: &UiState) -> Option<String> {
-    state
-        .ui_bearer_token
-        .clone()
-        .or_else(resolve_ui_token)
+    state.ui_bearer_token.clone().or_else(resolve_ui_token)
 }
 
 fn ui_auth_token(state: &UiState) -> Option<String> {
