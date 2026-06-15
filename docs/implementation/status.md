@@ -1,5 +1,26 @@
 # Krishiv Implementation Status
 
+## 2026-06-15 — Crate refactor: remove `krishiv-ai`, restore `krishiv-chaos`, slim default builds
+
+- **Removed `krishiv-ai`**: deprecated vector-sink shim; Python `ai`/`vector-sinks`/`qdrant`/`pgvector` features now gate `krishiv-connectors` directly.
+- **Dropped dead deps**: removed unused `krishiv-ai` edges from `krishiv-dataflow` and `krishiv-executor`.
+- **`krishiv-chaos`**: restored as a test-only crate; moved `chaos_suite` out of `krishiv-common` so the foundation crate no longer pulls scheduler/operator dev-deps.
+- **`krishiv-bench`**: removed from workspace `default-members` (still buildable via `cargo bench -p krishiv-bench`).
+- **`docs/README.md`**: added `krishiv-sql-gateway` and `krishiv-chaos` to the workspace map.
+- **Deferred**: `krishiv-api` → `krishiv-runtime` compile-graph slimming (needs optional cluster wiring in runtime).
+
+### Validation
+
+```
+cargo check --workspace
+cargo test -p krishiv-chaos
+cargo test -p krishiv-common
+cargo test -p krishiv-dataflow --lib
+cargo test -p krishiv-executor --lib
+```
+
+---
+
 ## 2026-06-15 — Deferred API gap items (distributed sink, gateway, Flight tx, Python)
 
 Implemented the deferred follow-ups from `docs/implementation/api-gap-plan.md`:

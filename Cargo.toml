@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/krishiv",
-    "crates/krishiv-ai",
     "crates/krishiv-api",
     "crates/krishiv-common",
     "crates/krishiv-connectors",
@@ -21,10 +20,10 @@ members = [
     "crates/krishiv-sql-gateway",
     "crates/krishiv-metrics",
     "crates/krishiv-bench",
+    "crates/krishiv-chaos",
 ]
 default-members = [
     "crates/krishiv",
-    "crates/krishiv-ai",
     "crates/krishiv-api",
     "crates/krishiv-common",
     "crates/krishiv-connectors",
@@ -43,7 +42,6 @@ default-members = [
     "crates/krishiv-flight-sql",
     "crates/krishiv-sql-gateway",
     "crates/krishiv-metrics",
-    "crates/krishiv-bench",
 ]
 resolver = "3"
 

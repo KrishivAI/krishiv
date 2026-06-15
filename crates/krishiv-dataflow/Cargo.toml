@@ -10,7 +10,6 @@ arrow = { workspace = true }
 dashmap = { workspace = true }
 smallvec = "1"
 thiserror = { workspace = true }
-krishiv-ai = { path = "../krishiv-ai" }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
 krishiv-metrics = { path = "../krishiv-metrics" }
