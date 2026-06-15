@@ -189,8 +189,7 @@ impl PodLifecycleManager {
                     continue;
                 }
             };
-            if let Some(failure) = crate::pod_failure::detect_executor_pod_launch_failure(&value)
-            {
+            if let Some(failure) = crate::pod_failure::detect_executor_pod_launch_failure(&value) {
                 return Some(failure);
             }
         }

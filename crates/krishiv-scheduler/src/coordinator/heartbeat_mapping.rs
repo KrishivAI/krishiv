@@ -43,10 +43,8 @@ pub fn executor_heartbeat_from_request(request: &ExecutorHeartbeatRequest) -> Ex
 pub fn executor_heartbeat_response_from_effects(
     effects: ExecutorHeartbeatEffects,
 ) -> ExecutorHeartbeatResponse {
-    let mut resp = ExecutorHeartbeatResponse::new(
-        effects.lease_generation,
-        TransportDisposition::Accepted,
-    );
+    let mut resp =
+        ExecutorHeartbeatResponse::new(effects.lease_generation, TransportDisposition::Accepted);
     if !effects.source_throttles.is_empty() {
         let wire_cmds: Vec<HeartbeatThrottleCommand> = effects
             .source_throttles

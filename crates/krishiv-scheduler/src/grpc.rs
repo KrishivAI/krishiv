@@ -5,12 +5,12 @@ use std::sync::Arc;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointEpochInfo, CoordinatorExecutorService,
     CoordinatorManagementService, DeregisterExecutorRequest, DeregisterExecutorResponse,
-    ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse,
-    HeartbeatThrottleCommand, InspectStateRequest, InspectStateResponse, JobId, LeaseGeneration,
-    ListCheckpointsRequest, ListCheckpointsResponse, RegisterExecutorRequest,
-    RegisterExecutorResponse, RestoreJobRequest, RestoreJobResponse, StateSnapshotInfo,
-    TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
-    TransportVersion, TriggerSavepointRequest, TriggerSavepointResponse, wire,
+    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, InspectStateRequest, InspectStateResponse,
+    JobId, LeaseGeneration, ListCheckpointsRequest, ListCheckpointsResponse,
+    RegisterExecutorRequest, RegisterExecutorResponse, RestoreJobRequest, RestoreJobResponse,
+    StateSnapshotInfo, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate,
+    TransportDisposition, TransportVersion, TriggerSavepointRequest, TriggerSavepointResponse,
+    wire,
 };
 use krishiv_state::checkpoint::CheckpointStorage;
 

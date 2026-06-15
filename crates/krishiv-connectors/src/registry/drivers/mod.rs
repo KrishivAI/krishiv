@@ -1,9 +1,9 @@
 //! Built-in connector driver registrations.
 
+mod csv;
 mod parquet;
 mod s3;
 mod two_phase;
-mod csv;
 
 #[cfg(feature = "avro")]
 mod avro;
@@ -14,10 +14,10 @@ mod kafka;
 #[cfg(feature = "lakehouse")]
 mod lakehouse;
 
+pub use csv::CsvSourceDriver;
 pub use parquet::{ParquetSinkDriver, ParquetSourceDriver};
 pub use s3::{S3SinkDriver, S3SourceDriver};
 pub use two_phase::LocalParquetTwoPhaseSinkDriver;
-pub use csv::CsvSourceDriver;
 
 #[cfg(feature = "avro")]
 pub use avro::{AvroSinkDriver, AvroSourceDriver};

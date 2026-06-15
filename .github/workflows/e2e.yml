@@ -18,7 +18,7 @@ jobs:
   # ── Kubernetes failover test via kind ────────────────────────────────────────
   kind-e2e:
     name: Kubernetes E2E
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +31,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
       - name: Install kind
         run: |
           curl -sSLo ./kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
@@ -63,7 +63,7 @@ jobs:
   # ── Bare-metal distributed cluster smoke tests ───────────────────────────────
   bare-metal-e2e:
     name: Bare-Metal E2E
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -75,10 +75,10 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
       - name: Build cluster binaries
         run: |
-          cargo build -p krishiv-scheduler --bin krishiv-clusterd
+          cargo build -p krishiv-scheduler --bin krishiv-clusterd --features etcd
           cargo build -p krishiv-executor
       - name: Distributed scheduler integration tests
         run: cargo test -p krishiv-scheduler --test distributed_e2e

@@ -118,7 +118,6 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
         let request = request.into_inner();
-        let lease_generation = request.lease_generation();
         let running_tasks: Vec<_> = request
             .running_attempts()
             .iter()
@@ -126,7 +125,7 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
             .collect();
 
         // Fast path: update the executor registry via the sharded inner lock.
-        let mut registry_heartbeat = crate::coordinator::executor_heartbeat_from_request(&request);
+        let registry_heartbeat = crate::coordinator::executor_heartbeat_from_request(&request);
 
         {
             let coordinator = lock_coord(&self.coordinator)?;
@@ -149,10 +148,9 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
 
         // Full coordinator heartbeat for hot-keys, streaming progress, checkpoints,
         // and queued throttle commands from task-status updates.
-        let full_heartbeat =
-            crate::coordinator::executor_heartbeat_from_request(&request)
-                .with_lease_generation(lease_generation)
-                .with_running_tasks(running_tasks);
+        let full_heartbeat = crate::coordinator::executor_heartbeat_from_request(&request)
+            .with_lease_generation(lease_generation)
+            .with_running_tasks(running_tasks);
 
         let response = {
             let mut coordinator = lock_coord(&self.coordinator)?;

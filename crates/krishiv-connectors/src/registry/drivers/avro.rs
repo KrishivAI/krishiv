@@ -56,10 +56,15 @@ struct AvroFileSink {
 
 impl Sink for AvroFileSink {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_bounded().with_idempotent()
+        ConnectorCapabilities::new()
+            .with_bounded()
+            .with_idempotent()
     }
 
-    async fn write_batch(&mut self, batch: arrow::record_batch::RecordBatch) -> ConnectorResult<()> {
+    async fn write_batch(
+        &mut self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> ConnectorResult<()> {
         if self.inner.is_none() {
             let file = File::create(&self.path).map_err(crate::error::ConnectorError::Io)?;
             let sink = AvroSink::new(BufWriter::new(file), batch.schema().as_ref())?;
@@ -97,10 +102,7 @@ impl SourceDriver for AvroSourceDriver {
         Ok(())
     }
 
-    fn open<'a>(
-        &'a self,
-        config: &'a ConnectorConfig,
-    ) -> OpenSourceFuture<'a> {
+    fn open<'a>(&'a self, config: &'a ConnectorConfig) -> OpenSourceFuture<'a> {
         Box::pin(async move {
             let path = require_path(config)?;
             let file = File::open(&path).map_err(crate::error::ConnectorError::Io)?;
@@ -117,7 +119,9 @@ impl SinkDriver for AvroSinkDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Avro,
             ConnectorRole::Sink,
-            ConnectorCapabilities::new().with_bounded().with_idempotent(),
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_idempotent(),
         )
     }
 
@@ -129,10 +133,7 @@ impl SinkDriver for AvroSinkDriver {
     fn open<'a>(&'a self, config: &'a ConnectorConfig) -> OpenSinkFuture<'a> {
         Box::pin(async move {
             let path = require_path(config)?;
-            let sink = AvroFileSink {
-                inner: None,
-                path,
-            };
+            let sink = AvroFileSink { inner: None, path };
             Ok(Box::new(sink) as Box<dyn DynSink>)
         })
     }

@@ -4632,8 +4632,8 @@ mod scheduler_tests {
     #[test]
     fn hot_key_reports_from_task_status_queue_throttles_and_skew_override() {
         use krishiv_proto::{
-            ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport, TaskOutputMetadata,
-            TaskState, TaskStatusUpdate,
+            ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport, TaskOutputMetadata, TaskState,
+            TaskStatusUpdate,
         };
 
         let coordinator_id = CoordinatorId::try_new("coord-hk-task-status").unwrap();
