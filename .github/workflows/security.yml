@@ -15,7 +15,7 @@ jobs:
   # ── Vulnerability scan via cargo-audit (RustSec advisory DB) ────────────────
   audit:
     name: Dependency Audit
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
@@ -25,7 +25,7 @@ jobs:
   # ── Generate and archive CycloneDX SBOM ─────────────────────────────────────
   sbom:
     name: SBOM
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -21,7 +21,7 @@ jobs:
   # ── Format + Lint ────────────────────────────────────────────────────────────
   fmt-lint:
     name: Format & Lint
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +42,7 @@ jobs:
   # one mode but not others will only surface here.
   check-modes:
     name: check (${{ matrix.mode }})
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       fail-fast: false
       matrix:
@@ -73,7 +73,7 @@ jobs:
   # ── Rust workspace tests ─────────────────────────────────────────────────────
   test:
     name: Tests
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: [fmt-lint]
     steps:
       - uses: actions/checkout@v4
@@ -91,7 +91,7 @@ jobs:
   # ── Python binding tests ─────────────────────────────────────────────────────
   test-python:
     name: Python Tests
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: [fmt-lint]
     steps:
       - uses: actions/checkout@v4
@@ -116,7 +116,7 @@ jobs:
   # ── Project hygiene (API surface, links, release metadata) ───────────────────
   hygiene:
     name: Project Hygiene
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
         with:

@@ -18,7 +18,7 @@ jobs:
   # ── Kubernetes failover test via kind ────────────────────────────────────────
   kind-e2e:
     name: Kubernetes E2E
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +63,7 @@ jobs:
   # ── Bare-metal distributed cluster smoke tests ───────────────────────────────
   bare-metal-e2e:
     name: Bare-Metal E2E
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
