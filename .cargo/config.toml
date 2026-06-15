@@ -15,14 +15,10 @@ rustflags = [
 rustflags = []
 
 # ── Environment ───────────────────────────────────────────────────────────────
-# Redirect tmp files to a repo-local dir to avoid /tmp quota and race failures
-# during native dependency builds (ring, aws-lc-sys, protoc).
-# Only applies when building locally; Docker builds use their own tmp.
-[env]
-TMPDIR = { value = ".tmp", relative = true }
 # GCC 15 dropped the implicit <cstdint> transitive-include that older GCC/RocksDB
 # relied on. Force-including it fixes librocksdb-sys and any other C++ dep that
 # uses uint{8,16,32,64}_t without a direct <cstdint> include.
+[env]
 CXXFLAGS = "-include cstdint"
 
 # ── Cargo aliases (execution-mode shortcuts) ──────────────────────────────────

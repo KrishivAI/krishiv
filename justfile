@@ -58,7 +58,6 @@ build-single-node:
 
 # Build release binary for bare-metal / VM distributed clusters
 build-bare-metal:
-    @mkdir -p .tmp
     {{ cargo }} build -p krishiv \
         --no-default-features --features bare-metal \
         --profile release-bare-metal
@@ -67,7 +66,6 @@ build-bare-metal:
 # Uses release-k8s profile (thin LTO) to stay within CI runner RAM limits.
 # Outputs: target/{{ target }}/release-k8s/{krishiv,krishiv-operator}
 build-k8s:
-    @mkdir -p .tmp
     {{ cargo }} build -p krishiv -p krishiv-operator \
         --no-default-features --features k8s \
         --profile release-k8s \
