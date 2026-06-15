@@ -107,7 +107,7 @@ impl KrishivFlightSqlService {
         self
     }
 
-    #[allow(clippy::result_large_err)]
+    #[allow(clippy::result_large_err, dead_code)]
     fn bearer_token<B>(&self, req: &Request<B>) -> Result<Option<String>, Status> {
         let Some(_auth) = &self.auth else {
             return Ok(None);
@@ -160,12 +160,12 @@ impl KrishivFlightSqlService {
             return Ok(());
         };
         // Simple heuristic: extract table name after FROM keyword.
-        if let Some(table_name) = extract_from_table(query) {
-            if !policy.check_table_access(&table_name) {
-                return Err(Status::permission_denied(format!(
-                    "access denied to table: {table_name}"
-                )));
-            }
+        if let Some(table_name) = extract_from_table(query)
+            && !policy.check_table_access(&table_name)
+        {
+            return Err(Status::permission_denied(format!(
+                "access denied to table: {table_name}"
+            )));
         }
         Ok(())
     }
@@ -788,12 +788,11 @@ fn count_sql_params(sql: &str) -> usize {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            if i > start {
-                if let Ok(n) = sql[start..i].parse::<usize>() {
-                    if n > max {
-                        max = n;
-                    }
-                }
+            if i > start
+                && let Ok(n) = sql[start..i].parse::<usize>()
+                && n > max
+            {
+                max = n;
             }
         } else {
             i += 1;

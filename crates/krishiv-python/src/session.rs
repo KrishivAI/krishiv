@@ -290,7 +290,12 @@ impl PySession {
         if let Some(g) = grpc_url {
             builder = builder.with_coordinator_grpc(g);
         }
-        build_session_with_opts(builder, target_parallelism, shuffle_partitions, state_ttl_ms)
+        build_session_with_opts(
+            builder,
+            target_parallelism,
+            shuffle_partitions,
+            state_ttl_ms,
+        )
     }
 
     /// Build a session from environment variables.
@@ -462,7 +467,9 @@ impl PySession {
             Some(ref s) => {
                 let mut chars = s.chars();
                 let c = chars.next().ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err("delimiter must be a non-empty string")
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "delimiter must be a non-empty string",
+                    )
                 })?;
                 if chars.next().is_some() {
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -740,7 +747,14 @@ impl PySession {
         output_name: Option<String>,
     ) -> PyResult<()> {
         let udf = crate::udf::build_python_aggregate_udf(
-            py, name, accumulate_fn, finalize_fn, merge_fn, &input_types, &output_type, output_name,
+            py,
+            name,
+            accumulate_fn,
+            finalize_fn,
+            merge_fn,
+            &input_types,
+            &output_type,
+            output_name,
         )?;
         self.inner
             .register_aggregate_udf(udf)
@@ -1110,7 +1124,10 @@ impl PyOperationRegistry {
     }
 
     fn __repr__(&self) -> String {
-        format!("OperationRegistry(cancelled={:?})", self.inner.cancelled_ids())
+        format!(
+            "OperationRegistry(cancelled={:?})",
+            self.inner.cancelled_ids()
+        )
     }
 }
 
@@ -1212,7 +1229,9 @@ mod tests {
     fn with_auth_token_builds_session() {
         use crate::session::StaticBearerTokenAuth;
         use krishiv_plan::governance::AuthProvider;
-        let auth = StaticBearerTokenAuth { token: "secret".to_string() };
+        let auth = StaticBearerTokenAuth {
+            token: "secret".to_string(),
+        };
         assert_eq!(auth.authenticate("secret"), Some("bearer".to_string()));
         assert_eq!(auth.authenticate("wrong"), None);
         // Verify it integrates with SessionBuilder without panic.
@@ -1220,7 +1239,10 @@ mod tests {
             .with_auth(std::sync::Arc::new(auth))
             .build()
             .expect("session with bearer auth");
-        assert!(matches!(session.mode(), krishiv_api::ExecutionMode::Embedded));
+        assert!(matches!(
+            session.mode(),
+            krishiv_api::ExecutionMode::Embedded
+        ));
     }
 
     #[test]

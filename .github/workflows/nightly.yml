@@ -1,0 +1,122 @@
+name: Nightly
+
+# Publishes a fresh build from main every night.
+# Docker images are tagged :nightly and :nightly-YYYY-MM-DD.
+# Python wheels are uploaded as artifacts (14-day retention).
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 00:00 UTC daily
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.92"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/krishiv
+  CXXFLAGS: "-include cstdint"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ── Docker nightly (full feature set, multi-platform) ───────────────────────
+  docker-nightly:
+    name: Docker Nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=nightly
+            type=raw,value=nightly-{{date 'YYYY-MM-DD'}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.build
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            FEATURES=full
+            PROFILE=release-k8s
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=nightly
+          cache-to: type=gha,scope=nightly,mode=max
+
+  # ── Python nightly wheels ────────────────────────────────────────────────────
+  # Uploaded as artifacts only — not published to PyPI.
+  # Developers can download them for integration testing before a release.
+  wheels-nightly:
+    name: Nightly Wheel (${{ matrix.os }} / ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+          - os: macos-14
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - os: macos-13
+            target: x86_64-apple-darwin
+            manylinux: "off"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          command: build
+          args: --release --out dist/ --find-interpreter
+          manifest-path: crates/krishiv-python/pyproject.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-wheels-${{ matrix.os }}-${{ matrix.target }}-${{ github.run_id }}
+          path: dist/*.whl
+          retention-days: 14
+
+  # ── Nightly cargo check (full feature set) ───────────────────────────────────
+  # Catches regressions not caught by CI (e.g. upstream crate updates in nightly deps).
+  check-nightly:
+    name: Nightly Cargo Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-check
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld
+      - name: Check full feature set
+        run: cargo check -p krishiv --features full

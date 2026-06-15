@@ -646,10 +646,9 @@ pub mod native {
             assert!(snap_id > 0, "overwrite snapshot id must be positive");
 
             // Version hint must be updated.
-            let hint = std::fs::read_to_string(
-                dir.path().join("metadata").join("version-hint.text"),
-            )
-            .unwrap();
+            let hint =
+                std::fs::read_to_string(dir.path().join("metadata").join("version-hint.text"))
+                    .unwrap();
             assert!(hint.contains("metadata.json"));
         }
 
@@ -688,7 +687,10 @@ pub mod native {
             // Schema evolution is stored in table properties.
             let table = tpc.catalog.load_table(&tpc.ident).await.unwrap();
             let props = table.metadata().properties();
-            assert_eq!(props.get("krishiv.schema.id").map(String::as_str), Some("2"));
+            assert_eq!(
+                props.get("krishiv.schema.id").map(String::as_str),
+                Some("2")
+            );
             assert!(props.contains_key("krishiv.schema.fields"));
         }
     }

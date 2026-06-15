@@ -11,9 +11,11 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use krishiv::prelude::*;
+use krishiv_api::session::{Session, SessionBuilder};
+use krishiv_api::types::{ExecutionMode, QueryResult};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = Session::builder()
         .with_execution_mode(ExecutionMode::Embedded)
         .build()?;
@@ -40,26 +42,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     session.register_record_batches("word_stream", vec![batch])?;
 
     println!("--- Word frequencies (top 5) ---");
-    let result = session.sql(
-        "SELECT word, COUNT(*) AS freq \
-         FROM word_stream \
-         GROUP BY word \
-         ORDER BY freq DESC, word \
-         LIMIT 5",
-    )?;
+    let result = session
+        .sql(
+            "SELECT word, COUNT(*) AS freq \
+             FROM word_stream \
+             GROUP BY word \
+             ORDER BY freq DESC, word \
+             LIMIT 5",
+        )?
+        .collect_async()
+        .await?;
     print_result(&result);
 
     println!("\n--- Words per document ---");
-    let result = session.sql(
-        "SELECT doc_id, COUNT(*) AS word_count \
-         FROM word_stream \
-         GROUP BY doc_id \
-         ORDER BY doc_id",
-    )?;
+    let result = session
+        .sql(
+            "SELECT doc_id, COUNT(*) AS word_count \
+             FROM word_stream \
+             GROUP BY doc_id \
+             ORDER BY doc_id",
+        )?
+        .collect_async()
+        .await?;
     print_result(&result);
 
     println!("\n--- Unique word count ---");
-    let result = session.sql("SELECT COUNT(DISTINCT word) AS unique_words FROM word_stream")?;
+    let result = session
+        .sql("SELECT COUNT(DISTINCT word) AS unique_words FROM word_stream")?
+        .collect_async()
+        .await?;
     print_result(&result);
 
     Ok(())

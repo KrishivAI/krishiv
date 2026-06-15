@@ -463,7 +463,12 @@ impl PyDataFrame {
     /// DataFrame backed by it. Equivalent to `persist()`.
     pub fn cache(&self, py: Python<'_>) -> PyResult<Self> {
         let inner = self.inner.clone();
-        py.detach(move || inner.cache().map(|inner| Self { inner }).map_err(map_krishiv_error))
+        py.detach(move || {
+            inner
+                .cache()
+                .map(|inner| Self { inner })
+                .map_err(map_krishiv_error)
+        })
     }
 
     /// Alias for `cache()`.
@@ -598,14 +603,16 @@ impl PyDataFrame {
     /// Collect and return both the result and execution stats.
     ///
     /// Returns ``(QueryResult, {"output_rows": int, "cpu_nanos": int})``.
-    pub fn collect_with_stats(&self, py: Python<'_>) -> PyResult<(PyQueryResult, Py<pyo3::types::PyDict>)> {
+    pub fn collect_with_stats(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<(PyQueryResult, Py<pyo3::types::PyDict>)> {
         let inner = self.inner.clone();
-        let (result, stats) = py
-            .detach(move || {
-                inner
-                    .collect_with_stats()
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-            })?;
+        let (result, stats) = py.detach(move || {
+            inner
+                .collect_with_stats()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        })?;
         let stats_dict = pyo3::types::PyDict::new(py);
         stats_dict.set_item("output_rows", stats.output_rows)?;
         stats_dict.set_item("cpu_nanos", stats.cpu_nanos)?;
@@ -721,10 +728,7 @@ impl PyGroupedDataFrame {
                 .map(|set| set.into_iter().map(|c| c.inner).collect())
                 .collect(),
         );
-        let aggregates = aggregates
-            .into_iter()
-            .map(|c| c.inner)
-            .collect::<Vec<_>>();
+        let aggregates = aggregates.into_iter().map(|c| c.inner).collect::<Vec<_>>();
         self.dataframe
             .group_by(&self.group_exprs)
             .agg_grouping(grouping, &aggregates)

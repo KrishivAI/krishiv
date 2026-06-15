@@ -272,24 +272,20 @@ impl PyMemoryLakehouseTable {
     /// Append ``batch`` to the table.
     pub fn append(&self, batch: &crate::batch::PyBatch) -> PyResult<()> {
         RUNTIME
-            .block_on(
-                krishiv_connectors::lakehouse::LakehouseTable::append(
-                    self.inner.as_ref(),
-                    vec![batch.record_batch().clone()],
-                ),
-            )
+            .block_on(krishiv_connectors::lakehouse::LakehouseTable::append(
+                self.inner.as_ref(),
+                vec![batch.record_batch().clone()],
+            ))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Atomically replace all table contents with ``batch``.
     pub fn overwrite(&self, batch: &crate::batch::PyBatch) -> PyResult<()> {
         RUNTIME
-            .block_on(
-                krishiv_connectors::lakehouse::LakehouseTable::overwrite(
-                    self.inner.as_ref(),
-                    vec![batch.record_batch().clone()],
-                ),
-            )
+            .block_on(krishiv_connectors::lakehouse::LakehouseTable::overwrite(
+                self.inner.as_ref(),
+                vec![batch.record_batch().clone()],
+            ))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -299,15 +295,10 @@ impl PyMemoryLakehouseTable {
     pub fn delete_where(&self, py: Python<'_>, column: String, value: Py<PyAny>) -> PyResult<()> {
         let lv = py_to_lakehouse_value(py, value)?;
         RUNTIME
-            .block_on(
-                krishiv_connectors::lakehouse::LakehouseTable::delete_where(
-                    self.inner.as_ref(),
-                    &LakehousePredicate {
-                        column,
-                        equals: lv,
-                    },
-                ),
-            )
+            .block_on(krishiv_connectors::lakehouse::LakehouseTable::delete_where(
+                self.inner.as_ref(),
+                &LakehousePredicate { column, equals: lv },
+            ))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -324,32 +315,28 @@ impl PyMemoryLakehouseTable {
         let pred_val = py_to_lakehouse_value(py, predicate_value)?;
         let assign_val = py_to_lakehouse_value(py, assign_value)?;
         RUNTIME
-            .block_on(
-                krishiv_connectors::lakehouse::LakehouseTable::update_where(
-                    self.inner.as_ref(),
-                    &LakehousePredicate {
-                        column: predicate_column,
-                        equals: pred_val,
-                    },
-                    &[LakehouseAssignment {
-                        column: assign_column,
-                        value: assign_val,
-                    }],
-                ),
-            )
+            .block_on(krishiv_connectors::lakehouse::LakehouseTable::update_where(
+                self.inner.as_ref(),
+                &LakehousePredicate {
+                    column: predicate_column,
+                    equals: pred_val,
+                },
+                &[LakehouseAssignment {
+                    column: assign_column,
+                    value: assign_val,
+                }],
+            ))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Upsert ``batch`` into the table using ``key_columns`` to identify matching rows.
     pub fn merge(&self, batch: &crate::batch::PyBatch, key_columns: Vec<String>) -> PyResult<()> {
         RUNTIME
-            .block_on(
-                krishiv_connectors::lakehouse::LakehouseTable::merge(
-                    self.inner.as_ref(),
-                    vec![batch.record_batch().clone()],
-                    &key_columns,
-                ),
-            )
+            .block_on(krishiv_connectors::lakehouse::LakehouseTable::merge(
+                self.inner.as_ref(),
+                vec![batch.record_batch().clone()],
+                &key_columns,
+            ))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 

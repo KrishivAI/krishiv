@@ -234,13 +234,96 @@ bench-manifest suite command:
 
 # ── Release ───────────────────────────────────────────────────────────────────
 
-# Bump the workspace version and tag a release.
-# Usage: VERSION=0.2.0 just release
+# Bump workspace + Helm chart to VERSION, commit, tag, and push.
+# After pushing, go to GitHub → Releases → Draft a new release → select
+# tag v{{ version }} → fill in release notes → Publish.
+# Publishing the release triggers the CI pipeline (builds artifacts, Docker, Helm, PyPI, crates.io).
+# Usage: just release 0.2.0
 release version=env_var_or_default("VERSION", ""):
-    @if [ -z "{{ version }}" ]; then echo "ERROR: set VERSION env var"; exit 1; fi
+    @if [ -z "{{ version }}" ]; then echo "ERROR: pass version: just release 0.2.0"; exit 1; fi
     sed -i 's/^version = ".*"/version = "{{ version }}"/' Cargo.toml
+    sed -i 's/^version:.*/version: {{ version }}/' k8s/helm/krishiv/Chart.yaml
+    sed -i 's/^appVersion:.*/appVersion: "{{ version }}"/' k8s/helm/krishiv/Chart.yaml
     {{ cargo }} check --workspace --quiet
-    git add Cargo.toml Cargo.lock
+    git add Cargo.toml Cargo.lock k8s/helm/krishiv/Chart.yaml
     git commit -m "chore: bump version to {{ version }}"
     git tag -a "v{{ version }}" -m "Release v{{ version }}"
-    @echo "✓ tagged v{{ version }} — push with: git push && git push --tags"
+    git push
+    git push origin "v{{ version }}"
+    @echo ""
+    @echo "✓ pushed v{{ version }}"
+    @echo "→ Next: GitHub → Releases → Draft a new release → tag v{{ version }} → Publish"
+    @echo "  Or:    gh release create v{{ version }} --generate-notes [--prerelease]"
+
+# Tag and push a release candidate (does not bump version).
+# Usage: just release-rc 0.2.0        → v0.2.0-rc.1
+#        RC=2 just release-rc 0.2.0   → v0.2.0-rc.2
+release-rc version=env_var_or_default("VERSION", "") rc=env_var_or_default("RC", "1"):
+    @if [ -z "{{ version }}" ]; then echo "ERROR: pass version: just release-rc 0.2.0"; exit 1; fi
+    git tag -a "v{{ version }}-rc.{{ rc }}" -m "Release candidate v{{ version }}-rc.{{ rc }}"
+    git push origin "v{{ version }}-rc.{{ rc }}"
+    @echo "✓ pushed v{{ version }}-rc.{{ rc }}"
+    @echo "→ Next: gh release create v{{ version }}-rc.{{ rc }} --prerelease --generate-notes"
+
+# Dry-run: verify all 17 publishable crates pass packaging checks without uploading.
+publish-dry-run:
+    @echo "=== Dry-run publish for all crates ==="
+    @for crate in \
+        krishiv-common krishiv-proto krishiv-metrics krishiv-plan \
+        krishiv-dataflow krishiv-state krishiv-shuffle krishiv-connectors \
+        krishiv-sql krishiv-scheduler krishiv-executor krishiv-runtime \
+        krishiv-api krishiv-flight-sql krishiv-operator krishiv-ui krishiv; do \
+        echo "--> $crate"; \
+        cargo publish -p "$crate" --dry-run --allow-dirty 2>&1 | tail -1; \
+    done
+    @echo "✓ dry-run complete"
+
+# Publish all 17 Rust crates to crates.io in topological order.
+# Requires CARGO_REGISTRY_TOKEN env var.
+# Usage: CARGO_REGISTRY_TOKEN=<token> VERSION=0.2.0 just publish-crates
+publish-crates version=env_var_or_default("VERSION", ""):
+    @if [ -z "{{ version }}" ]; then echo "ERROR: set VERSION"; exit 1; fi
+    @if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then echo "ERROR: set CARGO_REGISTRY_TOKEN"; exit 1; fi
+    @echo "=== Publishing crates at v{{ version }} ==="
+    @for crate in \
+        krishiv-common krishiv-proto krishiv-metrics krishiv-plan \
+        krishiv-dataflow krishiv-state krishiv-shuffle krishiv-connectors \
+        krishiv-sql krishiv-scheduler krishiv-executor krishiv-runtime \
+        krishiv-api krishiv-flight-sql krishiv-operator krishiv-ui krishiv; do \
+        echo "--> Publishing $crate"; \
+        cargo publish -p "$crate" --no-verify || echo "WARNING: $crate may already be published"; \
+        sleep 30; \
+    done
+    @echo "✓ crates published"
+
+# Build and publish the Python wheel to PyPI.
+# Uses maturin for the krishiv-python crate (PyO3 bindings).
+# Requires MATURIN_PYPI_TOKEN env var (or keyring credentials).
+# Usage: MATURIN_PYPI_TOKEN=<token> just publish-wheel
+publish-wheel:
+    cd crates/krishiv-python && maturin publish --no-sdist
+
+# Build and push a Docker image to the registry.
+# Defaults to the k8s feature set. Override FEATURES/PROFILE/REGISTRY_IMAGE as needed.
+# Usage: VERSION=0.2.0 REGISTRY_IMAGE=ghcr.io/myorg/krishiv just publish-docker
+publish-docker version=env_var_or_default("VERSION", "dev"):
+    docker buildx build \
+        --platform linux/amd64,linux/arm64 \
+        --build-arg FEATURES=k8s \
+        --build-arg PROFILE=release-k8s \
+        -f Dockerfile.build \
+        -t {{ registry_image }}:{{ version }} \
+        -t {{ registry_image }}:latest \
+        --push .
+    @echo "✓ pushed {{ registry_image }}:{{ version }}"
+
+# Package the Helm chart and push it to the OCI registry.
+# Usage: VERSION=0.2.0 REGISTRY_IMAGE=ghcr.io/myorg/krishiv just publish-helm
+publish-helm version=env_var_or_default("VERSION", ""):
+    @if [ -z "{{ version }}" ]; then echo "ERROR: set VERSION"; exit 1; fi
+    sed -i 's/^version:.*/version: {{ version }}/' k8s/helm/krishiv/Chart.yaml
+    sed -i 's/^appVersion:.*/appVersion: "{{ version }}"/' k8s/helm/krishiv/Chart.yaml
+    @mkdir -p dist/helm
+    helm package k8s/helm/krishiv --destination dist/helm
+    helm push dist/helm/krishiv-{{ version }}.tgz oci://$(echo {{ registry_image }} | cut -d/ -f1-2)/charts
+    @echo "✓ pushed helm chart krishiv-{{ version }}.tgz"

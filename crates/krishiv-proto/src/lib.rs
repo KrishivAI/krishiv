@@ -57,7 +57,7 @@ pub use task::{
     ExecutorTaskAssignment, InitiateCheckpointCommand, InputPartition, InputPartitionDescriptor,
     KeyGroupRange, MemoryKafkaRecord, MissingShufflePartition, OutputContract,
     OutputContractDescriptor, OutputContractKind, PlanFragment, RegisterExecutorRequest,
-    RegisterExecutorResponse, RestoreFromCheckpointCommand,
-    TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskStatusRequest, TaskStatusResponse,
-    TaskStatusUpdate, TransportDisposition,
+    RegisterExecutorResponse, RestoreFromCheckpointCommand, TaskAssignment, TaskAttemptRef,
+    TaskCancellationRequest, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate,
+    TransportDisposition,
 };

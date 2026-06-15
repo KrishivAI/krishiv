@@ -10,9 +10,11 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use krishiv::prelude::*;
+use krishiv_api::session::{Session, SessionBuilder};
+use krishiv_api::types::{ExecutionMode, QueryResult};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Build an embedded session ─────────────────────────────────────────
     let session = Session::builder()
         .with_execution_mode(ExecutionMode::Embedded)
@@ -40,19 +42,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Run a simple SELECT ───────────────────────────────────────────────
     println!("--- Top scorers ---");
-    let result = session.sql("SELECT name, score FROM scores ORDER BY score DESC LIMIT 3")?;
+    let result = session
+        .sql("SELECT name, score FROM scores ORDER BY score DESC LIMIT 3")?
+        .collect_async()
+        .await?;
     print_result(&result);
 
     // ── Run an aggregate ─────────────────────────────────────────────────
     println!("\n--- Statistics ---");
-    let result = session.sql(
-        "SELECT COUNT(*) AS n, AVG(score) AS avg_score, MAX(score) AS top_score FROM scores",
-    )?;
+    let result = session
+        .sql("SELECT COUNT(*) AS n, AVG(score) AS avg_score, MAX(score) AS top_score FROM scores")?
+        .collect_async()
+        .await?;
     print_result(&result);
 
     // ── Run a filtered query ──────────────────────────────────────────────
     println!("\n--- Scores above 90 ---");
-    let result = session.sql("SELECT name FROM scores WHERE score > 90 ORDER BY name")?;
+    let result = session
+        .sql("SELECT name FROM scores WHERE score > 90 ORDER BY name")?
+        .collect_async()
+        .await?;
     print_result(&result);
 
     Ok(())

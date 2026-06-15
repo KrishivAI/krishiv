@@ -96,19 +96,25 @@ mod tests {
 
     #[test]
     fn unsupported_maps_to_feature_not_supported() {
-        let e = SqlError::Unsupported { feature: "TABLESAMPLE".into() };
+        let e = SqlError::Unsupported {
+            feature: "TABLESAMPLE".into(),
+        };
         assert_eq!(sqlstate_for(&e), FEATURE_NOT_SUPPORTED);
     }
 
     #[test]
     fn datafusion_maps_to_internal_error() {
-        let e = SqlError::DataFusion { message: "panic in executor".into() };
+        let e = SqlError::DataFusion {
+            message: "panic in executor".into(),
+        };
         assert_eq!(sqlstate_for(&e), INTERNAL_ERROR);
     }
 
     #[test]
     fn access_denied_maps_to_insufficient_privilege() {
-        let e = SqlError::AccessDenied { reason: "no read permission".into() };
+        let e = SqlError::AccessDenied {
+            reason: "no read permission".into(),
+        };
         assert_eq!(sqlstate_for(&e), INSUFFICIENT_PRIVILEGE);
     }
 
@@ -143,9 +149,18 @@ mod tests {
     #[test]
     fn all_sqlstate_codes_are_5_chars() {
         for code in &[
-            SUCCESS, FEATURE_NOT_SUPPORTED, DATA_EXCEPTION, INVALID_AUTHORIZATION,
-            SYNTAX_ERROR, INSUFFICIENT_PRIVILEGE, UNDEFINED_TABLE, QUERY_CANCELLED,
-            QUERY_TIMEOUT, SYSTEM_ERROR, INTERNAL_ERROR, GENERAL_ERROR,
+            SUCCESS,
+            FEATURE_NOT_SUPPORTED,
+            DATA_EXCEPTION,
+            INVALID_AUTHORIZATION,
+            SYNTAX_ERROR,
+            INSUFFICIENT_PRIVILEGE,
+            UNDEFINED_TABLE,
+            QUERY_CANCELLED,
+            QUERY_TIMEOUT,
+            SYSTEM_ERROR,
+            INTERNAL_ERROR,
+            GENERAL_ERROR,
         ] {
             assert_eq!(code.len(), 5, "SQLSTATE {code} must be 5 characters");
         }

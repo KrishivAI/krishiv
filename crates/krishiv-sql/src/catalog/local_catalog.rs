@@ -97,7 +97,11 @@ impl LocalCatalog {
     }
 
     /// Default table location (`file://` URI) for `{namespace}/{table}`.
-    fn table_location_uri(&self, namespace: &NamespaceIdent, table: &str) -> Result<String, LakehouseError> {
+    fn table_location_uri(
+        &self,
+        namespace: &NamespaceIdent,
+        table: &str,
+    ) -> Result<String, LakehouseError> {
         let mut dir = self.warehouse.clone();
         for part in namespace.clone().inner() {
             dir.push(part);
@@ -144,7 +148,10 @@ impl LocalCatalog {
 
         for (namespace, table_name, metadata_location) in discovered {
             // Create namespace chain (idempotent).
-            let _ = self.inner.create_namespace(&namespace, HashMap::new()).await;
+            let _ = self
+                .inner
+                .create_namespace(&namespace, HashMap::new())
+                .await;
             let ident = TableIdent::new(namespace, table_name);
             // Register only if not already known (defensive against double scan).
             if !self.inner.table_exists(&ident).await.unwrap_or(false) {
@@ -382,11 +389,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn create_table(
-        catalog: &LocalCatalog,
-        ns: &str,
-        table: &str,
-    ) -> Table {
+    async fn create_table(catalog: &LocalCatalog, ns: &str, table: &str) -> Table {
         let namespace = NamespaceIdent::new(ns.to_string());
         let _ = catalog.create_namespace(&namespace, HashMap::new()).await;
         let creation = TableCreation::builder()
@@ -404,11 +407,25 @@ mod tests {
         let created = create_table(&catalog, "sales", "orders").await;
         assert_eq!(created.identifier().name(), "orders");
 
-        let ident = TableIdent::new(NamespaceIdent::new("sales".to_string()), "orders".to_string());
+        let ident = TableIdent::new(
+            NamespaceIdent::new("sales".to_string()),
+            "orders".to_string(),
+        );
         let loaded = catalog.load_table(&ident).await.unwrap();
-        assert_eq!(loaded.metadata().current_schema().as_ref().field_id_by_name("id"), Some(1));
         assert_eq!(
-            loaded.metadata().current_schema().as_ref().field_id_by_name("name"),
+            loaded
+                .metadata()
+                .current_schema()
+                .as_ref()
+                .field_id_by_name("id"),
+            Some(1)
+        );
+        assert_eq!(
+            loaded
+                .metadata()
+                .current_schema()
+                .as_ref()
+                .field_id_by_name("name"),
             Some(2)
         );
 
@@ -483,7 +500,14 @@ mod tests {
             assert_eq!(tables[0].name(), "orders");
             // And it must be loadable.
             let loaded = catalog.load_table(&tables[0]).await.unwrap();
-            assert!(loaded.metadata().current_schema().as_ref().field_id_by_name("id").is_some());
+            assert!(
+                loaded
+                    .metadata()
+                    .current_schema()
+                    .as_ref()
+                    .field_id_by_name("id")
+                    .is_some()
+            );
         }
     }
 
@@ -493,7 +517,10 @@ mod tests {
         let catalog = LocalCatalog::new(dir.path()).await.unwrap();
         create_table(&catalog, "sales", "orders").await;
 
-        let ident = TableIdent::new(NamespaceIdent::new("sales".to_string()), "orders".to_string());
+        let ident = TableIdent::new(
+            NamespaceIdent::new("sales".to_string()),
+            "orders".to_string(),
+        );
         assert!(catalog.table_exists(&ident).await.unwrap());
         catalog.drop_table(&ident).await.unwrap();
         assert!(!catalog.table_exists(&ident).await.unwrap());

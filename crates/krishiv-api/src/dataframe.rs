@@ -1197,6 +1197,7 @@ Execution statistics:
     ///
     /// Requires a SQL-backed DataFrame (`session.sql(..)` / `read_parquet`):
     /// the query text is what the sink job executes remotely.
+    #[allow(dead_code)]
     pub(crate) fn write_parquet_sink(
         &self,
         path: &str,
@@ -1505,7 +1506,7 @@ Execution statistics:
         })?;
         let delimiter = opts.delimiter.map(|c| c as u8).unwrap_or(b',');
         let has_header = opts.has_header.unwrap_or(true);
-        let mut builder = arrow::csv::WriterBuilder::new()
+        let builder = arrow::csv::WriterBuilder::new()
             .with_delimiter(delimiter)
             .with_header(has_header);
         let mut writer = builder.build(file);
@@ -1586,8 +1587,6 @@ fn build_parquet_writer_props(
         };
         builder = builder.set_compression(codec);
     }
-    if let Some(size) = opts.max_row_group_size {
-        builder = builder.set_max_row_group_size(size);
-    }
+    builder = builder.set_max_row_group_row_count(opts.max_row_group_size);
     Ok(Some(builder.build()))
 }

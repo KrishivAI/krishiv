@@ -138,7 +138,13 @@ impl FlightExecutionHost {
         let mut entries: Vec<(String, String, String)> = self
             .catalog
             .iter()
-            .map(|e| ("krishiv".to_string(), "default".to_string(), e.key().clone()))
+            .map(|e| {
+                (
+                    "krishiv".to_string(),
+                    "default".to_string(),
+                    e.key().clone(),
+                )
+            })
             .collect();
         entries.sort();
         entries

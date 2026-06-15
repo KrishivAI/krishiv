@@ -993,12 +993,7 @@ impl Coordinator {
                 .iter()
                 .flat_map(|stage| stage.tasks())
                 .filter_map(|task| task.sink_contract())
-                .filter_map(|contract| {
-                    contract
-                        .trim()
-                        .strip_prefix(SINK_PREFIX)
-                        .map(str::to_owned)
-                })
+                .filter_map(|contract| contract.trim().strip_prefix(SINK_PREFIX).map(str::to_owned))
                 .collect();
             (record.state(), contracts)
         };
@@ -1022,29 +1017,27 @@ impl Coordinator {
                 continue;
             }
             match state {
-                JobState::Succeeded => {
-                    match publish_staged_outputs(&spec, job_id.as_str()) {
-                        Ok(outcome) => {
-                            tracing::info!(
-                                job_id = %job_id,
-                                dest = %spec.dest_path,
-                                published = outcome.published.len(),
-                                skipped_existing = outcome.skipped_existing,
-                                ignored = outcome.ignored,
-                                "published staged sink outputs"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                job_id = %job_id,
-                                dest = %spec.dest_path,
-                                error = %error,
-                                "failed to publish staged sink outputs; failing job"
-                            );
-                            publish_failed = true;
-                        }
+                JobState::Succeeded => match publish_staged_outputs(&spec, job_id.as_str()) {
+                    Ok(outcome) => {
+                        tracing::info!(
+                            job_id = %job_id,
+                            dest = %spec.dest_path,
+                            published = outcome.published.len(),
+                            skipped_existing = outcome.skipped_existing,
+                            ignored = outcome.ignored,
+                            "published staged sink outputs"
+                        );
                     }
-                }
+                    Err(error) => {
+                        tracing::error!(
+                            job_id = %job_id,
+                            dest = %spec.dest_path,
+                            error = %error,
+                            "failed to publish staged sink outputs; failing job"
+                        );
+                        publish_failed = true;
+                    }
+                },
                 JobState::Failed | JobState::Cancelled => {
                     if let Err(error) = cleanup_staged_outputs(&spec, job_id.as_str()) {
                         tracing::warn!(

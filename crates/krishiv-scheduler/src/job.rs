@@ -218,10 +218,10 @@ impl JobRecord {
 
     pub(crate) fn apply_assignments(&mut self, assignments: Vec<TaskAssignment>) {
         self.state = JobState::Running;
-        let job_id_str = self.job_id().to_string();
+        let _job_id_str = self.job_id().to_string();
         for stage in &mut self.stages {
             stage.state = StageState::Scheduling;
-            let stage_id_str = stage.stage_id().to_string();
+            let _stage_id_str = stage.stage_id().to_string();
             for task in &mut stage.tasks {
                 if let Some(assignment) = assignments
                     .iter()
@@ -641,7 +641,7 @@ impl JobRecord {
 
             if stage_affected {
                 // Mark the collected paths as Failed in the metadata registry.
-                if let Some(stage_key) = krishiv_proto::StageId::try_new(&stage_id_str).ok() {
+                if let Ok(stage_key) = krishiv_proto::StageId::try_new(&stage_id_str) {
                     let meta_entry = self.shuffle_output.entry(stage_key).or_default();
                     for path in &paths_to_invalidate {
                         meta_entry.mark_failed(path, "executor lost".to_owned());
@@ -1054,7 +1054,7 @@ impl TaskRecord {
     /// Called by the re-attach protocol to update the coordinator's view of the
     /// task's progress without re-submitting the job.
     pub(crate) fn apply_streaming_state(&mut self, state: &StreamingTaskState) {
-        self.last_watermark_ms = Some(state.watermark_ms as i64);
+        self.last_watermark_ms = Some(state.watermark_ms);
         if !state.source_offset.is_empty() {
             self.last_source_offset = Some(state.source_offset.clone());
         }

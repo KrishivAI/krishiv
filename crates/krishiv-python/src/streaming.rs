@@ -23,9 +23,9 @@ use krishiv_api::{
     DataFrame, ForeachBatchFn, StreamingOutputMode, StreamingQuery, StreamingTrigger,
 };
 
+use crate::RUNTIME;
 use crate::batch::PyBatch;
 use crate::errors::map_krishiv_error;
-use crate::RUNTIME;
 
 // ── PyStreamingQueryProgress ─────────────────────────────────────────────────
 
@@ -118,29 +118,30 @@ impl PyStreamingQuery {
     #[pyo3(signature = (timeout_ms=None))]
     fn await_termination(&self, timeout_ms: Option<u64>) -> PyResult<()> {
         let q = Arc::clone(&self.inner);
-        RUNTIME.block_on(async move {
-            // Poll the is_active flag until done, respecting timeout.
-            let deadline = timeout_ms.map(|ms| {
-                tokio::time::Instant::now() + Duration::from_millis(ms)
-            });
-            loop {
-                {
-                    let guard = q.lock().unwrap();
-                    if !guard.is_active() {
-                        return Ok(());
+        RUNTIME
+            .block_on(async move {
+                // Poll the is_active flag until done, respecting timeout.
+                let deadline =
+                    timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+                loop {
+                    {
+                        let guard = q.lock().unwrap();
+                        if !guard.is_active() {
+                            return Ok(());
+                        }
                     }
-                }
-                if let Some(d) = deadline {
-                    if tokio::time::Instant::now() >= d {
-                        return Err(krishiv_api::KrishivError::Runtime {
-                            message: "streaming query timed out waiting for termination".to_string(),
-                        });
+                    if let Some(d) = deadline {
+                        if tokio::time::Instant::now() >= d {
+                            return Err(krishiv_api::KrishivError::Runtime {
+                                message: "streaming query timed out waiting for termination"
+                                    .to_string(),
+                            });
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .map_err(map_krishiv_error)
+            })
+            .map_err(map_krishiv_error)
     }
 
     /// Return the latest progress snapshot, if any micro-batch has run.
@@ -309,8 +310,10 @@ impl PyDataStreamWriter {
             if let Some(py_fn) = foreach_fn_opt {
                 let foreach: ForeachBatchFn = Arc::new(move |batches, epoch| {
                     Python::attach(|py| {
-                        let py_batches: Vec<PyBatch> =
-                            batches.into_iter().map(PyBatch::from_record_batch).collect();
+                        let py_batches: Vec<PyBatch> = batches
+                            .into_iter()
+                            .map(PyBatch::from_record_batch)
+                            .collect();
                         py_fn
                             .call1(py, (py_batches, epoch))
                             .map(|_| ())
@@ -325,9 +328,7 @@ impl PyDataStreamWriter {
             RUNTIME.block_on(writer.start())
         });
 
-        query
-            .map(PyStreamingQuery::new)
-            .map_err(map_krishiv_error)
+        query.map(PyStreamingQuery::new).map_err(map_krishiv_error)
     }
 
     fn __repr__(&self) -> String {

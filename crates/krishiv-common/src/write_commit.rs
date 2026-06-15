@@ -680,16 +680,16 @@ pub fn publish_staged_outputs(
 
     // Detect final-name collisions between distinct task ids up front.
     let mut index_owner: BTreeMap<(String, usize), String> = BTreeMap::new();
-    for ((hive_path, task_id), _) in &winners {
+    for (hive_path, task_id) in winners.keys() {
         let index = task_index_from_task_id(task_id);
-        if let Some(owner) = index_owner.get(&(hive_path.clone(), index)) {
-            if owner != task_id {
-                return Err(WriteCommitError::FinalNameCollision {
-                    first: owner.clone(),
-                    second: task_id.clone(),
-                    index,
-                });
-            }
+        if let Some(owner) = index_owner.get(&(hive_path.clone(), index))
+            && owner != task_id
+        {
+            return Err(WriteCommitError::FinalNameCollision {
+                first: owner.clone(),
+                second: task_id.clone(),
+                index,
+            });
         }
         index_owner.insert((hive_path.clone(), index), task_id.clone());
     }

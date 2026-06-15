@@ -85,34 +85,33 @@ impl ProcessFunction for PyProcessFunctionBridge {
         let key_owned = key.to_owned();
         let batch_clone = batch.clone();
 
-        let (emitted, event_timers, processing_timers) =
-            Python::attach(|py| -> ExecResult<_> {
-                let on_event = self.on_event_callable.clone_ref(py);
-                let bridge_ctx = Py::new(
+        let (emitted, event_timers, processing_timers) = Python::attach(|py| -> ExecResult<_> {
+            let on_event = self.on_event_callable.clone_ref(py);
+            let bridge_ctx = Py::new(
+                py,
+                PyProcessContext {
+                    emitted: Vec::new(),
+                    event_timers: Vec::new(),
+                    processing_timers: Vec::new(),
+                },
+            )
+            .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
+
+            let py_batch = PyBatch::from_record_batch(batch_clone);
+            on_event
+                .call1(
                     py,
-                    PyProcessContext {
-                        emitted: Vec::new(),
-                        event_timers: Vec::new(),
-                        processing_timers: Vec::new(),
-                    },
+                    (key_owned.as_str(), py_batch, row, bridge_ctx.clone_ref(py)),
                 )
                 .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
 
-                let py_batch = PyBatch::from_record_batch(batch_clone);
-                on_event
-                    .call1(
-                        py,
-                        (key_owned.as_str(), py_batch, row, bridge_ctx.clone_ref(py)),
-                    )
-                    .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
-
-                let inner = bridge_ctx.borrow(py);
-                Ok((
-                    inner.emitted.clone(),
-                    inner.event_timers.clone(),
-                    inner.processing_timers.clone(),
-                ))
-            })?;
+            let inner = bridge_ctx.borrow(py);
+            Ok((
+                inner.emitted.clone(),
+                inner.event_timers.clone(),
+                inner.processing_timers.clone(),
+            ))
+        })?;
 
         for b in emitted {
             ctx.emit(b);
@@ -134,33 +133,32 @@ impl ProcessFunction for PyProcessFunctionBridge {
     ) -> ExecResult<()> {
         let key_owned = key.to_owned();
 
-        let (emitted, event_timers, processing_timers) =
-            Python::attach(|py| -> ExecResult<_> {
-                let on_timer = self.on_timer_callable.clone_ref(py);
-                let bridge_ctx = Py::new(
+        let (emitted, event_timers, processing_timers) = Python::attach(|py| -> ExecResult<_> {
+            let on_timer = self.on_timer_callable.clone_ref(py);
+            let bridge_ctx = Py::new(
+                py,
+                PyProcessContext {
+                    emitted: Vec::new(),
+                    event_timers: Vec::new(),
+                    processing_timers: Vec::new(),
+                },
+            )
+            .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
+
+            on_timer
+                .call1(
                     py,
-                    PyProcessContext {
-                        emitted: Vec::new(),
-                        event_timers: Vec::new(),
-                        processing_timers: Vec::new(),
-                    },
+                    (key_owned.as_str(), fire_time_ms, bridge_ctx.clone_ref(py)),
                 )
                 .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
 
-                on_timer
-                    .call1(
-                        py,
-                        (key_owned.as_str(), fire_time_ms, bridge_ctx.clone_ref(py)),
-                    )
-                    .map_err(|e| ExecError::InvalidInput(e.to_string()))?;
-
-                let inner = bridge_ctx.borrow(py);
-                Ok((
-                    inner.emitted.clone(),
-                    inner.event_timers.clone(),
-                    inner.processing_timers.clone(),
-                ))
-            })?;
+            let inner = bridge_ctx.borrow(py);
+            Ok((
+                inner.emitted.clone(),
+                inner.event_timers.clone(),
+                inner.processing_timers.clone(),
+            ))
+        })?;
 
         for b in emitted {
             ctx.emit(b);
@@ -194,14 +192,10 @@ pub fn apply_process_function(
     func: Py<PyAny>,
 ) -> PyResult<crate::dataframe::PyDataFrameStream> {
     let on_event: Py<PyAny> = func.getattr(py, "on_event").map_err(|_| {
-        pyo3::exceptions::PyRuntimeError::new_err(
-            "process function must have an 'on_event' method",
-        )
+        pyo3::exceptions::PyRuntimeError::new_err("process function must have an 'on_event' method")
     })?;
     let on_timer: Py<PyAny> = func.getattr(py, "on_timer").map_err(|_| {
-        pyo3::exceptions::PyRuntimeError::new_err(
-            "process function must have an 'on_timer' method",
-        )
+        pyo3::exceptions::PyRuntimeError::new_err("process function must have an 'on_timer' method")
     })?;
 
     let inner_df = df.inner.clone();
@@ -264,9 +258,7 @@ impl PyValueState {
             return Ok(None);
         }
         let s = std::str::from_utf8(raw).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "state contains invalid UTF-8: {e}"
-            ))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("state contains invalid UTF-8: {e}"))
         })?;
         let val = py.import("json")?.getattr("loads")?.call1((s,))?;
         Ok(Some(val))
@@ -312,9 +304,7 @@ impl PyListState {
             return Ok(py.eval(c"[]", None, None)?);
         }
         let s = std::str::from_utf8(raw).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "state contains invalid UTF-8: {e}"
-            ))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("state contains invalid UTF-8: {e}"))
         })?;
         Ok(py.import("json")?.getattr("loads")?.call1((s,))?)
     }
@@ -367,9 +357,7 @@ impl PyMapState {
             return Ok(py.eval(c"{}", None, None)?);
         }
         let s = std::str::from_utf8(raw).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "state contains invalid UTF-8: {e}"
-            ))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("state contains invalid UTF-8: {e}"))
         })?;
         Ok(py.import("json")?.getattr("loads")?.call1((s,))?)
     }

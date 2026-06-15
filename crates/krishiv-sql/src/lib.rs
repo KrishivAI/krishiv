@@ -111,10 +111,10 @@ impl PlanCache {
             // Remove the stale order entry so a repeated insert doesn't accumulate
             // duplicate references and corrupt LRU eviction order.
             self.order.retain(|k| k != &key);
-        } else if self.map.len() >= self.max {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
+        } else if self.map.len() >= self.max
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.map.remove(&oldest);
         }
         self.order.push_back(key.clone());
         self.map.insert(key, plan);

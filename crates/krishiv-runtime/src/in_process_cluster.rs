@@ -286,7 +286,9 @@ impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
     }
 }
 #[cfg(test)]
-pub fn fragment_from_local_spec(spec: &LocalWindowExecutionSpec) -> Result<String, krishiv_plan::PlanError> {
+pub fn fragment_from_local_spec(
+    spec: &LocalWindowExecutionSpec,
+) -> Result<String, krishiv_plan::PlanError> {
     use krishiv_plan::window::encode_stream_fragment;
     encode_stream_fragment(&local_spec_to_plan_spec(spec))
 }

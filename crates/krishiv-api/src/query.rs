@@ -82,7 +82,7 @@ pub struct QueryProgress {
 
 /// Shared state between [`QueryHandle`] and the executor task.
 #[derive(Debug, Clone)]
-struct QueryState {
+pub(crate) struct QueryState {
     status: QueryStatus,
     progress: QueryProgress,
 }
@@ -218,10 +218,7 @@ impl QueryDriver {
     pub(crate) fn set_completed(&self, result: QueryResult) {
         let rows = result.row_count() as u64;
         self.state_tx.send_modify(|s| {
-            s.status = QueryStatus::Completed(QueryCompletion {
-                result,
-                rows,
-            });
+            s.status = QueryStatus::Completed(QueryCompletion { result, rows });
             s.progress.rows_emitted = rows;
         });
     }

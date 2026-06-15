@@ -106,10 +106,10 @@ impl NamespaceQuotaQueueManager {
 
 impl QueueManager for NamespaceQuotaQueueManager {
     fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
-        if let Some(max_jobs) = self.max_active_jobs {
-            if quota.active_job_count >= max_jobs {
-                return SubmitOutcome::Queued { position: 0 };
-            }
+        if let Some(max_jobs) = self.max_active_jobs
+            && quota.active_job_count >= max_jobs
+        {
+            return SubmitOutcome::Queued { position: 0 };
         }
         if let Some(max_cpu) = self.max_cpu_nanos {
             let would_be = quota

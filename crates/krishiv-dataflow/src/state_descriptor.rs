@@ -231,13 +231,15 @@ impl<K: StateValue + std::hash::Hash + Eq, V: StateValue> MapState<K, V> {
 
 // ── ReducingState ─────────────────────────────────────────────────────────────
 
+type ReducerFn<T> = Arc<dyn Fn(&T, &T) -> T + Send + Sync>;
+
 /// Reducing state descriptor.
 ///
 /// Folds incoming values with a combining function, storing only a single
 /// accumulated value. Equivalent to Flink's `ReducingState`.
 pub struct ReducingState<T: StateValue> {
     key: String,
-    reducer: Arc<dyn Fn(&T, &T) -> T + Send + Sync>,
+    reducer: ReducerFn<T>,
 }
 
 impl<T: StateValue> ReducingState<T> {

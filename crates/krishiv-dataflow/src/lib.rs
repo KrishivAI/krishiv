@@ -81,24 +81,24 @@ pub use adaptive::{
     HotKeyReport, RateLimiter, SinkLatencyTracker, StreamingPartitionAdvisor, ThrottleCommand,
 };
 pub use aggregate::{AggExpr, AggFunction};
-pub use continuous::ContinuousWindowExecutor;
-pub use operator_runtime::{
-    execute_bounded_window, execute_streaming_window,
-};
 pub use broadcast_state::{
     BroadcastContext, BroadcastProcessExecutor, BroadcastProcessFunction, BroadcastStateDescriptor,
 };
 pub use connected_streams::{CoProcessExecutor, CoProcessFunction, ConnectedStreams};
+pub use continuous::ContinuousWindowExecutor;
 pub use operator_config::{OperatorConfig, OperatorUid};
+pub use operator_runtime::{execute_bounded_window, execute_streaming_window};
 pub use process_fn::{
     ProcessContext, ProcessFunction, ProcessFunctionExecutor, TimerEntry, TimerKind,
 };
-pub use state_descriptor::{ListState, MapState, ReducingState, StateError, StateValue, ValueState};
 pub use queue::{
     OperatorMessage, OperatorQueueError, OperatorQueueMetrics, OperatorQueueReceiver,
     OperatorQueueSender, operator_queue,
 };
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
+pub use state_descriptor::{
+    ListState, MapState, ReducingState, StateError, StateValue, ValueState,
+};
 pub use window::{
     CountWindowOperator, CountWindowSpec, MultiSourceWatermarkState, SessionWindowOperator,
     SessionWindowSpec, SlidingWindowOperator, SlidingWindowSpec, StateBackedSessionWindowOperator,
@@ -135,8 +135,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::{
-        AggExpr, AggFunction, ExecError,
-        TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
+        AggExpr, AggFunction, ExecError, TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
     };
     use crate::aggregate::LocalAggregator;
 

@@ -44,8 +44,7 @@ impl KrishivRestCatalog {
             builder = builder.token(t.to_string());
         }
 
-        let config = builder
-            .build();
+        let config = builder.build();
 
         Ok(Self {
             inner: Arc::new(RestCatalog::new(config)),

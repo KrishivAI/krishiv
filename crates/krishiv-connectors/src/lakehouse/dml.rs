@@ -123,9 +123,7 @@ pub async fn iceberg_delete_where(
     ctx.register_table(&tmp_name, Arc::new(mem))
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
-    let survive_sql = format!(
-        "SELECT * FROM \"{tmp_name}\" WHERE NOT ({predicate_sql})"
-    );
+    let survive_sql = format!("SELECT * FROM \"{tmp_name}\" WHERE NOT ({predicate_sql})");
     let surviving_batches = ctx
         .sql(&survive_sql)
         .await
@@ -201,11 +199,7 @@ pub async fn iceberg_update_where(
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
     let updated = extract_count(&count_batches).max(0) as u64;
 
-    let rewrite_sql = format!(
-        "SELECT {} FROM \"{}\"",
-        select_cols.join(", "),
-        tmp_name
-    );
+    let rewrite_sql = format!("SELECT {} FROM \"{}\"", select_cols.join(", "), tmp_name);
     let batches = ctx
         .sql(&rewrite_sql)
         .await
@@ -246,8 +240,7 @@ pub async fn iceberg_merge_into(
     let target_name = format!("__krishiv_merge_tgt_{}", uuid::Uuid::new_v4().simple());
     if !target_batches.is_empty() {
         let schema = target_batches[0].schema();
-        let field_names: Vec<String> =
-            schema.fields().iter().map(|f| f.name().clone()).collect();
+        let field_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
 
         let mem = MemTable::try_new(schema.clone(), vec![target_batches])
             .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
@@ -255,9 +248,8 @@ pub async fn iceberg_merge_into(
             .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
         let source_schema = source_batches[0].schema();
-        let source_mem =
-            MemTable::try_new(source_schema, vec![source_batches])
-                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        let source_mem = MemTable::try_new(source_schema, vec![source_batches])
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
         let source_name = format!("__krishiv_merge_src_{}", uuid::Uuid::new_v4().simple());
         ctx.register_table(&source_name, Arc::new(source_mem))
             .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
@@ -353,10 +345,8 @@ pub async fn overwrite_table_pub(
         move || -> Result<(Vec<u8>, u64, u64), LakehouseError> {
             use std::fs::File;
 
-            let tmp_path = std::env::temp_dir()
-                .join(format!("{}.parquet", uuid::Uuid::new_v4()));
-            let file =
-                File::create(&tmp_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let tmp_path = std::env::temp_dir().join(format!("{}.parquet", uuid::Uuid::new_v4()));
+            let file = File::create(&tmp_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
             let mut writer = ArrowWriter::try_new(file, arrow_schema, None)
                 .map_err(|e| LakehouseError::Io(e.to_string()))?;
             let mut row_count = 0u64;
@@ -375,8 +365,7 @@ pub async fn overwrite_table_pub(
                 .len();
             drop(inner);
 
-            let bytes = std::fs::read(&tmp_path)
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let bytes = std::fs::read(&tmp_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
             let _ = std::fs::remove_file(&tmp_path);
             Ok((bytes, size, row_count))
         }
@@ -462,12 +451,12 @@ fn extract_count(batches: &[RecordBatch]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use datafusion::prelude::SessionContext;
     use iceberg::io::LocalFsStorageFactory;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{NestedField, PrimitiveType, Type};
     use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation};
+    use std::collections::HashMap;
 
     async fn make_catalog_with_table() -> (
         Arc<dyn Catalog + Send + Sync>,

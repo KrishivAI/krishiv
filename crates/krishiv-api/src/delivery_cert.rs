@@ -96,7 +96,10 @@ mod delivery_cert_tests {
             .register_record_batches("chk", vec![make_batch(&vals)])
             .unwrap();
         let sum2 = query_i64(&session2, "SELECT SUM(v) AS s FROM chk");
-        assert_eq!(sum2[0], expected_sum, "session2 aggregate wrong after restart");
+        assert_eq!(
+            sum2[0], expected_sum,
+            "session2 aggregate wrong after restart"
+        );
 
         assert_eq!(sum1, sum2, "aggregate changed across session boundary");
     }
@@ -121,10 +124,7 @@ mod delivery_cert_tests {
     fn partial_failure_does_not_corrupt_completed_batches() {
         let session = embedded_session();
         session
-            .register_record_batches(
-                "part",
-                vec![make_batch(&[1, 2, 3]), make_batch(&[4, 5, 6])],
-            )
+            .register_record_batches("part", vec![make_batch(&[1, 2, 3]), make_batch(&[4, 5, 6])])
             .unwrap();
         // Filter simulates: only process rows where v <= 3 (first batch "committed").
         let s = query_i64(&session, "SELECT SUM(v) AS s FROM part WHERE v <= 3");
@@ -156,8 +156,7 @@ mod delivery_cert_tests {
         ]));
         let et_arr: Int64Array = vec![900i64, 1000, 1100, 800].into_iter().collect();
         let v_arr: Int64Array = vec![1i64, 2, 3, 4].into_iter().collect();
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(et_arr), Arc::new(v_arr)]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(et_arr), Arc::new(v_arr)]).unwrap();
         session
             .register_record_batches("events", vec![batch])
             .unwrap();
