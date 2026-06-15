@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn reducing_state_folds_values() {
-        let desc: ReducingState<i64> = ReducingState::new("sum", |a, b| a + b);
+        let desc: ReducingState<i64> = ReducingState::new("sum", |a: &i64, b: &i64| a + b);
         let mut raw: Vec<u8> = Vec::new();
 
         // Empty returns None.

@@ -592,11 +592,12 @@ fn move_file(from: &Path, to: &Path) -> Result<(), WriteCommitError> {
     }
     match std::fs::rename(from, to) {
         Ok(()) => Ok(()),
-        Err(_) => {
+        Err(rename_err) if rename_err.kind() == io::ErrorKind::CrossesDevices => {
             std::fs::copy(from, to).map_err(|e| WriteCommitError::io(to, e))?;
             std::fs::remove_file(from).map_err(|e| WriteCommitError::io(from, e))?;
             Ok(())
         }
+        Err(rename_err) => Err(WriteCommitError::io(from, rename_err)),
     }
 }
 

@@ -321,12 +321,11 @@ pub async fn reconcile_dynamic_object_with_runtime(
     object: DynamicObject,
 ) -> OperatorResult<KubernetesReconcileReport> {
     let resource = resource_from_dynamic_object(&object)?;
-    let (outcome, job_id) = {
+    let mut outcome = {
         let mut coordinator = runtime.coordinator.write().await;
-        let job_id = crate::reconciler::scheduler_job_id(&resource).ok();
-        let outcome = runtime.reconciler.reconcile(&mut coordinator, &resource)?;
-        (outcome, job_id)
+        runtime.reconciler.reconcile(&mut coordinator, &resource)?
     };
+    let job_id = crate::reconciler::scheduler_job_id(&resource).ok();
 
     let remove_finalizer = outcome.action() == ReconcileAction::FinalizerRemoved;
     match outcome.action() {
@@ -346,6 +345,17 @@ pub async fn reconcile_dynamic_object_with_runtime(
                                 pod_count = executor_ids.len(),
                                 "created executor pods for submitted job"
                             );
+                            if let Some(failure) = pod_manager
+                                .detect_executor_pod_launch_failure(&resource)
+                                .await
+                            {
+                                let mut coordinator = runtime.coordinator.write().await;
+                                outcome = runtime.reconciler.reconcile_with_executor_pod_failure(
+                                    &mut coordinator,
+                                    &resource,
+                                    Some(failure),
+                                )?;
+                            }
                         }
                         Err(err) => {
                             tracing::warn!(

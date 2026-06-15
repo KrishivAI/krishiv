@@ -20,6 +20,9 @@ pub enum ConnectorRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConnectorKind {
     Parquet,
+    Csv,
+    #[cfg(feature = "avro")]
+    Avro,
     S3,
     #[cfg(feature = "kafka")]
     Kafka,
@@ -50,6 +53,13 @@ impl ConnectorKind {
     pub fn parse(raw: &str) -> ConnectorResult<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
+            "csv" => Ok(Self::Csv),
+            #[cfg(feature = "avro")]
+            "avro" => Ok(Self::Avro),
+            #[cfg(not(feature = "avro"))]
+            "avro" => Err(ConnectorError::Unsupported {
+                message: "avro connector requires the `avro` feature".into(),
+            }),
             "s3" | "object_store" | "object-store" => Ok(Self::S3),
             #[cfg(feature = "kafka")]
             "kafka" => Ok(Self::Kafka),
@@ -85,7 +95,9 @@ impl ConnectorKind {
     /// Return the repository-published maturity for this connector kind.
     pub fn default_maturity(self) -> ConnectorMaturity {
         match self {
-            Self::Parquet | Self::S3 => ConnectorMaturity::Preview,
+            Self::Parquet | Self::S3 | Self::Csv => ConnectorMaturity::Preview,
+            #[cfg(feature = "avro")]
+            Self::Avro => ConnectorMaturity::Preview,
             #[cfg(feature = "kafka")]
             Self::Kafka => ConnectorMaturity::Preview,
             Self::TwoPhaseParquet => ConnectorMaturity::Preview,
@@ -108,6 +120,9 @@ impl ConnectorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Parquet => "parquet",
+            Self::Csv => "csv",
+            #[cfg(feature = "avro")]
+            Self::Avro => "avro",
             Self::S3 => "s3",
             #[cfg(feature = "kafka")]
             Self::Kafka => "kafka",

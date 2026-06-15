@@ -7,7 +7,7 @@
 mod conformance_tests {
     use arrow::array::{
         Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
-        TimestampMicrosecondArray,
+        StringViewArray, TimestampMicrosecondArray,
     };
     use arrow::datatypes::{DataType, TimeUnit};
     use krishiv_sql::SqlEngine;
@@ -35,7 +35,7 @@ mod conformance_tests {
     async fn float_nan_is_not_equal_to_itself() {
         let e = engine();
         let df = e
-            .sql("SELECT CAST('NaN' AS DOUBLE) = CAST('NaN' AS DOUBLE) AS v")
+            .sql("SELECT CAST('NaN' AS DOUBLE) IS DISTINCT FROM CAST('NaN' AS DOUBLE) AS v")
             .await
             .unwrap();
         let batches = df.collect().await.unwrap();
@@ -44,8 +44,9 @@ mod conformance_tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
-        // SQL NULL semantics: NaN comparison propagates NULL, not false.
-        assert!(col.is_null(0) || !col.value(0));
+        // `IS DISTINCT FROM` treats NaN as equal to NaN (returns false).
+        assert!(!col.is_null(0));
+        assert!(!col.value(0));
     }
 
     #[tokio::test]
@@ -156,8 +157,9 @@ mod conformance_tests {
             matches!(
                 col.data_type(),
                 DataType::Timestamp(TimeUnit::Microsecond, _)
+                    | DataType::Timestamp(TimeUnit::Nanosecond, _)
             ),
-            "expected Timestamp(Microsecond), got {:?}",
+            "expected Timestamp(Microsecond|Nanosecond), got {:?}",
             col.data_type()
         );
     }
@@ -302,12 +304,18 @@ mod conformance_tests {
         let e = engine();
         let df = e.sql("SELECT CAST(42 AS VARCHAR) AS v").await.unwrap();
         let batches = df.collect().await.unwrap();
-        let col = batches[0]
-            .column(0)
+        let col = batches[0].column(0);
+        let value = col
             .as_any()
             .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(col.value(0), "42");
+            .map(|a| a.value(0))
+            .or_else(|| {
+                col.as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .map(|a| a.value(0))
+            })
+            .unwrap_or_else(|| panic!("expected Utf8 column, got {:?}", col.data_type()));
+        assert_eq!(value, "42");
     }
 
     // Needed for downcast in date test

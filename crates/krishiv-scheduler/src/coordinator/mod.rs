@@ -176,6 +176,10 @@ pub struct Coordinator {
     /// Entry is removed after the next task launch to allow normal partitioning
     /// to resume (adaptive: only applies to the immediate next batch).
     pub(crate) skew_repartition_overrides: HashMap<JobId, u32>,
+    /// Throttle commands queued from task-status hot-key reports; drained on the
+    /// executor's next heartbeat (task status responses do not carry throttles).
+    pub(crate) pending_source_throttles:
+        HashMap<ExecutorId, Vec<crate::adaptive::ThrottleDecision>>,
 
     /// EMA-derived advisory partition counts for streaming jobs.
     ///
@@ -725,6 +729,7 @@ impl Coordinator {
             job_task_input_partitions: HashMap::new(),
             continuous_input_cycles: HashSet::new(),
             skew_repartition_overrides: HashMap::new(),
+            pending_source_throttles: HashMap::new(),
             streaming_advisory_partitions: HashMap::new(),
             notify: Arc::new(Notify::new()),
             job_coordinators: HashMap::new(),
@@ -1090,6 +1095,10 @@ impl Coordinator {
 
 mod checkpoint_ops;
 mod executor_ops;
+mod heartbeat_mapping;
+pub(crate) use heartbeat_mapping::{
+    executor_heartbeat_from_request, executor_heartbeat_response_from_effects,
+};
 mod job_lifecycle;
 pub mod observability;
 mod recovery;

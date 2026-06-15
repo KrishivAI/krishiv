@@ -36,6 +36,8 @@ pub struct UiState {
     coordinator: SharedCoordinator,
     metrics_cache: Arc<std::sync::Mutex<(String, std::time::Instant)>>,
     sql: Option<Arc<krishiv_sql::SqlEngine>>,
+    /// Optional bearer token exposed to browser scripts for authenticated fetches.
+    ui_bearer_token: Option<String>,
 }
 
 impl std::fmt::Debug for UiState {
@@ -62,7 +64,14 @@ impl UiState {
                 std::time::Instant::now() - std::time::Duration::from_secs(100),
             ))),
             sql: None,
+            ui_bearer_token: resolve_ui_token(),
         }
+    }
+
+    /// Override the bearer token injected into browser-facing pages.
+    pub fn with_ui_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.ui_bearer_token = Some(token.into());
+        self
     }
 
     /// Attach a SQL engine to enable the query editor.
@@ -121,6 +130,17 @@ impl IntoResponse for UiError {
 /// returned (treated as no token, i.e. anonymous router). Trimmed
 /// whitespace at the start/end of the file contents is stripped so a
 /// trailing newline in a Secret does not break the comparison.
+fn effective_ui_bearer_token(state: &UiState) -> Option<String> {
+    state
+        .ui_bearer_token
+        .clone()
+        .or_else(resolve_ui_token)
+}
+
+fn ui_auth_token(state: &UiState) -> Option<String> {
+    effective_ui_bearer_token(state)
+}
+
 fn resolve_ui_token() -> Option<String> {
     if let Ok(value) = std::env::var("KRISHIV_UI_TOKEN") {
         let trimmed = value.trim();
@@ -182,12 +202,14 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/assets/krishiv.css", get(stylesheet))
+        .route("/assets/krishiv-auth.js", get(auth_js))
         .route("/assets/krishiv-live.js", get(live_js))
         .route("/assets/krishiv-sql.js", get(sql_js))
         // Alias under /ui/assets/ so the paths work through a path-prefix reverse
         // proxy (e.g. code-server /proxy/PORT/) where root-relative /assets/ URLs
         // resolve outside the proxied subtree.
         .route("/ui/assets/krishiv.css", get(stylesheet))
+        .route("/ui/assets/krishiv-auth.js", get(auth_js))
         .route("/ui/assets/krishiv-live.js", get(live_js))
         .route("/ui/assets/krishiv-sql.js", get(sql_js))
         .route("/api/v1/openapi.json", get(openapi_json));
@@ -247,21 +269,25 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
 pub fn embedded_router(state: UiState) -> Router {
     let public = Router::new()
         .route("/assets/krishiv.css", get(stylesheet))
+        .route("/assets/krishiv-auth.js", get(auth_js))
         .route("/assets/krishiv-live.js", get(live_js))
         .route("/assets/krishiv-sql.js", get(sql_js))
         .route("/ui/assets/krishiv.css", get(stylesheet))
+        .route("/ui/assets/krishiv-auth.js", get(auth_js))
         .route("/ui/assets/krishiv-live.js", get(live_js))
         .route("/ui/assets/krishiv-sql.js", get(sql_js))
         .route("/api/v1/openapi.json", get(openapi_json));
 
     let protected = Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui") }))
+        .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/jobs/{job_id}", get(api_job_detail))
         .route(
             "/api/v1/jobs/{job_id}/checkpoints",
             get(api_job_checkpoints),
         )
         .route("/api/v1/jobs/{job_id}/diagnose", get(api_job_diagnose))
+        .route("/api/v1/executors", get(api_executors))
         .route("/api/v1/executors/{executor_id}", get(api_executor_detail))
         .route("/api/v1/queues", get(api_queues))
         .route("/api/v1/sql", post(api_sql_execute))
@@ -281,7 +307,7 @@ pub fn embedded_router(state: UiState) -> Router {
         .route("/ui/history", get(ui_history))
         .route("/ui/history/{job_id}", get(ui_history_detail));
 
-    let protected = if let Some(expected) = resolve_ui_token().as_deref() {
+    let protected = if let Some(expected) = ui_auth_token(&state).as_deref() {
         let expected = expected.to_string();
         protected.layer(middleware::from_fn(move |req, next| {
             let expected = expected.clone();
@@ -616,6 +642,7 @@ pub struct CheckpointsView {
 struct JobsTemplate {
     jobs: Vec<JobSummaryView>,
     executors: Vec<ExecutorView>,
+    bearer_token: Option<String>,
 }
 
 impl JobsTemplate {
@@ -633,12 +660,14 @@ impl JobsTemplate {
 struct JobTemplate {
     job: JobDetailView,
     executors: Vec<ExecutorView>,
+    bearer_token: Option<String>,
 }
 
 #[derive(Template)]
 #[template(path = "executor.html")]
 struct ExecutorTemplate {
     executor: ExecutorView,
+    bearer_token: Option<String>,
 }
 
 #[derive(Template)]
@@ -647,6 +676,7 @@ struct CheckpointsTemplate {
     job_id: String,
     epochs: Vec<u64>,
     latest_epoch: Option<u64>,
+    bearer_token: Option<String>,
 }
 
 impl CheckpointsTemplate {
@@ -657,13 +687,16 @@ impl CheckpointsTemplate {
 
 #[derive(Template)]
 #[template(path = "submit.html")]
-struct SubmitTemplate {}
+struct SubmitTemplate {
+    bearer_token: Option<String>,
+}
 
 #[derive(Template)]
 #[template(path = "health.html")]
 struct HealthTemplate {
     executors: Vec<ExecutorView>,
     jobs: Vec<JobSummaryView>,
+    bearer_token: Option<String>,
 }
 
 impl HealthTemplate {
@@ -721,6 +754,7 @@ struct MetricsTemplate {
     executors_count: usize,
     avg_duration_ms: u64,
     global: GlobalMetricsView,
+    bearer_token: Option<String>,
 }
 
 #[derive(Template)]
@@ -728,6 +762,7 @@ struct MetricsTemplate {
 struct JobDiagnoseTemplate {
     job_id: String,
     report_json: String,
+    bearer_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -783,6 +818,7 @@ struct HistoryTemplate {
     total: usize,
     limit: usize,
     offset: usize,
+    bearer_token: Option<String>,
 }
 
 impl HistoryTemplate {
@@ -801,6 +837,7 @@ impl HistoryTemplate {
 #[template(path = "history_detail.html")]
 struct HistoryDetailTemplate {
     record: JobHistoryView,
+    bearer_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -997,13 +1034,16 @@ async fn api_queues(State(state): State<UiState>) -> Result<Json<QueuesResponse>
     }))
 }
 
-async fn ui_submit(State(_state): State<UiState>) -> Result<Html<String>, UiError> {
-    let template = SubmitTemplate {};
+async fn ui_submit(State(state): State<UiState>) -> Result<Html<String>, UiError> {
+    let template = SubmitTemplate {
+        bearer_token: ui_auth_token(&state),
+    };
     Ok(Html(template.render()?))
 }
 
 async fn ui_health(State(state): State<UiState>) -> Result<Html<String>, UiError> {
     let coordinator = state.coordinator.read().await;
+    let bearer_token = ui_auth_token(&state);
     let template = HealthTemplate {
         executors: coordinator
             .executor_snapshots()
@@ -1015,6 +1055,7 @@ async fn ui_health(State(state): State<UiState>) -> Result<Html<String>, UiError
             .iter()
             .map(JobSummaryView::from_snapshot)
             .collect(),
+        bearer_token,
     };
     Ok(Html(template.render()?))
 }
@@ -1048,6 +1089,7 @@ async fn ui_metrics(State(state): State<UiState>) -> Result<Html<String>, UiErro
         executors_count: snapshot.executors.len(),
         avg_duration_ms: avg,
         global,
+        bearer_token: ui_auth_token(&state),
     };
     Ok(Html(template.render()?))
 }
@@ -1136,6 +1178,7 @@ async fn ui_jobs(
     let template = JobsTemplate {
         jobs,
         executors: snapshot.executors,
+        bearer_token: ui_auth_token(&state),
     };
     Ok(Html(template.render()?))
 }
@@ -1148,6 +1191,7 @@ async fn ui_job_detail(
     let template = JobTemplate {
         job: job_detail(&state, &job_id).await?,
         executors: snapshot.executors,
+        bearer_token: ui_auth_token(&state),
     };
     Ok(Html(template.render()?))
 }
@@ -1165,7 +1209,10 @@ async fn ui_executor_detail(
     Path(executor_id): Path<String>,
 ) -> Result<Html<String>, UiError> {
     let executor = api_executor_detail_inner(&state, &executor_id).await?;
-    let template = ExecutorTemplate { executor };
+    let template = ExecutorTemplate {
+        executor,
+        bearer_token: ui_auth_token(&state),
+    };
     Ok(Html(template.render()?))
 }
 
@@ -1182,6 +1229,7 @@ async fn ui_job_checkpoints_page(
         job_id: job_id.clone(),
         epochs,
         latest_epoch,
+        bearer_token: ui_auth_token(&state),
     };
     Ok(Html(template.render()?))
 }
@@ -1216,6 +1264,7 @@ async fn ui_job_diagnose(
     let template = JobDiagnoseTemplate {
         job_id: job_id_str,
         report_json,
+        bearer_token: ui_auth_token(&state),
     };
     Ok(Html(template.render()?))
 }
@@ -1277,6 +1326,7 @@ async fn ui_history(
         total,
         limit,
         offset,
+        bearer_token: ui_auth_token(&state),
     };
     Ok(Html(template.render()?))
 }
@@ -1295,7 +1345,10 @@ async fn ui_history_detail(
                     .unwrap_or_else(|_| krishiv_proto::JobId::try_new("unknown").unwrap()),
             })
         })?;
-    let template = HistoryDetailTemplate { record };
+    let template = HistoryDetailTemplate {
+        record,
+        bearer_token: ui_auth_token(&state),
+    };
     Ok(Html(template.render()?))
 }
 
@@ -1319,6 +1372,13 @@ async fn stylesheet() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../static/style.css"),
+    )
+}
+
+async fn auth_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/krishiv-auth.js"),
     )
 }
 

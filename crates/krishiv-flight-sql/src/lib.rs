@@ -443,6 +443,7 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandGetDbSchemas,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        self.authenticate_request(&request)?;
         let flight_descriptor = request.into_inner();
         let ticket_bytes = query.as_any().encode_to_vec();
         let schema = query.into_builder().schema();
@@ -462,8 +463,9 @@ impl FlightSqlService for KrishivFlightSqlService {
     async fn do_get_schemas(
         &self,
         query: CommandGetDbSchemas,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        self.authenticate_request(&request)?;
         let mut builder = query.into_builder();
         builder.append("krishiv", "default");
         for (catalog, schema, _) in self.host.list_catalog_tables() {
@@ -491,6 +493,7 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandGetTables,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        self.authenticate_request(&request)?;
         let flight_descriptor = request.into_inner();
         let ticket_bytes = query.as_any().encode_to_vec();
         let schema = query.into_builder().schema();
@@ -510,8 +513,9 @@ impl FlightSqlService for KrishivFlightSqlService {
     async fn do_get_tables(
         &self,
         query: CommandGetTables,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        self.authenticate_request(&request)?;
         let mut builder = query.into_builder();
         for (catalog, schema, table) in self.host.list_catalog_tables() {
             builder

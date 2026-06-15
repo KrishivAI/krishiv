@@ -391,6 +391,7 @@ impl ShuffleStore for InMemoryShuffleStore {
 
     async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()> {
         // Acquire locks in the same order as write_partition: lease_tokens → partitions → spilled → spill_order.
+        shuffle_write_lock(&self.content_hashes)?.retain(|(jid, _, _), _| jid != job_id);
         shuffle_write_lock(&self.lease_tokens)?.retain(|(jid, _, _), _| jid != job_id);
         shuffle_write_lock(&self.partitions)?.retain(|(jid, _, _), _| jid != job_id);
         shuffle_write_lock(&self.spilled)?.retain(|(jid, _, _)| jid != job_id);

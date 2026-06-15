@@ -38,60 +38,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     )?;
 
-    session
-        .register_record_batches("scores", vec![batch])
-        .await?;
+    session.register_record_batches("scores", vec![batch])?;
 
     // ── Run a simple SELECT ───────────────────────────────────────────────
     println!("--- Top scorers ---");
-    let result = session.sql("SELECT name, score FROM scores ORDER BY score DESC LIMIT 3")?;
-    print_result(result);
+    let result = session
+        .sql("SELECT name, score FROM scores ORDER BY score DESC LIMIT 3")?
+        .collect_async()
+        .await?;
+    print_result(&result);
 
     // ── Run an aggregate ─────────────────────────────────────────────────
     println!("\n--- Statistics ---");
-    let result = session.sql(
-        "SELECT COUNT(*) AS n, AVG(score) AS avg_score, MAX(score) AS top_score FROM scores",
-    )?;
-    print_result(result);
+    let result = session
+        .sql("SELECT COUNT(*) AS n, AVG(score) AS avg_score, MAX(score) AS top_score FROM scores")?
+        .collect_async()
+        .await?;
+    print_result(&result);
 
     // ── Run a filtered query ──────────────────────────────────────────────
     println!("\n--- Scores above 90 ---");
-    let result = session.sql("SELECT name FROM scores WHERE score > 90 ORDER BY name")?;
-    print_result(result);
+    let result = session
+        .sql("SELECT name FROM scores WHERE score > 90 ORDER BY name")?
+        .collect_async()
+        .await?;
+    print_result(&result);
 
     Ok(())
 }
 
-fn print_result(result: QueryResult) {
-    match result {
-        QueryResult::Batch(batches) => {
-            for batch in &batches {
-                let schema = batch.schema();
-                // Print header
-                let headers: Vec<&str> =
-                    schema.fields().iter().map(|f| f.name().as_str()).collect();
-                println!("{}", headers.join(" | "));
-                println!("{}", "─".repeat(headers.join(" | ").len()));
-                // Print rows
-                for row in 0..batch.num_rows() {
-                    let vals: Vec<String> = (0..batch.num_columns())
-                        .map(|col| {
-                            let arr = batch.column(col);
-                            if arr.is_null(row) {
-                                "NULL".to_string()
-                            } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-                                a.value(row).to_string()
-                            } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-                                a.value(row).to_string()
-                            } else {
-                                "?".to_string()
-                            }
-                        })
-                        .collect();
-                    println!("{}", vals.join(" | "));
-                }
-            }
+fn print_result(result: &QueryResult) {
+    for batch in result.batches() {
+        let schema = batch.schema();
+        let headers: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        println!("{}", headers.join(" | "));
+        println!("{}", "─".repeat(headers.join(" | ").len()));
+        for row in 0..batch.num_rows() {
+            let vals: Vec<String> = (0..batch.num_columns())
+                .map(|col| {
+                    let arr = batch.column(col);
+                    if arr.is_null(row) {
+                        "NULL".to_string()
+                    } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                        a.value(row).to_string()
+                    } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+                        a.value(row).to_string()
+                    } else {
+                        "?".to_string()
+                    }
+                })
+                .collect();
+            println!("{}", vals.join(" | "));
         }
-        other => println!("{other:?}"),
     }
 }

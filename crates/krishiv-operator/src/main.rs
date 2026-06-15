@@ -292,6 +292,8 @@ struct OperatorCliConfig {
     executor_grpc_addr: Option<SocketAddr>,
     /// Coordinator HTTP sidecar address (health-check / state API); defaults to 0.0.0.0:8080.
     http_sidecar_addr: SocketAddr,
+    /// gRPC endpoint injected into executor pods (KRISHIV_COORDINATOR_ENDPOINT).
+    coordinator_endpoint: String,
     help: bool,
 }
 
@@ -315,6 +317,8 @@ impl OperatorCliConfig {
             http_sidecar_addr: "0.0.0.0:8080"
                 .parse()
                 .expect("default sidecar addr is valid"),
+            coordinator_endpoint: std::env::var("KRISHIV_COORDINATOR_ENDPOINT")
+                .unwrap_or_else(|_| String::from("http://krishiv-coordinator:9090")),
             help: false,
         };
         let mut args = args.into_iter();
@@ -380,6 +384,10 @@ impl OperatorCliConfig {
                         .parse()
                         .map_err(|_| format!("invalid socket address: {value}"))?;
                 }
+                "--coordinator-endpoint" => {
+                    config.coordinator_endpoint =
+                        next_arg(&mut args, "--coordinator-endpoint")?;
+                }
                 "--help" | "-h" => config.help = true,
                 unknown => return Err(format!("unknown option: {unknown}\n\n{}", Self::help())),
             }
@@ -387,6 +395,9 @@ impl OperatorCliConfig {
 
         if config.coordinator_id.trim().is_empty() {
             return Err(String::from("coordinator id cannot be empty"));
+        }
+        if config.coordinator_endpoint.trim().is_empty() {
+            return Err(String::from("coordinator endpoint cannot be empty"));
         }
 
         Ok(config)
@@ -421,6 +432,7 @@ impl OperatorCliConfig {
                 slots,
             ));
         }
+        config = config.with_coordinator_endpoint(self.coordinator_endpoint);
 
         Ok(config)
     }
@@ -454,6 +466,7 @@ impl OperatorCliConfig {
            --status-addr <HOST:PORT>        Serve scheduler-backed status API/UI on this address\n\
            --executor-grpc-addr <HOST:PORT> Serve coordinator/executor gRPC on this address\n\
            --http-sidecar-addr <HOST:PORT>  Coordinator HTTP sidecar address (default: 0.0.0.0:8080)\n\
+           --coordinator-endpoint <URL>     Coordinator gRPC endpoint for executor pods (default: KRISHIV_COORDINATOR_ENDPOINT or http://krishiv-coordinator:9090)\n\
            -h, --help                       Show help\n"
     }
 }
@@ -516,6 +529,19 @@ mod tests {
             config.executor_grpc_addr.unwrap().to_string(),
             "0.0.0.0:9090"
         );
+    }
+
+    #[test]
+    fn parses_coordinator_endpoint() {
+        let config = OperatorCliConfig::parse([
+            String::from("--coordinator-endpoint"),
+            String::from("http://coord.example:9090"),
+        ])
+        .unwrap();
+        let controller = config.clone().into_controller_config().unwrap();
+
+        assert_eq!(config.coordinator_endpoint, "http://coord.example:9090");
+        assert_eq!(controller.coordinator_endpoint(), "http://coord.example:9090");
     }
 
     #[test]

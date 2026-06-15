@@ -253,10 +253,12 @@ impl SessionBuilder {
             builder = builder.with_target_parallelism(nz);
         }
 
-        if let Ok(val) = std::env::var("KRIVISH_SHUFFLE_PARTITIONS") {
+        if let Ok(val) = std::env::var("KRISHIV_SHUFFLE_PARTITIONS")
+            .or_else(|_| std::env::var("KRIVISH_SHUFFLE_PARTITIONS"))
+        {
             let n: u32 = val.trim().parse().map_err(|_| {
                 KrishivError::unsupported(format!(
-                    "KRIVISH_SHUFFLE_PARTITIONS must be a positive integer, got '{val}'"
+                    "KRISHIV_SHUFFLE_PARTITIONS must be a positive integer, got '{val}'"
                 ))
             })?;
             builder = builder.with_shuffle_partitions(n);
@@ -1018,7 +1020,7 @@ impl Session {
             .map_err(KrishivError::from)?;
         // In distributed mode, forward the registration to the remote coordinator
         // so the remote SQL engine can plan streaming queries over Kafka topics.
-        if self.runtime.uses_remote() {
+        if self.runtime.uses_remote_execution() {
             let schema_ipc_b64 = krishiv_runtime::encode_schema_ipc_b64(&schema).map_err(|e| {
                 KrishivError::Runtime {
                     message: e.to_string(),

@@ -461,7 +461,7 @@ pub struct ConnectorQualityHook {
     config: CompiledDataQualityConfig,
     dead_letter: DeadLetterSink,
     /// Rejected sub-batches buffered by [`filter`] for async forwarding.
-    pending_rejected: Vec<arrow::record_batch::RecordBatch>,
+    pending_rejected: Vec<(arrow::record_batch::RecordBatch, Vec<RejectedRow>)>,
 }
 
 impl ConnectorQualityHook {
@@ -484,14 +484,11 @@ impl ConnectorQualityHook {
     /// Returns the total number of rows forwarded.
     pub async fn flush_rejected(&mut self) -> ConnectorResult<usize> {
         let mut total = 0usize;
-        for batch in self.pending_rejected.drain(..) {
+        for (batch, rejected) in self.pending_rejected.drain(..) {
             let nrows = batch.num_rows();
-            // process_batch runs quality rules again; pass a no-op config via a
-            // temporary DeadLetterSink on our stored sink — but since we already
-            // have the rejected sub-batch we forward it directly.  We use the
-            // secondary-sink path of dead_letter by writing the batch as if it
-            // were a raw input with no rules (all rows pass).
-            let (_, _rejected) = self.dead_letter.process_batch(&batch).await?;
+            self.dead_letter
+                .write_rejected_to_secondary(&batch, &rejected)
+                .await?;
             total += nrows;
         }
         Ok(total)
@@ -543,7 +540,8 @@ impl krishiv_common::StreamQualityHook for ConnectorQualityHook {
                 .collect();
             let rejected_batch = arrow::compute::filter_record_batch(&batch, &reject_mask)
                 .map_err(|e| format!("filter_record_batch (rejected) failed: {e}"))?;
-            self.pending_rejected.push(rejected_batch);
+            self.pending_rejected
+                .push((rejected_batch, result.rejected));
         }
 
         Ok((accepted, rejected_count))
@@ -679,5 +677,50 @@ impl DeadLetterSink {
         }
 
         Ok((accepted, result.rejected))
+    }
+
+    /// Write pre-filtered rejected rows to the secondary sink without re-running
+    /// quality rules. Used by [`ConnectorQualityHook::flush_rejected`].
+    pub async fn write_rejected_to_secondary(
+        &mut self,
+        rejected_batch: &arrow::record_batch::RecordBatch,
+        rejected_rows: &[RejectedRow],
+    ) -> ConnectorResult<()> {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field};
+
+        let Some(ref mut secondary) = self.secondary else {
+            return Ok(());
+        };
+        if rejected_batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let mut rejected_sorted: Vec<_> = rejected_rows.to_vec();
+        rejected_sorted.sort_by_key(|row| row.batch_row_index);
+        let error_strings: Vec<Option<&str>> = rejected_sorted
+            .iter()
+            .map(|row| Some(row.rule_violated.as_str()))
+            .collect();
+        let error_col: StringArray = error_strings.into_iter().collect();
+
+        let mut new_fields: Vec<Field> = rejected_batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        new_fields.push(Field::new("_error", DataType::Utf8, true));
+        let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(new_fields));
+        let mut new_cols: Vec<std::sync::Arc<dyn arrow::array::Array>> =
+            rejected_batch.columns().to_vec();
+        new_cols.push(std::sync::Arc::new(error_col));
+        let dlq_batch = arrow::record_batch::RecordBatch::try_new(new_schema, new_cols)
+            .map_err(|e| ConnectorError::Schema {
+                message: format!("failed to build dead-letter batch: {e}"),
+            })?;
+
+        secondary.write_batch_dyn(dlq_batch).await?;
+        Ok(())
     }
 }

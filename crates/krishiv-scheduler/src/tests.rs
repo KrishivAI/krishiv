@@ -4630,6 +4630,102 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn hot_key_reports_from_task_status_queue_throttles_and_skew_override() {
+        use krishiv_proto::{
+            ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport, TaskOutputMetadata,
+            TaskState, TaskStatusUpdate,
+        };
+
+        let coordinator_id = CoordinatorId::try_new("coord-hk-task-status").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        let executor_id = ExecutorId::try_new("exec-hk-ts").unwrap();
+        let lease = coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-1", 4))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-hk-ts").unwrap();
+        let stage_id = StageId::try_new("stage-1").unwrap();
+        let task_id = TaskId::try_new("task-1").unwrap();
+
+        coordinator
+            .submit_job(
+                JobSpec::new(job_id.clone(), "hk-ts-test", JobKind::Batch).with_stage(
+                    StageSpec::new(stage_id.clone(), "stage")
+                        .with_task(TaskSpec::new(task_id.clone(), "batch")),
+                ),
+            )
+            .unwrap();
+
+        let assignment = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap()
+            .remove(0);
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    job_id.clone(),
+                    assignment.stage_id().clone(),
+                    assignment.task_id().clone(),
+                    executor_id.clone(),
+                    TaskState::Running,
+                    assignment.attempt_id().as_u32(),
+                )
+                .with_lease_generation(lease),
+            )
+            .unwrap();
+
+        let meta = TaskOutputMetadata::new("shuffle", 100, 1, 2).with_hot_key_reports(vec![
+            HeartbeatHotKeyReport {
+                key: "hot-key".into(),
+                estimated_count: 500,
+                max_error: 10,
+                heat_score: 0.35,
+                job_id: job_id.clone(),
+                source_id: "src-0".into(),
+            },
+        ]);
+
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    job_id.clone(),
+                    assignment.stage_id().clone(),
+                    assignment.task_id().clone(),
+                    executor_id.clone(),
+                    TaskState::Succeeded,
+                    assignment.attempt_id().as_u32(),
+                )
+                .with_lease_generation(lease)
+                .with_output_metadata(meta),
+            )
+            .unwrap();
+
+        assert!(
+            coordinator.skew_repartition_overrides.contains_key(&job_id),
+            "batch hot-key from task status must set skew repartition override"
+        );
+        assert!(
+            coordinator
+                .pending_source_throttles
+                .contains_key(&executor_id),
+            "throttles from task status must be queued for next heartbeat"
+        );
+
+        let effects = coordinator
+            .executor_heartbeat(ExecutorHeartbeat::new(
+                executor_id.clone(),
+                ExecutorState::Healthy,
+            ))
+            .unwrap();
+        assert!(
+            !effects.source_throttles.is_empty(),
+            "queued throttles must be delivered on heartbeat"
+        );
+        assert!(coordinator.pending_source_throttles.is_empty());
+    }
+
+    #[test]
     fn adaptive_override_config_defaults_all_false() {
         let cfg = AdaptiveOverrideConfig::default();
         assert!(!cfg.disable_hot_key_splitting);

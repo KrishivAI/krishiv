@@ -589,11 +589,12 @@ Execution statistics:
                         BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
                     })
                     .collect::<Vec<_>>();
+                let is_streaming = self.logical_plan.kind() == ExecutionKind::Streaming;
                 let batches = crate::session::runtime_collect_batch_sql(
                     Arc::clone(&self.runtime),
                     query,
                     &tables,
-                    false,
+                    is_streaming,
                 )
                 .await?;
                 let stream = futures::stream::iter(batches.into_iter().map(Ok));

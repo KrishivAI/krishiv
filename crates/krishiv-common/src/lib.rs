@@ -2,9 +2,19 @@
 
 //! Shared utilities for the Krishiv workspace.
 //!
-//! Provides canonical implementations of:
-//! - SHA-256 hashing (`hash` module)
-//! - Identifier and path validation (`validate` module)
+//! Cross-cutting primitives used by runtime, scheduler, executor, and connector
+//! crates:
+//!
+//! - [`hash`] — SHA-256 helpers
+//! - [`validate`] — identifier, path, and SQL identifier validation
+//! - [`durability`] — durability profile contracts
+//! - [`production`] — production-mode guards and policy hooks
+//! - [`write_commit`] — staged sink commit and publish
+//! - [`partition`] — Arrow record-batch partitioning
+//! - [`async_util`] — `block_on` bridge and wall-clock helpers
+//! - [`memory_budget`] — in-process memory accounting
+//! - [`backpressure`] — credit-based backpressure signals
+//! - [`stream_quality`] — streaming quality hook trait
 
 pub mod async_util;
 pub mod backpressure;

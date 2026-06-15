@@ -233,7 +233,7 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     /// cycle) rather than on every read so that the amortised GC cost is low.
     ///
     /// **Performance note:** Each expired key deletion opens a separate write
-    /// transaction in `RedbStateBackend`.  For backends with many expired keys,
+    /// transaction in `RocksDbStateBackend`.  For backends with many expired keys,
     /// consider calling this method in a background task or batching deletions
     /// to avoid latency spikes.
     ///
@@ -278,7 +278,7 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     /// the full configured TTL duration remaining.
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
         let entries = decode_snapshot_entries(bytes)?;
-        let now_ms = unix_now_ms();
+        let now_ms = self.now_ms();
         let expires_at_ms = now_ms + self.config.ttl_ms as i64;
         // Pre-compute entries so the clear+insert phase has no fallible computation.
         let precomputed: Vec<(Namespace, Vec<u8>, Vec<u8>)> = entries

@@ -3,6 +3,10 @@
 mod parquet;
 mod s3;
 mod two_phase;
+mod csv;
+
+#[cfg(feature = "avro")]
+mod avro;
 
 #[cfg(feature = "kafka")]
 mod kafka;
@@ -13,6 +17,10 @@ mod lakehouse;
 pub use parquet::{ParquetSinkDriver, ParquetSourceDriver};
 pub use s3::{S3SinkDriver, S3SourceDriver};
 pub use two_phase::LocalParquetTwoPhaseSinkDriver;
+pub use csv::CsvSourceDriver;
+
+#[cfg(feature = "avro")]
+pub use avro::{AvroSinkDriver, AvroSourceDriver};
 
 #[cfg(feature = "kafka")]
 pub use kafka::{KafkaSinkDriver, KafkaSourceDriver};

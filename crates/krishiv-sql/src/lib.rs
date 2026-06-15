@@ -515,6 +515,16 @@ impl SqlEngine {
             .with_context(self.context.clone())
     }
 
+    /// Attach SQL text and execution kind derived from registered streaming sources.
+    fn attach_query_metadata(&self, df: SqlDataFrame, query: &str) -> SqlDataFrame {
+        let kind = if self.is_streaming_query(query).unwrap_or(false) {
+            ExecutionKind::Streaming
+        } else {
+            ExecutionKind::Batch
+        };
+        df.with_query(query).with_execution_kind(kind)
+    }
+
     /// Set an override for the shuffle partition count.
     ///
     /// When `n` is `Some`, exchange and shuffle-write operations use `n` buckets
@@ -1505,7 +1515,9 @@ impl SqlEngine {
             udf::register_single_table_udf(&self.context, std::sync::Arc::clone(&udf))
                 .map_err(SqlError::from)?;
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-            return Ok(self.make_sql_df("create-function", empty).with_query(query));
+            return Ok(
+                self.attach_query_metadata(self.make_sql_df("create-function", empty), query)
+            );
         }
 
         if query
@@ -1520,7 +1532,7 @@ impl SqlEngine {
                 .context
                 .sql(&format!("SELECT * FROM {merge_table}"))
                 .await?;
-            return Ok(self.make_sql_df("merge", dataframe).with_query(query));
+            return Ok(self.attach_query_metadata(self.make_sql_df("merge", dataframe), query));
         }
 
         // ── Intercept CALL system.<proc> ──────────────────────────────────────
@@ -1534,7 +1546,7 @@ impl SqlEngine {
                 .context
                 .sql(&format!("SELECT * FROM {call_table}"))
                 .await?;
-            return Ok(self.make_sql_df("call", dataframe).with_query(query));
+            return Ok(self.attach_query_metadata(self.make_sql_df("call", dataframe), query));
         }
 
         // ── Intercept DELETE FROM <iceberg-table> [WHERE …] ──────────────────
@@ -1575,7 +1587,9 @@ impl SqlEngine {
                         .context
                         .sql(&format!("SELECT * FROM {res_table}"))
                         .await?;
-                    return Ok(self.make_sql_df("delete", dataframe).with_query(query));
+                    return Ok(
+                        self.attach_query_metadata(self.make_sql_df("delete", dataframe), query)
+                    );
                 }
             }
         }
@@ -1623,7 +1637,9 @@ impl SqlEngine {
                         .context
                         .sql(&format!("SELECT * FROM {res_table}"))
                         .await?;
-                    return Ok(self.make_sql_df("update", dataframe).with_query(query));
+                    return Ok(
+                        self.attach_query_metadata(self.make_sql_df("update", dataframe), query)
+                    );
                 }
             }
         }
@@ -1672,7 +1688,7 @@ impl SqlEngine {
                 .context
                 .sql(&format!("SELECT * FROM {cep_table}"))
                 .await?;
-            return Ok(self.make_sql_df("cep", dataframe).with_query(query));
+            return Ok(self.attach_query_metadata(self.make_sql_df("cep", dataframe), query));
         }
 
         let (rewritten, as_ofs) =
@@ -1701,10 +1717,11 @@ impl SqlEngine {
                 .cloned();
             if let Some(plan) = cached_plan {
                 let dataframe = self.context.execute_logical_plan(plan).await?;
-                return Ok(self
-                    .make_sql_df("sql-query", dataframe)
-                    .with_query(rewritten)
-                    .with_shuffle_partitions(shuffle_override));
+                return Ok(self.attach_query_metadata(
+                    self.make_sql_df("sql-query", dataframe)
+                        .with_shuffle_partitions(shuffle_override),
+                    &rewritten,
+                ));
             }
         }
 
@@ -1736,10 +1753,11 @@ impl SqlEngine {
             }
         }
 
-        Ok(self
-            .make_sql_df("sql-query", dataframe)
-            .with_query(rewritten)
-            .with_shuffle_partitions(shuffle_override))
+        Ok(self.attach_query_metadata(
+            self.make_sql_df("sql-query", dataframe)
+                .with_shuffle_partitions(shuffle_override),
+            &rewritten,
+        ))
     }
 
     /// Execute a SQL query with a timeout.
@@ -2391,6 +2409,7 @@ pub struct SqlDataFrame {
     query: Option<String>,
     /// Alias for `query` used by `create_view` — same value.
     query_text: Option<String>,
+    execution_kind: ExecutionKind,
     dataframe: DataFusionDataFrame,
     shuffle_partitions: Option<u32>,
     /// Shared session context for table registration (cache/view operations).
@@ -2421,6 +2440,7 @@ impl SqlDataFrame {
             name: name.into(),
             query: None,
             query_text: None,
+            execution_kind: ExecutionKind::Batch,
             dataframe,
             shuffle_partitions: None,
             context: SessionContext::default(),
@@ -2438,6 +2458,11 @@ impl SqlDataFrame {
         let q = query.into();
         self.query_text = Some(q.clone());
         self.query = Some(q);
+        self
+    }
+
+    fn with_execution_kind(mut self, kind: ExecutionKind) -> Self {
+        self.execution_kind = kind;
         self
     }
 
@@ -2459,6 +2484,7 @@ impl SqlDataFrame {
             name: format!("{}-{}", self.name, tag),
             query: None,
             query_text: None,
+            execution_kind: self.execution_kind,
             dataframe: df,
             shuffle_partitions: self.shuffle_partitions,
             context: self.context.clone(),
@@ -2483,7 +2509,7 @@ impl SqlDataFrame {
         let mut counter = 0usize;
         let (nodes, _root_id) = df_plan_to_krishiv_nodes(df_plan, &counts, &mut counter);
 
-        let mut plan = LogicalPlan::new(self.name.clone(), ExecutionKind::Batch);
+        let mut plan = LogicalPlan::new(self.name.clone(), self.execution_kind);
         for node in nodes {
             plan = plan.with_node(node);
         }
@@ -4332,6 +4358,41 @@ mod udtf_ddl_tests {
         assert!(
             !engine.is_streaming_query("SELECT 1 AS n").unwrap(),
             "plain SELECT must not be classified as streaming"
+        );
+    }
+
+    #[tokio::test]
+    async fn krishiv_logical_plan_kind_is_streaming_for_streaming_source() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let engine = SqlEngine::new();
+        engine.register_streaming_source_name("events").unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("user_id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2])),
+                Arc::new(Int64Array::from(vec![10i64, 20])),
+            ],
+        )
+        .unwrap();
+        engine
+            .register_record_batches("events", vec![batch])
+            .await
+            .unwrap();
+        let df = engine
+            .sql("SELECT ts, user_id FROM events WHERE ts > 0")
+            .await
+            .expect("streaming sql");
+        assert_eq!(
+            df.krishiv_logical_plan().kind(),
+            super::ExecutionKind::Streaming
         );
     }
 

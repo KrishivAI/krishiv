@@ -141,65 +141,11 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
-        let mut heartbeat = ExecutorHeartbeat::new(request.executor_id().clone(), request.state())
-            .with_lease_generation(request.lease_generation())
-            .with_running_tasks(
-                request
-                    .running_attempts()
-                    .iter()
-                    .map(|attempt| attempt.task_id().clone())
-                    .collect(),
-            );
-        if let Some(bytes) = request.memory_used_bytes() {
-            heartbeat = heartbeat.with_memory_used_bytes(bytes);
-        }
-        if let Some(bytes) = request.memory_limit_bytes() {
-            heartbeat = heartbeat.with_memory_limit_bytes(bytes);
-        }
-        if let Some(count) = request.active_task_count() {
-            heartbeat = heartbeat.with_active_task_count(count);
-        }
-        if !request.streaming_task_states().is_empty() {
-            heartbeat =
-                heartbeat.with_streaming_task_states(request.streaming_task_states().to_vec());
-        }
-        if !request.hot_key_reports().is_empty() {
-            heartbeat = heartbeat.with_hot_key_reports(request.hot_key_reports().to_vec());
-        }
-        if !request.streaming_progress().is_empty() {
-            heartbeat = heartbeat.with_streaming_progress(request.streaming_progress().to_vec());
-        }
+        let heartbeat = crate::coordinator::executor_heartbeat_from_request(&request);
         let mut coordinator = self.coordinator.write().await;
 
         let response = match coordinator.executor_heartbeat(heartbeat) {
-            Ok(effects) => {
-                let mut resp = ExecutorHeartbeatResponse::new(
-                    effects.lease_generation,
-                    TransportDisposition::Accepted,
-                );
-                if !effects.source_throttles.is_empty() {
-                    let wire_cmds: Vec<HeartbeatThrottleCommand> = effects
-                        .source_throttles
-                        .into_iter()
-                        .map(|c| HeartbeatThrottleCommand {
-                            source_id: c.source_id,
-                            rows_per_second: c.rows_per_second,
-                        })
-                        .collect();
-                    resp = resp.with_throttle_commands(wire_cmds);
-                }
-                if !effects.checkpoint_commands.is_empty() {
-                    resp = resp.with_checkpoint_commands(effects.checkpoint_commands);
-                }
-                if !effects.checkpoint_complete_commands.is_empty() {
-                    resp = resp
-                        .with_checkpoint_complete_commands(effects.checkpoint_complete_commands);
-                }
-                if !effects.restore_commands.is_empty() {
-                    resp = resp.with_restore_commands(effects.restore_commands);
-                }
-                resp
-            }
+            Ok(effects) => crate::coordinator::executor_heartbeat_response_from_effects(effects),
             Err(SchedulerError::UnknownExecutor { .. }) => ExecutorHeartbeatResponse::new(
                 request.lease_generation(),
                 TransportDisposition::UnknownExecutor,

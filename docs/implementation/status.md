@@ -1,5 +1,56 @@
 # Krishiv Implementation Status
 
+## 2026-06-14 — Audit follow-ups: hot-key loop, connectors, UI, operator
+
+Implemented the documented follow-up work on PR #79:
+
+- **`krishiv-scheduler`**: Hot-key reports in `TaskOutputMetadata` now drive `process_hot_key_reports` from `apply_task_update`; throttles queue in `pending_source_throttles` and drain on heartbeat. Shared `heartbeat_mapping` helpers; in-process heartbeat parity (throttles/checkpoints). Regression test `hot_key_reports_from_task_status_queue_throttles_and_skew_override`.
+- **`krishiv-connectors`**: `ConnectorQualityHook::flush_rejected` forwards pre-filtered batches via `DeadLetterSink::write_rejected_to_secondary` (no double quality check). Registry drivers for `csv` and `avro` kinds.
+- **`krishiv-ui`**: `embedded_router` adds `GET /api/v1/jobs` and `GET /api/v1/executors`. Bearer token injected via `auth_meta.html` + `krishiv-auth.js`; SQL editor and live polling send `Authorization` when `KRISHIV_UI_TOKEN` is set.
+- **`krishiv-operator`**: Post-create pod status inspection wires `detect_executor_pod_launch_failure` into reconciler. CLI/env `--coordinator-endpoint` / `KRISHIV_COORDINATOR_ENDPOINT`.
+
+### Validation
+
+```
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-scheduler --lib   # 311/311
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-connectors --lib  # 73/73
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-ui --lib          # 24/24
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-operator --lib    # 42/42
+```
+
+---
+
+## 2026-06-14 — Cross-crate audit: bugs, dead code, docs, and tests
+
+Completed a parallel audit and applied high-impact fixes across core crates:
+
+- **`krishiv-api`**: `uses_remote_execution()` typo; `KRISHIV_SHUFFLE_PARTITIONS` env (legacy alias); remote `execute_stream_async` passes streaming flag; conformance tests aligned with DataFusion 53.
+- **`krishiv-sql`**: `SqlDataFrame` carries `ExecutionKind::Streaming` when SQL references registered streaming sources (`attach_query_metadata`).
+- **`krishiv-common`**: `write_commit::move_file` only copy-falls-back on cross-device rename; expanded crate docs; backpressure doc link fixed.
+- **`krishiv-dataflow`**: `MemoCache` LRU promotion on hit; removed dead `JoinKind` / `pre_agg_indices`; `watermark_e2e` test no longer references removed `barrier_align`; temporal join `upsert_version_encoded`; broadcast snapshot returns `Result`.
+- **`krishiv-state`**: TTL `load_snapshot` uses watermark-aware clock; Redb→RocksDB stale comments fixed.
+- **`krishiv-metrics`**: `remove_job` clears `source_offset_lag` and `streaming_rows`.
+- **`krishiv-shuffle`**: `delete_job_partitions` clears `content_hashes`.
+- **`krishiv-flight-sql`**: auth on catalog `GetDbSchemas` / `GetTables` RPCs.
+- **`krishiv-bench`**: fixed tautological TPC-H Q1 assertion.
+- **`krishiv` examples**: updated to current `QueryResult` struct API and facade prelude.
+
+### Validation
+
+```
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-common --lib          # 80/80
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-dataflow --lib       # 218/218
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-metrics --lib        # 67/67
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-shuffle --lib         # 132/132
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-state --lib           # 296/296
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-sql --lib             # 295/295
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-api --lib             # 122/122
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-flight-sql --lib      # 49/49
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-bench --lib           # 9/9
+```
+
+---
+
 ## 2026-06-14 — G16 + G17: Flight SQL prepared-parameter binding and catalog introspection
 
 ### G16 — Prepared statement `$N` parameter binding

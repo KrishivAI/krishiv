@@ -653,6 +653,10 @@ impl KrishivMetrics {
         self.state_bytes.remove(job_id);
         self.remove_task_attempt_counters(job_id);
         self.remove_shuffle_partition_counters(job_id);
+        let prefix = format!("{job_id}:");
+        self.source_offset_lag
+            .retain(|k, _| !k.starts_with(&prefix));
+        self.streaming_rows.retain(|k, _| !k.starts_with(&prefix));
     }
 
     // ── Duration observation histograms ────────────────────────────────────
@@ -1466,6 +1470,8 @@ mod tests {
         m.set_shuffle_partitions("job-a", "stage-1", 1, 0, 0);
         m.set_state_key_count("job-a", 42);
         m.set_state_bytes("job-a", 1024);
+        m.set_source_offset_lag("job-a", "kafka-0", 99);
+        m.add_streaming_rows("job-a", "task-0", 10);
         m.remove_job("job-a");
 
         let body = m.render_prometheus();

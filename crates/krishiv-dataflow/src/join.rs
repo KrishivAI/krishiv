@@ -115,24 +115,7 @@ pub fn extract_agg_key(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecR
     }
 }
 
-// ── JoinKind ──────────────────────────────────────────────────────────────────
-
-/// Join type for control over non-matching rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinKind {
-    /// Inner join — only emit rows where keys match on both sides.
-    Inner,
-    /// Left outer join — emit all left rows; right columns are null for unmatched.
-    LeftOuter,
-    /// Left semi join — emit left rows that have at least one match on the right.
-    LeftSemi,
-    /// Left anti join — emit left rows that have no match on the right.
-    LeftAnti,
-    /// Cartesian product — no join predicate.
-    Cross,
-    /// Nested-loop join for non-equi predicates.
-    NestedLoop,
-}
+// ── CompositeKey ────────────────────────────────────────────────────────────
 
 /// Composite multi-key for use with join operators.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

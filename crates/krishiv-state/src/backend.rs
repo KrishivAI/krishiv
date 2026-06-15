@@ -35,7 +35,7 @@ pub trait StateBackend: Send + Sync {
     ///
     /// The default implementation calls `put` for each entry individually.
     /// Backends that support batch writes should override this for efficiency —
-    /// `RedbStateBackend` overrides this to open a single write transaction for all entries.
+    /// `RocksDbStateBackend` overrides this to open a single write transaction for all entries.
     fn put_batch(&mut self, entries: &[(&str, &str, &[u8], &[u8])]) -> StateResult<()> {
         for (op_id, name, key, value) in entries {
             let ns = Namespace::new(*op_id, *name);
@@ -48,7 +48,7 @@ pub trait StateBackend: Send + Sync {
     ///
     /// The default implementation calls `delete` for each entry individually.
     /// Backends that support batch deletes should override this for efficiency —
-    /// `RedbStateBackend` overrides this to open a single write transaction for all entries.
+    /// `RocksDbStateBackend` overrides this to open a single write transaction for all entries.
     fn delete_batch(&mut self, entries: &[(&Namespace, &[u8])]) -> StateResult<()> {
         for (ns, key) in entries {
             self.delete(ns, key)?;
@@ -60,7 +60,7 @@ pub trait StateBackend: Send + Sync {
     ///
     /// The default implementation calls `get` for each entry individually.
     /// Backends that support batch reads should override this for efficiency —
-    /// `RedbStateBackend` overrides this to open a single read transaction for all keys.
+    /// `RocksDbStateBackend` overrides this to open a single read transaction for all keys.
     fn get_batch(&self, keys: &[(&str, &str, &[u8])]) -> StateResult<Vec<Option<Vec<u8>>>> {
         keys.iter()
             .map(|(op_id, name, key)| {

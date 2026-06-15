@@ -66,9 +66,12 @@
         spinner.classList.add("active");
       }
       try {
+        var headers = window.krishivAuthHeaders
+          ? window.krishivAuthHeaders({ "Content-Type": "application/json" })
+          : { "Content-Type": "application/json" };
         var resp = await fetch("/api/v1/sql", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: headers,
           credentials: "same-origin",
           body: JSON.stringify({ query: query }),
         });

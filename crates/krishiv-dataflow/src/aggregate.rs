@@ -413,13 +413,11 @@ impl LocalAggregator {
             .map(|&idx| PreDowncastCol::downcast(batch.column(idx)))
             .collect::<ExecResult<_>>()?;
 
-        // Pre-resolve aggregate column indices and pre-downcast once.
-        let mut pre_agg_indices: Vec<usize> = Vec::with_capacity(self.agg_exprs.len());
+        // Pre-downcast aggregate input columns once.
         let mut pre_agg_cols: Vec<Option<PreDowncastCol>> =
             Vec::with_capacity(self.agg_exprs.len());
         for expr in &self.agg_exprs {
             if matches!(expr.function, AggFunction::Count) {
-                pre_agg_indices.push(0); // unused
                 pre_agg_cols.push(None);
             } else {
                 let col_idx = batch
@@ -427,7 +425,6 @@ impl LocalAggregator {
                     .index_of(&expr.input_column)
                     .map_err(|_| ExecError::ColumnNotFound(expr.input_column.clone()))?;
                 let col = PreDowncastCol::downcast(batch.column(col_idx))?;
-                pre_agg_indices.push(col_idx);
                 pre_agg_cols.push(Some(col));
             }
         }

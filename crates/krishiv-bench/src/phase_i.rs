@@ -180,7 +180,7 @@ mod phase_i_tests {
         let df = e.sql(crate::tpch::Q1).await.expect("Q1 must not error");
         let batches = df.collect().await.expect("Q1 collect");
         assert!(
-            !batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0),
+            !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0),
             "Q1 returned no data"
         );
         // Schema: l_returnflag, l_linestatus, sum_qty, sum_base_price, count_order

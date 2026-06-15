@@ -152,6 +152,51 @@ impl PodLifecycleManager {
         Ok(executor_ids)
     }
 
+    /// Inspect executor pods for a job and return the first classified launch failure.
+    pub async fn detect_executor_pod_launch_failure(
+        &self,
+        resource: &KrishivJobResource,
+    ) -> Option<crate::pod_failure::ExecutorPodLaunchFailure> {
+        let namespace = resource.metadata.namespace_or_default();
+        let job_name = &resource.metadata.name;
+        let parallelism = resource.spec.effective_parallelism();
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+
+        for idx in 0..parallelism {
+            let pod_name = format!("{job_name}-exec-{idx}");
+            let pod = match pods.get(&pod_name).await {
+                Ok(pod) => pod,
+                Err(kube::Error::Api(err)) if err.code == 404 => continue,
+                Err(err) => {
+                    warn!(
+                        job = job_name,
+                        pod = pod_name,
+                        error = %err,
+                        "failed to read executor pod status during launch-failure detection"
+                    );
+                    continue;
+                }
+            };
+            let value = match serde_json::to_value(&pod) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        job = job_name,
+                        pod = pod_name,
+                        error = %err,
+                        "failed to serialize executor pod for launch-failure detection"
+                    );
+                    continue;
+                }
+            };
+            if let Some(failure) = crate::pod_failure::detect_executor_pod_launch_failure(&value)
+            {
+                return Some(failure);
+            }
+        }
+        None
+    }
+
     /// Delete all executor Pods associated with `resource`.
     ///
     /// Pods are selected by the `krishiv.io/job` label.  Missing pods (`404`)
