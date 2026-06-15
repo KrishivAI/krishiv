@@ -1,6 +1,25 @@
 use super::*;
 
-pub(crate) const MAX_CONCURRENT_ASSIGNMENT_RPCS: usize = 64;
+/// Env var for overriding the max concurrent task-assignment gRPC calls.
+///
+/// Default: 128. Raise for large clusters (> 100 executors) where the default
+/// caps assignment throughput. Lower in memory-constrained environments.
+const MAX_CONCURRENT_ASSIGNMENT_RPCS_ENV: &str = "KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS";
+
+/// Returns the effective concurrent-assignment RPC limit.
+pub(crate) fn max_concurrent_assignment_rpcs() -> usize {
+    std::env::var(MAX_CONCURRENT_ASSIGNMENT_RPCS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(128)
+}
+
+/// Constant used in the few places that need it at compile time (e.g. semaphore
+/// construction with a literal). Callers that need a runtime value should call
+/// `max_concurrent_assignment_rpcs()` instead.
+pub(crate) const DEFAULT_MAX_CONCURRENT_ASSIGNMENT_RPCS: usize = 128;
+
 const MAX_ASSIGNMENT_DELIVERY_ATTEMPTS: usize = 3;
 const ASSIGNMENT_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";
@@ -70,7 +89,7 @@ where
     use futures::StreamExt;
 
     let mut stream =
-        futures::stream::iter(futures).buffer_unordered(MAX_CONCURRENT_ASSIGNMENT_RPCS);
+        futures::stream::iter(futures).buffer_unordered(max_concurrent_assignment_rpcs());
     let mut responses = Vec::new();
     let mut first_err = None;
     while let Some(result) = stream.next().await {
@@ -856,7 +875,8 @@ mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
 
-        let futures = (0..(MAX_CONCURRENT_ASSIGNMENT_RPCS + 8)).map(|_| {
+        let limit = max_concurrent_assignment_rpcs();
+        let futures = (0..(limit + 8)).map(|_| {
             let active = Arc::clone(&active);
             let max_active = Arc::clone(&max_active);
             async move {
@@ -870,9 +890,9 @@ mod tests {
 
         let responses = collect_bounded_assignment_futures(futures).await.unwrap();
 
-        assert_eq!(responses.len(), MAX_CONCURRENT_ASSIGNMENT_RPCS + 8);
+        assert_eq!(responses.len(), limit + 8);
         assert!(
-            max_active.load(Ordering::SeqCst) <= MAX_CONCURRENT_ASSIGNMENT_RPCS,
+            max_active.load(Ordering::SeqCst) <= limit,
             "assignment dispatch must not exceed the configured concurrency cap"
         );
     }

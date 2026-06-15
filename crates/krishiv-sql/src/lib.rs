@@ -57,9 +57,13 @@ pub use streaming::{ContinuousInputError, ContinuousTableInput};
 /// SQL result alias.
 pub type SqlResult<T> = Result<T, SqlError>;
 
-/// Pinned stream of record batches with `String` error type.
+/// Pinned stream of record batches with typed [`SqlError`] items.
+///
+/// Previously this used `String` as the error type, which lost diagnostic
+/// information at the stream boundary. Callers that need a `String` error can
+/// map with `|e| e.to_string()`.
 pub type SqlStream =
-    std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<RecordBatch, String>> + Send>>;
+    std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<RecordBatch, SqlError>> + Send>>;
 
 /// Global counter for unique ephemeral table names, preventing concurrent
 /// MERGE/CEP queries from overwriting each other's result tables.
@@ -875,7 +879,7 @@ impl SqlEngine {
         let mut total_rows = 0u64;
 
         while let Some(result) = stream.next().await {
-            let batch = result.map_err(|e| SqlError::DataFusion { message: e })?;
+            let batch = result.map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
             if batch.num_rows() > 0 {
                 total_rows += batch.num_rows() as u64;
                 sink.write_batch(batch)
@@ -1654,17 +1658,18 @@ impl SqlEngine {
         // ── Intercept UPDATE <iceberg-table> SET … [WHERE …] ─────────────────
         #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
         if trimmed.to_ascii_uppercase().starts_with("UPDATE ") {
-            if let Some((table_ref, set_clause, predicate)) = parse_dml_update(trimmed) {
-                if let Some((iceberg_catalog, table_ident)) = self.resolve_iceberg_table(&table_ref)
+            if let Some(parsed) = parse_dml_update(trimmed) {
+                if let Some((iceberg_catalog, table_ident)) =
+                    self.resolve_iceberg_table(&parsed.table_ref)
                 {
                     use arrow::array::{ArrayRef, Int64Array};
                     use arrow::datatypes::{DataType, Field, Schema};
-                    let assignments = split_set_assignments(&set_clause);
-                    let borrowed: Vec<(&str, &str)> = assignments
+                    let borrowed: Vec<(&str, &str)> = parsed
+                        .assignments
                         .iter()
                         .map(|(c, e)| (c.as_str(), e.as_str()))
                         .collect();
-                    let pred = predicate.as_deref();
+                    let pred = parsed.predicate.as_deref();
                     let (updated, _) = krishiv_connectors::lakehouse::dml::iceberg_update_where(
                         iceberg_catalog,
                         &table_ident,
@@ -2634,7 +2639,11 @@ impl SqlDataFrame {
     pub async fn execute_stream(&self) -> SqlResult<SqlStream> {
         let df_stream = self.dataframe.clone().execute_stream().await?;
         use futures::StreamExt;
-        let mapped = df_stream.map(|res| res.map_err(|e| e.to_string()));
+        let mapped = df_stream.map(|res| {
+            res.map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })
+        });
         Ok(Box::pin(mapped))
     }
 
@@ -3650,93 +3659,86 @@ fn parse_call_duration(s: &str) -> SqlResult<chrono::Duration> {
 
 // ── Iceberg DML helpers ───────────────────────────────────────────────────────
 
-/// Parse `DELETE FROM <table> [WHERE <predicate>]` into `(table_ref, predicate)`.
+/// Parse `DELETE FROM <table> [WHERE <predicate>]` into `(table_ref, predicate)`
+/// using the sqlparser AST, which correctly handles quoted identifiers, comments,
+/// and subqueries in predicates.  Returns `None` for non-DELETE statements.
 ///
-/// Returns `None` when the statement does not match the expected shape.
-/// A missing WHERE clause is treated as `"TRUE"` (delete all rows).
+/// A missing WHERE clause is returned as `"TRUE"` (delete all rows).
 #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
 fn parse_dml_delete(stmt: &str) -> Option<(String, String)> {
-    use regex::Regex;
-    use std::sync::LazyLock;
+    use datafusion::sql::sqlparser::ast::{Statement, TableFactor};
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
 
-    static WITH_WHERE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?is)^\s*DELETE\s+FROM\s+(\S+)\s+WHERE\s+([\s\S]+?)\s*;?\s*$").unwrap()
-    });
-    static NO_WHERE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)^\s*DELETE\s+FROM\s+(\S+)\s*;?\s*$").unwrap());
-
-    if let Some(cap) = WITH_WHERE.captures(stmt) {
-        let table = cap.get(1)?.as_str().to_string();
-        let pred = cap.get(2)?.as_str().trim().to_string();
-        Some((table, pred))
-    } else if let Some(cap) = NO_WHERE.captures(stmt) {
-        let table = cap.get(1)?.as_str().to_string();
-        Some((table, "TRUE".to_string()))
-    } else {
-        None
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, stmt).ok()?;
+    if stmts.len() != 1 {
+        return None;
     }
+    let Statement::Delete(delete) = stmts.remove(0) else {
+        return None;
+    };
+    // The first FROM table is the deletion target.
+    let first_from = delete.from.into_iter().next()?;
+    let table_name = match first_from.relation {
+        TableFactor::Table { name, .. } => name.to_string(),
+        _ => return None,
+    };
+    let predicate = delete
+        .selection
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "TRUE".to_string());
+    Some((table_name, predicate))
 }
 
-/// Parse `UPDATE <table> SET <assignments> [WHERE <predicate>]` into
-/// `(table_ref, set_clause, Option<predicate>)`.
+/// Parsed UPDATE statement, decomposed into its components for Iceberg DML.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+struct ParsedUpdate {
+    table_ref: String,
+    /// Ordered (column_name, value_expression) pairs from the SET clause.
+    assignments: Vec<(String, String)>,
+    predicate: Option<String>,
+}
+
+/// Parse `UPDATE <table> SET col = expr [, …] [WHERE <predicate>]` using the
+/// sqlparser AST.  Returns `None` for non-UPDATE statements or unsupported shapes.
 ///
-/// Returns `None` when the statement does not match.
+/// Replaces the former regex implementation which could not handle quoted
+/// identifiers, expressions with commas, or subqueries in predicates.
 #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
-fn parse_dml_update(stmt: &str) -> Option<(String, String, Option<String>)> {
-    use regex::Regex;
-    use std::sync::LazyLock;
+fn parse_dml_update(stmt: &str) -> Option<ParsedUpdate> {
+    use datafusion::sql::sqlparser::ast::{Statement, TableFactor};
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
 
-    static UPDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?is)^\s*UPDATE\s+(\S+)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]+?))?\s*;?\s*$")
-            .unwrap()
-    });
-
-    let cap = UPDATE_RE.captures(stmt)?;
-    let table = cap.get(1)?.as_str().to_string();
-    let set_clause = cap.get(2)?.as_str().trim().to_string();
-    let predicate = cap.get(3).map(|m| m.as_str().trim().to_string());
-    Some((table, set_clause, predicate))
-}
-
-/// Split a SQL SET clause (`col1 = expr1, col2 = expr2`) into assignment pairs.
-///
-/// Handles commas inside balanced parentheses (e.g. `CONCAT(a, b)`).
-#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
-fn split_set_assignments(set_clause: &str) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut depth: i32 = 0;
-    let mut start = 0usize;
-    let bytes = set_clause.as_bytes();
-
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b',' if depth == 0 => {
-                push_set_pair(&mut pairs, &set_clause[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, stmt).ok()?;
+    if stmts.len() != 1 {
+        return None;
     }
-    push_set_pair(&mut pairs, &set_clause[start..]);
-    pairs
-}
-
-#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
-fn push_set_pair(pairs: &mut Vec<(String, String)>, s: &str) {
-    let s = s.trim();
-    if let Some(eq) = s.find('=') {
-        let col = s[..eq]
-            .trim()
-            .trim_matches('`')
-            .trim_matches('"')
-            .to_string();
-        let expr = s[eq + 1..].trim().to_string();
-        if !col.is_empty() && !expr.is_empty() {
-            pairs.push((col, expr));
-        }
+    let Statement::Update { table, assignments, selection, .. } = stmts.remove(0) else {
+        return None;
+    };
+    let table_name = match table.relation {
+        TableFactor::Table { name, .. } => name.to_string(),
+        _ => return None,
+    };
+    // Convert AST assignments to (column_name, expression_string) pairs.
+    let parsed_assignments: Vec<(String, String)> = assignments
+        .into_iter()
+        .map(|a| {
+            // `target` may be `AssignmentTarget::ColumnName(ObjectName)` in 0.61.
+            let col = a.target.to_string();
+            let val = a.value.to_string();
+            (col, val)
+        })
+        .collect();
+    if parsed_assignments.is_empty() {
+        return None;
     }
+    Some(ParsedUpdate {
+        table_ref: table_name,
+        assignments: parsed_assignments,
+        predicate: selection.map(|e| e.to_string()),
+    })
 }
 
 /// Create a Krishiv logical plan wrapper for a SQL query without executing it.

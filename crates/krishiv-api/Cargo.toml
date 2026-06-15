@@ -23,6 +23,7 @@ krishiv-sql = { path = "../krishiv-sql" }
 # iceberg feature deps — pulled in only when local-catalog or iceberg-datafusion are requested
 iceberg = { workspace = true, optional = true }
 parquet = { workspace = true }
+twox-hash = { workspace = true }
 
 [features]
 kafka = ["krishiv-connectors/kafka"]

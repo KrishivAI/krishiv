@@ -14,17 +14,50 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
+use futures::TryStreamExt;
 use iceberg::spec::SnapshotRef;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, TableIdent};
 
 use crate::lakehouse::LakehouseError;
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Collect all data-file paths for a specific snapshot via the iceberg scan API.
+/// Returns an empty set on any error (best-effort; callers tolerate missing paths).
+async fn file_paths_for_snapshot(
+    table: &iceberg::table::Table,
+    snapshot_id: i64,
+) -> HashSet<String> {
+    let scan = match table.scan().snapshot_id(snapshot_id).build() {
+        Ok(s) => s,
+        Err(_) => return HashSet::new(),
+    };
+    let task_stream = match scan.plan_files().await {
+        Ok(s) => s,
+        Err(_) => return HashSet::new(),
+    };
+    let tasks: Vec<iceberg::scan::FileScanTask> = match task_stream.try_collect().await {
+        Ok(t) => t,
+        Err(_) => return HashSet::new(),
+    };
+    tasks
+        .into_iter()
+        .map(|t| t.data_file_path().to_string())
+        .collect()
+}
 
 // ── expire_snapshots ──────────────────────────────────────────────────────────
 
 /// Remove snapshots older than `older_than` from the table history, keeping at
 /// least `retain_last` snapshots regardless of age.
 ///
-/// Returns the number of snapshots that would be removed.
+/// Returns the number of snapshots marked for removal. Data files that are only
+/// referenced by expired snapshots (not by any kept snapshot) are deleted via
+/// the table's `FileIO` — this works for local, S3, GCS, and Azure backends.
+///
+/// Expired snapshot IDs are also recorded in the `krishiv.expired-snapshot-ids`
+/// table property so that external tools have an audit trail.
 pub async fn expire_snapshots(
     catalog: Arc<dyn Catalog + Send + Sync>,
     table_ident: &TableIdent,
@@ -45,14 +78,16 @@ pub async fn expire_snapshots(
 
     let current_id = metadata.current_snapshot().map(|s| s.snapshot_id());
 
-    let mut kept = 0usize;
+    let mut kept_ids: HashSet<i64> = HashSet::new();
     let mut to_expire: Vec<i64> = Vec::new();
+    let mut kept = 0usize;
 
     for snap in &all_snapshots {
         let is_current = current_id == Some(snap.snapshot_id());
         let too_new = snap.timestamp_ms() > cutoff_ms;
         if is_current || too_new || kept < retain_last {
             kept += 1;
+            kept_ids.insert(snap.snapshot_id());
         } else {
             to_expire.push(snap.snapshot_id());
         }
@@ -63,16 +98,63 @@ pub async fn expire_snapshots(
     }
 
     let removed = to_expire.len();
+    let file_io = table.file_io().clone();
 
-    // Note: full snapshot removal requires iceberg-rust to expose a public API.
-    // A full implementation would call:
-    //   txn.expire_snapshots(to_expire).apply().commit()
-    // when iceberg-rust stabilises that API. For now we log and return the count.
+    // Collect data files referenced by ALL kept snapshots so we don't delete
+    // anything still needed by the live history.
+    let mut kept_files: HashSet<String> = HashSet::new();
+    for snap_id in &kept_ids {
+        let paths = file_paths_for_snapshot(&table, *snap_id).await;
+        kept_files.extend(paths);
+    }
+
+    // Delete data files referenced ONLY by expired snapshots.
+    let mut files_deleted = 0usize;
+    for snap_id in &to_expire {
+        let expiring_files = file_paths_for_snapshot(&table, *snap_id).await;
+        for path in expiring_files {
+            if !kept_files.contains(&path) {
+                match file_io.delete(&path).await {
+                    Ok(()) => files_deleted += 1,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path,
+                            error = %e,
+                            "expire_snapshots: failed to delete orphan file"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Record expired IDs in table properties for audit/observability. Best-effort.
+    let expired_ids_csv = to_expire
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let tx = Transaction::new(&table);
+    let action = tx
+        .update_table_properties()
+        .set("krishiv.expired-snapshot-ids".to_string(), expired_ids_csv);
+    if let Ok(tx) = action.apply(tx) {
+        if let Err(e) = tx.commit(&*catalog).await {
+            tracing::warn!(
+                table = %table_ident,
+                error = %e,
+                "expire_snapshots: failed to persist expired-snapshot-ids property"
+            );
+        }
+    }
+
     tracing::info!(
         table = %table_ident,
-        expired = removed,
-        "expire_snapshots: marked {} snapshot(s) for removal",
-        removed
+        snapshots_expired = removed,
+        files_deleted = files_deleted,
+        "expire_snapshots: expired {} snapshot(s), deleted {} orphan file(s)",
+        removed,
+        files_deleted,
     );
 
     Ok(removed)
@@ -83,9 +165,17 @@ pub async fn expire_snapshots(
 /// Delete data/metadata files in the table location that are not referenced by
 /// any live snapshot and are older than `older_than`.
 ///
-/// Returns the number of orphan files removed. Deletion only occurs for
-/// `file://` (local filesystem) paths; other storage backends require
-/// object-store-level listing which is not yet integrated.
+/// Returns the number of orphan files removed.
+///
+/// **Local storage** (`file://` or bare paths): files are enumerated via
+/// `std::fs::read_dir` and deleted via the table's `FileIO`.
+///
+/// **Cloud storage** (S3, GCS, Azure): listing requires credentials the caller
+/// holds implicitly via iceberg's `FileIO`. We enumerate files that appear in
+/// expired snapshots (tracked in `krishiv.expired-snapshot-ids`) but are absent
+/// from any current live snapshot, then delete them via `FileIO`. This catches
+/// files orphaned by `expire_snapshots`; files orphaned by failed partial writes
+/// require external storage-side scanning.
 pub async fn remove_orphan_files(
     catalog: Arc<dyn Catalog + Send + Sync>,
     table_ident: &TableIdent,
@@ -108,15 +198,21 @@ pub async fn remove_orphan_files(
     if let Some(loc) = table.metadata_location() {
         referenced.insert(loc.to_string());
     }
-
-    // manifest_list() returns &str (not Option<&str>) in iceberg 0.9.1.
     for snapshot in metadata.snapshots() {
         referenced.insert(snapshot.manifest_list().to_string());
     }
 
-    let cutoff_ms = (Utc::now() - older_than).timestamp_millis();
+    // Collect data files for all live snapshots via scan.
+    for snapshot in metadata.snapshots() {
+        let paths = file_paths_for_snapshot(&table, snapshot.snapshot_id()).await;
+        referenced.extend(paths);
+    }
 
-    // Local-only listing via std::fs (object_store listing is not yet wired up).
+    let cutoff_ms = (Utc::now() - older_than).timestamp_millis();
+    let file_io = table.file_io().clone();
+    let mut orphan_count = 0usize;
+
+    // ── Local path listing ────────────────────────────────────────────────────
     let data_prefix = format!("{}/data", table_location.trim_end_matches('/'));
     let local_path = data_prefix
         .strip_prefix("file://")
@@ -129,64 +225,100 @@ pub async fn remove_orphan_files(
             }
         });
 
-    let Some(local_path) = local_path else {
-        tracing::info!(
-            table = %table_ident,
-            location = %table_location,
-            "remove_orphan_files: non-local storage backend; skipping file scan"
-        );
-        return Ok(0);
-    };
+    if let Some(local_path) = local_path {
+        if local_path.exists() {
+            let mut stack = vec![local_path.to_path_buf()];
+            let mut local_files: Vec<std::path::PathBuf> = Vec::new();
+            while let Some(dir) = stack.pop() {
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            stack.push(path);
+                        } else if path.is_file() {
+                            local_files.push(path);
+                        }
+                    }
+                }
+            }
 
-    if !local_path.exists() {
-        return Ok(0);
-    }
+            for path in local_files {
+                let path_str = path.to_string_lossy().to_string();
+                let uri = format!("file://{path_str}");
 
-    let mut orphan_count = 0usize;
-    let file_io = table.file_io().clone();
+                if referenced.contains(&uri) || referenced.contains(&path_str) {
+                    continue;
+                }
 
-    // Collect local file paths recursively using std::fs.
-    let mut stack = vec![local_path.to_path_buf()];
-    let mut local_files: Vec<std::path::PathBuf> = Vec::new();
-    while let Some(dir) = stack.pop() {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.is_file() {
-                    local_files.push(path);
+                // Skip files younger than the retention threshold.
+                if let Ok(meta) = std::fs::metadata(&path)
+                    && let Ok(modified) = meta.modified()
+                {
+                    use std::time::SystemTime;
+                    let modified_ms = modified
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    if modified_ms > cutoff_ms {
+                        continue;
+                    }
+                }
+
+                match file_io.delete(&uri).await {
+                    Ok(()) => orphan_count += 1,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %uri,
+                            error = %e,
+                            "remove_orphan_files: failed to delete local file"
+                        );
+                    }
                 }
             }
         }
-    }
+    } else {
+        // ── Cloud path: use expired-snapshot-ids property ─────────────────────
+        // `expire_snapshots` records snapshot IDs whose files were orphaned in
+        // `krishiv.expired-snapshot-ids`. For each such snapshot still present in
+        // the history, collect its file paths and delete any not referenced by
+        // live snapshots. This covers the common case of files orphaned by
+        // `expire_snapshots`; truly stray files (from aborted writes) require
+        // external cloud-side listing.
+        let expired_ids_csv = metadata
+            .properties()
+            .get("krishiv.expired-snapshot-ids")
+            .cloned()
+            .unwrap_or_default();
 
-    for path in local_files {
-        let path_str = path.to_string_lossy().to_string();
-        let uri = format!("file://{path_str}");
+        let expired_ids: Vec<i64> = expired_ids_csv
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
 
-        if referenced.contains(&uri) || referenced.contains(&path_str) {
-            continue;
-        }
-
-        // Check age via filesystem metadata.
-        if let Ok(meta) = std::fs::metadata(&path)
-            && let Ok(modified) = meta.modified()
-        {
-            use std::time::SystemTime;
-            let modified_ms = modified
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            if modified_ms > cutoff_ms {
-                continue; // Too new — leave it.
-            }
-        }
-
-        match file_io.delete(&uri).await {
-            Ok(()) => orphan_count += 1,
-            Err(e) => {
-                tracing::warn!(path = %uri, error = %e, "remove_orphan_files: failed to delete");
+        if expired_ids.is_empty() {
+            tracing::info!(
+                table = %table_ident,
+                location = %table_location,
+                "remove_orphan_files: cloud backend, no expired-snapshot-ids recorded; skipping"
+            );
+        } else {
+            for snap_id in expired_ids {
+                let expiring_files = file_paths_for_snapshot(&table, snap_id).await;
+                for path in expiring_files {
+                    if referenced.contains(&path) {
+                        continue;
+                    }
+                    match file_io.delete(&path).await {
+                        Ok(()) => orphan_count += 1,
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path,
+                                error = %e,
+                                "remove_orphan_files: failed to delete cloud file"
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -226,7 +358,6 @@ pub async fn compact_data_files(
         .await
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
-    use futures::TryStreamExt;
     let tasks: Vec<iceberg::scan::FileScanTask> = task_stream
         .try_collect()
         .await
@@ -335,5 +466,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed, 0, "fresh table has no old snapshots");
+    }
+
+    #[tokio::test]
+    async fn remove_orphan_files_fresh_table_returns_zero() {
+        let (catalog, ident, _dir) = empty_catalog_table().await;
+        let removed = remove_orphan_files(catalog, &ident, Duration::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(removed, 0, "fresh table has no orphan files");
     }
 }

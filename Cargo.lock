@@ -5321,6 +5321,7 @@ dependencies = [
  "tokio",
  "tonic 0.14.6",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]

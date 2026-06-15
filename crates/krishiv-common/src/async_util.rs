@@ -4,18 +4,37 @@ use std::future::Future;
 use std::sync::OnceLock;
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
+/// Env var that overrides the fallback runtime's worker-thread count.
+///
+/// Default: number of logical CPUs capped at 4 so the fallback runtime does
+/// not monopolise cores in embedded/test workloads.  Set to `"0"` to let
+/// Tokio default to the CPU count without a cap.
+const FALLBACK_RUNTIME_THREADS_ENV: &str = "KRISHIV_FALLBACK_RUNTIME_THREADS";
+
 static FALLBACK_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn fallback_runtime() -> &'static tokio::runtime::Runtime {
     FALLBACK_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, "failed to create fallback Tokio runtime; panicking");
-                panic!("failed to create fallback Tokio runtime: {e}");
-            })
+        let threads = std::env::var(FALLBACK_RUNTIME_THREADS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                // Default: min(cpu_count, 4) — avoids monopolising the host
+                // under embedded workloads while providing enough parallelism
+                // for concurrent block_on callers (bottleneck B3).
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(4))
+                    .unwrap_or(4)
+            });
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        if threads > 0 {
+            builder.worker_threads(threads);
+        }
+        builder.build().unwrap_or_else(|e| {
+            tracing::error!(error = %e, "failed to create fallback Tokio runtime; panicking");
+            panic!("failed to create fallback Tokio runtime: {e}");
+        })
     })
 }
 

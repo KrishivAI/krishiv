@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
+use twox_hash::XxHash64;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, StringArray};
@@ -366,9 +367,12 @@ impl DeduplicatingStream {
     }
 
     /// Compute a stable u64 hash over the dedup-column values for a single row.
+    ///
+    /// Uses XxHash64 with a fixed seed so the hash is deterministic across
+    /// Rust versions, process restarts, and executor instances.  `DefaultHasher`
+    /// is intentionally not stable and cannot be used here.
     fn row_hash(batch: &RecordBatch, row: usize, columns: &[String]) -> u64 {
-        use std::hash::DefaultHasher;
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = XxHash64::with_seed(0);
         for col_name in columns {
             // Hash the column name as a separator so ("ab","c") ≠ ("a","bc").
             col_name.hash(&mut hasher);

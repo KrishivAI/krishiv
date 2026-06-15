@@ -33,6 +33,13 @@ use crate::actions::{
 };
 use crate::host::FlightExecutionHost;
 
+/// Env var controlling how many queries may execute concurrently through the
+/// Flight SQL ingress. Requests above the limit receive `Status::resource_exhausted`.
+/// Default: 256.  Set to `"0"` to disable the cap entirely.
+const FLIGHT_MAX_CONCURRENT_QUERIES_ENV: &str = "KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES";
+/// Default cap on simultaneous Flight SQL query executions.
+const DEFAULT_FLIGHT_MAX_CONCURRENT_QUERIES: usize = 256;
+
 /// **Beta API**: may change between minor releases.
 #[derive(Clone)]
 pub struct KrishivFlightSqlService {
@@ -45,6 +52,9 @@ pub struct KrishivFlightSqlService {
     bound_params: Arc<tokio::sync::Mutex<lru::LruCache<String, Vec<RecordBatch>>>>,
     /// Active Flight SQL transaction ids issued by `BeginTransaction`.
     transactions: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Semaphore that caps the number of queries executing concurrently through
+    /// the Flight ingress. `None` means no cap.
+    inflight_queries: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 const PREPARED_STMT_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(128) {
@@ -52,18 +62,37 @@ const PREPARED_STMT_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUs
     None => panic!("capacity must be non-zero"),
 };
 
+fn read_max_concurrent_queries() -> Option<usize> {
+    let n = std::env::var(FLIGHT_MAX_CONCURRENT_QUERIES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FLIGHT_MAX_CONCURRENT_QUERIES);
+    if n == 0 { None } else { Some(n) }
+}
+
 impl std::fmt::Debug for KrishivFlightSqlService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KrishivFlightSqlService")
             .field("auth", &self.auth.is_some())
             .field("policy", &self.policy.is_some())
+            .field(
+                "max_concurrent_queries",
+                &self
+                    .inflight_queries
+                    .as_ref()
+                    .map(|s| s.available_permits()),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl KrishivFlightSqlService {
     /// Create a new `KrishivFlightSqlService` with a shared server-side cluster.
+    ///
+    /// The concurrent-query cap is read from `KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES`
+    /// (default 256; set to `"0"` to disable).
     pub fn new() -> Result<Self, Status> {
+        let limit = read_max_concurrent_queries();
         Ok(Self {
             auth: None,
             policy: None,
@@ -75,11 +104,13 @@ impl KrishivFlightSqlService {
                 PREPARED_STMT_CAPACITY,
             ))),
             transactions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
         })
     }
 
     /// Attach a pre-built execution host (tests / custom wiring).
     pub fn with_host(host: FlightExecutionHost) -> Self {
+        let limit = read_max_concurrent_queries();
         Self {
             auth: None,
             policy: None,
@@ -91,7 +122,18 @@ impl KrishivFlightSqlService {
                 PREPARED_STMT_CAPACITY,
             ))),
             transactions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
         }
+    }
+
+    /// Override the concurrent-query cap programmatically. `0` disables the cap.
+    pub fn with_max_concurrent_queries(mut self, n: usize) -> Self {
+        self.inflight_queries = if n == 0 {
+            None
+        } else {
+            Some(Arc::new(tokio::sync::Semaphore::new(n)))
+        };
+        self
     }
 
     /// Attach an [`AuthProvider`] to this service.
@@ -289,6 +331,22 @@ impl FlightSqlService for KrishivFlightSqlService {
 
         // Check table access if a policy is configured.
         self.check_table_access(query)?;
+
+        // Acquire a concurrent-query slot. Returns immediately if no cap is set;
+        // returns resource_exhausted when the semaphore is saturated.
+        let _permit = if let Some(sem) = &self.inflight_queries {
+            match sem.try_acquire() {
+                Ok(p) => Some(p),
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    return Err(Status::resource_exhausted(
+                        "too many concurrent Flight SQL queries; retry later",
+                    ));
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => None,
+            }
+        } else {
+            None
+        };
 
         let batches = self
             .host

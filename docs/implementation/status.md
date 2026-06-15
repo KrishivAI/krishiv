@@ -1,5 +1,66 @@
 # Krishiv Implementation Status
 
+## 2026-06-15 — Architectural fixes: hashing, runtimes, rate limits, tracing, SQL parsers
+
+Implemented fixes for all architectural issues identified in the codebase audit:
+
+### B1 — Stable deduplication hash (`krishiv-api/streaming_dataframe.rs`)
+- Replaced `std::hash::DefaultHasher` (non-deterministic across Rust versions and restarts) in
+  `DeduplicatingStream::row_hash` with `twox_hash::XxHash64::with_seed(0)` — deterministic across
+  executors, process restarts, and Rust versions.
+- Added `twox-hash = { workspace = true }` to `crates/krishiv-api/Cargo.toml`.
+
+### B2 — Configurable fallback runtime threads (`krishiv-common/async_util.rs`)
+- Changed `FALLBACK_RUNTIME` from hardcoded 2 worker threads to `min(cpu_count, 4)` by default.
+- Added `KRISHIV_FALLBACK_RUNTIME_THREADS` env var override (set to `"0"` for no cap).
+
+### B3 — Configurable task assignment RPC limit (`krishiv-scheduler/coordinator/task_assignment.rs`)
+- Changed `MAX_CONCURRENT_ASSIGNMENT_RPCS` from hardcoded 64 to runtime-configurable 128 via
+  `KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS` env var.
+- Exposed `DEFAULT_MAX_CONCURRENT_ASSIGNMENT_RPCS` and `max_concurrent_assignment_rpcs()`.
+
+### B4 — Typed `SqlStream` errors (`krishiv-sql/lib.rs`, `krishiv-api/dataframe.rs`)
+- Changed `SqlStream` error type from `String` to `SqlError` for better observability.
+- Added `SqlError → String` adapter at the `KrishivStream` public boundary in `dataframe.rs`.
+
+### B5 — AST-based DML parsers (`krishiv-sql/lib.rs`, `krishiv-sql/sql_tests.rs`)
+- Replaced regex-based `parse_dml_delete` and `parse_dml_update` with sqlparser AST parsers.
+- Correctly handles quoted identifiers, subqueries, comma-containing expressions, SQL comments.
+- Added `ParsedUpdate` struct with structured `table_ref`, `assignments`, `predicate` fields.
+- Removed now-redundant `split_set_assignments` / `push_set_pair` helper functions.
+- Fixed stray `pub mod kafka_table;` in `sql_tests.rs` (E0583 file-not-found error).
+
+### B6 — Iceberg maintenance: orphan file deletion and cloud storage (`krishiv-connectors/lakehouse/maintenance.rs`)
+- `expire_snapshots`: Deletes orphaned data files via `FileIO::delete()` from expired snapshots
+  not referenced by kept snapshots. Works for local, S3, GCS, Azure backends. Records expired
+  IDs in `krishiv.expired-snapshot-ids` table property for audit.
+- `remove_orphan_files`: Local paths use `std::fs` listing; cloud paths read
+  `krishiv.expired-snapshot-ids` and delete orphans via `FileIO::delete()`.
+- Added `file_paths_for_snapshot(table, snapshot_id)` helper for per-snapshot file enumeration.
+
+### B7 — Tracing span propagation (`krishiv-scheduler/coordinator/mod.rs`)
+- Wrapped all three background orchestration loops with named `tracing::info_span!(...)`.
+- Wrapped concurrent assignment delivery futures with `.instrument(tracing::Span::current())`.
+
+### B8 — Flight SQL ingress rate limiting (`krishiv-flight-sql/service.rs`)
+- Added `inflight_queries: Option<Arc<Semaphore>>` to `KrishivFlightSqlService`.
+- Default cap: 256 concurrent queries via `KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES` env var.
+- `do_get_statement` acquires a permit; returns `resource_exhausted` when saturated.
+- `with_max_concurrent_queries(n)` builder method for programmatic override.
+
+### Validation
+
+```
+cargo check --workspace                               # 0 errors
+cargo check -p krishiv-connectors --features iceberg  # 0 errors
+cargo test -p krishiv-common --lib                    # 80/80 passed
+cargo test -p krishiv-scheduler --lib                 # 310/310 passed
+cargo test -p krishiv-sql --lib                       # 299/299 passed
+cargo test -p krishiv-api --lib                       # 125/125 passed
+```
+
+---
+
 ## 2026-06-15 — Refactor bugfixes: schema_registry visibility and scheduler chaos test
 
 Fixed compile/test gaps introduced by the large-file split:

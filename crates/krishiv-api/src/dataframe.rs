@@ -613,7 +613,17 @@ Execution statistics:
                     ))
                     .map_err(KrishivError::from)?;
             }
-            dataframe.execute_stream().await.map_err(Into::into)
+            dataframe
+                .execute_stream()
+                .await
+                .map(|sql_stream| {
+                    use futures::StreamExt;
+                    // Adapt SqlError → String at the KrishivStream boundary so
+                    // callers retain a stable public error type.
+                    let mapped = sql_stream.map(|r| r.map_err(|e| e.to_string()));
+                    Box::pin(mapped) as crate::streaming_dataframe::KrishivStream
+                })
+                .map_err(Into::into)
         } else {
             self.runtime
                 .accept_plan(&PhysicalPlan::new(
