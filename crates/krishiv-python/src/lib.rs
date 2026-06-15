@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 
 mod agg;
 mod batch;
+mod blocking_session;
 mod dataframe;
 mod errors;
 mod expression;
@@ -22,6 +23,7 @@ mod process_api;
 mod query_handle;
 mod query_result;
 mod relation;
+mod rust_udf;
 mod schema;
 mod session;
 mod sinks;
@@ -85,6 +87,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::register(m)?;
 
     m.add_class::<session::PySession>()?;
+    m.add_class::<blocking_session::PyBlockingSession>()?;
+    m.add_class::<rust_udf::PyRustScalarUdf>()?;
     m.add_class::<dataframe::PyDataFrame>()?;
     m.add_class::<prepared::PyPreparedStatement>()?;
     m.add_class::<expression::PyColumn>()?;
@@ -150,6 +154,9 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Streaming write (Phase F parity)
     m.add_function(wrap_pyfunction!(streaming_dataframe::interval_join, m)?)?;
+    m.add_function(wrap_pyfunction!(streaming_dataframe::stream_table_join, m)?)?;
+    m.add_function(wrap_pyfunction!(streaming_dataframe::temporal_join, m)?)?;
+    m.add_function(wrap_pyfunction!(streaming_dataframe::stream_stream_join, m)?)?;
     m.add_class::<streaming_dataframe::PyStreamingDataFrame>()?;
     m.add_class::<streaming_dataframe::PyDataStreamReader>()?;
     m.add_class::<streaming::PyStreamingQueryProgress>()?;

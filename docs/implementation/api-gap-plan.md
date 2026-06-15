@@ -49,9 +49,10 @@ matrix review.
 | Flight `CancelOperation` / `GetOperationProgress` | New `KrishivFlightAction` variants |
 | `FlightExecutionHost` registry | Shared across requests |
 
-## Deferred (explicit follow-up)
+## Deferred (explicit follow-up) — completed 2026-06-15
 
-- Distributed atomic sink writes
-- JDBC/ODBC gateway
-- Flight SQL transactions (`BEGIN`/`COMMIT`/`ROLLBACK`)
-- Generic reader/writer `option()` until typed per-format options exist
+- Distributed atomic sink writes (`DataFrameWriter` → staged parquet sink)
+- JDBC/ODBC gateway (`krishiv-sql-gateway` crate)
+- Flight SQL transactions (`BeginTransaction` / `EndTransaction` actions)
+- Generic reader/writer `option()` compatibility mapping
+- Python: `BlockingSession`, streaming joins, `register_function` for Rust UDFs

@@ -18,6 +18,7 @@ members = [
     "crates/krishiv-ui",
     "crates/krishiv-python",
     "crates/krishiv-flight-sql",
+    "crates/krishiv-sql-gateway",
     "crates/krishiv-metrics",
     "crates/krishiv-bench",
 ]
@@ -40,6 +41,7 @@ default-members = [
     "crates/krishiv-ui",
     "crates/krishiv-python",
     "crates/krishiv-flight-sql",
+    "crates/krishiv-sql-gateway",
     "crates/krishiv-metrics",
     "crates/krishiv-bench",
 ]

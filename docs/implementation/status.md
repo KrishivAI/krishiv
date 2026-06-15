@@ -1,5 +1,29 @@
 # Krishiv Implementation Status
 
+## 2026-06-15 — Deferred API gap items (distributed sink, gateway, Flight tx, Python)
+
+Implemented the deferred follow-ups from `docs/implementation/api-gap-plan.md`:
+
+- **`krishiv-api`**: `DataFrameWriter::save_target_async` routes remote SQL-backed parquet
+  writes through the staged `object-parquet-sink` protocol; expanded deprecated reader/writer
+  `option()` string compatibility mapping.
+- **`krishiv-flight-sql`**: `BeginTransaction` / `EndTransaction` Flight SQL actions with
+  transaction-id validation on statement queries.
+- **`krishiv-sql-gateway`** (new crate): separately versioned blocking SQL gateway facade with
+  SQLSTATE error mapping for JDBC/ODBC-oriented clients.
+- **`krishiv-python`**: `BlockingSession`, `RustScalarUdf` + `register_function`, streaming
+  join exports (`stream_table_join`, `temporal_join`, `stream_stream_join`).
+
+### Validation
+
+```
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo check -p krishiv-api -p krishiv-flight-sql -p krishiv-sql-gateway -p krishiv-python
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-flight-sql --lib flight_sql_transaction
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-sql-gateway
+```
+
+---
+
 ## 2026-06-15 — API gap closure across Rust, SQL, and Python
 
 Closed the cross-surface API parity gaps from the API matrix review:

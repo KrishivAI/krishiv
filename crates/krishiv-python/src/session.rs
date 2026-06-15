@@ -771,6 +771,10 @@ impl PySession {
         Ok(())
     }
 
+    pub fn register_function(&self, name: String, udf: &crate::rust_udf::PyRustScalarUdf) -> PyResult<()> {
+        crate::rust_udf::register_function(&self.inner, name, udf)
+    }
+
     pub fn list_udfs(&self) -> Vec<String> {
         self.inner.scalar_udf_names()
     }

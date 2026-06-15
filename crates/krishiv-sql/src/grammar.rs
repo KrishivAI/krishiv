@@ -523,8 +523,9 @@ static FEATURES: &[FeatureEntry] = &[
         "flight.transactions",
         "FLIGHT SQL",
         "BEGIN/COMMIT/ROLLBACK transactions",
-        L,
-    ),
+        P,
+    )
+    .with_note("Flight SQL BeginTransaction/EndTransaction actions; SQL BEGIN/COMMIT not routed"),
     FeatureEntry::new(
         "flight.schemas",
         "FLIGHT SQL",

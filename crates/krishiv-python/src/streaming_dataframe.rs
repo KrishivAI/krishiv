@@ -132,6 +132,127 @@ pub fn interval_join(
         .collect())
 }
 
+#[pyfunction]
+#[pyo3(signature = (stream_batches, table_snapshots, stream_time_col, version_col, lookback_ms, *, inner_join = false))]
+pub fn stream_table_join(
+    stream_batches: Vec<crate::batch::PyBatch>,
+    table_snapshots: Vec<crate::batch::PyBatch>,
+    stream_time_col: String,
+    version_col: String,
+    lookback_ms: i64,
+    inner_join: bool,
+) -> PyResult<Vec<(crate::batch::PyBatch, Option<crate::batch::PyBatch>)>> {
+    let stream: Vec<_> = stream_batches
+        .into_iter()
+        .map(|b| b.record_batch().clone())
+        .collect();
+    let table: Vec<_> = table_snapshots
+        .into_iter()
+        .map(|b| b.record_batch().clone())
+        .collect();
+    let pairs = krishiv_api::streaming_dataframe::StreamingDataFrame::stream_table_join(
+        &stream,
+        &table,
+        &stream_time_col,
+        &version_col,
+        lookback_ms,
+        inner_join,
+    )
+    .map_err(map_krishiv_error)?;
+    Ok(pairs
+        .into_iter()
+        .map(|(stream_batch, table_batch)| {
+            (
+                crate::batch::PyBatch::from_record_batch(stream_batch),
+                table_batch.map(|batch| crate::batch::PyBatch::from_record_batch(batch)),
+            )
+        })
+        .collect())
+}
+
+#[pyfunction]
+#[pyo3(signature = (stream_batches, table_snapshots, stream_time_col, version_col, lookback_ms, *, inner_join = false, join_keys = None))]
+pub fn temporal_join(
+    stream_batches: Vec<crate::batch::PyBatch>,
+    table_snapshots: Vec<crate::batch::PyBatch>,
+    stream_time_col: String,
+    version_col: String,
+    lookback_ms: i64,
+    inner_join: bool,
+    join_keys: Option<Vec<String>>,
+) -> PyResult<Vec<(crate::batch::PyBatch, Option<crate::batch::PyBatch>)>> {
+    use krishiv_dataflow::temporal_join::TemporalJoinSpec;
+
+    let stream: Vec<_> = stream_batches
+        .into_iter()
+        .map(|b| b.record_batch().clone())
+        .collect();
+    let table: Vec<_> = table_snapshots
+        .into_iter()
+        .map(|b| b.record_batch().clone())
+        .collect();
+    let spec = TemporalJoinSpec {
+        stream_time_col,
+        join_keys: join_keys.unwrap_or_default(),
+        inner_join,
+    };
+    let pairs = krishiv_api::streaming_dataframe::temporal_join(
+        &stream,
+        &table,
+        &spec,
+        &version_col,
+        lookback_ms,
+    )
+    .map_err(map_krishiv_error)?;
+    Ok(pairs
+        .into_iter()
+        .map(|(stream_batch, table_batch)| {
+            (
+                crate::batch::PyBatch::from_record_batch(stream_batch),
+                table_batch.map(|batch| crate::batch::PyBatch::from_record_batch(batch)),
+            )
+        })
+        .collect())
+}
+
+#[pyfunction]
+#[pyo3(signature = (left, right, left_time_col, right_time_col, lower_bound_ms, upper_bound_ms))]
+pub fn stream_stream_join(
+    left: Vec<crate::batch::PyBatch>,
+    right: Vec<crate::batch::PyBatch>,
+    left_time_col: String,
+    right_time_col: String,
+    lower_bound_ms: i64,
+    upper_bound_ms: i64,
+) -> PyResult<Vec<(crate::batch::PyBatch, crate::batch::PyBatch)>> {
+    let left_batches: Vec<_> = left
+        .into_iter()
+        .map(|b| b.record_batch().clone())
+        .collect();
+    let right_batches: Vec<_> = right
+        .into_iter()
+        .map(|b| b.record_batch().clone())
+        .collect();
+    let pairs = krishiv_api::streaming_dataframe::StreamingDataFrame::stream_stream_join(
+        &left_batches,
+        &right_batches,
+        &left_time_col,
+        &right_time_col,
+        lower_bound_ms,
+        upper_bound_ms,
+    )
+    .map_err(map_krishiv_error)?;
+    Ok(pairs
+        .into_iter()
+        .map(|(l, r)| {
+            (
+                crate::batch::PyBatch::from_record_batch(l.as_ref().clone()),
+                crate::batch::PyBatch::from_record_batch(r.as_ref().clone()),
+            )
+        })
+        .collect())
+}
+
 #[pyclass(name = "DataStreamReader")]
 pub struct PyDataStreamReader {
     session: krishiv_api::Session,
