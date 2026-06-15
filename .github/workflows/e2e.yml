@@ -78,7 +78,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
       - name: Build cluster binaries
         run: |
-          cargo build -p krishiv-scheduler --bin krishiv-clusterd
+          cargo build -p krishiv-scheduler --bin krishiv-clusterd --features etcd
           cargo build -p krishiv-executor
       - name: Distributed scheduler integration tests
         run: cargo test -p krishiv-scheduler --test distributed_e2e
