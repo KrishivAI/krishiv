@@ -51,8 +51,11 @@
     }
     setIndicator(true);
     try {
+      var headers = window.krishivAuthHeaders
+        ? window.krishivAuthHeaders({ "X-Requested-With": "krishiv-live" })
+        : { "X-Requested-With": "krishiv-live" };
       var resp = await fetch(window.location.href, {
-        headers: { "X-Requested-With": "krishiv-live" },
+        headers: headers,
         credentials: "same-origin",
       });
       if (!resp.ok) {

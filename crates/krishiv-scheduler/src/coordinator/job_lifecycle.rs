@@ -206,6 +206,10 @@ impl Coordinator {
         // Save before update is moved.
         let missing_partitions: Vec<krishiv_proto::MissingShufflePartition> =
             update.missing_shuffle_partitions().to_vec();
+        let hot_key_reports = update
+            .output_metadata()
+            .map(|meta| meta.hot_key_reports().to_vec())
+            .unwrap_or_default();
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
 
         if outcome == TaskUpdateOutcome::Duplicate {
@@ -219,6 +223,16 @@ impl Coordinator {
                 "duplicate task status update ignored without replaying side effects"
             );
             return Ok(outcome);
+        }
+
+        if !hot_key_reports.is_empty() {
+            let throttles = self.process_hot_key_reports(&hot_key_reports);
+            if !throttles.is_empty() {
+                self.pending_source_throttles
+                    .entry(executor_id_for_circuit.clone())
+                    .or_default()
+                    .extend(throttles);
+            }
         }
 
         // IMM-2 (Circuit Breaker Strengthening):

@@ -1,5 +1,25 @@
 # Krishiv Implementation Status
 
+## 2026-06-14 — Audit follow-ups: hot-key loop, connectors, UI, operator
+
+Implemented the documented follow-up work on PR #79:
+
+- **`krishiv-scheduler`**: Hot-key reports in `TaskOutputMetadata` now drive `process_hot_key_reports` from `apply_task_update`; throttles queue in `pending_source_throttles` and drain on heartbeat. Shared `heartbeat_mapping` helpers; in-process heartbeat parity (throttles/checkpoints). Regression test `hot_key_reports_from_task_status_queue_throttles_and_skew_override`.
+- **`krishiv-connectors`**: `ConnectorQualityHook::flush_rejected` forwards pre-filtered batches via `DeadLetterSink::write_rejected_to_secondary` (no double quality check). Registry drivers for `csv` and `avro` kinds.
+- **`krishiv-ui`**: `embedded_router` adds `GET /api/v1/jobs` and `GET /api/v1/executors`. Bearer token injected via `auth_meta.html` + `krishiv-auth.js`; SQL editor and live polling send `Authorization` when `KRISHIV_UI_TOKEN` is set.
+- **`krishiv-operator`**: Post-create pod status inspection wires `detect_executor_pod_launch_failure` into reconciler. CLI/env `--coordinator-endpoint` / `KRISHIV_COORDINATOR_ENDPOINT`.
+
+### Validation
+
+```
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-scheduler --lib   # 311/311
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-connectors --lib  # 73/73
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-ui --lib          # 24/24
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-operator --lib    # 42/42
+```
+
+---
+
 ## 2026-06-14 — Cross-crate audit: bugs, dead code, docs, and tests
 
 Completed a parallel audit and applied high-impact fixes across core crates:

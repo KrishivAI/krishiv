@@ -221,9 +221,15 @@ pub fn default_registry() -> ConnectorRegistry {
     let mut registry = ConnectorRegistry::new();
     registry.register_source(Arc::new(super::drivers::ParquetSourceDriver));
     registry.register_sink(Arc::new(super::drivers::ParquetSinkDriver));
+    registry.register_source(Arc::new(super::drivers::CsvSourceDriver));
     registry.register_source(Arc::new(super::drivers::S3SourceDriver));
     registry.register_sink(Arc::new(super::drivers::S3SinkDriver));
     registry.register_two_phase_sink(Arc::new(super::drivers::LocalParquetTwoPhaseSinkDriver));
+    #[cfg(feature = "avro")]
+    {
+        registry.register_source(Arc::new(super::drivers::AvroSourceDriver));
+        registry.register_sink(Arc::new(super::drivers::AvroSinkDriver));
+    }
     #[cfg(feature = "kafka")]
     {
         registry.register_source(Arc::new(super::drivers::KafkaSourceDriver));

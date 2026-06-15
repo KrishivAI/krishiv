@@ -76,7 +76,10 @@ impl Coordinator {
             self.apply_streaming_task_state(state);
         }
         // R7.2 Group D: process hot-key reports and record adaptive decisions.
-        let source_throttles = self.process_hot_key_reports(&hot_key_reports);
+        let mut source_throttles = self.process_hot_key_reports(&hot_key_reports);
+        if let Some(pending) = self.pending_source_throttles.remove(&executor_id) {
+            source_throttles.extend(pending);
+        }
         // Record streaming progress for observability (watermark, throughput, state size).
         for report in &streaming_progress {
             self.record_streaming_progress(report);

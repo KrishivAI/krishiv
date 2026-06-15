@@ -4,10 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
-    DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorHeartbeat,
-    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, RegisterExecutorRequest,
-    RegisterExecutorResponse, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
-    TransportVersion,
+    DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorHeartbeatRequest,
+    ExecutorHeartbeatResponse, RegisterExecutorRequest, RegisterExecutorResponse,
+    TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
 };
 use tokio::sync::RwLock;
 
@@ -119,30 +118,15 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
         let request = request.into_inner();
-        let executor_id = request.executor_id().clone();
         let lease_generation = request.lease_generation();
         let running_tasks: Vec<_> = request
             .running_attempts()
             .iter()
             .map(|a| a.task_id().clone())
             .collect();
-        let streaming_states: Vec<_> = request.streaming_task_states().to_vec();
 
         // Fast path: update the executor registry via the sharded inner lock.
-        // This avoids serializing the heartbeat behind the full coordinator lock
-        // when the heartbeat carries no streaming state updates.
-        let mut heartbeat = ExecutorHeartbeat::new(executor_id.clone(), request.state())
-            .with_lease_generation(lease_generation)
-            .with_running_tasks(running_tasks.clone());
-        if let Some(bytes) = request.memory_used_bytes() {
-            heartbeat = heartbeat.with_memory_used_bytes(bytes);
-        }
-        if let Some(bytes) = request.memory_limit_bytes() {
-            heartbeat = heartbeat.with_memory_limit_bytes(bytes);
-        }
-        if let Some(count) = request.active_task_count() {
-            heartbeat = heartbeat.with_active_task_count(count);
-        }
+        let mut registry_heartbeat = crate::coordinator::executor_heartbeat_from_request(&request);
 
         {
             let coordinator = lock_coord(&self.coordinator)?;
@@ -154,9 +138,8 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         let lease_generation = {
             let mut inner = self.executor_inner.write().await;
             let lg = inner
-                .handle_heartbeat(heartbeat)
+                .handle_heartbeat(registry_heartbeat)
                 .map_err(status_from_scheduler_error)?;
-            // Sync inner → outer to prevent dual-state drift (G3).
             let mut coord = lock_coord(&self.coordinator)?;
             coord.executors.clone_from(&inner.executors);
             coord.state = inner.state;
@@ -164,24 +147,33 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
             lg
         };
 
-        // Complex heartbeat processing (streaming states, hot-keys, LLM quota,
-        // checkpoint initiation) still needs the full coordinator lock.
-        if !streaming_states.is_empty() {
-            let mut coordinator = lock_coord(&self.coordinator)?;
-            coordinator
-                .executor_heartbeat(
-                    ExecutorHeartbeat::new(executor_id, request.state())
-                        .with_lease_generation(lease_generation)
-                        .with_running_tasks(running_tasks)
-                        .with_streaming_task_states(streaming_states),
-                )
-                .map_err(status_from_scheduler_error)?;
-        }
+        // Full coordinator heartbeat for hot-keys, streaming progress, checkpoints,
+        // and queued throttle commands from task-status updates.
+        let full_heartbeat =
+            crate::coordinator::executor_heartbeat_from_request(&request)
+                .with_lease_generation(lease_generation)
+                .with_running_tasks(running_tasks);
 
-        Ok(tonic::Response::new(ExecutorHeartbeatResponse::new(
-            lease_generation,
-            TransportDisposition::Accepted,
-        )))
+        let response = {
+            let mut coordinator = lock_coord(&self.coordinator)?;
+            match coordinator.executor_heartbeat(full_heartbeat) {
+                Ok(effects) => {
+                    crate::coordinator::executor_heartbeat_response_from_effects(effects)
+                }
+                Err(SchedulerError::UnknownExecutor { .. }) => ExecutorHeartbeatResponse::new(
+                    request.lease_generation(),
+                    TransportDisposition::UnknownExecutor,
+                )
+                .with_message("executor is not registered"),
+                Err(SchedulerError::StaleExecutorLease { expected, .. }) => {
+                    ExecutorHeartbeatResponse::new(expected, TransportDisposition::StaleLease)
+                        .with_message("executor lease generation is stale")
+                }
+                Err(error) => return Err(status_from_scheduler_error(error)),
+            }
+        };
+
+        Ok(tonic::Response::new(response))
     }
 
     async fn task_status(
