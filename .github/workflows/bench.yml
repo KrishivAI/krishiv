@@ -27,7 +27,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
       - uses: taiki-e/install-action@just
 
       - name: Restore main baseline

@@ -31,7 +31,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
       - uses: taiki-e/install-action@just
       - run: just fmt
       - run: just lint
@@ -65,7 +65,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld protobuf-compiler
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev protobuf-compiler
       - uses: taiki-e/install-action@just
       - run: just check-${{ matrix.mode }}
 
@@ -83,7 +83,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
       - uses: taiki-e/install-action@just
       - run: just test
 
