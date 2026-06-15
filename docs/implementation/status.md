@@ -1,5 +1,66 @@
 # Krishiv Implementation Status
 
+## 2026-06-15 — Refactor bugfixes: schema_registry visibility and scheduler chaos test
+
+Fixed compile/test gaps introduced by the large-file split:
+
+- **`krishiv-connectors/schema_registry`**: restored avro helpers in `avro.rs`; fixed `pub(crate)` visibility for client fetch/cache APIs and deserializer `client` fields so sibling modules and parent tests compile with the `schema-registry` feature.
+- **`krishiv-scheduler`**: re-added missing `#[test]` on `chaos_coordinator_failover_mid_ack_fencing` after a bad section boundary in `chaos_jcp.rs.inc`.
+
+### Validation
+
+```
+CXX=g++ CXXFLAGS="-include cstdint" cargo check --workspace
+CXX=g++ CXXFLAGS="-include cstdint" RUSTFLAGS="-C linker=g++" cargo test -p krishiv-connectors --features schema-registry --lib schema_registry::tests
+CXX=g++ CXXFLAGS="-include cstdint" RUSTFLAGS="-C linker=g++" cargo test -p krishiv-scheduler --lib chaos_coordinator_failover_mid_ack_fencing
+```
+
+---
+
+## 2026-06-15 — Large-file refactor: split tests and production modules
+
+- **Test monoliths**: split `krishiv-scheduler` (18 sections), `krishiv-executor` (4), and `krishiv-shuffle` (12) via `include!` section files under `src/sections/`.
+- **`krishiv-sql`**: moved inline tests to `sql_tests.rs`; production `lib.rs` unchanged.
+- **`krishiv-state/checkpoint`**: split into `metadata`, `paths`, `storage_trait`, `io`, `local_fs`, `ephemeral`, `tests`.
+- **`krishiv-executor/runner`**: split into `partition`, `task_output`, `task_runner`, `executor_task_runner`, `runner_tests`.
+- **`krishiv-connectors`**: `schema_registry/` and `cdc/` submodules.
+- **`krishiv-ui`**: `router`, `handlers`, `views`.
+- **`krishiv-flight-sql`**: `service`, `actions`.
+- **`krishiv-metrics`**: `init`, `counters`.
+- **`krishiv-scheduler/job`**: `record`, `snapshot`, `scheduler`.
+- **`krishiv-plan` / `krishiv-dataflow`**: moved inline tests to dedicated `#[cfg(test)]` modules.
+
+### Validation
+
+```
+CXX=g++ CXXFLAGS="-include cstdint" RUSTFLAGS="-C linker=g++" cargo test -p krishiv-scheduler --lib --no-run
+CXX=g++ CXXFLAGS="-include cstdint" RUSTFLAGS="-C linker=g++" cargo test -p krishiv-executor -p krishiv-shuffle --lib --no-run
+CXX=g++ CXXFLAGS="-include cstdint" cargo check -p krishiv-state -p krishiv-executor -p krishiv-connectors -p krishiv-ui -p krishiv-flight-sql -p krishiv-metrics -p krishiv-sql
+```
+
+---
+
+## 2026-06-15 — Crate refactor: remove `krishiv-ai`, restore `krishiv-chaos`, slim default builds
+
+- **Removed `krishiv-ai`**: deprecated vector-sink shim; Python `ai`/`vector-sinks`/`qdrant`/`pgvector` features now gate `krishiv-connectors` directly.
+- **Dropped dead deps**: removed unused `krishiv-ai` edges from `krishiv-dataflow` and `krishiv-executor`.
+- **`krishiv-chaos`**: restored as a test-only crate; moved `chaos_suite` out of `krishiv-common` so the foundation crate no longer pulls scheduler/operator dev-deps.
+- **`krishiv-bench`**: removed from workspace `default-members` (still buildable via `cargo bench -p krishiv-bench`).
+- **`docs/README.md`**: added `krishiv-sql-gateway` and `krishiv-chaos` to the workspace map.
+- **Deferred**: `krishiv-api` → `krishiv-runtime` compile-graph slimming (needs optional cluster wiring in runtime).
+
+### Validation
+
+```
+cargo check --workspace
+cargo test -p krishiv-chaos
+cargo test -p krishiv-common
+cargo test -p krishiv-dataflow --lib
+cargo test -p krishiv-executor --lib
+```
+
+---
+
 ## 2026-06-15 — Deferred API gap items (distributed sink, gateway, Flight tx, Python)
 
 Implemented the deferred follow-ups from `docs/implementation/api-gap-plan.md`:

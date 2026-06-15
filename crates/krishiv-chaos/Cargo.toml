@@ -1,0 +1,26 @@
+[package]
+name = "krishiv-chaos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Cross-crate chaos and fault-injection integration tests"
+
+[dependencies]
+arrow = { workspace = true }
+krishiv-common = { path = "../krishiv-common", features = ["chaos"] }
+krishiv-connectors = { path = "../krishiv-connectors" }
+krishiv-operator = { path = "../krishiv-operator" }
+krishiv-plan = { path = "../krishiv-plan" }
+krishiv-proto = { path = "../krishiv-proto" }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-state = { path = "../krishiv-state" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[test]]
+name = "chaos_suite"
+path = "tests/chaos_suite.rs"
+
+[lints]
+workspace = true

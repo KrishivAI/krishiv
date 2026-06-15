@@ -43,10 +43,11 @@ Core implementation choices:
 | `krishiv-operator` | Kubernetes CRD and operator integration. |
 | `krishiv-ui` | Status API and web UI assets. |
 | `krishiv-flight-sql` | Arrow Flight SQL service. |
+| `krishiv-sql-gateway` | Separately versioned JDBC/ODBC SQL gateway facade. |
 | `krishiv-python` | PyO3 Python bindings. |
 | `krishiv-metrics` | Metrics, tracing, and debug report structures. |
-| `krishiv-ai` | Deprecated compatibility shim for optional vector sinks; not part of the standard compute-engine build. |
-| `krishiv-bench` | Benchmarks. Fault-injection/chaos tests live in `krishiv-common`'s `chaos` feature + `tests/chaos_suite.rs`. Schema registry helpers live in `krishiv-connectors`'s `schema-registry` feature. |
+| `krishiv-chaos` | Cross-crate chaos and fault-injection integration tests. |
+| `krishiv-bench` | Benchmarks (on-demand; excluded from default workspace builds). Schema registry helpers live in `krishiv-connectors`'s `schema-registry` feature. |
 
 ## Runtime Modes
 

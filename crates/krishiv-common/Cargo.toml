@@ -15,19 +15,5 @@ thiserror = { workspace = true }
 [features]
 chaos = []
 
-[dev-dependencies]
-krishiv-state = { path = "../krishiv-state" }
-krishiv-connectors = { path = "../krishiv-connectors" }
-krishiv-proto = { path = "../krishiv-proto" }
-krishiv-scheduler = { path = "../krishiv-scheduler" }
-krishiv-plan = { path = "../krishiv-plan" }
-krishiv-operator = { path = "../krishiv-operator" }
-tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
-
-[[test]]
-name = "chaos_suite"
-path = "tests/chaos_suite.rs"
-required-features = ["chaos"]
-
 [lints]
 workspace = true

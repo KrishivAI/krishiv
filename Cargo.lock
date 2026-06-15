@@ -5299,13 +5299,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krishiv-ai"
-version = "0.1.0"
-dependencies = [
- "krishiv-connectors",
-]
-
-[[package]]
 name = "krishiv-api"
 version = "0.1.0"
 dependencies = [
@@ -5345,16 +5338,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "krishiv-common"
+name = "krishiv-chaos"
 version = "0.1.0"
 dependencies = [
  "arrow 58.3.0",
+ "krishiv-common",
  "krishiv-connectors",
  "krishiv-operator",
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-state",
+ "tokio",
+]
+
+[[package]]
+name = "krishiv-common"
+version = "0.1.0"
+dependencies = [
+ "arrow 58.3.0",
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
@@ -5417,7 +5419,6 @@ dependencies = [
  "async-stream",
  "dashmap",
  "futures",
- "krishiv-ai",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-metrics",
@@ -5442,7 +5443,6 @@ dependencies = [
  "constant_time_eq 0.3.1",
  "dashmap",
  "futures",
- "krishiv-ai",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-dataflow",
@@ -5584,7 +5584,6 @@ dependencies = [
  "constant_time_eq 0.3.1",
  "futures",
  "jsonwebtoken",
- "krishiv-ai",
  "krishiv-api",
  "krishiv-common",
  "krishiv-connectors",
