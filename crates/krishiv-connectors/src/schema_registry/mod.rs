@@ -4,9 +4,9 @@ mod avro;
 mod client;
 mod protobuf;
 
-pub use avro::{AvroDeserializer, decode_avro_datum_payload};
+pub use avro::AvroDeserializer;
 pub use client::SchemaRegistryClient;
-pub use protobuf::{ProtobufDeserializer, parse_proto_schema};
+pub use protobuf::ProtobufDeserializer;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -116,11 +116,29 @@ impl SchemaRegistryClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::client::SchemaRegistryClient;
-    use super::avro::{decode_avro_datum_payload, avro_schema_to_arrow_schema, avro_values_to_column, avro_records_to_batches};
-    use super::protobuf::{parse_proto_schema, proto_fields_to_arrow_schema, decode_protobuf_wire, strip_confluent_protobuf_message_indexes, proto_records_to_batches, proto_values_to_column, ProtoValue};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    use apache_avro::types::Value;
+    use arrow::array::{
+        BinaryArray, BooleanArray, Float32Array, Float64Array, Int64Array, StringArray,
+    };
+    use arrow::datatypes::DataType;
+
+    use super::*;
+    use super::avro::{
+        avro_records_to_batches, avro_schema_to_arrow_schema, avro_values_to_column,
+        decode_avro_datum_payload,
+    };
+    use super::client::{
+        SchemaRegistryClient, MAX_CACHED_SCHEMA_BYTES, MAX_CACHED_SCHEMAS,
+        MAX_REGISTRY_RESPONSE_BYTES,
+    };
+    use super::protobuf::{
+        decode_protobuf_wire, parse_proto_schema, proto_fields_to_arrow_schema,
+        proto_records_to_batches, proto_values_to_column, strip_confluent_protobuf_message_indexes,
+        ProtoValue,
+    };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

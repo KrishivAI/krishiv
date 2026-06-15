@@ -17,18 +17,18 @@ pub(crate) const MAX_CACHED_SCHEMA_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Clone)]
 pub struct SchemaRegistryClient {
     base_url: Url,
-    cache: Arc<DashMap<u32, String>>,
-    avro_cache: Arc<DashMap<u32, Arc<apache_avro::Schema>>>,
+    pub(crate) cache: Arc<DashMap<u32, String>>,
+    pub(crate) avro_cache: Arc<DashMap<u32, Arc<apache_avro::Schema>>>,
     protobuf_cache: Arc<DashMap<u32, Arc<Vec<super::protobuf::ProtoField>>>>,
-    cache_state: Arc<StdMutex<SchemaCacheState>>,
-    fetch_locks: Arc<DashMap<u32, Arc<AsyncMutex<()>>>>,
+    pub(crate) cache_state: Arc<StdMutex<SchemaCacheState>>,
+    pub(crate) fetch_locks: Arc<DashMap<u32, Arc<AsyncMutex<()>>>>,
     http: Client,
 }
 
 #[derive(Default)]
-struct SchemaCacheState {
+pub(crate) struct SchemaCacheState {
     order: VecDeque<u32>,
-    total_bytes: usize,
+    pub(crate) total_bytes: usize,
 }
 
 struct FetchLockLease<'a> {
@@ -150,7 +150,7 @@ impl SchemaRegistryClient {
         Ok(body.schema)
     }
 
-    fn cached_schema(&self, id: u32) -> Option<String> {
+    pub(crate) fn cached_schema(&self, id: u32) -> Option<String> {
         let mut state = self
             .cache_state
             .lock()
@@ -170,7 +170,7 @@ impl SchemaRegistryClient {
         }
     }
 
-    fn cache_schema(&self, id: u32, schema: String) {
+    pub(crate) fn cache_schema(&self, id: u32, schema: String) {
         let mut state = self
             .cache_state
             .lock()
@@ -205,7 +205,10 @@ impl SchemaRegistryClient {
         state.order.push_back(id);
     }
 
-    async fn fetch_avro_schema(&self, id: u32) -> SchemaRegistryResult<Arc<apache_avro::Schema>> {
+    pub(crate) async fn fetch_avro_schema(
+        &self,
+        id: u32,
+    ) -> SchemaRegistryResult<Arc<apache_avro::Schema>> {
         if let Some(cached) = self.avro_cache.get(&id) {
             let schema = cached.clone();
             drop(cached);
@@ -224,7 +227,10 @@ impl SchemaRegistryClient {
         Ok(schema)
     }
 
-    async fn fetch_protobuf_schema(&self, id: u32) -> SchemaRegistryResult<Arc<Vec<super::protobuf::ProtoField>>> {
+    pub(crate) async fn fetch_protobuf_schema(
+        &self,
+        id: u32,
+    ) -> SchemaRegistryResult<Arc<Vec<super::protobuf::ProtoField>>> {
         if let Some(cached) = self.protobuf_cache.get(&id) {
             let schema = cached.clone();
             drop(cached);
@@ -240,7 +246,7 @@ impl SchemaRegistryClient {
         Ok(schema)
     }
 
-    fn cache_parsed_avro(&self, id: u32, schema: Arc<apache_avro::Schema>) {
+    pub(crate) fn cache_parsed_avro(&self, id: u32, schema: Arc<apache_avro::Schema>) {
         let _state = self
             .cache_state
             .lock()
@@ -260,7 +266,7 @@ impl SchemaRegistryClient {
         }
     }
 
-    fn parse_base_url(raw_url: &str) -> SchemaRegistryResult<Url> {
+    pub(crate) fn parse_base_url(raw_url: &str) -> SchemaRegistryResult<Url> {
         let raw_url = raw_url.trim();
         if raw_url.is_empty() {
             return Err(SchemaRegistryError::InvalidConfiguration {

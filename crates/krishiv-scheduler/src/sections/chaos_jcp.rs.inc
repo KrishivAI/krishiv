@@ -1,3 +1,4 @@
+#[test]
 fn chaos_coordinator_failover_mid_ack_fencing() {
     // High-priority PRR scenario: old coordinator tries to ack with stale/higher fencing token.
     // We simulate via harness + direct fencing checks.
