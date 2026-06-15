@@ -13,7 +13,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: "1.92"
-  TMPDIR: .tmp
   # librocksdb-sys 0.16 requires this on GCC 15+
   CXXFLAGS: "-include cstdint"
 
