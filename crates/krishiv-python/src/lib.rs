@@ -156,7 +156,10 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(streaming_dataframe::interval_join, m)?)?;
     m.add_function(wrap_pyfunction!(streaming_dataframe::stream_table_join, m)?)?;
     m.add_function(wrap_pyfunction!(streaming_dataframe::temporal_join, m)?)?;
-    m.add_function(wrap_pyfunction!(streaming_dataframe::stream_stream_join, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        streaming_dataframe::stream_stream_join,
+        m
+    )?)?;
     m.add_class::<streaming_dataframe::PyStreamingDataFrame>()?;
     m.add_class::<streaming_dataframe::PyDataStreamReader>()?;
     m.add_class::<streaming::PyStreamingQueryProgress>()?;

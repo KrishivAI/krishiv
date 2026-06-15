@@ -1436,8 +1436,7 @@ impl SqlEngine {
         if let Some(stmt) = introspection_sql::parse_introspection_statement(query)? {
             return match stmt {
                 introspection_sql::IntrospectionStatement::Describe { table } => {
-                    let batch =
-                        introspection_sql::describe_table(&self.context, &table).await?;
+                    let batch = introspection_sql::describe_table(&self.context, &table).await?;
                     let describe_table_name = next_ephemeral_name("describe_result");
                     lakehouse::register_scan_batches(
                         &self.context,
@@ -1449,29 +1448,19 @@ impl SqlEngine {
                         .context
                         .sql(&format!("SELECT * FROM {describe_table_name}"))
                         .await?;
-                    Ok(self.attach_query_metadata(
-                        self.make_sql_df("describe", dataframe),
-                        query,
-                    ))
+                    Ok(self.attach_query_metadata(self.make_sql_df("describe", dataframe), query))
                 }
                 introspection_sql::IntrospectionStatement::Explain { mode, query: inner } => {
                     let text = introspection_sql::explain_query(&inner, mode)?;
                     let batch = introspection_sql::explain_result_batch(&text)?;
                     let explain_table = next_ephemeral_name("explain_result");
-                    lakehouse::register_scan_batches(
-                        &self.context,
-                        &explain_table,
-                        vec![batch],
-                    )
-                    .await?;
+                    lakehouse::register_scan_batches(&self.context, &explain_table, vec![batch])
+                        .await?;
                     let dataframe = self
                         .context
                         .sql(&format!("SELECT * FROM {explain_table}"))
                         .await?;
-                    Ok(self.attach_query_metadata(
-                        self.make_sql_df("explain", dataframe),
-                        query,
-                    ))
+                    Ok(self.attach_query_metadata(self.make_sql_df("explain", dataframe), query))
                 }
             };
         }
@@ -1479,9 +1468,7 @@ impl SqlEngine {
         // ── Intercept CREATE / REFRESH / DROP LIVE TABLE ─────────────────────
         if live_table::execute_live_table_ddl(&self.live_table_registry, query)?.is_some() {
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-            return Ok(
-                self.attach_query_metadata(self.make_sql_df("live-table-ddl", empty), query)
-            );
+            return Ok(self.attach_query_metadata(self.make_sql_df("live-table-ddl", empty), query));
         }
 
         // ── Intercept SET shuffle.partitions = N ─────────────────────────────
@@ -2753,14 +2740,15 @@ fn top_level_alias_index(expression: &str) -> Option<usize> {
             }
             b'(' if !single_quoted && !double_quoted => depth += 1,
             b')' if !single_quoted && !double_quoted => depth = depth.saturating_sub(1),
-            b' ' if depth == 0 && !single_quoted && !double_quoted => {
-                if bytes
+            b' ' if depth == 0
+                && !single_quoted
+                && !double_quoted
+                && bytes
                     .get(index..index + 4)
-                    .is_some_and(|slice| slice.eq_ignore_ascii_case(b" AS "))
-                {
-                    candidate = Some(index);
-                    index += 3;
-                }
+                    .is_some_and(|slice| slice.eq_ignore_ascii_case(b" AS ")) =>
+            {
+                candidate = Some(index);
+                index += 3;
             }
             _ => {}
         }

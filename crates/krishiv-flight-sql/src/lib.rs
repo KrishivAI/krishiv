@@ -14,11 +14,11 @@ use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
 use arrow_flight::sql::{
-    ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionClosePreparedStatementRequest,
-    ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult,
-    ActionEndTransactionRequest, CommandGetDbSchemas, CommandGetTables, CommandPreparedStatementQuery,
-    CommandStatementQuery, DoPutPreparedStatementResult, EndTransaction, ProstMessageExt, SqlInfo,
-    TicketStatementQuery,
+    ActionBeginTransactionRequest, ActionBeginTransactionResult,
+    ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
+    ActionCreatePreparedStatementResult, ActionEndTransactionRequest, CommandGetDbSchemas,
+    CommandGetTables, CommandPreparedStatementQuery, CommandStatementQuery,
+    DoPutPreparedStatementResult, EndTransaction, ProstMessageExt, SqlInfo, TicketStatementQuery,
 };
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
@@ -482,19 +482,14 @@ impl FlightSqlService for KrishivFlightSqlService {
         self.authenticate_request(&request)?;
         let transaction_id = std::str::from_utf8(&query.transaction_id)
             .map_err(|_| Status::invalid_argument("invalid transaction id encoding"))?;
-        if !self
-            .transactions
-            .lock()
-            .await
-            .remove(transaction_id)
-        {
+        if !self.transactions.lock().await.remove(transaction_id) {
             return Err(Status::invalid_argument(format!(
                 "unknown transaction id: {transaction_id}"
             )));
         }
-        match EndTransaction::try_from(query.action).map_err(|_| {
-            Status::invalid_argument("invalid EndTransaction action")
-        })? {
+        match EndTransaction::try_from(query.action)
+            .map_err(|_| Status::invalid_argument("invalid EndTransaction action"))?
+        {
             EndTransaction::Commit | EndTransaction::Rollback => Ok(()),
             EndTransaction::Unspecified => Err(Status::invalid_argument(
                 "EndTransaction action must be Commit or Rollback",

@@ -1,4 +1,4 @@
-use krishiv_api::{BlockingSession, DataFrame, QueryResult, Session, SessionBuilder};
+use krishiv_api::{BlockingSession, DataFrame, Session, SessionBuilder};
 
 use crate::error::{GatewayError, GatewayQueryResult, GatewayResult};
 

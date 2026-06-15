@@ -383,18 +383,16 @@ impl DataFrameWriter {
                 };
             }
             "maxRecordsPerFile" | "max_records_per_file" => {
-                options.layout.max_rows_per_file = Some(
-                    value
-                        .parse()
-                        .map_err(|_| invalid(format!("option '{key}' must be a positive integer")))?,
-                );
+                options.layout.max_rows_per_file =
+                    Some(value.parse().map_err(|_| {
+                        invalid(format!("option '{key}' must be a positive integer"))
+                    })?);
             }
             "targetFileSize" | "target_file_size_bytes" => {
-                options.layout.target_file_size_bytes = Some(
-                    value
-                        .parse()
-                        .map_err(|_| invalid(format!("option '{key}' must be a positive integer")))?,
-                );
+                options.layout.target_file_size_bytes =
+                    Some(value.parse().map_err(|_| {
+                        invalid(format!("option '{key}' must be a positive integer"))
+                    })?);
             }
             _ => {
                 return Err(invalid(format!(
@@ -481,16 +479,16 @@ impl DataFrameWriter {
         options.layout.validate().map_err(connector_error)?;
         let dataframe = apply_sort(self.dataframe, &options.layout)?;
 
-        if options.format == DataFormat::Parquet {
-            if let Some(sink_mode) = to_sink_write_mode(options.mode) {
-                let partition_by = options.layout.partition_by.clone();
-                let path_str = path.to_string_lossy().into_owned();
-                if dataframe
-                    .try_distributed_parquet_sink(&path_str, sink_mode, &partition_by)?
-                    .is_some()
-                {
-                    return Ok(());
-                }
+        if options.format == DataFormat::Parquet
+            && let Some(sink_mode) = to_sink_write_mode(options.mode)
+        {
+            let partition_by = options.layout.partition_by.clone();
+            let path_str = path.to_string_lossy().into_owned();
+            if dataframe
+                .try_distributed_parquet_sink(&path_str, sink_mode, &partition_by)?
+                .is_some()
+            {
+                return Ok(());
             }
         }
 
@@ -780,7 +778,9 @@ fn parse_write_mode(key: &str, value: &str) -> Result<WriteMode> {
         "dynamicoverwrite" | "dynamic_overwrite" | "dynamic-overwrite" => {
             Ok(WriteMode::DynamicOverwrite)
         }
-        other => Err(invalid(format!("unknown write mode '{other}' for option '{key}'"))),
+        other => Err(invalid(format!(
+            "unknown write mode '{other}' for option '{key}'"
+        ))),
     }
 }
 

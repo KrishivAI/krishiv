@@ -126,7 +126,6 @@ impl PyChangeFeedIter {
     }
 }
 
-
 #[cfg(test)]
 fn test_registry() -> std::sync::Arc<LiveTableRegistry> {
     std::sync::Arc::new(LiveTableRegistry::new())

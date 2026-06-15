@@ -172,7 +172,7 @@ crates/krishiv-api/src/io.rs::fn::load_source_async::pub async fn load_source_as
 crates/krishiv-api/src/io.rs::fn::mode::pub fn mode(mut self, mode: WriteMode) -> Self
 crates/krishiv-api/src/io.rs::fn::new::pub fn new(format: DataFormat) -> Self
 crates/krishiv-api/src/io.rs::fn::option::pub fn option(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self>
-crates/krishiv-api/src/io.rs::fn::option::pub fn option(self, key: impl Into<String>, _value: impl Into<String>) -> Result<Self>
+crates/krishiv-api/src/io.rs::fn::option::pub fn option(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self>#2
 crates/krishiv-api/src/io.rs::fn::parquet::pub fn parquet(mut self, options: ParquetReadOptions) -> Self
 crates/krishiv-api/src/io.rs::fn::save::pub fn save(self, path: &str) -> Result<()>
 crates/krishiv-api/src/io.rs::fn::save_async::pub async fn save_async(mut self, path: impl AsRef<Path>) -> Result<()>
@@ -228,11 +228,13 @@ crates/krishiv-api/src/session.rs::fn::get_config::pub fn get_config(&self, key:
 crates/krishiv-api/src/session.rs::fn::is_streaming_query::pub fn is_streaming_query(&self, sql: &str) -> Result<bool>
 crates/krishiv-api/src/session.rs::fn::jobs::pub fn jobs(&self) -> Vec<JobStatus>
 crates/krishiv-api/src/session.rs::fn::list_tables::pub fn list_tables(&self) -> Result<Vec<String>>
+crates/krishiv-api/src/session.rs::fn::live_table_registry::pub fn live_table_registry(&self) -> &Arc<krishiv_sql::live_table::LiveTableRegistry>
 crates/krishiv-api/src/session.rs::fn::local_cluster::pub fn local_cluster(&self) -> &InProcessCluster
 crates/krishiv-api/src/session.rs::fn::memory_stream::pub fn memory_stream(
 crates/krishiv-api/src/session.rs::fn::memory_stream_batches::pub fn memory_stream_batches(&self, name: &str) -> Option<Vec<RecordBatch>>
 crates/krishiv-api/src/session.rs::fn::mode::pub fn mode(&self) -> ExecutionMode
 crates/krishiv-api/src/session.rs::fn::new::pub fn new() -> Self
+crates/krishiv-api/src/session.rs::fn::operation_registry::pub fn operation_registry(&self) -> Arc<krishiv_sql::OperationRegistry>
 crates/krishiv-api/src/session.rs::fn::poll_stream_job::pub async fn poll_stream_job(&self, job_id: &str) -> Result<Vec<RecordBatch>>
 crates/krishiv-api/src/session.rs::fn::push_stream_job_input::pub fn push_stream_job_input(&self, job_id: &str, batches: Vec<RecordBatch>) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::read::pub fn read(&self) -> crate::DataFrameReader
@@ -263,6 +265,8 @@ crates/krishiv-api/src/session.rs::fn::register_unbounded_with_capacity::pub fn 
 crates/krishiv-api/src/session.rs::fn::scalar_udf_names::pub fn scalar_udf_names(&self) -> Vec<String>
 crates/krishiv-api/src/session.rs::fn::set_config::pub fn set_config(&self, key: impl Into<String>, value: impl Into<String>)
 crates/krishiv-api/src/session.rs::fn::sql::pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame>
+crates/krishiv-api/src/session.rs::fn::sql_as::pub fn sql_as(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame>
+crates/krishiv-api/src/session.rs::fn::sql_as_async::pub async fn sql_as_async(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::sql_async::pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::sql_with_timeout::pub fn sql_with_timeout(&self, query: impl AsRef<str>, timeout_ms: u64) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::sql_with_timeout_async::pub async fn sql_with_timeout_async(
@@ -354,7 +358,7 @@ crates/krishiv-api/src/streaming_dataframe.rs::fn::with_side_output::pub fn with
 crates/krishiv-api/src/streaming_dataframe.rs::fn::with_watermark_lag::pub fn with_watermark_lag(mut self, lag_ms: u64) -> Self
 crates/krishiv-api/src/streaming_dataframe.rs::fn::write_stream::pub fn write_stream(self) -> crate::streaming_builder::DataStreamWriter
 crates/krishiv-api/src/streaming_dataframe.rs::struct::NamedSideOutputStream::pub struct NamedSideOutputStream
-crates/krishiv-api/src/streaming_dataframe.rs::struct::StreamingDataFrame::pub struct StreamingDataFrame
+crates/krishiv-api/src/streaming_dataframe.rs::struct::StreamingDataFrame::#[derive(Clone)] pub struct StreamingDataFrame
 crates/krishiv-api/src/streaming_dataframe.rs::struct::StreamingOutputStreams::pub struct StreamingOutputStreams
 crates/krishiv-api/src/streaming_dataframe.rs::type::KrishivStream::pub type KrishivStream =
 crates/krishiv-api/src/types.rs::enum::DeploymentTarget::#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub enum DeploymentTarget

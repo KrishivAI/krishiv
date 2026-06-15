@@ -684,8 +684,8 @@ impl PySession {
     }
 
     pub fn table_metadata(&self, name: String) -> PyResult<(Vec<(String, String)>, String)> {
-        let identifier = krishiv_api::catalog::TableIdentifier::new(name)
-            .map_err(map_krishiv_error)?;
+        let identifier =
+            krishiv_api::catalog::TableIdentifier::new(name).map_err(map_krishiv_error)?;
         let metadata = self
             .inner
             .table_metadata(&identifier)
@@ -701,8 +701,8 @@ impl PySession {
     }
 
     pub fn create_temp_view(&self, name: String, query: String) -> PyResult<()> {
-        let identifier = krishiv_api::catalog::ViewIdentifier::new(name)
-            .map_err(map_krishiv_error)?;
+        let identifier =
+            krishiv_api::catalog::ViewIdentifier::new(name).map_err(map_krishiv_error)?;
         self.inner
             .create_temp_view(&identifier, &query)
             .map_err(map_krishiv_error)
@@ -771,7 +771,11 @@ impl PySession {
         Ok(())
     }
 
-    pub fn register_function(&self, name: String, udf: &crate::rust_udf::PyRustScalarUdf) -> PyResult<()> {
+    pub fn register_function(
+        &self,
+        name: String,
+        udf: &crate::rust_udf::PyRustScalarUdf,
+    ) -> PyResult<()> {
         crate::rust_udf::register_function(&self.inner, name, udf)
     }
 
@@ -831,11 +835,7 @@ impl PySession {
     }
 
     pub fn live_table(&self, name: String, query: String) -> PyResult<PyLiveTable> {
-        crate::live_table::create_live_table(
-            name,
-            query,
-            self.inner.live_table_registry().clone(),
-        )
+        crate::live_table::create_live_table(name, query, self.inner.live_table_registry().clone())
     }
 
     /// Create a [`PyStream`] backed by in-memory batches (supports windowed `collect()` / `async for`).

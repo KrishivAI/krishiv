@@ -13,10 +13,7 @@ use crate::{SqlError, SqlResult};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntrospectionStatement {
     Describe { table: String },
-    Explain {
-        mode: ExplainSqlMode,
-        query: String,
-    },
+    Explain { mode: ExplainSqlMode, query: String },
 }
 
 /// Detail level for `EXPLAIN` SQL.
@@ -91,11 +88,20 @@ fn parse_explain_target(trimmed: &str, upper: &str) -> Option<(ExplainSqlMode, S
     let rest = trimmed["EXPLAIN ".len()..].trim();
     let upper_rest = rest.to_ascii_uppercase();
     let (mode, query) = if let Some(query) = upper_rest.strip_prefix("LOGICAL ") {
-        (ExplainSqlMode::Logical, rest[rest.len() - query.len()..].trim())
+        (
+            ExplainSqlMode::Logical,
+            rest[rest.len() - query.len()..].trim(),
+        )
     } else if let Some(query) = upper_rest.strip_prefix("PHYSICAL ") {
-        (ExplainSqlMode::Physical, rest[rest.len() - query.len()..].trim())
+        (
+            ExplainSqlMode::Physical,
+            rest[rest.len() - query.len()..].trim(),
+        )
     } else if let Some(query) = upper_rest.strip_prefix("ANALYZE ") {
-        (ExplainSqlMode::Analyze, rest[rest.len() - query.len()..].trim())
+        (
+            ExplainSqlMode::Analyze,
+            rest[rest.len() - query.len()..].trim(),
+        )
     } else {
         (ExplainSqlMode::Physical, rest)
     };
@@ -107,10 +113,7 @@ fn parse_explain_target(trimmed: &str, upper: &str) -> Option<(ExplainSqlMode, S
 }
 
 /// Build a `DESCRIBE` result batch for `table` using the DataFusion catalog.
-pub async fn describe_table(
-    context: &SessionContext,
-    table: &str,
-) -> SqlResult<RecordBatch> {
+pub async fn describe_table(context: &SessionContext, table: &str) -> SqlResult<RecordBatch> {
     let provider = context
         .table_provider(table)
         .await
@@ -171,11 +174,7 @@ pub fn explain_query(query: &str, mode: ExplainSqlMode) -> SqlResult<String> {
 
 /// Build a single-row batch containing explain text.
 pub fn explain_result_batch(text: &str) -> SqlResult<RecordBatch> {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "plan",
-        DataType::Utf8,
-        false,
-    )]));
+    let schema = Arc::new(Schema::new(vec![Field::new("plan", DataType::Utf8, false)]));
     let values = Arc::new(StringArray::from(vec![text]));
     RecordBatch::try_new(schema, vec![values]).map_err(|error| SqlError::DataFusion {
         message: format!("EXPLAIN: failed to build result batch: {error}"),
@@ -188,21 +187,26 @@ mod tests {
 
     #[test]
     fn parse_describe_variants() {
-        let stmt = parse_introspection_statement("DESCRIBE orders").unwrap().unwrap();
+        let stmt = parse_introspection_statement("DESCRIBE orders")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             stmt,
             IntrospectionStatement::Describe {
                 table: "orders".into()
             }
         );
-        let stmt = parse_introspection_statement("DESC TABLE people").unwrap().unwrap();
+        let stmt = parse_introspection_statement("DESC TABLE people")
+            .unwrap()
+            .unwrap();
         assert!(matches!(stmt, IntrospectionStatement::Describe { .. }));
     }
 
     #[test]
     fn parse_show_columns() {
-        let stmt =
-            parse_introspection_statement("SHOW COLUMNS FROM events").unwrap().unwrap();
+        let stmt = parse_introspection_statement("SHOW COLUMNS FROM events")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             stmt,
             IntrospectionStatement::Describe {
@@ -213,7 +217,9 @@ mod tests {
 
     #[test]
     fn parse_explain_modes() {
-        let stmt = parse_introspection_statement("EXPLAIN SELECT 1").unwrap().unwrap();
+        let stmt = parse_introspection_statement("EXPLAIN SELECT 1")
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             stmt,
             IntrospectionStatement::Explain {
@@ -221,8 +227,9 @@ mod tests {
                 ..
             }
         ));
-        let stmt =
-            parse_introspection_statement("EXPLAIN LOGICAL SELECT 1").unwrap().unwrap();
+        let stmt = parse_introspection_statement("EXPLAIN LOGICAL SELECT 1")
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             stmt,
             IntrospectionStatement::Explain {

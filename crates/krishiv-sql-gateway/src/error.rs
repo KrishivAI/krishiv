@@ -1,5 +1,5 @@
 use krishiv_api::{KrishivError, QueryResult};
-use krishiv_sql::sqlstate::{INTERNAL_ERROR, INSUFFICIENT_PRIVILEGE};
+use krishiv_sql::sqlstate::{INSUFFICIENT_PRIVILEGE, INTERNAL_ERROR};
 use krishiv_sql::{SqlError, SqlStateError, sqlstate_for};
 
 /// Gateway-level error with JDBC/ODBC-compatible SQLSTATE metadata.

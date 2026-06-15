@@ -1227,15 +1227,14 @@ fn sql_as_enforces_policy_on_referenced_tables() {
         .with_policy(Arc::new(DenySecretPolicy))
         .build()
         .unwrap();
-    session.register_record_batches(
-        "secret",
-        vec![RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )])))],
-    )
-    .unwrap();
+    session
+        .register_record_batches(
+            "secret",
+            vec![RecordBatch::new_empty(Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+            ])))],
+        )
+        .unwrap();
     let err = session
         .sql_as("dev-key", "SELECT * FROM secret")
         .unwrap_err();
@@ -1251,11 +1250,9 @@ fn sql_as_enforces_policy_on_referenced_tables() {
     session_allow
         .register_record_batches(
             "open",
-            vec![RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
-                "id",
-                DataType::Int64,
-                false,
-            )])))],
+            vec![RecordBatch::new_empty(Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+            ])))],
         )
         .unwrap();
     let df = session_allow
@@ -1270,17 +1267,19 @@ fn describe_and_live_table_sql_intercepts_work() {
     session
         .register_record_batches(
             "people",
-            vec![RecordBatch::try_new(
-                Arc::new(Schema::new(vec![
-                    Field::new("id", DataType::Int64, false),
-                    Field::new("name", DataType::Utf8, true),
-                ])),
-                vec![
-                    Arc::new(Int64Array::from(vec![1_i64])),
-                    Arc::new(StringArray::from(vec![Some("alice")])),
-                ],
-            )
-            .unwrap()],
+            vec![
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Int64, false),
+                        Field::new("name", DataType::Utf8, true),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1_i64])),
+                        Arc::new(StringArray::from(vec![Some("alice")])),
+                    ],
+                )
+                .unwrap(),
+            ],
         )
         .unwrap();
 
@@ -1290,5 +1289,10 @@ fn describe_and_live_table_sql_intercepts_work() {
     session
         .sql("CREATE LIVE TABLE live_people AS SELECT id FROM people")
         .unwrap();
-    assert!(session.live_table_registry().contains("live_people").unwrap());
+    assert!(
+        session
+            .live_table_registry()
+            .contains("live_people")
+            .unwrap()
+    );
 }

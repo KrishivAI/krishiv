@@ -1106,9 +1106,12 @@ impl Session {
 
     /// Async variant of [`Self::sql_as`].
     pub async fn sql_as_async(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame> {
-        let auth = self.auth.as_ref().ok_or_else(|| KrishivError::InvalidConfig {
-            message: "sql_as requires SessionBuilder::with_auth".into(),
-        })?;
+        let auth = self
+            .auth
+            .as_ref()
+            .ok_or_else(|| KrishivError::InvalidConfig {
+                message: "sql_as requires SessionBuilder::with_auth".into(),
+            })?;
         if auth.authenticate(api_key).is_none() {
             return Err(KrishivError::AccessDenied {
                 reason: "invalid API key".into(),

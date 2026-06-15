@@ -13,9 +13,7 @@ pub struct PyStreamingDataFrame {
 
 impl PyStreamingDataFrame {
     pub fn new(df: krishiv_api::DataFrame) -> Self {
-        Self {
-            inner: df.stream(),
-        }
+        Self { inner: df.stream() }
     }
 }
 
@@ -41,10 +39,7 @@ impl PyStreamingDataFrame {
 
     pub fn sliding_window(&self, window_size_ms: u64, slide_ms: u64) -> Self {
         Self {
-            inner: self
-                .inner
-                .clone()
-                .sliding_window(window_size_ms, slide_ms),
+            inner: self.inner.clone().sliding_window(window_size_ms, slide_ms),
         }
     }
 
@@ -104,10 +99,7 @@ pub fn interval_join(
     lower_bound_ms: i64,
     upper_bound_ms: i64,
 ) -> PyResult<Vec<(crate::batch::PyBatch, crate::batch::PyBatch)>> {
-    let left_batches: Vec<_> = left
-        .into_iter()
-        .map(|b| b.record_batch().clone())
-        .collect();
+    let left_batches: Vec<_> = left.into_iter().map(|b| b.record_batch().clone()).collect();
     let right_batches: Vec<_> = right
         .into_iter()
         .map(|b| b.record_batch().clone())
@@ -225,10 +217,7 @@ pub fn stream_stream_join(
     lower_bound_ms: i64,
     upper_bound_ms: i64,
 ) -> PyResult<Vec<(crate::batch::PyBatch, crate::batch::PyBatch)>> {
-    let left_batches: Vec<_> = left
-        .into_iter()
-        .map(|b| b.record_batch().clone())
-        .collect();
+    let left_batches: Vec<_> = left.into_iter().map(|b| b.record_batch().clone()).collect();
     let right_batches: Vec<_> = right
         .into_iter()
         .map(|b| b.record_batch().clone())

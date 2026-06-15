@@ -106,7 +106,6 @@ pub fn features_by_status(status: FeatureStatus) -> Vec<&'static FeatureEntry> {
 
 const S: FeatureStatus = FeatureStatus::Supported;
 const P: FeatureStatus = FeatureStatus::Partial;
-const L: FeatureStatus = FeatureStatus::Planned;
 
 static FEATURES: &[FeatureEntry] = &[
     // ── SELECT ────────────────────────────────────────────────────────────────

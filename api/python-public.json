@@ -2,6 +2,63 @@
   "classes": [
     {
       "deprecated": false,
+      "documentation": "crates/krishiv-python/src/blocking_session.rs#L9",
+      "id": "crates/krishiv-python/src/blocking_session.rs::BlockingSession",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/blocking_session.rs#L45",
+          "id": "BlockingSession.collect",
+          "kind": "method",
+          "name": "collect",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/blocking_session.rs#L31",
+          "id": "BlockingSession.connect",
+          "kind": "method",
+          "name": "connect",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/blocking_session.rs#L17",
+          "id": "BlockingSession.embedded",
+          "kind": "method",
+          "name": "embedded",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/blocking_session.rs#L24",
+          "id": "BlockingSession.from_env",
+          "kind": "method",
+          "name": "from_env",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/blocking_session.rs#L36",
+          "id": "BlockingSession.sql",
+          "kind": "method",
+          "name": "sql",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "BlockingSession",
+      "replacement": null,
+      "rust_type": "PyBlockingSession",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
       "documentation": "crates/krishiv-python/src/stream.rs#L698",
       "id": "crates/krishiv-python/src/stream.rs::BroadcastContext",
       "kind": "class",
@@ -53,13 +110,13 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/live_table.rs#L76",
+      "documentation": "crates/krishiv-python/src/live_table.rs#L77",
       "id": "crates/krishiv-python/src/live_table.rs::ChangeFeedIter",
       "kind": "class",
       "methods": [
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/live_table.rs#L104",
+          "documentation": "crates/krishiv-python/src/live_table.rs#L105",
           "id": "ChangeFeedIter.__aiter__",
           "kind": "method",
           "name": "__aiter__",
@@ -68,7 +125,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/live_table.rs#L108",
+          "documentation": "crates/krishiv-python/src/live_table.rs#L109",
           "id": "ChangeFeedIter.__anext__",
           "kind": "method",
           "name": "__anext__",
@@ -77,7 +134,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/live_table.rs#L82",
+          "documentation": "crates/krishiv-python/src/live_table.rs#L83",
           "id": "ChangeFeedIter.__iter__",
           "kind": "method",
           "name": "__iter__",
@@ -86,7 +143,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/live_table.rs#L86",
+          "documentation": "crates/krishiv-python/src/live_table.rs#L87",
           "id": "ChangeFeedIter.__next__",
           "kind": "method",
           "name": "__next__",
@@ -320,7 +377,7 @@
       "methods": [
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L639",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L644",
           "id": "DataFrame.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -329,7 +386,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L633",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L638",
           "id": "DataFrame.alias",
           "kind": "method",
           "name": "alias",
@@ -392,7 +449,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L606",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L611",
           "id": "DataFrame.collect_with_stats",
           "kind": "method",
           "name": "collect_with_stats",
@@ -401,7 +458,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L538",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L543",
           "id": "DataFrame.columns",
           "kind": "method",
           "name": "columns",
@@ -419,7 +476,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L546",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L551",
           "id": "DataFrame.describe",
           "kind": "method",
           "name": "describe",
@@ -590,7 +647,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L563",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L568",
           "id": "DataFrame.join",
           "kind": "method",
           "name": "join",
@@ -599,7 +656,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L576",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L581",
           "id": "DataFrame.join_on",
           "kind": "method",
           "name": "join_on",
@@ -626,7 +683,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L623",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L628",
           "id": "DataFrame.order_by",
           "kind": "method",
           "name": "order_by",
@@ -662,7 +719,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L596",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L601",
           "id": "DataFrame.repartition",
           "kind": "method",
           "name": "repartition",
@@ -680,7 +737,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L525",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L530",
           "id": "DataFrame.schema",
           "kind": "method",
           "name": "schema",
@@ -729,6 +786,15 @@
           "id": "DataFrame.sort",
           "kind": "method",
           "name": "sort",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L521",
+          "id": "DataFrame.to_streaming",
+          "kind": "method",
+          "name": "to_streaming",
           "replacement": null,
           "stability": "preview"
         },
@@ -848,13 +914,13 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/dataframe.rs#L749",
+      "documentation": "crates/krishiv-python/src/dataframe.rs#L754",
       "id": "crates/krishiv-python/src/dataframe.rs::DataFrameStream",
       "kind": "class",
       "methods": [
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L763",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L768",
           "id": "DataFrameStream.__aiter__",
           "kind": "method",
           "name": "__aiter__",
@@ -863,7 +929,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L767",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L772",
           "id": "DataFrameStream.__anext__",
           "kind": "method",
           "name": "__anext__",
@@ -874,6 +940,27 @@
       "name": "DataFrameStream",
       "replacement": null,
       "rust_type": "PyDataFrameStream",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L245",
+      "id": "crates/krishiv-python/src/streaming_dataframe.rs::DataStreamReader",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L257",
+          "id": "DataStreamReader.file_stream",
+          "kind": "method",
+          "name": "file_stream",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "DataStreamReader",
+      "replacement": null,
+      "rust_type": "PyDataStreamReader",
       "stability": "preview"
     },
     {
@@ -953,13 +1040,13 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/dataframe.rs#L645",
+      "documentation": "crates/krishiv-python/src/dataframe.rs#L650",
       "id": "crates/krishiv-python/src/dataframe.rs::GroupedDataFrame",
       "kind": "class",
       "methods": [
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L652",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L657",
           "id": "GroupedDataFrame.agg",
           "kind": "method",
           "name": "agg",
@@ -968,7 +1055,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L665",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L670",
           "id": "GroupedDataFrame.agg_columns",
           "kind": "method",
           "name": "agg_columns",
@@ -977,7 +1064,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L721",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L726",
           "id": "GroupedDataFrame.agg_grouping_sets",
           "kind": "method",
           "name": "agg_grouping_sets",
@@ -986,7 +1073,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L738",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L743",
           "id": "GroupedDataFrame.count",
           "kind": "method",
           "name": "count",
@@ -995,7 +1082,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L677",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L682",
           "id": "GroupedDataFrame.cube",
           "kind": "method",
           "name": "cube",
@@ -1004,7 +1091,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/dataframe.rs#L692",
+          "documentation": "crates/krishiv-python/src/dataframe.rs#L697",
           "id": "GroupedDataFrame.rollup",
           "kind": "method",
           "name": "rollup",
@@ -1367,7 +1454,7 @@
       "methods": [
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/live_table.rs#L47",
+          "documentation": "crates/krishiv-python/src/live_table.rs#L48",
           "id": "LiveTable.change_feed",
           "kind": "method",
           "name": "change_feed",
@@ -1376,7 +1463,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/live_table.rs#L40",
+          "documentation": "crates/krishiv-python/src/live_table.rs#L41",
           "id": "LiveTable.drop",
           "kind": "method",
           "name": "drop",
@@ -1385,7 +1472,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/live_table.rs#L60",
+          "documentation": "crates/krishiv-python/src/live_table.rs#L61",
           "id": "LiveTable.ingest_row",
           "kind": "method",
           "name": "ingest_row",
@@ -1394,7 +1481,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/live_table.rs#L31",
+          "documentation": "crates/krishiv-python/src/live_table.rs#L32",
           "id": "LiveTable.name",
           "kind": "method",
           "name": "name",
@@ -1403,7 +1490,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/live_table.rs#L34",
+          "documentation": "crates/krishiv-python/src/live_table.rs#L35",
           "id": "LiveTable.refresh",
           "kind": "method",
           "name": "refresh",
@@ -1618,13 +1705,13 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/session.rs#L1091",
+      "documentation": "crates/krishiv-python/src/session.rs#L1146",
       "id": "crates/krishiv-python/src/session.rs::OperationRegistry",
       "kind": "class",
       "methods": [
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1125",
+          "documentation": "crates/krishiv-python/src/session.rs#L1183",
           "id": "OperationRegistry.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -1633,7 +1720,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1107",
+          "documentation": "crates/krishiv-python/src/session.rs#L1160",
           "id": "OperationRegistry.cancel",
           "kind": "method",
           "name": "cancel",
@@ -1642,7 +1729,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1122",
+          "documentation": "crates/krishiv-python/src/session.rs#L1180",
           "id": "OperationRegistry.cancelled_ids",
           "kind": "method",
           "name": "cancelled_ids",
@@ -1651,7 +1738,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1112",
+          "documentation": "crates/krishiv-python/src/session.rs#L1165",
           "id": "OperationRegistry.is_cancelled",
           "kind": "method",
           "name": "is_cancelled",
@@ -1660,7 +1747,16 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1117",
+          "documentation": "crates/krishiv-python/src/session.rs#L1175",
+          "id": "OperationRegistry.progress",
+          "kind": "method",
+          "name": "progress",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L1170",
           "id": "OperationRegistry.remove",
           "kind": "method",
           "name": "remove",
@@ -2155,6 +2251,36 @@
     },
     {
       "deprecated": false,
+      "documentation": "crates/krishiv-python/src/rust_udf.rs#L11",
+      "id": "crates/krishiv-python/src/rust_udf.rs::RustScalarUdf",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/rust_udf.rs#L20",
+          "id": "RustScalarUdf.multiply",
+          "kind": "method",
+          "name": "multiply",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/rust_udf.rs#L25",
+          "id": "RustScalarUdf.name",
+          "kind": "method",
+          "name": "name",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "RustScalarUdf",
+      "replacement": null,
+      "rust_type": "PyRustScalarUdf",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
       "documentation": "crates/krishiv-python/src/vector_sinks.rs#L21",
       "id": "crates/krishiv-python/src/vector_sinks.rs::ScoredChunk",
       "kind": "class",
@@ -2191,7 +2317,7 @@
       "methods": [
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L959",
+          "documentation": "crates/krishiv-python/src/session.rs#L1014",
           "id": "Session.close_unbounded_input",
           "kind": "method",
           "name": "close_unbounded_input",
@@ -2218,7 +2344,16 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L937",
+          "documentation": "crates/krishiv-python/src/session.rs#L702",
+          "id": "Session.create_temp_view",
+          "kind": "method",
+          "name": "create_temp_view",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L992",
           "id": "Session.create_view",
           "kind": "method",
           "name": "create_view",
@@ -2227,7 +2362,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L836",
+          "documentation": "crates/krishiv-python/src/session.rs#L891",
           "id": "Session.dataframe",
           "kind": "method",
           "name": "dataframe",
@@ -2245,7 +2380,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L944",
+          "documentation": "crates/krishiv-python/src/session.rs#L999",
           "id": "Session.drop_table",
           "kind": "method",
           "name": "drop_table",
@@ -2281,7 +2416,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L859",
+          "documentation": "crates/krishiv-python/src/session.rs#L914",
           "id": "Session.from_bounded_stream",
           "kind": "method",
           "name": "from_bounded_stream",
@@ -2299,7 +2434,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L851",
+          "documentation": "crates/krishiv-python/src/session.rs#L906",
           "id": "Session.from_source",
           "kind": "method",
           "name": "from_source",
@@ -2317,7 +2452,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L949",
+          "documentation": "crates/krishiv-python/src/session.rs#L1004",
           "id": "Session.is_streaming_query",
           "kind": "method",
           "name": "is_streaming_query",
@@ -2326,7 +2461,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L670",
+          "documentation": "crates/krishiv-python/src/session.rs#L717",
           "id": "Session.jobs",
           "kind": "method",
           "name": "jobs",
@@ -2344,6 +2479,15 @@
         },
         {
           "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L674",
+          "id": "Session.list_table_identifiers",
+          "kind": "method",
+          "name": "list_table_identifiers",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
           "documentation": "crates/krishiv-python/src/session.rs#L528",
           "id": "Session.list_table_udfs",
           "kind": "method",
@@ -2353,7 +2497,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L925",
+          "documentation": "crates/krishiv-python/src/session.rs#L980",
           "id": "Session.list_tables",
           "kind": "method",
           "name": "list_tables",
@@ -2362,7 +2506,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L726",
+          "documentation": "crates/krishiv-python/src/session.rs#L781",
           "id": "Session.list_udfs",
           "kind": "method",
           "name": "list_udfs",
@@ -2371,7 +2515,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L781",
+          "documentation": "crates/krishiv-python/src/session.rs#L836",
           "id": "Session.live_table",
           "kind": "method",
           "name": "live_table",
@@ -2389,7 +2533,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L788",
+          "documentation": "crates/krishiv-python/src/session.rs#L843",
           "id": "Session.memory_stream",
           "kind": "method",
           "name": "memory_stream",
@@ -2398,7 +2542,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L803",
+          "documentation": "crates/krishiv-python/src/session.rs#L858",
           "id": "Session.memory_stream_collect",
           "kind": "method",
           "name": "memory_stream_collect",
@@ -2434,7 +2578,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L910",
+          "documentation": "crates/krishiv-python/src/session.rs#L965",
           "id": "Session.poll_stream_job",
           "kind": "method",
           "name": "poll_stream_job",
@@ -2452,7 +2596,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L899",
+          "documentation": "crates/krishiv-python/src/session.rs#L954",
           "id": "Session.push_stream_job_input",
           "kind": "method",
           "name": "push_stream_job_input",
@@ -2515,7 +2659,16 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L738",
+          "documentation": "crates/krishiv-python/src/session.rs#L670",
+          "id": "Session.read_stream",
+          "kind": "method",
+          "name": "read_stream",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L793",
           "id": "Session.register_aggregate_udf",
           "kind": "method",
           "name": "register_aggregate_udf",
@@ -2524,7 +2677,16 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1040",
+          "documentation": "crates/krishiv-python/src/session.rs#L773",
+          "id": "Session.register_function",
+          "kind": "method",
+          "name": "register_function",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L1095",
           "id": "Session.register_kafka_source",
           "kind": "method",
           "name": "register_kafka_source",
@@ -2560,7 +2722,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L769",
+          "documentation": "crates/krishiv-python/src/session.rs#L824",
           "id": "Session.register_table_udf",
           "kind": "method",
           "name": "register_table_udf",
@@ -2569,7 +2731,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L695",
+          "documentation": "crates/krishiv-python/src/session.rs#L742",
           "id": "Session.register_udf",
           "kind": "method",
           "name": "register_udf",
@@ -2614,6 +2776,15 @@
         },
         {
           "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L710",
+          "id": "Session.sql_as",
+          "kind": "method",
+          "name": "sql_as",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
           "documentation": "crates/krishiv-python/src/session.rs#L639",
           "id": "Session.sql_with_timeout",
           "kind": "method",
@@ -2623,7 +2794,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L680",
+          "documentation": "crates/krishiv-python/src/session.rs#L727",
           "id": "Session.stream",
           "kind": "method",
           "name": "stream",
@@ -2641,7 +2812,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L891",
+          "documentation": "crates/krishiv-python/src/session.rs#L946",
           "id": "Session.submit_stream_job",
           "kind": "method",
           "name": "submit_stream_job",
@@ -2659,10 +2830,19 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L930",
+          "documentation": "crates/krishiv-python/src/session.rs#L985",
           "id": "Session.table_exists",
           "kind": "method",
           "name": "table_exists",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L685",
+          "id": "Session.table_metadata",
+          "kind": "method",
+          "name": "table_metadata",
           "replacement": null,
           "stability": "preview"
         },
@@ -2677,7 +2857,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L978",
+          "documentation": "crates/krishiv-python/src/session.rs#L1033",
           "id": "Session.with_auth_token",
           "kind": "method",
           "name": "with_auth_token",
@@ -2686,7 +2866,7 @@
         },
         {
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1013",
+          "documentation": "crates/krishiv-python/src/session.rs#L1068",
           "id": "Session.with_oidc_provider",
           "kind": "method",
           "name": "with_oidc_provider",
@@ -2835,6 +3015,99 @@
       "name": "Stream",
       "replacement": null,
       "rust_type": "PyStream",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L9",
+      "id": "crates/krishiv-python/src/streaming_dataframe.rs::StreamingDataFrame",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L68",
+          "id": "StreamingDataFrame.drop_duplicates",
+          "kind": "method",
+          "name": "drop_duplicates",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L27",
+          "id": "StreamingDataFrame.key_by",
+          "kind": "method",
+          "name": "key_by",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L45",
+          "id": "StreamingDataFrame.session_window",
+          "kind": "method",
+          "name": "session_window",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L39",
+          "id": "StreamingDataFrame.sliding_window",
+          "kind": "method",
+          "name": "sliding_window",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L33",
+          "id": "StreamingDataFrame.tumbling_window",
+          "kind": "method",
+          "name": "tumbling_window",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L21",
+          "id": "StreamingDataFrame.with_event_time",
+          "kind": "method",
+          "name": "with_event_time",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L57",
+          "id": "StreamingDataFrame.with_side_output",
+          "kind": "method",
+          "name": "with_side_output",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L51",
+          "id": "StreamingDataFrame.with_watermark_lag",
+          "kind": "method",
+          "name": "with_watermark_lag",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/streaming_dataframe.rs#L82",
+          "id": "StreamingDataFrame.write_stream",
+          "kind": "method",
+          "name": "write_stream",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "StreamingDataFrame",
+      "replacement": null,
+      "rust_type": "PyStreamingDataFrame",
       "stability": "preview"
     },
     {
@@ -3215,6 +3488,15 @@
     {
       "deprecated": false,
       "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "interval_join",
+      "kind": "function",
+      "name": "interval_join",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
       "id": "lit",
       "kind": "function",
       "name": "lit",
@@ -3359,9 +3641,27 @@
     {
       "deprecated": false,
       "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "stream_table_join",
+      "kind": "function",
+      "name": "stream_table_join",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
       "id": "sum",
       "kind": "function",
       "name": "sum",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "temporal_join",
+      "kind": "function",
+      "name": "temporal_join",
       "replacement": null,
       "stability": "preview"
     },
