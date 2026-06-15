@@ -212,6 +212,9 @@ async fn query_dataframe(
     session: &Session,
     command: &QueryCommand,
 ) -> Result<DataFrame, KrishivError> {
+    if let Some(api_key) = &command.api_key {
+        return session.sql_as_async(api_key, &command.query).await;
+    }
     match command.execution {
         QueryExecution::Default => session.sql_async(&command.query).await,
         QueryExecution::Local => session.execute_local_async(&command.query).await,

@@ -64,6 +64,7 @@ impl NamedSideOutputStream {
 }
 
 /// A fluent builder for creating asynchronous streaming pipelines from a DataFrame.
+#[derive(Clone)]
 pub struct StreamingDataFrame {
     df: DataFrame,
     event_time_column: Option<String>,

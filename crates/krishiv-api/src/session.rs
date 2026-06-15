@@ -535,6 +535,8 @@ impl SessionBuilder {
             stream_jobs: Arc::new(DashMap::new()),
             unbounded_streams: Arc::new(DashMap::new()),
             config: Arc::new(DashMap::from_iter(self.config)),
+            auth: self.auth,
+            policy: self.policy,
         })
     }
 }
@@ -558,6 +560,8 @@ pub struct Session {
     stream_jobs: Arc<DashMap<String, LocalWindowExecutionSpec>>,
     unbounded_streams: Arc<DashMap<String, Arc<ContinuousTableInput>>>,
     config: Arc<DashMap<String, String>>,
+    auth: Option<Arc<dyn AuthProvider>>,
+    policy: Option<Arc<dyn PolicyHook>>,
 }
 
 impl fmt::Debug for Session {
@@ -1089,6 +1093,48 @@ impl Session {
         let query = query.as_ref().to_owned();
         let sql_dataframe = self.sql_engine.sql(&query).await?;
         Ok(self.dataframe_from_sql(sql_dataframe))
+    }
+
+    /// Execute SQL after API-key authentication and table-level policy checks.
+    ///
+    /// Requires [`SessionBuilder::with_auth`]. When [`SessionBuilder::with_policy`]
+    /// is configured, every table referenced by the query must pass
+    /// [`PolicyHook::check_table_access`].
+    pub fn sql_as(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame> {
+        block_on(self.sql_as_async(api_key, query))
+    }
+
+    /// Async variant of [`Self::sql_as`].
+    pub async fn sql_as_async(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame> {
+        let auth = self.auth.as_ref().ok_or_else(|| KrishivError::InvalidConfig {
+            message: "sql_as requires SessionBuilder::with_auth".into(),
+        })?;
+        if auth.authenticate(api_key).is_none() {
+            return Err(KrishivError::AccessDenied {
+                reason: "invalid API key".into(),
+            });
+        }
+        let query = query.as_ref();
+        if let Some(policy) = &self.policy {
+            for table in krishiv_sql::referenced_table_names(query).map_err(KrishivError::from)? {
+                if !policy.check_table_access(&table) {
+                    return Err(KrishivError::AccessDenied {
+                        reason: format!("access denied to table: {table}"),
+                    });
+                }
+            }
+        }
+        self.sql_async(query).await
+    }
+
+    /// Shared operation registry for cancellation and progress reporting.
+    pub fn operation_registry(&self) -> Arc<krishiv_sql::OperationRegistry> {
+        Arc::clone(self.sql_engine.operation_registry())
+    }
+
+    /// Shared live-table registry backing `CREATE LIVE TABLE` DDL.
+    pub fn live_table_registry(&self) -> &Arc<krishiv_sql::live_table::LiveTableRegistry> {
+        self.sql_engine.live_table_registry()
     }
 
     /// Execute a SQL query with a wall-clock timeout.

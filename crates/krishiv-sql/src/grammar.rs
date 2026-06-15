@@ -434,8 +434,9 @@ static FEATURES: &[FeatureEntry] = &[
         "prepared.parameters",
         "PREPARED",
         "Positional parameter binding ($1, $2, …)",
-        L,
-    ),
+        S,
+    )
+    .with_note("local PreparedStatement::bind and Flight SQL DoPut parameter batches"),
     // ── OPERATION CONTROL ────────────────────────────────────────────────────
     FeatureEntry::new(
         "operation.id",
@@ -572,6 +573,25 @@ static FEATURES: &[FeatureEntry] = &[
         "streaming.sink_modes",
         "STREAMING",
         "Append / Update / Complete output modes",
+        S,
+    ),
+    // ── INTROSPECTION ─────────────────────────────────────────────────────────
+    FeatureEntry::new(
+        "introspection.describe",
+        "INTROSPECTION",
+        "DESCRIBE / DESC / SHOW COLUMNS table schema",
+        S,
+    ),
+    FeatureEntry::new(
+        "introspection.explain",
+        "INTROSPECTION",
+        "EXPLAIN [LOGICAL|PHYSICAL|ANALYZE] query plans",
+        S,
+    ),
+    FeatureEntry::new(
+        "ddl.live_table",
+        "DDL",
+        "CREATE / REFRESH / DROP LIVE TABLE via session.sql()",
         S,
     ),
 ];

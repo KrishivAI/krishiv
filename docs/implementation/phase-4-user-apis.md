@@ -49,9 +49,15 @@ DataFusion implementation types.
       `ExecutionRuntime`, Flight actions, Rust `Session`, and Python `Session`.
 - [ ] Add JDBC/ODBC compatibility through a separately versioned SQL gateway;
       Arrow Flight SQL remains the native protocol.
-- [ ] Add prepared statements and parameter binding across Flight SQL.
-- [ ] Add cache/persist/unpersist and temporary-view APIs.
 - [ ] Add remote analyze metrics once coordinator transport is versioned.
+
+## Recently completed (API gap closure)
+
+- [x] Cache/persist/unpersist and temporary-view APIs (Rust + Python).
+- [x] Local prepared-statement parameter binding (`$1`, `$2`, …).
+- [x] `Session::sql_as` policy-enforced SQL entry point.
+- [x] SQL `DESCRIBE` / `SHOW COLUMNS` / `EXPLAIN` intercepts.
+- [x] `CREATE LIVE TABLE` routing through `SqlEngine::sql()`.
 
 ## Exit criteria
 

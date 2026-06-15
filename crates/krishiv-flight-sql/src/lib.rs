@@ -770,6 +770,28 @@ impl KrishivFlightSqlService {
             A::RegisterKafkaSource(_) => Err(KrishivActionError::Other(
                 "Kafka support not enabled; rebuild with --features kafka".into(),
             )),
+            A::CancelOperation(body) => {
+                self.host.cancel_operation(body.operation_id);
+                Ok(Vec::new())
+            }
+            A::GetOperationProgress(body) => {
+                let response = self
+                    .host
+                    .operation_progress(body.operation_id)
+                    .map(|(rows_scanned, rows_emitted)| {
+                        krishiv_runtime::flight_action::OperationProgressResponse {
+                            rows_scanned,
+                            rows_emitted,
+                        }
+                    })
+                    .unwrap_or(krishiv_runtime::flight_action::OperationProgressResponse {
+                        rows_scanned: 0,
+                        rows_emitted: 0,
+                    });
+                response
+                    .to_json_bytes()
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))
+            }
         }
     }
 }

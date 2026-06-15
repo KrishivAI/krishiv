@@ -29,6 +29,7 @@ mod sources;
 mod stream;
 mod stream_exec;
 mod streaming;
+mod streaming_dataframe;
 mod udf;
 mod windows;
 
@@ -57,6 +58,7 @@ pub use stream::{
     PyWindowedStream,
 };
 pub use streaming::{PyDataStreamWriter, PyStreamingQuery, PyStreamingQueryProgress};
+pub use streaming_dataframe::{PyDataStreamReader, PyStreamingDataFrame, interval_join};
 pub use udf::call_python_udf;
 pub use vector_sinks::{PyInMemoryVectorSink, PyScoredChunk};
 pub use windows::PyWindowSpec;
@@ -147,6 +149,9 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<lakehouse::PyMemoryLakehouseTable>()?;
 
     // Streaming write (Phase F parity)
+    m.add_function(wrap_pyfunction!(streaming_dataframe::interval_join, m)?)?;
+    m.add_class::<streaming_dataframe::PyStreamingDataFrame>()?;
+    m.add_class::<streaming_dataframe::PyDataStreamReader>()?;
     m.add_class::<streaming::PyStreamingQueryProgress>()?;
     m.add_class::<streaming::PyStreamingQuery>()?;
     m.add_class::<streaming::PyDataStreamWriter>()?;

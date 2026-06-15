@@ -39,6 +39,8 @@ pub struct FlightExecutionHost {
     /// Path-based Parquet table catalog shared across concurrent requests.
     /// Uses DashMap for lock-free concurrent access.
     catalog: Arc<DashMap<String, PathBuf>>,
+    /// Cancelled operations and progress snapshots for remote query lifecycle control.
+    operation_registry: Arc<krishiv_sql::OperationRegistry>,
     /// Optional HTTP URL of a remote coordinator, for informational / test use.
     coordinator_http_url: Option<String>,
 }
@@ -52,6 +54,7 @@ impl FlightExecutionHost {
         Ok(Self {
             backend: Arc::new(FlightHostBackend::InProcess(Arc::new(cluster))),
             catalog: Arc::new(DashMap::new()),
+            operation_registry: Arc::new(krishiv_sql::OperationRegistry::new()),
             coordinator_http_url: None,
         })
     }
@@ -65,6 +68,7 @@ impl FlightExecutionHost {
         Self {
             backend: Arc::new(FlightHostBackend::Coordinator(coordinator)),
             catalog: Arc::new(DashMap::new()),
+            operation_registry: Arc::new(krishiv_sql::OperationRegistry::new()),
             coordinator_http_url: None,
         }
     }
@@ -78,8 +82,24 @@ impl FlightExecutionHost {
         Ok(Self {
             backend: Arc::new(FlightHostBackend::InProcess(Arc::new(cluster))),
             catalog: Arc::new(DashMap::new()),
+            operation_registry: Arc::new(krishiv_sql::OperationRegistry::new()),
             coordinator_http_url: url,
         })
+    }
+
+    /// Shared operation registry for cancellation and progress reporting.
+    pub fn operation_registry(&self) -> Arc<krishiv_sql::OperationRegistry> {
+        Arc::clone(&self.operation_registry)
+    }
+
+    /// Cancel an in-flight operation by ID.
+    pub fn cancel_operation(&self, operation_id: u64) {
+        self.operation_registry.cancel(operation_id);
+    }
+
+    /// Return the latest progress snapshot for an operation, if recorded.
+    pub fn operation_progress(&self, operation_id: u64) -> Option<(u64, u64)> {
+        self.operation_registry.progress(operation_id)
     }
 
     /// Return the coordinator HTTP URL recorded at construction time, if any.
