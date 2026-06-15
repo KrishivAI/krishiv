@@ -4,6 +4,7 @@
 
 mod host;
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -13,10 +14,11 @@ use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
 use arrow_flight::sql::{
+    ActionBeginTransactionRequest, ActionBeginTransactionResult,
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
-    ActionCreatePreparedStatementResult, CommandGetDbSchemas, CommandGetTables,
-    CommandPreparedStatementQuery, CommandStatementQuery, DoPutPreparedStatementResult,
-    ProstMessageExt, SqlInfo, TicketStatementQuery,
+    ActionCreatePreparedStatementResult, ActionEndTransactionRequest, CommandGetDbSchemas,
+    CommandGetTables, CommandPreparedStatementQuery, CommandStatementQuery,
+    DoPutPreparedStatementResult, EndTransaction, ProstMessageExt, SqlInfo, TicketStatementQuery,
 };
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
@@ -43,6 +45,8 @@ pub struct KrishivFlightSqlService {
     prepared_statements: Arc<tokio::sync::Mutex<lru::LruCache<String, String>>>,
     /// LRU cache of handle → bound parameter record batches (set via DoPut).
     bound_params: Arc<tokio::sync::Mutex<lru::LruCache<String, Vec<RecordBatch>>>>,
+    /// Active Flight SQL transaction ids issued by `BeginTransaction`.
+    transactions: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 const PREPARED_STMT_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(128) {
@@ -72,6 +76,7 @@ impl KrishivFlightSqlService {
             bound_params: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
                 PREPARED_STMT_CAPACITY,
             ))),
+            transactions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         })
     }
 
@@ -87,6 +92,7 @@ impl KrishivFlightSqlService {
             bound_params: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
                 PREPARED_STMT_CAPACITY,
             ))),
+            transactions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -126,7 +132,6 @@ impl KrishivFlightSqlService {
     /// Returns `Ok(Some(subject))` when auth is configured and the token is
     /// valid, `Ok(None)` when no [`AuthProvider`] is attached, and
     /// `Err(Status::unauthenticated(...))` when the token is missing or invalid.
-    #[allow(clippy::result_large_err)]
     fn authenticate_request<B>(&self, req: &Request<B>) -> Result<Option<String>, Status> {
         let Some(auth) = &self.auth else {
             if krishiv_common::profile_requires_authenticated_flight(
@@ -168,6 +173,22 @@ impl KrishivFlightSqlService {
             )));
         }
         Ok(())
+    }
+
+    async fn validate_transaction_id(&self, transaction_id: Option<&[u8]>) -> Result<(), Status> {
+        let Some(bytes) = transaction_id.filter(|id| !id.is_empty()) else {
+            return Ok(());
+        };
+        let id = std::str::from_utf8(bytes)
+            .map_err(|_| Status::invalid_argument("invalid transaction id encoding"))?;
+        let transactions = self.transactions.lock().await;
+        if transactions.contains(id) {
+            Ok(())
+        } else {
+            Err(Status::invalid_argument(format!(
+                "unknown transaction id: {id}"
+            )))
+        }
     }
 }
 
@@ -230,6 +251,8 @@ impl FlightSqlService for KrishivFlightSqlService {
 
         // Authenticate if an auth provider is configured.
         self.authenticate_request(&request)?;
+        self.validate_transaction_id(query.transaction_id.as_deref())
+            .await?;
 
         let ticket_query = TicketStatementQuery {
             statement_handle: query.query.into_bytes().into(),
@@ -433,6 +456,45 @@ impl FlightSqlService for KrishivFlightSqlService {
         self.prepared_statements.lock().await.pop(&handle);
         self.bound_params.lock().await.pop(&handle);
         Ok(())
+    }
+
+    async fn do_action_begin_transaction(
+        &self,
+        _query: ActionBeginTransactionRequest,
+        request: Request<arrow_flight::Action>,
+    ) -> Result<ActionBeginTransactionResult, Status> {
+        self.authenticate_request(&request)?;
+        let transaction_id = Uuid::new_v4().to_string();
+        self.transactions
+            .lock()
+            .await
+            .insert(transaction_id.clone());
+        Ok(ActionBeginTransactionResult {
+            transaction_id: transaction_id.into_bytes().into(),
+        })
+    }
+
+    async fn do_action_end_transaction(
+        &self,
+        query: ActionEndTransactionRequest,
+        request: Request<arrow_flight::Action>,
+    ) -> Result<(), Status> {
+        self.authenticate_request(&request)?;
+        let transaction_id = std::str::from_utf8(&query.transaction_id)
+            .map_err(|_| Status::invalid_argument("invalid transaction id encoding"))?;
+        if !self.transactions.lock().await.remove(transaction_id) {
+            return Err(Status::invalid_argument(format!(
+                "unknown transaction id: {transaction_id}"
+            )));
+        }
+        match EndTransaction::try_from(query.action)
+            .map_err(|_| Status::invalid_argument("invalid EndTransaction action"))?
+        {
+            EndTransaction::Commit | EndTransaction::Rollback => Ok(()),
+            EndTransaction::Unspecified => Err(Status::invalid_argument(
+                "EndTransaction action must be Commit or Rollback",
+            )),
+        }
     }
 
     // ── G17: Catalog introspection ────────────────────────────────────────────
@@ -770,6 +832,28 @@ impl KrishivFlightSqlService {
             A::RegisterKafkaSource(_) => Err(KrishivActionError::Other(
                 "Kafka support not enabled; rebuild with --features kafka".into(),
             )),
+            A::CancelOperation(body) => {
+                self.host.cancel_operation(body.operation_id);
+                Ok(Vec::new())
+            }
+            A::GetOperationProgress(body) => {
+                let response = self
+                    .host
+                    .operation_progress(body.operation_id)
+                    .map(|(rows_scanned, rows_emitted)| {
+                        krishiv_runtime::flight_action::OperationProgressResponse {
+                            rows_scanned,
+                            rows_emitted,
+                        }
+                    })
+                    .unwrap_or(krishiv_runtime::flight_action::OperationProgressResponse {
+                        rows_scanned: 0,
+                        rows_emitted: 0,
+                    });
+                response
+                    .to_json_bytes()
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))
+            }
         }
     }
 }
@@ -1109,6 +1193,53 @@ mod tests {
         let info = resp.into_inner();
         assert_eq!(info.endpoint.len(), 1);
         assert!(!info.endpoint[0].ticket.as_ref().unwrap().ticket.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flight_sql_transaction_begin_commit_round_trip() {
+        use arrow_flight::Action;
+
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let begin = svc
+            .do_action_begin_transaction(
+                ActionBeginTransactionRequest {},
+                Request::new(Action {
+                    r#type: "BeginTransaction".into(),
+                    body: bytes::Bytes::new(),
+                }),
+            )
+            .await
+            .expect("begin transaction");
+        let transaction_id = begin.transaction_id;
+        let cmd = CommandStatementQuery {
+            query: "SELECT 1".into(),
+            transaction_id: Some(transaction_id.clone()),
+        };
+        svc.get_flight_info_statement(cmd, Request::new(FlightDescriptor::new_cmd(vec![])))
+            .await
+            .expect("statement in transaction");
+        svc.do_action_end_transaction(
+            ActionEndTransactionRequest {
+                transaction_id: transaction_id.clone(),
+                action: EndTransaction::Commit as i32,
+            },
+            Request::new(Action {
+                r#type: "EndTransaction".into(),
+                body: bytes::Bytes::new(),
+            }),
+        )
+        .await
+        .expect("commit transaction");
+        let missing = svc
+            .get_flight_info_statement(
+                CommandStatementQuery {
+                    query: "SELECT 1".into(),
+                    transaction_id: Some(transaction_id),
+                },
+                Request::new(FlightDescriptor::new_cmd(vec![])),
+            )
+            .await;
+        assert!(missing.is_err());
     }
 
     #[tokio::test]

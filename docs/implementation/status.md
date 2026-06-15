@@ -1,5 +1,57 @@
 # Krishiv Implementation Status
 
+## 2026-06-15 — Deferred API gap items (distributed sink, gateway, Flight tx, Python)
+
+Implemented the deferred follow-ups from `docs/implementation/api-gap-plan.md`:
+
+- **`krishiv-api`**: `DataFrameWriter::save_target_async` routes remote SQL-backed parquet
+  writes through the staged `object-parquet-sink` protocol; expanded deprecated reader/writer
+  `option()` string compatibility mapping.
+- **`krishiv-flight-sql`**: `BeginTransaction` / `EndTransaction` Flight SQL actions with
+  transaction-id validation on statement queries.
+- **`krishiv-sql-gateway`** (new crate): separately versioned blocking SQL gateway facade with
+  SQLSTATE error mapping for JDBC/ODBC-oriented clients.
+- **`krishiv-python`**: `BlockingSession`, `RustScalarUdf` + `register_function`, streaming
+  join exports (`stream_table_join`, `temporal_join`, `stream_stream_join`).
+
+### Validation
+
+```
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo check -p krishiv-api -p krishiv-flight-sql -p krishiv-sql-gateway -p krishiv-python
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-flight-sql --lib flight_sql_transaction
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-sql-gateway
+```
+
+---
+
+## 2026-06-15 — API gap closure across Rust, SQL, and Python
+
+Closed the cross-surface API parity gaps from the API matrix review:
+
+- **`krishiv-sql`**: `introspection_sql` module (`DESCRIBE`/`SHOW COLUMNS`/`EXPLAIN` intercepts);
+  `CREATE/REFRESH/DROP LIVE TABLE` routed through `SqlEngine::sql()`; shared
+  `live_table_registry` and `operation_registry` on `SqlEngine`; `$1` binding marked supported in
+  grammar matrix.
+- **`krishiv-api`**: `Session::sql_as` / `sql_as_async` with auth + policy; auth/policy stored on
+  `Session`; `operation_registry()` and `live_table_registry()` accessors.
+- **`krishiv-runtime` / `krishiv-flight-sql`**: `CancelOperation` and `GetOperationProgress`
+  Flight actions; `OperationRegistry::progress` snapshots.
+- **`krishiv-python`**: `PyStreamingDataFrame`, `DataStreamReader`, `interval_join`, typed
+  catalog helpers, `sql_as`, shared `operation_registry`, `LiveTable`/`read_kinesis`/`read_pulsar`
+  exports.
+- **Docs**: `docs/implementation/api-gap-plan.md`; updated `phase-4-user-apis.md`.
+
+### Validation
+
+```
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-sql --lib introspection
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-api --lib sql_as
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo test -p krishiv-api --lib describe_and_live
+CXX=g++ RUSTFLAGS="-C linker=g++" cargo check -p krishiv-python
+```
+
+---
+
 ## 2026-06-14 — Audit follow-ups: hot-key loop, connectors, UI, operator
 
 Implemented the documented follow-up work on PR #79:

@@ -5727,6 +5727,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-sql-gateway"
+version = "0.1.0"
+dependencies = [
+ "krishiv-api",
+ "krishiv-sql",
+]
+
+[[package]]
 name = "krishiv-state"
 version = "0.1.0"
 dependencies = [

@@ -20,3 +20,13 @@ replacement = "Stream.tumbling_window (public stable API unchanged)"
 id = "sql-public.json:items/crates/krishiv-sql/src/lib.rs::struct::SqlDataFrame::#[derive(Debug, Clone)] pub struct SqlDataFrame"
 reason = "SqlDataFrame derive set changed in main (commit 5ccd121) as part of SQL API surface cleanup."
 replacement = "SqlDataFrame (struct retained, derive set updated)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/io.rs::fn::option::pub fn option(self, key: impl Into<String>, _value: impl Into<String>) -> Result<Self>"
+reason = "Writer option() inventory id changed when implementing generic option compatibility (parameter renamed and body enabled)."
+replacement = "DataFrameWriter::option(mut self, key, value)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/streaming_dataframe.rs::struct::StreamingDataFrame::pub struct StreamingDataFrame"
+reason = "StreamingDataFrame gained Clone derive for Python streaming join bindings; inventory id updated."
+replacement = "StreamingDataFrame (#[derive(Clone)] retained)"

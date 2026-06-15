@@ -29,6 +29,7 @@ pub mod cep_sql;
 mod connector_table;
 pub mod create_function_ddl;
 pub mod grammar;
+pub mod introspection_sql;
 mod lakehouse;
 pub mod live_table;
 pub mod pivot_sql;
@@ -354,6 +355,10 @@ pub struct SqlEngine {
     /// can dispatch maintenance operations to the right catalog.
     #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
     iceberg_catalogs: Arc<std::sync::RwLock<Vec<(Arc<catalog::unified::KrishivCatalog>, String)>>>,
+    /// Live-table DDL registry shared across SQL and session APIs.
+    live_table_registry: Arc<live_table::LiveTableRegistry>,
+    /// Cancelled operation IDs and progress snapshots for query lifecycle control.
+    operation_registry: Arc<OperationRegistry>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -620,6 +625,8 @@ impl SqlEngine {
             memory_limit_bytes,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
             iceberg_catalogs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            live_table_registry: Arc::new(live_table::LiveTableRegistry::new()),
+            operation_registry: Arc::new(OperationRegistry::new()),
         })
     }
 
@@ -949,6 +956,16 @@ impl SqlEngine {
             self.invalidate_plan_cache();
         }
         Ok(())
+    }
+
+    /// Shared live-table registry for `CREATE LIVE TABLE` DDL.
+    pub fn live_table_registry(&self) -> &Arc<live_table::LiveTableRegistry> {
+        &self.live_table_registry
+    }
+
+    /// Shared operation registry for cancellation and progress reporting.
+    pub fn operation_registry(&self) -> &Arc<OperationRegistry> {
+        &self.operation_registry
     }
 
     /// Drop a named table from the session context.
@@ -1413,6 +1430,45 @@ impl SqlEngine {
                 self.udf_last_synced_version
                     .store(current, Ordering::Release);
             }
+        }
+
+        // ── Intercept DESCRIBE / SHOW COLUMNS / EXPLAIN ──────────────────────
+        if let Some(stmt) = introspection_sql::parse_introspection_statement(query)? {
+            return match stmt {
+                introspection_sql::IntrospectionStatement::Describe { table } => {
+                    let batch = introspection_sql::describe_table(&self.context, &table).await?;
+                    let describe_table_name = next_ephemeral_name("describe_result");
+                    lakehouse::register_scan_batches(
+                        &self.context,
+                        &describe_table_name,
+                        vec![batch],
+                    )
+                    .await?;
+                    let dataframe = self
+                        .context
+                        .sql(&format!("SELECT * FROM {describe_table_name}"))
+                        .await?;
+                    Ok(self.attach_query_metadata(self.make_sql_df("describe", dataframe), query))
+                }
+                introspection_sql::IntrospectionStatement::Explain { mode, query: inner } => {
+                    let text = introspection_sql::explain_query(&inner, mode)?;
+                    let batch = introspection_sql::explain_result_batch(&text)?;
+                    let explain_table = next_ephemeral_name("explain_result");
+                    lakehouse::register_scan_batches(&self.context, &explain_table, vec![batch])
+                        .await?;
+                    let dataframe = self
+                        .context
+                        .sql(&format!("SELECT * FROM {explain_table}"))
+                        .await?;
+                    Ok(self.attach_query_metadata(self.make_sql_df("explain", dataframe), query))
+                }
+            };
+        }
+
+        // ── Intercept CREATE / REFRESH / DROP LIVE TABLE ─────────────────────
+        if live_table::execute_live_table_ddl(&self.live_table_registry, query)?.is_some() {
+            let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("live-table-ddl", empty), query));
         }
 
         // ── Intercept SET shuffle.partitions = N ─────────────────────────────
@@ -1959,7 +2015,7 @@ pub struct TaggedQueryResult {
     pub inner: SqlDataFrame,
 }
 
-/// Registry of cancelled operation IDs.
+/// Registry of cancelled operation IDs and optional progress snapshots.
 ///
 /// Callers can cancel an in-flight operation by registering its ID here before
 /// or during execution.  [`SqlEngine::execute_with_operation_id`] checks this
@@ -1967,6 +2023,7 @@ pub struct TaggedQueryResult {
 #[derive(Clone, Default)]
 pub struct OperationRegistry {
     cancelled: Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
+    progress: Arc<std::sync::RwLock<std::collections::HashMap<u64, (u64, u64)>>>,
 }
 
 impl OperationRegistry {
@@ -1997,6 +2054,24 @@ impl OperationRegistry {
         if let Ok(mut ids) = self.cancelled.write() {
             ids.remove(&operation_id);
         }
+        if let Ok(mut progress) = self.progress.write() {
+            progress.remove(&operation_id);
+        }
+    }
+
+    /// Record row-level progress for an operation.
+    pub fn update_progress(&self, operation_id: u64, rows_scanned: u64, rows_emitted: u64) {
+        if let Ok(mut progress) = self.progress.write() {
+            progress.insert(operation_id, (rows_scanned, rows_emitted));
+        }
+    }
+
+    /// Return the latest `(rows_scanned, rows_emitted)` snapshot, if any.
+    pub fn progress(&self, operation_id: u64) -> Option<(u64, u64)> {
+        self.progress
+            .read()
+            .ok()
+            .and_then(|progress| progress.get(&operation_id).copied())
     }
 
     /// Return all currently cancelled operation IDs.
@@ -2665,14 +2740,15 @@ fn top_level_alias_index(expression: &str) -> Option<usize> {
             }
             b'(' if !single_quoted && !double_quoted => depth += 1,
             b')' if !single_quoted && !double_quoted => depth = depth.saturating_sub(1),
-            b' ' if depth == 0 && !single_quoted && !double_quoted => {
-                if bytes
+            b' ' if depth == 0
+                && !single_quoted
+                && !double_quoted
+                && bytes
                     .get(index..index + 4)
-                    .is_some_and(|slice| slice.eq_ignore_ascii_case(b" AS "))
-                {
-                    candidate = Some(index);
-                    index += 3;
-                }
+                    .is_some_and(|slice| slice.eq_ignore_ascii_case(b" AS ")) =>
+            {
+                candidate = Some(index);
+                index += 3;
             }
             _ => {}
         }

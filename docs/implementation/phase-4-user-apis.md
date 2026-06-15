@@ -48,17 +48,29 @@ DataFusion implementation types.
 - [ ] Add coordinator query progress, metrics streaming, and cancellation to
       `ExecutionRuntime`, Flight actions, Rust `Session`, and Python `Session`.
 - [ ] Add JDBC/ODBC compatibility through a separately versioned SQL gateway;
-      Arrow Flight SQL remains the native protocol.
-- [ ] Add prepared statements and parameter binding across Flight SQL.
-- [ ] Add cache/persist/unpersist and temporary-view APIs.
+      Arrow Flight SQL remains the native protocol. (`krishiv-sql-gateway` facade
+      crate landed; wire-protocol drivers remain follow-up.)
 - [ ] Add remote analyze metrics once coordinator transport is versioned.
+
+## Recently completed (API gap closure)
+
+- [x] Cache/persist/unpersist and temporary-view APIs (Rust + Python).
+- [x] Local prepared-statement parameter binding (`$1`, `$2`, …).
+- [x] `Session::sql_as` policy-enforced SQL entry point.
+- [x] SQL `DESCRIBE` / `SHOW COLUMNS` / `EXPLAIN` intercepts.
+- [x] `CREATE LIVE TABLE` routing through `SqlEngine::sql()`.
+- [x] Distributed atomic parquet sink writes via `DataFrameWriter` (remote SQL-backed).
+- [x] Flight SQL `BeginTransaction` / `EndTransaction` actions.
+- [x] Generic reader/writer `option()` compatibility mapping.
+- [x] `krishiv-sql-gateway` separately versioned JDBC/ODBC facade crate.
+- [x] Python `BlockingSession`, streaming joins (`stream_table_join`, `temporal_join`,
+      `stream_stream_join`), and `register_function` for Rust scalar UDFs.
 
 ## Exit criteria
 
 The local Rust and Python API slice is implemented when focused SQL/API/Python
-checks pass. Distributed writes, remote progress/cancellation, JDBC/ODBC, and
-prepared statements remain explicit follow-up work rather than undocumented
-claims.
+checks pass. Remote analyze metrics and full JDBC/ODBC wire-protocol drivers
+remain explicit follow-up work rather than undocumented claims.
 
 ## Stable API continuation
 

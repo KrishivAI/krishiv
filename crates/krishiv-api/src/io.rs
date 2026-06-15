@@ -175,6 +175,31 @@ impl DataFrameReader {
                 }
                 options.delimiter = bytes[0];
             }
+            (Some(FileReadOptions::Csv(options)), "malformedRecords" | "malformed_records") => {
+                options.malformed_records = parse_malformed_policy(&key, &value)?;
+            }
+            (Some(FileReadOptions::Parquet(options)), "columns" | "projection") => {
+                options.projection = parse_csv_list(&value);
+            }
+            (Some(FileReadOptions::Json(options)), "columns" | "projection") => {
+                options.projection = parse_csv_list(&value);
+            }
+            (Some(FileReadOptions::Json(options)), "malformedRecords" | "malformed_records") => {
+                options.malformed_records = parse_malformed_policy(&key, &value)?;
+            }
+            (None, "header" | "delimiter") => {
+                let mut options = CsvReadOptions::default();
+                if key == "header" {
+                    options.has_header = parse_bool(&key, &value)?;
+                } else {
+                    let bytes = value.as_bytes();
+                    if bytes.len() != 1 {
+                        return Err(invalid("CSV delimiter must be one byte"));
+                    }
+                    options.delimiter = bytes[0];
+                }
+                self.file_options = Some(FileReadOptions::Csv(options));
+            }
             _ => return Err(invalid(format!("unknown typed reader option '{key}'"))),
         }
         Ok(self)
@@ -334,11 +359,48 @@ impl DataFrameWriter {
     }
 
     #[deprecated(note = "use typed FileWriteOptions")]
-    pub fn option(self, key: impl Into<String>, _value: impl Into<String>) -> Result<Self> {
-        Err(invalid(format!(
-            "unknown generic writer option '{}'; use FileWriteOptions",
-            key.into()
-        )))
+    pub fn option(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        let key = key.into();
+        let value = value.into();
+        let options = self
+            .options
+            .get_or_insert_with(|| FileWriteOptions::new(DataFormat::Parquet));
+        match key.as_str() {
+            "mode" => {
+                options.mode = parse_write_mode(&key, &value)?;
+            }
+            "partitionBy" | "partition_by" => {
+                options.layout.partition_by = parse_csv_list(&value);
+            }
+            "format" => {
+                options.format = match value.trim().to_ascii_lowercase().as_str() {
+                    "parquet" => DataFormat::Parquet,
+                    "csv" => DataFormat::Csv,
+                    "json" | "ndjson" => DataFormat::Json,
+                    other => {
+                        return Err(invalid(format!("unsupported data format '{other}'")));
+                    }
+                };
+            }
+            "maxRecordsPerFile" | "max_records_per_file" => {
+                options.layout.max_rows_per_file =
+                    Some(value.parse().map_err(|_| {
+                        invalid(format!("option '{key}' must be a positive integer"))
+                    })?);
+            }
+            "targetFileSize" | "target_file_size_bytes" => {
+                options.layout.target_file_size_bytes =
+                    Some(value.parse().map_err(|_| {
+                        invalid(format!("option '{key}' must be a positive integer"))
+                    })?);
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "unknown generic writer option '{key}'; use FileWriteOptions"
+                )));
+            }
+        }
+        Ok(self)
     }
 
     pub fn save(self, path: &str) -> Result<()> {
@@ -416,6 +478,20 @@ impl DataFrameWriter {
             .ok_or_else(|| invalid("typed file write options are required"))?;
         options.layout.validate().map_err(connector_error)?;
         let dataframe = apply_sort(self.dataframe, &options.layout)?;
+
+        if options.format == DataFormat::Parquet
+            && let Some(sink_mode) = to_sink_write_mode(options.mode)
+        {
+            let partition_by = options.layout.partition_by.clone();
+            let path_str = path.to_string_lossy().into_owned();
+            if dataframe
+                .try_distributed_parquet_sink(&path_str, sink_mode, &partition_by)?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+
         let batches = dataframe.collect_async().await?.into_batches();
         tokio::task::spawn_blocking(move || write_files(path, batches, options))
             .await
@@ -672,6 +748,51 @@ fn parse_bool(key: &str, value: &str) -> Result<bool> {
     value
         .parse()
         .map_err(|_| invalid(format!("option '{key}' must be true or false")))
+}
+
+fn parse_csv_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parse_malformed_policy(key: &str, value: &str) -> Result<MalformedRecordPolicy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "failfast" | "fail_fast" | "fail" => Ok(MalformedRecordPolicy::FailFast),
+        "drop" | "dropmalformed" | "drop_malformed" => Ok(MalformedRecordPolicy::DropMalformed),
+        other => Err(invalid(format!(
+            "option '{key}' must be failfast or drop; got '{other}'"
+        ))),
+    }
+}
+
+fn parse_write_mode(key: &str, value: &str) -> Result<WriteMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "append" => Ok(WriteMode::Append),
+        "overwrite" => Ok(WriteMode::Overwrite),
+        "errorifexists" | "error_if_exists" | "error-if-exists" => Ok(WriteMode::ErrorIfExists),
+        "ignore" => Ok(WriteMode::Ignore),
+        "dynamicoverwrite" | "dynamic_overwrite" | "dynamic-overwrite" => {
+            Ok(WriteMode::DynamicOverwrite)
+        }
+        other => Err(invalid(format!(
+            "unknown write mode '{other}' for option '{key}'"
+        ))),
+    }
+}
+
+fn to_sink_write_mode(mode: WriteMode) -> Option<krishiv_common::write_commit::WriteMode> {
+    use krishiv_common::write_commit::WriteMode as SinkMode;
+    match mode {
+        WriteMode::Append => Some(SinkMode::Append),
+        WriteMode::Overwrite => Some(SinkMode::Overwrite),
+        WriteMode::ErrorIfExists => Some(SinkMode::ErrorIfExists),
+        WriteMode::Ignore => Some(SinkMode::Ignore),
+        WriteMode::DynamicOverwrite => None,
+    }
 }
 
 fn connector_error(error: krishiv_connectors::ConnectorError) -> KrishivError {

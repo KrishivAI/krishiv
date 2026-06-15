@@ -1199,3 +1199,100 @@ async fn phase_d_async_reader_and_iceberg_writer_round_trip() {
         .unwrap();
     assert_eq!(loaded.row_count(), 2);
 }
+
+#[test]
+fn sql_as_rejects_missing_auth_provider() {
+    let session = Session::builder().build().unwrap();
+    let err = session.sql_as("key", "SELECT 1").unwrap_err();
+    assert!(matches!(err, KrishivError::InvalidConfig { .. }));
+}
+
+#[test]
+fn sql_as_enforces_policy_on_referenced_tables() {
+    use krishiv_plan::governance::{AllowAllPolicyHook, StaticApiKeyAuthProvider};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct DenySecretPolicy;
+    impl krishiv_plan::governance::PolicyHook for DenySecretPolicy {
+        fn check_table_access(&self, table_name: &str) -> bool {
+            table_name != "secret"
+        }
+    }
+
+    let mut keys = HashMap::new();
+    keys.insert("dev-key".into(), "alice".into());
+    let session = Session::builder()
+        .with_auth(Arc::new(StaticApiKeyAuthProvider::new(keys)))
+        .with_policy(Arc::new(DenySecretPolicy))
+        .build()
+        .unwrap();
+    session
+        .register_record_batches(
+            "secret",
+            vec![RecordBatch::new_empty(Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+            ])))],
+        )
+        .unwrap();
+    let err = session
+        .sql_as("dev-key", "SELECT * FROM secret")
+        .unwrap_err();
+    assert!(matches!(err, KrishivError::AccessDenied { .. }));
+
+    let mut allow_keys = HashMap::new();
+    allow_keys.insert("dev-key".into(), "alice".into());
+    let session_allow = Session::builder()
+        .with_auth(Arc::new(StaticApiKeyAuthProvider::new(allow_keys)))
+        .with_policy(Arc::new(AllowAllPolicyHook))
+        .build()
+        .unwrap();
+    session_allow
+        .register_record_batches(
+            "open",
+            vec![RecordBatch::new_empty(Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+            ])))],
+        )
+        .unwrap();
+    let df = session_allow
+        .sql_as("dev-key", "SELECT * FROM open")
+        .unwrap();
+    assert_eq!(df.collect().unwrap().row_count(), 0);
+}
+
+#[test]
+fn describe_and_live_table_sql_intercepts_work() {
+    let session = Session::builder().build().unwrap();
+    session
+        .register_record_batches(
+            "people",
+            vec![
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Int64, false),
+                        Field::new("name", DataType::Utf8, true),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1_i64])),
+                        Arc::new(StringArray::from(vec![Some("alice")])),
+                    ],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+    let describe = session.sql("DESCRIBE people").unwrap().collect().unwrap();
+    assert_eq!(describe.row_count(), 2);
+
+    session
+        .sql("CREATE LIVE TABLE live_people AS SELECT id FROM people")
+        .unwrap();
+    assert!(
+        session
+            .live_table_registry()
+            .contains("live_people")
+            .unwrap()
+    );
+}

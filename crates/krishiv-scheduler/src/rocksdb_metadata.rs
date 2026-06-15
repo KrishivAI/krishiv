@@ -161,7 +161,7 @@ impl RocksDbMetadataStore {
                 }
             }
             // Most-recent first: sort descending by completed_at_ms
-            history.sort_by(|a, b| b.completed_at_ms.cmp(&a.completed_at_ms));
+            history.sort_by_key(|b| std::cmp::Reverse(b.completed_at_ms));
         }
 
         Ok(Self {

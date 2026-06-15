@@ -517,6 +517,11 @@ impl PyDataFrame {
         crate::streaming::PyDataStreamWriter::new(self.inner.clone())
     }
 
+    /// Convert this DataFrame into a :class:`StreamingDataFrame` builder.
+    pub fn to_streaming(&self) -> crate::streaming_dataframe::PyStreamingDataFrame {
+        crate::streaming_dataframe::PyStreamingDataFrame::new(self.inner.clone())
+    }
+
     /// Return the schema as a list of `(column_name, arrow_type)` pairs.
     ///
     /// Example::

@@ -23,6 +23,7 @@ pub struct PyLiveTable {
     name: String,
     store: Arc<MemoryDeltaStore>,
     exec: CreateLiveTableExec,
+    registry: std::sync::Arc<LiveTableRegistry>,
 }
 
 #[pymethods]
@@ -40,7 +41,7 @@ impl PyLiveTable {
 
     pub fn drop(&self) -> PyResult<()> {
         let sql = format!("DROP LIVE TABLE {}", self.name);
-        execute_live_table_ddl(&LIVE_TABLE_REGISTRY, &sql)
+        execute_live_table_ddl(self.registry.as_ref(), &sql)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(())
     }
@@ -125,17 +126,28 @@ impl PyChangeFeedIter {
     }
 }
 
-static LIVE_TABLE_REGISTRY: std::sync::LazyLock<LiveTableRegistry> =
-    std::sync::LazyLock::new(LiveTableRegistry::new);
+#[cfg(test)]
+fn test_registry() -> std::sync::Arc<LiveTableRegistry> {
+    std::sync::Arc::new(LiveTableRegistry::new())
+}
 
-pub fn create_live_table(name: String, query: String) -> PyResult<PyLiveTable> {
+pub fn create_live_table(
+    name: String,
+    query: String,
+    registry: std::sync::Arc<LiveTableRegistry>,
+) -> PyResult<PyLiveTable> {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
     let store = Arc::new(MemoryDeltaStore::new());
     let exec = CreateLiveTableExec::new(name.clone(), query.clone(), schema, Some(store.clone()));
     let ddl = format!("CREATE LIVE TABLE {name} AS {query}");
-    execute_live_table_ddl(&LIVE_TABLE_REGISTRY, &ddl)
+    execute_live_table_ddl(registry.as_ref(), &ddl)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    Ok(PyLiveTable { name, store, exec })
+    Ok(PyLiveTable {
+        name,
+        store,
+        exec,
+        registry,
+    })
 }
 
 #[cfg(test)]
@@ -143,8 +155,12 @@ mod tests {
     use super::*;
 
     fn make_table(suffix: &str) -> PyLiveTable {
-        create_live_table(format!("test_table_{suffix}"), "SELECT 1 AS n".to_string())
-            .expect("create_live_table must succeed")
+        create_live_table(
+            format!("test_table_{suffix}"),
+            "SELECT 1 AS n".to_string(),
+            test_registry(),
+        )
+        .expect("create_live_table must succeed")
     }
 
     #[test]

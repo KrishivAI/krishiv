@@ -1197,15 +1197,33 @@ Execution statistics:
     ///
     /// Requires a SQL-backed DataFrame (`session.sql(..)` / `read_parquet`):
     /// the query text is what the sink job executes remotely.
-    #[allow(dead_code)]
-    pub(crate) fn write_parquet_sink(
+    /// Submit a distributed staged parquet sink when the runtime supports it.
+    ///
+    /// Returns `Ok(Some(()))` when the sink job was submitted, `Ok(None)` when
+    /// the caller should fall back to a local collect-then-write path, and
+    /// `Err` for client-side or runtime failures other than unsupported sink.
+    pub(crate) fn try_distributed_parquet_sink(
         &self,
         path: &str,
         mode: krishiv_common::write_commit::WriteMode,
         partition_by: &[String],
-    ) -> Result<()> {
-        self.run_sink_write(path, mode, partition_by)?
-            .map_err(KrishivError::from)
+    ) -> Result<Option<()>> {
+        if !(self.runtime.uses_remote_execution() && !self.force_local && self.sql_query.is_some())
+        {
+            return Ok(None);
+        }
+        match self.run_sink_write(path, mode, partition_by)? {
+            Ok(()) => Ok(Some(())),
+            Err(krishiv_runtime::RuntimeError::Unsupported { feature }) => {
+                tracing::warn!(
+                    feature,
+                    "distributed sink write unsupported by runtime; \
+                     falling back to client-side collect-then-write"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Build the sink contract for `path` and submit the sink job.
@@ -1283,21 +1301,12 @@ Execution statistics:
         use std::fs::File;
         use std::path::Path;
 
-        if self.runtime.uses_remote_execution() && !self.force_local && self.sql_query.is_some() {
-            // Probe the runtime directly so an Unsupported response (e.g. an
-            // older Flight server without the batch_sql_sink action) can fall
-            // back to the legacy client-side collect-then-write path.
-            match self.run_sink_write(path, krishiv_common::write_commit::WriteMode::Append, &[])? {
-                Ok(()) => return Ok(()),
-                Err(krishiv_runtime::RuntimeError::Unsupported { feature }) => {
-                    tracing::warn!(
-                        feature,
-                        "distributed sink write unsupported by runtime; \
-                         falling back to client-side collect-then-write"
-                    );
-                }
-                Err(e) => return Err(e.into()),
-            }
+        if let Some(()) = self.try_distributed_parquet_sink(
+            path,
+            krishiv_common::write_commit::WriteMode::Append,
+            &[],
+        )? {
+            return Ok(());
         }
 
         let result = krishiv_common::async_util::block_on(self.collect_async())?;

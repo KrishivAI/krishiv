@@ -42,6 +42,8 @@ pub mod tags {
     pub const BATCH_SQL: &str = "batch_sql";
     pub const BATCH_SQL_SINK: &str = "batch_sql_sink";
     pub const REGISTER_KAFKA_SOURCE: &str = "register_kafka_source";
+    pub const CANCEL_OPERATION: &str = "operation.cancel";
+    pub const GET_OPERATION_PROGRESS: &str = "operation.progress";
 }
 
 /// Build a stable action type for a tag — `format!("krishiv.v1.{tag}")`.
@@ -194,6 +196,33 @@ pub struct RegisterKafkaSourceBody {
     pub group_id: String,
 }
 
+/// Cancel an in-flight operation by numeric ID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelOperationBody {
+    pub operation_id: u64,
+}
+
+/// Request progress for an in-flight operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationProgressBody {
+    pub operation_id: u64,
+}
+
+/// Progress snapshot returned by [`OperationProgressBody`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationProgressResponse {
+    pub rows_scanned: u64,
+    pub rows_emitted: u64,
+}
+
+impl OperationProgressResponse {
+    /// Encode this response as JSON bytes for Flight `DoAction` replies.
+    pub fn to_json_bytes(&self) -> RuntimeResult<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| RuntimeError::transport(format!("operation progress encode: {e}")))
+    }
+}
+
 /// Typed Flight `DoAction` payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind")]
@@ -208,6 +237,8 @@ pub enum KrishivFlightAction {
     BatchSql(BatchSqlBody),
     BatchSqlSink(BatchSqlSinkBody),
     RegisterKafkaSource(RegisterKafkaSourceBody),
+    CancelOperation(CancelOperationBody),
+    GetOperationProgress(OperationProgressBody),
 }
 
 impl KrishivFlightAction {
@@ -224,6 +255,8 @@ impl KrishivFlightAction {
             Self::BatchSql(_) => tags::BATCH_SQL,
             Self::BatchSqlSink(_) => tags::BATCH_SQL_SINK,
             Self::RegisterKafkaSource(_) => tags::REGISTER_KAFKA_SOURCE,
+            Self::CancelOperation(_) => tags::CANCEL_OPERATION,
+            Self::GetOperationProgress(_) => tags::GET_OPERATION_PROGRESS,
         };
         action_type(tag)
     }

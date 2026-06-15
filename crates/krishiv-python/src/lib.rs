@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 
 mod agg;
 mod batch;
+mod blocking_session;
 mod dataframe;
 mod errors;
 mod expression;
@@ -22,6 +23,7 @@ mod process_api;
 mod query_handle;
 mod query_result;
 mod relation;
+mod rust_udf;
 mod schema;
 mod session;
 mod sinks;
@@ -29,6 +31,7 @@ mod sources;
 mod stream;
 mod stream_exec;
 mod streaming;
+mod streaming_dataframe;
 mod udf;
 mod windows;
 
@@ -57,6 +60,7 @@ pub use stream::{
     PyWindowedStream,
 };
 pub use streaming::{PyDataStreamWriter, PyStreamingQuery, PyStreamingQueryProgress};
+pub use streaming_dataframe::{PyDataStreamReader, PyStreamingDataFrame, interval_join};
 pub use udf::call_python_udf;
 pub use vector_sinks::{PyInMemoryVectorSink, PyScoredChunk};
 pub use windows::PyWindowSpec;
@@ -83,6 +87,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::register(m)?;
 
     m.add_class::<session::PySession>()?;
+    m.add_class::<blocking_session::PyBlockingSession>()?;
+    m.add_class::<rust_udf::PyRustScalarUdf>()?;
     m.add_class::<dataframe::PyDataFrame>()?;
     m.add_class::<prepared::PyPreparedStatement>()?;
     m.add_class::<expression::PyColumn>()?;
@@ -147,6 +153,15 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<lakehouse::PyMemoryLakehouseTable>()?;
 
     // Streaming write (Phase F parity)
+    m.add_function(wrap_pyfunction!(streaming_dataframe::interval_join, m)?)?;
+    m.add_function(wrap_pyfunction!(streaming_dataframe::stream_table_join, m)?)?;
+    m.add_function(wrap_pyfunction!(streaming_dataframe::temporal_join, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        streaming_dataframe::stream_stream_join,
+        m
+    )?)?;
+    m.add_class::<streaming_dataframe::PyStreamingDataFrame>()?;
+    m.add_class::<streaming_dataframe::PyDataStreamReader>()?;
     m.add_class::<streaming::PyStreamingQueryProgress>()?;
     m.add_class::<streaming::PyStreamingQuery>()?;
     m.add_class::<streaming::PyDataStreamWriter>()?;

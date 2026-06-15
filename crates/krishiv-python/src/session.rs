@@ -665,7 +665,54 @@ impl PySession {
 
     /// Create an :class:`OperationRegistry` tied to this session for operation-level cancellation.
     pub fn operation_registry(&self) -> PyOperationRegistry {
-        PyOperationRegistry::new()
+        PyOperationRegistry::new(self.inner.operation_registry())
+    }
+
+    pub fn read_stream(&self) -> crate::streaming_dataframe::PyDataStreamReader {
+        crate::streaming_dataframe::PyDataStreamReader::new(self.inner.as_ref().clone())
+    }
+
+    pub fn list_table_identifiers(&self) -> PyResult<Vec<String>> {
+        self.inner
+            .list_table_identifiers()
+            .map(|ids| {
+                ids.into_iter()
+                    .map(|id| id.name.as_str().to_string())
+                    .collect()
+            })
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn table_metadata(&self, name: String) -> PyResult<(Vec<(String, String)>, String)> {
+        let identifier =
+            krishiv_api::catalog::TableIdentifier::new(name).map_err(map_krishiv_error)?;
+        let metadata = self
+            .inner
+            .table_metadata(&identifier)
+            .map_err(map_krishiv_error)?;
+        let schema = metadata
+            .schema
+            .fields()
+            .iter()
+            .map(|field| (field.name().clone(), field.data_type().to_string()))
+            .collect();
+        let boundedness = format!("{:?}", metadata.boundedness);
+        Ok((schema, boundedness))
+    }
+
+    pub fn create_temp_view(&self, name: String, query: String) -> PyResult<()> {
+        let identifier =
+            krishiv_api::catalog::ViewIdentifier::new(name).map_err(map_krishiv_error)?;
+        self.inner
+            .create_temp_view(&identifier, &query)
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn sql_as(&self, api_key: String, query: String) -> PyResult<PyDataFrame> {
+        self.inner
+            .sql_as(&api_key, &query)
+            .map(|inner| PyDataFrame { inner })
+            .map_err(map_krishiv_error)
     }
 
     pub fn jobs(&self) -> Vec<PyJobStatus> {
@@ -724,6 +771,14 @@ impl PySession {
         Ok(())
     }
 
+    pub fn register_function(
+        &self,
+        name: String,
+        udf: &crate::rust_udf::PyRustScalarUdf,
+    ) -> PyResult<()> {
+        crate::rust_udf::register_function(&self.inner, name, udf)
+    }
+
     pub fn list_udfs(&self) -> Vec<String> {
         self.inner.scalar_udf_names()
     }
@@ -780,7 +835,7 @@ impl PySession {
     }
 
     pub fn live_table(&self, name: String, query: String) -> PyResult<PyLiveTable> {
-        crate::live_table::create_live_table(name, query)
+        crate::live_table::create_live_table(name, query, self.inner.live_table_registry().clone())
     }
 
     /// Create a [`PyStream`] backed by in-memory batches (supports windowed `collect()` / `async for`).
@@ -1090,14 +1145,12 @@ impl PySession {
 /// ```
 #[pyclass(name = "OperationRegistry")]
 pub struct PyOperationRegistry {
-    inner: krishiv_sql::OperationRegistry,
+    inner: std::sync::Arc<krishiv_sql::OperationRegistry>,
 }
 
 impl PyOperationRegistry {
-    pub fn new() -> Self {
-        Self {
-            inner: krishiv_sql::OperationRegistry::new(),
-        }
+    pub fn new(inner: std::sync::Arc<krishiv_sql::OperationRegistry>) -> Self {
+        Self { inner }
     }
 }
 
@@ -1116,6 +1169,11 @@ impl PyOperationRegistry {
     /// Remove ``operation_id`` from the registry (after the operation finishes).
     fn remove(&self, operation_id: u64) {
         self.inner.remove(operation_id);
+    }
+
+    /// Return ``(rows_scanned, rows_emitted)`` for an operation, if recorded.
+    fn progress(&self, operation_id: u64) -> Option<(u64, u64)> {
+        self.inner.progress(operation_id)
     }
 
     /// Return all currently cancelled operation IDs.
