@@ -1,5 +1,22 @@
 # Krishiv Implementation Status
 
+## 2026-06-15 — Refactor bugfixes: schema_registry visibility and scheduler chaos test
+
+Fixed compile/test gaps introduced by the large-file split:
+
+- **`krishiv-connectors/schema_registry`**: restored avro helpers in `avro.rs`; fixed `pub(crate)` visibility for client fetch/cache APIs and deserializer `client` fields so sibling modules and parent tests compile with the `schema-registry` feature.
+- **`krishiv-scheduler`**: re-added missing `#[test]` on `chaos_coordinator_failover_mid_ack_fencing` after a bad section boundary in `chaos_jcp.rs.inc`.
+
+### Validation
+
+```
+CXX=g++ CXXFLAGS="-include cstdint" cargo check --workspace
+CXX=g++ CXXFLAGS="-include cstdint" RUSTFLAGS="-C linker=g++" cargo test -p krishiv-connectors --features schema-registry --lib schema_registry::tests
+CXX=g++ CXXFLAGS="-include cstdint" RUSTFLAGS="-C linker=g++" cargo test -p krishiv-scheduler --lib chaos_coordinator_failover_mid_ack_fencing
+```
+
+---
+
 ## 2026-06-15 — Large-file refactor: split tests and production modules
 
 - **Test monoliths**: split `krishiv-scheduler` (18 sections), `krishiv-executor` (4), and `krishiv-shuffle` (12) via `include!` section files under `src/sections/`.
