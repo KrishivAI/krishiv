@@ -110,6 +110,45 @@
     },
     {
       "deprecated": false,
+      "documentation": "crates/krishiv-python/src/sinks.rs#L196",
+      "id": "crates/krishiv-python/src/sinks.rs::CassandraSink",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L247",
+          "id": "CassandraSink.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L206",
+          "id": "CassandraSink.new",
+          "kind": "method",
+          "name": "new",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L213",
+          "id": "CassandraSink.write_batches",
+          "kind": "method",
+          "name": "write_batches",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "CassandraSink",
+      "replacement": null,
+      "rust_type": "PyCassandraSink",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
       "documentation": "crates/krishiv-python/src/live_table.rs#L77",
       "id": "crates/krishiv-python/src/live_table.rs::ChangeFeedIter",
       "kind": "class",
@@ -1040,6 +1079,45 @@
     },
     {
       "deprecated": false,
+      "documentation": "crates/krishiv-python/src/sinks.rs#L259",
+      "id": "crates/krishiv-python/src/sinks.rs::ElasticsearchSink",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L305",
+          "id": "ElasticsearchSink.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L268",
+          "id": "ElasticsearchSink.new",
+          "kind": "method",
+          "name": "new",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L271",
+          "id": "ElasticsearchSink.write_batches",
+          "kind": "method",
+          "name": "write_batches",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "ElasticsearchSink",
+      "replacement": null,
+      "rust_type": "PyElasticsearchSink",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
       "documentation": "crates/krishiv-python/src/dataframe.rs#L650",
       "id": "crates/krishiv-python/src/dataframe.rs::GroupedDataFrame",
       "kind": "class",
@@ -1102,6 +1180,45 @@
       "name": "GroupedDataFrame",
       "replacement": null,
       "rust_type": "PyGroupedDataFrame",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/sinks.rs#L319",
+      "id": "crates/krishiv-python/src/sinks.rs::HBaseSink",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L370",
+          "id": "HBaseSink.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L329",
+          "id": "HBaseSink.new",
+          "kind": "method",
+          "name": "new",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/sinks.rs#L336",
+          "id": "HBaseSink.write_batches",
+          "kind": "method",
+          "name": "write_batches",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "HBaseSink",
+      "replacement": null,
+      "rust_type": "PyHBaseSink",
       "stability": "preview"
     },
     {
@@ -1396,6 +1513,72 @@
       "name": "KeyedStream",
       "replacement": null,
       "rust_type": "PyKeyedStream",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/vector_sinks.rs#L274",
+      "id": "crates/krishiv-python/src/vector_sinks.rs::LanceDbSink",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L343",
+          "id": "LanceDbSink.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L312",
+          "id": "LanceDbSink.delete_by_ids",
+          "kind": "method",
+          "name": "delete_by_ids",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L283",
+          "id": "LanceDbSink.open",
+          "kind": "method",
+          "name": "open",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L323",
+          "id": "LanceDbSink.query_nearest",
+          "kind": "method",
+          "name": "query_nearest",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L339",
+          "id": "LanceDbSink.sink_name",
+          "kind": "method",
+          "name": "sink_name",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L295",
+          "id": "LanceDbSink.upsert_batch",
+          "kind": "method",
+          "name": "upsert_batch",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "LanceDbSink",
+      "replacement": null,
+      "rust_type": "PyLanceDbSink",
       "stability": "preview"
     },
     {
@@ -1810,6 +1993,129 @@
     },
     {
       "deprecated": false,
+      "documentation": "crates/krishiv-python/src/vector_sinks.rs#L639",
+      "id": "crates/krishiv-python/src/vector_sinks.rs::PgvectorSink",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L651",
+          "id": "PgvectorSink.connect",
+          "kind": "method",
+          "name": "connect",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L707",
+          "id": "PgvectorSink.delete_by_ids",
+          "kind": "method",
+          "name": "delete_by_ids",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L728",
+          "id": "PgvectorSink.query_nearest",
+          "kind": "method",
+          "name": "query_nearest",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L754",
+          "id": "PgvectorSink.sink_name",
+          "kind": "method",
+          "name": "sink_name",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L680",
+          "id": "PgvectorSink.upsert_batch",
+          "kind": "method",
+          "name": "upsert_batch",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "PgvectorSink",
+      "replacement": null,
+      "rust_type": "PyPgvectorSink",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/vector_sinks.rs#L427",
+      "id": "crates/krishiv-python/src/vector_sinks.rs::PineconeSink",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L493",
+          "id": "PineconeSink.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L462",
+          "id": "PineconeSink.delete_by_ids",
+          "kind": "method",
+          "name": "delete_by_ids",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L436",
+          "id": "PineconeSink.new",
+          "kind": "method",
+          "name": "new",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L473",
+          "id": "PineconeSink.query_nearest",
+          "kind": "method",
+          "name": "query_nearest",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L489",
+          "id": "PineconeSink.sink_name",
+          "kind": "method",
+          "name": "sink_name",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L445",
+          "id": "PineconeSink.upsert_batch",
+          "kind": "method",
+          "name": "upsert_batch",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "PineconeSink",
+      "replacement": null,
+      "rust_type": "PyPineconeSink",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
       "documentation": "crates/krishiv-python/src/prepared.rs#L8",
       "id": "crates/krishiv-python/src/prepared.rs::PreparedStatement",
       "kind": "class",
@@ -1914,6 +2220,63 @@
       "name": "PyQueryResultIter",
       "replacement": null,
       "rust_type": "PyQueryResultIter",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/vector_sinks.rs#L503",
+      "id": "crates/krishiv-python/src/vector_sinks.rs::QdrantSink",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L516",
+          "id": "QdrantSink.connect",
+          "kind": "method",
+          "name": "connect",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L574",
+          "id": "QdrantSink.delete_by_ids",
+          "kind": "method",
+          "name": "delete_by_ids",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L595",
+          "id": "QdrantSink.query_nearest",
+          "kind": "method",
+          "name": "query_nearest",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L621",
+          "id": "QdrantSink.sink_name",
+          "kind": "method",
+          "name": "sink_name",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L547",
+          "id": "QdrantSink.upsert_batch",
+          "kind": "method",
+          "name": "upsert_batch",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "QdrantSink",
+      "replacement": null,
+      "rust_type": "PyQdrantSink",
       "stability": "preview"
     },
     {
@@ -3288,6 +3651,72 @@
       "name": "ValueState",
       "replacement": null,
       "rust_type": "PyValueState",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/vector_sinks.rs#L353",
+      "id": "crates/krishiv-python/src/vector_sinks.rs::WeaviateSink",
+      "kind": "class",
+      "methods": [
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L417",
+          "id": "WeaviateSink.__repr__",
+          "kind": "method",
+          "name": "__repr__",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L386",
+          "id": "WeaviateSink.delete_by_ids",
+          "kind": "method",
+          "name": "delete_by_ids",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L362",
+          "id": "WeaviateSink.new",
+          "kind": "method",
+          "name": "new",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L397",
+          "id": "WeaviateSink.query_nearest",
+          "kind": "method",
+          "name": "query_nearest",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L413",
+          "id": "WeaviateSink.sink_name",
+          "kind": "method",
+          "name": "sink_name",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/vector_sinks.rs#L369",
+          "id": "WeaviateSink.upsert_batch",
+          "kind": "method",
+          "name": "upsert_batch",
+          "replacement": null,
+          "stability": "preview"
+        }
+      ],
+      "name": "WeaviateSink",
+      "replacement": null,
+      "rust_type": "PyWeaviateSink",
       "stability": "preview"
     },
     {
