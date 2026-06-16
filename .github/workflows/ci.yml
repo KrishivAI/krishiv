@@ -12,9 +12,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Toolchain version is canonical in rust-toolchain.toml; this is a readable label.
   RUST_VERSION: "1.92"
-  # librocksdb-sys 0.16 requires this on GCC 15+
+  # librocksdb-sys requires this on GCC 15+ (uint64_t not declared without <cstdint>)
   CXXFLAGS: "-include cstdint"
+  # sccache caches rustc invocations across jobs and workflow runs on self-hosted runners.
+  # The local disk cache at ~/.cache/sccache persists between runs automatically.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_DIR: /home/runner/.cache/sccache
 
 jobs:
   # ── Format + Lint ────────────────────────────────────────────────────────────
@@ -27,15 +32,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          clean: false
-        with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev pkg-config cmake mold clang libclang-dev sccache
       - uses: taiki-e/install-action@just
       - run: just fmt
       - run: just lint
@@ -64,8 +68,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          clean: false
-        with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
@@ -73,7 +75,8 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev protobuf-compiler
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev pkg-config cmake mold clang libclang-dev protobuf-compiler sccache
       - uses: taiki-e/install-action@just
       - run: just check-${{ matrix.mode }}
 
@@ -88,14 +91,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          clean: false
-        with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev pkg-config cmake mold clang libclang-dev sccache
+      - uses: taiki-e/install-action@cargo-nextest
       - uses: taiki-e/install-action@just
       - run: just test
 
@@ -109,8 +112,6 @@ jobs:
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          clean: false
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2

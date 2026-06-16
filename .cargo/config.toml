@@ -1,17 +1,46 @@
-# ── Local dev linker ──────────────────────────────────────────────────────────
-# lld is faster than ld for incremental dev builds.
+# ── Build cache (optional, high-impact on CI and branch switching) ─────────────
+# sccache caches rustc invocations across builds and branches.
+# Install:  cargo binstall sccache   OR   cargo install sccache
+# Enable:   export RUSTC_WRAPPER=sccache   (add to your shell profile / CI env)
+# Stats:    sccache --show-stats
+#
+# [build]
+# rustc-wrapper = "sccache"
+
+# ── Linker selection ───────────────────────────────────────────────────────────
+# mold is 5-10x faster than GNU ld and 2-5x faster than lld on large link steps.
+# Install: apt install mold (Ubuntu 22+) | brew install mold (macOS)
+# The Linux targets below default to mold. If mold is not installed, fall back by
+# replacing "-fuse-ld=mold" with "-fuse-ld=lld" in the target sections below.
+# lld fallback install: apt install lld
+#
 # target-cpu=native is intentionally NOT set here: it breaks Docker builds and
 # cross-compilation silently (the binary won't run on any machine but the builder).
 # Set it per-profile in Cargo.toml or via RUSTFLAGS if you need native tuning
 # for a specific local benchmark.
-[target.x86_64-unknown-linux-gnu]
-rustflags = [
-    "-C", "link-arg=-fuse-ld=lld",
-]
 
-# musl target for portable release binaries (k8s image, bare-metal releases).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# aarch64 Linux (Graviton, Ampere, cloud ARM VMs)
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# musl targets for portable release binaries (k8s image, bare-metal releases).
 # No special linker flags — uses musl's built-in static linker.
 [target.x86_64-unknown-linux-musl]
+rustflags = []
+
+[target.aarch64-unknown-linux-musl]
+rustflags = []
+
+# Apple Silicon — ld64 is already fast; no linker override needed.
+# For further speedup install zld: brew install zld
+# then set: rustflags = ["-C", "link-arg=-fuse-ld=zld"]
+[target.aarch64-apple-darwin]
+rustflags = []
+
+[target.x86_64-apple-darwin]
 rustflags = []
 
 # ── Environment ───────────────────────────────────────────────────────────────

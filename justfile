@@ -5,6 +5,13 @@ set dotenv-load := true   # picks up .env for IMAGE, BOOTSTRAP, etc.
 rust_toolchain := env_var_or_default("RUST_TOOLCHAIN", "stable")
 cargo := "cargo +" + rust_toolchain
 
+# Optional build accelerators — used automatically if installed.
+#   sccache:  cargo binstall sccache   (caches across branches and CI runs)
+#   nextest:  cargo binstall nextest   (parallel test runner, ~2x faster)
+#   mold:     apt install mold         (5-10x faster linker than lld)
+sccache_env  := if `which sccache 2>/dev/null` != "" { "RUSTC_WRAPPER=sccache" } else { "" }
+cargo_test   := if `which cargo-nextest 2>/dev/null` != "" { cargo + " nextest run" } else { cargo + " test" }
+
 # Target triple for portable release binaries (k8s / bare-metal)
 target := env_var_or_default("TARGET", "x86_64-unknown-linux-musl")
 
@@ -21,6 +28,13 @@ default:
     @just --list
 
 # ── Check (fast, no codegen) ─────────────────────────────────────────────────
+
+# Fastest possible check — dev-fast profile (opt-level 0 for deps, no debuginfo).
+# Use during active development when you only care about compile errors, not runtime speed.
+check-fast:
+    {{ sccache_env }} {{ cargo }} check --workspace --profile dev-fast \
+        --exclude krishiv-python \
+        --exclude krishiv-chaos
 
 # Verify every execution-mode feature set compiles independently
 check: check-embedded check-single-node check-distributed check-k8s
@@ -47,6 +61,13 @@ check-k8s:
         --no-default-features --features k8s
 
 # ── Build ─────────────────────────────────────────────────────────────────────
+
+# Fast debug build using dev-fast profile (deps at opt-level 0, no debuginfo).
+# Link time is the bottleneck — install mold for an additional 5-10x speedup.
+build-fast:
+    {{ sccache_env }} {{ cargo }} build -p krishiv \
+        --no-default-features --features single-node \
+        --profile dev-fast
 
 # Build embedded mode (library — no binary produced)
 build-embedded:
@@ -140,32 +161,41 @@ undeploy-k8s:
 
 # ── Test ──────────────────────────────────────────────────────────────────────
 
-# Run all workspace lib tests
+# Run all workspace lib tests.
+# Uses cargo-nextest automatically if installed (parallel, faster output).
+# Install nextest: cargo binstall nextest
 test:
-    {{ cargo }} test --workspace --lib \
+    {{ sccache_env }} {{ cargo_test }} --workspace --lib \
+        --exclude krishiv-python \
+        --exclude krishiv-chaos
+
+# Fast test iteration — dev-fast profile (opt-level 0 for deps).
+# Runtime is slower but compile-link cycle is as short as possible.
+test-fast:
+    {{ sccache_env }} {{ cargo }} test --workspace --lib --profile dev-fast \
         --exclude krishiv-python \
         --exclude krishiv-chaos
 
 # Tests that must pass with only embedded features enabled
 test-embedded:
-    {{ cargo }} test -p krishiv --no-default-features --features embedded --lib
+    {{ sccache_env }} {{ cargo }} test -p krishiv --no-default-features --features embedded --lib
 
 # Single-node scheduler and runtime tests
 test-single-node:
-    {{ cargo }} test -p krishiv-scheduler --lib --no-default-features --features sqlite
-    {{ cargo }} test -p krishiv-runtime --lib
+    {{ sccache_env }} {{ cargo }} test -p krishiv-scheduler --lib --no-default-features --features sqlite
+    {{ sccache_env }} {{ cargo }} test -p krishiv-runtime --lib
 
 # Kubernetes operator unit tests
 test-k8s:
-    {{ cargo }} test -p krishiv-operator --lib
+    {{ sccache_env }} {{ cargo }} test -p krishiv-operator --lib
 
 # Connector certification suite (no live broker required)
 test-connectors:
-    {{ cargo }} test -p krishiv-connectors --lib
+    {{ sccache_env }} {{ cargo }} test -p krishiv-connectors --lib
 
 # SQL engine tests
 test-sql:
-    {{ cargo }} test -p krishiv-sql --lib
+    {{ sccache_env }} {{ cargo }} test -p krishiv-sql --lib
 
 # ── Quality ───────────────────────────────────────────────────────────────────
 

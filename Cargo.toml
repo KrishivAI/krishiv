@@ -121,10 +121,27 @@ unsafe_code = "forbid"
 
 [profile.dev]
 split-debuginfo = "unpacked"
+incremental = true
 
+# Deps compiled at opt-level 1: basic inlining + loop unrolling keeps Arrow/DataFusion
+# usable in tests while shaving ~30% off cold-compile time vs opt-level 2.
+# Drop to 0 below if runtime correctness (not speed) is all you care about during
+# a session, or use --profile dev-fast for maximum compile speed.
 [profile.dev.package."*"]
-opt-level = 2
-debug = 1
+opt-level = 1
+debug = 0
+
+# dev-fast: maximum compile-speed profile for rapid iteration.
+# Use: cargo check/build/test --profile dev-fast
+# WARNING: Arrow/DataFusion run 10-100x slower — do not benchmark under this profile.
+[profile.dev-fast]
+inherits = "dev"
+debug = 0
+incremental = true
+
+[profile.dev-fast.package."*"]
+opt-level = 0
+debug = 0
 
 [profile.release]
 opt-level = 3
@@ -134,10 +151,12 @@ codegen-units = 1
 # release-single-node: fast local release build for single-node deployments.
 # Skips LTO and uses multiple codegen units so `cargo build --profile release-single-node`
 # finishes quickly without the multi-minute fat-LTO link step.
+# incremental = true so repeated local rebuilds stay fast.
 [profile.release-single-node]
 inherits = "release"
 lto = "off"
 codegen-units = 16
+incremental = true
 
 # release-k8s: k8s/bare-metal image builds on memory-constrained CI runners.
 # Thin LTO keeps binary size reasonable without the peak RAM of fat LTO.
