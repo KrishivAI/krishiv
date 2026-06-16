@@ -22,8 +22,12 @@ jobs:
     name: Format & Lint
     runs-on: self-hosted
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          clean: false
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
@@ -55,8 +59,12 @@ jobs:
           - mode: k8s
             crates: -p krishiv -p krishiv-operator
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          clean: false
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
@@ -75,8 +83,12 @@ jobs:
     runs-on: self-hosted
     needs: [fmt-lint]
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          clean: false
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
@@ -93,8 +105,12 @@ jobs:
     runs-on: self-hosted
     needs: [fmt-lint]
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          clean: false
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
@@ -118,9 +134,12 @@ jobs:
     name: Project Hygiene
     runs-on: self-hosted
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          clean: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}

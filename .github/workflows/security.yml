@@ -18,7 +18,11 @@ jobs:
     name: Dependency Audit
     runs-on: self-hosted
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
+        with:
+          clean: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.92"
@@ -31,7 +35,11 @@ jobs:
     name: SBOM
     runs-on: self-hosted
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
+        with:
+          clean: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.92"
@@ -42,3 +50,5 @@ jobs:
           name: sbom-${{ github.sha }}
           path: sbom-*.json
           retention-days: 365
+
+

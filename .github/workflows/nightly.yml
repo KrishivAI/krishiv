@@ -25,6 +25,8 @@ jobs:
     name: Docker Nightly
     runs-on: self-hosted
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           ref: main
@@ -56,6 +58,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=nightly
           cache-to: type=gha,scope=nightly,mode=max
+          clean: false
 
   # ── Python nightly wheels ────────────────────────────────────────────────────
   # Uploaded as artifacts only — not published to PyPI.
@@ -80,6 +83,8 @@ jobs:
             target: x86_64-apple-darwin
             manylinux: "off"
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           ref: main
@@ -104,6 +109,7 @@ jobs:
           name: nightly-wheels-${{ matrix.os }}-${{ matrix.target }}-${{ github.run_id }}
           path: dist/*.whl
           retention-days: 14
+          clean: false
 
   # ── Nightly cargo check (full feature set) ───────────────────────────────────
   # Catches regressions not caught by CI (e.g. upstream crate updates in nightly deps).
@@ -111,6 +117,8 @@ jobs:
     name: Nightly Cargo Check
     runs-on: self-hosted
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           ref: main
@@ -126,3 +134,5 @@ jobs:
           sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
       - name: Check full feature set
         run: cargo check -p krishiv --features full
+        clean: false
+

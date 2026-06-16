@@ -21,7 +21,11 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 30
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
+        with:
+          clean: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -65,7 +69,11 @@ jobs:
     name: Bare-Metal E2E
     runs-on: self-hosted
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
+        with:
+          clean: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -88,3 +96,5 @@ jobs:
         run: |
           test -f deploy/systemd/krishiv-clusterd.service
           test -f deploy/systemd/krishiv-executor@.service
+
+

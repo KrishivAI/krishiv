@@ -17,8 +17,12 @@ jobs:
     name: TPC-H / Nexmark
     runs-on: self-hosted
     steps:
+      - name: Clean workspace (root-owned files)
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          clean: false
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
