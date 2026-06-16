@@ -234,6 +234,7 @@ pub struct CheckpointsView {
     pub latest_epoch: Option<u64>,
 }
 
+
 #[derive(Template)]
 #[template(path = "jobs.html")]
 pub(crate) struct JobsTemplate {

@@ -200,10 +200,11 @@ fn parse_proto_text_schema(schema_str: &str) -> SchemaRegistryResult<Vec<ProtoFi
             continue;
         }
 
-        if depth == 1 && line.ends_with(';') {
-            if let Some(field) = parse_proto_text_field(line, syntax)? {
-                fields.push(field);
-            }
+        if depth == 1
+            && line.ends_with(';')
+            && let Some(field) = parse_proto_text_field(line, syntax)?
+        {
+            fields.push(field);
         }
         if depth == 1 && line.starts_with("oneof ") {
             return Err(SchemaRegistryError::Decode(

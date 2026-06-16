@@ -24,10 +24,9 @@
 //!
 //! All three functions return `(rows_affected, new_snapshot_id)`.
 
-#![cfg(feature = "iceberg")]
-
 use std::sync::Arc;
 
+#[cfg(feature = "iceberg")]
 use arrow::array::RecordBatch;
 use bytes::Bytes;
 use datafusion::datasource::MemTable;
@@ -403,11 +402,10 @@ pub async fn overwrite_table_pub(
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
     // Drop old table and recreate so the new snapshot references ONLY our file.
-    let drop_result = catalog
+    catalog
         .drop_table(ident)
         .await
-        .map_err(|e| LakehouseError::Iceberg(e.to_string()));
-    drop_result?;
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
     let create_result = catalog
         .create_table(

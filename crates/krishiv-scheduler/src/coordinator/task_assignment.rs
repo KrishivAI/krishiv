@@ -15,11 +15,6 @@ pub(crate) fn max_concurrent_assignment_rpcs() -> usize {
         .unwrap_or(DEFAULT_MAX_CONCURRENT_ASSIGNMENT_RPCS)
 }
 
-/// Constant used in the few places that need it at compile time (e.g. semaphore
-/// construction with a literal). Callers that need a runtime value should call
-/// `max_concurrent_assignment_rpcs()` instead.
-pub(crate) const DEFAULT_MAX_CONCURRENT_ASSIGNMENT_RPCS: usize = 128;
-
 const MAX_ASSIGNMENT_DELIVERY_ATTEMPTS: usize = 3;
 const ASSIGNMENT_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";

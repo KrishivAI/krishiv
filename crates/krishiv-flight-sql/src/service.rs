@@ -51,7 +51,7 @@ pub struct KrishivFlightSqlService {
     policy: Option<Arc<dyn PolicyHook>>,
     host: FlightExecutionHost,
     /// Per-subject LRU caches of opaque handle (UUID string) → SQL text for prepared statements.
-    prepared_statements: Arc<tokio::sync::Mutex<HashMap<String, lru::LruCache<String, String>>>>,
+    prepared_statements: PreparedStatementCache,
     /// Per-subject LRU caches of handle → bound parameter record batches (set via DoPut).
     bound_params: BoundParamCache,
     /// Active Flight SQL transaction ids issued by `BeginTransaction`. Maps txn_id -> subject.

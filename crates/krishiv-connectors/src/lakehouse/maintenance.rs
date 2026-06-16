@@ -8,8 +8,6 @@
 //! | `remove_orphan_files` | `CALL system.remove_orphan_files('ns.tbl', '1 day')` | Delete data files not in any live snapshot |
 //! | `compact_data_files` | `CALL system.compact_data_files('ns.tbl', 134217728)` | Merge small Parquet files into larger ones |
 
-#![cfg(feature = "iceberg")]
-
 use std::collections::HashSet;
 use std::sync::Arc;
 

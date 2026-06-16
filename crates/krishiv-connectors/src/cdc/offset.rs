@@ -1,4 +1,7 @@
 #[cfg(feature = "state")]
+use crate::error::ConnectorError;
+
+#[cfg(feature = "state")]
 pub struct CdcOffsetTracker {
     backend: Box<dyn krishiv_state::StateBackend>,
     ns: krishiv_state::Namespace,
@@ -21,18 +24,18 @@ impl CdcOffsetTracker {
                         continue;
                     };
                     let partition = u32::from_le_bytes(key_arr);
-                    if let Ok(Some(val_bytes)) = backend.get(&ns, &k) {
-                        if val_bytes.len() == 8 {
-                            let Ok(val_arr) = val_bytes.as_slice().try_into() else {
-                                tracing::warn!(
-                                    partition,
-                                    "cdc offset value has unexpected length, skipping"
-                                );
-                                continue;
-                            };
-                            let offset = i64::from_le_bytes(val_arr);
-                            offsets.insert(partition, offset);
-                        }
+                    if let Ok(Some(val_bytes)) = backend.get(&ns, &k)
+                        && val_bytes.len() == 8
+                    {
+                        let Ok(val_arr) = val_bytes.as_slice().try_into() else {
+                            tracing::warn!(
+                                partition,
+                                "cdc offset value has unexpected length, skipping"
+                            );
+                            continue;
+                        };
+                        let offset = i64::from_le_bytes(val_arr);
+                        offsets.insert(partition, offset);
                     }
                 }
             }

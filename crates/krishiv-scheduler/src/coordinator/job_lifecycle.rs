@@ -272,15 +272,12 @@ impl Coordinator {
                     tokio::spawn(async move {
                         let _ = jc.clear_assignments_for_bad_executor_and_count(&eid).await;
                     });
-                } else {
-                    if let Ok(mut job) = self.find_job_mut(&job_id) {
-                        for stage in job.stages_mut() {
-                            for task in stage.tasks_mut() {
-                                if task.assigned_executor.as_ref() == Some(&executor_id_for_circuit)
-                                {
-                                    task.assigned_executor = None;
-                                    task.launch_in_flight = false;
-                                }
+                } else if let Ok(mut job) = self.find_job_mut(&job_id) {
+                    for stage in job.stages_mut() {
+                        for task in stage.tasks_mut() {
+                            if task.assigned_executor.as_ref() == Some(&executor_id_for_circuit) {
+                                task.assigned_executor = None;
+                                task.launch_in_flight = false;
                             }
                         }
                     }

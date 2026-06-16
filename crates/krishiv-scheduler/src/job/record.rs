@@ -17,7 +17,7 @@ const MAX_KEY_GROUPS: u32 = 32_768;
 /// Conservative per-job UDF execution time cap (ms) — 1 hour.
 const UDF_EXECUTION_TIME_CAP_MS: u64 = 60 * 60 * 1_000;
 
-fn key_group_range_for_task(task_index: usize, parallelism: usize) -> KeyGroupRange {
+pub(crate) fn key_group_range_for_task(task_index: usize, parallelism: usize) -> KeyGroupRange {
     let p = parallelism.max(1) as u32;
     let idx = task_index as u32;
     let base = MAX_KEY_GROUPS / p;

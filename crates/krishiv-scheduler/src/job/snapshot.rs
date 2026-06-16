@@ -7,6 +7,7 @@ use crate::ExecutorHeartbeatAge;
 
 use super::scheduler::ResourceUsage;
 
+
 /// Job status summary for CLI/UI use in later R2 slices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSnapshot {

@@ -15,9 +15,8 @@ pub use snapshot::{JobDetailSnapshot, JobSnapshot, StabilityMetrics, StageSnapsh
 #[cfg(test)]
 mod exchange_stage_tests {
     use super::record::JobRecord;
-    use super::scheduler::{
-        job_spec_from_physical_plan, key_group_range_for_task, topo_sort_plan_nodes,
-    };
+    use super::scheduler::{job_spec_from_physical_plan, topo_sort_plan_nodes};
+    use crate::job::record::key_group_range_for_task;
     use krishiv_plan::{
         ExecutionKind, NodeOp, Partitioning, PhysicalPlan, PlanNode, TypedTaskFragment,
     };
