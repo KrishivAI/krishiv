@@ -182,4 +182,3 @@ pub(crate) fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, Kri
     }
     Ok(buf)
 }
-

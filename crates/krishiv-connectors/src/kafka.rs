@@ -780,6 +780,9 @@ pub struct RdkafkaKafkaSource {
     poll_timeout_ms: u64,
     /// Latest offset read per partition — tracks all partitions, not just the last one.
     partition_offsets: std::collections::HashMap<i32, i64>,
+    /// Optional schema registry deserializer for Confluent-framed Avro/Protobuf payloads.
+    #[cfg(feature = "schema-registry")]
+    schema_registry: Option<std::sync::Arc<dyn crate::schema_registry::KafkaDeserializer>>,
 }
 
 #[cfg(feature = "kafka")]
@@ -854,7 +857,24 @@ impl RdkafkaKafkaSource {
             group_id: group_id.as_ref().to_string(),
             poll_timeout_ms: 100,
             partition_offsets: std::collections::HashMap::new(),
+            #[cfg(feature = "schema-registry")]
+            schema_registry: None,
         })
+    }
+
+    /// Attach a Confluent-compatible schema registry deserializer.
+    ///
+    /// When set, `read_batch()` decodes Confluent wire-format payloads (magic byte
+    /// + schema ID + Avro/Protobuf bytes) instead of raw JSON parsing.
+    #[cfg(feature = "schema-registry")]
+    pub fn with_schema_registry(
+        mut self,
+        config: crate::schema_registry::SchemaRegistryConfig,
+    ) -> Result<Self, String> {
+        let deser = crate::schema_registry::deserializer_for(&config)
+            .map_err(|e| format!("schema registry init: {e}"))?;
+        self.schema_registry = Some(deser);
+        Ok(self)
     }
 
     /// Create a source from a [`crate::cdc::KafkaCdcConfig`] (manual commit mode).
@@ -1035,6 +1055,36 @@ impl Source for RdkafkaKafkaSource {
                         partition = msg.partition(),
                         "Kafka partition assigned to this consumer via group rebalance"
                     );
+                }
+
+                // Schema registry path: decode Confluent wire-format payloads.
+                #[cfg(feature = "schema-registry")]
+                if let Some(ref deser) = self.schema_registry {
+                    let raw_bytes = msg.payload().unwrap_or(&[]);
+                    if raw_bytes.is_empty() {
+                        return Ok(Some(arrow::record_batch::RecordBatch::new_empty(
+                            std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+                        )));
+                    }
+                    let (_schema, batches) = deser.decode(raw_bytes).await.map_err(|e| {
+                        crate::ConnectorError::Schema {
+                            message: format!("schema registry decode: {e}"),
+                        }
+                    })?;
+                    if batches.is_empty() {
+                        return Ok(Some(arrow::record_batch::RecordBatch::new_empty(
+                            std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+                        )));
+                    }
+                    if batches.len() == 1 {
+                        return Ok(Some(batches.into_iter().next().unwrap()));
+                    }
+                    let schema = batches[0].schema();
+                    return arrow::compute::concat_batches(&schema, &batches)
+                        .map(Some)
+                        .map_err(|e| crate::ConnectorError::Schema {
+                            message: format!("schema registry batch concat: {e}"),
+                        });
                 }
 
                 let payload = match msg.payload_view::<str>() {

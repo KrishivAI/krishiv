@@ -105,14 +105,23 @@ impl SchemaRegistryClient {
         format: RegistryFormat,
     ) -> SchemaRegistryResult<(SchemaRef, Vec<RecordBatch>)> {
         match format {
-            RegistryFormat::Avro => AvroDeserializer { client: self.clone() }.decode(payload).await,
+            RegistryFormat::Avro => {
+                AvroDeserializer {
+                    client: self.clone(),
+                }
+                .decode(payload)
+                .await
+            }
             RegistryFormat::Protobuf => {
-                ProtobufDeserializer { client: self.clone() }.decode(payload).await
+                ProtobufDeserializer {
+                    client: self.clone(),
+                }
+                .decode(payload)
+                .await
             }
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -125,20 +134,19 @@ mod tests {
     };
     use arrow::datatypes::DataType;
 
-    use super::*;
     use super::avro::{
         avro_records_to_batches, avro_schema_to_arrow_schema, avro_values_to_column,
         decode_avro_datum_payload,
     };
     use super::client::{
-        SchemaRegistryClient, MAX_CACHED_SCHEMA_BYTES, MAX_CACHED_SCHEMAS,
-        MAX_REGISTRY_RESPONSE_BYTES,
+        MAX_CACHED_SCHEMA_BYTES, MAX_CACHED_SCHEMAS, MAX_REGISTRY_RESPONSE_BYTES,
+        SchemaRegistryClient,
     };
     use super::protobuf::{
-        decode_protobuf_wire, parse_proto_schema, proto_fields_to_arrow_schema,
+        ProtoValue, decode_protobuf_wire, parse_proto_schema, proto_fields_to_arrow_schema,
         proto_records_to_batches, proto_values_to_column, strip_confluent_protobuf_message_indexes,
-        ProtoValue,
     };
+    use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

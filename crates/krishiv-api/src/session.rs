@@ -831,11 +831,13 @@ impl Session {
     /// Names of scalar UDFs registered on this session.
     pub fn scalar_udf_names(&self) -> Vec<String> {
         match self.udf_registry.read() {
-            Ok(guard) => guard.scalar_names().into_iter().map(str::to_owned).collect(),
+            Ok(guard) => guard
+                .scalar_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             Err(e) => {
-                tracing::warn!(
-                    "UDF registry lock poisoned: {e}; returning empty scalar UDF list"
-                );
+                tracing::warn!("UDF registry lock poisoned: {e}; returning empty scalar UDF list");
                 e.into_inner()
                     .scalar_names()
                     .into_iter()
@@ -867,9 +869,11 @@ impl Session {
     /// Names of aggregate UDAFs registered on this session.
     pub fn aggregate_udf_names(&self) -> Vec<String> {
         match self.udf_registry.read() {
-            Ok(guard) => {
-                guard.aggregate_names().into_iter().map(str::to_owned).collect()
-            }
+            Ok(guard) => guard
+                .aggregate_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             Err(e) => {
                 tracing::warn!(
                     "UDF registry lock poisoned: {e}; returning empty aggregate UDF list"
@@ -1236,14 +1240,14 @@ impl Session {
             ));
         }
         let query = query.as_ref();
-        if let Some(policy) = &self.policy {
-            if let Ok(tables) = krishiv_sql::referenced_table_names(query) {
-                for table in &tables {
-                    if !policy.check_table_access(table) {
-                        return Err(KrishivError::AccessDenied {
-                            reason: format!("access denied to table: {table}"),
-                        });
-                    }
+        if let Some(policy) = &self.policy
+            && let Ok(tables) = krishiv_sql::referenced_table_names(query)
+        {
+            for table in &tables {
+                if !policy.check_table_access(table) {
+                    return Err(KrishivError::AccessDenied {
+                        reason: format!("access denied to table: {table}"),
+                    });
                 }
             }
         }

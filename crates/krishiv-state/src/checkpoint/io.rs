@@ -1,6 +1,5 @@
 use crate::checkpoint::metadata::{
-    CheckpointError, CheckpointMetadata, CheckpointResult, IntegrityManifest,
-    OperatorSnapshotRef,
+    CheckpointError, CheckpointMetadata, CheckpointResult, IntegrityManifest, OperatorSnapshotRef,
 };
 use crate::checkpoint::paths::{
     epoch_dir, latest_epoch_hint_path, manifest_path, metadata_path, snapshot_path,

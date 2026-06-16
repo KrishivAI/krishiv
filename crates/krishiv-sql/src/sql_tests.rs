@@ -783,8 +783,8 @@ mod streaming_match_recognize_limit_tests {
 mod iceberg_catalog_tests {
     use std::sync::Arc;
 
-    use crate::*;
     use crate::catalog::unified::KrishivCatalog;
+    use crate::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn with_iceberg_catalog_registers_under_given_name() {
@@ -886,7 +886,10 @@ mod iceberg_catalog_tests {
         let result = crate::parse_dml_delete(r#"DELETE FROM "my schema"."my table" WHERE x > 0"#);
         assert!(result.is_some(), "quoted identifiers must parse");
         let (tbl, pred) = result.unwrap();
-        assert!(tbl.contains("my schema") || tbl.contains("my table"), "tbl: {tbl}");
+        assert!(
+            tbl.contains("my schema") || tbl.contains("my table"),
+            "tbl: {tbl}"
+        );
         assert!(pred.contains('0'), "pred: {pred}");
     }
 
@@ -897,7 +900,10 @@ mod iceberg_catalog_tests {
                 .expect("must parse");
         assert_eq!(parsed.table_ref, "myns.orders");
         assert!(
-            parsed.assignments.iter().any(|(_, v)| v.contains("price") && v.contains('2')),
+            parsed
+                .assignments
+                .iter()
+                .any(|(_, v)| v.contains("price") && v.contains('2')),
             "assignments: {:?}",
             parsed.assignments,
         );
@@ -921,7 +927,12 @@ mod iceberg_catalog_tests {
             "UPDATE t SET name = CONCAT(first_name, ' ', last_name), age = age + 1",
         )
         .expect("must parse");
-        assert_eq!(parsed.assignments.len(), 2, "assignments: {:?}", parsed.assignments);
+        assert_eq!(
+            parsed.assignments.len(),
+            2,
+            "assignments: {:?}",
+            parsed.assignments
+        );
         assert_eq!(parsed.assignments[0].0, "name");
         assert_eq!(parsed.assignments[1].0, "age");
     }

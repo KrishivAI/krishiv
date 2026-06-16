@@ -109,7 +109,7 @@ impl IntoResponse for UiError {
     }
 }
 
-pub use router::{embedded_router, empty_state, demo_state, router, router_with_token, serve};
+pub use router::{demo_state, embedded_router, empty_state, router, router_with_token, serve};
 
 #[cfg(test)]
 mod tests {

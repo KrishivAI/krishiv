@@ -350,7 +350,9 @@ impl HudiCowWriter {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(LakehouseError::Concurrency {
-                    message: format!("Hudi commit directory already exists for instant '{instant}'"),
+                    message: format!(
+                        "Hudi commit directory already exists for instant '{instant}'"
+                    ),
                 });
             }
             Err(e) => return Err(LakehouseError::Io(e.to_string())),

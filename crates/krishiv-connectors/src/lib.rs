@@ -20,6 +20,8 @@ pub mod elasticsearch_sink;
 pub mod hbase_connector;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+#[cfg(feature = "kafka")]
+pub mod kafka_transactional_sink;
 #[cfg(feature = "kinesis")]
 pub mod kinesis;
 #[cfg(feature = "lakehouse")]
@@ -34,7 +36,7 @@ pub mod schema_registry;
 pub mod transactional;
 #[cfg(feature = "kafka")]
 pub mod transactional_kafka;
-#[cfg(any(feature = "kafka", feature = "state"))]
+#[cfg(feature = "two-phase")]
 pub mod two_phase_parquet_s3;
 
 // Module facades
@@ -61,6 +63,8 @@ pub mod certification;
 pub use capabilities::{ConnectorCapabilities, ConnectorMaturity, DeliveryGuarantee};
 pub use config::ConnectorConfig;
 pub use error::{ConnectorError, ConnectorResult};
+#[cfg(feature = "kafka")]
+pub use kafka_transactional_sink::RdkafkaTransactionalSink;
 pub use offset::{CommitHandle, Offset, OffsetCommitter, ParquetOffset};
 pub use quality::{
     CompiledDataQualityConfig, CompiledQualityRule, ConnectorQualityHook, DataQualityCheckResult,

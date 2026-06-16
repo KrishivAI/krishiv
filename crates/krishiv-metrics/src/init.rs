@@ -207,4 +207,3 @@ pub fn current_traceparent() -> Option<String> {
         None
     }
 }
-

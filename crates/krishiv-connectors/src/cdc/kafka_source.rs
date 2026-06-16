@@ -288,4 +288,3 @@ impl CdcEventSource for RdkafkaCdcEventSource {
         self.commit_offsets_inner()
     }
 }
-

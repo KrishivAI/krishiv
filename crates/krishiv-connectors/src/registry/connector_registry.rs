@@ -244,6 +244,26 @@ pub fn default_registry() -> ConnectorRegistry {
         registry.register_source(Arc::new(super::drivers::HudiSourceDriver));
         registry.register_sink(Arc::new(super::drivers::HudiSinkDriver));
     }
+    #[cfg(feature = "kinesis")]
+    {
+        registry.register_source(Arc::new(super::drivers::KinesisSourceDriver));
+    }
+    #[cfg(feature = "pulsar-source")]
+    {
+        registry.register_source(Arc::new(super::drivers::PulsarSourceDriver));
+    }
+    #[cfg(feature = "elasticsearch")]
+    {
+        registry.register_sink(Arc::new(super::drivers::ElasticsearchSinkDriver));
+    }
+    #[cfg(feature = "cassandra")]
+    {
+        registry.register_sink(Arc::new(super::drivers::CassandraSinkDriver));
+    }
+    #[cfg(feature = "hbase")]
+    {
+        registry.register_sink(Arc::new(super::drivers::HBaseSinkDriver));
+    }
     #[cfg(feature = "vector-sinks")]
     {
         super::vector_drivers::register_builtin_vector_drivers(&mut registry);

@@ -14,6 +14,21 @@ mod kafka;
 #[cfg(feature = "lakehouse")]
 mod lakehouse;
 
+#[cfg(feature = "kinesis")]
+mod kinesis;
+
+#[cfg(feature = "pulsar-source")]
+mod pulsar;
+
+#[cfg(feature = "elasticsearch")]
+mod elasticsearch;
+
+#[cfg(feature = "cassandra")]
+mod cassandra;
+
+#[cfg(feature = "hbase")]
+mod hbase;
+
 pub use csv::CsvSourceDriver;
 pub use parquet::{ParquetSinkDriver, ParquetSourceDriver};
 pub use s3::{S3SinkDriver, S3SourceDriver};
@@ -30,3 +45,18 @@ pub use lakehouse::{
     DeltaSinkDriver, DeltaSourceDriver, HudiSinkDriver, HudiSourceDriver, IcebergSinkDriver,
     IcebergSourceDriver,
 };
+
+#[cfg(feature = "kinesis")]
+pub use kinesis::KinesisSourceDriver;
+
+#[cfg(feature = "pulsar-source")]
+pub use pulsar::PulsarSourceDriver;
+
+#[cfg(feature = "elasticsearch")]
+pub use elasticsearch::ElasticsearchSinkDriver;
+
+#[cfg(feature = "cassandra")]
+pub use cassandra::CassandraSinkDriver;
+
+#[cfg(feature = "hbase")]
+pub use hbase::HBaseSinkDriver;

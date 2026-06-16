@@ -45,6 +45,49 @@ review documents; the docs have been intentionally collapsed to avoid drift.
 - Prefer typed IDs, typed fragments, typed errors, and capability flags over
   stringly public contracts.
 
+## CI Quality Gates
+
+Every change must pass both gates before committing. Run in this order:
+
+```bash
+# 1. Formatting
+cargo fmt --check
+
+# 2. Linting (all warnings treated as errors)
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings
+```
+
+Auto-fix commands (run before the check commands):
+
+```bash
+cargo fmt
+cargo clippy --workspace --exclude krishiv-python \
+    --exclude krishiv-chaos --fix --allow-dirty -- -D warnings
+```
+
+### Common CI Failure Patterns and Fixes
+
+**Unused imports** — run `cargo clippy --fix --allow-dirty` to auto-remove. Never add `#[allow(unused_imports)]`.
+
+**Dead code — test-only constants/functions** — annotate with `#[cfg(test)]` instead of `#[allow(dead_code)]`. Also annotate any types that become import-only outside tests: `#[cfg(test)] use some_crate::SomeType;`
+
+**Dead code — intentional public API placeholder** — use `#[allow(dead_code)]` only on `pub` items not yet wired up. Add a one-line comment explaining future use.
+
+**Very complex type** (`clippy::type_complexity`) — extract a `type Alias = …;` for inner types used in struct fields or function signatures.
+
+**Duplicate definitions across split files** — when a file is split, shared helpers must live in exactly one module. Use `pub(crate)` with `#[cfg(test)]` when callers are only in test blocks. Remove all duplicate definitions immediately.
+
+**`DEFAULT_*` constants defined but never used** — wire them as `.unwrap_or(DEFAULT_CONSTANT)` in the env-var reader function.
+
+### Connector / Python Crate Specifics
+
+- Concrete sink types (`CassandraSink`, `ElasticsearchSink`, `HBaseSink`) take `&RecordBatch`, NOT `RecordBatch`. Call `write_batch(&batch)` (borrow).
+- Concrete sinks have no `flush()` method; do not call it.
+- New Kafka transactional sinks use `BaseRecord` (not `FutureRecord`); `ThreadedProducer::send(record)` takes one arg, no timeout.
+- Feature-gated Python sinks must return a friendly `RuntimeError` message naming the missing Cargo feature and the `maturin develop --features` command.
+
+`krishiv-python` is excluded from the workspace clippy run. Lint it separately with `maturin develop` or `cargo check -p krishiv-python`.
+
 ## Validation Defaults
 
 Prefer narrow checks while iterating:
@@ -62,6 +105,4 @@ Use workspace-wide checks when the change crosses crate boundaries:
 ```bash
 cargo check --workspace
 cargo test --workspace
-cargo clippy --workspace --all-targets
-cargo fmt --check
 ```

@@ -1,21 +1,11 @@
-use std::sync::Arc;
-
 use askama::Template;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
-use axum::response::{Html, IntoResponse, Response};
-use axum::{Json, Router};
-use krishiv_proto::{
-    ConnectorCapabilityFlags, CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId,
-    ExecutorState, JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
-};
-use krishiv_scheduler::metrics::SchedulerMetrics;
-use krishiv_scheduler::{
-    Coordinator, ExecutorRecord, JobDetailSnapshot, JobHistoryRecord, JobSnapshot,
-    NamespaceQuotaSnapshot, ResourceUsage, SchedulerError, SharedCoordinator, StabilityMetrics,
-};
-use serde::{Deserialize, Serialize};
+use axum::response::{Html, IntoResponse};
+use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+use krishiv_scheduler::{ExecutorRecord, JobDetailSnapshot, JobSnapshot, StabilityMetrics};
 
 use crate::router::ui_auth_token;
 use crate::views::*;
@@ -120,14 +110,18 @@ pub(crate) async fn api_job_detail(
     }))
 }
 
-pub(crate) async fn api_executors(State(state): State<UiState>) -> Result<Json<ExecutorsResponse>, UiError> {
+pub(crate) async fn api_executors(
+    State(state): State<UiState>,
+) -> Result<Json<ExecutorsResponse>, UiError> {
     let snapshot = status_snapshot(&state).await?;
     Ok(Json(ExecutorsResponse {
         executors: snapshot.executors,
     }))
 }
 
-pub(crate) async fn api_queues(State(state): State<UiState>) -> Result<Json<QueuesResponse>, UiError> {
+pub(crate) async fn api_queues(
+    State(state): State<UiState>,
+) -> Result<Json<QueuesResponse>, UiError> {
     let coordinator = state.coordinator.read().await;
 
     // Collect all distinct namespaces from active jobs plus the default namespace.
@@ -483,7 +477,10 @@ pub(crate) async fn ui_history_detail(
     Ok(Html(template.render()?))
 }
 
-pub(crate) async fn api_executor_detail_inner(state: &UiState, executor_id: &str) -> UiResult<ExecutorView> {
+pub(crate) async fn api_executor_detail_inner(
+    state: &UiState,
+    executor_id: &str,
+) -> UiResult<ExecutorView> {
     let coordinator = state.coordinator.read().await;
     let executors = coordinator.executor_snapshots();
     let eid = krishiv_proto::ExecutorId::try_new(executor_id.to_owned())
@@ -824,4 +821,3 @@ pub(crate) fn demo_job(job_id: JobId) -> UiResult<JobSpec> {
 
     Ok(JobSpec::new(job_id, "demo-status-job", JobKind::Batch).with_stage(stage))
 }
-

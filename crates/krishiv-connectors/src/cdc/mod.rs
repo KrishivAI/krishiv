@@ -10,12 +10,12 @@ mod kafka_source;
 mod offset;
 
 pub use debezium::{
-    parse_debezium_envelope, parse_debezium_envelope_result, CdcEvent, CdcOp, DebeziumParseError,
-    RawCdcRecord,
+    CdcEvent, CdcOp, DebeziumParseError, RawCdcRecord, parse_debezium_envelope,
+    parse_debezium_envelope_result,
 };
 pub use pipeline::{
-    build_batch_from_events, CdcBatchError, CdcEventSource, CdcSchemaRegistryFormat,
-    CdcToLakehousePipeline, InMemoryCdcEventSource,
+    CdcBatchError, CdcEventSource, CdcSchemaRegistryFormat, CdcToLakehousePipeline,
+    InMemoryCdcEventSource, build_batch_from_events,
 };
 
 #[cfg(feature = "kafka")]
@@ -23,7 +23,6 @@ pub use kafka_source::{KafkaCdcConfig, RdkafkaCdcEventSource};
 
 #[cfg(feature = "state")]
 pub use offset::CdcOffsetTracker;
-
 
 #[cfg(test)]
 mod tests {

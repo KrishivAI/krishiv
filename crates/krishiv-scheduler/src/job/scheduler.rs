@@ -1,24 +1,24 @@
-use std::collections::HashMap;
-
 use krishiv_plan::{
     ExecutionKind as PlanExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanNode,
 };
 use krishiv_proto::{
-    AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, ExecutorTaskAssignment,
-    InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, KeyGroupRange,
-    LeaseGeneration, MissingShufflePartition, OutputContract, OutputContractKind, PlanFragment,
-    StageId, StageSpec, StageState, StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskId,
-    TaskOutputMetadata, TaskSpec, TaskState, TaskStatusUpdate,
+    ExecutorDescriptor, JobId, JobKind, JobSpec, StageId, StageSpec, TaskAssignment, TaskId,
+    TaskSpec,
 };
-use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 
-use crate::{ExecutorHeartbeatAge, SchedulerError, SchedulerResult, TaskUpdateOutcome};
+use crate::{SchedulerError, SchedulerResult};
 
+#[cfg(test)]
+use krishiv_proto::KeyGroupRange;
+
+#[cfg(test)]
 const MAX_KEY_GROUPS: u32 = 32_768;
 
 /// Conservative per-job UDF execution time cap (ms) — 1 hour.
+#[cfg(test)]
 const UDF_EXECUTION_TIME_CAP_MS: u64 = 60 * 60 * 1_000;
 
+#[cfg(test)]
 pub(crate) fn key_group_range_for_task(task_index: usize, parallelism: usize) -> KeyGroupRange {
     let p = parallelism.max(1) as u32;
     let idx = task_index as u32;
@@ -491,4 +491,3 @@ pub(crate) fn topo_sort_plan_nodes(nodes: &[PlanNode]) -> SchedulerResult<Vec<&P
     }
     Ok(ordered)
 }
-

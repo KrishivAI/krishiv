@@ -28,8 +28,8 @@ use uuid::Uuid;
 use krishiv_plan::governance::{AuthProvider, PolicyHook, StaticApiKeyAuthProvider};
 
 use crate::actions::{
-    build_param_schema, count_sql_params, encode_batches_ipc, schema_to_ipc_bytes,
-    substitute_sql_params, KrishivActionError,
+    KrishivActionError, build_param_schema, count_sql_params, encode_batches_ipc,
+    schema_to_ipc_bytes, substitute_sql_params,
 };
 use crate::host::FlightExecutionHost;
 
@@ -40,6 +40,10 @@ const FLIGHT_MAX_CONCURRENT_QUERIES_ENV: &str = "KRISHIV_FLIGHT_MAX_CONCURRENT_Q
 /// Default cap on simultaneous Flight SQL query executions.
 const DEFAULT_FLIGHT_MAX_CONCURRENT_QUERIES: usize = 256;
 
+/// Per-subject LRU cache mapping handle → bound parameter record batches.
+type BoundParamCache =
+    Arc<tokio::sync::Mutex<HashMap<String, lru::LruCache<String, Vec<RecordBatch>>>>>;
+
 /// **Beta API**: may change between minor releases.
 #[derive(Clone)]
 pub struct KrishivFlightSqlService {
@@ -49,7 +53,7 @@ pub struct KrishivFlightSqlService {
     /// Per-subject LRU caches of opaque handle (UUID string) → SQL text for prepared statements.
     prepared_statements: Arc<tokio::sync::Mutex<HashMap<String, lru::LruCache<String, String>>>>,
     /// Per-subject LRU caches of handle → bound parameter record batches (set via DoPut).
-    bound_params: Arc<tokio::sync::Mutex<HashMap<String, lru::LruCache<String, Vec<RecordBatch>>>>>,
+    bound_params: BoundParamCache,
     /// Active Flight SQL transaction ids issued by `BeginTransaction`. Maps txn_id -> subject.
     transactions: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     /// Semaphore that caps the number of queries executing concurrently through
@@ -225,7 +229,7 @@ impl KrishivFlightSqlService {
             .map_err(|_| Status::invalid_argument("invalid transaction id encoding"))?;
         let transactions = self.transactions.lock().await;
         match transactions.get(id) {
-            Some(owner) if subject.map_or(true, |s| s == owner) => Ok(()),
+            Some(owner) if subject.is_none_or(|s| s == owner) => Ok(()),
             Some(_) => Err(Status::permission_denied(format!(
                 "transaction id {id} does not belong to this subject"
             ))),
@@ -1064,4 +1068,3 @@ impl KrishivFlightSqlService {
         }
     }
 }
-
