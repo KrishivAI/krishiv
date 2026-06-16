@@ -156,6 +156,13 @@ impl Coordinator {
             job.cancel();
         }
 
+        if let Some(store) = &self.store {
+            let mut guard = store.inner();
+            let _ = guard.append_event(EventLogEvent::JobCancelled {
+                job_id: job_id.clone(),
+            });
+        }
+
         if !self.gc_ready_jobs.contains(job_id) {
             const MAX_GC_JOBS: usize = 1000;
             if self.gc_ready_jobs.len() >= MAX_GC_JOBS {
@@ -210,6 +217,14 @@ impl Coordinator {
             .output_metadata()
             .map(|meta| meta.hot_key_reports().to_vec())
             .unwrap_or_default();
+        let already_terminal = self
+            .job_coordinators
+            .get(&job_id)
+            .map(|jc| jc.read_record().state().is_terminal())
+            .unwrap_or(false);
+        if already_terminal {
+            return Ok(TaskUpdateOutcome::Duplicate);
+        }
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
 
         if outcome == TaskUpdateOutcome::Duplicate {
@@ -473,6 +488,31 @@ impl Coordinator {
                 guard.save_job(&record)?;
             } else {
                 store.save_job(&record);
+            }
+        }
+        // H3: Emit task-level event log entries for succeeded/failed terminal states.
+        if let Some(store) = &self.store {
+            let attempt_id =
+                AttemptId::try_new(attempt).unwrap_or(AttemptId::initial());
+            let event = match terminal_state {
+                TaskState::Succeeded => Some(EventLogEvent::TaskSucceeded {
+                    job_id: job_id.clone(),
+                    stage_id: stage_id.clone(),
+                    task_id: task_id.clone(),
+                    attempt: attempt_id,
+                }),
+                TaskState::Failed => Some(EventLogEvent::TaskFailed {
+                    job_id: job_id.clone(),
+                    stage_id: stage_id.clone(),
+                    task_id: task_id.clone(),
+                    attempt: attempt_id,
+                    reason: String::new(),
+                }),
+                _ => None,
+            };
+            if let Some(event) = event {
+                let mut guard = store.inner();
+                let _ = guard.append_event(event);
             }
         }
         // P1.1: Remove streaming task index entries when job reaches a terminal state.

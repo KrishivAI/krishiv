@@ -409,7 +409,7 @@ impl DeduplicatingStream {
     }
 
     /// Filter a batch, keeping only rows whose hash has not been seen before.
-    fn dedup_batch(&mut self, batch: RecordBatch) -> Option<RecordBatch> {
+    fn dedup_batch(&mut self, batch: RecordBatch) -> std::result::Result<Option<RecordBatch>, String> {
         let mut keep_indices: Vec<usize> = Vec::new();
         for row in 0..batch.num_rows() {
             let h = Self::row_hash(&batch, row, &self.columns);
@@ -418,10 +418,10 @@ impl DeduplicatingStream {
             }
         }
         if keep_indices.is_empty() {
-            return None;
+            return Ok(None);
         }
         if keep_indices.len() == batch.num_rows() {
-            return Some(batch);
+            return Ok(Some(batch));
         }
         // Build a filtered batch.
         let indices = arrow::array::UInt32Array::from(
@@ -430,9 +430,12 @@ impl DeduplicatingStream {
         let columns: Vec<Arc<dyn arrow::array::Array>> = batch
             .columns()
             .iter()
-            .map(|col| arrow::compute::take(col.as_ref(), &indices, None).unwrap())
-            .collect();
-        RecordBatch::try_new(batch.schema(), columns).ok()
+            .map(|col| {
+                arrow::compute::take(col.as_ref(), &indices, None)
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        Ok(RecordBatch::try_new(batch.schema(), columns).ok())
     }
 }
 
@@ -451,10 +454,13 @@ impl futures::stream::Stream for DeduplicatingStream {
                     return std::task::Poll::Ready(Some(Err(e)));
                 }
                 std::task::Poll::Ready(Some(Ok(batch))) => {
-                    if let Some(deduped) = self.dedup_batch(batch) {
-                        return std::task::Poll::Ready(Some(Ok(deduped)));
+                    match self.dedup_batch(batch) {
+                        Err(e) => return std::task::Poll::Ready(Some(Err(e))),
+                        Ok(None) => {} // all dups, poll again
+                        Ok(Some(deduped)) => {
+                            return std::task::Poll::Ready(Some(Ok(deduped)));
+                        }
                     }
-                    // All rows were duplicates — poll again.
                 }
             }
         }
@@ -524,10 +530,13 @@ fn spawn_side_output_router(
                     }
                 }
                 Err(error) => {
-                    let _ = tokio::join!(
+                    let (main_sent, side_sent) = tokio::join!(
                         send_stream_error(&main_tx, error.clone(), main_open),
                         send_stream_error(&side_tx, error, side_open),
                     );
+                    if !main_sent && !side_sent {
+                        tracing::debug!("side output error: both receivers already closed");
+                    }
                     break;
                 }
             }

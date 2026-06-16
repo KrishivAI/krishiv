@@ -247,10 +247,21 @@ impl CdcEventSource for RdkafkaCdcEventSource {
                             )));
                         }
                         None => {
+                            // C6: explicitly store the tombstone offset so that the
+                            // next commit_consumer_state call includes it.  Without
+                            // this, a partition whose last message before a commit
+                            // is a tombstone would not have its offset advanced in
+                            // the Iceberg snapshot metadata.
                             tracing::warn!(
                                 partition = msg.partition(),
                                 offset = msg.offset(),
-                                "skipping tombstone message (null payload)"
+                                "skipping tombstone message (null payload); offset committed"
+                            );
+                            use rdkafka::consumer::Consumer;
+                            let _ = self.consumer.store_offset(
+                                msg.topic(),
+                                msg.partition(),
+                                msg.offset(),
                             );
                             continue;
                         }

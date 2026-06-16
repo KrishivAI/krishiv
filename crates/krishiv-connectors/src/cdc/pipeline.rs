@@ -527,10 +527,14 @@ impl CdcToLakehousePipeline {
 fn kafka_offsets_for_events(events: &[CdcEvent]) -> BTreeMap<String, i64> {
     let mut offsets = BTreeMap::new();
     for event in events {
-        offsets.insert(
-            format!("{}-{}", event.table, event.partition_id),
-            event.offset + 1,
-        );
+        let key = format!("{}-{}", event.table, event.partition_id);
+        let next_offset = event.offset + 1;
+        // H5: take the max offset per partition so non-ascending event order
+        // (e.g. from merged multi-table batches) never commits a stale offset.
+        offsets
+            .entry(key)
+            .and_modify(|v: &mut i64| *v = (*v).max(next_offset))
+            .or_insert(next_offset);
     }
     offsets
 }

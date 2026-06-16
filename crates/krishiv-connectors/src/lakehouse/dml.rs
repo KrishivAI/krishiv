@@ -110,7 +110,7 @@ pub async fn iceberg_delete_where(
 
     let all_batches = scan_iceberg_table(&table, ctx).await?;
     if all_batches.is_empty() {
-        return Ok((0, -1));
+        return Ok((0, -1)); // -1: no snapshot needed (table empty, no-op)
     }
 
     let total_rows: i64 = all_batches.iter().map(|b| b.num_rows() as i64).sum();
@@ -330,6 +330,8 @@ pub async fn overwrite_table_pub(
             .create_table(ident.namespace(), creation)
             .await
             .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        // -1 sentinel: iceberg-rust 0.9.1 returns no snapshot for empty tables;
+        // callers must treat -1 as "no snapshot"
         return Ok(new_table
             .metadata()
             .current_snapshot()
@@ -343,10 +345,11 @@ pub async fn overwrite_table_pub(
         let arrow_schema = arrow_schema.clone();
         let batches = batches.clone();
         move || -> Result<(Vec<u8>, u64, u64), LakehouseError> {
-            use std::fs::File;
-
-            let tmp_path = std::env::temp_dir().join(format!("{}.parquet", uuid::Uuid::new_v4()));
-            let file = File::create(&tmp_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let tmp = tempfile::NamedTempFile::new()
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let tmp_path = tmp.path().to_path_buf();
+            let file = std::fs::File::create(&tmp_path)
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
             let mut writer = ArrowWriter::try_new(file, arrow_schema, None)
                 .map_err(|e| LakehouseError::Io(e.to_string()))?;
             let mut row_count = 0u64;
@@ -366,7 +369,7 @@ pub async fn overwrite_table_pub(
             drop(inner);
 
             let bytes = std::fs::read(&tmp_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let _ = std::fs::remove_file(&tmp_path);
+            // tmp drops here, auto-deleting the temp file
             Ok((bytes, size, row_count))
         }
     })
@@ -400,19 +403,51 @@ pub async fn overwrite_table_pub(
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
     // Drop old table and recreate so the new snapshot references ONLY our file.
-    catalog
+    let drop_result = catalog
         .drop_table(ident)
         .await
-        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-    let creation = TableCreation::builder()
-        .name(ident.name().to_string())
-        .schema((*iceberg_schema).clone())
-        .location(table_location)
-        .build();
-    let new_table = catalog
-        .create_table(ident.namespace(), creation)
-        .await
-        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()));
+    if let Err(e) = drop_result {
+        return Err(e);
+    }
+
+    let create_result = catalog
+        .create_table(
+            ident.namespace(),
+            TableCreation::builder()
+                .name(ident.name().to_string())
+                .schema((*iceberg_schema).clone())
+                .location(table_location.clone())
+                .build(),
+        )
+        .await;
+
+    let new_table = match create_result {
+        Ok(t) => t,
+        Err(create_err) => {
+            // Recreate failed — try to restore the original table so we don't leave it invisible
+            // (best-effort: if this also fails, log and propagate the original error)
+            if let Err(restore_err) = catalog
+                .create_table(
+                    ident.namespace(),
+                    TableCreation::builder()
+                        .name(ident.name().to_string())
+                        .schema((*iceberg_schema).clone())
+                        .location(table_location.clone())
+                        .build(),
+                )
+                .await
+            {
+                tracing::error!(
+                    table = %ident,
+                    create_error = %create_err,
+                    restore_error = %restore_err,
+                    "CRITICAL: table is invisible after failed overwrite and restore attempt; manual intervention required"
+                );
+            }
+            return Err(LakehouseError::Iceberg(create_err.to_string()));
+        }
+    };
 
     // Commit the single data file via fast_append.
     let tx = Transaction::new(&new_table);
