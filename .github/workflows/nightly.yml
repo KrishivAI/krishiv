@@ -90,16 +90,15 @@ jobs:
       - name: Install Python (self-hosted)
         if: runner.os != 'macOS'
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            python3-pip python3-venv python3-dev \
-          && sudo rm -rf /var/lib/apt/lists/*
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \
+            python3-pip python3-venv python3-dev
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           command: build
           args: --release --out dist/ --find-interpreter
-          manifest-path: crates/krishiv-python/pyproject.toml
+          working-directory: crates/krishiv-python
       - uses: actions/upload-artifact@v4
         with:
           name: nightly-wheels-${{ matrix.os }}-${{ matrix.target }}-${{ github.run_id }}
