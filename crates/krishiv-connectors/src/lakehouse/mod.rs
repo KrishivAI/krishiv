@@ -34,8 +34,10 @@ pub use delta_lake::{
 };
 pub use hudi::{
     HudiCowWriter, HudiObjectStoreReader, HudiObjectStoreWriter, HudiQueryType, HudiSnapshotReader,
-    HudiWriteResult, write_hudi_cow_append, write_hudi_cow_fixture, write_hudi_cow_upsert,
+    HudiStageHandle, HudiTwoPhaseCommitSink, HudiWriteResult, write_hudi_cow_append,
+    write_hudi_cow_fixture, write_hudi_cow_upsert,
 };
+pub use local_delta::{DeltaStageHandle, LocalDeltaTwoPhaseCommitSink};
 pub use iceberg_fs::IcebergFsTable;
 #[cfg(feature = "iceberg")]
 pub use iceberg_native::IcebergNativeTwoPhaseCommit;
@@ -1243,7 +1245,7 @@ mod tests {
         }
     }
 
-    // ── MemoryLakehouseTable compaction ────────────────────────────────────────
+    // ── MemoryLakehouseTable compaction ───────────────────────────────────────────
 
     #[tokio::test]
     async fn memory_iceberg_row_level_dml_and_schema_evolution() {
