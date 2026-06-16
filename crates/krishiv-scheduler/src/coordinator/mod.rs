@@ -2,7 +2,6 @@
 
 use dashmap::DashMap;
 use krishiv_common::DurabilityProfile;
-use tracing::Instrument as _;
 use krishiv_plan::{LogicalPlan, PhysicalPlan};
 use krishiv_proto::{
     AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorId, CoordinatorState,
@@ -22,6 +21,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use tokio::sync::{Notify, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tracing::Instrument as _;
 
 use crate::adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, ExecutorHeartbeatEffects,

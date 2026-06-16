@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use twox_hash::XxHash64;
 use std::sync::Arc;
+use twox_hash::XxHash64;
 
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::DataType;
@@ -409,7 +409,10 @@ impl DeduplicatingStream {
     }
 
     /// Filter a batch, keeping only rows whose hash has not been seen before.
-    fn dedup_batch(&mut self, batch: RecordBatch) -> std::result::Result<Option<RecordBatch>, String> {
+    fn dedup_batch(
+        &mut self,
+        batch: RecordBatch,
+    ) -> std::result::Result<Option<RecordBatch>, String> {
         let mut keep_indices: Vec<usize> = Vec::new();
         for row in 0..batch.num_rows() {
             let h = Self::row_hash(&batch, row, &self.columns);
@@ -431,8 +434,7 @@ impl DeduplicatingStream {
             .columns()
             .iter()
             .map(|col| {
-                arrow::compute::take(col.as_ref(), &indices, None)
-                    .map_err(|e| e.to_string())
+                arrow::compute::take(col.as_ref(), &indices, None).map_err(|e| e.to_string())
             })
             .collect::<std::result::Result<Vec<_>, String>>()?;
         Ok(RecordBatch::try_new(batch.schema(), columns).ok())

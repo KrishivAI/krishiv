@@ -345,11 +345,11 @@ pub async fn overwrite_table_pub(
         let arrow_schema = arrow_schema.clone();
         let batches = batches.clone();
         move || -> Result<(Vec<u8>, u64, u64), LakehouseError> {
-            let tmp = tempfile::NamedTempFile::new()
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let tmp =
+                tempfile::NamedTempFile::new().map_err(|e| LakehouseError::Io(e.to_string()))?;
             let tmp_path = tmp.path().to_path_buf();
-            let file = std::fs::File::create(&tmp_path)
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let file =
+                std::fs::File::create(&tmp_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
             let mut writer = ArrowWriter::try_new(file, arrow_schema, None)
                 .map_err(|e| LakehouseError::Io(e.to_string()))?;
             let mut row_count = 0u64;
@@ -407,9 +407,7 @@ pub async fn overwrite_table_pub(
         .drop_table(ident)
         .await
         .map_err(|e| LakehouseError::Iceberg(e.to_string()));
-    if let Err(e) = drop_result {
-        return Err(e);
-    }
+    drop_result?;
 
     let create_result = catalog
         .create_table(

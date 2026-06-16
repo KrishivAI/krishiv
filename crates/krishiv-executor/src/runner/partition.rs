@@ -48,7 +48,9 @@ pub(crate) fn format_failure_message(fragment: &str, error: &str) -> String {
 /// Arrow Flight call, it returns `ExecutorError::ShufflePartitionMissing`.  This
 /// helper converts that into the wire-level `MissingShufflePartition` list so the
 /// coordinator can re-schedule the producing task.
-pub(crate) fn collect_missing_shuffle_partitions(error: &ExecutorError) -> Vec<MissingShufflePartition> {
+pub(crate) fn collect_missing_shuffle_partitions(
+    error: &ExecutorError,
+) -> Vec<MissingShufflePartition> {
     match error {
         ExecutorError::ShufflePartitionMissing {
             stage_id,

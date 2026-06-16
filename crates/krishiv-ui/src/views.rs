@@ -1,18 +1,10 @@
-use std::sync::Arc;
-
 use askama::Template;
-use krishiv_proto::{
-    ConnectorCapabilityFlags, CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId,
-    ExecutorState, JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
-};
-use krishiv_scheduler::{
-    Coordinator, ExecutorRecord, JobDetailSnapshot, JobHistoryRecord, JobSnapshot,
-    NamespaceQuotaSnapshot, ResourceUsage, StabilityMetrics,
-};
+use krishiv_proto::ConnectorCapabilityFlags;
 use krishiv_scheduler::metrics::SchedulerMetrics;
+use krishiv_scheduler::{
+    JobHistoryRecord, NamespaceQuotaSnapshot, ResourceUsage, StabilityMetrics,
+};
 use serde::{Deserialize, Serialize};
-
-use crate::{UiError, UiResult, UiState};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobsResponse {
@@ -235,6 +227,7 @@ pub struct ExecutorDetailResponse {
 
 /// Response for `GET /api/v1/jobs/{job_id}/checkpoints` HTML rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[allow(dead_code)]
 pub struct CheckpointsView {
     pub job_id: String,
     pub epochs: Vec<u64>,
@@ -493,4 +486,3 @@ impl Pagination {
         (limit, self.offset.unwrap_or(0))
     }
 }
-

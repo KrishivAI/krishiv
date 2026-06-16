@@ -492,8 +492,7 @@ impl Coordinator {
         }
         // H3: Emit task-level event log entries for succeeded/failed terminal states.
         if let Some(store) = &self.store {
-            let attempt_id =
-                AttemptId::try_new(attempt).unwrap_or(AttemptId::initial());
+            let attempt_id = AttemptId::try_new(attempt).unwrap_or(AttemptId::initial());
             let event = match terminal_state {
                 TaskState::Succeeded => Some(EventLogEvent::TaskSucceeded {
                     job_id: job_id.clone(),

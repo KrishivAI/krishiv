@@ -1,18 +1,16 @@
 use std::collections::HashMap;
 
-use krishiv_plan::{
-    ExecutionKind as PlanExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanNode,
-};
+use krishiv_plan::ExecutionKind as PlanExecutionKind;
 use krishiv_proto::{
-    AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, ExecutorTaskAssignment,
-    InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, KeyGroupRange,
-    LeaseGeneration, MissingShufflePartition, OutputContract, OutputContractKind, PlanFragment,
-    StageId, StageSpec, StageState, StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskId,
-    TaskOutputMetadata, TaskSpec, TaskState, TaskStatusUpdate,
+    AttemptId, ExecutorId, ExecutorTaskAssignment, InputPartition, InputPartitionDescriptor, JobId,
+    JobKind, JobSpec, JobState, KeyGroupRange, LeaseGeneration, MissingShufflePartition,
+    OutputContract, OutputContractKind, PlanFragment, StageId, StageSpec, StageState,
+    StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskSpec,
+    TaskState, TaskStatusUpdate,
 };
 use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 
-use crate::{ExecutorHeartbeatAge, SchedulerError, SchedulerResult, TaskUpdateOutcome};
+use crate::{SchedulerError, SchedulerResult, TaskUpdateOutcome};
 
 const MAX_KEY_GROUPS: u32 = 32_768;
 
@@ -1033,4 +1031,3 @@ impl TaskRecord {
         }
     }
 }
-

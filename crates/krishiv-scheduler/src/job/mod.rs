@@ -5,14 +5,12 @@ mod scheduler;
 mod snapshot;
 
 pub use record::{JobRecord, StageRecord, TaskRecord};
-pub use scheduler::{
-    NamespaceQuotaSnapshot, ResourceUsage, StaticScheduler, SlotAwareScheduler,
-    job_spec_from_logical_plan, job_spec_from_physical_plan, SubmitOutcome,
-};
 pub(crate) use scheduler::validate_job;
-pub use snapshot::{
-    JobDetailSnapshot, JobSnapshot, StabilityMetrics, StageSnapshot, TaskSnapshot,
+pub use scheduler::{
+    NamespaceQuotaSnapshot, ResourceUsage, SlotAwareScheduler, StaticScheduler, SubmitOutcome,
+    job_spec_from_logical_plan, job_spec_from_physical_plan,
 };
+pub use snapshot::{JobDetailSnapshot, JobSnapshot, StabilityMetrics, StageSnapshot, TaskSnapshot};
 
 #[cfg(test)]
 mod exchange_stage_tests {

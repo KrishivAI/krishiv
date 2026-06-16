@@ -10,11 +10,13 @@ mod counters;
 mod init;
 
 pub use counters::{KrishivHistogram, KrishivMetrics, current_tracestate, global_metrics};
-pub use init::{current_traceparent, init, MetricsConfig, MetricsError, MetricsHandle, TracerExporter};
+pub use init::{
+    MetricsConfig, MetricsError, MetricsHandle, TracerExporter, current_traceparent, init,
+};
 
 #[cfg(test)]
 mod tests {
-    use super::{init::*, counters::*};
+    use super::{counters::*, init::*};
 
     #[test]
     fn init_noop_does_not_panic() {

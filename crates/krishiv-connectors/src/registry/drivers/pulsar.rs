@@ -21,7 +21,9 @@ impl SourceDriver for PulsarSourceDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Pulsar,
             ConnectorRole::Source,
-            ConnectorCapabilities::new().with_unbounded().with_checkpoint(),
+            ConnectorCapabilities::new()
+                .with_unbounded()
+                .with_checkpoint(),
         )
     }
 
@@ -45,12 +47,11 @@ impl SourceDriver for PulsarSourceDriver {
 
             let cfg = PulsarConfig::new(broker_url, topic).with_subscription(subscription);
 
-            let source =
-                PulsarSource::connect(cfg)
-                    .await
-                    .map_err(|e| ConnectorError::Config {
-                        message: format!("pulsar source open failed: {e}"),
-                    })?;
+            let source = PulsarSource::connect(cfg)
+                .await
+                .map_err(|e| ConnectorError::Config {
+                    message: format!("pulsar source open failed: {e}"),
+                })?;
             Ok(Box::new(source) as Box<dyn DynSource>)
         })
     }

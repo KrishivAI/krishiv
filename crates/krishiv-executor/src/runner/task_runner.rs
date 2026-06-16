@@ -4,7 +4,6 @@ use arrow::record_batch::RecordBatch;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointSourceOffset, InitiateCheckpointRequest, TaskId,
 };
-use krishiv_state::StateBackend;
 use krishiv_state::checkpoint::{CheckpointStorage, snapshot_path};
 
 use crate::{ExecutorError, ExecutorResult};

@@ -206,4 +206,3 @@ pub fn parse_debezium_envelope_result(
         table,
     })
 }
-

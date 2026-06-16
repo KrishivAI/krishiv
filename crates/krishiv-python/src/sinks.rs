@@ -204,7 +204,11 @@ pub struct PyCassandraSink {
 impl PyCassandraSink {
     #[new]
     pub fn new(node: String, keyspace: String, table: String) -> Self {
-        Self { node, keyspace, table }
+        Self {
+            node,
+            keyspace,
+            table,
+        }
     }
 
     pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
@@ -300,7 +304,10 @@ impl PyElasticsearchSink {
     }
 
     pub fn __repr__(&self) -> String {
-        format!("ElasticsearchSink(url={:?}, index={:?})", self.url, self.index)
+        format!(
+            "ElasticsearchSink(url={:?}, index={:?})",
+            self.url, self.index
+        )
     }
 }
 
@@ -320,7 +327,11 @@ pub struct PyHBaseSink {
 impl PyHBaseSink {
     #[new]
     pub fn new(host: String, table: String, column_family: String) -> Self {
-        Self { host, table, column_family }
+        Self {
+            host,
+            table,
+            column_family,
+        }
     }
 
     pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {

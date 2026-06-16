@@ -138,14 +138,14 @@ pub async fn expire_snapshots(
     let action = tx
         .update_table_properties()
         .set("krishiv.expired-snapshot-ids".to_string(), expired_ids_csv);
-    if let Ok(tx) = action.apply(tx) {
-        if let Err(e) = tx.commit(&*catalog).await {
-            tracing::warn!(
-                table = %table_ident,
-                error = %e,
-                "expire_snapshots: failed to persist expired-snapshot-ids property"
-            );
-        }
+    if let Ok(tx) = action.apply(tx)
+        && let Err(e) = tx.commit(&*catalog).await
+    {
+        tracing::warn!(
+            table = %table_ident,
+            error = %e,
+            "expire_snapshots: failed to persist expired-snapshot-ids property"
+        );
     }
 
     tracing::info!(

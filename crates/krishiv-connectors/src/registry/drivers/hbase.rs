@@ -22,7 +22,9 @@ impl SinkDriver for HBaseSinkDriver {
             ConnectorKind::HBase,
             ConnectorRole::Sink,
             // HBase Put operations are idempotent (same row key overwrites previous value).
-            ConnectorCapabilities::new().with_unbounded().with_idempotent(),
+            ConnectorCapabilities::new()
+                .with_unbounded()
+                .with_idempotent(),
         )
     }
 
@@ -50,11 +52,12 @@ impl SinkDriver for HBaseSinkDriver {
             let column_family = config.get("column_family").unwrap_or("cf").to_string();
 
             let hbase_config = HBaseConfig::new(thrift_addr, table, column_family);
-            let sink = HBaseSink::connect(hbase_config)
-                .await
-                .map_err(|e| ConnectorError::Config {
-                    message: format!("hbase sink open failed: {e}"),
-                })?;
+            let sink =
+                HBaseSink::connect(hbase_config)
+                    .await
+                    .map_err(|e| ConnectorError::Config {
+                        message: format!("hbase sink open failed: {e}"),
+                    })?;
             Ok(Box::new(HBaseSinkWrapper(sink)) as Box<dyn DynSink>)
         })
     }
@@ -64,7 +67,9 @@ struct HBaseSinkWrapper(HBaseSink);
 
 impl crate::sink::Sink for HBaseSinkWrapper {
     fn capabilities(&self) -> crate::capabilities::ConnectorCapabilities {
-        ConnectorCapabilities::new().with_unbounded().with_idempotent()
+        ConnectorCapabilities::new()
+            .with_unbounded()
+            .with_idempotent()
     }
 
     async fn write_batch(

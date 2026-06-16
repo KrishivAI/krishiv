@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::error::ConnectorError;
 
-use super::debezium::{parse_debezium_envelope, parse_debezium_envelope_result, CdcEvent, CdcOp, DebeziumParseError, RawCdcRecord};
+use super::debezium::{CdcEvent, RawCdcRecord, parse_debezium_envelope_result};
 #[cfg(feature = "kafka")]
 use super::kafka_source::{KafkaCdcConfig, RdkafkaCdcEventSource};
 
@@ -338,7 +338,8 @@ impl CdcToLakehousePipeline {
                     }
                     concat_registry_batches(&batches).map_err(ConnectorError::Cdc)
                 } else {
-                    let events = super::debezium::parse_debezium_records(&raw).map_err(ConnectorError::Cdc)?;
+                    let events = super::debezium::parse_debezium_records(&raw)
+                        .map_err(ConnectorError::Cdc)?;
                     if events.is_empty() {
                         continue;
                     }
@@ -354,7 +355,8 @@ impl CdcToLakehousePipeline {
                             .into(),
                     ));
                 }
-                let events = super::debezium::parse_debezium_records(&raw).map_err(ConnectorError::Cdc)?;
+                let events =
+                    super::debezium::parse_debezium_records(&raw).map_err(ConnectorError::Cdc)?;
                 if events.is_empty() {
                     continue;
                 }
@@ -814,4 +816,3 @@ fn safe_payload_column(name: &str) -> String {
 // ---------------------------------------------------------------------------
 // RdkafkaCdcEventSource  (behind `kafka` feature)
 // ---------------------------------------------------------------------------
-

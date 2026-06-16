@@ -21,7 +21,9 @@ impl SourceDriver for KinesisSourceDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Kinesis,
             ConnectorRole::Source,
-            ConnectorCapabilities::new().with_unbounded().with_checkpoint(),
+            ConnectorCapabilities::new()
+                .with_unbounded()
+                .with_checkpoint(),
         )
     }
 
@@ -58,9 +60,11 @@ impl SourceDriver for KinesisSourceDriver {
                 .with_shard_id(shard_id)
                 .with_start(start);
 
-            let source = KinesisSource::new(cfg).await.map_err(|e| ConnectorError::Config {
-                message: format!("kinesis source open failed: {e}"),
-            })?;
+            let source = KinesisSource::new(cfg)
+                .await
+                .map_err(|e| ConnectorError::Config {
+                    message: format!("kinesis source open failed: {e}"),
+                })?;
             Ok(Box::new(source) as Box<dyn DynSource>)
         })
     }

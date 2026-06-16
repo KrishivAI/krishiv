@@ -20,6 +20,8 @@ pub mod elasticsearch_sink;
 pub mod hbase_connector;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+#[cfg(feature = "kafka")]
+pub mod kafka_transactional_sink;
 #[cfg(feature = "kinesis")]
 pub mod kinesis;
 #[cfg(feature = "lakehouse")]
@@ -36,8 +38,6 @@ pub mod transactional;
 pub mod transactional_kafka;
 #[cfg(feature = "two-phase")]
 pub mod two_phase_parquet_s3;
-#[cfg(feature = "kafka")]
-pub mod kafka_transactional_sink;
 
 // Module facades
 pub mod capabilities;
@@ -63,6 +63,8 @@ pub mod certification;
 pub use capabilities::{ConnectorCapabilities, ConnectorMaturity, DeliveryGuarantee};
 pub use config::ConnectorConfig;
 pub use error::{ConnectorError, ConnectorResult};
+#[cfg(feature = "kafka")]
+pub use kafka_transactional_sink::RdkafkaTransactionalSink;
 pub use offset::{CommitHandle, Offset, OffsetCommitter, ParquetOffset};
 pub use quality::{
     CompiledDataQualityConfig, CompiledQualityRule, ConnectorQualityHook, DataQualityCheckResult,
@@ -75,8 +77,6 @@ pub use registry::{
 pub use schema_normalize::SchemaNormalizeOperator;
 pub use sink::{AtLeastOnceSinkContract, DynSink, PostWriteOffsetCommitProtocol, Sink};
 pub use source::{CheckpointSource, DynSource, Source};
-#[cfg(feature = "kafka")]
-pub use kafka_transactional_sink::RdkafkaTransactionalSink;
 pub use two_phase::{
     EpochTransactionLog, InMemoryCommitHandle, InMemoryTwoPhaseCommitSink,
     LocalParquetTwoPhaseCommitSink, ParquetCommitHandle, TransactionalSinkParticipant,

@@ -1,37 +1,12 @@
-use std::collections::HashMap;
-
-use krishiv_plan::{
-    ExecutionKind as PlanExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanNode,
-};
 use krishiv_proto::{
-    AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, ExecutorTaskAssignment,
-    InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, KeyGroupRange,
-    LeaseGeneration, MissingShufflePartition, OutputContract, OutputContractKind, PlanFragment,
-    StageId, StageSpec, StageState, StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskId,
-    TaskOutputMetadata, TaskSpec, TaskState, TaskStatusUpdate,
+    ConnectorCapabilityFlags, ExecutorId, JobId, JobKind, JobState, StageId, StageState, TaskId,
+    TaskOutputMetadata, TaskState,
 };
-use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 
-use crate::{ExecutorHeartbeatAge, SchedulerError, SchedulerResult, TaskUpdateOutcome};
+use crate::ExecutorHeartbeatAge;
 
 use super::scheduler::ResourceUsage;
 
-const MAX_KEY_GROUPS: u32 = 32_768;
-
-/// Conservative per-job UDF execution time cap (ms) — 1 hour.
-const UDF_EXECUTION_TIME_CAP_MS: u64 = 60 * 60 * 1_000;
-
-fn key_group_range_for_task(task_index: usize, parallelism: usize) -> KeyGroupRange {
-    let p = parallelism.max(1) as u32;
-    let idx = task_index as u32;
-    let base = MAX_KEY_GROUPS / p;
-    let rem = MAX_KEY_GROUPS % p;
-    let extra_before = idx.min(rem);
-    let start = idx.saturating_mul(base) + extra_before;
-    let count = base + u32::from(idx < rem);
-    let end = start + count - 1;
-    KeyGroupRange::new(start, end)
-}
 /// Job status summary for CLI/UI use in later R2 slices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSnapshot {
@@ -283,4 +258,3 @@ impl StabilityMetrics {
         self.failed_assignments
     }
 }
-

@@ -22,7 +22,9 @@ impl SinkDriver for CassandraSinkDriver {
             ConnectorKind::Cassandra,
             ConnectorRole::Sink,
             // Cassandra INSERT operations are idempotent when using the same row key.
-            ConnectorCapabilities::new().with_unbounded().with_idempotent(),
+            ConnectorCapabilities::new()
+                .with_unbounded()
+                .with_idempotent(),
         )
     }
 
@@ -43,11 +45,12 @@ impl SinkDriver for CassandraSinkDriver {
             let table = config.required("table")?.to_string();
 
             let cass_config = CassandraConfig::new(contact_points, keyspace, table);
-            let sink = CassandraSink::connect(cass_config)
-                .await
-                .map_err(|e| ConnectorError::Config {
-                    message: format!("cassandra sink open failed: {e}"),
-                })?;
+            let sink =
+                CassandraSink::connect(cass_config)
+                    .await
+                    .map_err(|e| ConnectorError::Config {
+                        message: format!("cassandra sink open failed: {e}"),
+                    })?;
             Ok(Box::new(CassandraSinkWrapper(sink)) as Box<dyn DynSink>)
         })
     }
@@ -57,7 +60,9 @@ struct CassandraSinkWrapper(CassandraSink);
 
 impl crate::sink::Sink for CassandraSinkWrapper {
     fn capabilities(&self) -> crate::capabilities::ConnectorCapabilities {
-        ConnectorCapabilities::new().with_unbounded().with_idempotent()
+        ConnectorCapabilities::new()
+            .with_unbounded()
+            .with_idempotent()
     }
 
     async fn write_batch(

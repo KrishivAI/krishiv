@@ -42,21 +42,20 @@ pub use krishiv_common::durability::{CheckpointDurability, DurabilityProfile};
 pub use object_store::ObjectStoreCheckpointStorage;
 pub use storage_uri::open_checkpoint_storage_from_uri;
 
-pub use metadata::{
-    CheckpointError, CheckpointMetadata, CheckpointResult, IntegrityManifest,
-    OperatorSnapshotRef, SourceOffsetRecord,
-};
-pub use paths::{epoch_dir, manifest_path, metadata_path, snapshot_path};
-pub use storage_trait::{CheckpointStorage, run_blocking_on_tokio};
+pub use ephemeral::EphemeralCheckpointStorage;
 pub use io::{
     create_savepoint, create_savepoint_at_epoch, delete_epoch, delete_epoch_async,
     delete_savepoint, latest_valid_epoch, latest_valid_epoch_async, list_savepoints,
-    list_valid_epochs, list_valid_epochs_async, read_epoch_metadata,
-    read_epoch_metadata_async, read_operator_snapshot, read_operator_snapshot_async,
-    restore_savepoint, validate_epoch, validate_epoch_async, validate_fencing_token,
-    validate_fencing_token_for_restore, write_epoch_hint, write_epoch_hint_async,
-    write_epoch_metadata, write_epoch_metadata_async, write_manifest, write_manifest_async,
-    write_operator_snapshot, write_operator_snapshot_async,
+    list_valid_epochs, list_valid_epochs_async, read_epoch_metadata, read_epoch_metadata_async,
+    read_operator_snapshot, read_operator_snapshot_async, restore_savepoint, validate_epoch,
+    validate_epoch_async, validate_fencing_token, validate_fencing_token_for_restore,
+    write_epoch_hint, write_epoch_hint_async, write_epoch_metadata, write_epoch_metadata_async,
+    write_manifest, write_manifest_async, write_operator_snapshot, write_operator_snapshot_async,
 };
-pub use ephemeral::EphemeralCheckpointStorage;
 pub use local_fs::LocalFsCheckpointStorage;
+pub use metadata::{
+    CheckpointError, CheckpointMetadata, CheckpointResult, IntegrityManifest, OperatorSnapshotRef,
+    SourceOffsetRecord,
+};
+pub use paths::{epoch_dir, manifest_path, metadata_path, snapshot_path};
+pub use storage_trait::{CheckpointStorage, run_blocking_on_tokio};

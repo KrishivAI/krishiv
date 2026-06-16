@@ -4,8 +4,8 @@ use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
     StringArray, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, Field, Schema};
 use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 
@@ -770,4 +770,3 @@ fn proto_value_mismatch(expected: &DataType, actual: &ProtoValue) -> SchemaRegis
         "protobuf value {actual:?} does not match Arrow type {expected}"
     ))
 }
-

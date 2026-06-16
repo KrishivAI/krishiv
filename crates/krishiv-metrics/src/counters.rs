@@ -877,4 +877,3 @@ pub fn current_tracestate() -> Option<String> {
         Some(state.header().to_string())
     }
 }
-

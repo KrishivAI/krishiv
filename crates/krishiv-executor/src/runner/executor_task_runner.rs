@@ -7,12 +7,11 @@ use dashmap::DashMap;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
     ExecutorTaskAssignment, FencingToken, InitiateCheckpointRequest, JobId,
-    MissingShufflePartition, StageId, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskState,
-    TaskStatusRequest, TaskStatusResponse, TransportDisposition,
+    MissingShufflePartition, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskState,
+    TaskStatusRequest, TaskStatusResponse,
 };
 use krishiv_sql::SqlEngine;
-use krishiv_state::StateBackend;
-use krishiv_state::checkpoint::{CheckpointStorage, snapshot_path};
+use krishiv_state::checkpoint::CheckpointStorage;
 
 use crate::{
     ExecutorAssignmentInbox, ExecutorError, ExecutorResult, SharedBarrierAckRegistry,

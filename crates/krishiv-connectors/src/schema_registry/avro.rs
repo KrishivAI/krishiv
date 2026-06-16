@@ -7,8 +7,8 @@ use arrow::array::{
     Int64Array, NullArray, StringArray, Time32MillisecondArray, Time64MicrosecondArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
 };
-use arrow::datatypes::{DataType, Field, Schema};
 use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 
@@ -388,4 +388,3 @@ pub(crate) fn avro_value_mismatch(expected: &DataType, actual: &Value) -> Schema
         "Avro value {actual:?} does not match Arrow type {expected}"
     ))
 }
-

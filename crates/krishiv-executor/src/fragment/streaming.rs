@@ -451,9 +451,11 @@ fn execute_loop_fragment(
                      window state is inconsistent — restart the job",
                 ),
             })?;
-        let batches = exec.drain(input_batches).map_err(|e| ExecutorError::LocalExecution {
-            message: format!("stream:loop drain error: {e}"),
-        })?;
+        let batches = exec
+            .drain(input_batches)
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("stream:loop drain error: {e}"),
+            })?;
         // H2: propagate watermark so the coordinator can advance the global
         // streaming watermark and trigger late-data handling downstream.
         let wm = exec.last_watermark_ms();

@@ -42,11 +42,11 @@ impl SinkDriver for ElasticsearchSinkDriver {
             let index = config.required("index")?.to_string();
 
             let es_config = ElasticsearchConfig::new(url, index);
-            let sink = ElasticsearchSink::connect(es_config)
-                .await
-                .map_err(|e| ConnectorError::Config {
+            let sink = ElasticsearchSink::connect(es_config).await.map_err(|e| {
+                ConnectorError::Config {
                     message: format!("elasticsearch sink open failed: {e}"),
-                })?;
+                }
+            })?;
             Ok(Box::new(ElasticsearchSinkWrapper(sink)) as Box<dyn DynSink>)
         })
     }

@@ -12,7 +12,7 @@ pub(crate) fn max_concurrent_assignment_rpcs() -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(128)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_ASSIGNMENT_RPCS)
 }
 
 /// Constant used in the few places that need it at compile time (e.g. semaphore

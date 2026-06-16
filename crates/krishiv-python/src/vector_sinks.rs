@@ -231,28 +231,38 @@ fn parse_payload_dict(d: &Bound<'_, PyDict>) -> PyResult<HashMap<String, Payload
     Ok(m)
 }
 
-fn parse_payloads(payloads: Option<Vec<Bound<'_, PyDict>>>, n: usize) -> PyResult<Vec<HashMap<String, PayloadValue>>> {
+fn parse_payloads(
+    payloads: Option<Vec<Bound<'_, PyDict>>>,
+    n: usize,
+) -> PyResult<Vec<HashMap<String, PayloadValue>>> {
     match payloads {
         None => Ok(vec![HashMap::new(); n]),
         Some(dicts) => dicts.iter().map(parse_payload_dict).collect(),
     }
 }
 
-fn parse_filter(filter: Option<Bound<'_, PyDict>>) -> PyResult<Option<krishiv_connectors::vector::PayloadFilter>> {
-    filter.map(|d| {
-        let equals = parse_payload_dict(&d)?;
-        Ok(krishiv_connectors::vector::PayloadFilter { equals })
-    }).transpose()
+fn parse_filter(
+    filter: Option<Bound<'_, PyDict>>,
+) -> PyResult<Option<krishiv_connectors::vector::PayloadFilter>> {
+    filter
+        .map(|d| {
+            let equals = parse_payload_dict(&d)?;
+            Ok(krishiv_connectors::vector::PayloadFilter { equals })
+        })
+        .transpose()
 }
 
 fn chunks_to_py(chunks: Vec<krishiv_connectors::vector::ScoredChunk>) -> Vec<PyScoredChunk> {
-    chunks.into_iter().map(|c| PyScoredChunk {
-        doc_id: c.doc_id,
-        chunk_index: c.chunk_index,
-        text: c.text,
-        score: c.score,
-        payload: c.payload,
-    }).collect()
+    chunks
+        .into_iter()
+        .map(|c| PyScoredChunk {
+            doc_id: c.doc_id,
+            chunk_index: c.chunk_index,
+            text: c.text,
+            score: c.score,
+            payload: c.payload,
+        })
+        .collect()
 }
 
 // ── LanceDB sink ──────────────────────────────────────────────────────────────
@@ -273,7 +283,9 @@ impl PyLanceDbSink {
     pub fn open(py: Python<'_>, uri: String, table: String, vector_dim: usize) -> PyResult<Self> {
         py.detach(move || {
             crate::RUNTIME
-                .block_on(krishiv_connectors::vector::LanceDbSink::open(&uri, &table, vector_dim))
+                .block_on(krishiv_connectors::vector::LanceDbSink::open(
+                    &uri, &table, vector_dim,
+                ))
                 .map(|s| Self { inner: Arc::new(s) })
                 .map_err(map_sink_err)
         })
@@ -292,14 +304,18 @@ impl PyLanceDbSink {
         let batch = EmbeddingBatch::new(doc_ids, vectors, payloads, epoch);
         let sink = Arc::clone(&self.inner);
         py.detach(move || {
-            crate::RUNTIME.block_on(sink.upsert_batch(&batch)).map_err(map_sink_err)
+            crate::RUNTIME
+                .block_on(sink.upsert_batch(&batch))
+                .map_err(map_sink_err)
         })
     }
 
     pub fn delete_by_ids(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<()> {
         let sink = Arc::clone(&self.inner);
         py.detach(move || {
-            crate::RUNTIME.block_on(sink.delete_by_ids(&ids)).map_err(map_sink_err)
+            crate::RUNTIME
+                .block_on(sink.delete_by_ids(&ids))
+                .map_err(map_sink_err)
         })
     }
 
@@ -321,7 +337,9 @@ impl PyLanceDbSink {
         })
     }
 
-    pub fn sink_name(&self) -> &str { self.inner.sink_name() }
+    pub fn sink_name(&self) -> &str {
+        self.inner.sink_name()
+    }
     pub fn __repr__(&self) -> String {
         format!("LanceDbSink(name={:?})", self.inner.sink_name())
     }
@@ -360,14 +378,18 @@ impl PyWeaviateSink {
         let batch = EmbeddingBatch::new(doc_ids, vectors, payloads, epoch);
         let sink = Arc::clone(&self.inner);
         py.detach(move || {
-            crate::RUNTIME.block_on(sink.upsert_batch(&batch)).map_err(map_sink_err)
+            crate::RUNTIME
+                .block_on(sink.upsert_batch(&batch))
+                .map_err(map_sink_err)
         })
     }
 
     pub fn delete_by_ids(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<()> {
         let sink = Arc::clone(&self.inner);
         py.detach(move || {
-            crate::RUNTIME.block_on(sink.delete_by_ids(&ids)).map_err(map_sink_err)
+            crate::RUNTIME
+                .block_on(sink.delete_by_ids(&ids))
+                .map_err(map_sink_err)
         })
     }
 
@@ -389,7 +411,9 @@ impl PyWeaviateSink {
         })
     }
 
-    pub fn sink_name(&self) -> &str { self.inner.sink_name() }
+    pub fn sink_name(&self) -> &str {
+        self.inner.sink_name()
+    }
     pub fn __repr__(&self) -> String {
         format!("WeaviateSink(name={:?})", self.inner.sink_name())
     }
@@ -411,7 +435,9 @@ impl PyPineconeSink {
     #[pyo3(signature = (host, api_key, namespace=None))]
     pub fn new(host: String, api_key: String, namespace: Option<String>) -> Self {
         Self {
-            inner: Arc::new(krishiv_connectors::vector::PineconeSink::new(host, api_key, namespace)),
+            inner: Arc::new(krishiv_connectors::vector::PineconeSink::new(
+                host, api_key, namespace,
+            )),
         }
     }
 
@@ -428,14 +454,18 @@ impl PyPineconeSink {
         let batch = EmbeddingBatch::new(doc_ids, vectors, payloads, epoch);
         let sink = Arc::clone(&self.inner);
         py.detach(move || {
-            crate::RUNTIME.block_on(sink.upsert_batch(&batch)).map_err(map_sink_err)
+            crate::RUNTIME
+                .block_on(sink.upsert_batch(&batch))
+                .map_err(map_sink_err)
         })
     }
 
     pub fn delete_by_ids(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<()> {
         let sink = Arc::clone(&self.inner);
         py.detach(move || {
-            crate::RUNTIME.block_on(sink.delete_by_ids(&ids)).map_err(map_sink_err)
+            crate::RUNTIME
+                .block_on(sink.delete_by_ids(&ids))
+                .map_err(map_sink_err)
         })
     }
 
@@ -457,7 +487,9 @@ impl PyPineconeSink {
         })
     }
 
-    pub fn sink_name(&self) -> &str { self.inner.sink_name() }
+    pub fn sink_name(&self) -> &str {
+        self.inner.sink_name()
+    }
     pub fn __repr__(&self) -> String {
         format!("PineconeSink(name={:?})", self.inner.sink_name())
     }
@@ -493,7 +525,10 @@ impl PyQdrantSink {
             py.detach(move || {
                 crate::RUNTIME
                     .block_on(krishiv_connectors::vector::QdrantSink::connect(
-                        &url, collection, vector_size, create_if_missing,
+                        &url,
+                        collection,
+                        vector_size,
+                        create_if_missing,
                     ))
                     .map(|s| Self { inner: Arc::new(s) })
                     .map_err(map_sink_err)
@@ -523,13 +558,17 @@ impl PyQdrantSink {
             let batch = EmbeddingBatch::new(doc_ids, vectors, payloads, epoch);
             let sink = Arc::clone(&self.inner);
             py.detach(move || {
-                crate::RUNTIME.block_on(sink.upsert_batch(&batch)).map_err(map_sink_err)
+                crate::RUNTIME
+                    .block_on(sink.upsert_batch(&batch))
+                    .map_err(map_sink_err)
             })
         }
         #[cfg(not(feature = "qdrant"))]
         {
             let _ = (py, doc_ids, vectors, payloads, epoch);
-            Err(PyRuntimeError::new_err("QdrantSink requires the 'qdrant' feature"))
+            Err(PyRuntimeError::new_err(
+                "QdrantSink requires the 'qdrant' feature",
+            ))
         }
     }
 
@@ -538,13 +577,17 @@ impl PyQdrantSink {
         {
             let sink = Arc::clone(&self.inner);
             py.detach(move || {
-                crate::RUNTIME.block_on(sink.delete_by_ids(&ids)).map_err(map_sink_err)
+                crate::RUNTIME
+                    .block_on(sink.delete_by_ids(&ids))
+                    .map_err(map_sink_err)
             })
         }
         #[cfg(not(feature = "qdrant"))]
         {
             let _ = (py, ids);
-            Err(PyRuntimeError::new_err("QdrantSink requires the 'qdrant' feature"))
+            Err(PyRuntimeError::new_err(
+                "QdrantSink requires the 'qdrant' feature",
+            ))
         }
     }
 
@@ -570,15 +613,21 @@ impl PyQdrantSink {
         #[cfg(not(feature = "qdrant"))]
         {
             let _ = (py, vector, top_k, filter);
-            Err(PyRuntimeError::new_err("QdrantSink requires the 'qdrant' feature"))
+            Err(PyRuntimeError::new_err(
+                "QdrantSink requires the 'qdrant' feature",
+            ))
         }
     }
 
     pub fn sink_name(&self) -> &str {
         #[cfg(feature = "qdrant")]
-        { self.inner.sink_name() }
+        {
+            self.inner.sink_name()
+        }
         #[cfg(not(feature = "qdrant"))]
-        { "qdrant" }
+        {
+            "qdrant"
+        }
     }
 }
 
@@ -610,7 +659,9 @@ impl PyPgvectorSink {
             py.detach(move || {
                 crate::RUNTIME
                     .block_on(krishiv_connectors::vector::PgvectorSink::connect(
-                        &database_url, table, vector_dim,
+                        &database_url,
+                        table,
+                        vector_dim,
                     ))
                     .map(|s| Self { inner: Arc::new(s) })
                     .map_err(map_sink_err)
@@ -640,13 +691,17 @@ impl PyPgvectorSink {
             let batch = EmbeddingBatch::new(doc_ids, vectors, payloads, epoch);
             let sink = Arc::clone(&self.inner);
             py.detach(move || {
-                crate::RUNTIME.block_on(sink.upsert_batch(&batch)).map_err(map_sink_err)
+                crate::RUNTIME
+                    .block_on(sink.upsert_batch(&batch))
+                    .map_err(map_sink_err)
             })
         }
         #[cfg(not(feature = "pgvector"))]
         {
             let _ = (py, doc_ids, vectors, payloads, epoch);
-            Err(PyRuntimeError::new_err("PgvectorSink requires the 'pgvector' feature"))
+            Err(PyRuntimeError::new_err(
+                "PgvectorSink requires the 'pgvector' feature",
+            ))
         }
     }
 
@@ -655,13 +710,17 @@ impl PyPgvectorSink {
         {
             let sink = Arc::clone(&self.inner);
             py.detach(move || {
-                crate::RUNTIME.block_on(sink.delete_by_ids(&ids)).map_err(map_sink_err)
+                crate::RUNTIME
+                    .block_on(sink.delete_by_ids(&ids))
+                    .map_err(map_sink_err)
             })
         }
         #[cfg(not(feature = "pgvector"))]
         {
             let _ = (py, ids);
-            Err(PyRuntimeError::new_err("PgvectorSink requires the 'pgvector' feature"))
+            Err(PyRuntimeError::new_err(
+                "PgvectorSink requires the 'pgvector' feature",
+            ))
         }
     }
 
@@ -687,15 +746,21 @@ impl PyPgvectorSink {
         #[cfg(not(feature = "pgvector"))]
         {
             let _ = (py, vector, top_k, filter);
-            Err(PyRuntimeError::new_err("PgvectorSink requires the 'pgvector' feature"))
+            Err(PyRuntimeError::new_err(
+                "PgvectorSink requires the 'pgvector' feature",
+            ))
         }
     }
 
     pub fn sink_name(&self) -> &str {
         #[cfg(feature = "pgvector")]
-        { self.inner.sink_name() }
+        {
+            self.inner.sink_name()
+        }
         #[cfg(not(feature = "pgvector"))]
-        { "pgvector" }
+        {
+            "pgvector"
+        }
     }
 }
 

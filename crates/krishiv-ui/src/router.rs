@@ -1,13 +1,15 @@
+use axum::Router;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
-use krishiv_proto::{CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId};
+use krishiv_proto::{
+    CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
+};
 use krishiv_scheduler::Coordinator;
 
 use crate::handlers::{
-    api_executors, api_executor_detail, api_history, api_history_detail, api_job_checkpoints,
+    api_executor_detail, api_executors, api_history, api_history_detail, api_job_checkpoints,
     api_job_detail, api_job_diagnose, api_jobs, api_queues, api_sql_execute, auth_js, demo_job,
     healthz, live_js, metrics, openapi_json, readyz, sql_js, stylesheet, ui_executor_detail,
     ui_health, ui_history, ui_history_detail, ui_job_checkpoints_page, ui_job_detail,

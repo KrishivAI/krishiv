@@ -879,7 +879,9 @@ impl SqlEngine {
         let mut total_rows = 0u64;
 
         while let Some(result) = stream.next().await {
-            let batch = result.map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+            let batch = result.map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
             if batch.num_rows() > 0 {
                 total_rows += batch.num_rows() as u64;
                 sink.write_batch(batch)
@@ -3714,7 +3716,13 @@ fn parse_dml_update(stmt: &str) -> Option<ParsedUpdate> {
     if stmts.len() != 1 {
         return None;
     }
-    let Statement::Update { table, assignments, selection, .. } = stmts.remove(0) else {
+    let Statement::Update {
+        table,
+        assignments,
+        selection,
+        ..
+    } = stmts.remove(0)
+    else {
         return None;
     };
     let table_name = match table.relation {
@@ -3837,7 +3845,6 @@ pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
         })?
         .to_string())
 }
-
 
 #[cfg(test)]
 mod sql_tests;
