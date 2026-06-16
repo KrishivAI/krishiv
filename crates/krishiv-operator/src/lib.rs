@@ -18,6 +18,7 @@ pub mod pod_manager;
 pub mod queue_manager;
 pub mod reconciler;
 pub mod status;
+pub mod webhook;
 
 #[cfg(all(test, feature = "k8s"))]
 mod tests;
@@ -48,5 +49,6 @@ pub use reconciler::{
 pub use status::{
     ConditionStatus, JobCondition, KrishivJobPhase, KrishivJobStatus, TaskStatusCounters,
 };
+pub use webhook::{admission_router, handle_admission_review};
 #[cfg(feature = "k8s")]
 pub use status::{patch_krishivjob_finalizer, patch_krishivjob_status, status_patch};

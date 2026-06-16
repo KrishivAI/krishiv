@@ -269,7 +269,7 @@ pub fn demo_coordinator(
     Ok(coordinator)
 }
 
-fn validate_resource(resource: &KrishivJobResource) -> OperatorResult<()> {
+pub(crate) fn validate_resource(resource: &KrishivJobResource) -> OperatorResult<()> {
     if resource.api_version != format!("{API_GROUP}/{API_VERSION}") {
         return Err(OperatorError::InvalidResource {
             message: format!(
