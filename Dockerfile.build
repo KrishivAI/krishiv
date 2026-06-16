@@ -26,6 +26,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         lld \
         libclang-dev \
         g++ \
+        make \
+        curl \
+        protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -52,10 +55,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     # Copy out of the cache-mounted target dir before it disappears.
     OUTDIR="/out"; \
     mkdir -p "$OUTDIR"; \
-    PROFILE_DIR=$(echo "$PROFILE" | sed 's/-/_/g'); \
-    cp "target/$PROFILE_DIR/krishiv" "$OUTDIR/krishiv" 2>/dev/null || \
-    cp "target/$(echo $PROFILE_DIR)/krishiv" "$OUTDIR/krishiv"; \
-    cp "target/$PROFILE_DIR/krishiv-operator" "$OUTDIR/krishiv-operator" 2>/dev/null || true
+    cp "target/$PROFILE/krishiv" "$OUTDIR/krishiv"; \
+    cp "target/$PROFILE/krishiv-operator" "$OUTDIR/krishiv-operator" 2>/dev/null || touch "$OUTDIR/krishiv-operator"
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM ubuntu:26.04
@@ -65,10 +66,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/krishiv /usr/local/bin/krishiv
-# krishiv-operator is optional (only present for k8s builds)
-COPY --from=builder /out/krishiv-operator /usr/local/bin/krishiv-operator 2>/dev/null || true
-
-RUN chmod +x /usr/local/bin/krishiv; \
-    chmod +x /usr/local/bin/krishiv-operator 2>/dev/null || true
+# krishiv-operator is only built when FEATURES contains 'k8s'.
+COPY --from=builder /out/krishiv-operator /usr/local/bin/krishiv-operator
+RUN chmod +x /usr/local/bin/krishiv /usr/local/bin/krishiv-operator 2>/dev/null; true
 
 ENTRYPOINT ["/usr/local/bin/krishiv"]
