@@ -1,5 +1,69 @@
 # Krishiv Implementation Status
 
+## 2026-06-16 — Component stabilization: connectors, metrics, gateway, chaos
+
+### Work completed
+
+**[P0] Connector trait impls — Kinesis + Pulsar (Experimental → Preview)**
+- `crates/krishiv-connectors/src/kinesis.rs`: Added `KinesisOffset` (implements
+  `Offset` encode/decode via UTF-8 sequence number), `impl Source for KinesisSource`
+  (delegates to `next_batch()`, applies deferred `AfterSequenceNumber` seek on restore),
+  `impl CheckpointSource for KinesisSource` (stores last seen sequence number per batch;
+  `restore_offset` stores a pending seek applied on next `read_batch`). 5 new tests.
+- `crates/krishiv-connectors/src/pulsar_connector.rs`: Added `batch_size` field to
+  `PulsarConfig` and `PulsarSource`; `with_batch_size` builder. `impl Source for
+  PulsarSource` delegates to `next_batch(self.batch_size)`; current_offset returns
+  `None` (Pulsar consumer position is broker-managed). 4 new tests.
+
+**[P0] Maturity promotions**
+- `crates/krishiv-connectors/src/registry/kind.rs`: Promoted Kinesis, Pulsar,
+  Elasticsearch, Cassandra, HBase from `Experimental` → `Preview`. Promoted Qdrant and
+  pgvector from `Experimental` → `Preview`. All have complete registry drivers, `Sink`
+  wrapper impls, and test coverage.
+
+**[P2] Metrics memory leak fix**
+- `crates/krishiv-metrics/src/counters.rs`: `remove_job` now clears
+  `operator_memory_bytes` entries for the completed job (was leaking per-operator
+  memory gauge entries; `source_offset_lag` and `streaming_rows` were already cleared).
+
+**[P2] SQL Gateway session pool**
+- `crates/krishiv-sql-gateway/src/session.rs`: Added `SessionPool` (bounded pool of
+  pre-warmed `GatewaySession` instances; `acquire()` returns `PooledSession` RAII guard
+  that returns the session on drop up to `capacity`). 4 new pool tests.
+- `crates/krishiv-sql-gateway/src/lib.rs`: Exports `SessionPool` and `PooledSession`.
+
+**[P3] Chaos test expansion (12 → 15 tests)**
+- `crates/krishiv-chaos/tests/chaos_suite.rs`: 3 new tests:
+  - `network_partition_drops_records_then_recovers`
+  - `oom_task_triggers_coordinator_reassignment`
+  - `multi_executor_shuffle_failure_triggers_reshuffle`
+
+### Validation
+
+```
+cargo check --workspace                                   # 0 errors
+cargo test -p krishiv-connectors --lib --features kinesis # 85/85 passed
+cargo test -p krishiv-sql-gateway                         # 6/6 passed
+cargo test -p krishiv-chaos                               # 15/15 passed
+```
+
+### Remaining stabilization work (not yet implemented)
+
+- Delta Lake / Hudi `TwoPhaseCommitSink` impl (path from Experimental → Preview)
+- Parquet/S3/CSV exactly-once certification tests (path from Preview → Certified)
+- Kafka exactly-once certification test with `InMemoryKafkaSource` replay
+- Python Kinesis/Pulsar source bindings (depends on `Source` trait impl now done)
+- K8s operator admission webhook for CRD validation
+- Prometheus histogram for query latency (currently only counters in metrics)
+
+### Next useful command
+
+```bash
+cargo test --workspace --lib --exclude krishiv-python --exclude krishiv-chaos
+```
+
+---
+
 ## 2026-06-16 — Async/sync architecture audit and fix: eliminate spawn_blocking triple-hop
 
 ### Audit Findings
