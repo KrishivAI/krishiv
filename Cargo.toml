@@ -143,10 +143,26 @@ incremental = true
 opt-level = 0
 debug = 0
 
+# release: shared base — opt-level 3, panic=abort for all production variants.
+# Specific profiles override lto/codegen-units for their compile-time budget.
+# panic=abort removes all unwinding infrastructure (~5% size reduction, minor
+# speed boost). Tests always run under dev (panic=unwind), so this is safe.
 [profile.release]
 opt-level = 3
 lto = false
 codegen-units = 1
+panic = "abort"
+
+# release-max: highest performance for nightly Docker and production releases.
+# Fat LTO performs whole-program optimization across every crate boundary —
+# critical for a data engine where hot paths span datafusion → arrow → parquet.
+# Expect 15-25% faster runtime and ~20% smaller binary vs release-k8s.
+# Compile cost: 3-5x longer than release-k8s; only suitable for nightly/release CI.
+[profile.release-max]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
 
 # release-single-node: fast local release build for single-node deployments.
 # Skips LTO and uses multiple codegen units so `cargo build --profile release-single-node`
@@ -160,10 +176,12 @@ incremental = true
 
 # release-k8s: k8s/bare-metal image builds on memory-constrained CI runners.
 # Thin LTO keeps binary size reasonable without the peak RAM of fat LTO.
+# Use this when nightly runners have less than ~16 GB free RAM.
 [profile.release-k8s]
 inherits = "release"
 lto = "thin"
 codegen-units = 4
+strip = "debuginfo"
 
 # release-bare-metal: same as release-k8s; alias so Makefile targets are readable.
 [profile.release-bare-metal]

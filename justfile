@@ -83,6 +83,14 @@ build-bare-metal:
         --no-default-features --features bare-metal \
         --profile release-bare-metal
 
+# Maximum-performance release build (fat LTO + panic=abort + strip).
+# Matches what nightly and production release CI produce.
+# Expect 3-5x longer compile than build-single-node; run only when benchmarking.
+build-max:
+    {{ sccache_env }} {{ cargo }} build -p krishiv \
+        --no-default-features --features full \
+        --profile release-max
+
 # Build release binaries for Kubernetes (krishiv + krishiv-operator)
 # Uses release-k8s profile (thin LTO) to stay within CI runner RAM limits.
 # Outputs: target/{{ target }}/release-k8s/{krishiv,krishiv-operator}

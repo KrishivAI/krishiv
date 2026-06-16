@@ -15,6 +15,8 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/krishiv
   CXXFLAGS: "-include cstdint"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_DIR: /home/runner/.cache/sccache
 
 permissions:
   contents: write
@@ -88,9 +90,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            libssl-dev pkg-config cmake lld clang libclang-dev ${{ matrix.extra_sys_deps }}
+            libssl-dev pkg-config cmake mold clang libclang-dev sccache ${{ matrix.extra_sys_deps }}
       - name: Build
-        run: cargo build -p krishiv --release --features full --target ${{ matrix.target }}
+        run: cargo build -p krishiv --profile release-max --features full --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
@@ -167,11 +169,11 @@ jobs:
         include:
           - variant: k8s
             features: k8s
-            profile: release-k8s
+            profile: release-max
             tag_suffix: ""
           - variant: full
             features: full
-            profile: release-k8s
+            profile: release-max
             tag_suffix: "-full"
     steps:
       - name: Clean workspace (root-owned files)
