@@ -9,29 +9,21 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.92"
   CXXFLAGS: "-include cstdint"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_DIR: /home/runner/.cache/sccache
 
 jobs:
   bench:
     name: TPC-H / Nexmark
     runs-on: self-hosted
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-setup
         with:
-          clean: false
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: bench
-      - name: Install system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
+          cache-key: bench
       - uses: taiki-e/install-action@just
 
       - name: Restore main baseline

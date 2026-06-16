@@ -1,5 +1,10 @@
 name: Security
 
+# Deeper scheduled scans that complement the per-PR audit in ci.yml:
+#   - Trivy: filesystem CVE scan → SARIF uploaded to GitHub Security tab
+#   - Gitleaks: secret scan across full commit history
+#   - cargo audit: weekly advisory check (catches new CVEs against locked deps)
+#   - SBOM: weekly snapshot for dependency drift tracking
 on:
   push:
     branches: [main]
@@ -9,40 +14,80 @@ on:
 
 permissions:
   contents: read
-  security-events: write
-  checks: write
+  security-events: write  # SARIF upload to GitHub Security tab
+  checks: write           # audit-check annotations
 
 jobs:
-  # ── Vulnerability scan via cargo-audit (RustSec advisory DB) ────────────────
+  # ── Trivy filesystem scan → GitHub Security tab ──────────────────────────────
+  trivy:
+    name: Trivy Scan
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy (SARIF)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+  # ── Gitleaks: scan full history for accidentally committed secrets ────────────
+  secrets:
+    name: Secret Scan
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── cargo audit: weekly advisory check against locked dependency tree ─────────
   audit:
     name: Dependency Audit
     runs-on: self-hosted
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           clean: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.92"
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # ── Generate and archive CycloneDX SBOM ─────────────────────────────────────
-  sbom:
-    name: SBOM
+  # ── cargo deny: license, banned crates, duplicate versions ───────────────────
+  deny:
+    name: License & Ban Check
     runs-on: self-hosted
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           clean: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # ── SBOM: weekly snapshot for dependency drift tracking ───────────────────────
+  # Python-only — no Rust toolchain needed.
+  sbom:
+    name: SBOM Snapshot
+    runs-on: self-hosted
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
         with:
-          toolchain: "1.92"
+          clean: false
       - name: Generate SBOM
         run: python3 scripts/generate_sbom.py --output sbom-$(date +%Y%m%d).json
       - uses: actions/upload-artifact@v4
@@ -50,5 +95,3 @@ jobs:
           name: sbom-${{ github.sha }}
           path: sbom-*.json
           retention-days: 365
-
-

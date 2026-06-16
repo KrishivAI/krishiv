@@ -118,3 +118,23 @@ jobs:
         run: python3 scripts/check_markdown_links.py
       - name: Validate release metadata
         run: python3 scripts/check_release.py
+
+  # ── Security: dependency audit + license/ban check ───────────────────────────
+  # Runs on every PR so vulnerabilities are caught before merge.
+  # Deeper scans (Trivy, Gitleaks) run on a schedule in security.yml.
+  security:
+    name: Security Audit
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
+      - name: Audit dependencies (RustSec advisory DB)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check licenses, banned crates, and advisories
+        uses: EmbarkStudios/cargo-deny-action@v2
