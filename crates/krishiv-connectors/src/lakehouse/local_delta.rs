@@ -165,6 +165,127 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
     Ok(())
 }
 
+// ── TwoPhaseCommitSink ────────────────────────────────────────────────────────────────
+
+use crate::capabilities::ConnectorCapabilities;
+use crate::error::{ConnectorError, ConnectorResult};
+use crate::two_phase::TwoPhaseCommitSink;
+
+fn to_connector(e: impl std::fmt::Display) -> ConnectorError {
+    ConnectorError::Io(std::io::Error::other(e.to_string()))
+}
+
+/// Handle returned by [`LocalDeltaTwoPhaseCommitSink::prepare`].
+///
+/// The staging file lives in `<root>/.delta-stage/` until `commit` renames it
+/// into the table root and registers it in the `_delta_log`.
+#[derive(Debug, Clone)]
+pub struct DeltaStageHandle {
+    /// Checkpoint epoch this write belongs to.
+    pub epoch: u64,
+    /// Path to the `.parquet.tmp` staging file.
+    pub staging_path: PathBuf,
+}
+
+/// [`TwoPhaseCommitSink`] backed by a local Delta Lake table.
+///
+/// `prepare()` serialises the batch to a `.parquet.tmp` staging file inside
+/// `<root>/.delta-stage/`. `commit()` atomically renames the staging file into
+/// the table root and appends the corresponding `_delta_log` entry. `abort()`
+/// deletes the staging file without touching the log.
+///
+/// Both `commit()` and `abort()` are idempotent: if the staging file has
+/// already been moved or removed, the call succeeds without error.
+pub struct LocalDeltaTwoPhaseCommitSink {
+    root: PathBuf,
+    next_handle: u64,
+}
+
+impl LocalDeltaTwoPhaseCommitSink {
+    /// Create a sink targeting the Delta table rooted at `root`.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            next_handle: 0,
+        }
+    }
+
+    fn stage_dir(&self) -> PathBuf {
+        self.root.join(".delta-stage")
+    }
+}
+
+impl TwoPhaseCommitSink for LocalDeltaTwoPhaseCommitSink {
+    type Handle = DeltaStageHandle;
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new().with_two_phase_commit()
+    }
+
+    fn prepare(
+        &mut self,
+        epoch: u64,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> ConnectorResult<Self::Handle> {
+        let stage_dir = self.stage_dir();
+        fs::create_dir_all(&stage_dir).map_err(to_connector)?;
+        let handle_id = self.next_handle;
+        self.next_handle += 1;
+        let staging_path = stage_dir.join(format!("{epoch}-{handle_id}.parquet.tmp"));
+        let f = File::create(&staging_path).map_err(to_connector)?;
+        let mut writer =
+            ArrowWriter::try_new(f, batch.schema(), None).map_err(|e| to_connector(e))?;
+        writer.write(batch).map_err(|e| to_connector(e))?;
+        let f = writer.into_inner().map_err(|e| to_connector(e))?;
+        f.sync_all().map_err(to_connector)?;
+        Ok(DeltaStageHandle { epoch, staging_path })
+    }
+
+    fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+        if !handle.staging_path.exists() {
+            return Ok(());
+        }
+        let root = &self.root;
+        fs::create_dir_all(root).map_err(to_connector)?;
+        let version = next_version(root).map_err(to_connector)?;
+        let file_name = format!("part-{version:05}-stage.parquet");
+        let final_path = root.join(&file_name);
+        fs::rename(&handle.staging_path, &final_path).map_err(to_connector)?;
+        let meta = final_path.metadata().map_err(to_connector)?;
+        let log_dir = delta_log_dir(root);
+        fs::create_dir_all(&log_dir).map_err(to_connector)?;
+        let log_path = log_dir.join(format!("{version:020}.json"));
+        let tmp_log_path = log_dir.join(format!("{version:020}.json.tmp"));
+        let commit_entry =
+            json!({"commitInfo":{"operation":"WRITE","epoch":handle.epoch}});
+        let add_entry =
+            json!({"add":{"path":file_name,"size":meta.len(),"dataChange":true}});
+        {
+            let mut log = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_log_path)
+                .map_err(to_connector)?;
+            writeln!(log, "{commit_entry}").map_err(to_connector)?;
+            writeln!(log, "{add_entry}").map_err(to_connector)?;
+            log.sync_all().map_err(to_connector)?;
+        }
+        fs::rename(&tmp_log_path, &log_path).map_err(to_connector)?;
+        if let Ok(dir_file) = File::open(&log_dir) {
+            dir_file.sync_all().ok();
+        }
+        Ok(())
+    }
+
+    fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+        if handle.staging_path.exists() {
+            fs::remove_file(&handle.staging_path).map_err(to_connector)?;
+        }
+        Ok(())
+    }
+}
+
 pub fn table_schema(path: &str) -> LakehouseResult<SchemaRef> {
     let batches = read_table(path, None)?;
     Ok(batches
@@ -182,6 +303,75 @@ mod tests {
     fn batch(values: &[i64]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap()
+    }
+
+    use crate::two_phase::TwoPhaseCommitSink as _;
+
+    #[test]
+    fn delta_two_phase_prepare_commit_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let mut sink = LocalDeltaTwoPhaseCommitSink::new(dir.path());
+        let b = batch(&[10, 20, 30]);
+
+        let handle = sink.prepare(1, &b).unwrap();
+        assert!(handle.staging_path.exists(), "staging file must exist after prepare");
+
+        sink.commit(handle).unwrap();
+
+        // Staging file should be gone after commit.
+        let stage_dir = dir.path().join(".delta-stage");
+        let leftovers: Vec<_> = std::fs::read_dir(&stage_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(leftovers.is_empty(), "staging directory must be empty after commit");
+
+        // The batch must be readable through the Delta log.
+        let rows = read_table(&path, None).unwrap();
+        let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn delta_two_phase_abort_removes_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = LocalDeltaTwoPhaseCommitSink::new(dir.path());
+        let b = batch(&[1, 2]);
+        let handle = sink.prepare(2, &b).unwrap();
+        let staging = handle.staging_path.clone();
+        assert!(staging.exists());
+        sink.abort(handle).unwrap();
+        assert!(!staging.exists(), "staging file must be removed after abort");
+    }
+
+    #[test]
+    fn delta_two_phase_double_abort_is_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = LocalDeltaTwoPhaseCommitSink::new(dir.path());
+        let handle = sink.prepare(3, &batch(&[5])).unwrap();
+        sink.abort(handle.clone()).unwrap();
+        sink.abort(handle).unwrap(); // second abort must not error
+    }
+
+    #[test]
+    fn delta_two_phase_idempotent_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let mut sink = LocalDeltaTwoPhaseCommitSink::new(dir.path());
+        let handle = sink.prepare(1, &batch(&[99])).unwrap();
+        sink.commit(handle.clone()).unwrap();
+        sink.commit(handle).unwrap(); // second commit must not error
+        let rows = read_table(&path, None).unwrap();
+        let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "idempotent commit must not duplicate data");
+    }
+
+    #[test]
+    fn delta_two_phase_capabilities_include_two_phase_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = LocalDeltaTwoPhaseCommitSink::new(dir.path());
+        assert!(sink.capabilities().is_two_phase_commit_capable());
     }
 
     #[test]
