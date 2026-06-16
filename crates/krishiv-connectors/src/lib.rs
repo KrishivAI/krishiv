@@ -34,8 +34,10 @@ pub mod schema_registry;
 pub mod transactional;
 #[cfg(feature = "kafka")]
 pub mod transactional_kafka;
-#[cfg(any(feature = "kafka", feature = "state"))]
+#[cfg(feature = "two-phase")]
 pub mod two_phase_parquet_s3;
+#[cfg(feature = "kafka")]
+pub mod kafka_transactional_sink;
 
 // Module facades
 pub mod capabilities;
@@ -73,6 +75,8 @@ pub use registry::{
 pub use schema_normalize::SchemaNormalizeOperator;
 pub use sink::{AtLeastOnceSinkContract, DynSink, PostWriteOffsetCommitProtocol, Sink};
 pub use source::{CheckpointSource, DynSource, Source};
+#[cfg(feature = "kafka")]
+pub use kafka_transactional_sink::RdkafkaTransactionalSink;
 pub use two_phase::{
     EpochTransactionLog, InMemoryCommitHandle, InMemoryTwoPhaseCommitSink,
     LocalParquetTwoPhaseCommitSink, ParquetCommitHandle, TransactionalSinkParticipant,

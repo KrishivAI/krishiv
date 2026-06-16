@@ -189,6 +189,182 @@ impl PyIcebergSink {
     }
 }
 
+/// Cassandra / ScyllaDB sink — writes Arrow record batches to a Cassandra table.
+///
+/// Each batch row becomes one CQL INSERT inside an UNLOGGED BATCH.
+/// Requires the `cassandra` Cargo feature.
+#[pyclass(name = "CassandraSink")]
+pub struct PyCassandraSink {
+    node: String,
+    keyspace: String,
+    table: String,
+}
+
+#[pymethods]
+impl PyCassandraSink {
+    #[new]
+    pub fn new(node: String, keyspace: String, table: String) -> Self {
+        Self { node, keyspace, table }
+    }
+
+    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+        #[cfg(feature = "cassandra")]
+        {
+            use krishiv_common::async_util::block_on;
+            use krishiv_connectors::cassandra_sink::{CassandraConfig, CassandraSink};
+
+            let records: Vec<arrow::record_batch::RecordBatch> =
+                batches.into_iter().map(|b| b.into_inner()).collect();
+            if records.is_empty() {
+                return Ok(0);
+            }
+            let total_rows: usize = records.iter().map(|b| b.num_rows()).sum();
+            let cfg = CassandraConfig::new(&self.node, &self.keyspace, &self.table);
+            let sink = block_on(CassandraSink::connect(cfg))
+                .map_err(|e| PyRuntimeError::new_err(format!("cassandra sink init: {e}")))?;
+            block_on(async {
+                for batch in &records {
+                    sink.write_batch(batch).await?;
+                }
+                Ok::<_, krishiv_connectors::error::ConnectorError>(())
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("cassandra write: {e}")))?;
+            Ok(total_rows)
+        }
+        #[cfg(not(feature = "cassandra"))]
+        {
+            let _ = batches;
+            Err(PyRuntimeError::new_err(
+                "CassandraSink.write_batches requires the 'cassandra' feature; \
+                 rebuild with: maturin develop --features cassandra",
+            ))
+        }
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!(
+            "CassandraSink(node={:?}, keyspace={:?}, table={:?})",
+            self.node, self.keyspace, self.table
+        )
+    }
+}
+
+/// Elasticsearch / OpenSearch sink — bulk-indexes Arrow record batches as JSON documents.
+///
+/// Requires the `elasticsearch` Cargo feature.
+#[pyclass(name = "ElasticsearchSink")]
+pub struct PyElasticsearchSink {
+    url: String,
+    index: String,
+}
+
+#[pymethods]
+impl PyElasticsearchSink {
+    #[new]
+    pub fn new(url: String, index: String) -> Self {
+        Self { url, index }
+    }
+
+    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+        #[cfg(feature = "elasticsearch")]
+        {
+            use krishiv_common::async_util::block_on;
+            use krishiv_connectors::elasticsearch_sink::{ElasticsearchConfig, ElasticsearchSink};
+
+            let records: Vec<arrow::record_batch::RecordBatch> =
+                batches.into_iter().map(|b| b.into_inner()).collect();
+            if records.is_empty() {
+                return Ok(0);
+            }
+            let total_rows: usize = records.iter().map(|b| b.num_rows()).sum();
+            let cfg = ElasticsearchConfig::new(&self.url, &self.index);
+            let sink = block_on(ElasticsearchSink::connect(cfg))
+                .map_err(|e| PyRuntimeError::new_err(format!("elasticsearch sink init: {e}")))?;
+            block_on(async {
+                for batch in &records {
+                    sink.write_batch(batch).await?;
+                }
+                Ok::<_, krishiv_connectors::error::ConnectorError>(())
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("elasticsearch write: {e}")))?;
+            Ok(total_rows)
+        }
+        #[cfg(not(feature = "elasticsearch"))]
+        {
+            let _ = batches;
+            Err(PyRuntimeError::new_err(
+                "ElasticsearchSink.write_batches requires the 'elasticsearch' feature; \
+                 rebuild with: maturin develop --features elasticsearch",
+            ))
+        }
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!("ElasticsearchSink(url={:?}, index={:?})", self.url, self.index)
+    }
+}
+
+/// HBase sink — writes Arrow record batches to an HBase table via Thrift.
+///
+/// `host` is the HBase Thrift server address (e.g. `"localhost:9090"`).
+/// `column_family` is the HBase column family (e.g. `"cf"`).
+/// Requires the `hbase` Cargo feature.
+#[pyclass(name = "HBaseSink")]
+pub struct PyHBaseSink {
+    host: String,
+    table: String,
+    column_family: String,
+}
+
+#[pymethods]
+impl PyHBaseSink {
+    #[new]
+    pub fn new(host: String, table: String, column_family: String) -> Self {
+        Self { host, table, column_family }
+    }
+
+    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+        #[cfg(feature = "hbase")]
+        {
+            use krishiv_common::async_util::block_on;
+            use krishiv_connectors::hbase_connector::{HBaseConfig, HBaseSink};
+
+            let records: Vec<arrow::record_batch::RecordBatch> =
+                batches.into_iter().map(|b| b.into_inner()).collect();
+            if records.is_empty() {
+                return Ok(0);
+            }
+            let total_rows: usize = records.iter().map(|b| b.num_rows()).sum();
+            let cfg = HBaseConfig::new(&self.host, &self.table, &self.column_family);
+            let sink = block_on(HBaseSink::connect(cfg))
+                .map_err(|e| PyRuntimeError::new_err(format!("hbase sink init: {e}")))?;
+            block_on(async {
+                for batch in &records {
+                    sink.write_batch(batch).await?;
+                }
+                Ok::<_, krishiv_connectors::error::ConnectorError>(())
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("hbase write: {e}")))?;
+            Ok(total_rows)
+        }
+        #[cfg(not(feature = "hbase"))]
+        {
+            let _ = batches;
+            Err(PyRuntimeError::new_err(
+                "HBaseSink.write_batches requires the 'hbase' feature; \
+                 rebuild with: maturin develop --features hbase",
+            ))
+        }
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!(
+            "HBaseSink(host={:?}, table={:?}, column_family={:?})",
+            self.host, self.table, self.column_family
+        )
+    }
+}
+
 #[pyfunction]
 #[pyo3(name = "parquet")]
 fn sinks_parquet(path: String) -> PyParquetSink {
@@ -207,14 +383,38 @@ fn sinks_iceberg(catalog: String, table: String) -> PyIcebergSink {
     PyIcebergSink::new(catalog, table)
 }
 
+#[pyfunction]
+#[pyo3(name = "cassandra")]
+fn sinks_cassandra(node: String, keyspace: String, table: String) -> PyCassandraSink {
+    PyCassandraSink::new(node, keyspace, table)
+}
+
+#[pyfunction]
+#[pyo3(name = "elasticsearch")]
+fn sinks_elasticsearch(url: String, index: String) -> PyElasticsearchSink {
+    PyElasticsearchSink::new(url, index)
+}
+
+#[pyfunction]
+#[pyo3(name = "hbase")]
+fn sinks_hbase(host: String, table: String, column_family: String) -> PyHBaseSink {
+    PyHBaseSink::new(host, table, column_family)
+}
+
 pub fn register_sinks_module(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let sinks = PyModule::new(py, "sinks")?;
     sinks.add_class::<PyParquetSink>()?;
     sinks.add_class::<PyKafkaSink>()?;
     sinks.add_class::<PyIcebergSink>()?;
+    sinks.add_class::<PyCassandraSink>()?;
+    sinks.add_class::<PyElasticsearchSink>()?;
+    sinks.add_class::<PyHBaseSink>()?;
     sinks.add_function(wrap_pyfunction!(sinks_parquet, &sinks)?)?;
     sinks.add_function(wrap_pyfunction!(sinks_kafka, &sinks)?)?;
     sinks.add_function(wrap_pyfunction!(sinks_iceberg, &sinks)?)?;
+    sinks.add_function(wrap_pyfunction!(sinks_cassandra, &sinks)?)?;
+    sinks.add_function(wrap_pyfunction!(sinks_elasticsearch, &sinks)?)?;
+    sinks.add_function(wrap_pyfunction!(sinks_hbase, &sinks)?)?;
     parent.add_submodule(&sinks)?;
     Ok(())
 }

@@ -121,6 +121,14 @@ impl CdcToLakehousePipeline {
         iceberg_table: impl Into<String>,
         primary_key_columns: Vec<String>,
     ) -> Self {
+        #[cfg(not(feature = "state"))]
+        tracing::warn!(
+            "CdcToLakehousePipeline: the `state` feature is not enabled. \
+             Kafka offset tracking is unavailable — this pipeline will restart \
+             from the earliest available offset on crash or restart, potentially \
+             reprocessing already-committed data. Enable the `state` feature to \
+             persist offsets across restarts."
+        );
         Self {
             source_topic: source_topic.into(),
             kafka_brokers,

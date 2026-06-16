@@ -46,6 +46,18 @@ pub enum ConnectorKind {
     Delta,
     #[cfg(feature = "lakehouse")]
     Hudi,
+    #[cfg(feature = "kafka")]
+    KafkaTransactional,
+    #[cfg(feature = "kinesis")]
+    Kinesis,
+    #[cfg(feature = "pulsar-source")]
+    Pulsar,
+    #[cfg(feature = "elasticsearch")]
+    Elasticsearch,
+    #[cfg(feature = "cassandra")]
+    Cassandra,
+    #[cfg(feature = "hbase")]
+    HBase,
 }
 
 impl ConnectorKind {
@@ -86,6 +98,42 @@ impl ConnectorKind {
             "delta" => Ok(Self::Delta),
             #[cfg(feature = "lakehouse")]
             "hudi" => Ok(Self::Hudi),
+            #[cfg(feature = "kafka")]
+            "kafka-transactional" | "kafka_transactional" => Ok(Self::KafkaTransactional),
+            #[cfg(not(feature = "kafka"))]
+            "kafka-transactional" | "kafka_transactional" => Err(ConnectorError::Unsupported {
+                message: "kafka-transactional connector requires the `kafka` feature".into(),
+            }),
+            #[cfg(feature = "kinesis")]
+            "kinesis" => Ok(Self::Kinesis),
+            #[cfg(not(feature = "kinesis"))]
+            "kinesis" => Err(ConnectorError::Unsupported {
+                message: "kinesis connector requires the `kinesis` feature".into(),
+            }),
+            #[cfg(feature = "pulsar-source")]
+            "pulsar" => Ok(Self::Pulsar),
+            #[cfg(not(feature = "pulsar-source"))]
+            "pulsar" => Err(ConnectorError::Unsupported {
+                message: "pulsar connector requires the `pulsar-source` feature".into(),
+            }),
+            #[cfg(feature = "elasticsearch")]
+            "elasticsearch" | "opensearch" => Ok(Self::Elasticsearch),
+            #[cfg(not(feature = "elasticsearch"))]
+            "elasticsearch" | "opensearch" => Err(ConnectorError::Unsupported {
+                message: "elasticsearch connector requires the `elasticsearch` feature".into(),
+            }),
+            #[cfg(feature = "cassandra")]
+            "cassandra" | "scylladb" => Ok(Self::Cassandra),
+            #[cfg(not(feature = "cassandra"))]
+            "cassandra" | "scylladb" => Err(ConnectorError::Unsupported {
+                message: "cassandra connector requires the `cassandra` feature".into(),
+            }),
+            #[cfg(feature = "hbase")]
+            "hbase" => Ok(Self::HBase),
+            #[cfg(not(feature = "hbase"))]
+            "hbase" => Err(ConnectorError::Unsupported {
+                message: "hbase connector requires the `hbase` feature".into(),
+            }),
             other => Err(ConnectorError::Config {
                 message: format!("unknown connector kind '{other}'"),
             }),
@@ -113,6 +161,18 @@ impl ConnectorKind {
             Self::Qdrant => ConnectorMaturity::Experimental,
             #[cfg(all(feature = "vector-sinks", feature = "pgvector"))]
             Self::Pgvector => ConnectorMaturity::Experimental,
+            #[cfg(feature = "kafka")]
+            Self::KafkaTransactional => ConnectorMaturity::Preview,
+            #[cfg(feature = "kinesis")]
+            Self::Kinesis => ConnectorMaturity::Experimental,
+            #[cfg(feature = "pulsar-source")]
+            Self::Pulsar => ConnectorMaturity::Experimental,
+            #[cfg(feature = "elasticsearch")]
+            Self::Elasticsearch => ConnectorMaturity::Experimental,
+            #[cfg(feature = "cassandra")]
+            Self::Cassandra => ConnectorMaturity::Experimental,
+            #[cfg(feature = "hbase")]
+            Self::HBase => ConnectorMaturity::Experimental,
         }
     }
 
@@ -145,6 +205,18 @@ impl ConnectorKind {
             Self::Delta => "delta",
             #[cfg(feature = "lakehouse")]
             Self::Hudi => "hudi",
+            #[cfg(feature = "kafka")]
+            Self::KafkaTransactional => "kafka-transactional",
+            #[cfg(feature = "kinesis")]
+            Self::Kinesis => "kinesis",
+            #[cfg(feature = "pulsar-source")]
+            Self::Pulsar => "pulsar",
+            #[cfg(feature = "elasticsearch")]
+            Self::Elasticsearch => "elasticsearch",
+            #[cfg(feature = "cassandra")]
+            Self::Cassandra => "cassandra",
+            #[cfg(feature = "hbase")]
+            Self::HBase => "hbase",
         }
     }
 }

@@ -3757,3 +3757,62 @@ Client → Flight SQL (port 50051, served BY coordinator in same process)
 - `drain_continuous_stream_coordinated()` — drain results without HTTP
 
 **`crates/krishiv-scheduler/src/coordinator_daemon.rs`** — Config and si
+
+---
+
+## 2026-06-16 — Connector audit: gap fixes, new drivers, Python API expansion
+
+### Summary
+
+Comprehensive connector audit and implementation pass covering:
+- Fixed `RdkafkaTransactionalSink` (exactly-once Kafka write)
+- Added 5 new registry drivers (Kinesis, Pulsar, Elasticsearch, Cassandra, HBase)
+- Added `ConnectorKind` variants for all 6 new connectors
+- Extended Python API with Cassandra, Elasticsearch, HBase sinks
+- Extended Python `krishiv.ai` module with LanceDB, Weaviate, Pinecone, Qdrant, pgvector bindings
+- Wired Kafka schema registry decode path in `KafkaSource`
+- Fixed `two_phase_parquet_s3` feature gate (`two-phase` not `kafka|state`)
+- Added CDC pipeline warning when `state` feature absent
+
+### Fixed: `kafka_transactional_sink.rs`
+
+- Replaced `uuid::Uuid::new_v4()` (requires `iceberg` feature) with `AtomicU64` counter
+- Changed `FutureRecord` → `BaseRecord` (`ThreadedProducer::send` takes `BaseRecord`)
+- Removed extraneous `SEND_TIMEOUT` from `send()` call (not accepted by `ThreadedProducer`)
+- Removed unused `HANDLE_COUNTER` (renamed from placeholder, now used correctly)
+
+### New registry drivers
+
+- `crates/krishiv-connectors/src/registry/drivers/kinesis.rs`
+- `crates/krishiv-connectors/src/registry/drivers/pulsar.rs`
+- `crates/krishiv-connectors/src/registry/drivers/cassandra.rs`
+- `crates/krishiv-connectors/src/registry/drivers/elasticsearch.rs`
+- `crates/krishiv-connectors/src/registry/drivers/hbase.rs`
+
+### Python API additions
+
+**`crates/krishiv-python/src/sinks.rs`** — Added `PyCassandraSink`, `PyElasticsearchSink`, `PyHBaseSink`
+- Each class has `write_batches(batches: List[PyBatch]) -> int`
+- Feature-gated with friendly `RuntimeError` when feature is absent
+- Factory functions in `krishiv.sinks`: `cassandra()`, `elasticsearch()`, `hbase()`
+
+**`crates/krishiv-python/src/vector_sinks.rs`** — Added to `krishiv.ai` submodule:
+- `LanceDbSink.open(uri, table, vector_dim)` — local Parquet-backed LanceDB-compatible sink
+- `WeaviateSink(base_url, class_name, api_key=None)` — REST sink
+- `PineconeSink(host, api_key, namespace=None)` — REST sink
+- `QdrantSink.connect(url, collection, vector_size)` — behind `qdrant` feature
+- `PgvectorSink.connect(database_url, table, vector_dim)` — behind `pgvector` feature
+- All expose `upsert_batch`, `delete_by_ids`, `query_nearest`
+
+### Validation
+
+```
+cargo check -p krishiv-connectors --features kafka   # 0 errors
+cargo check -p krishiv-python                        # 0 errors (Finished dev)
+```
+
+### Next steps
+
+- `cargo test -p krishiv-connectors --features kafka --lib`
+- Integration test: spin up Kafka + transactional sink, verify commit/abort semantics
+- Python wheel build: `maturin develop --features cassandra,elasticsearch,hbase,qdrant,pgvector`

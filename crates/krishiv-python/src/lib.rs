@@ -54,7 +54,9 @@ pub use query_result::PyQueryResult;
 pub use relation::PyRelation;
 pub use schema::PySchema;
 pub use session::{PyOperationRegistry, PySession};
-pub use sinks::{PyIcebergSink, PyKafkaSink, PyParquetSink};
+pub use sinks::{
+    PyCassandraSink, PyElasticsearchSink, PyHBaseSink, PyIcebergSink, PyKafkaSink, PyParquetSink,
+};
 pub use stream::{
     PyBroadcastStream, PyConnectedStreams, PyKeyedStream, PyMultiSourceWatermarkSpec, PyStream,
     PyWindowedStream,
@@ -62,7 +64,10 @@ pub use stream::{
 pub use streaming::{PyDataStreamWriter, PyStreamingQuery, PyStreamingQueryProgress};
 pub use streaming_dataframe::{PyDataStreamReader, PyStreamingDataFrame, interval_join};
 pub use udf::call_python_udf;
-pub use vector_sinks::{PyInMemoryVectorSink, PyScoredChunk};
+pub use vector_sinks::{
+    PyInMemoryVectorSink, PyLanceDbSink, PyPgvectorSink, PyPineconeSink, PyQdrantSink,
+    PyScoredChunk, PyWeaviateSink,
+};
 pub use windows::PyWindowSpec;
 
 // ---------------------------------------------------------------------------
@@ -117,6 +122,9 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sinks::PyParquetSink>()?;
     m.add_class::<sinks::PyKafkaSink>()?;
     m.add_class::<sinks::PyIcebergSink>()?;
+    m.add_class::<sinks::PyCassandraSink>()?;
+    m.add_class::<sinks::PyElasticsearchSink>()?;
+    m.add_class::<sinks::PyHBaseSink>()?;
 
     m.add_function(wrap_pyfunction!(expression::col, m)?)?;
     m.add_function(wrap_pyfunction!(expression::lit, m)?)?;
