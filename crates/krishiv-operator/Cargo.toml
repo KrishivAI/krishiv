@@ -25,7 +25,7 @@ krishiv-state = { path = "../krishiv-state" }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
-axum = "0.8"
+axum = { workspace = true }
 krishiv-ui = { path = "../krishiv-ui", optional = true }
 kube = { workspace = true, optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }

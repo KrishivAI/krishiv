@@ -15,13 +15,13 @@ datafusion = { workspace = true }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "iceberg", "s3"] }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-plan = { path = "../krishiv-plan" }
-regex = "1"
+regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlparser = "0.61"
+sqlparser = { workspace = true }
 tracing = { workspace = true }
-url = "2"
+url = { workspace = true }
 uuid = { workspace = true }
 futures.workspace = true
 tokio.workspace = true

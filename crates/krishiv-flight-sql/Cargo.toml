@@ -18,7 +18,7 @@ krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-sql = { path = "../krishiv-sql" }
 
 dashmap = { workspace = true }
-lru = "0.12"
+lru = "0.18"
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

@@ -54,7 +54,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 arrow = { version = "58.3.0", features = ["prettyprint", "ipc_compression", "csv", "json"] }
 arrow-flight = { version = "58.3.0", features = ["flight-sql-experimental"] }
-pyo3 = { version = "0.28.3", features = ["experimental-async"] }
+pyo3 = { version = "0.29.0", features = ["experimental-async"] }
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-datafusion = "0.9.1"
@@ -72,8 +72,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
-prost = "0.14.3"
-prost-build = "0.14.3"
+prost = "0.14.4"
+prost-build = "0.14.4"
 protoc-bin-vendored = "3.2.0"
 tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1.18", features = ["net"] }
@@ -90,9 +90,9 @@ opentelemetry = { version = "0.32.0", features = ["trace"] }
 opentelemetry_sdk = { version = "0.32.0", features = ["trace"] }
 opentelemetry-stdout = { version = "0.32.0", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
-rocksdb = { version = "0.22", features = ["multi-threaded-cf"] }
+rocksdb = { version = "0.24.0", features = ["multi-threaded-cf"] }
 mockito = "1"
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls", "blocking"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "blocking"] }
 webpki-root-certs = "1.0"
 uuid = { version = "1", features = ["v4"] }
 lz4_flex = "0.11"
@@ -100,15 +100,19 @@ twox-hash = "2.1"
 zstd = "0.13"
 thiserror = "1"
 dashmap = "6.1"
-fastembed = "4.9"
 qdrant-client = "1.16"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 
+base64 = "0.22.1"
 constant_time_eq = "0.3"
 indexmap = "2"
 hex = "0.4"
 apache-avro = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
+proptest = "1"
+regex = "1"
+sqlparser = "0.62.0"
+url = "2"
 wiremock = "0.6"
 
 [workspace.lints.rust]

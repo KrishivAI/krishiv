@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 arrow = { version = "58.3.0", features = ["json"] }
-futures = "0.3.32"
+futures = "0.3"
 krishiv = { path = "../../crates/krishiv" }
 krishiv-api = { path = "../../crates/krishiv-api" }
 krishiv-sql = { path = "../../crates/krishiv-sql" }
@@ -19,7 +19,7 @@ krishiv-dataflow = { path = "../../crates/krishiv-dataflow" }
 krishiv-connectors = { path = "../../crates/krishiv-connectors", features = ["lakehouse", "delta", "hudi"] }
 krishiv-runtime = { path = "../../crates/krishiv-runtime" }
 parquet = "58.3.0"
-rdkafka = { version = "0.36", optional = false, default-features = false, features = ["tokio"] }
-serde_json = "1.0.150"
+rdkafka = { version = "0.39", optional = false, default-features = false, features = ["tokio"] }
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }

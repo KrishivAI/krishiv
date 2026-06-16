@@ -11,7 +11,7 @@ kafka = ["krishiv-connectors/kafka"]
 [dependencies]
 arrow = { workspace = true }
 axum = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 constant_time_eq = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
