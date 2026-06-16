@@ -5495,6 +5495,7 @@ dependencies = [
 name = "krishiv-dataflow"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arrow 58.3.0",
  "async-stream",
  "dashmap",
@@ -5749,6 +5750,7 @@ dependencies = [
 name = "krishiv-shuffle"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arrow 58.3.0",
  "arrow-flight",
  "async-trait",

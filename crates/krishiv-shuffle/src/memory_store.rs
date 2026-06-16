@@ -5,11 +5,12 @@ use crate::{
     error::{shuffle_read_lock, shuffle_write_lock},
     store::{LeaseMap, PartitionKey},
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use ahash::{AHashMap, AHashSet};
+use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
-/// An in-memory shuffle store backed by a `BTreeMap` under an `RwLock`.
+/// An in-memory shuffle store backed by an `AHashMap` under an `RwLock`.
 ///
 /// Used for testing and single-node deployments where shuffle data does
 /// not need to survive process restarts. When configured with
@@ -17,17 +18,17 @@ use tokio::sync::Mutex;
 /// spilled to a [`LocalDiskShuffleStore`] once the in-memory byte cap is exceeded.
 pub struct InMemoryShuffleStore {
     // key: (job_id, stage_id, partition) → latest accepted partition
-    partitions: Arc<RwLock<BTreeMap<PartitionKey, ShufflePartition>>>,
+    partitions: Arc<RwLock<AHashMap<PartitionKey, ShufflePartition>>>,
     // key: (job_id, stage_id, partition) → current assignment lease token
     lease_tokens: LeaseMap,
     max_bytes: Option<usize>,
     bytes_used: Arc<RwLock<usize>>,
     spill_store: Option<Arc<LocalDiskShuffleStore>>,
     spill_order: Arc<RwLock<VecDeque<PartitionKey>>>,
-    spilled: Arc<RwLock<BTreeSet<PartitionKey>>>,
+    spilled: Arc<RwLock<AHashSet<PartitionKey>>>,
     spill_lock: Arc<Mutex<()>>,
     // Content hashes for partition determinism verification
-    content_hashes: Arc<RwLock<BTreeMap<PartitionKey, [u8; 32]>>>,
+    content_hashes: Arc<RwLock<AHashMap<PartitionKey, [u8; 32]>>>,
 }
 
 /// Simple stable hash for partition determinism verification.
@@ -50,15 +51,15 @@ fn compute_simple_partition_hash(partition: &ShufflePartition) -> [u8; 32] {
 impl Default for InMemoryShuffleStore {
     fn default() -> Self {
         Self {
-            partitions: Arc::new(RwLock::new(BTreeMap::new())),
-            lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
+            partitions: Arc::new(RwLock::new(AHashMap::default())),
+            lease_tokens: Arc::new(RwLock::new(AHashMap::default())),
             max_bytes: None,
             bytes_used: Arc::new(RwLock::new(0)),
             spill_store: None,
             spill_order: Arc::new(RwLock::new(VecDeque::new())),
-            spilled: Arc::new(RwLock::new(BTreeSet::new())),
+            spilled: Arc::new(RwLock::new(AHashSet::default())),
             spill_lock: Arc::new(Mutex::new(())),
-            content_hashes: Arc::new(RwLock::new(BTreeMap::new())),
+            content_hashes: Arc::new(RwLock::new(AHashMap::default())),
         }
     }
 }
@@ -73,29 +74,29 @@ impl InMemoryShuffleStore {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_SHUFFLE_MEMORY_BYTES);
         Self {
-            partitions: Arc::new(RwLock::new(BTreeMap::new())),
-            lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
+            partitions: Arc::new(RwLock::new(AHashMap::default())),
+            lease_tokens: Arc::new(RwLock::new(AHashMap::default())),
             max_bytes: Some(max_bytes),
             bytes_used: Arc::new(RwLock::new(0)),
             spill_store: None,
             spill_order: Arc::new(RwLock::new(VecDeque::new())),
-            spilled: Arc::new(RwLock::new(BTreeSet::new())),
+            spilled: Arc::new(RwLock::new(AHashSet::default())),
             spill_lock: Arc::new(Mutex::new(())),
-            content_hashes: Arc::new(RwLock::new(BTreeMap::new())),
+            content_hashes: Arc::new(RwLock::new(AHashMap::default())),
         }
     }
 
     pub fn new_unbounded() -> Self {
         Self {
-            partitions: Arc::new(RwLock::new(BTreeMap::new())),
-            lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
+            partitions: Arc::new(RwLock::new(AHashMap::default())),
+            lease_tokens: Arc::new(RwLock::new(AHashMap::default())),
             max_bytes: None,
             bytes_used: Arc::new(RwLock::new(0)),
             spill_store: None,
             spill_order: Arc::new(RwLock::new(VecDeque::new())),
-            spilled: Arc::new(RwLock::new(BTreeSet::new())),
+            spilled: Arc::new(RwLock::new(AHashSet::default())),
             spill_lock: Arc::new(Mutex::new(())),
-            content_hashes: Arc::new(RwLock::new(BTreeMap::new())),
+            content_hashes: Arc::new(RwLock::new(AHashMap::default())),
         }
     }
 

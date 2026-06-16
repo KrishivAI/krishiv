@@ -205,7 +205,9 @@ pub fn partition_record_batches_by_key(
         }
 
         let key_array = batch.column(key_idx);
-        let mut row_indices: Vec<Vec<u64>> = (0..shard_count.get()).map(|_| Vec::new()).collect();
+        let hint = batch.num_rows() / shard_count.get();
+        let mut row_indices: Vec<Vec<u64>> =
+            (0..shard_count.get()).map(|_| Vec::with_capacity(hint.max(1))).collect();
         for row in 0..batch.num_rows() {
             if key_array.is_null(row) {
                 return Err(PartitionError::new(format!(

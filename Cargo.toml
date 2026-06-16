@@ -99,6 +99,7 @@ lz4_flex = "0.11"
 twox-hash = "2.1"
 zstd = "0.13"
 thiserror = "1"
+ahash = "0.8"
 dashmap = "6.1"
 qdrant-client = "1.16"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }

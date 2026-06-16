@@ -28,10 +28,11 @@ impl ShuffleStore for TieredShuffleStore {
         id: PartitionId,
         lease_token: u64,
     ) -> ShuffleResult<()> {
-        self.local
-            .register_partition_lease(id.clone(), lease_token)
-            .await?;
-        self.remote.register_partition_lease(id, lease_token).await
+        tokio::try_join!(
+            self.local.register_partition_lease(id.clone(), lease_token),
+            self.remote.register_partition_lease(id, lease_token),
+        )?;
+        Ok(())
     }
 
     async fn write_partition(
@@ -39,13 +40,11 @@ impl ShuffleStore for TieredShuffleStore {
         partition: ShufflePartition,
         lease_token: u64,
     ) -> ShuffleResult<()> {
-        // Commit local first for fast same-node reads, then synchronously commit
-        // remote before acknowledging the write. If remote fails, the caller
-        // sees an error and can retry the partition.
-        self.local
-            .write_partition(partition.clone(), lease_token)
-            .await?;
-        self.remote.write_partition(partition, lease_token).await
+        tokio::try_join!(
+            self.local.write_partition(partition.clone(), lease_token),
+            self.remote.write_partition(partition, lease_token),
+        )?;
+        Ok(())
     }
 
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {

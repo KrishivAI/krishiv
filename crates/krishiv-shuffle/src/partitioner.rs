@@ -24,7 +24,6 @@ use arrow::array::{
 use arrow::compute::take;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -106,17 +105,19 @@ impl HashPartitioner {
     /// Hash the null sentinel for integer columns and count the null.
     fn null_int_bucket(&self) -> ShuffleBucket {
         self.null_key_count.fetch_add(1, Ordering::Relaxed);
-        let mut hasher = twox_hash::XxHash64::with_seed(self.seed);
-        hasher.write(NULL_SENTINEL_INT);
-        ShuffleBucket((hasher.finish() % self.buckets as u64) as u32)
+        ShuffleBucket(
+            (twox_hash::XxHash64::oneshot(self.seed, NULL_SENTINEL_INT) % self.buckets as u64)
+                as u32,
+        )
     }
 
     /// Hash the null sentinel for string columns and count the null.
     fn null_str_bucket(&self) -> ShuffleBucket {
         self.null_key_count.fetch_add(1, Ordering::Relaxed);
-        let mut hasher = twox_hash::XxHash64::with_seed(self.seed);
-        hasher.write(NULL_SENTINEL_STR);
-        ShuffleBucket((hasher.finish() % self.buckets as u64) as u32)
+        ShuffleBucket(
+            (twox_hash::XxHash64::oneshot(self.seed, NULL_SENTINEL_STR) % self.buckets as u64)
+                as u32,
+        )
     }
 
     /// Partition `batch` into `self.buckets` sub-batches.
@@ -434,9 +435,9 @@ impl SaltedHashPartitioner {
 /// independent distributions. Pass `0` for tests or when no job context exists.
 pub fn hash_i64(value: i64, buckets: u32, seed: u64) -> ShuffleBucket {
     debug_assert!(buckets > 0);
-    let mut hasher = twox_hash::XxHash64::with_seed(seed);
-    hasher.write(&value.to_le_bytes());
-    ShuffleBucket((hasher.finish() % buckets as u64) as u32)
+    ShuffleBucket(
+        (twox_hash::XxHash64::oneshot(seed, &value.to_le_bytes()) % buckets as u64) as u32,
+    )
 }
 
 /// Hash a string value into a shuffle bucket using XxHash64 with the given seed.
@@ -445,19 +446,23 @@ pub fn hash_i64(value: i64, buckets: u32, seed: u64) -> ShuffleBucket {
 /// independent distributions. Pass `0` for tests or when no job context exists.
 pub fn hash_str(value: &str, buckets: u32, seed: u64) -> ShuffleBucket {
     debug_assert!(buckets > 0);
-    let mut hasher = twox_hash::XxHash64::with_seed(seed);
-    hasher.write(value.as_bytes());
-    ShuffleBucket((hasher.finish() % buckets as u64) as u32)
+    ShuffleBucket(
+        (twox_hash::XxHash64::oneshot(seed, value.as_bytes()) % buckets as u64) as u32,
+    )
 }
 
 fn fill_buckets<F>(
     num_rows: usize,
-    _num_partitions: u32,
+    num_partitions: u32,
     bucket_indices: &mut [Vec<u32>],
     bucket_fn: F,
 ) where
     F: Fn(usize) -> ShuffleBucket,
 {
+    let hint = num_rows / (num_partitions as usize).max(1);
+    for v in bucket_indices.iter_mut() {
+        v.reserve(hint);
+    }
     for row in 0..num_rows {
         let bucket = bucket_fn(row).0 as usize;
         bucket_indices[bucket].push(row as u32);

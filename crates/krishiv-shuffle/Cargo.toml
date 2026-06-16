@@ -26,6 +26,7 @@ thiserror = { workspace = true }
 blake3 = "1"
 constant_time_eq = { workspace = true }
 lz4_flex = { workspace = true }
+ahash = { workspace = true }
 twox-hash = { workspace = true }
 zstd = { workspace = true }
 

@@ -5,7 +5,6 @@ use crate::{
     store::LeaseMap,
 };
 use dashmap::DashMap;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -77,7 +76,7 @@ impl LocalDiskShuffleStore {
         Self::cleanup_temp_files(&base_dir)?;
         Ok(Self {
             base_dir,
-            lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
+            lease_tokens: Arc::new(RwLock::new(ahash::AHashMap::default())),
             compression: ShuffleCompression::None,
             content_hashes: Arc::new(DashMap::new()),
         })

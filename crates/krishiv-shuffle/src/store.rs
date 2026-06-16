@@ -86,7 +86,7 @@ pub type PartitionKey = (String, String, u32);
 
 /// Shared lease-token map type used by both in-memory and disk-backed stores.
 pub type LeaseMap =
-    std::sync::Arc<std::sync::RwLock<std::collections::BTreeMap<PartitionKey, u64>>>;
+    std::sync::Arc<std::sync::RwLock<ahash::AHashMap<PartitionKey, u64>>>;
 
 #[derive(Clone)]
 pub enum ShuffleBackend {

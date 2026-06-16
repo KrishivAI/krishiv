@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
+ahash = { workspace = true }
 dashmap = { workspace = true }
 smallvec = "1"
 thiserror = { workspace = true }
