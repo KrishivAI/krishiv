@@ -64,9 +64,13 @@ SQL / API / Flight
   -> Arrow/DataFusion operators, shuffle, state, checkpoint, connectors
 ```
 
-`krishiv-runtime` currently exposes a sync `ExecutionRuntime`/`ExecutionBackend`
-surface. Remote calls use explicit sync-to-async boundaries internally. Do not
-document this as fully async unless the code has actually changed. Checkpoint
+`krishiv-runtime` exposes a mixed sync/async `ExecutionRuntime` surface.  The
+primary sync methods (`collect_batch_sql`, `accept_plan`, etc.) are complemented
+by async variants (`collect_batch_sql_async`) that callers in async contexts
+should prefer.  Remote runtimes drive Flight/gRPC calls directly in the async
+variants (no blocking thread), while in-process runtimes off-load DataFusion
+work to the blocking pool via `spawn_blocking`.  The sync methods delegate to
+the async variants via `block_on` at a single sync/async seam.  Checkpoint
 storage is async-capable; scheduler gRPC checkpoint acks use the async path.
 
 `RuntimeMode` and `ExecutionPlacement` are intentionally separate. `RuntimeMode`

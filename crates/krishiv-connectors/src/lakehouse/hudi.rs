@@ -418,6 +418,79 @@ impl HudiCowWriter {
     }
 }
 
+// ── TwoPhaseCommitSink ────────────────────────────────────────────────────────────────
+
+use crate::capabilities::ConnectorCapabilities;
+use crate::error::{ConnectorError, ConnectorResult};
+use crate::two_phase::TwoPhaseCommitSink;
+
+/// Handle returned by [`HudiTwoPhaseCommitSink::prepare`].
+///
+/// Wraps the Hudi instant so `commit` can call `append_at` with the exact
+/// instant chosen at `prepare` time, preserving timeline ordering.
+#[derive(Debug, Clone)]
+pub struct HudiStageHandle {
+    /// Hudi instant string generated during `prepare`.
+    pub instant: String,
+}
+
+/// [`TwoPhaseCommitSink`] backed by a local Hudi Copy-on-Write table.
+///
+/// `prepare()` generates a Hudi instant and holds the batch in memory.
+/// `commit()` calls [`HudiCowWriter::append_at`] with the staged instant.
+/// `abort()` discards the staged batch without touching the timeline.
+///
+/// Both `commit()` and `abort()` are idempotent: if the handle is no longer
+/// in the staged map (already committed or aborted), the call is a no-op.
+pub struct HudiTwoPhaseCommitSink {
+    writer: HudiCowWriter,
+    staged: std::collections::HashMap<String, RecordBatch>,
+}
+
+impl HudiTwoPhaseCommitSink {
+    /// Open or create a Hudi CoW table at `table_path`.
+    pub fn new(table_path: impl AsRef<Path>) -> Self {
+        Self {
+            writer: HudiCowWriter::open(table_path),
+            staged: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl TwoPhaseCommitSink for HudiTwoPhaseCommitSink {
+    type Handle = HudiStageHandle;
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new().with_two_phase_commit()
+    }
+
+    fn prepare(
+        &mut self,
+        _epoch: u64,
+        batch: &RecordBatch,
+    ) -> ConnectorResult<Self::Handle> {
+        let instant = next_instant();
+        self.staged.insert(instant.clone(), batch.clone());
+        Ok(HudiStageHandle { instant })
+    }
+
+    fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+        let batch = match self.staged.remove(&handle.instant) {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        self.writer
+            .append_at(&handle.instant, batch)
+            .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(())
+    }
+
+    fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+        self.staged.remove(&handle.instant);
+        Ok(())
+    }
+}
+
 /// Append rows to a local Hudi Copy-On-Write table.
 pub fn write_hudi_cow_append(
     table_path: impl AsRef<Path>,
@@ -548,7 +621,7 @@ pub fn write_hudi_cow_fixture(
     Ok(())
 }
 
-// ── ObjectStore-backed Hudi reader/writer ────────────────────────────────────
+// ── ObjectStore-backed Hudi reader/writer ─────────────────────────────────────────
 
 /// Serialize a `RecordBatch` to Parquet bytes in memory.
 fn batch_to_parquet_bytes(batch: &RecordBatch) -> LakehouseResult<bytes::Bytes> {
@@ -1283,7 +1356,64 @@ mod tests {
         assert!(matches!(err, Err(LakehouseError::Io(_))));
     }
 
-    // ── ObjectStore-backed Hudi: round-trip tests ──────────────────────────
+    // ── HudiTwoPhaseCommitSink tests ───────────────────────────────────────────────
+
+    use crate::two_phase::TwoPhaseCommitSink as _;
+
+    #[test]
+    fn hudi_two_phase_prepare_commit_roundtrip() {
+        let dir = tempdir().unwrap();
+        let mut sink = HudiTwoPhaseCommitSink::new(dir.path());
+        let b = batch(&[(1, "a"), (2, "b")]);
+        let handle = sink.prepare(1, &b).unwrap();
+        assert!(!handle.instant.is_empty());
+        sink.commit(handle).unwrap();
+        let batches = HudiSnapshotReader::open(dir.path()).scan_batches().unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "committed rows must be readable from the Hudi table");
+    }
+
+    #[test]
+    fn hudi_two_phase_abort_leaves_table_empty() {
+        let dir = tempdir().unwrap();
+        let mut sink = HudiTwoPhaseCommitSink::new(dir.path());
+        let b = batch(&[(7, "x")]);
+        let handle = sink.prepare(1, &b).unwrap();
+        sink.abort(handle).unwrap();
+        // Table timeline has not been initialised so scan_batches returns NotFound.
+        let err = HudiSnapshotReader::open(dir.path()).scan_batches();
+        assert!(matches!(err, Err(LakehouseError::NotFound { .. })));
+    }
+
+    #[test]
+    fn hudi_two_phase_double_abort_is_safe() {
+        let dir = tempdir().unwrap();
+        let mut sink = HudiTwoPhaseCommitSink::new(dir.path());
+        let handle = sink.prepare(1, &batch(&[(3, "z")])).unwrap();
+        sink.abort(handle.clone()).unwrap();
+        sink.abort(handle).unwrap(); // must not error
+    }
+
+    #[test]
+    fn hudi_two_phase_idempotent_commit() {
+        let dir = tempdir().unwrap();
+        let mut sink = HudiTwoPhaseCommitSink::new(dir.path());
+        let handle = sink.prepare(1, &batch(&[(5, "dup")])).unwrap();
+        sink.commit(handle.clone()).unwrap();
+        sink.commit(handle).unwrap(); // second commit must be a no-op
+        let batches = HudiSnapshotReader::open(dir.path()).scan_batches().unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "idempotent commit must not duplicate data");
+    }
+
+    #[test]
+    fn hudi_two_phase_capabilities_include_two_phase_commit() {
+        let dir = tempdir().unwrap();
+        let sink = HudiTwoPhaseCommitSink::new(dir.path());
+        assert!(sink.capabilities().is_two_phase_commit_capable());
+    }
+
+    // ── ObjectStore-backed Hudi: round-trip tests ─────────────────────────────────────
 
     fn make_inmemory_store() -> Arc<dyn object_store::ObjectStore> {
         Arc::new(object_store::memory::InMemory::new())

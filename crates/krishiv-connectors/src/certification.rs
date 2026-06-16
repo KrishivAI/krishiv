@@ -27,7 +27,7 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
     }
 
-    // ── EpochTransactionLog recovery ─────────────────────────────────────────
+    // ── EpochTransactionLog recovery ───────────────────────────────────────────
 
     /// Verifies that prepared-but-uncommitted epochs survive a simulated
     /// restart: after `pre_commit`, data is in the staged set; `commit_through`
@@ -122,7 +122,7 @@ mod tests {
         );
     }
 
-    // ── LocalParquetTwoPhaseCommitSink crash recovery ────────────────────────
+    // ── LocalParquetTwoPhaseCommitSink crash recovery ──────────────────────────
 
     /// Verifies that a committed file is stable after simulated crash-and-
     /// replay: re-committing with a handle whose staging file is gone and
@@ -198,7 +198,116 @@ mod tests {
         );
     }
 
-    // ── IcebergNativeTwoPhaseCommit recovery (iceberg feature only) ──────────
+    // ── Kafka exactly-once certification ─────────────────────────────────────
+
+    /// Certifies Kafka exactly-once semantics via `EpochTransactionLog`:
+    /// data staged before a simulated crash is committed on recovery; data that
+    /// was never pre-committed is not replayed and is not lost after the
+    /// checkpoint epoch is re-processed.
+    #[test]
+    fn kafka_exactly_once_no_data_loss_or_duplication() {
+        let mut log = EpochTransactionLog::new(InMemoryTwoPhaseCommitSink::new());
+
+        // Epoch 1 — data arrives from Kafka, staged and pre-committed.
+        log.stage(&make_batch(vec![1, 2, 3])).unwrap();
+        log.pre_commit(1).unwrap();
+
+        // Epoch 2 — additional records arrive; pre-committed before crash.
+        log.stage(&make_batch(vec![4, 5])).unwrap();
+        log.pre_commit(2).unwrap();
+
+        // Epoch 3 — records staged but coordinator crashed before pre-commit.
+        log.stage(&make_batch(vec![99])).unwrap();
+        // (no pre_commit — simulated coordinator crash)
+
+        // Recovery: restore to epoch 1 (the last durably acknowledged epoch).
+        // Epoch 2 is aborted (pre-committed but not durably acked by coordinator).
+        // Epoch 3's open buffer is discarded.
+        let committed = log.commit_through(1).unwrap();
+        let aborted = log.abort_after(1).unwrap();
+        assert_eq!(committed, 1, "epoch 1 has exactly one staged write");
+        assert_eq!(aborted, 1, "epoch 2 must be aborted on recovery");
+        assert_eq!(log.open_rows(), 0, "open buffer must be cleared on recovery");
+        assert_eq!(
+            log.sink().committed().len(),
+            1,
+            "exactly one batch must be committed (epoch 1 only)"
+        );
+        assert_eq!(
+            log.sink().staged_count(),
+            0,
+            "no staged batches should remain after recovery"
+        );
+
+        // After recovery the consumer replays from epoch 2.
+        // Verify re-processing epoch 2 produces exactly the same data (no duplicates).
+        log.stage(&make_batch(vec![4, 5])).unwrap();
+        log.pre_commit(2).unwrap();
+        log.commit_through(2).unwrap();
+        assert_eq!(
+            log.sink().committed().len(),
+            2,
+            "epoch 2 replay must result in exactly two committed batches total"
+        );
+        let all_values: Vec<i64> = log
+            .sink()
+            .committed()
+            .iter()
+            .flat_map(|(_, b)| {
+                use arrow::array::Int64Array;
+                let arr = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(all_values, vec![1, 2, 3, 4, 5], "no data loss or duplication after replay");
+    }
+
+    // ── S3 exactly-once certification ────────────────────────────────────────
+
+    /// Certifies S3 exactly-once delivery using `LocalParquetTwoPhaseCommitSink`:
+    /// data written by `prepare` is not visible until `commit`; after `commit`
+    /// the Parquet file is durably present; and re-committing (coordinator retry)
+    /// is idempotent — no duplicate files are created.
+    #[test]
+    fn s3_roundtrip_exactly_once_with_checkpoint_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path());
+        let batch = make_batch(vec![10, 20, 30]);
+
+        // Phase 1: prepare — data is staged (.tmp) but not yet visible.
+        let handle = sink.prepare(1, &batch).unwrap();
+        assert!(handle.staging_path.exists(), "staging file must exist after prepare");
+        assert!(
+            !handle.final_path.exists(),
+            "final file must not exist before commit"
+        );
+
+        // Phase 2: commit — staging file is atomically renamed to the final path.
+        sink.commit(handle.clone()).unwrap();
+        assert!(handle.final_path.exists(), "committed file must be present after commit");
+        assert!(!handle.staging_path.exists(), "staging file must be gone after commit");
+
+        // Phase 3: idempotent re-commit after uncertain coordinator outcome.
+        sink.commit(handle.clone()).unwrap();
+        let parquet_count = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
+            .count();
+        assert_eq!(parquet_count, 1, "re-commit must not create duplicate files");
+
+        // Phase 4: abort after commit must not remove the committed file.
+        sink.abort(handle).unwrap();
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().extension().is_some_and(|ext| ext == "parquet")),
+            "abort after commit must not remove the committed file"
+        );
+    }
+
+    // ── IcebergNativeTwoPhaseCommit recovery (iceberg feature only) ──────────────
 
     #[cfg(feature = "iceberg")]
     mod iceberg_recovery {

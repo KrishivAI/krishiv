@@ -1650,13 +1650,12 @@ pub(crate) async fn runtime_collect_batch_sql(
     tables: &[BatchTableRegistration],
     is_streaming: bool,
 ) -> Result<Vec<RecordBatch>> {
-    let query = query.to_owned();
-    let tables = tables.to_vec();
-    tokio::task::spawn_blocking(move || runtime.collect_batch_sql(&query, &tables, is_streaming))
+    // Use the async variant: remote runtimes drive the Flight call directly
+    // without a spawn_blocking hop; in-process runtimes off-load DataFusion
+    // work to the blocking pool internally.
+    runtime
+        .collect_batch_sql_async(query, tables, is_streaming)
         .await
-        .map_err(|e| KrishivError::Runtime {
-            message: format!("runtime collect task failed: {e}"),
-        })?
         .map_err(KrishivError::from)
 }
 

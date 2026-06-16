@@ -1,5 +1,133 @@
 # Krishiv Implementation Status
 
+## 2026-06-16 — Component stabilization: connectors, metrics, gateway, chaos
+
+### Work completed
+
+**[P0] Connector trait impls — Kinesis + Pulsar (Experimental → Preview)**
+- `crates/krishiv-connectors/src/kinesis.rs`: Added `KinesisOffset` (implements
+  `Offset` encode/decode via UTF-8 sequence number), `impl Source for KinesisSource`
+  (delegates to `next_batch()`, applies deferred `AfterSequenceNumber` seek on restore),
+  `impl CheckpointSource for KinesisSource` (stores last seen sequence number per batch;
+  `restore_offset` stores a pending seek applied on next `read_batch`). 5 new tests.
+- `crates/krishiv-connectors/src/pulsar_connector.rs`: Added `batch_size` field to
+  `PulsarConfig` and `PulsarSource`; `with_batch_size` builder. `impl Source for
+  PulsarSource` delegates to `next_batch(self.batch_size)`; current_offset returns
+  `None` (Pulsar consumer position is broker-managed). 4 new tests.
+
+**[P0] Maturity promotions**
+- `crates/krishiv-connectors/src/registry/kind.rs`: Promoted Kinesis, Pulsar,
+  Elasticsearch, Cassandra, HBase from `Experimental` → `Preview`. Promoted Qdrant and
+  pgvector from `Experimental` → `Preview`. All have complete registry drivers, `Sink`
+  wrapper impls, and test coverage.
+
+**[P2] Metrics memory leak fix**
+- `crates/krishiv-metrics/src/counters.rs`: `remove_job` now clears
+  `operator_memory_bytes` entries for the completed job (was leaking per-operator
+  memory gauge entries; `source_offset_lag` and `streaming_rows` were already cleared).
+
+**[P2] SQL Gateway session pool**
+- `crates/krishiv-sql-gateway/src/session.rs`: Added `SessionPool` (bounded pool of
+  pre-warmed `GatewaySession` instances; `acquire()` returns `PooledSession` RAII guard
+  that returns the session on drop up to `capacity`). 4 new pool tests.
+- `crates/krishiv-sql-gateway/src/lib.rs`: Exports `SessionPool` and `PooledSession`.
+
+**[P3] Chaos test expansion (12 → 15 tests)**
+- `crates/krishiv-chaos/tests/chaos_suite.rs`: 3 new tests:
+  - `network_partition_drops_records_then_recovers`
+  - `oom_task_triggers_coordinator_reassignment`
+  - `multi_executor_shuffle_failure_triggers_reshuffle`
+
+### Validation
+
+```
+cargo check --workspace                                   # 0 errors
+cargo test -p krishiv-connectors --lib --features kinesis # 85/85 passed
+cargo test -p krishiv-sql-gateway                         # 6/6 passed
+cargo test -p krishiv-chaos                               # 15/15 passed
+```
+
+### Remaining stabilization work (not yet implemented)
+
+- Delta Lake / Hudi `TwoPhaseCommitSink` impl (path from Experimental → Preview)
+- Parquet/S3/CSV exactly-once certification tests (path from Preview → Certified)
+- Kafka exactly-once certification test with `InMemoryKafkaSource` replay
+- Python Kinesis/Pulsar source bindings (depends on `Source` trait impl now done)
+- K8s operator admission webhook for CRD validation
+- Prometheus histogram for query latency (currently only counters in metrics)
+
+### Next useful command
+
+```bash
+cargo test --workspace --lib --exclude krishiv-python --exclude krishiv-chaos
+```
+
+---
+
+## 2026-06-16 — Async/sync architecture audit and fix: eliminate spawn_blocking triple-hop
+
+### Audit Findings
+
+Conducted a full async/sync pattern audit across all three execution modes (embedded,
+single-node, distributed). Found **one real architectural gap**; all other patterns
+(`block_on` three-tier resolution, `spawn_blocking` for blocking I/O, `block_in_place`
+for object-store and catalog operations) were architecturally correct.
+
+### Gap: `runtime_collect_batch_sql` triple-hop (FIXED)
+
+**Root cause**: `session.py::runtime_collect_batch_sql` wrapped the sync
+`ExecutionRuntime::collect_batch_sql` in `spawn_blocking`. `RemoteExecutionRuntime`'s
+sync method then called `block_on` → `block_in_place` internally. This produced a
+redundant three-hop chain for every distributed SQL query:
+
+```
+tokio worker → spawn_blocking (blocking thread) → block_on → block_in_place → async Flight call
+```
+
+**Fix**: Added `collect_batch_sql_async` to `ExecutionRuntime` trait as a required
+boxed-future method:
+- `RemoteExecutionRuntime`: truly async (`Box::pin(async move { pool.do_action().await })`)
+  — no blocking thread, no `block_on`, no `block_in_place` for the distributed path
+- `InProcessExecutionRuntime`: proper `spawn_blocking` + Arc clone off-loads DataFusion
+  CPU work at the correct level
+- Sync `collect_batch_sql` on `RemoteExecutionRuntime` now delegates to the async
+  variant via a single `block_on` call (correct single sync/async seam for sync callers)
+- `runtime_collect_batch_sql` in `session.rs` now directly awaits `collect_batch_sql_async`
+
+### Files Changed
+
+- `crates/krishiv-runtime/src/execution_runtime.rs` — new trait method + two impls
+- `crates/krishiv-api/src/session.rs` — `runtime_collect_batch_sql` simplified
+- `docs/README.md` — updated async/sync surface description
+
+### Validation
+
+```
+cargo check -p krishiv-runtime -p krishiv-api  # 0 errors
+cargo fmt --check                               # clean
+cargo clippy -p krishiv-runtime -p krishiv-api # 0 warnings
+cargo test -p krishiv-runtime --lib            # 315/315 passed (incl. new async test)
+cargo test -p krishiv-api --lib                # 125/125 passed
+```
+
+### Patterns confirmed correct (no action needed)
+
+- `async_util::block_on` three-tier resolution (multi-thread → `block_in_place`,
+  current-thread → fallback runtime, no runtime → fallback runtime)
+- Connector `Source`/`Sink` traits are async; executor fragments always use `.await`
+- `spawn_blocking` for blocking FS/file-write I/O (Hudi, Parquet, io.rs)
+- `block_in_place` for object-store checkpoint and Iceberg catalog bridge
+- `spawn_blocking` for Python UDF execution
+- Checkpoint storage: `spawn_blocking` for all FS ops (correct per AGENTS.md rule)
+
+### Next useful command
+
+```bash
+cargo test --workspace --lib --exclude krishiv-python --exclude krishiv-chaos
+```
+
+---
+
 ## 2026-06-15 — Architectural fixes: hashing, runtimes, rate limits, tracing, SQL parsers
 
 Implemented fixes for all architectural issues identified in the codebase audit:
