@@ -158,23 +158,12 @@ jobs:
           path: dist/*.whl
           retention-days: 7
 
-  # ── 2c. Docker images (multi-platform via buildx) ────────────────────────────
+  # ── 2c. Docker image (multi-platform via buildx) ─────────────────────────────
+  # Single universal image: mode is selected at runtime via KRISHIV_MODE env var.
   docker:
-    name: Docker (${{ matrix.variant }})
+    name: Docker
     needs: validate
     runs-on: self-hosted
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: k8s
-            features: k8s
-            profile: release-max
-            tag_suffix: ""
-          - variant: full
-            features: full
-            profile: release-max
-            tag_suffix: "-full"
     steps:
       - name: Clean workspace (root-owned files)
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
@@ -193,7 +182,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          flavor: suffix=${{ matrix.tag_suffix }},onlatest=true
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -205,12 +193,12 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            FEATURES=${{ matrix.features }}
-            PROFILE=${{ matrix.profile }}
+            FEATURES=full
+            PROFILE=release-max
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=docker-${{ matrix.variant }}
-          cache-to: type=gha,scope=docker-${{ matrix.variant }},mode=max
+          cache-from: type=gha,scope=docker
+          cache-to: type=gha,scope=docker,mode=max
 
   # ── 2d. Helm chart ───────────────────────────────────────────────────────────
   helm:

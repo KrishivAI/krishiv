@@ -103,9 +103,10 @@ build-k8s:
 # ── Docker ────────────────────────────────────────────────────────────────────
 
 # Multi-stage build → tag as IMAGE → load into local k3s (default: localhost/krishiv:local)
+# Single image works for single-node, bare-metal, and k8s — mode selected at runtime via KRISHIV_MODE.
 docker-local:
     docker build \
-        --build-arg FEATURES=k8s \
+        --build-arg FEATURES=full \
         --build-arg PROFILE=release-k8s \
         -f Dockerfile.build \
         -t {{ image }} .
@@ -115,19 +116,11 @@ docker-local:
 # Multi-stage build → push to registry (set REGISTRY_IMAGE env var)
 docker-push:
     docker build \
-        --build-arg FEATURES=k8s \
+        --build-arg FEATURES=full \
         --build-arg PROFILE=release-k8s \
         -f Dockerfile.build \
         -t {{ registry_image }} .
     docker push {{ registry_image }}
-
-# Build a bare-metal image (no operator, smaller binary)
-docker-bare-metal:
-    docker build \
-        --build-arg FEATURES=bare-metal \
-        --build-arg PROFILE=release-k8s \
-        -f Dockerfile.build \
-        -t {{ image }}-bare-metal .
 
 # Copy release-k8s binaries to dist/docker/ for the staged (non-multi-stage) Dockerfile
 stage: build-k8s
@@ -345,8 +338,8 @@ publish-wheel:
 publish-docker version=env_var_or_default("VERSION", "dev"):
     docker buildx build \
         --platform linux/amd64,linux/arm64 \
-        --build-arg FEATURES=k8s \
-        --build-arg PROFILE=release-k8s \
+        --build-arg FEATURES=full \
+        --build-arg PROFILE=release-max \
         -f Dockerfile.build \
         -t {{ registry_image }}:{{ version }} \
         -t {{ registry_image }}:latest \

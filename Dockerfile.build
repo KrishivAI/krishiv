@@ -29,7 +29,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Stage 2: Builder ──────────────────────────────────────────────────────────
 FROM chef AS builder
 
-ARG FEATURES=k8s
+ARG FEATURES=full
 ARG PROFILE=release-k8s
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
