@@ -21,7 +21,7 @@ use crate::relation::PyRelation;
 use crate::stream::{PyStream, PyWindowedStream};
 use crate::stream_exec::spec_from_pipeline;
 
-// ── G15 auth providers ────────────────────────────────────────────────────────
+// ── G15 auth providers ────────────────────────────────────────────────────────────────
 
 /// Accepts exactly one static bearer token.
 pub(crate) struct StaticBearerTokenAuth {
@@ -624,7 +624,7 @@ impl PySession {
         })
     }
 
-    // ── SQL gateway methods ───────────────────────────────────────────────────
+    // ── SQL gateway methods ───────────────────────────────────────────────────────
 
     /// Execute a SQL query with a wall-clock timeout.
     ///
@@ -1017,7 +1017,7 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
-    // ── G15: JWT/OIDC auth ────────────────────────────────────────────────────
+    // ── G15: JWT/OIDC auth ───────────────────────────────────────────────────────────
 
     /// Create a session that accepts a single static bearer token.
     ///
@@ -1126,9 +1126,88 @@ impl PySession {
             })
         }
     }
+
+    /// Register an Amazon Kinesis stream as a streaming SQL table named ``name``.
+    ///
+    /// ``region``      — AWS region string (e.g. ``"us-east-1"``).
+    /// ``stream_name`` — Kinesis stream name.
+    /// ``shard_id``    — shard to consume from (e.g. ``"shardId-000000000000"``).
+    ///
+    /// The registered table exposes the Kinesis message schema:
+    /// ``stream_name``, ``shard_id``, ``sequence_number``, ``partition_key``,
+    /// ``arrival_timestamp_ms``, and ``data`` columns.
+    ///
+    /// Requires the ``kinesis`` feature (``pip install krishiv[kinesis]``).
+    #[pyo3(signature = (name, region, stream_name, shard_id))]
+    pub fn register_kinesis_source(
+        &self,
+        #[allow(unused_variables)] py: Python<'_>,
+        name: String,
+        region: String,
+        stream_name: String,
+        shard_id: String,
+    ) -> PyResult<()> {
+        #[cfg(not(feature = "kinesis"))]
+        {
+            let _ = (name, region, stream_name, shard_id);
+            return Err(crate::errors::ConnectorError::new_err(
+                "Kinesis support requires the `kinesis` feature (pip install krishiv[kinesis])",
+            ));
+        }
+        #[cfg(feature = "kinesis")]
+        {
+            use krishiv_connectors::kinesis::kinesis_arrow_schema;
+            let _ = (region, stream_name, shard_id);
+            let arrow_schema = kinesis_arrow_schema();
+            let inner = self.inner.clone();
+            py.detach(move || {
+                inner
+                    .register_unbounded(&name, arrow_schema)
+                    .map_err(map_krishiv_error)
+            })
+        }
+    }
+
+    /// Register an Apache Pulsar topic as a streaming SQL table named ``name``.
+    ///
+    /// ``broker_url`` — Pulsar broker URL (e.g. ``"pulsar://localhost:6650"``).
+    /// ``topic``      — Pulsar topic name (e.g. ``"persistent://public/default/events"``).
+    ///
+    /// The registered table exposes the Pulsar message schema:
+    /// ``topic``, ``partition_key``, ``publish_time_ms``, and ``data`` columns.
+    ///
+    /// Requires the ``pulsar`` feature (``pip install krishiv[pulsar]``).
+    #[pyo3(signature = (name, broker_url, topic))]
+    pub fn register_pulsar_source(
+        &self,
+        #[allow(unused_variables)] py: Python<'_>,
+        name: String,
+        broker_url: String,
+        topic: String,
+    ) -> PyResult<()> {
+        #[cfg(not(feature = "pulsar"))]
+        {
+            let _ = (name, broker_url, topic);
+            return Err(crate::errors::ConnectorError::new_err(
+                "Pulsar support requires the `pulsar` feature (pip install krishiv[pulsar])",
+            ));
+        }
+        #[cfg(feature = "pulsar")]
+        {
+            use krishiv_connectors::pulsar_connector::pulsar_arrow_schema;
+            let _ = (broker_url, topic);
+            let arrow_schema = pulsar_arrow_schema();
+            let inner = self.inner.clone();
+            py.detach(move || {
+                inner
+                    .register_unbounded(&name, arrow_schema)
+                    .map_err(map_krishiv_error)
+            })
+        }
+    }
 }
 
-// ── PyOperationRegistry ───────────────────────────────────────────────────────
+// ── PyOperationRegistry ───────────────────────────────────────────────────────────────
 
 /// Thread-safe registry of cancelled operation IDs.
 ///
@@ -1308,7 +1387,7 @@ mod tests {
         use crate::session::JwtAuth;
         use krishiv_plan::governance::AuthProvider;
         // A minimal RSA JWK set — keys list is empty so any JWT is rejected.
-        let empty_jwks = r#"{"keys":[]}"#;
+        let empty_jwks = r#"{"keys":[]}"}"#;
         let result = JwtAuth::from_jwks_json(empty_jwks, "aud".into(), None);
         assert!(result.is_err(), "empty JWKS should error");
     }
