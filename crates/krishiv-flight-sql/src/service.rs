@@ -41,6 +41,8 @@ const FLIGHT_MAX_CONCURRENT_QUERIES_ENV: &str = "KRISHIV_FLIGHT_MAX_CONCURRENT_Q
 const DEFAULT_FLIGHT_MAX_CONCURRENT_QUERIES: usize = 256;
 
 /// Per-subject LRU cache mapping handle → bound parameter record batches.
+type PreparedStatementCache =
+    Arc<tokio::sync::Mutex<HashMap<String, lru::LruCache<String, String>>>>;
 type BoundParamCache =
     Arc<tokio::sync::Mutex<HashMap<String, lru::LruCache<String, Vec<RecordBatch>>>>>;
 

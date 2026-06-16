@@ -100,11 +100,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: python
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Install Python
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            python3-pip python3-venv python3-dev \
+          && sudo rm -rf /var/lib/apt/lists/*
       - name: Install Python deps
-        run: pip install "maturin>=1.7,<2.0" pytest pytest-asyncio pyarrow pandas
+        run: pip3 install "maturin>=1.7,<2.0" pytest pytest-asyncio pyarrow pandas
       - name: Build and install krishiv-python
         working-directory: crates/krishiv-python
         run: maturin develop --release

@@ -7,8 +7,6 @@
 // commit(handle): commit_transaction on the producer.
 // abort(handle): abort_transaction on the producer.
 
-#![cfg(feature = "kafka")]
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
