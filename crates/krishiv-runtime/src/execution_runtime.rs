@@ -117,6 +117,22 @@ pub trait ExecutionRuntime: Send + Sync {
         is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>>;
 
+    /// Async variant of [`Self::collect_batch_sql`].
+    ///
+    /// Returns a boxed future so callers holding `Arc<dyn ExecutionRuntime>` can
+    /// await without an outer `spawn_blocking` wrapper.  In-process runtimes
+    /// off-load DataFusion work onto the blocking pool; remote runtimes produce a
+    /// genuinely async future that drives the Flight/gRPC call directly,
+    /// eliminating the extra thread hop that the sync path requires.
+    fn collect_batch_sql_async<'a>(
+        &'a self,
+        query: &'a str,
+        tables: &'a [BatchTableRegistration],
+        is_streaming: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = RuntimeResult<Vec<RecordBatch>>> + Send + 'a>,
+    >;
+
     /// Execute a batch SQL write whose result is committed through a sink
     /// output contract (Phase 2.3 distributed writes) instead of being
     /// collected back to the client.
@@ -261,6 +277,29 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
     ) -> RuntimeResult<Vec<RecordBatch>> {
         self.cluster
             .collect_batch_sql(query, &tables_to_batch_sql(tables), is_streaming)
+    }
+
+    fn collect_batch_sql_async<'a>(
+        &'a self,
+        query: &'a str,
+        tables: &'a [BatchTableRegistration],
+        is_streaming: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = RuntimeResult<Vec<RecordBatch>>> + Send + 'a>,
+    > {
+        // DataFusion execution is CPU-bound and blocking; off-load it to the
+        // blocking thread pool so we don't stall a tokio worker.  We clone the
+        // Arc (cheap) to satisfy the 'static bound required by spawn_blocking.
+        let cluster = Arc::clone(&self.cluster);
+        let query = query.to_owned();
+        let tables = tables_to_batch_sql(tables);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                cluster.collect_batch_sql(&query, &tables, is_streaming)
+            })
+            .await
+            .map_err(|e| RuntimeError::transport(format!("in-process task failed: {e}")))?
+        })
     }
 
     fn collect_batch_sql_sink(
@@ -450,23 +489,38 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         tables: &[BatchTableRegistration],
         is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>> {
+        use krishiv_common::async_util::block_on;
+        block_on(self.collect_batch_sql_async(query, tables, is_streaming))
+    }
+
+    fn collect_batch_sql_async<'a>(
+        &'a self,
+        query: &'a str,
+        tables: &'a [BatchTableRegistration],
+        is_streaming: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = RuntimeResult<Vec<RecordBatch>>> + Send + 'a>,
+    > {
         use crate::flight_action::{BatchSqlBody, KrishivFlightAction};
         use crate::flight_client::decode_ipc_response;
         use crate::flight_protocol::encode_batch_sql;
-        use krishiv_common::async_util::block_on;
-        let action = KrishivFlightAction::BatchSql(BatchSqlBody {
-            query: query.to_owned(),
-            tables: tables_to_batch_sql(tables),
-            is_streaming,
-        });
-        block_on(async {
+
+        Box::pin(async move {
+            // Build the typed action; clone tables into the action body so we
+            // still have them for the SQL-comment fallback path below.
+            let batch_tables = tables_to_batch_sql(tables);
+            let action = KrishivFlightAction::BatchSql(BatchSqlBody {
+                query: query.to_owned(),
+                tables: batch_tables.clone(),
+                is_streaming,
+            });
             match self.pool.do_action(&action).await {
                 Ok(body) => decode_ipc_response(&body),
                 Err(e) if is_server_unimplemented(&e) => {
                     if !allow_remote_sql_comment_fallback() {
                         return Err(e);
                     }
-                    let mut sql = encode_batch_sql(query, &tables_to_batch_sql(tables));
+                    let mut sql = encode_batch_sql(query, &batch_tables);
                     if is_streaming {
                         sql = format!("-- krishiv:streaming=true\n{sql}");
                     }
@@ -887,6 +941,23 @@ mod tests {
         let batches = rt.collect_batch_sql("SELECT 1 AS n", &[], false).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embedded_runtime_collect_batch_sql_async() {
+        let cluster = Arc::new(InProcessCluster::new().unwrap());
+        let rt: Arc<dyn ExecutionRuntime> = Arc::new(InProcessExecutionRuntime::embedded(cluster));
+        let batches = rt
+            .collect_batch_sql_async("SELECT 42 AS n", &[], false)
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 42);
     }
 
     #[test]
