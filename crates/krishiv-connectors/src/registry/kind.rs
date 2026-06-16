@@ -158,21 +158,21 @@ impl ConnectorKind {
                 ConnectorMaturity::Experimental
             }
             #[cfg(all(feature = "vector-sinks", feature = "qdrant"))]
-            Self::Qdrant => ConnectorMaturity::Experimental,
+            Self::Qdrant => ConnectorMaturity::Preview,
             #[cfg(all(feature = "vector-sinks", feature = "pgvector"))]
-            Self::Pgvector => ConnectorMaturity::Experimental,
+            Self::Pgvector => ConnectorMaturity::Preview,
             #[cfg(feature = "kafka")]
             Self::KafkaTransactional => ConnectorMaturity::Preview,
             #[cfg(feature = "kinesis")]
-            Self::Kinesis => ConnectorMaturity::Experimental,
+            Self::Kinesis => ConnectorMaturity::Preview,
             #[cfg(feature = "pulsar-source")]
-            Self::Pulsar => ConnectorMaturity::Experimental,
+            Self::Pulsar => ConnectorMaturity::Preview,
             #[cfg(feature = "elasticsearch")]
-            Self::Elasticsearch => ConnectorMaturity::Experimental,
+            Self::Elasticsearch => ConnectorMaturity::Preview,
             #[cfg(feature = "cassandra")]
-            Self::Cassandra => ConnectorMaturity::Experimental,
+            Self::Cassandra => ConnectorMaturity::Preview,
             #[cfg(feature = "hbase")]
-            Self::HBase => ConnectorMaturity::Experimental,
+            Self::HBase => ConnectorMaturity::Preview,
         }
     }
 

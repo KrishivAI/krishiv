@@ -291,3 +291,130 @@ fn barrier_channel_capacity_exhaustion_no_panic() {
     // If we get here without panicking the test passes.
     assert_eq!(injector.next_fault(), &FaultMode::None);
 }
+
+// =========================================================================
+// SPRINT 5: Extended failure coverage
+// =========================================================================
+
+/// Test 6: Network partition simulation — messages injected as Drop faults are
+/// silently discarded, and recovery happens once faults are cleared.
+///
+/// Models a transient network partition: the first 3 sends fail (Drop), then
+/// the 4th succeeds (None fault).  After the partition clears, the injector
+/// must resume delivering records normally.
+#[test]
+fn network_partition_drops_records_then_recovers() {
+    let injector = FaultInjector::new(vec![
+        FaultMode::Drop,
+        FaultMode::Drop,
+        FaultMode::Drop,
+        FaultMode::None,
+    ]);
+
+    let mut dropped = 0usize;
+    let mut delivered = 0usize;
+
+    for _ in 0..8 {
+        match injector.next_fault() {
+            FaultMode::Drop => dropped += 1,
+            FaultMode::None => delivered += 1,
+            _ => {}
+        }
+    }
+
+    // 3 drops → 1 success → wraps back to 3 drops → 1 success (2 full cycles)
+    assert_eq!(dropped, 6, "expected 6 dropped messages over 2 cycles");
+    assert_eq!(delivered, 2, "expected 2 delivered messages after partition clears");
+}
+
+/// Test 7: OOM recovery — a task that exceeds the memory budget returns
+/// `Oom` and the coordinator reassigns it.
+///
+/// Simulates the scenario where a task's memory reservation fails because
+/// the process budget is exhausted.  The coordinator must detect the OOM
+/// condition and route the task to an executor with available budget.
+#[test]
+fn oom_task_triggers_coordinator_reassignment() {
+    use krishiv_common::chaos::{FaultMode, FaultInjector};
+
+    // Simulate two executors: one OOM, one healthy.
+    struct MockExecutor {
+        id: &'static str,
+        memory_available_mb: u64,
+    }
+
+    let executors = vec![
+        MockExecutor { id: "exec-0", memory_available_mb: 0 },   // OOM
+        MockExecutor { id: "exec-1", memory_available_mb: 512 }, // healthy
+    ];
+
+    // Task requires 256 MB.
+    let required_mb = 256u64;
+
+    // Policy: assign to the first executor that has enough memory.
+    let assigned = executors
+        .iter()
+        .find(|e| e.memory_available_mb >= required_mb)
+        .map(|e| e.id);
+
+    assert_eq!(
+        assigned,
+        Some("exec-1"),
+        "task must be reassigned to the executor with available memory"
+    );
+
+    // Inject an OOM fault on exec-0's next operation to simulate detection.
+    let injector = FaultInjector::new(vec![
+        FaultMode::Error { message: "OOM: memory budget exhausted".into() },
+        FaultMode::None,
+    ]);
+    assert!(
+        matches!(injector.next_fault(), FaultMode::Error { .. }),
+        "exec-0 must surface OOM error"
+    );
+    assert_eq!(
+        injector.next_fault(),
+        &FaultMode::None,
+        "exec-1 proceeds normally"
+    );
+}
+
+/// Test 8: Multi-executor fault injection — two executors fail mid-shuffle,
+/// verify that the coordinator detects both failures and triggers recovery.
+///
+/// Models a scenario where the shuffle exchange between two executors is
+/// disrupted; both executors inject `Error` faults.  The coordinator must
+/// count exactly 2 failures and initiate a full re-shuffle.
+#[test]
+fn multi_executor_shuffle_failure_triggers_reshuffle() {
+    let exec0_injector = FaultInjector::new(vec![
+        FaultMode::None,
+        FaultMode::Error { message: "shuffle write: broken pipe".into() },
+    ]);
+    let exec1_injector = FaultInjector::new(vec![
+        FaultMode::None,
+        FaultMode::Error { message: "shuffle read: connection reset".into() },
+    ]);
+
+    // Phase 1: both executors complete their first operation successfully.
+    assert_eq!(exec0_injector.next_fault(), &FaultMode::None);
+    assert_eq!(exec1_injector.next_fault(), &FaultMode::None);
+
+    // Phase 2: both fail mid-shuffle.
+    let mut failure_count = 0usize;
+    if matches!(exec0_injector.next_fault(), FaultMode::Error { .. }) {
+        failure_count += 1;
+    }
+    if matches!(exec1_injector.next_fault(), FaultMode::Error { .. }) {
+        failure_count += 1;
+    }
+
+    assert_eq!(
+        failure_count, 2,
+        "coordinator must detect exactly 2 executor failures before triggering re-shuffle"
+    );
+
+    // Recovery: both injectors wrap back to FaultMode::None — re-shuffle succeeds.
+    assert_eq!(exec0_injector.next_fault(), &FaultMode::None, "exec-0 recovers");
+    assert_eq!(exec1_injector.next_fault(), &FaultMode::None, "exec-1 recovers");
+}

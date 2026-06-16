@@ -30,6 +30,7 @@
 //! # }
 //! ```
 
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{BinaryBuilder, Int64Builder, StringBuilder};
@@ -40,6 +41,7 @@ use pulsar::{Consumer, DeserializeMessage, Payload, Pulsar, SubType, TokioExecut
 
 use crate::capabilities::ConnectorCapabilities;
 use crate::error::{ConnectorError, ConnectorResult};
+use crate::source::Source;
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -80,6 +82,8 @@ pub struct PulsarConfig {
     pub subscription: String,
     /// Subscription type (default: `Exclusive`).
     pub sub_type: SubType,
+    /// Maximum messages per `read_batch` call (default: 500).
+    pub batch_size: usize,
 }
 
 impl PulsarConfig {
@@ -90,6 +94,7 @@ impl PulsarConfig {
             topic: topic.into(),
             subscription: "krishiv-default".into(),
             sub_type: SubType::Exclusive,
+            batch_size: 500,
         }
     }
 
@@ -100,6 +105,11 @@ impl PulsarConfig {
 
     pub fn with_sub_type(mut self, st: SubType) -> Self {
         self.sub_type = st;
+        self
+    }
+
+    pub fn with_batch_size(mut self, n: usize) -> Self {
+        self.batch_size = n.max(1);
         self
     }
 }
@@ -116,6 +126,7 @@ impl PulsarConfig {
 pub struct PulsarSource {
     consumer: Consumer<RawBytes, TokioExecutor>,
     schema: SchemaRef,
+    batch_size: usize,
 }
 
 impl PulsarSource {
@@ -138,6 +149,7 @@ impl PulsarSource {
         Ok(Self {
             consumer,
             schema: pulsar_arrow_schema(),
+            batch_size: config.batch_size,
         })
     }
 
@@ -200,6 +212,24 @@ impl PulsarSource {
     /// Connector capabilities: unbounded streaming source.
     pub fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities::default().with_unbounded()
+    }
+}
+
+// ── Source trait impl ─────────────────────────────────────────────────────────
+
+impl Source for PulsarSource {
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new().with_unbounded().with_checkpoint()
+    }
+
+    async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+        self.next_batch(self.batch_size).await
+    }
+
+    fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+        // Pulsar consumer position is broker-managed via subscription.
+        // Offsets are implicitly committed on ack; no client-side cursor needed.
+        None
     }
 }
 
@@ -345,5 +375,26 @@ mod tests {
     fn capabilities_unbounded() {
         let caps = ConnectorCapabilities::default().with_unbounded();
         assert!(!caps.is_bounded());
+    }
+
+    #[test]
+    fn source_capabilities_include_checkpoint() {
+        let caps = ConnectorCapabilities::new().with_unbounded().with_checkpoint();
+        assert!(caps.is_checkpoint_capable());
+        assert!(!caps.is_bounded());
+    }
+
+    #[test]
+    fn config_with_batch_size() {
+        let cfg = PulsarConfig::new("pulsar://localhost:6650", "topic")
+            .with_batch_size(200);
+        assert_eq!(cfg.batch_size, 200);
+    }
+
+    #[test]
+    fn config_batch_size_clamped_to_minimum_one() {
+        let cfg = PulsarConfig::new("pulsar://localhost:6650", "topic")
+            .with_batch_size(0);
+        assert_eq!(cfg.batch_size, 1);
     }
 }

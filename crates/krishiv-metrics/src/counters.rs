@@ -437,6 +437,8 @@ impl KrishivMetrics {
         self.source_offset_lag
             .retain(|k, _| !k.starts_with(&prefix));
         self.streaming_rows.retain(|k, _| !k.starts_with(&prefix));
+        self.operator_memory_bytes
+            .retain(|k, _| !k.starts_with(&prefix));
     }
 
     // ── Duration observation histograms ────────────────────────────────────
