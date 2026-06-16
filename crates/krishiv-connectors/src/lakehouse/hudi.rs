@@ -342,18 +342,19 @@ impl HudiCowWriter {
             .table_path
             .join(".hoodie/timeline")
             .join(format!("{instant}.commit"));
-        if timeline_marker.exists() {
-            return Err(LakehouseError::Concurrency {
-                message: format!("Hudi instant '{instant}' already exists"),
-            });
-        }
+        // C5: use atomic create_new to eliminate the TOCTOU race between exists()
+        // check and file creation that could allow two concurrent writers for the
+        // same instant to both proceed.
         let commit_dir = self.table_path.join(instant);
-        if commit_dir.exists() {
-            return Err(LakehouseError::Concurrency {
-                message: format!("Hudi commit directory already exists for instant '{instant}'"),
-            });
+        match fs::create_dir(&commit_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(LakehouseError::Concurrency {
+                    message: format!("Hudi commit directory already exists for instant '{instant}'"),
+                });
+            }
+            Err(e) => return Err(LakehouseError::Io(e.to_string())),
         }
-        fs::create_dir_all(&commit_dir).map_err(|e| LakehouseError::Io(e.to_string()))?;
 
         let change_rel = format!("{instant}/changes-0.parquet");
         let base_rel = base_batch
@@ -381,12 +382,21 @@ impl HudiCowWriter {
         // Hudi would interpret as a failed/aborted commit. fsync the marker
         // (and on Unix, the parent directory entry) to make the commit
         // atomic and crash-safe.
+        // C5: create_new=true atomically rejects duplicate commits without a
+        // TOCTOU window, replacing the removed exists() check above.
         let marker_file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&timeline_marker)
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    LakehouseError::Concurrency {
+                        message: format!("Hudi instant '{instant}' already exists"),
+                    }
+                } else {
+                    LakehouseError::Io(e.to_string())
+                }
+            })?;
         marker_file
             .sync_all()
             .map_err(|e| LakehouseError::Io(e.to_string()))?;

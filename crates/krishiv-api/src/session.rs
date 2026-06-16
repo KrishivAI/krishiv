@@ -733,10 +733,13 @@ impl Session {
 
     /// Known local jobs.
     pub fn jobs(&self) -> Vec<JobStatus> {
-        self.jobs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .snapshot()
+        match self.jobs.lock() {
+            Ok(guard) => guard.snapshot(),
+            Err(e) => {
+                tracing::warn!("job registry lock poisoned: {e}; returning empty job list");
+                e.into_inner().snapshot()
+            }
+        }
     }
 
     /// Optional control-plane gRPC endpoint associated with this session.
@@ -827,13 +830,19 @@ impl Session {
 
     /// Names of scalar UDFs registered on this session.
     pub fn scalar_udf_names(&self) -> Vec<String> {
-        self.udf_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .scalar_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        match self.udf_registry.read() {
+            Ok(guard) => guard.scalar_names().into_iter().map(str::to_owned).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    "UDF registry lock poisoned: {e}; returning empty scalar UDF list"
+                );
+                e.into_inner()
+                    .scalar_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            }
+        }
     }
 
     /// Register an aggregate UDAF on this session.
@@ -857,13 +866,21 @@ impl Session {
 
     /// Names of aggregate UDAFs registered on this session.
     pub fn aggregate_udf_names(&self) -> Vec<String> {
-        self.udf_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .aggregate_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        match self.udf_registry.read() {
+            Ok(guard) => {
+                guard.aggregate_names().into_iter().map(str::to_owned).collect()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "UDF registry lock poisoned: {e}; returning empty aggregate UDF list"
+                );
+                e.into_inner()
+                    .aggregate_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            }
+        }
     }
 
     /// Register a table UDTF on this session.
@@ -1219,6 +1236,17 @@ impl Session {
             ));
         }
         let query = query.as_ref();
+        if let Some(policy) = &self.policy {
+            if let Ok(tables) = krishiv_sql::referenced_table_names(query) {
+                for table in &tables {
+                    if !policy.check_table_access(table) {
+                        return Err(KrishivError::AccessDenied {
+                            reason: format!("access denied to table: {table}"),
+                        });
+                    }
+                }
+            }
+        }
         let tables = self
             .registered_parquet
             .iter()

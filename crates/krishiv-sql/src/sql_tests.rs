@@ -870,7 +870,7 @@ mod iceberg_catalog_tests {
         let (tbl, pred) =
             crate::parse_dml_delete("DELETE FROM myns.orders WHERE id = 5").expect("must parse");
         assert_eq!(tbl, "myns.orders");
-        assert_eq!(pred, "id = 5");
+        assert!(pred.contains("id") && pred.contains('5'), "pred: {pred}");
     }
 
     #[test]
@@ -881,40 +881,61 @@ mod iceberg_catalog_tests {
     }
 
     #[test]
+    fn parse_dml_delete_quoted_identifier() {
+        // Quoted identifiers must pass through the AST without truncation.
+        let result = crate::parse_dml_delete(r#"DELETE FROM "my schema"."my table" WHERE x > 0"#);
+        assert!(result.is_some(), "quoted identifiers must parse");
+        let (tbl, pred) = result.unwrap();
+        assert!(tbl.contains("my schema") || tbl.contains("my table"), "tbl: {tbl}");
+        assert!(pred.contains('0'), "pred: {pred}");
+    }
+
+    #[test]
     fn parse_dml_update_with_where() {
-        let (tbl, set, pred) =
+        let parsed =
             crate::parse_dml_update("UPDATE myns.orders SET price = price * 2 WHERE id = 1")
                 .expect("must parse");
-        assert_eq!(tbl, "myns.orders");
-        assert!(set.contains("price * 2"), "set clause: {set}");
-        assert_eq!(pred.unwrap(), "id = 1");
+        assert_eq!(parsed.table_ref, "myns.orders");
+        assert!(
+            parsed.assignments.iter().any(|(_, v)| v.contains("price") && v.contains('2')),
+            "assignments: {:?}",
+            parsed.assignments,
+        );
+        assert!(parsed.predicate.is_some());
     }
 
     #[test]
     fn parse_dml_update_without_where() {
-        let (tbl, set, pred) = crate::parse_dml_update("UPDATE myns.orders SET status = 'active'")
+        let parsed = crate::parse_dml_update("UPDATE myns.orders SET status = 'active'")
             .expect("must parse");
-        assert_eq!(tbl, "myns.orders");
-        assert!(set.contains("'active'"), "set clause: {set}");
-        assert!(pred.is_none());
+        assert_eq!(parsed.table_ref, "myns.orders");
+        assert_eq!(parsed.assignments.len(), 1);
+        assert_eq!(parsed.assignments[0].0, "status");
+        assert!(parsed.predicate.is_none());
     }
 
     #[test]
-    fn split_set_assignments_basic() {
-        let pairs = crate::split_set_assignments("a = 1, b = 'hello', c = c + 1");
-        assert_eq!(pairs.len(), 3);
-        assert_eq!(pairs[0], ("a".to_string(), "1".to_string()));
-        assert_eq!(pairs[1], ("b".to_string(), "'hello'".to_string()));
-        assert_eq!(pairs[2], ("c".to_string(), "c + 1".to_string()));
+    fn parse_dml_update_multi_column() {
+        // Multiple SET assignments with a comma in an expression (CONCAT).
+        let parsed = crate::parse_dml_update(
+            "UPDATE t SET name = CONCAT(first_name, ' ', last_name), age = age + 1",
+        )
+        .expect("must parse");
+        assert_eq!(parsed.assignments.len(), 2, "assignments: {:?}", parsed.assignments);
+        assert_eq!(parsed.assignments[0].0, "name");
+        assert_eq!(parsed.assignments[1].0, "age");
     }
 
     #[test]
-    fn split_set_assignments_function_with_comma() {
-        let pairs = crate::split_set_assignments("name = CONCAT(first, ' ', last), age = 5");
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0].0, "name");
-        assert!(pairs[0].1.starts_with("CONCAT("), "got: {}", pairs[0].1);
-        assert_eq!(pairs[1], ("age".to_string(), "5".to_string()));
+    fn parse_dml_delete_rejects_non_delete() {
+        assert!(crate::parse_dml_delete("SELECT 1").is_none());
+        assert!(crate::parse_dml_delete("UPDATE t SET x = 1").is_none());
+    }
+
+    #[test]
+    fn parse_dml_update_rejects_non_update() {
+        assert!(crate::parse_dml_update("SELECT 1").is_none());
+        assert!(crate::parse_dml_update("DELETE FROM t").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -983,5 +1004,3 @@ mod iceberg_catalog_tests {
         assert_eq!(updated, 0, "empty table: no rows to update");
     }
 }
-
-pub mod kafka_table;

@@ -214,6 +214,8 @@ fn execute_cep_fragment(
 
     let mut matcher = PartitionedCepMatcher::<String>::new(spec.pattern);
     let mut matched_batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+    // H2: track max event time seen so the output carries a watermark.
+    let mut max_event_time_ms: i64 = i64::MIN;
 
     for batch in &input_batches {
         let schema = batch.schema();
@@ -281,6 +283,10 @@ fn execute_cep_fragment(
             let event_time_ms = time_col.value(row);
             let stage_name = stage_col.value(row).to_owned();
 
+            if event_time_ms > max_event_time_ms {
+                max_event_time_ms = event_time_ms;
+            }
+
             let row_batch = batch.slice(row, 1);
             let matches = matcher.process_event(key, &stage_name, row_batch, event_time_ms);
 
@@ -313,12 +319,17 @@ fn execute_cep_fragment(
         total_rows as u64,
     );
 
-    Ok(ExecutorTaskOutput::streaming_window(
+    let mut output = ExecutorTaskOutput::streaming_window(
         total_rows,
         total_batches,
         column_count,
         matched_batches,
-    ))
+    );
+    // H2: propagate watermark so coordinator can advance global low-watermark.
+    if max_event_time_ms > i64::MIN {
+        output = output.with_watermark_ms(max_event_time_ms);
+    }
+    Ok(output)
 }
 
 /// Execute a `stream:loop:` fragment using `ContinuousWindowExecutor` (GAP-6).
@@ -431,7 +442,7 @@ fn execute_loop_fragment(
     };
 
     // Process through the stateful window executor.
-    let output_batches = {
+    let (output_batches, loop_watermark_ms) = {
         let mut exec = executor_arc
             .lock()
             .map_err(|_| ExecutorError::LocalExecution {
@@ -440,10 +451,13 @@ fn execute_loop_fragment(
                      window state is inconsistent — restart the job",
                 ),
             })?;
-        exec.drain(input_batches)
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: format!("stream:loop drain error: {e}"),
-            })?
+        let batches = exec.drain(input_batches).map_err(|e| ExecutorError::LocalExecution {
+            message: format!("stream:loop drain error: {e}"),
+        })?;
+        // H2: propagate watermark so the coordinator can advance the global
+        // streaming watermark and trigger late-data handling downstream.
+        let wm = exec.last_watermark_ms();
+        (batches, wm)
     };
 
     let total_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
@@ -468,6 +482,9 @@ fn execute_loop_fragment(
         output_batches,
     );
     output.hot_key_reports = hot_key_reports;
+    if loop_watermark_ms > i64::MIN {
+        output = output.with_watermark_ms(loop_watermark_ms);
+    }
     Ok(output)
 }
 

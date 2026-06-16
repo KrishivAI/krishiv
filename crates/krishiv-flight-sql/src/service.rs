@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -33,65 +33,105 @@ use crate::actions::{
 };
 use crate::host::FlightExecutionHost;
 
+/// Env var controlling how many queries may execute concurrently through the
+/// Flight SQL ingress. Requests above the limit receive `Status::resource_exhausted`.
+/// Default: 256.  Set to `"0"` to disable the cap entirely.
+const FLIGHT_MAX_CONCURRENT_QUERIES_ENV: &str = "KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES";
+/// Default cap on simultaneous Flight SQL query executions.
+const DEFAULT_FLIGHT_MAX_CONCURRENT_QUERIES: usize = 256;
+
 /// **Beta API**: may change between minor releases.
 #[derive(Clone)]
 pub struct KrishivFlightSqlService {
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
     host: FlightExecutionHost,
-    /// LRU cache of opaque handle (UUID string) → SQL text for prepared statements.
-    prepared_statements: Arc<tokio::sync::Mutex<lru::LruCache<String, String>>>,
-    /// LRU cache of handle → bound parameter record batches (set via DoPut).
-    bound_params: Arc<tokio::sync::Mutex<lru::LruCache<String, Vec<RecordBatch>>>>,
-    /// Active Flight SQL transaction ids issued by `BeginTransaction`.
-    transactions: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Per-subject LRU caches of opaque handle (UUID string) → SQL text for prepared statements.
+    prepared_statements: Arc<tokio::sync::Mutex<HashMap<String, lru::LruCache<String, String>>>>,
+    /// Per-subject LRU caches of handle → bound parameter record batches (set via DoPut).
+    bound_params: Arc<tokio::sync::Mutex<HashMap<String, lru::LruCache<String, Vec<RecordBatch>>>>>,
+    /// Active Flight SQL transaction ids issued by `BeginTransaction`. Maps txn_id -> subject.
+    transactions: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    /// Semaphore that caps the number of queries executing concurrently through
+    /// the Flight ingress. `None` means no cap.
+    inflight_queries: Option<Arc<tokio::sync::Semaphore>>,
 }
 
-const PREPARED_STMT_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(128) {
-    Some(n) => n,
-    None => panic!("capacity must be non-zero"),
-};
+const FLIGHT_PREPARED_STMT_CAPACITY_ENV: &str = "KRISHIV_FLIGHT_PREPARED_STMT_CAPACITY";
+const DEFAULT_PREPARED_STMT_CAPACITY: usize = 128;
+
+fn read_prepared_stmt_capacity() -> std::num::NonZeroUsize {
+    let n = std::env::var(FLIGHT_PREPARED_STMT_CAPACITY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PREPARED_STMT_CAPACITY);
+    std::num::NonZeroUsize::new(n.max(1)).unwrap()
+}
+
+fn read_max_concurrent_queries() -> Option<usize> {
+    let n = std::env::var(FLIGHT_MAX_CONCURRENT_QUERIES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FLIGHT_MAX_CONCURRENT_QUERIES);
+    if n == 0 { None } else { Some(n) }
+}
 
 impl std::fmt::Debug for KrishivFlightSqlService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KrishivFlightSqlService")
             .field("auth", &self.auth.is_some())
             .field("policy", &self.policy.is_some())
+            .field(
+                "max_concurrent_queries",
+                &self
+                    .inflight_queries
+                    .as_ref()
+                    .map(|s| s.available_permits()),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl KrishivFlightSqlService {
     /// Create a new `KrishivFlightSqlService` with a shared server-side cluster.
+    ///
+    /// The concurrent-query cap is read from `KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES`
+    /// (default 256; set to `"0"` to disable).
     pub fn new() -> Result<Self, Status> {
+        let limit = read_max_concurrent_queries();
         Ok(Self {
             auth: None,
             policy: None,
             host: FlightExecutionHost::from_env()?,
-            prepared_statements: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
-                PREPARED_STMT_CAPACITY,
-            ))),
-            bound_params: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
-                PREPARED_STMT_CAPACITY,
-            ))),
-            transactions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            prepared_statements: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            bound_params: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            transactions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
         })
     }
 
     /// Attach a pre-built execution host (tests / custom wiring).
     pub fn with_host(host: FlightExecutionHost) -> Self {
+        let limit = read_max_concurrent_queries();
         Self {
             auth: None,
             policy: None,
             host,
-            prepared_statements: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
-                PREPARED_STMT_CAPACITY,
-            ))),
-            bound_params: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
-                PREPARED_STMT_CAPACITY,
-            ))),
-            transactions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            prepared_statements: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            bound_params: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            transactions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
         }
+    }
+
+    /// Override the concurrent-query cap programmatically. `0` disables the cap.
+    pub fn with_max_concurrent_queries(mut self, n: usize) -> Self {
+        self.inflight_queries = if n == 0 {
+            None
+        } else {
+            Some(Arc::new(tokio::sync::Semaphore::new(n)))
+        };
+        self
     }
 
     /// Attach an [`AuthProvider`] to this service.
@@ -173,19 +213,25 @@ impl KrishivFlightSqlService {
         Ok(())
     }
 
-    async fn validate_transaction_id(&self, transaction_id: Option<&[u8]>) -> Result<(), Status> {
+    async fn validate_transaction_id(
+        &self,
+        transaction_id: Option<&[u8]>,
+        subject: Option<&str>,
+    ) -> Result<(), Status> {
         let Some(bytes) = transaction_id.filter(|id| !id.is_empty()) else {
             return Ok(());
         };
         let id = std::str::from_utf8(bytes)
             .map_err(|_| Status::invalid_argument("invalid transaction id encoding"))?;
         let transactions = self.transactions.lock().await;
-        if transactions.contains(id) {
-            Ok(())
-        } else {
-            Err(Status::invalid_argument(format!(
+        match transactions.get(id) {
+            Some(owner) if subject.map_or(true, |s| s == owner) => Ok(()),
+            Some(_) => Err(Status::permission_denied(format!(
+                "transaction id {id} does not belong to this subject"
+            ))),
+            None => Err(Status::invalid_argument(format!(
                 "unknown transaction id: {id}"
-            )))
+            ))),
         }
     }
 }
@@ -248,8 +294,8 @@ impl FlightSqlService for KrishivFlightSqlService {
         }
 
         // Authenticate if an auth provider is configured.
-        self.authenticate_request(&request)?;
-        self.validate_transaction_id(query.transaction_id.as_deref())
+        let subject = self.authenticate_request(&request)?;
+        self.validate_transaction_id(query.transaction_id.as_deref(), subject.as_deref())
             .await?;
 
         let ticket_query = TicketStatementQuery {
@@ -290,11 +336,29 @@ impl FlightSqlService for KrishivFlightSqlService {
         // Check table access if a policy is configured.
         self.check_table_access(query)?;
 
-        let batches = self
-            .host
-            .execute_sql(query)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // Acquire a concurrent-query slot. Returns immediately if no cap is set;
+        // returns resource_exhausted when the semaphore is saturated.
+        // The permit is held only for the duration of execute_sql, then dropped.
+        let batches = {
+            let _permit = if let Some(sem) = &self.inflight_queries {
+                match sem.try_acquire() {
+                    Ok(p) => Some(p),
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        return Err(Status::resource_exhausted(
+                            "too many concurrent Flight SQL queries; retry later",
+                        ));
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => None,
+                }
+            } else {
+                None
+            };
+            self.host
+                .execute_sql(query)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+            // _permit drops here
+        };
 
         let schema: Arc<Schema> = if batches.is_empty() {
             Arc::new(Schema::empty())
@@ -328,15 +392,19 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: ActionCreatePreparedStatementRequest,
         request: Request<arrow_flight::Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
-        self.authenticate_request(&request)?;
+        let subject = self.authenticate_request(&request)?;
+        let subject_key = subject.as_deref().unwrap_or("__anon__").to_owned();
         let handle = Uuid::new_v4().to_string();
         let n_params = count_sql_params(&query.query);
         let param_schema = build_param_schema(n_params);
         let parameter_schema = schema_to_ipc_bytes(&param_schema)?;
-        self.prepared_statements
-            .lock()
-            .await
-            .put(handle.clone(), query.query);
+        {
+            let mut map = self.prepared_statements.lock().await;
+            let cache = map
+                .entry(subject_key)
+                .or_insert_with(|| lru::LruCache::new(read_prepared_stmt_capacity()));
+            cache.put(handle.clone(), query.query);
+        }
         Ok(ActionCreatePreparedStatementResult {
             prepared_statement_handle: handle.into_bytes().into(),
             parameter_schema: parameter_schema.into(),
@@ -353,6 +421,11 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandPreparedStatementQuery,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<DoPutPreparedStatementResult, Status> {
+        let subject = {
+            let meta_req: &Request<_> = &request;
+            self.authenticate_request(meta_req)?
+        };
+        let subject_key = subject.as_deref().unwrap_or("__anon__").to_owned();
         let handle = std::str::from_utf8(&query.prepared_statement_handle)
             .map_err(|e| {
                 Status::invalid_argument(format!("invalid prepared statement handle: {e}"))
@@ -366,7 +439,11 @@ impl FlightSqlService for KrishivFlightSqlService {
         .await?;
 
         if !batches.is_empty() {
-            self.bound_params.lock().await.put(handle.clone(), batches);
+            let mut map = self.bound_params.lock().await;
+            let cache = map
+                .entry(subject_key)
+                .or_insert_with(|| lru::LruCache::new(read_prepared_stmt_capacity()));
+            cache.put(handle.clone(), batches);
         }
 
         Ok(DoPutPreparedStatementResult {
@@ -381,6 +458,8 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        let subject = self.authenticate_request(&request)?;
+        let subject_key = subject.as_deref().unwrap_or("__anon__").to_owned();
         let handle = std::str::from_utf8(&query.prepared_statement_handle)
             .map_err(|e| {
                 Status::invalid_argument(format!("invalid prepared statement handle encoding: {e}"))
@@ -389,7 +468,8 @@ impl FlightSqlService for KrishivFlightSqlService {
 
         let sql = {
             let mut map = self.prepared_statements.lock().await;
-            map.get(&handle)
+            map.get_mut(&subject_key)
+                .and_then(|cache| cache.get(&handle))
                 .cloned()
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
         };
@@ -411,6 +491,8 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandPreparedStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let subject = self.authenticate_request(&request)?;
+        let subject_key = subject.as_deref().unwrap_or("__anon__").to_owned();
         let handle = std::str::from_utf8(&query.prepared_statement_handle)
             .map_err(|e| {
                 Status::invalid_argument(format!("invalid prepared statement handle encoding: {e}"))
@@ -419,7 +501,8 @@ impl FlightSqlService for KrishivFlightSqlService {
 
         let sql = {
             let mut map = self.prepared_statements.lock().await;
-            map.get(&handle)
+            map.get_mut(&subject_key)
+                .and_then(|cache| cache.get(&handle))
                 .cloned()
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
         };
@@ -427,7 +510,11 @@ impl FlightSqlService for KrishivFlightSqlService {
         // Apply bound parameters if present.
         let effective_sql = {
             let mut params = self.bound_params.lock().await;
-            match params.get(&handle).and_then(|b| b.first()) {
+            match params
+                .get_mut(&subject_key)
+                .and_then(|cache| cache.get(&handle))
+                .and_then(|b| b.first())
+            {
                 Some(batch) => substitute_sql_params(&sql, batch),
                 None => sql,
             }
@@ -445,14 +532,25 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: ActionClosePreparedStatementRequest,
         request: Request<arrow_flight::Action>,
     ) -> Result<(), Status> {
-        self.authenticate_request(&request)?;
+        let subject = self.authenticate_request(&request)?;
+        let subject_key = subject.as_deref().unwrap_or("__anon__").to_owned();
         let handle = std::str::from_utf8(&query.prepared_statement_handle)
             .map_err(|e| {
                 Status::invalid_argument(format!("invalid prepared statement handle encoding: {e}"))
             })?
             .to_owned();
-        self.prepared_statements.lock().await.pop(&handle);
-        self.bound_params.lock().await.pop(&handle);
+        {
+            let mut map = self.prepared_statements.lock().await;
+            if let Some(cache) = map.get_mut(&subject_key) {
+                cache.pop(&handle);
+            }
+        }
+        {
+            let mut map = self.bound_params.lock().await;
+            if let Some(cache) = map.get_mut(&subject_key) {
+                cache.pop(&handle);
+            }
+        }
         Ok(())
     }
 
@@ -461,12 +559,13 @@ impl FlightSqlService for KrishivFlightSqlService {
         _query: ActionBeginTransactionRequest,
         request: Request<arrow_flight::Action>,
     ) -> Result<ActionBeginTransactionResult, Status> {
-        self.authenticate_request(&request)?;
+        let subject = self.authenticate_request(&request)?;
+        let subject_key = subject.unwrap_or_else(|| "__anon__".to_owned());
         let transaction_id = Uuid::new_v4().to_string();
         self.transactions
             .lock()
             .await
-            .insert(transaction_id.clone());
+            .insert(transaction_id.clone(), subject_key);
         Ok(ActionBeginTransactionResult {
             transaction_id: transaction_id.into_bytes().into(),
         })
@@ -477,13 +576,27 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: ActionEndTransactionRequest,
         request: Request<arrow_flight::Action>,
     ) -> Result<(), Status> {
-        self.authenticate_request(&request)?;
+        let subject = self.authenticate_request(&request)?;
+        let subject_key = subject.as_deref().unwrap_or("__anon__");
         let transaction_id = std::str::from_utf8(&query.transaction_id)
             .map_err(|_| Status::invalid_argument("invalid transaction id encoding"))?;
-        if !self.transactions.lock().await.remove(transaction_id) {
-            return Err(Status::invalid_argument(format!(
-                "unknown transaction id: {transaction_id}"
-            )));
+        {
+            let mut txns = self.transactions.lock().await;
+            match txns.get(transaction_id) {
+                None => {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown transaction id: {transaction_id}"
+                    )));
+                }
+                Some(owner) if owner != subject_key => {
+                    return Err(Status::permission_denied(format!(
+                        "transaction id {transaction_id} does not belong to this subject"
+                    )));
+                }
+                Some(_) => {
+                    txns.remove(transaction_id);
+                }
+            }
         }
         match EndTransaction::try_from(query.action)
             .map_err(|_| Status::invalid_argument("invalid EndTransaction action"))?

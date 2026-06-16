@@ -2,6 +2,7 @@
 
 use dashmap::DashMap;
 use krishiv_common::DurabilityProfile;
+use tracing::Instrument as _;
 use krishiv_plan::{LogicalPlan, PhysicalPlan};
 use krishiv_proto::{
     AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorId, CoordinatorState,
@@ -516,14 +517,17 @@ impl SharedCoordinator {
                 let channels = Arc::clone(&channels);
                 let job_id = jl.job_id.clone();
                 let targets = jl.targets.clone();
-                tokio::spawn(async move {
-                    let delivery = Coordinator::deliver_assignment_targets_with_channels(
-                        (*channels).clone(),
-                        targets,
-                    )
-                    .await;
-                    (job_id, delivery)
-                })
+                tokio::spawn(
+                    async move {
+                        let delivery = Coordinator::deliver_assignment_targets_with_channels(
+                            (*channels).clone(),
+                            targets,
+                        )
+                        .await;
+                        (job_id, delivery)
+                    }
+                    .instrument(tracing::Span::current()),
+                )
             })
             .collect();
 
@@ -582,22 +586,26 @@ impl SharedCoordinator {
         {
             let coord = self.clone();
             let mut rx = shutdown_rx.clone();
-            let task = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {}
-                        _ = rx.changed() => { if *rx.borrow() { return; } }
-                    }
-                    if let Err(error) = coord.advance_heartbeat_tick().await {
-                        let text = error.to_string();
-                        if !text.contains("InactiveCoordinator") {
-                            tracing::warn!(error = %text, "coordinator heartbeat tick failed");
+            let span = tracing::info_span!("coordinator.heartbeat_loop");
+            let task = tokio::spawn(
+                async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {}
+                            _ = rx.changed() => { if *rx.borrow() { return; } }
+                        }
+                        if let Err(error) = coord.advance_heartbeat_tick().await {
+                            let text = error.to_string();
+                            if !text.contains("InactiveCoordinator") {
+                                tracing::warn!(error = %text, "coordinator heartbeat tick failed");
+                            }
                         }
                     }
                 }
-            });
+                .instrument(span),
+            );
             abort_handles.push(task.abort_handle());
         }
 
@@ -607,26 +615,31 @@ impl SharedCoordinator {
         {
             let coord = self.clone();
             let mut rx = shutdown_rx.clone();
-            let task = tokio::spawn(async move {
-                // Clone the Arc<Notify> once before the loop to avoid taking the
-                // coordinator read-lock on every iteration.
-                let notify = coord.inner.read().await.notify.clone();
-                let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {}
-                        _ = notify.notified() => {}
-                        _ = rx.changed() => { if *rx.borrow() { return; } }
-                    }
-                    if let Err(error) = coord.drive_pending_task_launches().await {
-                        let text = error.to_string();
-                        if !text.contains("InactiveCoordinator") {
-                            tracing::warn!(error = %text, "coordinator task launch tick failed");
+            let span = tracing::info_span!("coordinator.task_launch_loop");
+            let task = tokio::spawn(
+                async move {
+                    // Clone the Arc<Notify> once before the loop to avoid taking the
+                    // coordinator read-lock on every iteration.
+                    let notify = coord.inner.read().await.notify.clone();
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_millis(500));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {}
+                            _ = notify.notified() => {}
+                            _ = rx.changed() => { if *rx.borrow() { return; } }
+                        }
+                        if let Err(error) = coord.drive_pending_task_launches().await {
+                            let text = error.to_string();
+                            if !text.contains("InactiveCoordinator") {
+                                tracing::warn!(error = %text, "coordinator task launch tick failed");
+                            }
                         }
                     }
                 }
-            });
+                .instrument(span),
+            );
             abort_handles.push(task.abort_handle());
         }
 
@@ -634,21 +647,26 @@ impl SharedCoordinator {
         {
             let coord = self.clone();
             let mut rx = shutdown_rx.clone();
-            let task = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {}
-                        _ = rx.changed() => { if *rx.borrow() { return; } }
-                    }
-                    if let Err(error) =
-                        drive_barrier_dispatches(&coord, std::time::Duration::from_secs(30)).await
-                    {
-                        tracing::warn!(error = %error, "coordinator barrier dispatch failed");
+            let span = tracing::info_span!("coordinator.barrier_dispatch_loop");
+            let task = tokio::spawn(
+                async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {}
+                            _ = rx.changed() => { if *rx.borrow() { return; } }
+                        }
+                        if let Err(error) =
+                            drive_barrier_dispatches(&coord, std::time::Duration::from_secs(30))
+                                .await
+                        {
+                            tracing::warn!(error = %error, "coordinator barrier dispatch failed");
+                        }
                     }
                 }
-            });
+                .instrument(span),
+            );
             abort_handles.push(task.abort_handle());
         }
 
