@@ -10,6 +10,7 @@ on:
 permissions:
   contents: read
   security-events: write
+  checks: write
 
 jobs:
   # ── Vulnerability scan via cargo-audit (RustSec advisory DB) ────────────────
