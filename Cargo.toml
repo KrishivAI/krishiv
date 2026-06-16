@@ -164,16 +164,6 @@ lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 
-# release-single-node: fast local release build for single-node deployments.
-# Skips LTO and uses multiple codegen units so `cargo build --profile release-single-node`
-# finishes quickly without the multi-minute fat-LTO link step.
-# incremental = true so repeated local rebuilds stay fast.
-[profile.release-single-node]
-inherits = "release"
-lto = "off"
-codegen-units = 16
-incremental = true
-
 # release-k8s: k8s/bare-metal image builds on memory-constrained CI runners.
 # Thin LTO keeps binary size reasonable without the peak RAM of fat LTO.
 # Use this when nightly runners have less than ~16 GB free RAM.
@@ -182,7 +172,3 @@ inherits = "release"
 lto = "thin"
 codegen-units = 4
 strip = "debuginfo"
-
-# release-bare-metal: same as release-k8s; alias so Makefile targets are readable.
-[profile.release-bare-metal]
-inherits = "release-k8s"

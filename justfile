@@ -81,7 +81,7 @@ build-single-node:
 build-bare-metal:
     {{ cargo }} build -p krishiv \
         --no-default-features --features bare-metal \
-        --profile release-bare-metal
+        --profile release-k8s
 
 # Maximum-performance release build (fat LTO + panic=abort + strip).
 # Matches what nightly and production release CI produce.
@@ -125,7 +125,7 @@ docker-push:
 docker-bare-metal:
     docker build \
         --build-arg FEATURES=bare-metal \
-        --build-arg PROFILE=release-bare-metal \
+        --build-arg PROFILE=release-k8s \
         -f Dockerfile.build \
         -t {{ image }}-bare-metal .
 
