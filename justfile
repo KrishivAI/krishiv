@@ -36,9 +36,9 @@ check-fast:
         --exclude krishiv-python \
         --exclude krishiv-chaos
 
-# Verify every execution-mode feature set compiles independently
-check: check-embedded check-single-node check-distributed check-k8s
-    @echo "✓ all execution modes check clean"
+# Verify every feature set compiles independently
+check: check-embedded check-single-node check-distributed check-k8s check-full
+    @echo "✓ all feature sets check clean"
 
 # Check embedded mode (in-process library only)
 check-embedded:
@@ -59,6 +59,11 @@ check-distributed: check-bare-metal
 check-k8s:
     {{ cargo }} check -p krishiv -p krishiv-operator \
         --no-default-features --features k8s
+
+# Check full feature set (kafka + iceberg + delta connectors)
+check-full:
+    {{ cargo }} check -p krishiv -p krishiv-operator \
+        --no-default-features --features full
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 

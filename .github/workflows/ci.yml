@@ -12,12 +12,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Toolchain version is canonical in rust-toolchain.toml; this is a readable label.
-  RUST_VERSION: "1.92"
-  # librocksdb-sys requires this on GCC 15+ (uint64_t not declared without <cstdint>)
   CXXFLAGS: "-include cstdint"
-  # sccache caches rustc invocations across jobs and workflow runs on self-hosted runners.
-  # The local disk cache at ~/.cache/sccache persists between runs automatically.
   RUSTC_WRAPPER: sccache
   SCCACHE_DIR: /home/runner/.cache/sccache
 
@@ -27,56 +22,35 @@ jobs:
     name: Format & Lint
     runs-on: self-hosted
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-setup
         with:
-          toolchain: ${{ env.RUST_VERSION }}
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Install system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            libssl-dev pkg-config cmake mold clang libclang-dev sccache
+          components: rustfmt,clippy
       - uses: taiki-e/install-action@just
       - run: just fmt
       - run: just lint
 
   # ── Feature-mode compilation matrix ─────────────────────────────────────────
-  # Each execution mode must compile independently. A regression that breaks
-  # one mode but not others will only surface here.
+  # Each feature set must compile independently. 'full' also covers connectors
+  # (kafka, iceberg, delta) not exercised by the other modes.
   check-modes:
     name: check (${{ matrix.mode }})
     runs-on: self-hosted
+    needs: [fmt-lint]
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - mode: embedded
-            crates: -p krishiv
-          - mode: single-node
-            crates: -p krishiv
-          - mode: bare-metal
-            crates: -p krishiv
-          - mode: k8s
-            crates: -p krishiv -p krishiv-operator
+        mode: [embedded, single-node, bare-metal, k8s, full]
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-setup
         with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: check-${{ matrix.mode }}
-      - name: Install system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            libssl-dev pkg-config cmake mold clang libclang-dev protobuf-compiler sccache
+          cache-key: check-${{ matrix.mode }}
+          extra-apt: protobuf-compiler
       - uses: taiki-e/install-action@just
       - run: just check-${{ matrix.mode }}
 
@@ -86,18 +60,10 @@ jobs:
     runs-on: self-hosted
     needs: [fmt-lint]
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
-      - name: Install system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            libssl-dev pkg-config cmake mold clang libclang-dev sccache
+      - uses: ./.github/actions/rust-setup
       - uses: taiki-e/install-action@cargo-nextest
       - uses: taiki-e/install-action@just
       - run: just test
@@ -108,15 +74,12 @@ jobs:
     runs-on: self-hosted
     needs: [fmt-lint]
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-setup
         with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: python
+          cache-key: python
       - name: Install Python
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \
@@ -131,19 +94,16 @@ jobs:
         run: pytest python/tests/ -q
 
   # ── Project hygiene (API surface, links, release metadata) ───────────────────
+  # Python-only — no Rust toolchain needed.
   hygiene:
     name: Project Hygiene
     runs-on: self-hosted
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          clean: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
       - name: Test project scripts
         run: python3 -m unittest discover -s scripts/tests -v
       - name: Validate public API inventories and parity manifest

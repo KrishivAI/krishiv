@@ -3,6 +3,8 @@ name: Nightly
 # Publishes a fresh build from main every night.
 # Docker images are tagged :nightly and :nightly-YYYY-MM-DD.
 # Python wheels are uploaded as artifacts (14-day retention).
+# Full-feature cargo check is now part of the CI check-modes matrix (mode: full),
+# so no separate nightly check job is needed.
 on:
   schedule:
     - cron: "0 0 * * *"   # 00:00 UTC daily
@@ -10,7 +12,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.92"
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/krishiv
   CXXFLAGS: "-include cstdint"
@@ -27,7 +28,7 @@ jobs:
     name: Docker Nightly
     runs-on: self-hosted
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
@@ -85,11 +86,12 @@ jobs:
             target: x86_64-apple-darwin
             manylinux: "off"
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           ref: main
+          clean: false
       - uses: actions/setup-python@v5
         if: runner.os == 'macOS'
         with:
@@ -111,30 +113,3 @@ jobs:
           name: nightly-wheels-${{ matrix.os }}-${{ matrix.target }}-${{ github.run_id }}
           path: dist/*.whl
           retention-days: 14
-          clean: false
-
-  # ── Nightly cargo check (full feature set) ───────────────────────────────────
-  # Catches regressions not caught by CI (e.g. upstream crate updates in nightly deps).
-  check-nightly:
-    name: Nightly Cargo Check
-    runs-on: self-hosted
-    steps:
-      - name: Clean workspace (root-owned files)
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          clean: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: nightly-check
-      - name: Install system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            libssl-dev pkg-config cmake mold clang libclang-dev sccache
-      - name: Check full feature set
-        run: cargo check -p krishiv --features full

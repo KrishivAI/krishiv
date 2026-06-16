@@ -2,7 +2,7 @@ name: Release
 
 # Triggered when a GitHub Release is published (via UI or gh CLI).
 # Workflow:
-#   1. git tag v0.2.0 && git push origin v0.2.0    (or: just release 0.2.0 && git push)
+#   1. just release 0.2.0   (bumps version, commits, tags, pushes)
 #   2. GitHub → Releases → Draft a new release → select tag → set notes / pre-release flag
 #   3. Click Publish → this workflow fires, builds all artifacts, uploads to the release
 on:
@@ -11,7 +11,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.92"
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/krishiv
   CXXFLAGS: "-include cstdint"
@@ -25,6 +24,7 @@ permissions:
 
 jobs:
   # ── 1. Validate release readiness ───────────────────────────────────────────
+  # Python-only validation — no Rust toolchain needed.
   validate:
     name: Validate
     runs-on: self-hosted
@@ -32,7 +32,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
@@ -46,9 +46,6 @@ jobs:
           echo "version=${VERSION}"      >> "$GITHUB_OUTPUT"
           echo "is_prerelease=${IS_PRE}" >> "$GITHUB_OUTPUT"
           echo "Tag=${TAG}  Version=${VERSION}  PreRelease=${IS_PRE}"
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
       - name: Validate tag and project metadata
         run: python3 scripts/check_release.py --tag "${{ github.event.release.tag_name }}"
       - name: Validate API parity manifest
@@ -73,24 +70,17 @@ jobs:
             runner: macos-14
             extra_sys_deps: ""
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           clean: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-setup
         with:
-          toolchain: ${{ env.RUST_VERSION }}
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: binary-${{ matrix.target }}
-      - name: Install system deps (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            libssl-dev pkg-config cmake mold clang libclang-dev sccache ${{ matrix.extra_sys_deps }}
+          cache-key: binary-${{ matrix.target }}
+          extra-apt: ${{ matrix.extra_sys_deps }}
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
       - name: Build
         run: cargo build -p krishiv --profile release-max --features full --target ${{ matrix.target }}
       - name: Package
@@ -99,7 +89,7 @@ jobs:
           VERSION="${{ needs.validate.outputs.version }}"
           NAME="krishiv-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/${NAME}"
-          cp "target/${{ matrix.target }}/release/krishiv" "dist/${NAME}/"
+          cp "target/${{ matrix.target }}/release-max/krishiv" "dist/${NAME}/"
           cp README.md LICENSE "dist/${NAME}/"
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
           sha256sum "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
@@ -131,7 +121,7 @@ jobs:
             target: x86_64-apple-darwin
             manylinux: "off"
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
@@ -165,7 +155,7 @@ jobs:
     needs: validate
     runs-on: self-hosted
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
@@ -206,7 +196,7 @@ jobs:
     needs: validate
     runs-on: self-hosted
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
@@ -237,19 +227,17 @@ jobs:
           retention-days: 7
 
   # ── 3. Generate SBOM ────────────────────────────────────────────────────────
+  # Python-only — no Rust toolchain needed.
   sbom:
     name: SBOM
     needs: validate
     runs-on: self-hosted
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           clean: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
       - name: Generate SBOM
         run: |
           python3 scripts/generate_sbom.py \
@@ -261,8 +249,6 @@ jobs:
           retention-days: 7
 
   # ── 4. Upload artifacts to the GitHub Release ────────────────────────────────
-  # The release already exists (publishing it triggered this workflow).
-  # This job attaches the built artifacts to it.
   upload-assets:
     name: Upload Release Assets
     needs: [validate, build-binary, build-wheels, docker, helm, sbom]
@@ -270,7 +256,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/download-artifact@v4
         with:
@@ -311,7 +297,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/download-artifact@v4
         with:
@@ -330,18 +316,12 @@ jobs:
     runs-on: self-hosted
     environment: crates-publish
     steps:
-      - name: Clean workspace (root-owned files)
+      - name: Clean workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           clean: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - name: Install system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config cmake lld clang libclang-dev
+      - uses: ./.github/actions/rust-setup
       - name: Publish crates in topological order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -371,4 +351,3 @@ jobs:
             cargo publish -p "${crate}" --no-verify || echo "WARNING: ${crate} may already be published at this version"
             sleep 30
           done
-
