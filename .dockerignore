@@ -1,5 +1,16 @@
 target/
 .git/
-venv/
+.github/
+docs/
+scripts/
+k8s/
 examples/
+dist/
+.bench-baselines/
+venv/
 tpch*
+*.md
+*.sh
+justfile
+.cargo/
+rust-toolchain.toml

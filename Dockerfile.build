@@ -1,73 +1,90 @@
-# Multi-stage Dockerfile — builds Krishiv inside Docker.
+# syntax=docker/dockerfile:1.7
+#
+# Multi-stage Dockerfile with cargo-chef for layer-cached dependency builds.
+# Dependencies compile in a separate layer; source-only changes skip that layer entirely.
 #
 # Build args:
 #   FEATURES  Cargo feature set (default: k8s)
 #             embedded | single-node | bare-metal | k8s | full
 #   PROFILE   Cargo build profile (default: release-k8s)
-#             release | release-k8s
+#             release-k8s | release-max
 #
 # Usage:
 #   docker build -f Dockerfile.build -t localhost/krishiv:local .
-#   docker build --build-arg FEATURES=bare-metal --build-arg PROFILE=release \
-#       -f Dockerfile.build -t krishiv:bare-metal .
+#   docker build --build-arg FEATURES=full --build-arg PROFILE=release-max \
+#       -f Dockerfile.build -t krishiv:latest .
 
-# ── Build stage ───────────────────────────────────────────────────────────────
-FROM rust:1.92-slim AS builder
+# ── Stage 0: cargo-chef base (shared between planner and builder) ─────────────
+FROM rust:1.92-slim AS chef
+RUN cargo install cargo-chef --locked
+WORKDIR /build
+
+# ── Stage 1: Planner — reads manifests, emits recipe.json ─────────────────────
+# Re-runs only when Cargo.toml or Cargo.lock changes.
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: Builder ──────────────────────────────────────────────────────────
+FROM chef AS builder
 
 ARG FEATURES=k8s
 ARG PROFILE=release-k8s
 
-# System deps required by transitive C build scripts (ring, openssl-sys).
-# cmake is needed by some crypto crates; pkg-config links native libs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         pkg-config \
         cmake \
-        lld \
+        mold \
+        clang \
         libclang-dev \
         g++ \
         make \
-        curl \
         protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build
+ENV CXXFLAGS="-include cstdint" \
+    CARGO_INCREMENTAL=0 \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 
-# Copy workspace manifests first so dependency layers cache independently
-# of source changes.
+# Cook dependencies — cached as long as recipe.json (= Cargo.toml/Cargo.lock) is unchanged.
+# A source-only change hits this layer from cache and skips straight to the build below.
+COPY --from=planner /build/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo chef cook \
+        --recipe-path recipe.json \
+        --no-default-features --features "$FEATURES" \
+        --profile "$PROFILE"
+
+# Copy source and build binaries (dep compilation above is already cached)
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-
-# Disable target-cpu=native (host-tuned, breaks cross-arch builds) and
-# TMPDIR override (only needed on space-constrained dev hosts).
-ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
-
-# Build the binaries that go into the runtime image.
-# krishiv-operator is only included when FEATURES contains 'k8s'.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
     set -e; \
     PKGS="-p krishiv"; \
     case "$FEATURES" in *k8s*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
     cargo build $PKGS \
         --no-default-features --features "$FEATURES" \
-        --profile "$PROFILE" && \
-    # Copy out of the cache-mounted target dir before it disappears.
-    OUTDIR="/out"; \
-    mkdir -p "$OUTDIR"; \
-    cp "target/$PROFILE/krishiv" "$OUTDIR/krishiv"; \
-    cp "target/$PROFILE/krishiv-operator" "$OUTDIR/krishiv-operator" 2>/dev/null || touch "$OUTDIR/krishiv-operator"
+        --profile "$PROFILE"; \
+    mkdir -p /out; \
+    cp "target/$PROFILE/krishiv" /out/krishiv; \
+    if [ -f "target/$PROFILE/krishiv-operator" ]; then \
+        cp "target/$PROFILE/krishiv-operator" /out/krishiv-operator; \
+    fi
 
-# ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM ubuntu:26.04
+# ── Stage 3: Runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/krishiv /usr/local/bin/krishiv
-# krishiv-operator is only built when FEATURES contains 'k8s'.
+# krishiv-operator is only present when FEATURES contains 'k8s'
 COPY --from=builder /out/krishiv-operator /usr/local/bin/krishiv-operator
-RUN chmod +x /usr/local/bin/krishiv /usr/local/bin/krishiv-operator 2>/dev/null; true
 
 ENTRYPOINT ["/usr/local/bin/krishiv"]
