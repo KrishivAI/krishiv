@@ -10,6 +10,8 @@ etcd = ["dep:etcd-client"]
 
 [dependencies]
 krishiv-common = { path = "../krishiv-common" }
+krishiv-ivm = { path = "../krishiv-ivm" }
+uuid = { workspace = true }
 arrow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }

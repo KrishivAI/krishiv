@@ -176,6 +176,9 @@ pub fn plan_to_sql(plan: &PhysicalPlan) -> String {
                 safe_name
             )
         }
+        ExecutionKind::DeltaBatch => {
+            format!("/* krishiv-delta-batch:{name} */ SELECT 1 AS delta_batch_accepted")
+        }
     }
 }
 

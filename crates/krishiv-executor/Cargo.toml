@@ -17,6 +17,7 @@ dashmap = { workspace = true }
 futures = { workspace = true }
 twox-hash = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
+krishiv-ivm = { path = "../krishiv-ivm" }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
 krishiv-dataflow = { path = "../krishiv-dataflow" }

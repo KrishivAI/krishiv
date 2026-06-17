@@ -13,6 +13,7 @@ krishiv-executor = { path = "../krishiv-executor" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-common = { path = "../krishiv-common" }
+krishiv-ivm = { path = "../krishiv-ivm" }
 krishiv-sql = { path = "../krishiv-sql" }
 dashmap = { workspace = true }
 reqwest = { workspace = true }

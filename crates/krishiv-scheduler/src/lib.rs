@@ -26,6 +26,8 @@ pub mod barrier_client;
 pub mod barrier_dispatch;
 pub mod barrier_tracker;
 pub mod batch_sql;
+pub mod ivm;
+pub mod ivm_http;
 pub mod batch_sql_http;
 pub mod bounded_window;
 pub mod bounded_window_http;
@@ -64,6 +66,8 @@ pub use auth::{
     validate_grpc_auth_for_role, validate_grpc_writer,
 };
 pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
+pub use ivm::{IvmJobRegistry, SharedIvmJobRegistry};
+pub use ivm_http::ivm_router;
 pub use barrier_tracker::CheckpointBarrierTracker;
 pub use batch_sql::{
     BatchSqlInlineTable, BatchSqlOutcome, BatchSqlTable, decode_inline_record_batches,

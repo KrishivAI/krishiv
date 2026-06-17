@@ -247,13 +247,19 @@ pub enum NodeOp {
     Other { description: String },
 }
 
-/// Whether a plan represents bounded batch work or unbounded streaming work.
+/// Whether a plan represents bounded batch work, unbounded streaming, or IVM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExecutionKind {
     /// Bounded work that eventually completes.
     Batch,
     /// Unbounded work that runs until cancelled.
     Streaming,
+    /// Tick-driven incremental view maintenance (DeltaBatch mode).
+    ///
+    /// Plans of this kind are managed through the IVM HTTP API on the
+    /// coordinator. Each tick consumes source deltas, runs SQL views, and
+    /// publishes incremental `DeltaBatch` outputs.
+    DeltaBatch,
 }
 
 impl fmt::Display for ExecutionKind {
@@ -261,6 +267,7 @@ impl fmt::Display for ExecutionKind {
         match self {
             Self::Batch => f.write_str("batch"),
             Self::Streaming => f.write_str("streaming"),
+            Self::DeltaBatch => f.write_str("delta-batch"),
         }
     }
 }

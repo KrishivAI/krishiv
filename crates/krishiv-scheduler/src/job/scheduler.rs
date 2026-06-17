@@ -313,6 +313,7 @@ fn job_spec_from_plan_parts(
     let job_kind = match kind {
         PlanExecutionKind::Batch => JobKind::Batch,
         PlanExecutionKind::Streaming => JobKind::Streaming,
+        PlanExecutionKind::DeltaBatch => JobKind::Batch,
     };
     let job_name = if plan_name.trim().is_empty() {
         String::from("unnamed-distributed-dag")

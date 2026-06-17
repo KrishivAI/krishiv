@@ -428,12 +428,13 @@ pub fn coordinator_http_router(
     use crate::http_auth::{require_coordinator_bearer, resolve_http_bearer_tokens};
     use axum::middleware;
 
-    let public = Router::new()
+    let public: Router<()> = Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics));
+        .route("/metrics", get(metrics))
+        .with_state(coordinator.clone());
 
-    let protected = Router::new()
+    let protected: Router<()> = Router::new()
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/executors", get(api_executors))
         .route(
@@ -476,10 +477,16 @@ pub fn coordinator_http_router(
         protected
     };
 
+    // IVM routes — own state (IvmJobRegistry), baked in before merging.
+    let ivm_registry = std::sync::Arc::new(crate::ivm::IvmJobRegistry::new());
+    let ivm_routes = crate::ivm_http::ivm_router(ivm_registry);
+
+    // All sub-routers are Router<()> (state already baked in), so no final
+    // .with_state() call is needed here.
     Router::new()
         .merge(public)
         .merge(protected)
-        .with_state(coordinator)
+        .merge(ivm_routes)
 }
 
 fn http_auth_required(config: &CoordinatorDaemonConfig) -> bool {

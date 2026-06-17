@@ -27,6 +27,9 @@ pub use coordinator_http_client::{
     execute_coordinator_batch_sql, execute_coordinator_batch_sql_inline,
     execute_coordinator_bounded_window, execute_coordinator_continuous_drain,
     execute_coordinator_continuous_push, execute_coordinator_continuous_register,
+    execute_coordinator_ivm_checkpoint, execute_coordinator_ivm_create_job,
+    execute_coordinator_ivm_feed_source, execute_coordinator_ivm_register_view,
+    execute_coordinator_ivm_restore, execute_coordinator_ivm_step,
     execute_coordinator_physical_plan,
 };
 pub use execution_runtime::{
@@ -305,6 +308,14 @@ impl ExecutionBackend for EmbeddedBackend {
                 "EmbeddedBackend: delegating streaming plan to SingleNodeBackend"
             );
             return self.single_node.execute(plan);
+        }
+        if plan.kind() == krishiv_plan::ExecutionKind::DeltaBatch {
+            debug!(
+                backend = "embedded",
+                plan = %plan.name(),
+                "EmbeddedBackend: accepting DeltaBatch plan (IVM managed via coordinator HTTP API)"
+            );
+            return accept_local_plan(self.backend_name(), plan);
         }
 
         debug!(

@@ -5392,6 +5392,7 @@ dependencies = [
  "krishiv-dataflow",
  "krishiv-delta",
  "krishiv-flight-sql",
+ "krishiv-ivm",
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-sql",
@@ -5544,6 +5545,7 @@ dependencies = [
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-dataflow",
+ "krishiv-ivm",
  "krishiv-metrics",
  "krishiv-plan",
  "krishiv-proto",
@@ -5588,6 +5590,20 @@ dependencies = [
  "tonic 0.14.6",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "krishiv-ivm"
+version = "0.1.0"
+dependencies = [
+ "arrow 58.3.0",
+ "datafusion 53.1.0",
+ "krishiv-common",
+ "krishiv-delta",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -5712,6 +5728,7 @@ dependencies = [
  "krishiv-dataflow",
  "krishiv-executor",
  "krishiv-flight-sql",
+ "krishiv-ivm",
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-scheduler",
@@ -5745,6 +5762,7 @@ dependencies = [
  "jsonwebtoken",
  "krishiv-common",
  "krishiv-connectors",
+ "krishiv-ivm",
  "krishiv-metrics",
  "krishiv-plan",
  "krishiv-proto",
@@ -5762,6 +5780,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "urlencoding",
+ "uuid",
 ]
 
 [[package]]

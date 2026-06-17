@@ -574,5 +574,266 @@ pub async fn execute_coordinator_physical_plan(
             )
             .await
         }
+        ExecutionKind::DeltaBatch => {
+            // DeltaBatch plans are managed through the IVM HTTP API.
+            // The job_id is the plan name; the coordinator must have an
+            // existing IVM job with that ID (created via ivm_create_job).
+            Ok(())
+        }
     }
+}
+
+// ── IVM HTTP client ────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct IvmCreateJobBody {
+    job_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct IvmCreateJobResponse {
+    job_id: String,
+}
+
+/// Create a new IVM job on the coordinator. Returns the assigned job ID.
+pub async fn execute_coordinator_ivm_create_job(
+    coordinator_http: &str,
+    job_id: Option<&str>,
+) -> RuntimeResult<String> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let body = IvmCreateJobBody { job_id: job_id.map(|s| s.to_string()) };
+    let resp = apply_coordinator_bearer(client.post(format!("{base}/api/v1/ivm/jobs")))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm create job: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm create job HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: IvmCreateJobResponse = resp
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm create job decode: {e}")))?;
+    Ok(parsed.job_id)
+}
+
+#[derive(serde::Serialize)]
+struct IvmRegisterViewBody<'a> {
+    name: &'a str,
+    body_sql: &'a str,
+    output_schema: IvmSchemaJson<'a>,
+    is_materialized: bool,
+    is_recursive: bool,
+}
+
+#[derive(serde::Serialize)]
+struct IvmSchemaJson<'a> {
+    fields: &'a [IvmFieldJson],
+}
+
+#[derive(serde::Serialize)]
+struct IvmFieldJson {
+    name: String,
+    data_type: String,
+    nullable: bool,
+}
+
+fn arrow_dt_to_str(dt: &arrow::datatypes::DataType) -> String {
+    use arrow::datatypes::{DataType, TimeUnit};
+    match dt {
+        DataType::Int8 => "Int8".to_owned(),
+        DataType::Int16 => "Int16".to_owned(),
+        DataType::Int32 => "Int32".to_owned(),
+        DataType::Int64 => "Int64".to_owned(),
+        DataType::UInt8 => "UInt8".to_owned(),
+        DataType::UInt16 => "UInt16".to_owned(),
+        DataType::UInt32 => "UInt32".to_owned(),
+        DataType::UInt64 => "UInt64".to_owned(),
+        DataType::Float32 => "Float32".to_owned(),
+        DataType::Float64 => "Float64".to_owned(),
+        DataType::Utf8 => "Utf8".to_owned(),
+        DataType::LargeUtf8 => "LargeUtf8".to_owned(),
+        DataType::Boolean => "Boolean".to_owned(),
+        DataType::Binary => "Binary".to_owned(),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => "TimestampMs".to_owned(),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => "TimestampUs".to_owned(),
+        DataType::Date32 => "Date32".to_owned(),
+        DataType::Date64 => "Date64".to_owned(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Register or update an incremental view on a remote IVM job.
+pub async fn execute_coordinator_ivm_register_view(
+    coordinator_http: &str,
+    job_id: &str,
+    spec: &krishiv_ivm::IncrementalViewSpec,
+) -> RuntimeResult<()> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let fields: Vec<IvmFieldJson> = spec
+        .output_schema
+        .fields()
+        .iter()
+        .map(|f| IvmFieldJson {
+            name: f.name().clone(),
+            data_type: arrow_dt_to_str(f.data_type()),
+            nullable: f.is_nullable(),
+        })
+        .collect();
+    let body = IvmRegisterViewBody {
+        name: &spec.name,
+        body_sql: &spec.body_sql,
+        output_schema: IvmSchemaJson { fields: &fields },
+        is_materialized: spec.is_materialized,
+        is_recursive: spec.is_recursive,
+    };
+    let resp =
+        apply_coordinator_bearer(client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/views")))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("ivm register view: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm register view HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct IvmFeedSourceBody {
+    delta_ipc_b64: String,
+}
+
+/// Feed a `DeltaBatch` to a named source on a remote IVM job.
+pub async fn execute_coordinator_ivm_feed_source(
+    coordinator_http: &str,
+    job_id: &str,
+    source_name: &str,
+    delta: &krishiv_ivm::DeltaBatch,
+) -> RuntimeResult<()> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let ipc = krishiv_ivm::serialize_delta_batch(delta)
+        .map_err(|e| RuntimeError::transport(format!("delta serialize: {e}")))?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
+    let body = IvmFeedSourceBody { delta_ipc_b64: b64 };
+    let resp = apply_coordinator_bearer(client.post(format!(
+        "{base}/api/v1/ivm/jobs/{job_id}/sources/{source_name}/feed"
+    )))
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm feed source: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm feed source HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct IvmStepResponse {
+    active_views: usize,
+    total_output_rows: usize,
+    tick: u64,
+}
+
+/// Run one IVM tick on a remote job. Returns `(active_views, tick)`.
+pub async fn execute_coordinator_ivm_step(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<(usize, u64)> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let resp =
+        apply_coordinator_bearer(client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/step")))
+            .json(&serde_json::Value::Null)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("ivm step: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm step HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: IvmStepResponse = resp
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm step decode: {e}")))?;
+    Ok((parsed.active_views, parsed.tick))
+}
+
+#[derive(serde::Deserialize)]
+struct IvmCheckpointResponse {
+    checkpoint_b64: String,
+}
+
+/// Retrieve a checkpoint from a remote IVM job.
+pub async fn execute_coordinator_ivm_checkpoint(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<Vec<u8>> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let resp = apply_coordinator_bearer(
+        client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/checkpoint")),
+    )
+    .json(&serde_json::Value::Null)
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm checkpoint: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm checkpoint HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: IvmCheckpointResponse = resp
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm checkpoint decode: {e}")))?;
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &parsed.checkpoint_b64)
+        .map_err(|e| RuntimeError::transport(format!("checkpoint base64 decode: {e}")))
+}
+
+#[derive(serde::Serialize)]
+struct IvmRestoreBody {
+    checkpoint_b64: String,
+}
+
+/// Restore an IVM job on the coordinator from checkpoint bytes.
+pub async fn execute_coordinator_ivm_restore(
+    coordinator_http: &str,
+    job_id: &str,
+    bytes: &[u8],
+) -> RuntimeResult<()> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let body = IvmRestoreBody { checkpoint_b64: b64 };
+    let resp = apply_coordinator_bearer(
+        client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/restore")),
+    )
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm restore: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm restore HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
 }
