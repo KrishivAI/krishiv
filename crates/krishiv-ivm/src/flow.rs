@@ -35,7 +35,7 @@ use tokio::sync::watch;
 
 use krishiv_delta::{
     DeltaBatch, DeltaError, IncrementalViewRegistry, IncrementalViewSpec, apply_delta,
-    deserialize_delta_batch, serialize_delta_batch,
+    deserialize_delta_batch, differentiate, serialize_delta_batch,
 };
 
 use crate::error::{IvmError, IvmResult};
@@ -63,6 +63,10 @@ struct IncrementalFlowInner {
     // Delta checkpoints: accumulate deltas since last checkpoint call.
     delta_checkpoint_enabled: bool,
     checkpoint_deltas: HashMap<String, Vec<DeltaBatch>>,
+
+    // Streaming → IVM bridge: previous materialized snapshot per source.
+    // Used by feed_stream_output to differentiate consecutive snapshots.
+    streaming_prev_snapshots: HashMap<String, RecordBatch>,
 }
 
 // ── IncrementalFlow ───────────────────────────────────────────────────────────
@@ -87,6 +91,7 @@ impl IncrementalFlow {
                 seen_input_hashes: AHashMap::new(),
                 delta_checkpoint_enabled: false,
                 checkpoint_deltas: HashMap::new(),
+                streaming_prev_snapshots: HashMap::new(),
             })),
         }
     }
@@ -182,23 +187,59 @@ impl IncrementalFlow {
         Ok(())
     }
 
-    /// Feed streaming micro-batch output as all-positive insertions for a source.
+    /// Feed streaming micro-batch output into IVM by differentiating consecutive snapshots.
     ///
-    /// Each `RecordBatch` in `batches` is wrapped in a `DeltaBatch::from_inserts`
-    /// and queued for the next `step_datafusion` tick. Empty batches are skipped.
+    /// Streaming jobs typically output a **full materialized snapshot** each tick.
+    /// This method calls `differentiate(prev_snapshot, new_snapshot)` to extract the
+    /// true delta (insertions and retractions) before pushing it to `feed_source`.
+    ///
+    /// On the first call for a source, all rows are treated as insertions (no previous
+    /// snapshot). Identical consecutive snapshots produce an empty delta and no tick work.
+    ///
+    /// Use `feed_source` directly if your streaming job already produces `DeltaBatch`es.
     pub fn feed_stream_output(
         &self,
         source_name: impl Into<String>,
         batches: &[RecordBatch],
     ) -> IvmResult<()> {
         let name: String = source_name.into();
-        for batch in batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let delta = DeltaBatch::from_inserts(batch.clone()).map_err(delta_err)?;
-            self.feed_source(name.clone(), delta)?;
+
+        // Combine all incoming batches into one new snapshot.
+        let non_empty: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+        if non_empty.is_empty() {
+            return Ok(());
         }
+        let schema = non_empty[0].schema();
+        let new_snapshot = if non_empty.len() == 1 {
+            (*non_empty[0]).clone()
+        } else {
+            arrow::compute::concat_batches(
+                &schema,
+                non_empty.iter().copied(),
+            )
+            .map_err(|e| IvmError::execution(e.to_string()))?
+        };
+
+        // Differentiate: true delta vs previous snapshot.
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        let prev = inner.streaming_prev_snapshots.get(&name);
+        let delta = differentiate(&schema, prev, &new_snapshot).map_err(delta_err)?;
+        inner.streaming_prev_snapshots.insert(name.clone(), new_snapshot);
+
+        if delta.is_empty() {
+            return Ok(());
+        }
+
+        // Accumulate for delta checkpoints.
+        if inner.delta_checkpoint_enabled {
+            inner
+                .checkpoint_deltas
+                .entry(name.clone())
+                .or_default()
+                .push(delta.clone());
+        }
+
+        inner.pending.entry(name).or_default().push(delta);
         Ok(())
     }
 
