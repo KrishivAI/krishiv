@@ -22,6 +22,7 @@ use pyo3::prelude::*;
 use krishiv_api::{
     DataFrame, ForeachBatchFn, StreamingOutputMode, StreamingQuery, StreamingTrigger,
 };
+use krishiv_runtime::RemoteStreamingJob;
 
 use crate::RUNTIME;
 use crate::batch::PyBatch;
@@ -336,5 +337,66 @@ impl PyDataStreamWriter {
             "DataStreamWriter(mode={}, trigger={}, query_name={:?})",
             self.output_mode, self.trigger_type, self.query_name
         )
+    }
+}
+
+// ── PyRemoteStreamingJob ──────────────────────────────────────────────────────
+
+/// Handle to a continuous streaming job managed by a remote coordinator.
+///
+/// Obtain via :func:`krishiv.connect_streaming` or
+/// :meth:`Session.connect_streaming`.
+///
+/// All methods are synchronous wrappers that run on the shared Tokio runtime.
+///
+/// Example::
+///
+///     job = krishiv.connect_streaming("http://coordinator:8080", "etl-job")
+///     job.push([batch1, batch2])
+///     results = job.drain()
+#[pyclass(name = "RemoteStreamingJob")]
+pub struct PyRemoteStreamingJob {
+    inner: RemoteStreamingJob,
+}
+
+#[pymethods]
+impl PyRemoteStreamingJob {
+    /// Connect to an existing streaming job on the coordinator.
+    ///
+    /// ``coordinator_url`` — base URL of the coordinator HTTP API.
+    /// ``job_id`` — the job ID assigned when the job was registered.
+    #[new]
+    pub fn py_new(coordinator_url: String, job_id: String) -> Self {
+        Self {
+            inner: RemoteStreamingJob::from_job_id(coordinator_url, job_id),
+        }
+    }
+
+    /// The job ID.
+    #[getter]
+    pub fn job_id(&self) -> &str {
+        self.inner.job_id()
+    }
+
+    /// Push a list of :class:`Batch` objects as input to the streaming job.
+    pub fn push(&self, batches: Vec<PyRef<'_, PyBatch>>) -> PyResult<()> {
+        let rbs: Vec<_> = batches.iter().map(|b| b.record_batch().clone()).collect();
+        RUNTIME
+            .block_on(self.inner.push(&rbs))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Drain accumulated output batches from the job.
+    ///
+    /// Returns a list of :class:`Batch` objects.
+    pub fn drain(&self) -> PyResult<Vec<PyBatch>> {
+        RUNTIME
+            .block_on(self.inner.drain())
+            .map(|rbs| rbs.into_iter().map(PyBatch::from_record_batch).collect())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!("RemoteStreamingJob(job_id='{}')", self.inner.job_id())
     }
 }

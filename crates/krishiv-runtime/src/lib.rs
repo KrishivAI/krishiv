@@ -19,13 +19,16 @@ pub mod flight_client;
 pub mod flight_protocol;
 pub mod in_process;
 pub mod in_process_cluster;
+pub mod ivm_job;
+pub mod krishiv_session;
 pub mod local_streaming;
 mod plan;
 pub mod stream_kafka;
+pub mod streaming_job;
 
 pub use continuous_stream::{ContinuousStreamError, ContinuousStreamRegistry};
 pub use coordinator_http_client::{
-    execute_coordinator_batch_sql, execute_coordinator_batch_sql_inline,
+    RemoteStepSummary, execute_coordinator_batch_sql, execute_coordinator_batch_sql_inline,
     execute_coordinator_bounded_window, execute_coordinator_continuous_drain,
     execute_coordinator_continuous_push, execute_coordinator_continuous_register,
     execute_coordinator_ivm_checkpoint, execute_coordinator_ivm_create_job,
@@ -45,10 +48,13 @@ pub use flight_action::{
 };
 pub use in_process::{BatchSqlTable, InProcessStreamingRuntime};
 pub use in_process_cluster::{InProcessCluster, plan_spec_to_local};
+pub use ivm_job::{EmbeddedIvmJob, IvmJobHandle, RemoteIvmJob};
+pub use krishiv_session::KrishivSession;
 pub use local_streaming::{
     LocalWindowExecutionSpec, LocalWindowKind, execute_streaming_window, execute_windowed_stream,
 };
 pub use plan::{is_streaming_plan, streaming_spec_from_plan};
+pub use streaming_job::RemoteStreamingJob;
 
 // tracing is used for debug-level plan delegation logging.
 use tracing::debug;

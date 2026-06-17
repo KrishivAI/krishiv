@@ -602,7 +602,9 @@ pub async fn execute_coordinator_ivm_create_job(
 ) -> RuntimeResult<String> {
     let base = normalize_http_base(coordinator_http)?;
     let client = coordinator_http_client()?;
-    let body = IvmCreateJobBody { job_id: job_id.map(|s| s.to_string()) };
+    let body = IvmCreateJobBody {
+        job_id: job_id.map(|s| s.to_string()),
+    };
     let resp = apply_coordinator_bearer(client.post(format!("{base}/api/v1/ivm/jobs")))
         .json(&body)
         .send()
@@ -748,11 +750,19 @@ struct IvmStepResponse {
     tick: u64,
 }
 
-/// Run one IVM tick on a remote job. Returns `(active_views, tick)`.
+/// Summary returned by [`execute_coordinator_ivm_step`].
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteStepSummary {
+    pub active_views: usize,
+    pub total_output_rows: usize,
+    pub tick: u64,
+}
+
+/// Run one IVM tick on a remote job. Returns a [`RemoteStepSummary`].
 pub async fn execute_coordinator_ivm_step(
     coordinator_http: &str,
     job_id: &str,
-) -> RuntimeResult<(usize, u64)> {
+) -> RuntimeResult<RemoteStepSummary> {
     let base = normalize_http_base(coordinator_http)?;
     let client = coordinator_http_client()?;
     let resp =
@@ -771,7 +781,11 @@ pub async fn execute_coordinator_ivm_step(
         .json()
         .await
         .map_err(|e| RuntimeError::transport(format!("ivm step decode: {e}")))?;
-    Ok((parsed.active_views, parsed.tick))
+    Ok(RemoteStepSummary {
+        active_views: parsed.active_views,
+        total_output_rows: parsed.total_output_rows,
+        tick: parsed.tick,
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -803,8 +817,11 @@ pub async fn execute_coordinator_ivm_checkpoint(
         .json()
         .await
         .map_err(|e| RuntimeError::transport(format!("ivm checkpoint decode: {e}")))?;
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &parsed.checkpoint_b64)
-        .map_err(|e| RuntimeError::transport(format!("checkpoint base64 decode: {e}")))
+    base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &parsed.checkpoint_b64,
+    )
+    .map_err(|e| RuntimeError::transport(format!("checkpoint base64 decode: {e}")))
 }
 
 #[derive(serde::Serialize)]
@@ -821,14 +838,15 @@ pub async fn execute_coordinator_ivm_restore(
     let base = normalize_http_base(coordinator_http)?;
     let client = coordinator_http_client()?;
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
-    let body = IvmRestoreBody { checkpoint_b64: b64 };
-    let resp = apply_coordinator_bearer(
-        client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/restore")),
-    )
-    .json(&body)
-    .send()
-    .await
-    .map_err(|e| RuntimeError::transport(format!("ivm restore: {e}")))?;
+    let body = IvmRestoreBody {
+        checkpoint_b64: b64,
+    };
+    let resp =
+        apply_coordinator_bearer(client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/restore")))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("ivm restore: {e}")))?;
     if !resp.status().is_success() {
         return Err(RuntimeError::transport(format!(
             "ivm restore HTTP {}",

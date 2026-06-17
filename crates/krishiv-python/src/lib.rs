@@ -11,9 +11,9 @@ mod blocking_session;
 mod dataframe;
 mod errors;
 mod expression;
+mod incremental;
 mod job_status;
 mod lakehouse;
-mod incremental;
 mod live_table;
 mod memo;
 mod metrics_api;
@@ -46,8 +46,8 @@ pub use errors::{
     SchemaError, UdfError,
 };
 pub use expression::PyColumn;
+pub use incremental::{PyDeltaBatch, PyIncrementalFlow, PyRemoteIvmJob, PyStepSummary};
 pub use job_status::PyJobStatus;
-pub use incremental::{PyDeltaBatch, PyIncrementalFlow, PyStepSummary};
 pub use live_table::{PyChangeFeedIter, PyLiveTable};
 pub use prepared::PyPreparedStatement;
 pub use process_api::{PyListState, PyMapState, PyProcessContext, PyValueState};
@@ -63,7 +63,9 @@ pub use stream::{
     PyBroadcastStream, PyConnectedStreams, PyKeyedStream, PyMultiSourceWatermarkSpec, PyStream,
     PyWindowedStream,
 };
-pub use streaming::{PyDataStreamWriter, PyStreamingQuery, PyStreamingQueryProgress};
+pub use streaming::{
+    PyDataStreamWriter, PyRemoteStreamingJob, PyStreamingQuery, PyStreamingQueryProgress,
+};
 pub use streaming_dataframe::{PyDataStreamReader, PyStreamingDataFrame, interval_join};
 pub use udf::call_python_udf;
 pub use vector_sinks::{
@@ -178,6 +180,10 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<streaming::PyStreamingQueryProgress>()?;
     m.add_class::<streaming::PyStreamingQuery>()?;
     m.add_class::<streaming::PyDataStreamWriter>()?;
+    m.add_class::<streaming::PyRemoteStreamingJob>()?;
+    m.add_class::<incremental::PyRemoteIvmJob>()?;
+    m.add_function(wrap_pyfunction!(connect_ivm, m)?)?;
+    m.add_function(wrap_pyfunction!(connect_streaming, m)?)?;
 
     // Process function / stateful operator (Phase G parity)
     m.add_class::<process_api::PyProcessContext>()?;
@@ -196,6 +202,70 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     metrics_api::register_metrics_module(m.py(), m)?;
 
     Ok(())
+}
+
+// ── Convenience module-level connection functions ─────────────────────────────
+
+/// Connect to a remote IVM job on the coordinator.
+///
+/// Creates the job if it doesn't exist yet (idempotent).
+///
+/// Parameters
+/// ----------
+/// coordinator_url : str
+///     Base URL of the coordinator HTTP API, e.g. ``"http://localhost:8080"``.
+/// job_name : str
+///     Job name used as the job ID.
+///
+/// Returns
+/// -------
+/// RemoteIvmJob
+///     Handle to the remote IVM job.
+///
+/// Example::
+///
+///     import krishiv
+///     job = krishiv.connect_ivm("http://coordinator:8080", "revenue")
+///     job.register_view("total_revenue", "SELECT sum(amount) AS total FROM orders", RevenueSchema)
+///     job.feed_source("orders", delta)
+///     active_views, tick = job.step()
+#[pyo3::pyfunction]
+pub fn connect_ivm(
+    coordinator_url: String,
+    job_name: String,
+) -> pyo3::PyResult<incremental::PyRemoteIvmJob> {
+    incremental::PyRemoteIvmJob::py_new(coordinator_url, job_name)
+}
+
+/// Connect to a remote continuous streaming job on the coordinator.
+///
+/// The job must already be registered; use the coordinator HTTP API to
+/// create it first.
+///
+/// Parameters
+/// ----------
+/// coordinator_url : str
+///     Base URL of the coordinator HTTP API.
+/// job_id : str
+///     The streaming job ID assigned at registration time.
+///
+/// Returns
+/// -------
+/// RemoteStreamingJob
+///     Handle to the remote streaming job.
+///
+/// Example::
+///
+///     import krishiv
+///     job = krishiv.connect_streaming("http://coordinator:8080", "etl-job")
+///     job.push([batch])
+///     results = job.drain()
+#[pyo3::pyfunction]
+pub fn connect_streaming(
+    coordinator_url: String,
+    job_id: String,
+) -> streaming::PyRemoteStreamingJob {
+    streaming::PyRemoteStreamingJob::py_new(coordinator_url, job_id)
 }
 
 // ---------------------------------------------------------------------------

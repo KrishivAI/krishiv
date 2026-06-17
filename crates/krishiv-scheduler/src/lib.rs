@@ -26,8 +26,6 @@ pub mod barrier_client;
 pub mod barrier_dispatch;
 pub mod barrier_tracker;
 pub mod batch_sql;
-pub mod ivm;
-pub mod ivm_http;
 pub mod batch_sql_http;
 pub mod bounded_window;
 pub mod bounded_window_http;
@@ -38,12 +36,15 @@ pub mod coordinator_daemon;
 pub mod coordinator_sharded;
 pub mod heartbeat;
 pub mod in_process;
+pub mod ivm;
+pub mod ivm_http;
 pub mod job;
 pub mod job_coordinator;
 pub mod queryable_state_http;
 pub mod rpc_drain;
 pub mod store;
 pub mod transport;
+pub mod unified_jobs_http;
 
 // Re-export the public API at the crate root for source compatibility.
 pub use adaptive::{
@@ -66,8 +67,6 @@ pub use auth::{
     validate_grpc_auth_for_role, validate_grpc_writer,
 };
 pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
-pub use ivm::{IvmJobRegistry, SharedIvmJobRegistry};
-pub use ivm_http::{IvmRouterState, ivm_router};
 pub use barrier_tracker::CheckpointBarrierTracker;
 pub use batch_sql::{
     BatchSqlInlineTable, BatchSqlOutcome, BatchSqlTable, decode_inline_record_batches,
@@ -90,6 +89,9 @@ pub use error::{SchedulerError, SchedulerResult, TaskUpdateOutcome};
 pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
 #[cfg(feature = "etcd")]
 pub use etcd_metadata::EtcdMetadataStore;
+pub use ivm::{IvmJobRegistry, SharedIvmJobRegistry};
+pub use ivm_http::{IvmRouterState, ivm_router};
+pub use unified_jobs_http::api_unified_submit;
 pub(crate) mod rocksdb_metadata;
 pub use continuous_stream_http::{
     ContinuousStreamError, drain_continuous_stream_coordinated, push_continuous_input_coordinated,

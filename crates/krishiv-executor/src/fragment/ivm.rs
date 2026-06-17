@@ -33,7 +33,9 @@ pub struct IvmJobState {
 
 impl IvmJobState {
     pub fn new() -> Self {
-        Self { flow: IncrementalFlow::new() }
+        Self {
+            flow: IncrementalFlow::new(),
+        }
     }
 }
 
@@ -109,11 +111,6 @@ fn parse_schema_fields(fields: &[SchemaFieldJson]) -> Option<arrow::datatypes::S
 /// Prefix for IVM step fragments.
 pub const IVM_FRAGMENT_PREFIX: &str = "delta:step:";
 
-/// Returns true if the fragment body is an IVM step fragment.
-pub fn is_ivm_fragment(fragment: &str) -> bool {
-    fragment.starts_with(IVM_FRAGMENT_PREFIX)
-}
-
 // ── execution ─────────────────────────────────────────────────────────────────
 
 /// Execute one IVM tick for a `delta:step:` fragment.
@@ -128,11 +125,14 @@ pub async fn execute_ivm_fragment(
     // Fragment format: "delta:step:{job_id}|{deltas_json}|{specs_json}"
     let rest = fragment_body
         .strip_prefix(IVM_FRAGMENT_PREFIX)
-        .ok_or_else(|| format!("invalid IVM fragment: missing prefix"))?;
+        .ok_or_else(|| "invalid IVM fragment: missing prefix".to_string())?;
 
     let parts: Vec<&str> = rest.splitn(3, '|').collect();
     if parts.len() < 2 {
-        return Err(format!("invalid IVM fragment: expected at least 2 '|'-separated parts, got {}", parts.len()));
+        return Err(format!(
+            "invalid IVM fragment: expected at least 2 '|'-separated parts, got {}",
+            parts.len()
+        ));
     }
 
     let job_id = parts[0];
@@ -145,13 +145,15 @@ pub async fn execute_ivm_fragment(
         .or_insert_with(|| Arc::new(Mutex::new(IvmJobState::new())))
         .clone();
 
-    let pending_deltas: Vec<PendingDeltaJson> = serde_json::from_str(deltas_json)
-        .map_err(|e| format!("delta decode: {e}"))?;
-    let view_specs: Vec<ViewSpecJson> = serde_json::from_str(specs_json)
-        .map_err(|e| format!("spec decode: {e}"))?;
+    let pending_deltas: Vec<PendingDeltaJson> =
+        serde_json::from_str(deltas_json).map_err(|e| format!("delta decode: {e}"))?;
+    let view_specs: Vec<ViewSpecJson> =
+        serde_json::from_str(specs_json).map_err(|e| format!("spec decode: {e}"))?;
 
     let flow = {
-        let state = state_arc.lock().map_err(|_| "ivm state lock poisoned".to_string())?;
+        let state = state_arc
+            .lock()
+            .map_err(|_| "ivm state lock poisoned".to_string())?;
         state.flow.clone()
     };
 
@@ -172,13 +174,12 @@ pub async fn execute_ivm_fragment(
 
     // Feed pending deltas.
     for pd in &pending_deltas {
-        let ipc_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &pd.delta_b64,
-        )
-        .map_err(|e| format!("base64 decode delta for '{}': {e}", pd.source))?;
+        let ipc_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &pd.delta_b64)
+                .map_err(|e| format!("base64 decode delta for '{}': {e}", pd.source))?;
         let delta = deserialize_delta_batch(&ipc_bytes).map_err(|e| e.to_string())?;
-        flow.feed_source(pd.source.clone(), delta).map_err(|e| e.to_string())?;
+        flow.feed_source(pd.source.clone(), delta)
+            .map_err(|e| e.to_string())?;
     }
 
     // Run one tick.

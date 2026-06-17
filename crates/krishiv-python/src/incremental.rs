@@ -24,6 +24,7 @@
 
 use krishiv_api::{IncrementalFlow, StepSummary};
 use krishiv_delta::{DeltaBatch, IncrementalViewSpec, LatenessSpec};
+use krishiv_runtime::RemoteIvmJob;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
@@ -53,8 +54,8 @@ impl PyDeltaBatch {
     #[staticmethod]
     pub fn from_inserts(batch: PyRef<'_, PyBatch>) -> PyResult<Self> {
         let rb = batch.record_batch().clone();
-        let inner = DeltaBatch::from_inserts(rb)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let inner =
+            DeltaBatch::from_inserts(rb).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { inner })
     }
 
@@ -63,8 +64,8 @@ impl PyDeltaBatch {
     #[staticmethod]
     pub fn from_deletes(batch: PyRef<'_, PyBatch>) -> PyResult<Self> {
         let rb = batch.record_batch().clone();
-        let inner = DeltaBatch::from_deletes(rb)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let inner =
+            DeltaBatch::from_deletes(rb).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { inner })
     }
 
@@ -210,7 +211,10 @@ impl PyIncrementalFlow {
         let output_schema = PySchema::arrow_schema_from_class(schema)?;
         let lateness = lateness_ms
             .into_iter()
-            .map(|(col, ms)| LatenessSpec { column: col, lateness_ms: ms })
+            .map(|(col, ms)| LatenessSpec {
+                column: col,
+                lateness_ms: ms,
+            })
             .collect();
         let spec = IncrementalViewSpec {
             name,
@@ -385,6 +389,127 @@ impl PyIncrementalFlow {
             .tick()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(format!("IncrementalFlow(tick={tick})"))
+    }
+}
+
+// ── PyRemoteIvmJob ────────────────────────────────────────────────────────────
+
+/// Handle to an IVM job running on a remote coordinator.
+///
+/// Obtain via :func:`krishiv.connect_ivm` or
+/// :meth:`Session.connect_ivm`.
+///
+/// All methods are synchronous wrappers around async coordinator HTTP calls
+/// that run on the shared Krishiv Tokio runtime.
+///
+/// Example::
+///
+///     job = krishiv.connect_ivm("http://coordinator:8080", "revenue")
+///     job.feed_source("orders", delta)
+///     summary = job.step()
+///     print(summary)
+#[pyclass(name = "RemoteIvmJob")]
+pub struct PyRemoteIvmJob {
+    pub(crate) inner: RemoteIvmJob,
+}
+
+#[pymethods]
+impl PyRemoteIvmJob {
+    /// Connect to an existing IVM job on the coordinator.
+    ///
+    /// ``coordinator_url`` — base URL of the coordinator HTTP API,
+    ///   e.g. ``"http://localhost:8080"``.
+    /// ``job_name`` — job name / ID. Creates the job if it doesn't exist.
+    #[new]
+    pub fn py_new(coordinator_url: String, job_name: String) -> PyResult<Self> {
+        use crate::RUNTIME;
+        let inner = RUNTIME
+            .block_on(RemoteIvmJob::create(&coordinator_url, Some(&job_name)))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// The coordinator-assigned job ID.
+    #[getter]
+    pub fn job_id(&self) -> &str {
+        self.inner.job_id()
+    }
+
+    /// Register or update an incremental view on this job.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    ///     Logical view name.
+    /// body_sql : str
+    ///     SQL body for the view.
+    /// schema : type
+    ///     A :class:`krishiv.Schema` subclass declaring output columns.
+    /// is_materialized : bool, optional
+    ///     Maintain a full snapshot (default ``False``).
+    /// is_recursive : bool, optional
+    ///     Participate in fixed-point iteration (default ``False``).
+    #[pyo3(signature = (name, body_sql, schema, is_materialized=false, is_recursive=false))]
+    pub fn register_view(
+        &self,
+        name: String,
+        body_sql: String,
+        schema: &Bound<'_, PyType>,
+        is_materialized: bool,
+        is_recursive: bool,
+    ) -> PyResult<()> {
+        use crate::RUNTIME;
+        let output_schema = PySchema::arrow_schema_from_class(schema)?;
+        let spec = IncrementalViewSpec {
+            name,
+            body_sql,
+            output_schema,
+            is_materialized,
+            is_recursive,
+            lateness: vec![],
+        };
+        RUNTIME
+            .block_on(self.inner.register_view(&spec))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Push a :class:`DeltaBatch` as input delta for a named source.
+    pub fn feed_source(&self, source_name: String, batch: PyRef<'_, PyDeltaBatch>) -> PyResult<()> {
+        use crate::RUNTIME;
+        RUNTIME
+            .block_on(self.inner.feed_source(&source_name, &batch.inner))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Advance one clock tick on the coordinator.
+    ///
+    /// Returns a :class:`StepSummary`-like tuple ``(active_views, total_output_rows, tick)``.
+    pub fn step(&self) -> PyResult<(usize, usize, u64)> {
+        use crate::RUNTIME;
+        RUNTIME
+            .block_on(self.inner.step())
+            .map(|s| (s.active_views, s.total_output_rows, s.tick))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Retrieve a serialized checkpoint from the coordinator as bytes.
+    pub fn checkpoint(&self) -> PyResult<Vec<u8>> {
+        use crate::RUNTIME;
+        RUNTIME
+            .block_on(self.inner.checkpoint())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Restore this job from previously captured checkpoint bytes.
+    pub fn restore(&self, bytes: Vec<u8>) -> PyResult<()> {
+        use crate::RUNTIME;
+        RUNTIME
+            .block_on(self.inner.restore(&bytes))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!("RemoteIvmJob(job_id='{}')", self.inner.job_id())
     }
 }
 

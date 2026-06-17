@@ -22,7 +22,9 @@ use axum::extract::{FromRef, Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use krishiv_ivm::{DeltaBatch, IncrementalViewSpec, deserialize_delta_batch, serialize_delta_batch};
+use krishiv_ivm::{
+    DeltaBatch, IncrementalViewSpec, deserialize_delta_batch, serialize_delta_batch,
+};
 
 use crate::SharedCoordinator;
 use crate::ivm::SharedIvmJobRegistry;
@@ -103,12 +105,8 @@ fn parse_schema(s: &SchemaJson) -> Option<arrow::datatypes::SchemaRef> {
                 "LargeUtf8" => Some(DataType::LargeUtf8),
                 "Boolean" => Some(DataType::Boolean),
                 "Binary" => Some(DataType::Binary),
-                "TimestampMs" => {
-                    Some(DataType::Timestamp(TimeUnit::Millisecond, None))
-                }
-                "TimestampUs" => {
-                    Some(DataType::Timestamp(TimeUnit::Microsecond, None))
-                }
+                "TimestampMs" => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
+                "TimestampUs" => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
                 "Date32" => Some(DataType::Date32),
                 "Date64" => Some(DataType::Date64),
                 _ => None,
@@ -139,9 +137,7 @@ pub async fn api_ivm_create_job(
     let job_id = body
         .job_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    registry
-        .create(job_id.clone())
-        .map_err(|e| ivm_err(e))?;
+    registry.create(job_id.clone()).map_err(ivm_err)?;
     Ok(Json(CreateJobResponse { job_id }))
 }
 
@@ -155,7 +151,9 @@ pub struct ListJobsResponse {
 pub async fn api_ivm_list_jobs(
     State(registry): State<SharedIvmJobRegistry>,
 ) -> Json<ListJobsResponse> {
-    Json(ListJobsResponse { job_ids: registry.job_ids() })
+    Json(ListJobsResponse {
+        job_ids: registry.job_ids(),
+    })
 }
 
 // ── DELETE /api/v1/ivm/jobs/{job_id} ─────────────────────────────────────────
@@ -169,7 +167,9 @@ pub async fn api_ivm_delete_job(
     State(registry): State<SharedIvmJobRegistry>,
     Path(job_id): Path<String>,
 ) -> Json<DeleteJobResponse> {
-    Json(DeleteJobResponse { deleted: registry.delete(&job_id) })
+    Json(DeleteJobResponse {
+        deleted: registry.delete(&job_id),
+    })
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/views ─────────────────────────────────────
@@ -195,7 +195,9 @@ pub async fn api_ivm_register_view(
     Path(job_id): Path<String>,
     Json(body): Json<RegisterViewRequest>,
 ) -> Result<Json<RegisterViewResponse>, StatusCode> {
-    let flow = registry.get(&job_id).ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
     let output_schema =
         parse_schema(&body.output_schema).ok_or_else(|| ivm_err("invalid output_schema"))?;
     let spec = IncrementalViewSpec {
@@ -206,7 +208,7 @@ pub async fn api_ivm_register_view(
         is_recursive: body.is_recursive,
         lateness: vec![],
     };
-    flow.register_view(spec).map_err(|e| ivm_err(e))?;
+    flow.register_view(spec).map_err(ivm_err)?;
     Ok(Json(RegisterViewResponse { success: true }))
 }
 
@@ -221,8 +223,10 @@ pub async fn api_ivm_drop_view(
     State(registry): State<SharedIvmJobRegistry>,
     Path((job_id, view_name)): Path<(String, String)>,
 ) -> Result<Json<DropViewResponse>, StatusCode> {
-    let flow = registry.get(&job_id).ok_or_else(|| ivm_not_found(&job_id))?;
-    let dropped = flow.drop_view(&view_name).map_err(|e| ivm_err(e))?;
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let dropped = flow.drop_view(&view_name).map_err(ivm_err)?;
     Ok(Json(DropViewResponse { dropped }))
 }
 
@@ -244,14 +248,16 @@ pub async fn api_ivm_feed_source(
     Path((job_id, source_name)): Path<(String, String)>,
     Json(body): Json<FeedSourceRequest>,
 ) -> Result<Json<FeedSourceResponse>, StatusCode> {
-    let flow = registry.get(&job_id).ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.delta_ipc_b64,
     )
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
-    let delta = deserialize_delta_batch(&ipc_bytes).map_err(|e| ivm_err(e))?;
-    flow.feed_source(source_name, delta).map_err(|e| ivm_err(e))?;
+    let delta = deserialize_delta_batch(&ipc_bytes).map_err(ivm_err)?;
+    flow.feed_source(source_name, delta).map_err(ivm_err)?;
     Ok(Json(FeedSourceResponse { success: true }))
 }
 
@@ -269,7 +275,9 @@ pub async fn api_ivm_step(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
 ) -> Result<Json<StepResponse>, StatusCode> {
-    let flow = registry.get(&job_id).ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
 
     // Log executor availability for observability. IVM computation always runs
     // centrally on the coordinator (distributed ingestion, centralized compute).
@@ -308,16 +316,24 @@ pub async fn api_ivm_snapshot(
     State(registry): State<SharedIvmJobRegistry>,
     Path((job_id, view_name)): Path<(String, String)>,
 ) -> Result<Json<SnapshotResponse>, StatusCode> {
-    let flow = registry.get(&job_id).ok_or_else(|| ivm_not_found(&job_id))?;
-    let rb_opt = flow.source_snapshot(&view_name).map_err(|e| ivm_err(e))?;
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let rb_opt = flow.source_snapshot(&view_name).map_err(ivm_err)?;
     match rb_opt {
-        None => Ok(Json(SnapshotResponse { snapshot_ipc_b64: None, num_rows: 0 })),
+        None => Ok(Json(SnapshotResponse {
+            snapshot_ipc_b64: None,
+            num_rows: 0,
+        })),
         Some(rb) => {
             let num_rows = rb.num_rows();
-            let delta = DeltaBatch::from_inserts(rb).map_err(|e| ivm_err(e))?;
-            let ipc = serialize_delta_batch(&delta).map_err(|e| ivm_err(e))?;
+            let delta = DeltaBatch::from_inserts(rb).map_err(ivm_err)?;
+            let ipc = serialize_delta_batch(&delta).map_err(ivm_err)?;
             let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
-            Ok(Json(SnapshotResponse { snapshot_ipc_b64: Some(b64), num_rows }))
+            Ok(Json(SnapshotResponse {
+                snapshot_ipc_b64: Some(b64),
+                num_rows,
+            }))
         }
     }
 }
@@ -335,17 +351,25 @@ pub async fn api_ivm_view_output(
     State(registry): State<SharedIvmJobRegistry>,
     Path((job_id, view_name)): Path<(String, String)>,
 ) -> Result<Json<ViewOutputResponse>, StatusCode> {
-    let flow = registry.get(&job_id).ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
     // Peek at the current watch value without blocking.
-    let rx = flow.view_output_stream(&view_name).map_err(|e| ivm_err(e))?;
+    let rx = flow.view_output_stream(&view_name).map_err(ivm_err)?;
     let guard = rx.borrow();
     match guard.as_ref() {
-        None => Ok(Json(ViewOutputResponse { delta_ipc_b64: None, num_rows: 0 })),
+        None => Ok(Json(ViewOutputResponse {
+            delta_ipc_b64: None,
+            num_rows: 0,
+        })),
         Some(delta) => {
             let num_rows = delta.num_rows();
-            let ipc = serialize_delta_batch(delta).map_err(|e| ivm_err(e))?;
+            let ipc = serialize_delta_batch(delta).map_err(ivm_err)?;
             let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
-            Ok(Json(ViewOutputResponse { delta_ipc_b64: Some(b64), num_rows }))
+            Ok(Json(ViewOutputResponse {
+                delta_ipc_b64: Some(b64),
+                num_rows,
+            }))
         }
     }
 }
@@ -362,10 +386,14 @@ pub async fn api_ivm_checkpoint(
     State(registry): State<SharedIvmJobRegistry>,
     Path(job_id): Path<String>,
 ) -> Result<Json<CheckpointResponse>, StatusCode> {
-    let flow = registry.get(&job_id).ok_or_else(|| ivm_not_found(&job_id))?;
-    let bytes = flow.checkpoint().map_err(|e| ivm_err(e))?;
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let bytes = flow.checkpoint().map_err(ivm_err)?;
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-    Ok(Json(CheckpointResponse { checkpoint_b64: b64 }))
+    Ok(Json(CheckpointResponse {
+        checkpoint_b64: b64,
+    }))
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/restore ───────────────────────────────────
@@ -385,13 +413,15 @@ pub async fn api_ivm_restore(
     Path(job_id): Path<String>,
     Json(body): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>, StatusCode> {
-    let flow = registry.get(&job_id).ok_or_else(|| ivm_not_found(&job_id))?;
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
     let bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.checkpoint_b64,
     )
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
-    flow.restore(&bytes).map_err(|e| ivm_err(e))?;
+    flow.restore(&bytes).map_err(ivm_err)?;
     Ok(Json(RestoreResponse { success: true }))
 }
 
@@ -406,9 +436,20 @@ use axum::routing::{delete, get, post};
 /// be merged into the main coordinator router.
 pub fn ivm_router(state: IvmRouterState) -> Router<()> {
     Router::new()
-        .route("/api/v1/ivm/jobs", post(api_ivm_create_job).get(api_ivm_list_jobs))
+        // Unified submit endpoint — dispatches by `kind` field.
+        .route(
+            "/api/v1/jobs",
+            post(crate::unified_jobs_http::api_unified_submit),
+        )
+        .route(
+            "/api/v1/ivm/jobs",
+            post(api_ivm_create_job).get(api_ivm_list_jobs),
+        )
         .route("/api/v1/ivm/jobs/{job_id}", delete(api_ivm_delete_job))
-        .route("/api/v1/ivm/jobs/{job_id}/views", post(api_ivm_register_view))
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/views",
+            post(api_ivm_register_view),
+        )
         .route(
             "/api/v1/ivm/jobs/{job_id}/views/{view_name}",
             delete(api_ivm_drop_view),
@@ -426,7 +467,10 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
             "/api/v1/ivm/jobs/{job_id}/views/{view_name}/output",
             get(api_ivm_view_output),
         )
-        .route("/api/v1/ivm/jobs/{job_id}/checkpoint", post(api_ivm_checkpoint))
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/checkpoint",
+            post(api_ivm_checkpoint),
+        )
         .route("/api/v1/ivm/jobs/{job_id}/restore", post(api_ivm_restore))
         .with_state(state)
 }
