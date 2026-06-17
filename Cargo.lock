@@ -5596,6 +5596,7 @@ dependencies = [
 name = "krishiv-ivm"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arrow 58.3.0",
  "datafusion 53.1.0",
  "krishiv-common",
@@ -5604,6 +5605,8 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+ "twox-hash",
 ]
 
 [[package]]
@@ -5727,6 +5730,7 @@ dependencies = [
  "dashmap",
  "futures",
  "krishiv-common",
+ "krishiv-connectors",
  "krishiv-dataflow",
  "krishiv-executor",
  "krishiv-flight-sql",

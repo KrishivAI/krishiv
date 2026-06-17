@@ -1,5 +1,99 @@
 # Krishiv Implementation Status
 
+## 2026-06-17 (session 2) — IVM optimisations: dirty-bit scheduling, dedup, delta checkpoints, vector sink, provenance
+
+### Work completed
+
+**[O-1] Dirty-bit tick scheduling — `IncrementalFlow::step_datafusion_with_ctx`**
+- Early exit when `pending` is empty (no lock re-entry, no SQL, just tick bump).
+- Pre-populates `view_full_outputs` with previous view snapshots so clean views still serve as
+  MemTables for downstream dirty views.
+- Computes `dirty_sources` (lowercased source names with non-empty input) and propagates
+  transitively through topo order via `dirty_views: HashSet<String>`.
+- Only dirty views execute SQL in phase 4; only dirty views are diffed in phase 5+6.
+- Result: SQL execution scales with the number of affected views, not all registered views.
+
+**[O-2] Content-addressed dedup — opt-in row-level dedup in `feed_source`**
+- `enable_input_dedup()`: activates per-source `AHashSet<u64>` of seen XxHash64 row hashes.
+- Insertion rows (weight > 0) are hashed across all data columns (null-byte separators to prevent
+  collisions). Re-delivered hashes are silently dropped; retractions always pass through.
+- `hash_row(batch, row) -> u64`: public `pub(crate)` helper; XxHash64 oneshot with seed
+  `0xcafe_babe_dead_beef`.
+- Uses `DeltaBatch::filter_mask` (already existed) to materialize the filtered batch.
+
+**[O-3] Streaming → IVM bridge — `feed_stream_output`**
+- `IncrementalFlow::feed_stream_output(source_name, batches: &[RecordBatch])`:
+  wraps each batch as `DeltaBatch::from_inserts`, calls `feed_source` (with dedup if enabled).
+  Converts streaming micro-batch output to IVM source insertions.
+
+**[O-4] Delta-encoded checkpoints**
+- `enable_delta_checkpoints()`: activates per-source `Vec<DeltaBatch>` accumulator.
+- `checkpoint_delta() -> Vec<u8>`: serialises accumulated deltas (same IPC format as full
+  checkpoint) and clears the accumulator. Returns `count=0` bytes if no new input.
+- `restore_delta(bytes)`: applies accumulated deltas directly to `source_snapshots` without SQL
+  execution; resets view baselines so the next step re-diffs from updated state.
+- Combined usage: `checkpoint()` for full baseline + `checkpoint_delta()` at each tick → restore
+  with `restore()` + `restore_delta()` calls in order.
+
+**[O-5] IVM → vector sink (no ML model deployment)**
+- **`krishiv-ivm/src/vector_sink.rs`** (new):
+  - `IvmVectorSink` trait: `upsert_batch(ids, vectors)` and `delete_batch(ids)` using
+    pinned boxed futures (no `async-trait` dep).
+  - `VectorViewSpec { view_name, id_column, vector_column, sink }`: user provides pre-computed
+    `FixedSizeList<Float32>` column; Krishiv handles incremental upsert/delete.
+  - `spawn_vector_view(flow, spec) -> JoinHandle<()>`: Tokio background task watching view
+    output stream; routes positive-weight rows → upsert, negative-weight → delete.
+  - `extract_vector_rows`: supports `FixedSizeListArray` and `ListArray<Float32>`.
+  - `testing::InMemoryVectorSink`: in-memory sink for unit tests.
+- **`krishiv-runtime/src/vector_sink_bridge.rs`** (new, `feature = "vector-sinks"`):
+  - `VectorSinkBridge`: wraps any `krishiv-connectors::VectorSink` (Qdrant, pgvector, LanceDB,
+    Pinecone, Weaviate) and implements `IvmVectorSink`. Converts `(ids, vectors)` to
+    `EmbeddingBatch`; uses monotonic epoch counter for idempotent upserts.
+  - Feature gate: `krishiv-runtime/Cargo.toml` `[features] vector-sinks = ["dep:krishiv-connectors"]`.
+
+**[O-6] ProvenanceIndex — opt-in input→output hash tracking**
+- **`krishiv-ivm/src/provenance.rs`** (new):
+  - `ProvenanceIndex`: `AHashMap<u64, AHashSet<u64>>` mapping input row hashes to sets of
+    output row hashes derived from them.
+  - `record(input_hash, output_hash)`, `record_many`, `outputs_for`, `forget`, `forget_many`.
+  - `hash_batch_row(batch, row) -> u64` / `hash_all_rows(batch) -> Vec<u64>`: public helpers
+    re-using `flow::hash_row` for consistency between dedup and provenance.
+  - 3 unit tests: record+lookup, forget, hash determinism.
+  - Use case: when input row is retracted (CDC DELETE), look up all output hashes to retract
+    without re-running view SQL.
+
+### Dependencies added
+
+- `krishiv-ivm`: `ahash`, `twox-hash`, `tracing` (workspace)
+- `krishiv-runtime`: `krishiv-connectors` (optional, `vector-sinks` feature)
+
+### Validation
+
+```
+cargo check --workspace --exclude krishiv-python  # 0 errors
+cargo test -p krishiv-ivm --lib                   # 3 passed (provenance tests)
+cargo test -p krishiv-delta -p krishiv-ivm -p krishiv-runtime --lib  # 315 passed, 0 failed
+cargo clippy -p krishiv-ivm --all-targets         # 0 errors, 0 warnings
+```
+
+### Pending items
+
+- **DataFusion Incremental Physical Optimizer** (highest-priority, 3-4 weeks): `PhysicalOptimizerRule`
+  substituting `AggregateExec` → `IncrementalAggregateExec`, `HashJoinExec` → `IncrementalHashJoinExec`.
+  Makes `step_datafusion` O(delta) not O(state). Needs `IncrementalAggOp` / `IncrementalJoinOp`
+  wired into DataFusion physical execution.
+- **Hybrid IVM cost-based switch** (depends on incremental physical optimizer being available).
+- **RocksDB-backed trace/spill** (design in ADR-I-02, implementation scaffolded in `krishiv-state`).
+- Pre-existing `krishiv-python` pyo3-arrow 0.19 / arrow-58 mismatch (excluded from CI gates).
+
+### Next useful command
+
+```bash
+cargo test --workspace --exclude krishiv-python --lib
+```
+
+---
+
 ## 2026-06-17 — Incremental computing engine (Phases I-1 through I-7)
 
 Implemented a complete incremental view maintenance (IVM) subsystem for Krishiv,
@@ -4271,3 +4365,100 @@ cargo check -p krishiv-python                        # 0 errors (Finished dev)
 - `cargo test -p krishiv-connectors --features kafka --lib`
 - Integration test: spin up Kafka + transactional sink, verify commit/abort semantics
 - Python wheel build: `maturin develop --features cassandra,elasticsearch,hbase,qdrant,pgvector`
+
+---
+
+## 2026-06-17 — Unified Compute API: ergonomic handles across batch, IVM, and streaming modes
+
+Implemented a unified API layer so Rust and Python users write the same code
+regardless of whether they're running embedded, single-node, or distributed.
+
+### New files
+
+**`crates/krishiv-runtime/src/ivm_job.rs`**
+- `RemoteIvmJob` — handle to a coordinator-managed IVM job: `create(url, name)`,
+  `register_view`, `feed_source`, `step → RemoteStepSummary`, `checkpoint`, `restore`
+- `EmbeddedIvmJob` — in-process counterpart wrapping `IncrementalFlow` from the
+  shared `SharedIvmJobRegistry`
+- `IvmJobHandle` — mode-agnostic enum (`Embedded | Remote`) with unified
+  `feed_source` and `step → (active_views, tick)`
+
+**`crates/krishiv-runtime/src/streaming_job.rs`**
+- `RemoteStreamingJob` — wraps `push(batches)` / `drain()` HTTP calls for
+  coordinator-managed continuous streaming jobs
+
+**`crates/krishiv-runtime/src/krishiv_session.rs`**
+- `KrishivSession::embedded()` / `KrishivSession::distributed(url)` top-level
+  builder; `.ivm_job(name)` returns the right `IvmJobHandle` transparently
+
+**`crates/krishiv-scheduler/src/unified_jobs_http.rs`**
+- `POST /api/v1/jobs` — unified submission endpoint dispatching by
+  `kind = "batch_sql" | "ivm" | "streaming"`. Returns `job_id`, `kind`, and
+  for batch jobs `state = "Submitted"` + `poll_url`. Backward-compatible with
+  all existing per-subsystem endpoints.
+
+### Modified files
+
+- `coordinator_http_client.rs`: `execute_coordinator_ivm_step` now returns
+  `RemoteStepSummary { active_views, total_output_rows, tick }` instead of a tuple
+- `ivm_http.rs`: wires `POST /api/v1/jobs` into `ivm_router`; 12 redundant-closure
+  clippy fixes applied
+- `krishiv-python/Cargo.toml`: adds `krishiv-runtime` and `krishiv-ivm` direct deps
+- `krishiv-python/src/incremental.rs`: adds `PyRemoteIvmJob` with `register_view`,
+  `feed_source`, `step → (active_views, total_output_rows, tick)`, `checkpoint`, `restore`
+- `krishiv-python/src/streaming.rs`: adds `PyRemoteStreamingJob` with `push`/`drain`
+- `krishiv-python/src/lib.rs`: registers new classes + `connect_ivm` / `connect_streaming`
+  module-level factory functions
+- `krishiv-executor/src/fragment/ivm.rs`: removes dead `is_ivm_fragment` function
+
+### Python API surface
+
+```python
+import krishiv
+
+# Connect to remote IVM job (creates idempotently)
+job = krishiv.connect_ivm("http://coordinator:8080", "revenue")
+job.register_view("total", "SELECT sum(amount) AS total FROM orders", Revenue)
+job.feed_source("orders", delta)
+active_views, total_rows, tick = job.step()
+
+# Connect to remote streaming job
+stream = krishiv.connect_streaming("http://coordinator:8080", "etl")
+stream.push([batch])
+results = stream.drain()
+```
+
+### Rust API surface
+
+```rust
+// Embedded
+let session = KrishivSession::embedded();
+let job = session.ivm_job("revenue").await?;
+
+// Distributed — same call
+let session = KrishivSession::distributed("http://coordinator:8080");
+let job = session.ivm_job("revenue").await?;
+
+job.feed_source("orders", &delta).await?;
+let (active_views, tick) = job.step().await?;
+```
+
+### Validation
+
+```
+cargo check --workspace --exclude krishiv-python --exclude krishiv-chaos  # 0 errors
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings  # 0 errors
+cargo test -p krishiv-runtime -p krishiv-scheduler -p krishiv-executor --lib  # 310/310 passed
+cargo fmt --check  # clean
+```
+
+### Commit
+
+`52a0f95` feat: implement unified compute API across batch, IVM, and streaming modes
+
+### Next steps
+
+- Push `52a0f95` to origin/main when ready
+- Phase 7 (ComputeStream trait): `impl Stream<Item=RecordBatch>` unifying all three
+  modes for async iteration — deferred as optional ergonomics improvement
+- Python wheel build to verify PyRemoteIvmJob loads correctly at import time

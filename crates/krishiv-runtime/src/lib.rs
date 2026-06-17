@@ -25,6 +25,7 @@ pub mod local_streaming;
 mod plan;
 pub mod stream_kafka;
 pub mod streaming_job;
+pub mod vector_sink_bridge;
 
 pub use continuous_stream::{ContinuousStreamError, ContinuousStreamRegistry};
 pub use coordinator_http_client::{
@@ -55,6 +56,8 @@ pub use local_streaming::{
 };
 pub use plan::{is_streaming_plan, streaming_spec_from_plan};
 pub use streaming_job::RemoteStreamingJob;
+#[cfg(feature = "vector-sinks")]
+pub use vector_sink_bridge::VectorSinkBridge;
 
 // tracing is used for debug-level plan delegation logging.
 use tracing::debug;

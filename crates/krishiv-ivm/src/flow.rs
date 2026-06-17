@@ -11,19 +11,31 @@
 //! 3. Each view's full SQL result is **differenced** against the previous
 //!    output (`diff_and_update`) to produce a true incremental `DeltaBatch`.
 //! 4. Only non-empty deltas are published to watch subscribers.
+//!
+//! # Optimisations
+//!
+//! * **Dirty-bit scheduling**: views whose SQL references no dirty source or
+//!   upstream view are skipped entirely; their previous snapshot is reused.
+//! * **Content-addressed dedup**: opt-in per-source row-hash filter drops
+//!   re-delivered insertion rows (at-least-once delivery resilience).
+//! * **Delta checkpoints**: accumulate per-source `DeltaBatch`es and serialise
+//!   only the incremental slice since the last checkpoint.
+//! * **Streaming bridge**: `feed_stream_output` converts micro-batch output
+//!   (all-positive `RecordBatch`es) into source `DeltaBatch`es.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::RecordBatch;
+use ahash::{AHashMap, AHashSet};
+use arrow::array::{Array, RecordBatch};
 use arrow::compute::cast;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use tokio::sync::watch;
 
 use krishiv_delta::{
-    DeltaBatch, DeltaError, IncrementalViewRegistry, IncrementalViewSpec,
-    apply_delta, deserialize_delta_batch, serialize_delta_batch,
+    DeltaBatch, DeltaError, IncrementalViewRegistry, IncrementalViewSpec, apply_delta,
+    deserialize_delta_batch, serialize_delta_batch,
 };
 
 use crate::error::{IvmError, IvmResult};
@@ -43,6 +55,14 @@ struct IncrementalFlowInner {
     pending: HashMap<String, Vec<DeltaBatch>>,
     tick: u64,
     source_snapshots: HashMap<String, RecordBatch>,
+
+    // Content-addressed dedup: opt-in per-source insertion row dedup.
+    input_dedup_enabled: bool,
+    seen_input_hashes: AHashMap<String, AHashSet<u64>>,
+
+    // Delta checkpoints: accumulate deltas since last checkpoint call.
+    delta_checkpoint_enabled: bool,
+    checkpoint_deltas: HashMap<String, Vec<DeltaBatch>>,
 }
 
 // ── IncrementalFlow ───────────────────────────────────────────────────────────
@@ -63,8 +83,29 @@ impl IncrementalFlow {
                 pending: HashMap::new(),
                 tick: 0,
                 source_snapshots: HashMap::new(),
+                input_dedup_enabled: false,
+                seen_input_hashes: AHashMap::new(),
+                delta_checkpoint_enabled: false,
+                checkpoint_deltas: HashMap::new(),
             })),
         }
+    }
+
+    /// Enable content-addressed dedup for all sources.
+    ///
+    /// Once enabled, re-delivered insertion rows (same hash as a previously
+    /// accepted row) are silently dropped. Retractions always pass through.
+    pub fn enable_input_dedup(&self) -> IvmResult<()> {
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        inner.input_dedup_enabled = true;
+        Ok(())
+    }
+
+    /// Enable accumulation of per-source deltas for `checkpoint_delta`.
+    pub fn enable_delta_checkpoints(&self) -> IvmResult<()> {
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        inner.delta_checkpoint_enabled = true;
+        Ok(())
     }
 
     /// Register or re-register an incremental view.
@@ -85,9 +126,79 @@ impl IncrementalFlow {
     }
 
     /// Push a `DeltaBatch` as input for a named source on the next step.
+    ///
+    /// If content-addressed dedup is enabled, insertion rows already seen in a
+    /// prior tick are silently dropped.
     pub fn feed_source(&self, source_name: impl Into<String>, batch: DeltaBatch) -> IvmResult<()> {
+        let source_name = source_name.into();
         let mut inner = self.inner.lock().map_err(lock_err)?;
-        inner.pending.entry(source_name.into()).or_default().push(batch);
+
+        // Content-addressed dedup: filter out re-delivered insertion rows.
+        let batch = if inner.input_dedup_enabled {
+            let seen = inner
+                .seen_input_hashes
+                .entry(source_name.clone())
+                .or_default();
+            let data = batch.data_batch();
+            let weights = batch.weights();
+            let mask: arrow::array::BooleanArray = (0..data.num_rows())
+                .map(|row| {
+                    if weights.value(row) > 0 {
+                        let h = hash_row(&data, row);
+                        if seen.contains(&h) {
+                            Some(false) // already seen
+                        } else {
+                            seen.insert(h);
+                            Some(true)
+                        }
+                    } else {
+                        Some(true) // retractions always pass
+                    }
+                })
+                .collect();
+            batch.filter_mask(&mask).map_err(delta_err)?
+        } else {
+            batch
+        };
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // Accumulate for delta checkpoints.
+        if inner.delta_checkpoint_enabled {
+            inner
+                .checkpoint_deltas
+                .entry(source_name.clone())
+                .or_default()
+                .push(batch.clone());
+        }
+
+        inner
+            .pending
+            .entry(source_name)
+            .or_default()
+            .push(batch);
+        Ok(())
+    }
+
+    /// Feed streaming micro-batch output as all-positive insertions for a source.
+    ///
+    /// Each `RecordBatch` in `batches` is wrapped in a `DeltaBatch::from_inserts`
+    /// and queued for the next `step_datafusion` tick. Empty batches are skipped.
+    pub fn feed_stream_output(
+        &self,
+        source_name: impl Into<String>,
+        batches: &[RecordBatch],
+    ) -> IvmResult<()> {
+        let name: String = source_name.into();
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let delta = DeltaBatch::from_inserts(batch.clone()).map_err(delta_err)?;
+            self.feed_source(name.clone(), delta)?;
+        }
         Ok(())
     }
 
@@ -117,7 +228,10 @@ impl IncrementalFlow {
                 let _ = view.publish_output(delta);
             }
         }
-        Ok(StepSummary { total_output_rows, active_views })
+        Ok(StepSummary {
+            total_output_rows,
+            active_views,
+        })
     }
 
     /// Advance one tick using DataFusion to execute view SQL.
@@ -126,22 +240,49 @@ impl IncrementalFlow {
     }
 
     /// Advance one tick using the supplied `SessionContext`.
+    ///
+    /// Views whose SQL references no dirty source or upstream view are skipped
+    /// (dirty-bit scheduling); their previous snapshot is reused unchanged.
     pub async fn step_datafusion_with_ctx(&self, ctx: &SessionContext) -> IvmResult<StepSummary> {
-        // Phase 1: drain pending, snapshot state (brief lock).
-        let (raw_pending, current_snapshots, view_specs) = {
+        // Phase 1: drain pending, snapshot state, extract prev view outputs (brief lock).
+        let (raw_pending, current_snapshots, view_specs, view_prev_snapshots) = {
             let mut inner = self.inner.lock().map_err(lock_err)?;
             let raw = std::mem::take(&mut inner.pending);
             let snapshots = inner.source_snapshots.clone();
             let names = inner.view_registry.view_names().map_err(delta_err)?;
             let specs: Vec<IncrementalViewSpec> = names
-                .into_iter()
-                .filter_map(|n| inner.view_registry.get(&n).ok().map(|v| v.spec.clone()))
+                .iter()
+                .filter_map(|n| inner.view_registry.get(n).ok().map(|v| v.spec.clone()))
                 .collect();
-            (raw, snapshots, specs)
+            // Extract previous view outputs for dirty-bit reuse.
+            let prev_outputs: HashMap<String, RecordBatch> = names
+                .iter()
+                .filter_map(|n| {
+                    inner
+                        .view_registry
+                        .get(n)
+                        .ok()
+                        .and_then(|v| v.snapshot().ok().flatten())
+                        .map(|snap| (n.clone(), snap))
+                })
+                .collect();
+            (raw, snapshots, specs, prev_outputs)
         };
 
-        // Phase 2: apply deltas to snapshots (no lock).
+        // Phase 2: apply deltas to source snapshots (no lock).
         let inputs = coalesce_pending(raw_pending)?;
+
+        // Early exit: if no sources have pending input, just bump the tick.
+        if inputs.is_empty() {
+            let mut inner = self.inner.lock().map_err(lock_err)?;
+            inner.tick += 1;
+            return Ok(StepSummary::default());
+        }
+
+        // Dirty-bit set: lowercase source names that had non-empty input.
+        let dirty_sources: HashSet<String> =
+            inputs.keys().map(|k| k.to_lowercase()).collect();
+
         let mut new_snapshots = current_snapshots;
         for (name, delta) in &inputs {
             let current = new_snapshots.remove(name);
@@ -149,7 +290,7 @@ impl IncrementalFlow {
             new_snapshots.insert(name.clone(), updated);
         }
 
-        // Phase 3: register source snapshots as MemTables.
+        // Phase 3: register source snapshots as DataFusion MemTables.
         for (name, snapshot) in &new_snapshots {
             if snapshot.num_rows() == 0 {
                 continue;
@@ -161,17 +302,37 @@ impl IncrementalFlow {
                 .map_err(|e| IvmError::execution(e.to_string()))?;
         }
 
-        // Phase 4: execute views in topological order.
+        // Phase 4: execute views in topological order with dirty-bit skip.
         let topo = toposort_views(&view_specs);
         let spec_map: HashMap<&str, &IncrementalViewSpec> =
             view_specs.iter().map(|s| (s.name.as_str(), s)).collect();
-        let mut view_full_outputs: HashMap<String, RecordBatch> = HashMap::new();
+
+        // Pre-populate with previous outputs so clean views are available as
+        // MemTables for downstream dirty views.
+        let mut view_full_outputs: HashMap<String, RecordBatch> = view_prev_snapshots;
+        let mut dirty_views: HashSet<String> = HashSet::new();
 
         for view_name in &topo {
             let spec = match spec_map.get(view_name.as_str()) {
                 Some(s) => s,
                 None => continue,
             };
+
+            // A view is dirty when any SQL token matches a dirty source or view.
+            let view_name_lower = view_name.to_lowercase();
+            let is_dirty = sql_identifiers(&spec.body_sql).iter().any(|token| {
+                dirty_sources.contains(token.as_str())
+                    || dirty_views.contains(token.as_str())
+            });
+
+            if !is_dirty {
+                // Keep the previous snapshot in view_full_outputs (already set above).
+                continue;
+            }
+
+            dirty_views.insert(view_name_lower);
+
+            // Register all upstream view outputs produced so far.
             for (up_name, up_batch) in &view_full_outputs {
                 if up_batch.num_rows() == 0 {
                     continue;
@@ -181,6 +342,7 @@ impl IncrementalFlow {
                     let _ = ctx.register_table(up_name.as_str(), Arc::new(table));
                 }
             }
+
             let new_full = match execute_view_sql(ctx, spec).await {
                 Ok(rb) => rb,
                 Err(_) => {
@@ -197,14 +359,25 @@ impl IncrementalFlow {
             view_full_outputs.insert(view_name.clone(), new_full);
         }
 
-        // Phase 5 + 6: diff, publish, bump tick.
+        // Phase 5 + 6: diff, publish, bump tick (only dirty views).
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.source_snapshots = new_snapshots;
         inner.tick += 1;
         let mut total_output_rows = 0usize;
         let mut active_views = 0usize;
-        for (view_name, new_full) in view_full_outputs {
-            let view = match inner.view_registry.get(&view_name) {
+
+        for view_name in &dirty_views {
+            // Map lowercase back to original name for registry lookup.
+            let original = topo.iter().find(|n| n.to_lowercase() == *view_name);
+            let view_name_orig = match original {
+                Some(n) => n,
+                None => continue,
+            };
+            let new_full = match view_full_outputs.get(view_name_orig) {
+                Some(b) => b.clone(),
+                None => continue,
+            };
+            let view = match inner.view_registry.get(view_name_orig) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -215,7 +388,10 @@ impl IncrementalFlow {
                 let _ = view.publish_output(delta);
             }
         }
-        Ok(StepSummary { total_output_rows, active_views })
+        Ok(StepSummary {
+            total_output_rows,
+            active_views,
+        })
     }
 
     // ── Subscriptions / snapshots ─────────────────────────────────────────────
@@ -264,7 +440,7 @@ impl IncrementalFlow {
 
     // ── Checkpoint / restore ──────────────────────────────────────────────────
 
-    /// Serialize all source snapshots to Arrow IPC bytes.
+    /// Serialize all source snapshots to Arrow IPC bytes (full checkpoint).
     ///
     /// Format: `u32 count || (u32 name_len || name_bytes || u32 data_len || ipc_bytes)*`
     pub fn checkpoint(&self) -> IvmResult<Vec<u8>> {
@@ -291,10 +467,9 @@ impl IncrementalFlow {
         let mut source_snapshots: HashMap<String, RecordBatch> = HashMap::with_capacity(n);
         for _ in 0..n {
             let name_len = read_u32(bytes, &mut pos)? as usize;
-            let name =
-                std::str::from_utf8(bytes.get(pos..pos + name_len).ok_or_else(slice_err)?)
-                    .map_err(|e| IvmError::execution(e.to_string()))?
-                    .to_string();
+            let name = std::str::from_utf8(bytes.get(pos..pos + name_len).ok_or_else(slice_err)?)
+                .map_err(|e| IvmError::execution(e.to_string()))?
+                .to_string();
             pos += name_len;
             let data_len = read_u32(bytes, &mut pos)? as usize;
             let data = bytes.get(pos..pos + data_len).ok_or_else(slice_err)?;
@@ -305,6 +480,68 @@ impl IncrementalFlow {
         }
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.source_snapshots = source_snapshots;
+        let names = inner.view_registry.view_names().map_err(delta_err)?;
+        for name in &names {
+            if let Ok(view) = inner.view_registry.get(name) {
+                let _ = view.reset_full_output();
+            }
+        }
+        Ok(())
+    }
+
+    /// Serialize only the `DeltaBatch`es accumulated since the last call to
+    /// `checkpoint_delta` (or since `enable_delta_checkpoints` was called).
+    ///
+    /// The returned bytes can be applied on top of a full [`checkpoint`] via
+    /// [`restore_delta`].  Accumulated deltas are cleared after serialisation.
+    ///
+    /// Returns empty bytes (`count = 0`) if no new input has arrived.
+    pub fn checkpoint_delta(&self) -> IvmResult<Vec<u8>> {
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        let deltas = std::mem::take(&mut inner.checkpoint_deltas);
+        let mut out: Vec<u8> = Vec::new();
+        let entries: Vec<(String, Vec<DeltaBatch>)> = deltas.into_iter().collect();
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (name, delta_list) in entries {
+            let combined = if delta_list.len() == 1 {
+                delta_list.into_iter().next().unwrap()
+            } else {
+                DeltaBatch::concat(&delta_list).map_err(delta_err)?
+            };
+            let ipc = serialize_delta_batch(&combined).map_err(delta_err)?;
+            let name_bytes = name.as_bytes();
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+            out.extend_from_slice(&ipc);
+        }
+        Ok(out)
+    }
+
+    /// Apply a delta checkpoint (produced by [`checkpoint_delta`]) to the
+    /// current source snapshots without re-executing view SQL.
+    ///
+    /// Intended for use after a full [`restore`]: apply accumulated delta
+    /// slices in order to reach a mid-session consistent state.
+    pub fn restore_delta(&self, bytes: &[u8]) -> IvmResult<()> {
+        let mut pos = 0usize;
+        let n = read_u32(bytes, &mut pos)? as usize;
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        for _ in 0..n {
+            let name_len = read_u32(bytes, &mut pos)? as usize;
+            let name = std::str::from_utf8(bytes.get(pos..pos + name_len).ok_or_else(slice_err)?)
+                .map_err(|e| IvmError::execution(e.to_string()))?
+                .to_string();
+            pos += name_len;
+            let data_len = read_u32(bytes, &mut pos)? as usize;
+            let data = bytes.get(pos..pos + data_len).ok_or_else(slice_err)?;
+            pos += data_len;
+            let delta = deserialize_delta_batch(data).map_err(delta_err)?;
+            let current = inner.source_snapshots.remove(&name);
+            let updated = apply_delta(current, &delta).map_err(delta_err)?;
+            inner.source_snapshots.insert(name, updated);
+        }
+        // Reset view baselines so the next step re-diffs from current state.
         let names = inner.view_registry.view_names().map_err(delta_err)?;
         for name in &names {
             if let Ok(view) = inner.view_registry.get(name) {
@@ -330,6 +567,63 @@ impl std::fmt::Debug for IncrementalFlow {
     }
 }
 
+// ── Row hashing (content-addressed dedup) ─────────────────────────────────────
+
+/// Hash all data column values for a single row using XxHash64.
+///
+/// Uses string representations with null-byte separators so different column
+/// counts cannot collide.  Retractions (weight < 0) are never hashed —
+/// callers must gate on weight before calling.
+pub(crate) fn hash_row(batch: &RecordBatch, row: usize) -> u64 {
+    let mut combined: Vec<u8> = Vec::with_capacity(64);
+    for col in batch.columns() {
+        let s = scalar_to_string(col.as_ref(), row);
+        combined.extend_from_slice(s.as_bytes());
+        combined.push(0u8);
+    }
+    twox_hash::XxHash64::oneshot(0xcafe_babe_dead_beef_u64, &combined)
+}
+
+fn scalar_to_string(arr: &dyn arrow::array::Array, row: usize) -> String {
+    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
+    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
+    }
+    "NULL".to_string()
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn coalesce_pending(
@@ -347,7 +641,10 @@ fn coalesce_pending(
         .collect()
 }
 
-async fn execute_view_sql(ctx: &SessionContext, spec: &IncrementalViewSpec) -> IvmResult<RecordBatch> {
+async fn execute_view_sql(
+    ctx: &SessionContext,
+    spec: &IncrementalViewSpec,
+) -> IvmResult<RecordBatch> {
     let df = ctx
         .sql(&spec.body_sql)
         .await
@@ -383,13 +680,12 @@ fn coerce_to_schema(
         .fields()
         .iter()
         .map(|field| {
-            let col_idx = batch
-                .schema()
-                .index_of(field.name())
-                .map_err(|_| IvmError::execution(format!(
+            let col_idx = batch.schema().index_of(field.name()).map_err(|_| {
+                IvmError::execution(format!(
                     "view output missing column '{}' declared in output_schema",
                     field.name()
-                )))?;
+                ))
+            })?;
             let col = batch.column(col_idx);
             if col.data_type() == field.data_type() {
                 Ok(Arc::clone(col))
@@ -399,8 +695,7 @@ fn coerce_to_schema(
             }
         })
         .collect::<IvmResult<_>>()?;
-    RecordBatch::try_new(Arc::clone(target), cols)
-        .map_err(|e| IvmError::execution(e.to_string()))
+    RecordBatch::try_new(Arc::clone(target), cols).map_err(|e| IvmError::execution(e.to_string()))
 }
 
 fn toposort_views(specs: &[IncrementalViewSpec]) -> Vec<String> {
@@ -411,7 +706,10 @@ fn toposort_views(specs: &[IncrementalViewSpec]) -> Vec<String> {
         in_degree.entry(spec.name.clone()).or_insert(0);
         for token in sql_identifiers(&spec.body_sql) {
             if all_names.contains(token.as_str()) && token != spec.name {
-                dependents.entry(token.clone()).or_default().push(spec.name.clone());
+                dependents
+                    .entry(token.clone())
+                    .or_default()
+                    .push(spec.name.clone());
                 *in_degree.entry(spec.name.clone()).or_insert(0) += 1;
             }
         }

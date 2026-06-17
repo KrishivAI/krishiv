@@ -28,9 +28,11 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 parquet = { workspace = true }
 webpki-root-certs = { workspace = true }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["vector-sinks"], optional = true }
 
 [features]
 kafka = []
+vector-sinks = ["dep:krishiv-connectors"]
 
 [dev-dependencies]
 krishiv-flight-sql = { path = "../krishiv-flight-sql" }
