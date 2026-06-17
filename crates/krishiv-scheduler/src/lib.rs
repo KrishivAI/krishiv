@@ -67,7 +67,7 @@ pub use auth::{
 };
 pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
 pub use ivm::{IvmJobRegistry, SharedIvmJobRegistry};
-pub use ivm_http::ivm_router;
+pub use ivm_http::{IvmRouterState, ivm_router};
 pub use barrier_tracker::CheckpointBarrierTracker;
 pub use batch_sql::{
     BatchSqlInlineTable, BatchSqlOutcome, BatchSqlTable, decode_inline_record_batches,

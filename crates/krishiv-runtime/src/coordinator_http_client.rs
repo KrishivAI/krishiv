@@ -575,9 +575,9 @@ pub async fn execute_coordinator_physical_plan(
             .await
         }
         ExecutionKind::DeltaBatch => {
-            // DeltaBatch plans are managed through the IVM HTTP API.
-            // The job_id is the plan name; the coordinator must have an
-            // existing IVM job with that ID (created via ivm_create_job).
+            // Create the IVM job idempotently on the coordinator.
+            // Plan name is the job ID so subsequent feed/step calls reference it.
+            execute_coordinator_ivm_create_job(coordinator_http, Some(plan.name())).await?;
             Ok(())
         }
     }

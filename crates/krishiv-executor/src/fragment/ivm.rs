@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
-use krishiv_ivm::{DeltaBatch, IncrementalFlow, IncrementalViewSpec, IvmError, deserialize_delta_batch};
+use krishiv_ivm::{IncrementalFlow, IncrementalViewSpec, deserialize_delta_batch};
 use serde::Deserialize;
 
 // ── per-job executor state ────────────────────────────────────────────────────

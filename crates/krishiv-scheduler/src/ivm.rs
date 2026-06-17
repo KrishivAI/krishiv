@@ -23,13 +23,10 @@ impl IvmJobRegistry {
         Self::default()
     }
 
-    /// Create a new IVM job. Returns `Err` if the job ID already exists.
+    /// Create a new IVM job. Idempotent: returns `Ok` if the job already exists.
     pub fn create(&self, job_id: String) -> Result<(), IvmError> {
         let mut jobs = self.jobs.lock().map_err(|_| IvmError::execution("registry lock poisoned"))?;
-        if jobs.contains_key(&job_id) {
-            return Err(IvmError::execution(format!("IVM job '{job_id}' already exists")));
-        }
-        jobs.insert(job_id, Arc::new(IncrementalFlow::new()));
+        jobs.entry(job_id).or_insert_with(|| Arc::new(IncrementalFlow::new()));
         Ok(())
     }
 

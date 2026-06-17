@@ -17,16 +17,41 @@
 //! | POST   | `/api/v1/ivm/jobs/{job_id}/checkpoint`          | Serialize state to bytes (b64)    |
 //! | POST   | `/api/v1/ivm/jobs/{job_id}/restore`             | Restore state from bytes (b64)    |
 
-use std::sync::Arc;
-
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{FromRef, Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use krishiv_ivm::{DeltaBatch, IncrementalViewSpec, deserialize_delta_batch, serialize_delta_batch};
 
+use crate::SharedCoordinator;
 use crate::ivm::SharedIvmJobRegistry;
+
+// ── combined router state ─────────────────────────────────────────────────────
+
+/// Router state for IVM endpoints: job registry + coordinator reference.
+///
+/// Carrying the coordinator enables the step handler to check executor
+/// availability and log distributed-compute context (future: offload heavy
+/// IVM computation to registered executors rather than always running on the
+/// coordinator).
+#[derive(Clone)]
+pub struct IvmRouterState {
+    pub registry: SharedIvmJobRegistry,
+    pub coordinator: SharedCoordinator,
+}
+
+impl FromRef<IvmRouterState> for SharedIvmJobRegistry {
+    fn from_ref(state: &IvmRouterState) -> Self {
+        state.registry.clone()
+    }
+}
+
+impl FromRef<IvmRouterState> for SharedCoordinator {
+    fn from_ref(state: &IvmRouterState) -> Self {
+        state.coordinator.clone()
+    }
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -241,9 +266,23 @@ pub struct StepResponse {
 
 pub async fn api_ivm_step(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
 ) -> Result<Json<StepResponse>, StatusCode> {
     let flow = registry.get(&job_id).ok_or_else(|| ivm_not_found(&job_id))?;
+
+    // Log executor availability for observability. IVM computation always runs
+    // centrally on the coordinator (distributed ingestion, centralized compute).
+    // Executor-side dispatch via delta:step: fragments is a future optimization.
+    let executor_count = coordinator.read().await.executor_snapshots().len();
+    if executor_count > 0 {
+        tracing::debug!(
+            job_id = %job_id,
+            executors = executor_count,
+            "IVM step: executors registered; computing centrally on coordinator"
+        );
+    }
+
     let summary = flow.step_datafusion().await.map_err(|e| {
         tracing::error!("IVM step error for job {job_id}: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -363,9 +402,9 @@ use axum::routing::{delete, get, post};
 
 /// Build the IVM sub-router with all endpoints wired up.
 ///
-/// The returned `Router<()>` has the registry state already baked in and can
+/// The returned `Router<()>` has combined `IvmRouterState` baked in and can
 /// be merged into the main coordinator router.
-pub fn ivm_router(registry: SharedIvmJobRegistry) -> Router<()> {
+pub fn ivm_router(state: IvmRouterState) -> Router<()> {
     Router::new()
         .route("/api/v1/ivm/jobs", post(api_ivm_create_job).get(api_ivm_list_jobs))
         .route("/api/v1/ivm/jobs/{job_id}", delete(api_ivm_delete_job))
@@ -389,5 +428,5 @@ pub fn ivm_router(registry: SharedIvmJobRegistry) -> Router<()> {
         )
         .route("/api/v1/ivm/jobs/{job_id}/checkpoint", post(api_ivm_checkpoint))
         .route("/api/v1/ivm/jobs/{job_id}/restore", post(api_ivm_restore))
-        .with_state(registry)
+        .with_state(state)
 }

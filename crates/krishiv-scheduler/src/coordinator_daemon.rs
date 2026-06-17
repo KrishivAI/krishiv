@@ -477,9 +477,13 @@ pub fn coordinator_http_router(
         protected
     };
 
-    // IVM routes — own state (IvmJobRegistry), baked in before merging.
+    // IVM routes — combined state (registry + coordinator), baked in before merging.
     let ivm_registry = std::sync::Arc::new(crate::ivm::IvmJobRegistry::new());
-    let ivm_routes = crate::ivm_http::ivm_router(ivm_registry);
+    let ivm_state = crate::ivm_http::IvmRouterState {
+        registry: ivm_registry,
+        coordinator: coordinator.clone(),
+    };
+    let ivm_routes = crate::ivm_http::ivm_router(ivm_state);
 
     // All sub-routers are Router<()> (state already baked in), so no final
     // .with_state() call is needed here.

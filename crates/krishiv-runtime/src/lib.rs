@@ -9,6 +9,7 @@
 use std::fmt;
 
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
+use krishiv_scheduler::{IvmJobRegistry, SharedIvmJobRegistry};
 
 pub mod continuous_stream;
 mod coordinator_http_client;
@@ -268,7 +269,7 @@ fn accept_local_plan(backend: &str, plan: &PhysicalPlan) -> RuntimeResult<Execut
 }
 
 /// Single-node in-process backend: accepts batch and streaming plans for local execution.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct SingleNodeBackend;
 
 impl ExecutionBackend for SingleNodeBackend {
@@ -289,10 +290,41 @@ impl ExecutionBackend for SingleNodeBackend {
 }
 
 /// Embedded in-process backend: batch via session `SqlEngine`, streaming delegated to
-/// [`SingleNodeBackend`] (ADR-12.5).
-#[derive(Debug, Default)]
+/// [`SingleNodeBackend`] (ADR-12.5). DeltaBatch plans are managed via a local
+/// in-process IVM registry — no coordinator HTTP server required.
+#[derive(Debug, Clone)]
 pub struct EmbeddedBackend {
     single_node: SingleNodeBackend,
+    local_ivm: SharedIvmJobRegistry,
+}
+
+impl Default for EmbeddedBackend {
+    fn default() -> Self {
+        Self {
+            single_node: SingleNodeBackend,
+            local_ivm: std::sync::Arc::new(IvmJobRegistry::new()),
+        }
+    }
+}
+
+impl EmbeddedBackend {
+    /// Create a new embedded backend with a fresh local IVM registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create an embedded backend sharing an existing IVM registry.
+    pub fn with_ivm_registry(registry: SharedIvmJobRegistry) -> Self {
+        Self {
+            single_node: SingleNodeBackend,
+            local_ivm: registry,
+        }
+    }
+
+    /// Access the local IVM job registry for in-process DeltaBatch operations.
+    pub fn local_ivm_registry(&self) -> SharedIvmJobRegistry {
+        self.local_ivm.clone()
+    }
 }
 
 impl ExecutionBackend for EmbeddedBackend {
@@ -313,8 +345,11 @@ impl ExecutionBackend for EmbeddedBackend {
             debug!(
                 backend = "embedded",
                 plan = %plan.name(),
-                "EmbeddedBackend: accepting DeltaBatch plan (IVM managed via coordinator HTTP API)"
+                "EmbeddedBackend: creating local IVM job and accepting DeltaBatch plan"
             );
+            self.local_ivm
+                .create(plan.name().to_owned())
+                .map_err(|e| RuntimeError::plan_rejected(e.to_string()))?;
             return accept_local_plan(self.backend_name(), plan);
         }
 
