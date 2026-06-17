@@ -218,7 +218,10 @@ impl KinesisSource {
         })
     }
 
-    async fn get_shard_iterator_after(&self, sequence_number: &str) -> ConnectorResult<Option<String>> {
+    async fn get_shard_iterator_after(
+        &self,
+        sequence_number: &str,
+    ) -> ConnectorResult<Option<String>> {
         let resp = self
             .client
             .get_shard_iterator()
@@ -281,7 +284,9 @@ impl KinesisSource {
 
 impl Source for KinesisSource {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_unbounded().with_checkpoint()
+        ConnectorCapabilities::new()
+            .with_unbounded()
+            .with_checkpoint()
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
@@ -494,7 +499,9 @@ mod tests {
 
     #[test]
     fn source_capabilities_include_checkpoint() {
-        let caps = ConnectorCapabilities::new().with_unbounded().with_checkpoint();
+        let caps = ConnectorCapabilities::new()
+            .with_unbounded()
+            .with_checkpoint();
         assert!(caps.is_checkpoint_capable());
         assert!(!caps.is_bounded());
     }

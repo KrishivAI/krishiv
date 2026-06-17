@@ -60,20 +60,20 @@ mod tests {
     #[test]
     fn inc_tasks_submitted_increments_by_one() {
         let m = KrishivMetrics::default();
-        assert_eq!(m.tasks_submitted.load(Ordering::Relaxed), 0);
+        assert_eq!(m.tasks_submitted(), 0);
         m.inc_tasks_submitted();
-        assert_eq!(m.tasks_submitted.load(Ordering::Relaxed), 1);
+        assert_eq!(m.tasks_submitted(), 1);
         m.inc_tasks_submitted();
-        assert_eq!(m.tasks_submitted.load(Ordering::Relaxed), 2);
+        assert_eq!(m.tasks_submitted(), 2);
     }
 
     #[test]
     fn set_tasks_running_stores_value() {
         let m = KrishivMetrics::default();
         m.set_tasks_running(5);
-        assert_eq!(m.tasks_running.load(Ordering::Relaxed), 5);
+        assert_eq!(m.tasks_running(), 5);
         m.set_tasks_running(0);
-        assert_eq!(m.tasks_running.load(Ordering::Relaxed), 0);
+        assert_eq!(m.tasks_running(), 0);
     }
 
     #[test]
@@ -82,14 +82,14 @@ mod tests {
         m.inc_tasks_succeeded();
         m.inc_tasks_succeeded();
         m.inc_tasks_succeeded();
-        assert_eq!(m.tasks_succeeded.load(Ordering::Relaxed), 3);
+        assert_eq!(m.tasks_succeeded(), 3);
     }
 
     #[test]
     fn inc_tasks_failed_increments() {
         let m = KrishivMetrics::default();
         m.inc_tasks_failed();
-        assert_eq!(m.tasks_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(m.tasks_failed(), 1);
     }
 
     /// Regression (Wave 4 — Observability & Shutdown): `inc_executor_lost`
@@ -101,7 +101,7 @@ mod tests {
         let m = KrishivMetrics::default();
         m.inc_executor_lost();
         m.inc_executor_lost();
-        assert_eq!(m.executor_lost.load(Ordering::Relaxed), 2);
+        assert_eq!(m.executor_lost(), 2);
 
         let rendered = m.render_prometheus();
         assert!(
@@ -115,14 +115,14 @@ mod tests {
         let m = KrishivMetrics::default();
         m.add_shuffle_bytes_written(1024);
         m.add_shuffle_bytes_written(2048);
-        assert_eq!(m.shuffle_bytes_written.load(Ordering::Relaxed), 3072);
+        assert_eq!(m.shuffle_bytes_written(), 3072);
     }
 
     #[test]
     fn set_job_queue_depth_stores_value() {
         let m = KrishivMetrics::default();
         m.set_job_queue_depth(42);
-        assert_eq!(m.job_queue_depth.load(Ordering::Relaxed), 42);
+        assert_eq!(m.job_queue_depth(), 42);
     }
 
     #[test]
@@ -511,21 +511,21 @@ mod tests {
     fn add_shuffle_bytes_written_zero() {
         let m = KrishivMetrics::default();
         m.add_shuffle_bytes_written(0);
-        assert_eq!(m.shuffle_bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(m.shuffle_bytes_written(), 0);
     }
 
     #[test]
     fn add_shuffle_bytes_written_max_value() {
         let m = KrishivMetrics::default();
         m.add_shuffle_bytes_written(u64::MAX);
-        assert_eq!(m.shuffle_bytes_written.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(m.shuffle_bytes_written(), u64::MAX);
     }
 
     #[test]
     fn set_tasks_running_max_value() {
         let m = KrishivMetrics::default();
         m.set_tasks_running(u64::MAX);
-        assert_eq!(m.tasks_running.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(m.tasks_running(), u64::MAX);
     }
 
     #[test]
@@ -533,7 +533,7 @@ mod tests {
         let m = KrishivMetrics::default();
         m.set_job_queue_depth(42);
         m.set_job_queue_depth(0);
-        assert_eq!(m.job_queue_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(m.job_queue_depth(), 0);
     }
 
     #[test]
@@ -548,9 +548,9 @@ mod tests {
         for _ in 0..10 {
             m.inc_tasks_failed();
         }
-        assert_eq!(m.tasks_submitted.load(Ordering::Relaxed), 100);
-        assert_eq!(m.tasks_succeeded.load(Ordering::Relaxed), 50);
-        assert_eq!(m.tasks_failed.load(Ordering::Relaxed), 10);
+        assert_eq!(m.tasks_submitted(), 100);
+        assert_eq!(m.tasks_succeeded(), 50);
+        assert_eq!(m.tasks_failed(), 10);
     }
 
     #[test]
@@ -582,7 +582,7 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(metrics.tasks_submitted.load(Ordering::Relaxed), 10000);
+        assert_eq!(metrics.tasks_submitted(), 10000);
     }
 
     /// Verify that labeled metrics are thread-safe (DashMap + AtomicU64).
@@ -676,7 +676,7 @@ mod tests {
         // global one, which can be replaced by concurrent tests calling init().
         {
             use opentelemetry::trace::TracerProvider as _;
-            let tracer = handle.tracer_provider.tracer("capture-test");
+            let tracer = handle.tracer_provider().tracer("capture-test");
             let span = tracer.start("test-capture-span");
             drop(span);
         }
@@ -684,20 +684,20 @@ mod tests {
         // Force flush to drain the processor (retry briefly for parallel test runs).
         let mut spans = Vec::new();
         for _ in 0..50 {
-            let _ = handle.tracer_provider.force_flush();
-            if let Ok(captured) = exporter.get_finished_spans() {
-                if !captured.is_empty() {
-                    spans = captured;
-                    break;
-                }
+            let _ = handle.tracer_provider().force_flush();
+            if let Ok(captured) = exporter.get_finished_spans()
+                && !captured.is_empty()
+            {
+                spans = captured;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let _ = handle.tracer_provider.shutdown();
-        if spans.is_empty() {
-            if let Ok(captured) = exporter.get_finished_spans() {
-                spans = captured;
-            }
+        let _ = handle.tracer_provider().shutdown();
+        if spans.is_empty()
+            && let Ok(captured) = exporter.get_finished_spans()
+        {
+            spans = captured;
         }
         assert!(
             !spans.is_empty(),

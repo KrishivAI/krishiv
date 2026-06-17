@@ -219,7 +219,9 @@ impl PulsarSource {
 
 impl Source for PulsarSource {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_unbounded().with_checkpoint()
+        ConnectorCapabilities::new()
+            .with_unbounded()
+            .with_checkpoint()
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
@@ -379,22 +381,22 @@ mod tests {
 
     #[test]
     fn source_capabilities_include_checkpoint() {
-        let caps = ConnectorCapabilities::new().with_unbounded().with_checkpoint();
+        let caps = ConnectorCapabilities::new()
+            .with_unbounded()
+            .with_checkpoint();
         assert!(caps.is_checkpoint_capable());
         assert!(!caps.is_bounded());
     }
 
     #[test]
     fn config_with_batch_size() {
-        let cfg = PulsarConfig::new("pulsar://localhost:6650", "topic")
-            .with_batch_size(200);
+        let cfg = PulsarConfig::new("pulsar://localhost:6650", "topic").with_batch_size(200);
         assert_eq!(cfg.batch_size, 200);
     }
 
     #[test]
     fn config_batch_size_clamped_to_minimum_one() {
-        let cfg = PulsarConfig::new("pulsar://localhost:6650", "topic")
-            .with_batch_size(0);
+        let cfg = PulsarConfig::new("pulsar://localhost:6650", "topic").with_batch_size(0);
         assert_eq!(cfg.batch_size, 1);
     }
 }

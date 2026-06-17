@@ -227,7 +227,11 @@ mod tests {
         let aborted = log.abort_after(1).unwrap();
         assert_eq!(committed, 1, "epoch 1 has exactly one staged write");
         assert_eq!(aborted, 1, "epoch 2 must be aborted on recovery");
-        assert_eq!(log.open_rows(), 0, "open buffer must be cleared on recovery");
+        assert_eq!(
+            log.open_rows(),
+            0,
+            "open buffer must be cleared on recovery"
+        );
         assert_eq!(
             log.sink().committed().len(),
             1,
@@ -259,7 +263,11 @@ mod tests {
                 (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
             })
             .collect();
-        assert_eq!(all_values, vec![1, 2, 3, 4, 5], "no data loss or duplication after replay");
+        assert_eq!(
+            all_values,
+            vec![1, 2, 3, 4, 5],
+            "no data loss or duplication after replay"
+        );
     }
 
     // ── S3 exactly-once certification ────────────────────────────────────────
@@ -276,7 +284,10 @@ mod tests {
 
         // Phase 1: prepare — data is staged (.tmp) but not yet visible.
         let handle = sink.prepare(1, &batch).unwrap();
-        assert!(handle.staging_path.exists(), "staging file must exist after prepare");
+        assert!(
+            handle.staging_path.exists(),
+            "staging file must exist after prepare"
+        );
         assert!(
             !handle.final_path.exists(),
             "final file must not exist before commit"
@@ -284,8 +295,14 @@ mod tests {
 
         // Phase 2: commit — staging file is atomically renamed to the final path.
         sink.commit(handle.clone()).unwrap();
-        assert!(handle.final_path.exists(), "committed file must be present after commit");
-        assert!(!handle.staging_path.exists(), "staging file must be gone after commit");
+        assert!(
+            handle.final_path.exists(),
+            "committed file must be present after commit"
+        );
+        assert!(
+            !handle.staging_path.exists(),
+            "staging file must be gone after commit"
+        );
 
         // Phase 3: idempotent re-commit after uncertain coordinator outcome.
         sink.commit(handle.clone()).unwrap();
@@ -294,7 +311,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
             .count();
-        assert_eq!(parquet_count, 1, "re-commit must not create duplicate files");
+        assert_eq!(
+            parquet_count, 1,
+            "re-commit must not create duplicate files"
+        );
 
         // Phase 4: abort after commit must not remove the committed file.
         sink.abort(handle).unwrap();

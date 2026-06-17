@@ -1,3 +1,6 @@
+use super::io::{read_latest_epoch_hint, savepoint_epoch_dir, validate_manifest_at_prefix};
+use super::metadata::sha256_hex;
+use super::storage_trait::uuid_simple;
 use super::*;
 
 fn make_storage() -> EphemeralCheckpointStorage {
@@ -434,7 +437,7 @@ fn ephemeral_storage_cleans_up_on_drop() {
     let base_path;
     {
         let s = make_storage();
-        base_path = s.inner.base_dir().to_path_buf();
+        base_path = s.base_dir().to_path_buf();
         s.write_bytes("test/data.bin", b"hello").unwrap();
         assert!(base_path.exists(), "dir must exist while storage is live");
     } // s dropped here — directory should be removed

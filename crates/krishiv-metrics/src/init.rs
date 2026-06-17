@@ -97,6 +97,11 @@ impl MetricsHandle {
     pub fn shutdown(self) {
         // Drop runs `Drop::drop` which calls `tracer_provider.shutdown()`.
     }
+
+    #[cfg(test)]
+    pub(crate) fn tracer_provider(&self) -> &SdkTracerProvider {
+        &self.tracer_provider
+    }
 }
 
 impl Drop for MetricsHandle {

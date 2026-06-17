@@ -464,11 +464,7 @@ impl TwoPhaseCommitSink for HudiTwoPhaseCommitSink {
         ConnectorCapabilities::new().with_two_phase_commit()
     }
 
-    fn prepare(
-        &mut self,
-        _epoch: u64,
-        batch: &RecordBatch,
-    ) -> ConnectorResult<Self::Handle> {
+    fn prepare(&mut self, _epoch: u64, batch: &RecordBatch) -> ConnectorResult<Self::Handle> {
         let instant = next_instant();
         self.staged.insert(instant.clone(), batch.clone());
         Ok(HudiStageHandle { instant })
@@ -1370,7 +1366,10 @@ mod tests {
         sink.commit(handle).unwrap();
         let batches = HudiSnapshotReader::open(dir.path()).scan_batches().unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total, 2, "committed rows must be readable from the Hudi table");
+        assert_eq!(
+            total, 2,
+            "committed rows must be readable from the Hudi table"
+        );
     }
 
     #[test]

@@ -12,8 +12,10 @@
 #![cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
@@ -22,12 +24,59 @@ use datafusion::error::Result as DfResult;
 use crate::catalog::iceberg_table_provider::iceberg_scan::iceberg_table_provider;
 use crate::catalog::unified::KrishivCatalog;
 
+/// TTL for cached namespace and table lists.
+///
+/// DataFusion's catalog traits are sync; every `schema_names()` / `table_names()`
+/// call would otherwise issue a remote REST round-trip. The cache eliminates
+/// redundant calls within a query-planning window while still reflecting schema
+/// changes after expiry.
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// In-memory TTL cache for Iceberg catalog metadata.
+struct CatalogMetaCache {
+    namespaces: Option<(Vec<String>, Instant)>,
+    tables: HashMap<String, (Vec<String>, Instant)>,
+}
+
+impl CatalogMetaCache {
+    fn new() -> Self {
+        Self {
+            namespaces: None,
+            tables: HashMap::new(),
+        }
+    }
+
+    fn get_namespaces(&self) -> Option<&Vec<String>> {
+        self.namespaces
+            .as_ref()
+            .filter(|(_, t)| t.elapsed() < CATALOG_CACHE_TTL)
+            .map(|(v, _)| v)
+    }
+
+    fn set_namespaces(&mut self, ns: Vec<String>) {
+        self.namespaces = Some((ns, Instant::now()));
+    }
+
+    fn get_tables(&self, namespace: &str) -> Option<&Vec<String>> {
+        self.tables
+            .get(namespace)
+            .filter(|(_, t)| t.elapsed() < CATALOG_CACHE_TTL)
+            .map(|(v, _)| v)
+    }
+
+    fn set_tables(&mut self, namespace: impl Into<String>, tables: Vec<String>) {
+        self.tables
+            .insert(namespace.into(), (tables, Instant::now()));
+    }
+}
+
 /// DataFusion [`CatalogProvider`] that resolves Iceberg tables through a
 /// [`KrishivCatalog`].
 #[derive(Clone)]
 pub struct IcebergCatalogBridge {
     catalog: Arc<KrishivCatalog>,
     catalog_name: String,
+    cache: Arc<Mutex<CatalogMetaCache>>,
 }
 
 impl IcebergCatalogBridge {
@@ -36,6 +85,7 @@ impl IcebergCatalogBridge {
         Self {
             catalog,
             catalog_name: catalog_name.into(),
+            cache: Arc::new(Mutex::new(CatalogMetaCache::new())),
         }
     }
 
@@ -76,16 +126,44 @@ impl CatalogProvider for IcebergCatalogBridge {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        Self::block_on(self.catalog.list_namespaces()).unwrap_or_default()
+        {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(ns) = cache.get_namespaces() {
+                return ns.clone();
+            }
+        }
+        let ns = Self::block_on(self.catalog.list_namespaces()).unwrap_or_default();
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_namespaces(ns.clone());
+        ns
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        // Expose the namespace as a schema if it exists.
-        let namespaces = Self::block_on(self.catalog.list_namespaces()).ok()?;
-        if namespaces.iter().any(|n| n == name) {
+        let cached_exists = {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache
+                .get_namespaces()
+                .map(|ns| ns.iter().any(|n| n == name))
+        };
+        let exists = match cached_exists {
+            Some(found) => found,
+            None => {
+                let ns = Self::block_on(self.catalog.list_namespaces()).ok()?;
+                let found = ns.iter().any(|n| n == name);
+                self.cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .set_namespaces(ns);
+                found
+            }
+        };
+        if exists {
             Some(Arc::new(IcebergSchemaBridge {
                 catalog: self.catalog.clone(),
                 namespace: name.to_string(),
+                cache: self.cache.clone(),
             }))
         } else {
             None
@@ -97,6 +175,7 @@ impl CatalogProvider for IcebergCatalogBridge {
 struct IcebergSchemaBridge {
     catalog: Arc<KrishivCatalog>,
     namespace: String,
+    cache: Arc<Mutex<CatalogMetaCache>>,
 }
 
 impl fmt::Debug for IcebergSchemaBridge {
@@ -114,8 +193,19 @@ impl SchemaProvider for IcebergSchemaBridge {
     }
 
     fn table_names(&self) -> Vec<String> {
-        IcebergCatalogBridge::block_on(self.catalog.list_tables(&self.namespace))
-            .unwrap_or_default()
+        {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(tables) = cache.get_tables(&self.namespace) {
+                return tables.clone();
+            }
+        }
+        let tables = IcebergCatalogBridge::block_on(self.catalog.list_tables(&self.namespace))
+            .unwrap_or_default();
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_tables(&self.namespace, tables.clone());
+        tables
     }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
@@ -130,9 +220,20 @@ impl SchemaProvider for IcebergSchemaBridge {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        IcebergCatalogBridge::block_on(self.catalog.list_tables(&self.namespace))
-            .map(|tables| tables.iter().any(|t| t == name))
-            .unwrap_or(false)
+        {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(tables) = cache.get_tables(&self.namespace) {
+                return tables.iter().any(|t| t == name);
+            }
+        }
+        let tables = IcebergCatalogBridge::block_on(self.catalog.list_tables(&self.namespace))
+            .unwrap_or_default();
+        let exists = tables.iter().any(|t| t == name);
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_tables(&self.namespace, tables);
+        exists
     }
 }
 

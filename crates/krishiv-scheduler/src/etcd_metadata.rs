@@ -16,10 +16,9 @@
 //! # Persist mechanism
 //!
 //! `MetadataStore` is a sync trait called from within the coordinator's async
-//! write-lock.  `block_in_place` is used to park the current tokio worker
-//! thread so other workers can drive the etcd client's internally-spawned gRPC
-//! streams.  This requires a multi-thread runtime (the production case).
-//! Single-thread runtimes (unit tests) must not reach durable paths.
+//! write-lock.  `krishiv_common::async_util::block_on` bridges the sync trait
+//! to the async etcd client, using `block_in_place` on multi-thread runtimes
+//! and a fallback runtime on current-thread or no-runtime callers.
 
 use etcd_client::{Client, GetOptions};
 
@@ -78,24 +77,17 @@ impl EtcdMetadataStore {
         })
     }
 
-    /// Write a single key to etcd using `block_in_place` so the calling worker
-    /// thread parks while the runtime drives the gRPC stream on other workers.
+    /// Write a single key to etcd.
     fn put_key(&self, key: String, value: Vec<u8>) -> SchedulerResult<()> {
         let mut client = self
             .client
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        // block_in_place parks this worker thread so the multi-thread runtime
-        // can run the etcd client's internally-spawned gRPC tasks on other
-        // workers.  block_on then drives the put future to completion from the
-        // current thread.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(client.put(key, value, None))
-                .map_err(|e| SchedulerError::Transport {
-                    message: format!("etcd put failed: {e}"),
-                })
+        krishiv_common::async_util::block_on(client.put(key, value, None)).map_err(|e| {
+            SchedulerError::Transport {
+                message: format!("etcd put failed: {e}"),
+            }
         })?;
         Ok(())
     }
@@ -107,12 +99,10 @@ impl EtcdMetadataStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(client.delete(key, None))
-                .map_err(|e| SchedulerError::Transport {
-                    message: format!("etcd delete failed: {e}"),
-                })
+        krishiv_common::async_util::block_on(client.delete(key, None)).map_err(|e| {
+            SchedulerError::Transport {
+                message: format!("etcd delete failed: {e}"),
+            }
         })?;
         Ok(())
     }

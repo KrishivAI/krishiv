@@ -324,7 +324,10 @@ fn network_partition_drops_records_then_recovers() {
 
     // 3 drops → 1 success → wraps back to 3 drops → 1 success (2 full cycles)
     assert_eq!(dropped, 6, "expected 6 dropped messages over 2 cycles");
-    assert_eq!(delivered, 2, "expected 2 delivered messages after partition clears");
+    assert_eq!(
+        delivered, 2,
+        "expected 2 delivered messages after partition clears"
+    );
 }
 
 /// Test 7: OOM recovery — a task that exceeds the memory budget returns
@@ -335,7 +338,7 @@ fn network_partition_drops_records_then_recovers() {
 /// condition and route the task to an executor with available budget.
 #[test]
 fn oom_task_triggers_coordinator_reassignment() {
-    use krishiv_common::chaos::{FaultMode, FaultInjector};
+    use krishiv_common::chaos::{FaultInjector, FaultMode};
 
     // Simulate two executors: one OOM, one healthy.
     struct MockExecutor {
@@ -344,8 +347,14 @@ fn oom_task_triggers_coordinator_reassignment() {
     }
 
     let executors = vec![
-        MockExecutor { id: "exec-0", memory_available_mb: 0 },   // OOM
-        MockExecutor { id: "exec-1", memory_available_mb: 512 }, // healthy
+        MockExecutor {
+            id: "exec-0",
+            memory_available_mb: 0,
+        }, // OOM
+        MockExecutor {
+            id: "exec-1",
+            memory_available_mb: 512,
+        }, // healthy
     ];
 
     // Task requires 256 MB.
@@ -365,7 +374,9 @@ fn oom_task_triggers_coordinator_reassignment() {
 
     // Inject an OOM fault on exec-0's next operation to simulate detection.
     let injector = FaultInjector::new(vec![
-        FaultMode::Error { message: "OOM: memory budget exhausted".into() },
+        FaultMode::Error {
+            message: "OOM: memory budget exhausted".into(),
+        },
         FaultMode::None,
     ]);
     assert!(
@@ -389,11 +400,15 @@ fn oom_task_triggers_coordinator_reassignment() {
 fn multi_executor_shuffle_failure_triggers_reshuffle() {
     let exec0_injector = FaultInjector::new(vec![
         FaultMode::None,
-        FaultMode::Error { message: "shuffle write: broken pipe".into() },
+        FaultMode::Error {
+            message: "shuffle write: broken pipe".into(),
+        },
     ]);
     let exec1_injector = FaultInjector::new(vec![
         FaultMode::None,
-        FaultMode::Error { message: "shuffle read: connection reset".into() },
+        FaultMode::Error {
+            message: "shuffle read: connection reset".into(),
+        },
     ]);
 
     // Phase 1: both executors complete their first operation successfully.
@@ -415,6 +430,14 @@ fn multi_executor_shuffle_failure_triggers_reshuffle() {
     );
 
     // Recovery: both injectors wrap back to FaultMode::None — re-shuffle succeeds.
-    assert_eq!(exec0_injector.next_fault(), &FaultMode::None, "exec-0 recovers");
-    assert_eq!(exec1_injector.next_fault(), &FaultMode::None, "exec-1 recovers");
+    assert_eq!(
+        exec0_injector.next_fault(),
+        &FaultMode::None,
+        "exec-0 recovers"
+    );
+    assert_eq!(
+        exec1_injector.next_fault(),
+        &FaultMode::None,
+        "exec-1 recovers"
+    );
 }

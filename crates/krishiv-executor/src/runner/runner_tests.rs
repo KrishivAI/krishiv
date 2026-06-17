@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::partition::{TASK_FAILURE_MESSAGE_MAX_BYTES, format_failure_message};
 use super::*;
 use crate::ExecutorAssignmentInbox;
 

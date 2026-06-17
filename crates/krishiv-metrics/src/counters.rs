@@ -172,6 +172,11 @@ impl KrishivMetrics {
         self.spill_files_total.fetch_add(files, Ordering::Relaxed);
     }
 
+    /// Current tasks running.
+    pub fn tasks_running(&self) -> u64 {
+        self.tasks_running.load(Ordering::Relaxed)
+    }
+
     /// Total tasks submitted.
     pub fn tasks_submitted(&self) -> u64 {
         self.tasks_submitted.load(Ordering::Relaxed)

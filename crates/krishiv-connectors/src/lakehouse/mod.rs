@@ -37,10 +37,10 @@ pub use hudi::{
     HudiStageHandle, HudiTwoPhaseCommitSink, HudiWriteResult, write_hudi_cow_append,
     write_hudi_cow_fixture, write_hudi_cow_upsert,
 };
-pub use local_delta::{DeltaStageHandle, LocalDeltaTwoPhaseCommitSink};
 pub use iceberg_fs::IcebergFsTable;
 #[cfg(feature = "iceberg")]
 pub use iceberg_native::IcebergNativeTwoPhaseCommit;
+pub use local_delta::{DeltaStageHandle, LocalDeltaTwoPhaseCommitSink};
 pub use partition_spec::{PartitionField, PartitionSpecResolver, PartitionSpecVersion};
 pub use two_phase::{
     DistributedIcebergCommitCoordinator, IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY,

@@ -26,7 +26,14 @@ pub use offset::CdcOffsetTracker;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::pipeline::{CdcSchemaEvolutionState, concat_registry_batches};
     use super::*;
+    use crate::ConnectorError;
 
     #[test]
     fn cdcop_from_debezium_parses_all_ops() {

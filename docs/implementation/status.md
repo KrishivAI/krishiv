@@ -1,5 +1,53 @@
 # Krishiv Implementation Status
 
+## 2026-06-16 — Performance: AHashMap, XxHash64 oneshot, concurrent tiered writes
+
+### Work completed
+
+**[P1] Shuffle hot-path: BTreeMap → AHashMap (O(log n) → O(1))**
+- `store.rs`: `LeaseMap` type alias changed from `BTreeMap` to `ahash::AHashMap`
+- `memory_store.rs`: All three maps (`partitions`, `spilled`, `content_hashes`) changed
+  from `BTreeMap`/`BTreeSet` to `AHashMap`/`AHashSet`; all constructors updated
+- `disk_store.rs`: `lease_tokens` construction changed from `BTreeMap::new()` to
+  `AHashMap::default()`
+
+**[P1] Shuffle routing: XxHash64 oneshot (3 calls → 1)**
+- `partitioner.rs`: `hash_i64`, `hash_str`, `null_int_bucket`, `null_str_bucket` all
+  switched from 3-call pattern (`with_seed` + `write` + `finish`) to `XxHash64::oneshot`
+- Removed now-unused `use std::hash::Hasher` import
+
+**[P1] Bucket pre-allocation: eliminates realloc during partitioning**
+- `partitioner.rs` `fill_buckets`: pre-allocates each bucket vec with
+  `num_rows / num_partitions` hint before the row loop
+- `partition.rs` `partition_record_batches_by_key`: pre-allocates `row_indices` vecs
+  with `batch.num_rows() / shard_count` hint
+
+**[P1] TieredShuffleStore: concurrent writes with tokio::try_join!**
+- `tiered_store.rs` `write_partition` and `register_partition_lease`: switched from
+  sequential await chain to `tokio::try_join!` — local and remote I/O now overlap
+
+**[P2] Aggregate hot map: std SipHash → AHashMap**
+- `dataflow/aggregate.rs`: `use ahash::AHashMap as HashMap` replaces `std::collections::HashMap`
+- `krishiv-dataflow/Cargo.toml` and `krishiv-shuffle/Cargo.toml`: added `ahash` workspace dep
+- `Cargo.toml` workspace: added `ahash = "0.8"`
+
+### Validation
+
+```
+cargo check -p krishiv-shuffle -p krishiv-common -p krishiv-dataflow  # 0 errors
+```
+
+Note: `krishiv-python` has 8 pre-existing `arrow`-version mismatch errors (arrow 58
+vs 59 conflict through pyo3-arrow 0.19.0 — unrelated to these changes).
+
+### Next useful command
+
+```bash
+cargo test -p krishiv-shuffle --lib
+```
+
+---
+
 ## 2026-06-16 — Component stabilization: connectors, metrics, gateway, chaos
 
 ### Work completed

@@ -31,11 +31,11 @@
 //! }
 //! ```
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::post;
-use axum::Router;
 use serde::{Deserialize, Serialize};
 
 use crate::crd::job::KrishivJobResource;
@@ -118,7 +118,11 @@ pub fn handle_admission_review(body: &str) -> Result<String, String> {
     let response = AdmissionReviewResponse {
         api_version: "admission.k8s.io/v1".to_string(),
         kind: "AdmissionReview".to_string(),
-        response: AdmissionResponse { uid, allowed, status },
+        response: AdmissionResponse {
+            uid,
+            allowed,
+            status,
+        },
     };
 
     serde_json::to_string(&response).map_err(|e| format!("serialisation error: {e}"))
@@ -201,10 +205,12 @@ mod tests {
         let response_json = handle_admission_review(&body).unwrap();
         let v: serde_json::Value = serde_json::from_str(&response_json).unwrap();
         assert_eq!(v["response"]["allowed"], serde_json::Value::Bool(false));
-        assert!(v["response"]["status"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("name"));
+        assert!(
+            v["response"]["status"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("name")
+        );
     }
 
     #[test]
@@ -227,10 +233,12 @@ mod tests {
         let response_json = handle_admission_review(&body).unwrap();
         let v: serde_json::Value = serde_json::from_str(&response_json).unwrap();
         assert_eq!(v["response"]["allowed"], serde_json::Value::Bool(false));
-        assert!(v["response"]["status"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("tasks"));
+        assert!(
+            v["response"]["status"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("tasks")
+        );
     }
 
     #[test]

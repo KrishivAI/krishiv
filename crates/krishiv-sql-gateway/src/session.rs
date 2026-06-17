@@ -112,11 +112,17 @@ pub struct PooledSession<'pool> {
 
 impl PooledSession<'_> {
     pub fn execute_sql(&self, query: &str) -> GatewayResult<GatewayQueryResult> {
-        self.session.as_ref().expect("session present").execute_sql(query)
+        self.session
+            .as_ref()
+            .expect("session present")
+            .execute_sql(query)
     }
 
     pub fn collect(&self, dataframe: DataFrame) -> GatewayResult<GatewayQueryResult> {
-        self.session.as_ref().expect("session present").collect(dataframe)
+        self.session
+            .as_ref()
+            .expect("session present")
+            .collect(dataframe)
     }
 
     pub fn session(&self) -> &Session {

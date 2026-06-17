@@ -132,5 +132,10 @@ name = "exactly_once"
 path = "tests/exactly_once.rs"
 required-features = ["exactly-once-integration"]
 
+[[test]]
+name = "integration_connector_lakehouse"
+path = "tests/integration_connector_lakehouse.rs"
+required-features = ["lakehouse", "iceberg"]
+
 [lints]
 workspace = true

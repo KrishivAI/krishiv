@@ -550,12 +550,12 @@ fn kafka_offsets_for_events(events: &[CdcEvent]) -> BTreeMap<String, i64> {
 }
 
 #[derive(Debug, Default)]
-struct CdcSchemaEvolutionState {
-    schema: Option<Arc<Schema>>,
+pub(super) struct CdcSchemaEvolutionState {
+    pub(super) schema: Option<Arc<Schema>>,
 }
 
 impl CdcSchemaEvolutionState {
-    fn normalize(&mut self, batch: RecordBatch) -> Result<RecordBatch, String> {
+    pub(super) fn normalize(&mut self, batch: RecordBatch) -> Result<RecordBatch, String> {
         let merged = match &self.schema {
             Some(existing) => merge_compatible_schemas(existing, &batch.schema())?,
             None => {
@@ -572,7 +572,7 @@ impl CdcSchemaEvolutionState {
 }
 
 #[cfg(any(feature = "schema-registry", test))]
-fn concat_registry_batches(batches: &[RecordBatch]) -> Result<RecordBatch, String> {
+pub(super) fn concat_registry_batches(batches: &[RecordBatch]) -> Result<RecordBatch, String> {
     let Some(first) = batches.first() else {
         return Err("cannot concatenate an empty schema-registry batch list".into());
     };

@@ -268,7 +268,7 @@ fn read_required_manifest(
     read_optional_manifest(storage, path, epoch)?.ok_or(CheckpointError::NoValidEpoch)
 }
 
-fn validate_manifest_at_prefix(
+pub(super) fn validate_manifest_at_prefix(
     storage: &dyn CheckpointStorage,
     base_prefix: &str,
     manifest_path: &str,
@@ -617,7 +617,7 @@ pub async fn latest_valid_epoch_async(
         .ok_or(CheckpointError::NoValidEpoch)
 }
 
-fn read_latest_epoch_hint(
+pub(super) fn read_latest_epoch_hint(
     storage: &dyn CheckpointStorage,
     job_id: &str,
 ) -> CheckpointResult<Option<u64>> {
@@ -713,7 +713,7 @@ fn savepoint_prefix(job_id: &str) -> String {
 }
 
 /// Path to a specific savepoint epoch directory.
-fn savepoint_epoch_dir(job_id: &str, savepoint_epoch: u64) -> String {
+pub(super) fn savepoint_epoch_dir(job_id: &str, savepoint_epoch: u64) -> String {
     format!("{}/{:020}", savepoint_prefix(job_id), savepoint_epoch)
 }
 

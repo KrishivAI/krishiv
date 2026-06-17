@@ -204,6 +204,6 @@ impl IntegrityManifest {
     }
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(super) fn sha256_hex(data: &[u8]) -> String {
     krishiv_common::hash::sha256_hex(data)
 }

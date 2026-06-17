@@ -238,7 +238,10 @@ impl TwoPhaseCommitSink for LocalDeltaTwoPhaseCommitSink {
         writer.write(batch).map_err(|e| to_connector(e))?;
         let f = writer.into_inner().map_err(|e| to_connector(e))?;
         f.sync_all().map_err(to_connector)?;
-        Ok(DeltaStageHandle { epoch, staging_path })
+        Ok(DeltaStageHandle {
+            epoch,
+            staging_path,
+        })
     }
 
     fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
@@ -256,10 +259,8 @@ impl TwoPhaseCommitSink for LocalDeltaTwoPhaseCommitSink {
         fs::create_dir_all(&log_dir).map_err(to_connector)?;
         let log_path = log_dir.join(format!("{version:020}.json"));
         let tmp_log_path = log_dir.join(format!("{version:020}.json.tmp"));
-        let commit_entry =
-            json!({"commitInfo":{"operation":"WRITE","epoch":handle.epoch}});
-        let add_entry =
-            json!({"add":{"path":file_name,"size":meta.len(),"dataChange":true}});
+        let commit_entry = json!({"commitInfo":{"operation":"WRITE","epoch":handle.epoch}});
+        let add_entry = json!({"add":{"path":file_name,"size":meta.len(),"dataChange":true}});
         {
             let mut log = OpenOptions::new()
                 .create(true)
@@ -315,7 +316,10 @@ mod tests {
         let b = batch(&[10, 20, 30]);
 
         let handle = sink.prepare(1, &b).unwrap();
-        assert!(handle.staging_path.exists(), "staging file must exist after prepare");
+        assert!(
+            handle.staging_path.exists(),
+            "staging file must exist after prepare"
+        );
 
         sink.commit(handle).unwrap();
 
@@ -325,7 +329,10 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert!(leftovers.is_empty(), "staging directory must be empty after commit");
+        assert!(
+            leftovers.is_empty(),
+            "staging directory must be empty after commit"
+        );
 
         // The batch must be readable through the Delta log.
         let rows = read_table(&path, None).unwrap();
@@ -342,7 +349,10 @@ mod tests {
         let staging = handle.staging_path.clone();
         assert!(staging.exists());
         sink.abort(handle).unwrap();
-        assert!(!staging.exists(), "staging file must be removed after abort");
+        assert!(
+            !staging.exists(),
+            "staging file must be removed after abort"
+        );
     }
 
     #[test]

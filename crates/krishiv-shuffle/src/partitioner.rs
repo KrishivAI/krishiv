@@ -446,9 +446,7 @@ pub fn hash_i64(value: i64, buckets: u32, seed: u64) -> ShuffleBucket {
 /// independent distributions. Pass `0` for tests or when no job context exists.
 pub fn hash_str(value: &str, buckets: u32, seed: u64) -> ShuffleBucket {
     debug_assert!(buckets > 0);
-    ShuffleBucket(
-        (twox_hash::XxHash64::oneshot(seed, value.as_bytes()) % buckets as u64) as u32,
-    )
+    ShuffleBucket((twox_hash::XxHash64::oneshot(seed, value.as_bytes()) % buckets as u64) as u32)
 }
 
 fn fill_buckets<F>(

@@ -1,5 +1,5 @@
-use std::cmp::Ordering;
 use ahash::AHashMap as HashMap;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
