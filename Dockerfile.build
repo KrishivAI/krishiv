@@ -21,6 +21,9 @@ WORKDIR /build
 
 # ── Stage 1: Planner — reads manifests, emits recipe.json ─────────────────────
 # Re-runs only when Cargo.toml or Cargo.lock changes.
+# cargo chef prepare captures the full workspace dep graph; the cook step
+# below scopes to only the packages we actually build (-p krishiv etc.),
+# so krishiv-python/pyo3 and other dev-only crate deps are never compiled.
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
@@ -51,10 +54,14 @@ ENV CXXFLAGS="-include cstdint" \
 
 # Cook dependencies — cached as long as recipe.json (= Cargo.toml/Cargo.lock) is unchanged.
 # A source-only change hits this layer from cache and skips straight to the build below.
+# Use the same -p scoping as the final cargo build so we only compile needed deps.
 COPY --from=planner /build/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo chef cook \
+    set -e; \
+    PKGS="-p krishiv"; \
+    case "$FEATURES" in *k8s*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
+    cargo chef cook $PKGS \
         --recipe-path recipe.json \
         --no-default-features --features "$FEATURES" \
         --profile "$PROFILE"
@@ -71,9 +78,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         --no-default-features --features "$FEATURES" \
         --profile "$PROFILE"; \
     mkdir -p /out; \
-    cp "target/$PROFILE/krishiv" /out/krishiv; \
-    if [ -f "target/$PROFILE/krishiv-operator" ]; then \
-        cp "target/$PROFILE/krishiv-operator" /out/krishiv-operator; \
+    OUTDIR="target/$PROFILE"; \
+    case "$PROFILE" in dev|test) OUTDIR="target/debug" ;; esac; \
+    cp "$OUTDIR/krishiv" /out/krishiv; \
+    if [ -f "$OUTDIR/krishiv-operator" ]; then \
+        cp "$OUTDIR/krishiv-operator" /out/krishiv-operator; \
+    else \
+        touch /out/krishiv-operator; \
     fi
 
 # ── Stage 3: Runtime ──────────────────────────────────────────────────────────
