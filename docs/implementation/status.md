@@ -1,5 +1,102 @@
 # Krishiv Implementation Status
 
+## 2026-06-17 — Production readiness: all Critical/High/Medium fixes
+
+### Work completed
+
+**[C-1] Blocking FS under async lock — eliminated**
+- `coordinator/mod.rs`: `finalize_staged_sink_outputs` now only collects work into
+  `pending_sink_finalize: Vec<SinkFinalizeWork>`; no I/O inside the lock.
+- `grpc.rs` / `in_process.rs`: Two-phase pattern — drain `take_pending_sink_finalize()`
+  after releasing the write lock, then run `spawn_blocking(|| work.execute())`.
+- `mark_sink_publish_failed` applied under a fresh write lock if publish fails.
+
+**[C-2] Stalled tasks — CancelTask RPC now sent before reset**
+- `collect_stall_cancel_work` (pure read) + `apply_stall_resets` (write) split on `Coordinator`.
+- `detect_and_cancel_stalled_tasks` on `SharedCoordinator`: reads stall targets, sends
+  concurrent `CancelTask` RPCs via `tokio::try_join!`, then applies resets under write lock.
+- Wired into the production heartbeat loop (was previously only in test `coordinator_tick`).
+
+**[C-3] Content-integrity hash — DefaultHasher replaced with XxHash64**
+- `memory_store.rs` `compute_simple_partition_hash`: now hashes actual column buffer
+  bytes (sampled 64 bytes per buffer) via `XxHash64` with fixed seed.
+
+**[C-4] Shutdown race — OrchestratorHandles now awaits JoinHandles**
+- `OrchestratorHandles`: stores `Vec<JoinHandle<()>>`; `async fn shutdown(self)` awaits
+  with 5-second graceful timeout then aborts stragglers; sync `abort_all()` kept for `Drop`.
+
+**[H-1] EtcdMetadataStore cache divergence — eliminated**
+- `etcd_metadata.rs`: `startup_jobs` / `startup_executors` are populated once at
+  `connect()` and never mutated. `save_job`, `save_executor`, `remove_executor` write
+  to etcd only. `jobs()` / `executors()` return the startup snapshot (used for recovery).
+
+**[H-2] JWT JWKS fetch — converted to async**
+- `auth.rs` `from_jwks_uri`: uses `reqwest::Client` async HTTP; propagates to
+  `from_env` / `configure_jwt_auth_provider_from_env` / `configure_coordinator_grpc_auth`.
+
+**[H-3] subject_to_role — prefix-based role mapping**
+- `auth.rs`: `reader:` prefix → `Role::Reader`; `writer:` prefix → `Role::Writer`; else `Admin`.
+
+**[H-4] Checkpoint recovery failure — hard error for streaming jobs**
+- `recovery.rs`: both failure paths changed from `warn!` to `error!`; job marked `Failed`.
+
+**[H-5] Executor loss in sync tick — JCP now notified**
+- `job_coordinator.rs`: `handle_executor_loss_sync` performs the same state mutations as
+  the async variant; `coordinator_tick` now calls it for all affected JCPs.
+
+**[H-6] Auth rejection logging**
+- `auth.rs` `auth_interceptor`: logs `subject`, `code`, `message` on every rejected request.
+
+**[M-1] CreditGate — Notify + correct atomic ordering**
+- `backpressure.rs`: added `Notify`; `try_send`/`ack`/`reset` use `AcqRel`/`Acquire`;
+  `wait_for_credit` double-checked locking; new async test `wait_for_credit_wakes_on_ack`.
+
+**[M-2] Shuffle spill eviction — O(1) IndexSet swap_remove**
+- `memory_store.rs`: `spill_order` changed from `VecDeque` to `IndexSet`; O(1) removal.
+
+**[M-3] LocalFsCheckpointStorage — symlink-escape prevention**
+- `checkpoint/local_fs.rs` `full_path`: canonicalize both base and parent, verify prefix.
+
+**[M-5] Stall timeout configurable**
+- `config.rs`: `task_stall_timeout_ms` field (default 30 min); `with_task_stall_timeout_ms`.
+- `collect_stall_cancel_work` reads `self.config.task_stall_timeout_ms()`.
+
+**[M-6] ObjectStoreShuffleStore — true streaming stream_partition**
+- `object_store.rs`: custom `stream_partition` downloads + hash-verifies once, then yields
+  IPC batches lazily via `spawn_blocking` unfold (avoids pre-collecting all batches into Vec).
+
+**[M-7] Lock acquisition order — documented**
+- `coordinator/mod.rs` `SharedCoordinator`: four-level lock ordering comment added.
+- `job_coordinator.rs` `JobCoordinator`: inner → heartbeat_timestamps ordering documented.
+
+**[L-3] Tracing instruments on hot paths**
+- `#[tracing::instrument]` added to `advance_heartbeat_tick`, `apply_task_update`,
+  `recover_from_store`, `audit_shuffle_availability`.
+
+### Validation
+
+```
+cargo check --workspace --exclude krishiv-python --exclude krishiv-chaos  # 0 errors, 0 warnings (scheduler/shuffle/common)
+cargo test -p krishiv-scheduler --lib   # 310 passed, 0 failed
+cargo test -p krishiv-shuffle --lib    # 132 passed, 0 failed
+cargo test -p krishiv-common --lib     # 81 passed, 0 failed
+```
+
+### Remaining work (not addressed)
+
+- Architecture decomposition (Coordinator → StreamingCoordinator + AdaptiveCoordinator + JobRegistry)
+- CCP↔JCP contract formalization via `JobCoordinatorApi` trait
+- 10 failure-mode integration tests (executor crash mid-checkpoint, stalled task cancel RPC, etc.)
+- M-8 verified as non-issue: `assigned_at_ms` is always set when transitioning to Running
+
+### Next useful command
+
+```bash
+cargo test --workspace --exclude krishiv-python --exclude krishiv-chaos
+```
+
+---
+
 ## 2026-06-16 — Performance: AHashMap, XxHash64 oneshot, concurrent tiered writes
 
 ### Work completed

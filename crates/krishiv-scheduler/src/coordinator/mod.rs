@@ -203,6 +203,87 @@ pub struct Coordinator {
     /// completes and the CoalesceRule fires.  Consumed by `launch_assigned_task_assignments`
     /// for the downstream stage to right-size reduce-side parallelism.
     pub(crate) aqe_coalesce_hints: HashMap<(JobId, StageId), usize>,
+
+    /// Deferred sink-finalization work queued by `finalize_staged_sink_outputs`.
+    ///
+    /// Callers in async contexts (gRPC handler) drain this after releasing the
+    /// coordinator write lock and execute the blocking filesystem operations via
+    /// `tokio::task::spawn_blocking`, so the write lock is not held during I/O.
+    /// Callers in sync contexts use `block_in_place` to drain.
+    pub(crate) pending_sink_finalize: Vec<SinkFinalizeWork>,
+}
+
+/// Describes a stalled task that must be cancelled and reset.
+///
+/// Produced by [`Coordinator::collect_stall_cancel_work`]; consumed by
+/// [`SharedCoordinator::detect_and_cancel_stalled_tasks`].
+#[derive(Debug, Clone)]
+pub struct StallCancelWork {
+    pub job_id: JobId,
+    pub stage_id: StageId,
+    pub task_id: TaskId,
+    pub attempt: u32,
+    /// gRPC endpoint of the executor holding the task, or `None` for in-process.
+    pub executor_endpoint: Option<String>,
+    pub stall_secs: u64,
+}
+
+/// Deferred work for Phase 2.3 distributed write commit.
+///
+/// Produced by [`Coordinator::finalize_staged_sink_outputs`] and consumed by
+/// the gRPC/in-process task-status handler outside the coordinator write lock.
+#[derive(Debug)]
+pub struct SinkFinalizeWork {
+    pub job_id: JobId,
+    pub state: JobState,
+    pub specs: Vec<krishiv_common::write_commit::SinkWriteSpec>,
+}
+
+impl SinkFinalizeWork {
+    /// Execute the blocking filesystem operations for this finalize work.
+    /// Returns `true` if all publish operations succeeded, `false` if any failed
+    /// (failure should cause the caller to mark the job as `Failed`).
+    pub fn execute(self) -> bool {
+        use krishiv_common::write_commit::{cleanup_staged_outputs, publish_staged_outputs};
+        let mut all_ok = true;
+        for spec in &self.specs {
+            match self.state {
+                JobState::Succeeded => match publish_staged_outputs(spec, self.job_id.as_str()) {
+                    Ok(outcome) => {
+                        tracing::info!(
+                            job_id = %self.job_id,
+                            dest = %spec.dest_path,
+                            published = outcome.published.len(),
+                            skipped_existing = outcome.skipped_existing,
+                            ignored = outcome.ignored,
+                            "published staged sink outputs"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            job_id = %self.job_id,
+                            dest = %spec.dest_path,
+                            error = %error,
+                            "failed to publish staged sink outputs; failing job"
+                        );
+                        all_ok = false;
+                    }
+                },
+                JobState::Failed | JobState::Cancelled => {
+                    if let Err(error) = cleanup_staged_outputs(spec, self.job_id.as_str()) {
+                        tracing::warn!(
+                            job_id = %self.job_id,
+                            dest = %spec.dest_path,
+                            error = %error,
+                            "failed to clean up staged sink outputs"
+                        );
+                    }
+                }
+                JobState::Accepted | JobState::Planning | JobState::Running => {}
+            }
+        }
+        all_ok
+    }
 }
 
 impl fmt::Debug for Coordinator {
@@ -230,6 +311,21 @@ impl fmt::Debug for Coordinator {
 /// `executor_inner` and `checkpoint_inner` locks provide finer-grained access
 /// to the hottest paths (heartbeat processing and checkpoint acks) without
 /// requiring the full coordinator write lock.
+///
+/// # Lock acquisition order
+///
+/// To prevent deadlock, always acquire locks in the following order:
+///
+/// 1. `SharedCoordinator::inner` (Tokio async `RwLock`) — outermost, guards all `Coordinator` state.
+/// 2. `SharedCoordinator::executor_inner` / `checkpoint_inner` (Tokio async `RwLock`) — shard locks;
+///    never hold while trying to re-acquire `inner`.
+/// 3. `JobCoordinator::inner` (std `RwLock<JobRecord>`) — per-job record; acquired via
+///    `jc.read_record()` / `jc.write_record()`.
+/// 4. `JobCoordinator::heartbeat_timestamps` (std `Mutex`) — always the innermost lock; never
+///    acquire (3) while holding (4).
+///
+/// Any code that acquires locks in a different order risks a deadlock.  If you add a new
+/// synchronization primitive, place it in this ordering and update this comment.
 #[derive(Debug, Clone)]
 pub struct SharedCoordinator {
     inner: Arc<RwLock<Coordinator>>,
@@ -333,6 +429,7 @@ impl SharedCoordinator {
     }
 
     /// Advance the heartbeat clock by one tick.
+    #[tracing::instrument(skip(self), name = "advance_heartbeat_tick")]
     pub async fn advance_heartbeat_tick(&self) -> SchedulerResult<Vec<ExecutorId>> {
         tracing::debug!("advancing heartbeat tick");
         let lost = {
@@ -407,6 +504,85 @@ impl SharedCoordinator {
             "heartbeat tick completed; lost executors will trigger recovery paths"
         );
         Ok(lost)
+    }
+
+    /// R5 (production path): detect stalled tasks, send CancelTask RPCs, then
+    /// reset them.
+    ///
+    /// The three-phase pattern mirrors `push_cancel_job`:
+    /// 1. Read stall info under read lock — no mutation.
+    /// 2. Send CancelTask RPCs concurrently outside any lock.
+    /// 3. Apply state resets under write lock.
+    ///
+    /// This ensures the coordinator write lock is not held while waiting for
+    /// gRPC round-trips, and the zombie executor receives a cancel signal before
+    /// the coordinator re-queues the task for another executor.
+    pub async fn detect_and_cancel_stalled_tasks(&self) {
+        use crate::coordinator::task_assignment::inject_executor_task_request_context;
+        use crate::in_process::is_in_process_task_endpoint;
+
+        let work: Vec<StallCancelWork> = {
+            let coord = self.inner.read().await;
+            coord.collect_stall_cancel_work()
+        };
+        if work.is_empty() {
+            return;
+        }
+
+        // Send CancelTask RPCs concurrently — outside any lock.
+        let channels = {
+            let coord = self.inner.read().await;
+            coord.executor_channels.clone()
+        };
+        let mut cancel_futures = futures::stream::FuturesUnordered::new();
+        for item in &work {
+            let Some(ref endpoint) = item.executor_endpoint else {
+                continue;
+            };
+            if is_in_process_task_endpoint(endpoint) {
+                continue;
+            }
+            let endpoint = endpoint.clone();
+            let channels = channels.clone();
+            let attempt_id = match AttemptId::try_new(item.attempt) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let req = TaskCancellationRequest::new(TaskAttemptRef::new(
+                item.job_id.clone(),
+                item.stage_id.clone(),
+                item.task_id.clone(),
+                attempt_id,
+            ))
+            .with_reason("task stalled: no progress for >30 min");
+            cancel_futures.push(async move {
+                let channel =
+                    match Coordinator::get_or_connect_channel_on_map(&channels, &endpoint).await {
+                        Ok(c) => c,
+                        Err(err) => {
+                            tracing::warn!(endpoint = %endpoint, error = %err, "stall-cancel: connect failed");
+                            return;
+                        }
+                    };
+                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+                    channel,
+                    inject_executor_task_request_context
+                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                );
+                if let Err(err) = client
+                    .cancel_task(wire::task_cancellation_request_to_wire(req))
+                    .await
+                {
+                    tracing::warn!(endpoint = %endpoint, error = %err, "stall-cancel: cancel_task rpc failed");
+                }
+            });
+        }
+        use futures::stream::StreamExt as _;
+        while cancel_futures.next().await.is_some() {}
+
+        // Apply resets under write lock after RPCs complete.
+        let mut coord = self.inner.write().await;
+        coord.apply_stall_resets(&work);
     }
 
     /// Wait for any coordinator state change notification (executor, checkpoint, etc.).
@@ -576,18 +752,24 @@ impl SharedCoordinator {
     ///
     /// The returned [`OrchestratorHandles`] **must be stored**; dropping it
     /// immediately aborts all loops. Call [`OrchestratorHandles::shutdown`]
-    /// before dropping on graceful coordinator shutdown or demotion.
+    /// for graceful termination before dropping.
     #[must_use = "dropping OrchestratorHandles immediately aborts all background loops"]
     pub fn spawn_orchestration_loops(&self) -> OrchestratorHandles {
+        self.spawn_orchestration_loops_inner()
+    }
+}
+
+impl SharedCoordinator {
+    fn spawn_orchestration_loops_inner(&self) -> OrchestratorHandles {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let mut abort_handles = Vec::with_capacity(3);
+        let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(3);
 
         // Heartbeat loop
         {
             let coord = self.clone();
             let mut rx = shutdown_rx.clone();
             let span = tracing::info_span!("coordinator.heartbeat_loop");
-            let task = tokio::spawn(
+            join_handles.push(tokio::spawn(
                 async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -602,24 +784,20 @@ impl SharedCoordinator {
                                 tracing::warn!(error = %text, "coordinator heartbeat tick failed");
                             }
                         }
+                        coord.detect_and_cancel_stalled_tasks().await;
                     }
                 }
                 .instrument(span),
-            );
-            abort_handles.push(task.abort_handle());
+            ));
         }
 
-        // Task launch loop — wakes immediately on any state-change notification
-        // (job submit, task completion, executor registration, etc.) with a 500 ms
-        // fallback interval so missed notifications never stall the queue.
+        // Task launch loop
         {
             let coord = self.clone();
             let mut rx = shutdown_rx.clone();
             let span = tracing::info_span!("coordinator.task_launch_loop");
-            let task = tokio::spawn(
+            join_handles.push(tokio::spawn(
                 async move {
-                    // Clone the Arc<Notify> once before the loop to avoid taking the
-                    // coordinator read-lock on every iteration.
                     let notify = coord.inner.read().await.notify.clone();
                     let mut interval =
                         tokio::time::interval(std::time::Duration::from_millis(500));
@@ -639,8 +817,7 @@ impl SharedCoordinator {
                     }
                 }
                 .instrument(span),
-            );
-            abort_handles.push(task.abort_handle());
+            ));
         }
 
         // Barrier dispatch loop
@@ -648,7 +825,7 @@ impl SharedCoordinator {
             let coord = self.clone();
             let mut rx = shutdown_rx.clone();
             let span = tracing::info_span!("coordinator.barrier_dispatch_loop");
-            let task = tokio::spawn(
+            join_handles.push(tokio::spawn(
                 async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -666,12 +843,11 @@ impl SharedCoordinator {
                     }
                 }
                 .instrument(span),
-            );
-            abort_handles.push(task.abort_handle());
+            ));
         }
 
         OrchestratorHandles {
-            abort_handles,
+            join_handles,
             shutdown_tx,
         }
     }
@@ -681,25 +857,43 @@ impl SharedCoordinator {
 /// [`SharedCoordinator::spawn_orchestration_loops`].
 ///
 /// **Must be kept alive** for the loops to run. Call [`OrchestratorHandles::shutdown`]
-/// for graceful termination, or drop to abort immediately.
+/// for graceful termination, or drop to signal-and-abort immediately.
 pub struct OrchestratorHandles {
-    abort_handles: Vec<tokio::task::AbortHandle>,
+    join_handles: Vec<tokio::task::JoinHandle<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl OrchestratorHandles {
-    /// Signal all loops to stop and wait for them to exit.
-    pub fn shutdown(&self) {
+    /// Signal shutdown and wait for all loops to exit (with 5-second timeout).
+    ///
+    /// Loops check the shutdown watch on every tick; with a 2-second maximum
+    /// tick interval all loops should exit well within 5 seconds. If they do
+    /// not, they are aborted.
+    pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
-        for h in &self.abort_handles {
-            h.abort();
+        let timeout = std::time::Duration::from_secs(5);
+        for handle in self.join_handles.drain(..) {
+            match tokio::time::timeout(timeout, handle).await {
+                Ok(_) => {}
+                Err(_) => {
+                    tracing::warn!("orchestration loop did not exit within 5s; aborting");
+                }
+            }
+        }
+    }
+
+    /// Abort all loops immediately (called from Drop; does not wait for exit).
+    fn abort_all(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        for handle in &self.join_handles {
+            handle.abort();
         }
     }
 }
 
 impl Drop for OrchestratorHandles {
     fn drop(&mut self) {
-        self.shutdown();
+        self.abort_all();
     }
 }
 
@@ -752,6 +946,7 @@ impl Coordinator {
             notify: Arc::new(Notify::new()),
             job_coordinators: HashMap::new(),
             aqe_coalesce_hints: HashMap::new(),
+            pending_sink_finalize: Vec::new(),
         }
     }
 
@@ -933,7 +1128,15 @@ impl Coordinator {
     }
 
     pub fn coordinator_tick(&mut self) -> SchedulerResult<()> {
-        self.advance_heartbeat_clock(1)?;
+        let lost = self.advance_heartbeat_clock(1)?;
+        // H-5: Mirror JCP executor-loss handling (same logic as the async
+        // `SharedCoordinator::advance_heartbeat_tick`). Without this the JCP's
+        // copy of job state retains stale executor assignments after a loss.
+        for lost_id in &lost {
+            for jc in self.job_coordinators.values() {
+                jc.handle_executor_loss_sync(lost_id);
+            }
+        }
         let job_ids: Vec<JobId> = self.job_coordinators.keys().cloned().collect();
         for job_id in &job_ids {
             let _ = self.launch_assigned_task_assignments(job_id)?;
@@ -946,57 +1149,103 @@ impl Coordinator {
         Ok(())
     }
 
-    /// R5: Scan all Running tasks and reset those that have been in-flight
-    /// longer than `TASK_STALL_TIMEOUT_MS`. The task is marked Failed so the
-    /// coordinator retries it on a different executor slot.
-    fn detect_and_reset_stalled_tasks(&mut self) {
-        const TASK_STALL_TIMEOUT_MS: u64 = 30 * 60 * 1_000; // 30 minutes
+    /// R5: Collect stalled Running tasks that have exceeded the configured
+    /// `task_stall_timeout_ms` (default: 30 minutes).
+    ///
+    /// Pure read — does not mutate any state. Callers send `CancelTask` RPCs
+    /// from the returned targets, then call [`Self::apply_stall_resets`].
+    pub(crate) fn collect_stall_cancel_work(&self) -> Vec<StallCancelWork> {
+        let stall_timeout_ms = self.config.task_stall_timeout_ms();
         let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        let mut work = Vec::new();
         for jc in self.job_coordinators.values() {
-            let mut record = jc.write_record();
-            for stage in record.stages_mut() {
-                for task in stage.tasks_mut() {
+            let record = jc.read_record();
+            for stage in record.stages() {
+                for task in stage.tasks() {
                     if task.state() != krishiv_proto::TaskState::Running {
                         continue;
                     }
                     if let Some(assigned_ms) = task.assigned_at_ms
-                        && now_ms.saturating_sub(assigned_ms) > TASK_STALL_TIMEOUT_MS
+                        && now_ms.saturating_sub(assigned_ms) > stall_timeout_ms
                     {
-                        tracing::warn!(
-                            task_id = %task.task_id(),
-                            stall_secs = now_ms.saturating_sub(assigned_ms) / 1000,
-                            "resetting stalled task (no progress for >30 min)"
-                        );
-                        task.state = krishiv_proto::TaskState::Failed;
-                        task.last_failure_reason = Some(format!(
-                            "task stalled: no progress for {} min",
-                            now_ms.saturating_sub(assigned_ms) / 60_000
-                        ));
-                        task.launch_in_flight = false;
-                        task.assigned_at_ms = None;
+                        let executor_endpoint = task
+                            .assigned_executor()
+                            .and_then(|eid| self.executors.find_executor(eid).ok())
+                            .and_then(|rec| rec.descriptor().task_endpoint().map(str::to_owned));
+                        work.push(StallCancelWork {
+                            job_id: record.job_id().clone(),
+                            stage_id: stage.stage_id().clone(),
+                            task_id: task.task_id().clone(),
+                            attempt: task.attempt(),
+                            executor_endpoint,
+                            stall_secs: now_ms.saturating_sub(assigned_ms) / 1000,
+                        });
                     }
+                }
+            }
+        }
+        work
+    }
+
+    /// Apply stall resets: mark each task in `work` as Failed and clear
+    /// in-flight state. Must be called after cancel RPCs are sent.
+    pub(crate) fn apply_stall_resets(&mut self, work: &[StallCancelWork]) {
+        for item in work {
+            let Some(jc) = self.job_coordinators.get(&item.job_id) else {
+                continue;
+            };
+            let mut record = jc.write_record();
+            for stage in record.stages_mut() {
+                if stage.stage_id() != &item.stage_id {
+                    continue;
+                }
+                for task in stage.tasks_mut() {
+                    if task.task_id() != &item.task_id || task.attempt() != item.attempt {
+                        continue;
+                    }
+                    if task.state() != krishiv_proto::TaskState::Running {
+                        continue;
+                    }
+                    tracing::warn!(
+                        task_id = %item.task_id,
+                        stall_secs = item.stall_secs,
+                        "resetting stalled task (no progress for >30 min)"
+                    );
+                    task.state = krishiv_proto::TaskState::Failed;
+                    task.last_failure_reason = Some(format!(
+                        "task stalled: no progress for {} min",
+                        item.stall_secs / 60,
+                    ));
+                    task.launch_in_flight = false;
+                    task.assigned_at_ms = None;
                 }
             }
         }
     }
 
-    /// Finalize the staged sink outputs of a job that just reached a terminal
-    /// state (Phase 2.3 distributed write commit).
+    /// Legacy sync path used by tests. Sends no cancel RPCs (test executors
+    /// are in-process and don't need them); prefer the async
+    /// [`SharedCoordinator::detect_and_cancel_stalled_tasks`] in production.
+    fn detect_and_reset_stalled_tasks(&mut self) {
+        let work = self.collect_stall_cancel_work();
+        self.apply_stall_resets(&work);
+    }
+
+    /// Collect staged sink finalization work for a job that just reached a
+    /// terminal state (Phase 2.3 distributed write commit).
     ///
-    /// - `Succeeded`: atomically publish staged part files into the
-    ///   destination (rename, with copy+delete fallback) and remove staging.
-    ///   A publish failure demotes the job to `Failed` so callers never
-    ///   observe a succeeded job whose output was not made visible; the
-    ///   staging directory is left in place for a later retry or GC.
-    /// - `Failed` / `Cancelled`: remove staged files (tolerates already
-    ///   missing staging directories).
+    /// This method only reads state; it does **not** perform any filesystem I/O.
+    /// The returned [`SinkFinalizeWork`] is pushed to `self.pending_sink_finalize`
+    /// so the caller can drain it after releasing the coordinator write lock and
+    /// run the blocking operations via `tokio::task::spawn_blocking`.
     ///
-    /// Both publish and cleanup are idempotent, so re-entering this method on
-    /// duplicate terminal updates converges.
+    /// - `Succeeded`: marks parts for atomic publish (rename / copy+delete fallback).
+    /// - `Failed` / `Cancelled`: marks staged files for cleanup.
+    ///
+    /// Both operations are idempotent; re-entry on duplicate terminal updates
+    /// converges.
     pub(crate) fn finalize_staged_sink_outputs(&mut self, job_id: &JobId) {
-        use krishiv_common::write_commit::{
-            SinkWriteSpec, cleanup_staged_outputs, publish_staged_outputs,
-        };
+        use krishiv_common::write_commit::SinkWriteSpec;
 
         const SINK_PREFIX: &str = "object-parquet-sink:";
 
@@ -1019,58 +1268,37 @@ impl Coordinator {
             return;
         }
 
-        let mut publish_failed = false;
+        let mut specs = Vec::with_capacity(contracts.len());
         for payload in contracts {
             let spec = match SinkWriteSpec::parse(&payload) {
                 Ok(spec) => spec,
                 Err(error) => {
-                    // An unparseable contract on a terminal job is a launch-time
-                    // bug; nothing was staged under a path we can derive.
                     tracing::error!(job_id = %job_id, error = %error, "invalid sink contract during finalize");
                     continue;
                 }
             };
-            if !spec.staged {
-                // Legacy direct-write contracts commit inside the task itself.
-                continue;
-            }
-            match state {
-                JobState::Succeeded => match publish_staged_outputs(&spec, job_id.as_str()) {
-                    Ok(outcome) => {
-                        tracing::info!(
-                            job_id = %job_id,
-                            dest = %spec.dest_path,
-                            published = outcome.published.len(),
-                            skipped_existing = outcome.skipped_existing,
-                            ignored = outcome.ignored,
-                            "published staged sink outputs"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            job_id = %job_id,
-                            dest = %spec.dest_path,
-                            error = %error,
-                            "failed to publish staged sink outputs; failing job"
-                        );
-                        publish_failed = true;
-                    }
-                },
-                JobState::Failed | JobState::Cancelled => {
-                    if let Err(error) = cleanup_staged_outputs(&spec, job_id.as_str()) {
-                        tracing::warn!(
-                            job_id = %job_id,
-                            dest = %spec.dest_path,
-                            error = %error,
-                            "failed to clean up staged sink outputs"
-                        );
-                    }
-                }
-                JobState::Accepted | JobState::Planning | JobState::Running => {}
+            if spec.staged {
+                specs.push(spec);
             }
         }
+        if !specs.is_empty() {
+            self.pending_sink_finalize.push(SinkFinalizeWork {
+                job_id: job_id.clone(),
+                state,
+                specs,
+            });
+        }
+    }
 
-        if publish_failed && let Ok(mut job) = self.find_job_mut(job_id) {
+    /// Drain all pending sink finalization work. Callers release the coordinator
+    /// write lock before executing the returned work via `spawn_blocking`.
+    pub fn take_pending_sink_finalize(&mut self) -> Vec<SinkFinalizeWork> {
+        std::mem::take(&mut self.pending_sink_finalize)
+    }
+
+    /// Mark a job `Failed` after a publish step failed outside the write lock.
+    pub(crate) fn mark_sink_publish_failed(&mut self, job_id: &JobId) {
+        if let Ok(mut job) = self.find_job_mut(job_id) {
             job.state = JobState::Failed;
         }
     }

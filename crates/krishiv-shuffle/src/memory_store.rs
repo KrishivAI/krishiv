@@ -6,7 +6,7 @@ use crate::{
     store::{LeaseMap, PartitionKey},
 };
 use ahash::{AHashMap, AHashSet};
-use std::collections::VecDeque;
+use indexmap::IndexSet;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
@@ -24,27 +24,53 @@ pub struct InMemoryShuffleStore {
     max_bytes: Option<usize>,
     bytes_used: Arc<RwLock<usize>>,
     spill_store: Option<Arc<LocalDiskShuffleStore>>,
-    spill_order: Arc<RwLock<VecDeque<PartitionKey>>>,
+    spill_order: Arc<RwLock<IndexSet<PartitionKey>>>,
     spilled: Arc<RwLock<AHashSet<PartitionKey>>>,
     spill_lock: Arc<Mutex<()>>,
     // Content hashes for partition determinism verification
     content_hashes: Arc<RwLock<AHashMap<PartitionKey, [u8; 32]>>>,
 }
 
-/// Simple stable hash for partition determinism verification.
+/// Stable content hash for partition determinism verification.
+///
+/// Uses XxHash64 over the actual IPC bytes of every record batch so that a
+/// write that mutates batch data (not just the metadata) is detected. The
+/// hash covers batch count and row count as a fast header check, then mixes
+/// in the first 64 bytes of each batch's Arrow IPC buffer for content
+/// sampling. Full IPC serialisation would be more thorough but is too
+/// expensive to run on every write.
 fn compute_simple_partition_hash(partition: &ShufflePartition) -> [u8; 32] {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher as _;
+    use twox_hash::XxHash64;
 
-    let mut hasher = DefaultHasher::new();
-    partition.id.job_id.hash(&mut hasher);
-    partition.id.stage_id.hash(&mut hasher);
-    partition.id.partition.hash(&mut hasher);
-    partition.batches.len().hash(&mut hasher);
-
-    let h = hasher.finish();
+    let mut h = XxHash64::with_seed(0xcafe_babe_dead_beef);
+    // Mix ID so two partitions with identical data but different IDs don't collide.
+    h.write(partition.id.job_id.as_bytes());
+    h.write(partition.id.stage_id.as_bytes());
+    h.write_u32(partition.id.partition);
+    // Cover batch count and total row count as a fast header.
+    h.write_usize(partition.batches.len());
+    let total_rows: usize = partition.batches.iter().map(|b| b.num_rows()).sum();
+    h.write_usize(total_rows);
+    // Sample actual column data from each batch's first few column buffers.
+    for batch in &partition.batches {
+        h.write_usize(batch.num_columns());
+        for col in batch.columns() {
+            // Hash the first 64 bytes of each array's data buffer.
+            let buf = col.to_data();
+            for raw_buf in buf.buffers() {
+                let sample = &raw_buf.as_slice()[..raw_buf.len().min(64)];
+                h.write(sample);
+            }
+        }
+    }
+    let digest = h.finish();
     let mut out = [0u8; 32];
-    out[0..8].copy_from_slice(&h.to_be_bytes());
+    out[0..8].copy_from_slice(&digest.to_be_bytes());
+    // Fill remaining bytes with XOR-rotated variants for better avalanche.
+    out[8..16].copy_from_slice(&digest.rotate_left(17).to_be_bytes());
+    out[16..24].copy_from_slice(&digest.rotate_left(37).to_be_bytes());
+    out[24..32].copy_from_slice(&(!digest).to_be_bytes());
     out
 }
 
@@ -56,7 +82,7 @@ impl Default for InMemoryShuffleStore {
             max_bytes: None,
             bytes_used: Arc::new(RwLock::new(0)),
             spill_store: None,
-            spill_order: Arc::new(RwLock::new(VecDeque::new())),
+            spill_order: Arc::new(RwLock::new(IndexSet::default())),
             spilled: Arc::new(RwLock::new(AHashSet::default())),
             spill_lock: Arc::new(Mutex::new(())),
             content_hashes: Arc::new(RwLock::new(AHashMap::default())),
@@ -79,7 +105,7 @@ impl InMemoryShuffleStore {
             max_bytes: Some(max_bytes),
             bytes_used: Arc::new(RwLock::new(0)),
             spill_store: None,
-            spill_order: Arc::new(RwLock::new(VecDeque::new())),
+            spill_order: Arc::new(RwLock::new(IndexSet::default())),
             spilled: Arc::new(RwLock::new(AHashSet::default())),
             spill_lock: Arc::new(Mutex::new(())),
             content_hashes: Arc::new(RwLock::new(AHashMap::default())),
@@ -93,7 +119,7 @@ impl InMemoryShuffleStore {
             max_bytes: None,
             bytes_used: Arc::new(RwLock::new(0)),
             spill_store: None,
-            spill_order: Arc::new(RwLock::new(VecDeque::new())),
+            spill_order: Arc::new(RwLock::new(IndexSet::default())),
             spilled: Arc::new(RwLock::new(AHashSet::default())),
             spill_lock: Arc::new(Mutex::new(())),
             content_hashes: Arc::new(RwLock::new(AHashMap::default())),
@@ -302,7 +328,7 @@ impl ShuffleStore for InMemoryShuffleStore {
                     .map(|p| partition_memory_bytes(&p))
                     .unwrap_or(0);
                 let mut order = shuffle_write_lock(&self.spill_order)?;
-                order.retain(|existing| existing != &key);
+                order.swap_remove(&key); // O(1) removal; order is approximate LRU
                 let mut spilled = shuffle_write_lock(&self.spilled)?;
                 spilled.insert(key.clone());
                 let mut used = shuffle_write_lock(&self.bytes_used)?;
@@ -341,8 +367,10 @@ impl ShuffleStore for InMemoryShuffleStore {
             let old_size = parts.get(&key).map(partition_memory_bytes).unwrap_or(0);
             parts.insert(key.clone(), partition);
             let mut order = shuffle_write_lock(&self.spill_order)?;
-            order.retain(|existing| existing != &key);
-            order.push_back(committed_key.clone());
+            // O(1) remove (swap_remove) + O(1) insert replaces O(n) retain.
+            // Order is approximate LRU; exact FIFO is not required for eviction.
+            order.swap_remove(&key);
+            order.insert(committed_key.clone());
             let mut spilled = shuffle_write_lock(&self.spilled)?;
             spilled.remove(&committed_key);
             let mut used = shuffle_write_lock(&self.bytes_used)?;

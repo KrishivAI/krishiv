@@ -36,11 +36,26 @@ const EXECUTOR_KEY_PREFIX: &str = "/krishiv/executors/";
 /// Each job and executor descriptor lives under its own key so writes are
 /// O(1) regardless of cluster size, and the 1.5 MiB etcd value limit only
 /// applies per-record rather than to the full metadata snapshot.
+///
+/// # Cache contract
+///
+/// `startup_jobs` and `startup_executors` are populated once at `connect()` time
+/// and are **never mutated** afterwards.  All writes (`save_job`, `save_executor`,
+/// `remove_executor`) go directly to etcd; the in-memory fields are not touched.
+///
+/// This eliminates split-brain between the in-memory view and etcd that would
+/// otherwise arise when a network timeout causes `put` to return an error even
+/// though the server committed the write.  `jobs()` and `executors()` are called
+/// only during coordinator startup (recovery), where the startup snapshot is
+/// authoritative.  For all other in-session state, the coordinator's own
+/// `job_coordinators` map is the source of truth.
 pub struct EtcdMetadataStore {
     client: std::sync::Mutex<Client>,
     events: Vec<EventLogEvent>,
-    jobs: Vec<JobRecord>,
-    executor_descriptors: Vec<krishiv_proto::ExecutorDescriptor>,
+    /// Startup-time snapshot loaded from etcd.  Read-only after construction.
+    startup_jobs: Vec<JobRecord>,
+    /// Startup-time snapshot loaded from etcd.  Read-only after construction.
+    startup_executors: Vec<krishiv_proto::ExecutorDescriptor>,
 }
 
 impl EtcdMetadataStore {
@@ -72,8 +87,8 @@ impl EtcdMetadataStore {
         Ok(Self {
             client: std::sync::Mutex::new(client),
             events: Vec::new(),
-            jobs,
-            executor_descriptors,
+            startup_jobs: jobs,
+            startup_executors: executor_descriptors,
         })
     }
 
@@ -125,18 +140,11 @@ impl MetadataStore for EtcdMetadataStore {
         let bytes = serde_json::to_vec(&persisted).map_err(|e| SchedulerError::Transport {
             message: format!("etcd job encode failed for {}: {e}", record.job_id()),
         })?;
-        self.put_key(key, bytes)?;
-        // Update in-memory view.
-        if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
-            *existing = record.clone();
-        } else {
-            self.jobs.push(record.clone());
-        }
-        Ok(())
+        self.put_key(key, bytes)
     }
 
     fn jobs(&self) -> &[JobRecord] {
-        &self.jobs
+        &self.startup_jobs
     }
 
     fn save_executor(
@@ -151,30 +159,16 @@ impl MetadataStore for EtcdMetadataStore {
                 descriptor.executor_id()
             ),
         })?;
-        self.put_key(key, bytes)?;
-        // Update in-memory view.
-        if let Some(pos) = self
-            .executor_descriptors
-            .iter()
-            .position(|e| e.executor_id() == descriptor.executor_id())
-        {
-            self.executor_descriptors[pos] = descriptor.clone();
-        } else {
-            self.executor_descriptors.push(descriptor.clone());
-        }
-        Ok(())
+        self.put_key(key, bytes)
     }
 
     fn executors(&self) -> Vec<krishiv_proto::ExecutorDescriptor> {
-        self.executor_descriptors.clone()
+        self.startup_executors.clone()
     }
 
     fn remove_executor(&mut self, executor_id: &krishiv_proto::ExecutorId) -> SchedulerResult<()> {
         let key = format!("{EXECUTOR_KEY_PREFIX}{}", executor_id.as_str());
-        self.delete_key(key)?;
-        self.executor_descriptors
-            .retain(|e| e.executor_id() != executor_id);
-        Ok(())
+        self.delete_key(key)
     }
 
     fn save_continuous_snapshot(

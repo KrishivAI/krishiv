@@ -205,31 +205,51 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
             update = update
                 .with_missing_shuffle_partitions(request.missing_shuffle_partitions().to_vec());
         }
-        let mut coordinator = lock_coord(&self.coordinator)?;
-        let response = match coordinator.apply_task_update(update) {
-            Ok(TaskUpdateOutcome::Applied) => {
-                TaskStatusResponse::new(TransportDisposition::Accepted)
-            }
-            Ok(TaskUpdateOutcome::Duplicate) => {
-                TaskStatusResponse::new(TransportDisposition::Duplicate)
-            }
-            Err(SchedulerError::UnknownJob { .. }) => {
-                TaskStatusResponse::new(TransportDisposition::UnknownJob)
-            }
-            Err(SchedulerError::UnknownTask { .. }) => {
-                TaskStatusResponse::new(TransportDisposition::UnknownTask)
-            }
-            Err(SchedulerError::UnknownExecutor { .. }) => {
-                TaskStatusResponse::new(TransportDisposition::UnknownExecutor)
-            }
-            Err(SchedulerError::StaleExecutorLease { .. }) => {
-                TaskStatusResponse::new(TransportDisposition::StaleLease)
-            }
-            Err(SchedulerError::StaleTaskAttempt { .. }) => {
-                TaskStatusResponse::new(TransportDisposition::StaleAttempt)
-            }
-            Err(error) => return Err(status_from_scheduler_error(error)),
+        // Phase 1: apply update and collect deferred sink work under the lock.
+        let (response, sink_work) = {
+            let mut coordinator = lock_coord(&self.coordinator)?;
+            let response = match coordinator.apply_task_update(update) {
+                Ok(TaskUpdateOutcome::Applied) => {
+                    TaskStatusResponse::new(TransportDisposition::Accepted)
+                }
+                Ok(TaskUpdateOutcome::Duplicate) => {
+                    TaskStatusResponse::new(TransportDisposition::Duplicate)
+                }
+                Err(SchedulerError::UnknownJob { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::UnknownJob)
+                }
+                Err(SchedulerError::UnknownTask { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::UnknownTask)
+                }
+                Err(SchedulerError::UnknownExecutor { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::UnknownExecutor)
+                }
+                Err(SchedulerError::StaleExecutorLease { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::StaleLease)
+                }
+                Err(SchedulerError::StaleTaskAttempt { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::StaleAttempt)
+                }
+                Err(error) => return Err(status_from_scheduler_error(error)),
+            };
+            let sink_work = coordinator.take_pending_sink_finalize();
+            (response, sink_work)
+            // sync lock released here
         };
+
+        // Phase 2: run blocking filesystem I/O outside the sync lock.
+        // `block_in_place` lets Tokio move other tasks off this thread while we block.
+        if !sink_work.is_empty() {
+            tokio::task::block_in_place(|| {
+                for work in sink_work {
+                    let job_id = work.job_id.clone();
+                    let publish_ok = work.execute();
+                    if !publish_ok && let Ok(mut coordinator) = lock_coord(&self.coordinator) {
+                        coordinator.mark_sink_publish_failed(&job_id);
+                    }
+                }
+            });
+        }
         Ok(tonic::Response::new(response))
     }
 

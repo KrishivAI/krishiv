@@ -232,7 +232,7 @@ impl ClusterControlPlane {
                         tracing::error!(error = %e, "failed to demote to standby");
                     }
                     if let Some(handles) = orchestration_handles.take() {
-                        handles.shutdown();
+                        handles.shutdown().await;
                     }
                 }
             } else {
@@ -240,7 +240,7 @@ impl ClusterControlPlane {
                     tracing::error!(error = %e, "failed to demote to standby");
                 }
                 if let Some(handles) = orchestration_handles.take() {
-                    handles.shutdown();
+                    handles.shutdown().await;
                 }
             }
         }

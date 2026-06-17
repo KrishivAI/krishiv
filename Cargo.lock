@@ -5760,6 +5760,7 @@ dependencies = [
  "constant_time_eq 0.3.1",
  "dashmap",
  "futures",
+ "indexmap 2.14.0",
  "krishiv-common",
  "lz4_flex 0.11.6",
  "object_store 0.13.2",

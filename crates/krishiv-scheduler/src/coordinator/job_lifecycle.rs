@@ -181,6 +181,7 @@ impl Coordinator {
     }
 
     /// Apply a task update from an executor.
+    #[tracing::instrument(skip(self, update), fields(job_id = %update.job_id(), task_id = %update.task_id(), state = ?update.state()), name = "apply_task_update")]
     pub fn apply_task_update(
         &mut self,
         update: TaskStatusUpdate,

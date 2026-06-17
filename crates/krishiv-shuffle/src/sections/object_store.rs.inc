@@ -582,7 +582,7 @@ async fn spill_failure_does_not_corrupt_bytes_used() {
     let made_immutable = Command::new("chattr")
         .args(["+i", &spill_path.to_string_lossy()])
         .status()
-        .map_or(false, |s| s.success());
+        .is_ok_and(|s| s.success());
     if !made_immutable {
         // Fallback: set read-only permissions (chattr may require
         // CAP_LINUX_IMMUTABLE on some systems; 0o000 stops non-root writes).

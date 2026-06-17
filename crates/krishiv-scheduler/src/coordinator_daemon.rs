@@ -931,7 +931,7 @@ fn coordinator_bearer_token_configured() -> bool {
     crate::auth::coordinator_bearer_auth_configured()
 }
 
-fn configure_coordinator_grpc_auth(config: &CoordinatorDaemonConfig) -> bool {
+async fn configure_coordinator_grpc_auth(config: &CoordinatorDaemonConfig) -> bool {
     if config.insecure {
         if let Err(error) = crate::auth::set_allow_anonymous() {
             tracing::error!("{error}");
@@ -940,7 +940,7 @@ fn configure_coordinator_grpc_auth(config: &CoordinatorDaemonConfig) -> bool {
         return false;
     }
     // OIDC/JWKS JWT auth takes precedence over static bearer tokens.
-    if crate::auth::configure_jwt_auth_provider_from_env() {
+    if crate::auth::configure_jwt_auth_provider_from_env().await {
         return true;
     }
     crate::auth::configure_grpc_auth_provider_from_env()
@@ -1005,7 +1005,7 @@ pub async fn run_standalone_coordinator(
     extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
     extra_sidecars: Vec<CoordinatorSidecarFn>,
 ) -> Result<(), Box<dyn Error>> {
-    let grpc_auth_configured = configure_coordinator_grpc_auth(&config);
+    let grpc_auth_configured = configure_coordinator_grpc_auth(&config).await;
     validate_runtime_security_config(
         &config,
         executor_task_bearer_token_configured(),
@@ -1089,7 +1089,7 @@ pub async fn run_clusterd_daemon(
     extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
     extra_sidecars: Vec<CoordinatorSidecarFn>,
 ) -> Result<(), Box<dyn Error>> {
-    let grpc_auth_configured = configure_coordinator_grpc_auth(&config);
+    let grpc_auth_configured = configure_coordinator_grpc_auth(&config).await;
     validate_runtime_security_config(
         &config,
         executor_task_bearer_token_configured(),

@@ -7,6 +7,18 @@ use krishiv_proto::{ExecutorId, JobId, TaskState};
 /// Default heartbeat staleness threshold in milliseconds (30 seconds).
 const DEFAULT_HEARTBEAT_STALE_MS: u64 = 30_000;
 
+/// Per-job state container shared between the coordinator write path and async task handlers.
+///
+/// # Lock acquisition order within `JobCoordinator`
+///
+/// When code needs both fields, always acquire them in this order:
+///
+/// 1. `inner` (`RwLock<JobRecord>`) — acquired via `read_record()` / `write_record()`.
+/// 2. `heartbeat_timestamps` (`Mutex`) — may be acquired independently **or** while already
+///    holding `inner`, but **never** acquire `inner` while holding `heartbeat_timestamps`.
+///
+/// This matches the global ordering documented on `SharedCoordinator`: the
+/// `SharedCoordinator` outer lock is always acquired before any per-job lock.
 pub struct JobCoordinator {
     pub job_id: JobId,
     inner: Arc<RwLock<JobRecord>>,
@@ -138,6 +150,12 @@ impl JobCoordinator {
     }
 
     pub async fn handle_executor_loss(&self, executor_id: &ExecutorId) -> usize {
+        self.handle_executor_loss_sync(executor_id)
+    }
+
+    /// Sync variant of `handle_executor_loss` for the non-async coordinator
+    /// tick path. Identical logic — the async version just calls this.
+    pub fn handle_executor_loss_sync(&self, executor_id: &ExecutorId) -> usize {
         let mut job = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let mut affected = 0;
         for stage in job.stages_mut() {

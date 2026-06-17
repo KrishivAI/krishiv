@@ -31,7 +31,7 @@ fn configured_executor_task_bearer_token() -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-fn inject_executor_task_request_context(
+pub(crate) fn inject_executor_task_request_context(
     req: tonic::Request<()>,
 ) -> Result<tonic::Request<()>, tonic::Status> {
     let mut req = krishiv_metrics::grpc::inject_trace_context(req)?;

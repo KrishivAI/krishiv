@@ -192,38 +192,56 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                 .with_missing_shuffle_partitions(request.missing_shuffle_partitions().to_vec());
         }
 
-        let mut coordinator = self.coordinator.write().await;
-
-        let response = match coordinator.apply_task_update(update) {
-            Ok(TaskUpdateOutcome::Applied) => {
-                TaskStatusResponse::new(TransportDisposition::Accepted)
-            }
-            Ok(TaskUpdateOutcome::Duplicate) => {
-                TaskStatusResponse::new(TransportDisposition::Duplicate)
-                    .with_message("task status update was already applied")
-            }
-            Err(SchedulerError::UnknownJob { .. }) => {
-                TaskStatusResponse::new(TransportDisposition::UnknownJob)
-                    .with_message("job is not registered")
-            }
-            Err(SchedulerError::UnknownTask { .. }) => {
-                TaskStatusResponse::new(TransportDisposition::UnknownTask)
-                    .with_message("task is not registered")
-            }
-            Err(SchedulerError::UnknownExecutor { .. }) => {
-                TaskStatusResponse::new(TransportDisposition::UnknownExecutor)
-                    .with_message("executor is not registered")
-            }
-            Err(SchedulerError::StaleExecutorLease { .. }) => {
-                TaskStatusResponse::new(TransportDisposition::StaleLease)
-                    .with_message("executor lease generation is stale")
-            }
-            Err(SchedulerError::StaleTaskAttempt { .. }) => {
-                TaskStatusResponse::new(TransportDisposition::StaleAttempt)
-                    .with_message("task attempt is stale")
-            }
-            Err(error) => return Err(status_from_scheduler_error(error)),
+        // Phase 1: apply the update and collect any deferred sink-finalization
+        // work — all under the write lock, no I/O.
+        let (response, sink_work) = {
+            let mut coordinator = self.coordinator.write().await;
+            let response = match coordinator.apply_task_update(update) {
+                Ok(TaskUpdateOutcome::Applied) => {
+                    TaskStatusResponse::new(TransportDisposition::Accepted)
+                }
+                Ok(TaskUpdateOutcome::Duplicate) => {
+                    TaskStatusResponse::new(TransportDisposition::Duplicate)
+                        .with_message("task status update was already applied")
+                }
+                Err(SchedulerError::UnknownJob { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::UnknownJob)
+                        .with_message("job is not registered")
+                }
+                Err(SchedulerError::UnknownTask { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::UnknownTask)
+                        .with_message("task is not registered")
+                }
+                Err(SchedulerError::UnknownExecutor { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::UnknownExecutor)
+                        .with_message("executor is not registered")
+                }
+                Err(SchedulerError::StaleExecutorLease { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::StaleLease)
+                        .with_message("executor lease generation is stale")
+                }
+                Err(SchedulerError::StaleTaskAttempt { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::StaleAttempt)
+                        .with_message("task attempt is stale")
+                }
+                Err(error) => return Err(status_from_scheduler_error(error)),
+            };
+            let sink_work = coordinator.take_pending_sink_finalize();
+            (response, sink_work)
+            // write lock released here
         };
+
+        // Phase 2: run blocking filesystem I/O outside the coordinator write lock.
+        for work in sink_work {
+            let job_id = work.job_id.clone();
+            let publish_ok = tokio::task::spawn_blocking(move || work.execute())
+                .await
+                .unwrap_or(false);
+            if !publish_ok {
+                let mut coordinator = self.coordinator.write().await;
+                coordinator.mark_sink_publish_failed(&job_id);
+            }
+        }
 
         Ok(tonic::Response::new(response))
     }

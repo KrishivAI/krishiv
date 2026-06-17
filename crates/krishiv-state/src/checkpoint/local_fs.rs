@@ -30,18 +30,51 @@ impl LocalFsCheckpointStorage {
     }
 
     pub(crate) fn full_path(&self, path: &str) -> CheckpointResult<PathBuf> {
-        // Prevent path traversal: strip any leading '/' or '..' components,
-        // then verify the resolved path stays within `self.base_dir`.
+        // Phase 1: strip known-dangerous components before joining so that
+        // the candidate path does not escape the base directory via `..` or
+        // absolute paths.
         let clean: PathBuf = path
             .split('/')
             .filter(|c| !c.is_empty() && *c != "..")
             .collect();
-        let result = self.base_dir.join(clean);
-        if !result.starts_with(&self.base_dir) {
+        let candidate = self.base_dir.join(clean);
+
+        // Phase 2: resolve symlinks so that a symlink pointing outside
+        // base_dir cannot bypass the prefix check above.
+        // We call `canonicalize` on the *parent* directory rather than the
+        // candidate itself so that the operation succeeds even when the file
+        // does not yet exist (e.g. before a write creates it).
+        let canonical_base =
+            self.base_dir
+                .canonicalize()
+                .map_err(|e| CheckpointError::InvalidPath {
+                    path: format!(
+                        "cannot canonicalize base_dir {}: {e}",
+                        self.base_dir.display()
+                    ),
+                })?;
+
+        let parent = candidate.parent().unwrap_or(&candidate);
+        let canonical_parent = if parent.exists() {
+            parent
+                .canonicalize()
+                .map_err(|e| CheckpointError::InvalidPath {
+                    path: format!("cannot canonicalize parent {}: {e}", parent.display()),
+                })?
+        } else {
+            parent.to_path_buf()
+        };
+
+        // Phase 3: verify the resolved parent (and therefore the file) stays
+        // within the canonical base directory.
+        if !canonical_parent.starts_with(&canonical_base) {
             return Err(CheckpointError::InvalidPath {
-                path: result.display().to_string(),
+                path: candidate.display().to_string(),
             });
         }
-        Ok(result)
+
+        // Reconstruct the full path using the canonical parent so that the
+        // returned path is consistent with the filesystem view.
+        Ok(canonical_parent.join(candidate.file_name().unwrap_or_default()))
     }
 }

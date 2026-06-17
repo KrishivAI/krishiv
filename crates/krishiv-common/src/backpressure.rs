@@ -7,9 +7,14 @@
 //! `try_send(bytes)` before producing; the consumer calls `ack(bytes)` after
 //! draining output.  When credits drop to zero the producer signals backpressure
 //! upward via `BackpressureSignal`.
+//!
+//! Producers that need to block until credits are available should use
+//! `wait_for_credit` which parks on a `Notify` that the consumer wakes on
+//! every `ack` call.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Notify;
 
 /// Backpressure signal attached to a task output or operator boundary.
 ///
@@ -39,11 +44,13 @@ impl BackpressureSignal {
         if available == 0 {
             return Self::Pause;
         }
-        let ratio = available as f32 / capacity as f32;
+        let ratio = available as f64 / capacity as f64;
         if ratio < 0.1 {
             Self::Throttle { fraction: 0.1 }
         } else if ratio < 0.5 {
-            Self::Throttle { fraction: ratio }
+            Self::Throttle {
+                fraction: ratio as f32,
+            }
         } else {
             Self::None
         }
@@ -55,11 +62,19 @@ impl BackpressureSignal {
 /// The consumer initialises the gate with `capacity` bytes of credit; the
 /// producer deducts before writing, the consumer restores after draining.
 ///
-/// All operations use `Relaxed` ordering — the gate is advisory.
+/// Ordering: `try_send` and `ack` use `AcqRel` / `Acquire` so that all writes
+/// the consumer completed before `ack` are visible to the producer after a
+/// successful `try_send`.  Advisory reads (`available`, `signal`) use `Relaxed`.
+///
+/// Producers that must block until credits are available should call
+/// `wait_for_credit` which parks on the embedded `Notify` and is woken by
+/// every successful `ack`.
 #[derive(Debug)]
 pub struct CreditGate {
     available: AtomicU64,
     capacity: u64,
+    /// Woken by `ack` so producers blocked in `wait_for_credit` are unparked.
+    notify: Notify,
 }
 
 impl CreditGate {
@@ -68,6 +83,7 @@ impl CreditGate {
         Arc::new(Self {
             available: AtomicU64::new(capacity),
             capacity,
+            notify: Notify::new(),
         })
     }
 
@@ -76,7 +92,7 @@ impl CreditGate {
         self.capacity
     }
 
-    /// Current available credits.
+    /// Current available credits (advisory; may be stale).
     pub fn available(&self) -> u64 {
         self.available.load(Ordering::Relaxed)
     }
@@ -90,37 +106,60 @@ impl CreditGate {
     ///
     /// Returns `true` if the deduction was accepted (credits were available).
     /// Returns `false` if insufficient credits remain; the producer should
-    /// pause and retry after the consumer calls [`Self::ack`].
+    /// park in `wait_for_credit` and retry.
     pub fn try_send(&self, bytes: u64) -> bool {
         if bytes == 0 {
             return true;
         }
-        let prev = self
-            .available
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        self.available
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 if cur >= bytes {
                     Some(cur - bytes)
                 } else {
                     None
                 }
-            });
-        prev.is_ok()
+            })
+            .is_ok()
     }
 
     /// Consumer: return `bytes` credits after draining output.
     ///
-    /// Saturates at `capacity`.
+    /// Saturates at `capacity` and wakes any producer parked in
+    /// `wait_for_credit`.
     pub fn ack(&self, bytes: u64) {
         let _ = self
             .available
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 Some((cur + bytes).min(self.capacity))
             });
+        self.notify.notify_waiters();
     }
 
-    /// Reset to full capacity (e.g. on pipeline restart).
+    /// Reset to full capacity (e.g. on pipeline restart) and wake waiting producers.
     pub fn reset(&self) {
-        self.available.store(self.capacity, Ordering::Relaxed);
+        self.available.store(self.capacity, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Park until credits are available, then return.
+    ///
+    /// Does NOT deduct credits — the caller must call `try_send` after waking.
+    /// This avoids the thundering-herd problem: multiple producers all wake on
+    /// a single `ack` and compete fairly via `try_send`.
+    pub async fn wait_for_credit(&self) {
+        loop {
+            // Fast path: credits already available.
+            if self.available.load(Ordering::Acquire) > 0 {
+                return;
+            }
+            // Register the notification listener BEFORE re-checking credits so
+            // we cannot miss a concurrent `ack`.
+            let notified = self.notify.notified();
+            if self.available.load(Ordering::Acquire) > 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -183,5 +222,26 @@ mod tests {
         assert_eq!(g.available(), 0);
         g.reset();
         assert_eq!(g.available(), 200);
+    }
+
+    #[tokio::test]
+    async fn wait_for_credit_wakes_on_ack() {
+        let gate = CreditGate::new(100);
+        gate.try_send(100); // exhaust credits
+
+        let gate2 = Arc::clone(&gate);
+        let waker = tokio::spawn(async move {
+            gate2.wait_for_credit().await;
+            gate2.try_send(50)
+        });
+
+        // Give the task time to park.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        gate.ack(50);
+
+        assert!(
+            waker.await.unwrap(),
+            "producer should acquire credits after ack"
+        );
     }
 }

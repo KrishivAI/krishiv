@@ -11,6 +11,7 @@ impl Coordinator {
     ///
     /// For streaming jobs with checkpoint config, checkpoint state is recovered
     /// via `CheckpointCoordinator::recover_from_storage`.
+    #[tracing::instrument(skip(self, store), name = "recover_from_store")]
     pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
         // P1.23: Clear in-memory state first so stale phantom jobs cannot survive.
         // Always prefer the persisted store as the authoritative source of truth.
@@ -74,21 +75,41 @@ impl Coordinator {
                         task_count,
                     );
                     if let Err(e) = coord.recover_from_storage() {
-                        tracing::warn!(
+                        // Checkpoint recovery failure is a hard error for streaming jobs:
+                        // continuing without epoch state risks duplicate delivery because
+                        // the coordinator would not know which offsets are already committed.
+                        // Mark the job Failed so operators must explicitly decide whether
+                        // to replay from the last committed checkpoint or reset offsets.
+                        tracing::error!(
                             job_id = %job_id,
                             error = %e,
                             "checkpoint epoch state could not be recovered; \
-                             job will checkpoint from scratch (possible re-processing from last committed offset)"
+                             failing streaming job to prevent duplicate delivery"
                         );
+                        if let Some(jc) = self.job_coordinators.get(&job_id) {
+                            let mut record = jc.write_record();
+                            if !record.state().is_terminal() {
+                                record.state = JobState::Failed;
+                            }
+                        }
+                        // Do not insert a checkpoint coordinator for a failed job.
+                        continue;
                     }
                     self.checkpoint_coordinators.insert(job_id, coord);
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         job_id = %job_id,
                         error = %e,
-                        "cannot restore checkpoint coordinator (storage unavailable); job will checkpoint from scratch"
+                        "cannot open checkpoint storage after coordinator restart; \
+                         failing streaming job to prevent duplicate delivery"
                     );
+                    if let Some(jc) = self.job_coordinators.get(&job_id) {
+                        let mut record = jc.write_record();
+                        if !record.state().is_terminal() {
+                            record.state = JobState::Failed;
+                        }
+                    }
                 }
             }
         }
@@ -140,6 +161,7 @@ impl Coordinator {
     /// timeout eviction path invalidates their shuffle output if they never do.
     ///
     /// Returns the number of jobs with invalidated partitions.
+    #[tracing::instrument(skip(self), name = "audit_shuffle_availability")]
     pub fn audit_shuffle_availability(&mut self) -> usize {
         let known_executors: std::collections::HashSet<ExecutorId> = self
             .executors

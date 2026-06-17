@@ -62,11 +62,23 @@ impl AuthProvider for StaticApiKeyAuthProviderWithRole {
     }
 }
 
-/// Maps a subject string to a role (all coordinator-configured keys get Admin).
-/// We use the subject prefix convention: real subjects get Admin role for coordinator access.
-fn subject_to_role(_subject: &str) -> Role {
-    // Coordinator bearer tokens are always Admin-level access.
-    Role::Admin
+/// Maps an authenticated subject string to its access role.
+///
+/// Convention:
+/// - Subjects with the `reader:` prefix → `Role::Reader`
+/// - Subjects with the `writer:` prefix → `Role::Writer`
+/// - All other subjects (including bare coordinator tokens) → `Role::Admin`
+///
+/// JWT providers should encode the role in a `krishiv_role` claim and return
+/// a subject of the form `<role>:<original-sub>` after claim extraction.
+fn subject_to_role(subject: &str) -> Role {
+    if subject.starts_with("reader:") {
+        Role::Reader
+    } else if subject.starts_with("writer:") {
+        Role::Writer
+    } else {
+        Role::Admin
+    }
 }
 
 // ── gRPC auth enforcement (P3-20) ─────────────────────────────────────────────
@@ -460,7 +472,15 @@ impl AuthContext {
 /// Tonic interceptor that enforces auth on every incoming request.
 pub fn auth_interceptor(req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
     let ctx = extract_auth_context(req.metadata());
-    validate_grpc_auth(&ctx)?;
+    if let Err(status) = validate_grpc_auth(&ctx) {
+        tracing::warn!(
+            subject = ctx.subject(),
+            code = ?status.code(),
+            message = status.message(),
+            "gRPC request rejected by auth interceptor"
+        );
+        return Err(status);
+    }
     Ok(req)
 }
 
@@ -514,14 +534,19 @@ struct JwtClaims {
 
 impl JwtAuthProvider {
     /// Load JWKS from `KRISHIV_OIDC_JWKS_URI` and build a provider.
-    pub fn from_env() -> Option<Result<Self, Box<dyn std::error::Error + Send + Sync>>> {
+    pub async fn from_env() -> Option<Result<Self, Box<dyn std::error::Error + Send + Sync>>> {
         let uri = std::env::var(OIDC_JWKS_URI_ENV).ok()?;
-        Some(Self::from_jwks_uri(&uri))
+        Some(Self::from_jwks_uri(&uri).await)
     }
 
     /// Fetch a JWKS endpoint and build a provider.
-    pub fn from_jwks_uri(uri: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let body = reqwest::blocking::get(uri)?.text()?;
+    ///
+    /// Uses the async `reqwest` client so the caller does not block a Tokio
+    /// executor thread during the HTTP round-trip.
+    pub async fn from_jwks_uri(
+        uri: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let body = reqwest::Client::new().get(uri).send().await?.text().await?;
         Self::from_jwks_json(&body)
     }
 
@@ -565,8 +590,8 @@ impl AuthProvider for JwtAuthProvider {
 }
 
 /// Install OIDC JWKS auth if `KRISHIV_OIDC_JWKS_URI` is set.
-pub fn configure_jwt_auth_provider_from_env() -> bool {
-    match JwtAuthProvider::from_env() {
+pub async fn configure_jwt_auth_provider_from_env() -> bool {
+    match JwtAuthProvider::from_env().await {
         None => false,
         Some(Ok(provider)) => {
             tracing::info!("OIDC JWKS JWT auth provider installed");

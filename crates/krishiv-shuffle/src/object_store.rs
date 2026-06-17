@@ -325,6 +325,111 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         }
     }
 
+    /// Stream IPC batches lazily instead of materialising all into a Vec.
+    ///
+    /// The full object must still be fetched upfront for content-hash
+    /// verification, but individual `RecordBatch`es are yielded one at a time
+    /// via `spawn_blocking` rather than being pre-collected.
+    async fn stream_partition(
+        &self,
+        id: &PartitionId,
+    ) -> ShuffleResult<Option<crate::ShuffleStream>> {
+        use arrow::ipc::reader::StreamReader;
+
+        let path = self.object_path(id)?;
+        let data = match self.store.get(&path).await {
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(crate::error::io_err(e.to_string())),
+            Ok(obj) => obj
+                .bytes()
+                .await
+                .map_err(|e| crate::error::io_err(e.to_string()))?,
+        };
+
+        let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+        let id_clone = id.clone();
+
+        let persisted_hash_path = self.hash_object_path(id)?;
+        let persisted_hash = match self.store.get(&persisted_hash_path).await {
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(ShuffleError::ContentHashMismatch {
+                    partition: format!("{:?}", key),
+                    expected: "persisted blake3 sidecar".to_string(),
+                    actual: "missing".to_string(),
+                });
+            }
+            Err(e) => return Err(crate::error::io_err(e.to_string())),
+            Ok(hash_obj) => {
+                let hash_bytes = hash_obj
+                    .bytes()
+                    .await
+                    .map_err(|e| crate::error::io_err(e.to_string()))?;
+                Self::decode_content_hash(hash_bytes.as_ref()).ok_or_else(|| {
+                    ShuffleError::ContentHashMismatch {
+                        partition: format!("{:?}", key),
+                        expected: "64 lowercase hex blake3 digest".to_string(),
+                        actual: String::from_utf8_lossy(hash_bytes.as_ref()).into_owned(),
+                    }
+                })?
+            }
+        };
+
+        if let Some(stored_ref) = self.content_hashes.get(&key)
+            && *stored_ref != persisted_hash
+        {
+            return Err(ShuffleError::ContentHashMismatch {
+                partition: format!("{:?}", key),
+                expected: Self::encode_content_hash(stored_ref.value()),
+                actual: Self::encode_content_hash(&persisted_hash),
+            });
+        }
+        let computed = Self::compute_content_hash(data.as_ref());
+        if computed != persisted_hash {
+            return Err(ShuffleError::ContentHashMismatch {
+                partition: format!("{:?}", key),
+                expected: Self::encode_content_hash(&persisted_hash),
+                actual: Self::encode_content_hash(&computed),
+            });
+        }
+
+        let decompressed = self
+            .compression
+            .decompress(&data)
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
+        let cursor = std::io::Cursor::new(decompressed);
+        let reader =
+            StreamReader::try_new(cursor, None).map_err(|e| crate::error::io_err(e.to_string()))?;
+        let schema = reader.schema();
+
+        let batch_stream = futures::stream::unfold(Some(reader), |reader_opt| async move {
+            let mut reader = reader_opt?;
+            let res = tokio::task::spawn_blocking(move || {
+                reader.next().map(|batch_res| (batch_res, reader))
+            })
+            .await;
+            match res {
+                Ok(Some((Ok(batch), reader))) => Some((Ok(batch), Some(reader))),
+                Ok(Some((Err(e), reader))) => Some((
+                    Err(crate::error::io_err(format!("IPC batch read error: {e}"))),
+                    Some(reader),
+                )),
+                Ok(None) => None,
+                Err(e) => Some((
+                    Err(crate::error::io_err(format!(
+                        "spawn_blocking join error: {e}"
+                    ))),
+                    None,
+                )),
+            }
+        });
+
+        Ok(Some(crate::ShuffleStream {
+            id: id_clone,
+            schema,
+            batches: Box::pin(batch_stream),
+        }))
+    }
+
     async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()> {
         use futures::StreamExt as _;
         use futures::TryStreamExt;

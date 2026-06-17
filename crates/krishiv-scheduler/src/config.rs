@@ -44,6 +44,14 @@ pub struct CoordinatorConfig {
     /// hard-coded constant. Operators with large in-memory tables can raise this
     /// limit; operators with memory-constrained coordinators can lower it.
     inline_partition_limit_bytes: usize,
+
+    /// Wall-clock milliseconds a task may stay in `Running` state without
+    /// progress before the coordinator resets it (R5 stall detection).
+    ///
+    /// Default: 30 minutes (`30 * 60 * 1_000`). Streaming jobs with long
+    /// micro-batches may need a higher value; batch jobs with a strict SLA
+    /// can lower it.
+    task_stall_timeout_ms: u64,
 }
 
 impl CoordinatorConfig {
@@ -58,6 +66,7 @@ impl CoordinatorConfig {
             checkpoint_ack_timeout_ms: 30_000,
             circuit_breaker_failure_threshold: 5,
             inline_partition_limit_bytes: 3 * 1024 * 1024,
+            task_stall_timeout_ms: 30 * 60 * 1_000,
         }
     }
 
@@ -131,6 +140,18 @@ impl CoordinatorConfig {
     #[must_use]
     pub fn with_inline_partition_limit_bytes(mut self, limit: usize) -> Self {
         self.inline_partition_limit_bytes = limit;
+        self
+    }
+
+    /// R5 stall detection threshold in milliseconds.
+    pub fn task_stall_timeout_ms(&self) -> u64 {
+        self.task_stall_timeout_ms
+    }
+
+    /// Override the R5 stall detection timeout.
+    #[must_use]
+    pub fn with_task_stall_timeout_ms(mut self, ms: u64) -> Self {
+        self.task_stall_timeout_ms = ms.max(1);
         self
     }
 }
