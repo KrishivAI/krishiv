@@ -39,11 +39,13 @@ impl std::fmt::Display for OperatorUid {
 
 /// Per-operator execution configuration.
 ///
-/// Holds the parallelism settings and the stable UID required for
-/// savepoint compatibility.
+/// Holds the parallelism settings and the stable UID required for savepoint
+/// compatibility. The `behavior_version` field is used by the incremental
+/// computing layer: bumping it signals that the operator's logic has changed,
+/// causing any cached `Trace` state to be discarded and recomputed from scratch.
 #[derive(Debug, Clone)]
 pub struct OperatorConfig {
-    /// Stable UID used to match state in savepoints.
+    /// Stable UID used to match state in savepoints and incremental Traces.
     pub uid: OperatorUid,
     /// Actual degree of parallelism (`1` means no key partitioning).
     pub parallelism: usize,
@@ -51,6 +53,11 @@ pub struct OperatorConfig {
     ///
     /// This value must not change across savepoint restores.
     pub max_parallelism: usize,
+    /// Incremental computing: bump this when the operator's UDF or transformation
+    /// logic changes. The `LogicFingerprint` is derived from `(uid, behavior_version)`.
+    /// When the fingerprint changes, the cached incremental `Trace` for this
+    /// operator is invalidated and recomputed from scratch. Default: `0`.
+    pub behavior_version: u64,
 }
 
 impl Default for OperatorConfig {
@@ -59,6 +66,7 @@ impl Default for OperatorConfig {
             uid: OperatorUid::new("default"),
             parallelism: 1,
             max_parallelism: 128,
+            behavior_version: 0,
         }
     }
 }
@@ -81,6 +89,15 @@ impl OperatorConfig {
     /// Set the maximum parallelism for this operator.
     pub fn with_max_parallelism(mut self, mp: usize) -> Self {
         self.max_parallelism = mp;
+        self
+    }
+
+    /// Set the behavior version for incremental Trace cache invalidation.
+    ///
+    /// Bump this (e.g., `0` → `1`) when UDF logic changes so that previously
+    /// cached incremental results are discarded and recomputed correctly.
+    pub fn with_behavior_version(mut self, v: u64) -> Self {
+        self.behavior_version = v;
         self
     }
 }

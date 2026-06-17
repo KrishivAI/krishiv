@@ -20,6 +20,8 @@ pub mod incremental_checkpoint;
 pub mod queryable;
 pub mod savepoint;
 
+pub mod incremental_trace;
+
 // Named modules
 pub mod backend;
 pub mod error;

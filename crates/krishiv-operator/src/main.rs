@@ -260,7 +260,7 @@ fn spawn_coordinator_leader_election(
                 if !renewed {
                     coordinator.write().await.demote_to_standby();
                     if let Some(handles) = orchestration_handles.take() {
-                        handles.shutdown();
+                        handles.shutdown().await;
                     }
                 }
             }

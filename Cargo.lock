@@ -5384,11 +5384,13 @@ dependencies = [
  "arrow 58.3.0",
  "async-trait",
  "dashmap",
+ "datafusion 53.1.0",
  "futures",
  "iceberg",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-dataflow",
+ "krishiv-delta",
  "krishiv-flight-sql",
  "krishiv-plan",
  "krishiv-runtime",
@@ -5512,6 +5514,21 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "krishiv-delta"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "arrow 58.3.0",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "twox-hash",
 ]
 
 [[package]]
@@ -5669,6 +5686,7 @@ dependencies = [
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-dataflow",
+ "krishiv-delta",
  "krishiv-metrics",
  "krishiv-plan",
  "krishiv-sql",

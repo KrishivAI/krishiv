@@ -13,6 +13,7 @@ mod errors;
 mod expression;
 mod job_status;
 mod lakehouse;
+mod incremental;
 mod live_table;
 mod memo;
 mod metrics_api;
@@ -46,6 +47,7 @@ pub use errors::{
 };
 pub use expression::PyColumn;
 pub use job_status::PyJobStatus;
+pub use incremental::{PyDeltaBatch, PyIncrementalFlow, PyStepSummary};
 pub use live_table::{PyChangeFeedIter, PyLiveTable};
 pub use prepared::PyPreparedStatement;
 pub use process_api::{PyListState, PyMapState, PyProcessContext, PyValueState};
@@ -115,6 +117,9 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<schema::PySchema>()?;
     m.add_class::<windows::PyWindowSpec>()?;
     m.add_class::<agg::PyAggExpr>()?;
+    m.add_class::<incremental::PyDeltaBatch>()?;
+    m.add_class::<incremental::PyIncrementalFlow>()?;
+    m.add_class::<incremental::PyStepSummary>()?;
     m.add_class::<live_table::PyLiveTable>()?;
     m.add_class::<live_table::PyChangeFeedIter>()?;
     m.add_class::<memo::MemoCacheInfo>()?;

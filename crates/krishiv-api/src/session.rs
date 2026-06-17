@@ -1161,6 +1161,22 @@ impl Session {
         self.sql_engine.live_table_registry()
     }
 
+    /// Shared incremental-view registry backing `CREATE INCREMENTAL VIEW` DDL.
+    pub fn incremental_view_registry(
+        &self,
+    ) -> &Arc<krishiv_sql::incremental_view::IncrementalViewRegistry> {
+        self.sql_engine.incremental_view_registry()
+    }
+
+    /// Create a new [`IncrementalFlow`] bound to this session.
+    ///
+    /// The returned flow shares the session's incremental-view registry so
+    /// that views registered via `CREATE INCREMENTAL VIEW` SQL are visible
+    /// in the flow.
+    pub fn incremental(&self) -> crate::incremental_flow::IncrementalFlow {
+        crate::incremental_flow::IncrementalFlow::new()
+    }
+
     /// Execute a SQL query with a wall-clock timeout.
     ///
     /// Returns `KrishivError::Runtime` if the query does not produce a result

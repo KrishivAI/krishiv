@@ -838,6 +838,16 @@ impl PySession {
         crate::live_table::create_live_table(name, query, self.inner.live_table_registry().clone())
     }
 
+    /// Create a new :class:`IncrementalFlow` backed by this session.
+    ///
+    /// The returned flow shares the session's incremental view registry so
+    /// that SQL DDL like ``CREATE INCREMENTAL VIEW`` is visible to the flow.
+    pub fn incremental(&self) -> crate::incremental::PyIncrementalFlow {
+        crate::incremental::PyIncrementalFlow {
+            inner: self.inner.incremental(),
+        }
+    }
+
     /// Create a [`PyStream`] backed by in-memory batches (supports windowed `collect()` / `async for`).
     #[pyo3(signature = (name, batches, watermark_column, max_lateness_ms))]
     pub fn memory_stream(

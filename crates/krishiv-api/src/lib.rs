@@ -6,6 +6,7 @@
 
 pub mod blocking;
 pub mod catalog;
+pub mod incremental_flow;
 pub mod dataframe;
 pub mod error;
 pub mod expression;
@@ -56,6 +57,7 @@ pub use krishiv_connectors::{
 pub use prepared::PreparedStatement;
 pub use process::{apply_async_io, apply_process_function};
 pub use query::{QueryCompletion, QueryHandle, QueryId, QueryProgress, QueryStatus};
+pub use incremental_flow::{IncrementalFlow, StepSummary};
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
 pub use streaming_builder::{

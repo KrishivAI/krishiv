@@ -5,6 +5,7 @@ members = [
     "crates/krishiv-common",
     "crates/krishiv-connectors",
     "crates/krishiv-dataflow",
+    "crates/krishiv-delta",
     "crates/krishiv-executor",
     "crates/krishiv-plan",
     "crates/krishiv-proto",
@@ -28,6 +29,7 @@ default-members = [
     "crates/krishiv-common",
     "crates/krishiv-connectors",
     "crates/krishiv-dataflow",
+    "crates/krishiv-delta",
     "crates/krishiv-executor",
     "crates/krishiv-plan",
     "crates/krishiv-proto",
@@ -101,6 +103,7 @@ zstd = "0.13"
 thiserror = "1"
 ahash = "0.8"
 dashmap = "6.1"
+krishiv-delta = { path = "crates/krishiv-delta" }
 qdrant-client = "1.16"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 

@@ -234,9 +234,9 @@ impl TwoPhaseCommitSink for LocalDeltaTwoPhaseCommitSink {
         let staging_path = stage_dir.join(format!("{epoch}-{handle_id}.parquet.tmp"));
         let f = File::create(&staging_path).map_err(to_connector)?;
         let mut writer =
-            ArrowWriter::try_new(f, batch.schema(), None).map_err(|e| to_connector(e))?;
-        writer.write(batch).map_err(|e| to_connector(e))?;
-        let f = writer.into_inner().map_err(|e| to_connector(e))?;
+            ArrowWriter::try_new(f, batch.schema(), None).map_err(to_connector)?;
+        writer.write(batch).map_err(to_connector)?;
+        let f = writer.into_inner().map_err(to_connector)?;
         f.sync_all().map_err(to_connector)?;
         Ok(DeltaStageHandle {
             epoch,

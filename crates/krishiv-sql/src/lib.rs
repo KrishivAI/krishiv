@@ -32,6 +32,7 @@ pub mod grammar;
 pub mod introspection_sql;
 mod kafka_table;
 mod lakehouse;
+pub mod incremental_view;
 pub mod live_table;
 pub mod pivot_sql;
 pub mod recursive_cte;
@@ -362,6 +363,8 @@ pub struct SqlEngine {
     iceberg_catalogs: Arc<std::sync::RwLock<Vec<(Arc<catalog::unified::KrishivCatalog>, String)>>>,
     /// Live-table DDL registry shared across SQL and session APIs.
     live_table_registry: Arc<live_table::LiveTableRegistry>,
+    /// Incremental-view DDL registry shared across SQL and session APIs.
+    incremental_view_registry: Arc<incremental_view::IncrementalViewRegistry>,
     /// Cancelled operation IDs and progress snapshots for query lifecycle control.
     operation_registry: Arc<OperationRegistry>,
 }
@@ -631,6 +634,7 @@ impl SqlEngine {
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
             iceberg_catalogs: Arc::new(std::sync::RwLock::new(Vec::new())),
             live_table_registry: Arc::new(live_table::LiveTableRegistry::new()),
+            incremental_view_registry: Arc::new(incremental_view::IncrementalViewRegistry::new()),
             operation_registry: Arc::new(OperationRegistry::new()),
         })
     }
@@ -968,6 +972,13 @@ impl SqlEngine {
     /// Shared live-table registry for `CREATE LIVE TABLE` DDL.
     pub fn live_table_registry(&self) -> &Arc<live_table::LiveTableRegistry> {
         &self.live_table_registry
+    }
+
+    /// Shared incremental-view registry for `CREATE INCREMENTAL VIEW` DDL.
+    pub fn incremental_view_registry(
+        &self,
+    ) -> &Arc<incremental_view::IncrementalViewRegistry> {
+        &self.incremental_view_registry
     }
 
     /// Shared operation registry for cancellation and progress reporting.
@@ -1476,6 +1487,19 @@ impl SqlEngine {
         if live_table::execute_live_table_ddl(&self.live_table_registry, query)?.is_some() {
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
             return Ok(self.attach_query_metadata(self.make_sql_df("live-table-ddl", empty), query));
+        }
+
+        // ── Intercept CREATE/DECLARE/REFRESH/DROP INCREMENTAL VIEW ───────────
+        if incremental_view::execute_incremental_view_ddl(
+            &self.incremental_view_registry,
+            query,
+        )?
+        .is_some()
+        {
+            let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+            return Ok(
+                self.attach_query_metadata(self.make_sql_df("incremental-view-ddl", empty), query),
+            );
         }
 
         // ── Intercept SET shuffle.partitions = N ─────────────────────────────

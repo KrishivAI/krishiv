@@ -1,5 +1,187 @@
 # Krishiv Implementation Status
 
+## 2026-06-17 — Incremental computing engine (Phases I-1 through I-7)
+
+Implemented a complete incremental view maintenance (IVM) subsystem for Krishiv,
+drawing from both Feldera (DBSP Z-set algebra) and CocoIndex (behavior_version +
+convergent roll-forward commits). The design introduces a new type hierarchy
+(`ChangeBatch`, `Trace`, `IncrementalFlow`) orthogonal to the existing batch and
+streaming paths.
+
+### Architecture decisions (ADRs)
+
+- **ADR-I-01**: `ChangeBatch` = Arrow `RecordBatch` + `_weight: Int64` column (last column, sentinel name).
+- **ADR-I-02**: `Trace` = in-memory Spine (8-level sorted merge-tree, `MERGE_THRESHOLD=4`) + optional RocksDB spill via `TraceStateNamespace`.
+- **ADR-I-03**: Runtime interpretation via DataFusion plans — no code generation.
+- **ADR-I-04**: New type family — do not extend existing batch/streaming paths.
+- **ADR-I-05**: Distributed from day one via existing shuffle/executor infrastructure.
+- **ADR-I-06**: `LATENESS` annotation for watermark-based state GC.
+- **ADR-I-07**: `behavior_version: u64` on `OperatorConfig` → `LogicFingerprint` (XxHash64 of `uid‖version`).
+- **ADR-I-08**: Convergent roll-forward commit; superset invariant for crash safety.
+- **ADR-I-09**: `CoalescingMap` for rapid-update debouncing.
+- **ADR-I-10**: Recursive views via fixed-point iteration with auto-DISTINCT and cycle limit guard.
+
+### Phase I-1: `krishiv-delta` crate (new)
+
+**`crates/krishiv-delta/`** — new crate added to workspace
+
+- `change_batch.rs`: `ChangeBatch` — Arrow `RecordBatch` + per-row `_weight: i64` (insertions +1, retractions -1). Methods: `from_inserts`, `from_retractions`, `with_weights`, `inner`, `num_rows`, `is_empty`, `weight_at`, `consolidate`. 9 unit tests.
+- `trace.rs`: `Trace` — sorted-merge spine of `ChangeBatch` slabs. Methods: `push`, `probe`, `probe_by_keys` (key-projected lookup for joins). `MERGE_THRESHOLD=4` with 8-level pyramid merge. 11 tests.
+- `operators/consolidate.rs`: `consolidate_batch` — merges duplicate rows by summing weights; drops rows with weight=0.
+- `operators/filter.rs`: `FilterOperator` — applies predicate column mask to deltas. 3 tests.
+- `operators/map.rs`: `MapOperator` — projects columns by index. 3 tests.
+- `operators/distinct.rs`: `DistinctOperator` — nonlinear DISTINCT via per-row weight accumulation; emits +1 when count crosses 0→>0, emits -1 when count crosses >0→≤0. 4 tests.
+- `operators/aggregate.rs`: `AggregateOperator` — retraction-protocol aggregation (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`); per-group typed output (Int64 for COUNT, Float64 for others). 5 tests.
+- `operators/join.rs`: `JoinOperator` — bilinear incremental join: `Δ(A⋈B) = (ΔA⋈B_trace) + (A_trace⋈ΔB)`. Fixed probe-index bug (sequential indices for projected probe batch). 3 tests.
+- `operators/recursive.rs`: `RecursiveOperator` — fixed-point iteration with auto-DISTINCT and `cycle_limit` guard. 4 tests.
+- `view.rs`: `IncrementalView`, `IncrementalViewSpec`, `IncrementalViewRegistry`. Thread-safe `watch::Sender` for output streaming; optional materialized snapshot. 10 tests.
+- `lateness.rs`: `LatenessSpec`, `SourceOrdinal`, `WatermarkTracker` — watermark-based state GC. 7 tests.
+- **Total: 48 tests — all pass.**
+
+### Phase I-2: `krishiv-state` extension
+
+**`crates/krishiv-state/src/incremental_trace.rs`** (new module):
+- `TraceStateNamespace` — durable Trace storage backed by `Arc<Mutex<RocksDbStateBackend>>`.
+- Key encoding: `{uid}\x00{behavior_version:016x}\x00{partition_id:08x}` — enables efficient prefix-based operator GC.
+- Methods: `put_trace`, `get_trace`, `delete_operator_traces`, `delete_specific_trace`.
+- 5 tests: roundtrip, behavior_version isolation, operator-level delete, cross-operator non-interference.
+- **State tests: 306 total — all pass.**
+
+### Phase I-3: `OperatorConfig` extension
+
+**`crates/krishiv-dataflow/src/operator_config.rs`**:
+- Added `behavior_version: u64` field (default 0) to `OperatorConfig`.
+- Added `with_behavior_version(v)` builder method.
+- `LogicFingerprint` = `XxHash64(uid‖0x00‖behavior_version.to_le_bytes())` — deterministic across restarts.
+
+### Phase I-4: Workspace registration
+
+**`Cargo.toml`**:
+- Added `"crates/krishiv-delta"` to `members` and `default-members`.
+- Added `krishiv-delta = { path = "crates/krishiv-delta" }` to `[workspace.dependencies]`.
+
+### Phase I-5: SQL surface (`krishiv-sql`)
+
+**`crates/krishiv-sql/src/incremental_view.rs`** (new module):
+- DDL parser for: `CREATE [MATERIALIZED] INCREMENTAL VIEW`, `DECLARE RECURSIVE VIEW`, `REFRESH INCREMENTAL VIEW`, `DROP INCREMENTAL VIEW`.
+- LATENESS annotation: `LATENESS <col> INTERVAL '<n>' <unit>` where unit ∈ {SECOND, MINUTE, HOUR, DAY, MS}.
+- `IncrementalViewRegistry` — `RwLock<HashMap>` for thread-safe read-heavy access.
+- `execute_incremental_view_ddl()` — returns `Option<String>` (view name if handled, None if not IVM DDL).
+- 10 unit tests covering all statement types, LATENESS parsing, registry operations.
+
+**`crates/krishiv-sql/src/lib.rs`**:
+- Added `pub mod incremental_view;` to module list.
+- Added `incremental_view_registry: Arc<IncrementalViewRegistry>` to `SqlEngine` struct.
+- Wired DDL intercept after live_table intercept; added `incremental_view_registry()` accessor.
+
+### Phase I-6: Rust API (`krishiv-api`)
+
+**`crates/krishiv-api/src/incremental_flow.rs`** (new module):
+- `IncrementalFlow { inner: Arc<Mutex<IncrementalFlowInner>> }` — Clone-able, thread-safe driver.
+- `StepSummary { total_output_rows: usize, active_views: usize }` — returned by `step()`.
+- Methods: `new()`, `register_view(spec)`, `feed_source(name, batch)`, `step()`, `view_output_stream(name)`, `snapshot(name)`, `view_names()`, `tick()`.
+- 5 unit tests: register_and_list_views, step_increments_tick, feed_source_drains_on_step, view_output_stream_returns_receiver, snapshot_returns_none_for_non_materialized_view.
+
+**`crates/krishiv-api/src/session.rs`**:
+- Added `incremental_view_registry()` accessor returning `&Arc<IncrementalViewRegistry>`.
+- Added `incremental()` method returning `IncrementalFlow::new()`.
+
+**`crates/krishiv-api/src/lib.rs`**:
+- Added `pub mod incremental_flow;` and re-exports for `IncrementalFlow`, `StepSummary`.
+
+### Phase I-7: Python API (`krishiv-python`)
+
+**`crates/krishiv-python/src/incremental.rs`** (new module):
+- `PyChangeBatch`: wraps `krishiv_delta::ChangeBatch`. Methods: `from_inserts(batch)`, `from_retractions(batch)`, `to_arrow()`, `num_rows`, `is_empty()`, `__repr__`.
+- `PyStepSummary`: `total_output_rows: int`, `active_views: int` — returned by `step()`.
+- `PyIncrementalFlow`: wraps `krishiv_api::IncrementalFlow`. Methods: `__new__()`, `register_view(name, body_sql, schema, *, is_materialized, is_recursive)`, `register_view_with_lateness(name, body_sql, schema, lateness_ms: dict[str, int], ...)`, `feed_source(name, batch)`, `step()`, `snapshot(name)`, `view_names()`, `tick` (property), `drop_view(name)`, `__repr__`.
+- 6 unit tests (non-PyO3 path).
+
+**`crates/krishiv-python/src/session.rs`**:
+- Added `incremental()` method returning `PyIncrementalFlow`.
+
+**`crates/krishiv-python/src/lib.rs`**:
+- Added `mod incremental;`, re-exports, and `m.add_class` registrations for `PyChangeBatch`, `PyIncrementalFlow`, `PyStepSummary`.
+
+### Phase I-9: All critical/high/medium gaps closed (2026-06-17)
+
+**Rename:** `ChangeBatch` → `DeltaBatch` everywhere (type, module, Python binding, serialize/deserialize fns).
+
+**`operators/stream.rs`** (new, 10 tests):
+- `differentiate(schema, prev, next) → DeltaBatch` — set-diff between two snapshots using Arrow `RowConverter` for collision-resistant row encoding. Insertions (+1) and retractions (−1).
+- `apply_delta(current, delta) → RecordBatch` — applies a delta to a snapshot: concatenates, consolidates (group by all columns), returns positive-weight rows only.
+- `IntegrateOp` — stateful wrapper: `apply`, `snapshot_or_empty`, `reset`.
+
+**`view.rs`** — `IncrementalView` gains:
+- `full_output: Arc<Mutex<Option<RecordBatch>>>` — baseline for diff computation.
+- `diff_and_update(new_full) → DeltaBatch` — calls `differentiate`, stores new baseline.
+- `reset_full_output()` — clears baseline (behavior_version invalidation hook).
+
+**`incremental_flow.rs`** — complete rewrite:
+- `pending: HashMap<String, Vec<DeltaBatch>>` — coalesces multiple `feed_source` calls per source (fixes prior HashMap dedup bug where last delta silently won).
+- `source_snapshots: HashMap<String, RecordBatch>` — cumulative live state per source via `apply_delta` (insertions add, retractions remove rows across ticks).
+- `step_datafusion_with_ctx`: (1) apply deltas to source snapshots, (2) register all snapshots as DataFusion MemTables, (3) execute views in **topological order** (Kahn's algorithm over SQL identifier tokens), (4) register each view's output for downstream views, (5) `diff_and_update` each result, (6) publish non-empty deltas.
+- `drop_view(name)` — new method.
+- `source_snapshot(name)` — inspect cumulative source state.
+- `checkpoint() → Vec<u8>` — Arrow IPC serialization of all source snapshots with length-prefix framing.
+- `restore(&[u8])` — deserializes and resets all view `full_output` baselines.
+- `register_view` resets existing view's `full_output` → behavior_version invalidation: next tick emits the fresh result as insertions.
+- `coerce_to_schema` — project/cast DataFusion result to declared `output_schema`.
+- Schema coercion in `execute_view_sql` — handles DataFusion column reordering/type differences.
+
+**Side-fix (I-8):** `krishiv-operator/src/main.rs:263` — `handles.shutdown().await`.
+
+### Validation (Phase I-9)
+
+```
+cargo test -p krishiv-delta --lib      # 58/58 (was 48; +10 stream tests)
+cargo test -p krishiv-state --lib      # 301/301
+cargo test -p krishiv-sql --lib -- incremental_view   # 10/10
+cargo test -p krishiv-api --lib -- incremental_flow   # 17/17 (was 9; +8 new tests)
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings  # 0 errors
+```
+
+### What's still NOT implemented (future phases)
+
+- **Operator-level O(Δ) execution**: `step_datafusion` is correct but O(result), not O(delta). Wiring `JoinOperator`, `AggregateOperator`, `DistinctOperator` into a DataFusion plan rewrite is a separate phase.
+- **Distributed IVM**: shuffle/executor partitioning.
+- **Python `step_async` full asyncio**: currently delegates to sync `step()`.
+- **Nested relations / group+ungroup**.
+
+### Phase I-8: DataFusion execution driver
+
+**`crates/krishiv-api/src/incremental_flow.rs`** — new async methods:
+- `step_datafusion()` — fresh `SessionContext`, registers pending `ChangeBatch`es as `MemTable`s (data columns only, `_weight` stripped), runs each view's `body_sql`, publishes all-positive output. Mutex held only for extract and publish phases, never across `.await`.
+- `step_datafusion_with_ctx(ctx)` — same with caller-supplied context (UDFs, catalogs).
+- `view_specs()` — snapshot of all registered `IncrementalViewSpec`s.
+
+**Side-fix**: `crates/krishiv-operator/src/main.rs:263` — `handles.shutdown()` was missing `.await` (masked by a prior build failure); now `handles.shutdown().await`.
+
+### Validation
+
+```
+cargo test -p krishiv-delta --lib                                              # 48/48
+cargo test -p krishiv-state --lib                                              # 306/306
+cargo test -p krishiv-sql --lib -- incremental_view                            # 10/10
+cargo test -p krishiv-api --lib -- incremental_flow                            # 9/9
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings  # 0 errors
+```
+
+### Next steps
+
+- Python `step_async()` full asyncio integration (currently delegates to sync `step()`).
+- Integration tests: end-to-end `feed_source → step_datafusion → snapshot` with joins/aggregates.
+- Distributed IVM: wire `IncrementalFlow` through shuffle/executor for partitioned views.
+- `CoalescingMap` integration into `IncrementalFlow::feed_source` for rapid-update debouncing (ADR-I-09).
+
+### Next useful command
+
+```bash
+cargo test -p krishiv-api --lib -- incremental_flow
+```
+
+---
+
 ## 2026-06-17 — Production readiness: all Critical/High/Medium fixes
 
 ### Work completed

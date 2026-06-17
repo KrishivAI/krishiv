@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 krishiv-api = { path = "../krishiv-api" }
+krishiv-delta = { path = "../krishiv-delta" }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse", "schema-registry", "iceberg", "hudi", "vector-sinks"] }
 krishiv-dataflow = { path = "../krishiv-dataflow" }
