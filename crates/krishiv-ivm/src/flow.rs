@@ -611,11 +611,22 @@ impl IncrementalFlow {
         let mut total_output_rows = 0usize;
         let mut active_views = 0usize;
 
-        // Provenance: pre-compute input hashes when enabled.
+        // Provenance: pre-compute weight-aware input hashes when enabled.
+        // Each row is hashed with its weight encoded so rows that differ only
+        // in multiplicity produce distinct provenance entries (G5 fix).
         let input_hashes: Option<Vec<u64>> = if inner.provenance.is_some() {
             let hashes = inputs
                 .values()
-                .flat_map(|delta| crate::provenance::hash_all_rows(&delta.data_batch()))
+                .flat_map(|delta| {
+                    let data = delta.data_batch();
+                    let weights = delta.weights();
+                    (0..data.num_rows()).map(move |row| {
+                        let base = hash_row(&data, row);
+                        let w = weights.value(row);
+                        // Mix weight into the hash so weight=+1 ≠ weight=+2.
+                        base.wrapping_add(w.unsigned_abs().wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                    })
+                })
                 .collect();
             Some(hashes)
         } else {
@@ -869,6 +880,9 @@ impl IncrementalFlow {
     ///
     /// Intended for use after a full [`restore`]: apply accumulated delta
     /// slices in order to reach a mid-session consistent state.
+    ///
+    /// Consolidates each snapshot after applying so stacked restores do not
+    /// accumulate paired ±1 rows that never cancel (G2 fix).
     pub fn restore_delta(&self, bytes: &[u8]) -> IvmResult<()> {
         let mut pos = 0usize;
         let n = read_u32(bytes, &mut pos)? as usize;
@@ -885,7 +899,13 @@ impl IncrementalFlow {
             let delta = deserialize_delta_batch(data).map_err(delta_err)?;
             let current = inner.source_snapshots.remove(&name);
             let updated = apply_delta(current, &delta).map_err(delta_err)?;
-            inner.source_snapshots.insert(name, updated);
+            // Consolidate: turns the snapshot (all-positive) into a DeltaBatch,
+            // consolidates to cancel any residual paired rows, then strips weights.
+            let schema = updated.schema();
+            let as_delta = DeltaBatch::from_inserts(updated).map_err(delta_err)?;
+            let consolidated = consolidate_batch(as_delta, &[], &schema).map_err(delta_err)?;
+            let snapshot = consolidated.filter_positive().map_err(delta_err)?;
+            inner.source_snapshots.insert(name, snapshot);
         }
         // Reset view baselines so the next step re-diffs from current state.
         let names = inner.view_registry.view_names().map_err(delta_err)?;
@@ -895,6 +915,40 @@ impl IncrementalFlow {
             }
         }
         Ok(())
+    }
+
+    // ── G1: shuffle / RecordBatch convenience feed ────────────────────────────
+
+    /// Wrap a plain `RecordBatch` as all-insertions and feed it to a source.
+    ///
+    /// Use this when the producer (e.g. a shuffle-write output, a Parquet scan,
+    /// or any non-CDC source) emits `RecordBatch`es with no weight column.
+    /// Equivalent to `feed_source(source, DeltaBatch::from_inserts(batch))`.
+    pub fn feed_source_from_record_batch(
+        &self,
+        source_name: impl Into<String>,
+        batch: RecordBatch,
+    ) -> IvmResult<()> {
+        let delta = DeltaBatch::from_inserts(batch).map_err(delta_err)?;
+        self.feed_source(source_name, delta)
+    }
+
+    // ── G4: feed_stream_delta — pre-computed delta fast path ──────────────────
+
+    /// Feed a pre-computed `DeltaBatch` directly to a source without snapshot diffing.
+    ///
+    /// Use this when the upstream producer already emits ±1 `DeltaBatch`es
+    /// (e.g. a CDC-native Kafka connector, a Debezium reader) and you do not
+    /// want the overhead of materialising a full snapshot for `differentiate`.
+    ///
+    /// Unlike `feed_stream_output`, this does NOT update the streaming-bridge
+    /// prev-snapshot for the source; the two paths are independent.
+    pub fn feed_stream_delta(
+        &self,
+        source_name: impl Into<String>,
+        delta: DeltaBatch,
+    ) -> IvmResult<()> {
+        self.feed_source(source_name, delta)
     }
 }
 
@@ -1172,4 +1226,92 @@ pub fn encode_ivm_step_fragment(
         serde_json::to_string(&spec_entries).map_err(|e| IvmError::execution(e.to_string()))?;
 
     Ok(format!("delta:step:{job_id}|{deltas_json}|{specs_json}"))
+}
+
+// ── Integration tests (3d) ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod integration_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use krishiv_delta::{DeltaBatch, serialize_delta_batch, deserialize_delta_batch};
+
+    use super::IncrementalFlow;
+
+    fn make_batch(ids: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids.to_vec()))]).unwrap()
+    }
+
+    // ── G2: restore_delta idempotency ─────────────────────────────────────────
+
+    #[test]
+    fn restore_delta_twice_does_not_bloat_snapshot() {
+        let flow = IncrementalFlow::new();
+        flow.enable_delta_checkpoints().unwrap();
+
+        // Feed 3 rows.
+        let batch = DeltaBatch::from_inserts(make_batch(&[1, 2, 3])).unwrap();
+        flow.feed_source("src", batch).unwrap();
+        flow.step().unwrap();
+
+        // Checkpoint: full baseline.
+        let full_ck = flow.checkpoint().unwrap();
+        let delta_ck = flow.checkpoint_delta().unwrap();
+
+        // Restore full, then apply delta TWICE (simulates re-delivery).
+        flow.restore(&full_ck).unwrap();
+        flow.restore_delta(&delta_ck).unwrap();
+        flow.restore_delta(&delta_ck).unwrap(); // second application
+
+        // Snapshot should still have exactly 3 rows (duplicates cancelled).
+        let snap = flow.source_snapshot("src").unwrap().unwrap();
+        assert_eq!(snap.num_rows(), 3, "stacked restore must not duplicate rows");
+    }
+
+    // ── G1: feed_source_from_record_batch ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn feed_source_from_record_batch_creates_insertions() {
+        let flow = IncrementalFlow::new();
+        let rb = make_batch(&[10, 20]);
+        flow.feed_source_from_record_batch("s", rb).unwrap();
+        // step_datafusion updates source_snapshots; step() alone does not.
+        flow.step_datafusion().await.unwrap();
+        let snap = flow.source_snapshot("s").unwrap().unwrap();
+        assert_eq!(snap.num_rows(), 2);
+    }
+
+    // ── G4: feed_stream_delta ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn feed_stream_delta_bypasses_differentiate() {
+        let flow = IncrementalFlow::new();
+        let insert_delta = DeltaBatch::from_inserts(make_batch(&[1, 2])).unwrap();
+        flow.feed_stream_delta("src", insert_delta).unwrap();
+        flow.step_datafusion().await.unwrap();
+        let snap = flow.source_snapshot("src").unwrap().unwrap();
+        assert_eq!(snap.num_rows(), 2);
+
+        // Feed a retraction via stream_delta.
+        let retract_delta = DeltaBatch::from_deletes(make_batch(&[1])).unwrap();
+        flow.feed_stream_delta("src", retract_delta).unwrap();
+        flow.step_datafusion().await.unwrap();
+        let snap2 = flow.source_snapshot("src").unwrap().unwrap();
+        assert_eq!(snap2.num_rows(), 1, "retraction must remove row 1");
+    }
+
+    // ── 3c: serialization versioning ──────────────────────────────────────────
+
+    #[test]
+    fn serialization_version_magic_prefix_roundtrip() {
+        let delta = DeltaBatch::from_inserts(make_batch(&[42])).unwrap();
+        let bytes = serialize_delta_batch(&delta).unwrap();
+        assert!(bytes.starts_with(b"DLT1"), "must have DLT1 magic prefix");
+        let restored = deserialize_delta_batch(&bytes).unwrap();
+        assert_eq!(restored.num_rows(), 1);
+        assert_eq!(restored.weights().value(0), 1);
+    }
 }

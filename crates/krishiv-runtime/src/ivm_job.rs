@@ -27,9 +27,10 @@ use krishiv_scheduler::SharedIvmJobRegistry;
 use crate::{
     RemoteStepSummary, RuntimeError, RuntimeResult, execute_coordinator_ivm_checkpoint,
     execute_coordinator_ivm_checkpoint_delta, execute_coordinator_ivm_create_job,
-    execute_coordinator_ivm_feed_source, execute_coordinator_ivm_register_view,
-    execute_coordinator_ivm_restore, execute_coordinator_ivm_restore_delta,
-    execute_coordinator_ivm_step, execute_coordinator_ivm_stream_bridge,
+    execute_coordinator_ivm_feed_source, execute_coordinator_ivm_feed_stream_delta,
+    execute_coordinator_ivm_register_view, execute_coordinator_ivm_restore,
+    execute_coordinator_ivm_restore_delta, execute_coordinator_ivm_step,
+    execute_coordinator_ivm_stream_bridge,
 };
 
 // ── RemoteIvmJob ──────────────────────────────────────────────────────────────
@@ -80,6 +81,36 @@ impl RemoteIvmJob {
     /// The delta is buffered until the next [`step`](Self::step) call.
     pub async fn feed_source(&self, source_name: &str, delta: &DeltaBatch) -> RuntimeResult<()> {
         execute_coordinator_ivm_feed_source(
+            &self.coordinator_http,
+            &self.job_id,
+            source_name,
+            delta,
+        )
+        .await
+    }
+
+    /// Wrap a plain `RecordBatch` as all-insertions and feed it to a source (G1).
+    ///
+    /// Equivalent to `DeltaBatch::from_inserts(batch)` followed by `feed_source`.
+    pub async fn feed_source_from_record_batch(
+        &self,
+        source_name: &str,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> RuntimeResult<()> {
+        let delta = DeltaBatch::from_inserts(batch)
+            .map_err(|e| RuntimeError::plan_rejected(e.to_string()))?;
+        self.feed_source(source_name, &delta).await
+    }
+
+    /// Feed a pre-computed `DeltaBatch` directly (G4 fast path, no snapshot diff).
+    ///
+    /// Use this for CDC-native producers that already emit ±1 weighted batches.
+    pub async fn feed_stream_delta(
+        &self,
+        source_name: &str,
+        delta: &DeltaBatch,
+    ) -> RuntimeResult<()> {
+        execute_coordinator_ivm_feed_stream_delta(
             &self.coordinator_http,
             &self.job_id,
             source_name,
@@ -181,6 +212,28 @@ impl EmbeddedIvmJob {
     ) -> RuntimeResult<()> {
         self.flow
             .feed_source(source_name, delta)
+            .map_err(|e| RuntimeError::plan_rejected(e.to_string()))
+    }
+
+    /// Wrap a plain `RecordBatch` as all-insertions and feed it (G1).
+    pub fn feed_source_from_record_batch(
+        &self,
+        source_name: impl Into<String>,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> RuntimeResult<()> {
+        self.flow
+            .feed_source_from_record_batch(source_name, batch)
+            .map_err(|e| RuntimeError::plan_rejected(e.to_string()))
+    }
+
+    /// Feed a pre-computed `DeltaBatch` directly — no snapshot diff (G4).
+    pub fn feed_stream_delta(
+        &self,
+        source_name: impl Into<String>,
+        delta: DeltaBatch,
+    ) -> RuntimeResult<()> {
+        self.flow
+            .feed_stream_delta(source_name, delta)
             .map_err(|e| RuntimeError::plan_rejected(e.to_string()))
     }
 

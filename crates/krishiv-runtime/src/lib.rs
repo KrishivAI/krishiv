@@ -36,7 +36,8 @@ pub use coordinator_http_client::{
     execute_coordinator_ivm_create_job, execute_coordinator_ivm_feed_source,
     execute_coordinator_ivm_register_view, execute_coordinator_ivm_restore,
     execute_coordinator_ivm_restore_delta, execute_coordinator_ivm_step,
-    execute_coordinator_ivm_stream_bridge, execute_coordinator_physical_plan,
+    execute_coordinator_ivm_feed_stream_delta, execute_coordinator_ivm_stream_bridge,
+    execute_coordinator_physical_plan,
 };
 pub use execution_runtime::{
     BatchTableRegistration, ClusterEndpoints, ExecutionPlacement, ExecutionRuntime,

@@ -17,6 +17,13 @@ use crate::error::{DeltaError, DeltaResult};
 /// Name of the synthetic weight column appended to every `DeltaBatch`.
 pub const WEIGHT_COLUMN: &str = "_weight";
 
+/// Magic prefix written by the versioned serializer (format version 1).
+///
+/// Legacy bytes (produced before versioning) start with Arrow IPC continuation
+/// markers (`0xFF 0xFF 0xFF 0xFF` or a small positive `i32` size), never with
+/// `b"DLT1"`. The deserializer uses this to auto-detect the format.
+const DELTA_BATCH_MAGIC: &[u8; 4] = b"DLT1";
+
 /// The integer weight type: positive = insert, negative = retract.
 pub type Weight = i64;
 
@@ -190,6 +197,50 @@ impl DeltaBatch {
         Ok(Self { inner, data_schema })
     }
 
+    /// Clamp every weight to its sign: `+1`, `-1`, or `0`.
+    ///
+    /// Call this before feeding batches with arbitrary integer weights into
+    /// operators that assume unit weights (e.g. the dedup filter). Zero-weight
+    /// rows should be removed afterwards with [`drop_zeros`](Self::drop_zeros).
+    pub fn normalize_weights(&self) -> DeltaResult<Self> {
+        let weights = self.weights();
+        let clamped: Int64Array = weights
+            .iter()
+            .map(|w| w.map(|v| v.signum()))
+            .collect();
+        let mut cols: Vec<Arc<dyn Array>> =
+            self.inner.columns()[..self.inner.num_columns() - 1].to_vec();
+        cols.push(Arc::new(clamped));
+        let inner = RecordBatch::try_new(self.inner.schema(), cols)?;
+        Ok(Self {
+            inner,
+            data_schema: self.data_schema.clone(),
+        })
+    }
+
+    /// Panic in debug builds if the internal invariant is violated.
+    ///
+    /// Invariant: last column is `_weight: Int64`.
+    /// This is enforced at construction; call this at the entry to hot paths
+    /// during development (`#[cfg(debug_assertions)]` guards the call site).
+    #[cfg(debug_assertions)]
+    pub fn validate(&self) {
+        let ncols = self.inner.num_columns();
+        let schema = self.inner.schema();
+        let field = schema.field(ncols - 1);
+        assert_eq!(
+            field.name(),
+            WEIGHT_COLUMN,
+            "DeltaBatch invariant violated: last column is '{}'",
+            field.name()
+        );
+        assert_eq!(
+            *field.data_type(),
+            arrow::datatypes::DataType::Int64,
+            "DeltaBatch invariant violated: _weight must be Int64"
+        );
+    }
+
     /// Remove rows with weight == 0 from this batch.
     pub fn drop_zeros(&self) -> DeltaResult<Self> {
         let weights = self.weights();
@@ -256,23 +307,39 @@ impl std::fmt::Display for DeltaBatch {
 
 // ── Arrow IPC serialization (for Trace persistence) ───────────────────────────
 
-/// Serialize a `DeltaBatch` to Arrow IPC bytes (for durable Trace storage).
+/// Serialize a `DeltaBatch` to versioned bytes.
+///
+/// Format: `DELTA_BATCH_MAGIC (4 bytes) || Arrow IPC stream bytes`.
+/// The magic prefix lets `deserialize_delta_batch` auto-detect legacy vs.
+/// versioned payloads so existing checkpoint files remain readable.
 pub fn serialize_delta_batch(batch: &DeltaBatch) -> DeltaResult<Vec<u8>> {
     use arrow::ipc::writer::StreamWriter;
-    let mut buf = Vec::new();
+    let mut ipc = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut buf, &batch.inner.schema())?;
+        let mut writer = StreamWriter::try_new(&mut ipc, &batch.inner.schema())?;
         writer.write(&batch.inner)?;
         writer.finish()?;
     }
+    let mut buf = Vec::with_capacity(DELTA_BATCH_MAGIC.len() + ipc.len());
+    buf.extend_from_slice(DELTA_BATCH_MAGIC);
+    buf.extend_from_slice(&ipc);
     Ok(buf)
 }
 
-/// Deserialize a `DeltaBatch` from Arrow IPC bytes.
+/// Deserialize a `DeltaBatch` from bytes produced by `serialize_delta_batch`.
+///
+/// Handles both versioned payloads (prefixed with `DELTA_BATCH_MAGIC`) and
+/// legacy Arrow IPC streams written before versioning was introduced.
 pub fn deserialize_delta_batch(bytes: &[u8]) -> DeltaResult<DeltaBatch> {
     use arrow::ipc::reader::StreamReader;
     use std::io::Cursor;
-    let cursor = Cursor::new(bytes);
+    // Strip magic prefix if present (versioned format); otherwise treat as legacy.
+    let ipc_bytes = if bytes.starts_with(DELTA_BATCH_MAGIC) {
+        &bytes[DELTA_BATCH_MAGIC.len()..]
+    } else {
+        bytes
+    };
+    let cursor = Cursor::new(ipc_bytes);
     let mut reader = StreamReader::try_new(cursor, None)?;
     let batch = reader
         .next()
@@ -357,6 +424,49 @@ mod tests {
         let restored = deserialize_delta_batch(&bytes).unwrap();
         assert_eq!(restored.num_rows(), 2);
         assert_eq!(restored.weights().value(0), 1);
+    }
+
+    #[test]
+    fn serialize_has_magic_prefix() {
+        let cb = DeltaBatch::from_inserts(small_batch(&[1])).unwrap();
+        let bytes = serialize_delta_batch(&cb).unwrap();
+        assert!(bytes.starts_with(b"DLT1"), "versioned bytes must start with DLT1 magic");
+    }
+
+    #[test]
+    fn deserialize_legacy_ipc_without_magic() {
+        use arrow::ipc::writer::StreamWriter;
+        // Produce a raw Arrow IPC stream (no magic prefix — legacy format).
+        let cb = DeltaBatch::from_inserts(small_batch(&[5])).unwrap();
+        let mut legacy = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut legacy, &cb.inner().schema()).unwrap();
+            w.write(cb.inner()).unwrap();
+            w.finish().unwrap();
+        }
+        let restored = deserialize_delta_batch(&legacy).unwrap();
+        assert_eq!(restored.num_rows(), 1);
+        assert_eq!(restored.weights().value(0), 1);
+    }
+
+    #[test]
+    fn normalize_weights_clamps_to_sign() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]));
+        let inner = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int64Array::from(vec![5i64, -3, 0, 1])),
+            ],
+        )
+        .unwrap();
+        let cb = DeltaBatch::from_weighted(inner).unwrap();
+        let normed = cb.normalize_weights().unwrap();
+        let w: Vec<i64> = normed.weights().iter().map(|v| v.unwrap()).collect();
+        assert_eq!(w, vec![1, -1, 0, 1]);
     }
 
     #[test]

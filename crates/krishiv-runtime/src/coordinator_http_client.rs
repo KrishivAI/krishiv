@@ -961,6 +961,38 @@ pub async fn execute_coordinator_ivm_stream_bridge(
     Ok(())
 }
 
+/// Feed a pre-computed `DeltaBatch` to a source on the coordinator (G4 fast path).
+///
+/// Unlike `execute_coordinator_ivm_stream_bridge`, this does not materialise a
+/// full snapshot: use it when your producer already emits ±1 `DeltaBatch`es.
+pub async fn execute_coordinator_ivm_feed_stream_delta(
+    coordinator_http: &str,
+    job_id: &str,
+    source_name: &str,
+    delta: &krishiv_ivm::DeltaBatch,
+) -> RuntimeResult<()> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let ipc = krishiv_ivm::serialize_delta_batch(delta)
+        .map_err(|e| RuntimeError::transport(format!("delta serialize: {e}")))?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
+    let body = IvmFeedSourceBody { delta_ipc_b64: b64 };
+    let resp = apply_coordinator_bearer(client.post(format!(
+        "{base}/api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-delta"
+    )))
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm stream-delta: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm stream-delta HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
+}
+
 /// Restore an IVM job on the coordinator from checkpoint bytes.
 pub async fn execute_coordinator_ivm_restore(
     coordinator_http: &str,

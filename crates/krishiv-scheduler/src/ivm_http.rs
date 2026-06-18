@@ -256,9 +256,51 @@ pub async fn api_ivm_feed_source(
         &body.delta_ipc_b64,
     )
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
-    let delta = deserialize_delta_batch(&ipc_bytes).map_err(ivm_err)?;
+    // G7: drop zero-weight rows on ingress so downstream operators never see them.
+    let delta = deserialize_delta_batch(&ipc_bytes)
+        .map_err(ivm_err)?
+        .drop_zeros()
+        .map_err(ivm_err)?;
     flow.feed_source(source_name, delta).map_err(ivm_err)?;
     Ok(Json(FeedSourceResponse { success: true }))
+}
+
+// ── POST /api/v1/ivm/jobs/{job_id}/sources/{src}/stream-delta ────────────────
+//
+// Fast path for producers that already emit pre-computed ±1 DeltaBatches
+// (CDC-native connectors, Debezium readers) and do not need the snapshot-diff
+// overhead of the /stream-bridge endpoint.
+
+#[derive(Debug, Deserialize)]
+pub struct FeedStreamDeltaRequest {
+    /// Base64-encoded Arrow IPC bytes of a pre-computed `DeltaBatch`.
+    pub delta_ipc_b64: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FeedStreamDeltaResponse {
+    pub success: bool,
+}
+
+pub async fn api_ivm_feed_stream_delta(
+    State(registry): State<SharedIvmJobRegistry>,
+    Path((job_id, source_name)): Path<(String, String)>,
+    Json(body): Json<FeedStreamDeltaRequest>,
+) -> Result<Json<FeedStreamDeltaResponse>, StatusCode> {
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let ipc_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &body.delta_ipc_b64,
+    )
+    .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
+    let delta = deserialize_delta_batch(&ipc_bytes)
+        .map_err(ivm_err)?
+        .drop_zeros()
+        .map_err(ivm_err)?;
+    flow.feed_stream_delta(source_name, delta).map_err(ivm_err)?;
+    Ok(Json(FeedStreamDeltaResponse { success: true }))
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/step ──────────────────────────────────────
@@ -612,6 +654,10 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
         .route(
             "/api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-bridge",
             post(api_ivm_stream_bridge),
+        )
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-delta",
+            post(api_ivm_feed_stream_delta),
         )
         .route("/api/v1/ivm/jobs/{job_id}/step", post(api_ivm_step))
         .route(

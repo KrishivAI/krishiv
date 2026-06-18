@@ -238,6 +238,36 @@ impl PyIncrementalFlow {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Wrap a plain :class:`Batch` as all-insertions and feed it to a source (G1).
+    ///
+    /// Equivalent to ``flow.feed_source(name, DeltaBatch.from_inserts(batch))``.
+    /// Use this for shuffle-write output or any non-CDC source that emits
+    /// plain :class:`Batch` objects without weight annotations.
+    pub fn feed_source_from_batch(
+        &self,
+        source_name: String,
+        batch: PyRef<'_, PyBatch>,
+    ) -> PyResult<()> {
+        let rb = batch.record_batch().clone();
+        self.inner
+            .feed_source_from_record_batch(source_name, rb)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Feed a pre-computed :class:`DeltaBatch` directly without snapshot diffing (G4).
+    ///
+    /// Use for CDC-native producers (Debezium, Kafka CDC) that already emit
+    /// weighted ±1 batches and do not need `feed_stream_output` overhead.
+    pub fn feed_stream_delta(
+        &self,
+        source_name: String,
+        delta: PyRef<'_, PyDeltaBatch>,
+    ) -> PyResult<()> {
+        self.inner
+            .feed_stream_delta(source_name, delta.inner.clone())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     /// Advance one clock tick (synchronous).
     ///
     /// Drains all pending input deltas, publishes output deltas to all
@@ -348,11 +378,33 @@ impl PyIncrementalFlow {
     /// :class:`Batch`, or ``None`` if no snapshot is available.
     ///
     /// Only valid for views registered with ``is_materialized=True``.
+    /// All rows have implicit weight +1 (the snapshot is a pure insertion set).
     pub fn snapshot(&self, name: String) -> PyResult<Option<PyBatch>> {
         self.inner
             .snapshot(&name)
             .map(|opt| opt.map(PyBatch::from_record_batch))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Return the latest materialized snapshot as a :class:`DeltaBatch`
+    /// with all rows weighted +1, or ``None`` if no snapshot is available (G3).
+    ///
+    /// Unlike :meth:`snapshot`, this makes the all-insertion weight contract
+    /// explicit: the returned :class:`DeltaBatch` can be passed directly to
+    /// another :class:`IncrementalFlow` as a seed delta.
+    pub fn snapshot_as_delta(&self, name: String) -> PyResult<Option<PyDeltaBatch>> {
+        let opt = self
+            .inner
+            .snapshot(&name)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match opt {
+            None => Ok(None),
+            Some(rb) => {
+                let inner = DeltaBatch::from_inserts(rb)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Ok(Some(PyDeltaBatch { inner }))
+            }
+        }
     }
 
     /// Return the names of all registered views.
