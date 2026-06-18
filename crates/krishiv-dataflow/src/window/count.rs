@@ -186,11 +186,15 @@ fn fold_agg_states<'a>(
         for (i, agg) in agg_exprs.iter().enumerate() {
             match agg.function {
                 AggFunction::Count => {
-                    merged.values[i] = merged.values[i].saturating_add(contrib.values[i]);
+                    merged.values[i] = merged.values[i]
+                        .checked_add(contrib.values[i])
+                        .unwrap_or(i64::MAX);
                     merged.has_value[i] = true;
                 }
                 AggFunction::Sum => {
-                    merged.values[i] = merged.values[i].saturating_add(contrib.values[i]);
+                    merged.values[i] = merged.values[i]
+                        .checked_add(contrib.values[i])
+                        .unwrap_or(i64::MAX);
                     if contrib.has_value[i] {
                         merged.has_value[i] = true;
                     }

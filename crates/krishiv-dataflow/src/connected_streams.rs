@@ -221,7 +221,7 @@ impl CoProcessExecutor {
     }
 
     /// Serialize operator state and pending timers to a snapshot blob.
-    pub fn snapshot(&self) -> Vec<u8> {
+    pub fn snapshot(&self) -> crate::ExecResult<Vec<u8>> {
         let mut timers: Vec<TimerEntry> = Vec::new();
         for (&fire_time, keys) in &self.timers {
             for key in keys {
@@ -237,7 +237,9 @@ impl CoProcessExecutor {
             timers,
             current_watermark_ms: self.current_watermark_ms,
         };
-        serde_json::to_vec(&snap).unwrap_or_default()
+        serde_json::to_vec(&snap).map_err(|e| {
+            crate::ExecError::InvalidInput(format!("snapshot serialization failed: {e}"))
+        })
     }
 
     /// Restore operator state and pending timers from a snapshot blob.
@@ -360,7 +362,7 @@ mod tests {
         exec.process_stream1(&b1, 100).unwrap();
         // Timer at 200.
 
-        let snap = exec.snapshot();
+        let snap = exec.snapshot().unwrap();
 
         // Restore into a new executor.
         let tracker2 = StreamTracker::new();

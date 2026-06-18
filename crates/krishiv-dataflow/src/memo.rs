@@ -51,7 +51,11 @@ impl MemoCache {
     }
 
     pub fn lookup(&self, key: [u8; 32]) -> Option<RecordBatch> {
-        let mut inner = self.inner.lock().ok()?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ExecError::Arrow("memo cache lock poisoned".into()))
+            .ok()?;
         let batch = inner.map.get(&key).cloned()?;
         inner.order.retain(|k| k != &key);
         inner.order.push_back(key);

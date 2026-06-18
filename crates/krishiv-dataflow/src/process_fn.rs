@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use arrow::record_batch::RecordBatch;
+
+use crate::ExecError;
 use serde::{Deserialize, Serialize};
 
 use crate::ExecResult;
@@ -333,7 +335,7 @@ impl ProcessFunctionExecutor {
     ///
     /// The snapshot can later be passed to [`restore`][Self::restore] to
     /// reconstruct the executor's state (minus the `ProcessFunction` itself).
-    pub fn snapshot(&self) -> Vec<u8> {
+    pub fn snapshot(&self) -> ExecResult<Vec<u8>> {
         let mut timers: Vec<TimerEntry> = Vec::new();
         for (&fire_time, keys) in &self.event_timers {
             for key in keys {
@@ -359,7 +361,8 @@ impl ProcessFunctionExecutor {
             timers,
             current_watermark_ms: self.current_watermark_ms,
         };
-        serde_json::to_vec(&snap).unwrap_or_default()
+        serde_json::to_vec(&snap)
+            .map_err(|e| ExecError::InvalidInput(format!("snapshot serialization failed: {e}")))
     }
 
     /// Restore operator state and pending timers from a snapshot blob.
@@ -603,7 +606,7 @@ mod tests {
         // Two keys → two event-time timers at 110.
         assert_eq!(exec.pending_timer_count(), 2);
 
-        let snap = exec.snapshot();
+        let snap = exec.snapshot().unwrap();
 
         // Create a new executor and restore into it.
         let func2 = CountAndTimerFn::new();
@@ -629,13 +632,13 @@ mod tests {
         let mut exec_a = ProcessFunctionExecutor::new("id", Box::new(func_a));
         // Task A handles key 1.
         exec_a.process_batch(&int_batch(&[1]), 100).unwrap();
-        let snap_a = exec_a.snapshot();
+        let snap_a = exec_a.snapshot().unwrap();
 
         let func_b = CountAndTimerFn::new();
         let mut exec_b = ProcessFunctionExecutor::new("id", Box::new(func_b));
         // Task B handles key 2.
         exec_b.process_batch(&int_batch(&[2]), 200).unwrap();
-        let snap_b = exec_b.snapshot();
+        let snap_b = exec_b.snapshot().unwrap();
 
         // Merged executor.
         let func_merged = CountAndTimerFn::new();
