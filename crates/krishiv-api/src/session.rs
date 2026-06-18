@@ -1238,10 +1238,20 @@ impl Session {
             };
         }
 
-        // A sink reads the view's snapshot, which requires materialization —
-        // force it on regardless of how the view was declared.
-        let _ = view_entry.is_materialized;
-        builder = builder.view(sink_spec.view.clone(), view_entry.body_sql.clone(), true);
+        // A view may reference upstream incremental views (not just sources), so
+        // register the transitive view closure feeding the sink, in dependency
+        // order. All are materialized so downstream views can read their output
+        // and the sink can read its view's snapshot.
+        let _ = &view_entry;
+        let mut ordered: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        collect_pipeline_view_deps(&sink_spec.view, &**view_reg, &mut ordered, &mut seen)
+            .map_err(KrishivError::from)?;
+        for vname in &ordered {
+            if let Some(entry) = view_reg.get(vname).map_err(KrishivError::from)? {
+                builder = builder.view(vname.clone(), entry.body_sql.clone(), true);
+            }
+        }
 
         // A connector sink writes the output out-of-band; a plain sink collects
         // it in memory to return as a result set.
@@ -1913,6 +1923,35 @@ pub(crate) async fn runtime_collect_batch_sql(
 /// Prevents SQL injection when interpolating user-provided names into SQL.
 fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Collect the transitive closure of incremental views that `view` depends on,
+/// in dependency order (upstream views before downstream). A token in a view's
+/// SQL that resolves to a registered incremental view is treated as a dependency;
+/// everything else (sources, columns, keywords) is ignored.
+fn collect_pipeline_view_deps(
+    view: &str,
+    reg: &krishiv_sql::incremental_view::IncrementalViewRegistry,
+    ordered: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+) -> krishiv_sql::SqlResult<()> {
+    if seen.contains(view) {
+        return Ok(());
+    }
+    seen.insert(view.to_string());
+    if let Some(entry) = reg.get(view)? {
+        for token in entry
+            .body_sql
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| !t.is_empty())
+        {
+            if token != view && reg.get(token)?.is_some() {
+                collect_pipeline_view_deps(token, reg, ordered, seen)?;
+            }
+        }
+        ordered.push(view.to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

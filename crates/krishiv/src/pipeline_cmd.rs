@@ -96,6 +96,7 @@ fn cmd_run(args: &[&str], dry: bool) -> Result<String, String> {
 
     let mut ddl_count = 0usize;
     let mut pipelines: Vec<String> = Vec::new();
+    let mut output = String::new();
 
     for stmt in &statements {
         let upper = stmt.to_uppercase();
@@ -115,7 +116,14 @@ fn cmd_run(args: &[&str], dry: bool) -> Result<String, String> {
                 } else {
                     stmt.clone()
                 };
-                session.sql(&run_stmt).map_err(|e| e.to_string())?;
+                // Execute and capture the sink's output (memory sinks return a
+                // result set; connector sinks return an empty ack).
+                let df = session.sql(&run_stmt).map_err(|e| e.to_string())?;
+                let result = df.collect().map_err(|e| e.to_string())?;
+                if result.row_count() > 0 {
+                    let pretty = result.pretty().map_err(|e| e.to_string())?;
+                    output.push_str(&format!("\n── pipeline '{sink}' output ──\n{pretty}\n"));
+                }
                 pipelines.push(sink);
             }
         } else {
@@ -126,14 +134,15 @@ fn cmd_run(args: &[&str], dry: bool) -> Result<String, String> {
     }
 
     let verb = if dry { "validated" } else { "ran" };
-    Ok(format!(
+    output.push_str(&format!(
         "pipeline {verb}: {ddl_count} DDL statement(s); pipeline(s): {}\n",
         if pipelines.is_empty() {
             "none".to_string()
         } else {
             pipelines.join(", ")
         }
-    ))
+    ));
+    Ok(output)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -186,7 +195,12 @@ fn load_sql_files(path: &str) -> Result<Vec<String>, String> {
     Ok(statements)
 }
 
-/// Split a SQL string into statements, stripping `--` comment lines.
+/// Split a SQL string into statements, stripping `--` comment lines and
+/// normalizing each statement's whitespace to single spaces.
+///
+/// Normalization makes multi-line statements (e.g. `CREATE ... AS\n  SELECT …`)
+/// parse correctly — the DDL keyword matching expects single-space delimiters,
+/// and SQL is otherwise whitespace-insensitive.
 fn split_statements(sql: &str) -> Vec<String> {
     let stripped: String = sql
         .lines()
@@ -201,7 +215,7 @@ fn split_statements(sql: &str) -> Vec<String> {
         .join("\n");
     stripped
         .split(';')
-        .map(|s| s.trim().to_string())
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|s| !s.is_empty())
         .collect()
 }
