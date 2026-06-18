@@ -1807,3 +1807,66 @@ async fn pipeline_temp_view_intermediate() {
         .value(0);
     assert_eq!(n, 1, "only the amount=100 row passes the temp view filter");
 }
+
+// ── DP-B: persistent incremental runs + refresh (full-refresh) ──────────────
+
+#[tokio::test]
+async fn pipeline_persistent_incremental_and_refresh() {
+    use crate::{PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn sum_of(sink: &StdArc<Mutex<Vec<RecordBatch>>>) -> f64 {
+        let out = sink.lock().unwrap();
+        out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("SUM is Float64")
+            .value(0)
+    }
+
+    let session = Session::builder().build().unwrap();
+
+    // Run 1: SUM over [10] = 10.
+    let s1: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    session
+        .pipeline("acc")
+        .source_memory("raw", vec![amounts(&[10])])
+        .view("total", "SELECT SUM(amount) AS s FROM raw", true)
+        .sink_memory("total", s1.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+    assert_eq!(sum_of(&s1), 10.0);
+
+    // Run 2 (same pipeline name): feed only the NEW row [5] → accumulates to 15.
+    let s2: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    session
+        .pipeline("acc")
+        .source_memory("raw", vec![amounts(&[5])])
+        .view("total", "SELECT SUM(amount) AS s FROM raw", true)
+        .sink_memory("total", s2.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+    assert_eq!(
+        sum_of(&s2),
+        15.0,
+        "persistent run accumulates across invocations"
+    );
+
+    // Refresh: reset state, then feed [100] → 100 (not 115).
+    let s3: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    session
+        .pipeline("acc")
+        .source_memory("raw", vec![amounts(&[100])])
+        .view("total", "SELECT SUM(amount) AS s FROM raw", true)
+        .sink_memory("total", s3.clone())
+        .mode(PipelineMode::Ivm)
+        .refresh(RunPolicy::Once)
+        .await
+        .unwrap();
+    assert_eq!(sum_of(&s3), 100.0, "refresh resets to a fresh state");
+}

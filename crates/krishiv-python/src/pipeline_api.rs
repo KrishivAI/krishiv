@@ -301,6 +301,31 @@ impl PyPipeline {
         crate::RUNTIME.block_on(builder.run(policy)).map_err(rt_err)
     }
 
+    /// Full-refresh: reset the pipeline's persisted IVM state, then run from
+    /// scratch (Spark SDP `--full-refresh`). `advance`/`every_rows` as in `run`.
+    #[pyo3(signature = (advance="once".to_string(), every_rows=None))]
+    pub fn refresh(&mut self, advance: String, every_rows: Option<usize>) -> PyResult<()> {
+        let policy = if let Some(n) = every_rows {
+            RunPolicy::EveryRows(n)
+        } else {
+            match advance.to_lowercase().as_str() {
+                "once" => RunPolicy::Once,
+                "on_change" => RunPolicy::OnChange,
+                other => return Err(rt_err(format!("unknown advance policy '{other}'"))),
+            }
+        };
+        let sources = std::mem::take(&mut self.sources);
+        let views = std::mem::take(&mut self.views);
+        let sinks = std::mem::take(&mut self.sinks);
+        let expectations = std::mem::take(&mut self.expectations);
+        let flows = std::mem::take(&mut self.flows);
+
+        let builder = self.to_builder(sources, views, sinks, expectations, flows);
+        crate::RUNTIME
+            .block_on(builder.refresh(policy))
+            .map_err(rt_err)
+    }
+
     pub fn __repr__(&self) -> String {
         format!(
             "Pipeline(name='{}', sources={}, views={}, sinks={}, expectations={})",

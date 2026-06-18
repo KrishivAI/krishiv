@@ -37,6 +37,9 @@ pub enum PipelineStatement {
     },
     /// `START PIPELINE <sink_name>` — run the pipeline feeding `sink_name`.
     StartPipeline { sink: String },
+    /// `REFRESH PIPELINE <sink_name> [FULL]` — re-run a pipeline; `full` resets
+    /// its persisted state first (Spark SDP `--full-refresh`).
+    RefreshPipeline { sink: String, full: bool },
     /// `DROP SOURCE <name>`.
     DropSource { name: String },
     /// `DROP SINK <name>`.
@@ -228,6 +231,17 @@ pub fn parse_pipeline_statement(sql: &str) -> SqlResult<Option<PipelineStatement
         return Ok(Some(PipelineStatement::StartPipeline { sink }));
     }
 
+    if upper.starts_with("REFRESH PIPELINE ") {
+        let rest = trimmed["REFRESH PIPELINE ".len()..].trim();
+        // Optional trailing FULL keyword.
+        let (sink, full) = match rest.to_uppercase().strip_suffix(" FULL") {
+            Some(_) => (rest[..rest.len() - " FULL".len()].trim().to_string(), true),
+            None => (rest.to_string(), false),
+        };
+        require_nonempty(&sink)?;
+        return Ok(Some(PipelineStatement::RefreshPipeline { sink, full }));
+    }
+
     if upper.starts_with("DROP SOURCE ") {
         let name = trimmed["DROP SOURCE ".len()..].trim().to_string();
         require_nonempty(&name)?;
@@ -273,8 +287,10 @@ pub fn execute_pipeline_ddl(registry: &PipelineRegistry, sql: &str) -> SqlResult
             registry.remove_sink(&name)?;
             Ok(Some(name))
         }
-        // START PIPELINE is handled by the api layer, not the registry.
-        PipelineStatement::StartPipeline { .. } => Ok(None),
+        // START / REFRESH PIPELINE are handled by the api layer, not the registry.
+        PipelineStatement::StartPipeline { .. } | PipelineStatement::RefreshPipeline { .. } => {
+            Ok(None)
+        }
     }
 }
 
@@ -410,6 +426,24 @@ mod tests {
         assert_eq!(
             parse_pipeline_statement("DROP SINK out").unwrap(),
             Some(PipelineStatement::DropSink { name: "out".into() })
+        );
+    }
+
+    #[test]
+    fn parse_refresh_pipeline() {
+        assert_eq!(
+            parse_pipeline_statement("REFRESH PIPELINE out").unwrap(),
+            Some(PipelineStatement::RefreshPipeline {
+                sink: "out".into(),
+                full: false
+            })
+        );
+        assert_eq!(
+            parse_pipeline_statement("REFRESH PIPELINE out FULL;").unwrap(),
+            Some(PipelineStatement::RefreshPipeline {
+                sink: "out".into(),
+                full: true
+            })
         );
     }
 

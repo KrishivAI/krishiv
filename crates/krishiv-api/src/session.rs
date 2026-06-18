@@ -1116,13 +1116,23 @@ impl Session {
     pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         let query = query.as_ref().to_owned();
 
-        // Intercept `START PIPELINE <sink>` — the SqlEngine handles CREATE/DROP
+        // Intercept START / REFRESH PIPELINE — the SqlEngine handles CREATE/DROP
         // SOURCE/SINK, but execution needs the api pipeline layer.
-        if let Some(krishiv_sql::pipeline_ddl::PipelineStatement::StartPipeline { sink }) =
-            krishiv_sql::pipeline_ddl::parse_pipeline_statement(&query)
-                .map_err(KrishivError::from)?
+        use krishiv_sql::pipeline_ddl::PipelineStatement;
+        match krishiv_sql::pipeline_ddl::parse_pipeline_statement(&query)
+            .map_err(KrishivError::from)?
         {
-            return self.run_sql_pipeline(&sink).await;
+            Some(PipelineStatement::StartPipeline { sink }) => {
+                return self.run_sql_pipeline(&sink).await;
+            }
+            Some(PipelineStatement::RefreshPipeline { sink, full }) => {
+                if full {
+                    // Full refresh: reset the persisted job before re-running.
+                    self.reset_ivm_job(&format!("sql::{sink}"));
+                }
+                return self.run_sql_pipeline(&sink).await;
+            }
+            _ => {}
         }
 
         self.sql_plain(&query).await
@@ -1335,8 +1345,20 @@ impl Session {
     /// driver loop, not a second engine. There is no trigger stage: boundedness,
     /// watermark, and change-events drive each mode; the optional
     /// [`RunPolicy`](crate::RunPolicy) only coalesces input.
+    ///
+    /// A named pipeline's IVM job **persists across runs** (the registry is keyed
+    /// by name), so repeated `run()` calls feed new input incrementally. Use
+    /// [`reset_ivm_job`](Self::reset_ivm_job) or `Pipeline::refresh` to start
+    /// fresh ("full refresh").
     pub fn pipeline(&self, name: impl Into<String>) -> crate::PipelineBuilder {
         crate::pipeline::PipelineBuilder::new(self.clone(), name)
+    }
+
+    /// Drop a persisted embedded IVM job by name so the next `ivm`/pipeline run
+    /// starts from fresh, empty state (the "full refresh" primitive). Returns
+    /// `true` if a job existed.
+    pub fn reset_ivm_job(&self, name: &str) -> bool {
+        self.ivm_registry.delete(name)
     }
 
     /// Execute a SQL query with a wall-clock timeout.

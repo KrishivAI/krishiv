@@ -253,6 +253,11 @@ impl PipelineBuilder {
     pub async fn run(self, policy: RunPolicy) -> Result<()> {
         self.build().run(policy).await
     }
+
+    /// Build, full-refresh (reset persisted state), and run the pipeline.
+    pub async fn refresh(self, policy: RunPolicy) -> Result<()> {
+        self.build().refresh(policy).await
+    }
 }
 
 impl Pipeline {
@@ -280,12 +285,22 @@ impl Pipeline {
     }
 
     /// Run the pipeline to its mode's natural completion / advance policy.
+    ///
+    /// A named pipeline's IVM job persists across runs, so repeated runs feed new
+    /// input **incrementally**. Use [`refresh`](Self::refresh) to reset first.
     pub async fn run(self, policy: RunPolicy) -> Result<()> {
         match self.mode {
             PipelineMode::Ivm => driver::run_incremental(self, policy).await,
             PipelineMode::Batch => driver::run_batch(self).await,
             PipelineMode::Stream => driver::run_stream(self, policy).await,
         }
+    }
+
+    /// Full-refresh: reset the pipeline's persisted IVM job, then run from a
+    /// fresh, empty state (Spark SDP `--full-refresh`).
+    pub async fn refresh(self, policy: RunPolicy) -> Result<()> {
+        self.session.reset_ivm_job(&self.name);
+        self.run(policy).await
     }
 }
 
