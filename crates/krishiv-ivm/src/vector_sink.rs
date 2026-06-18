@@ -119,6 +119,7 @@ async fn apply_delta_to_sink(
 /// Split a `DeltaBatch` into (upsert_ids, upsert_vecs, delete_ids).
 ///
 /// Positive-weight rows → upsert; negative-weight rows → delete.
+#[allow(clippy::type_complexity)]
 fn extract_vector_rows(
     delta: &DeltaBatch,
     id_col: &str,
@@ -239,6 +240,10 @@ pub mod testing {
 
         pub fn len(&self) -> usize {
             self.store.lock().unwrap().len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.store.lock().unwrap().is_empty()
         }
     }
 

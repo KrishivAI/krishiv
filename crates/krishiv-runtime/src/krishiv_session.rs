@@ -174,10 +174,9 @@ impl KrishivSession {
                         // Also register upstream views as empty tables for inference.
                         for spec in &specs {
                             let schema = spec.output_schema.clone();
-                            if let Ok(mt) = datafusion::datasource::MemTable::try_new(
-                                schema.clone(),
-                                vec![],
-                            ) {
+                            if let Ok(mt) =
+                                datafusion::datasource::MemTable::try_new(schema.clone(), vec![])
+                            {
                                 let _ = ctx.register_table(&spec.name, std::sync::Arc::new(mt));
                             }
                         }

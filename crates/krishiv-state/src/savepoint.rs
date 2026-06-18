@@ -104,10 +104,7 @@ impl SavepointCoordinator {
 
     /// Create a new coordinator with a durable storage handle.
     /// When set, `delete_savepoint` also removes the durable copy.
-    pub fn with_storage(
-        job_id: impl Into<String>,
-        storage: Arc<dyn CheckpointStorage>,
-    ) -> Self {
+    pub fn with_storage(job_id: impl Into<String>, storage: Arc<dyn CheckpointStorage>) -> Self {
         Self {
             job_id: job_id.into(),
             index: HashMap::new(),
@@ -164,30 +161,27 @@ impl SavepointCoordinator {
     /// Returns the removed metadata, or an error if the savepoint does not
     /// exist in the in-memory index.
     pub fn delete_savepoint(&mut self, savepoint_id: &str) -> StateResult<SavepointMeta> {
-        let meta = self
-            .index
-            .remove(savepoint_id)
-            .ok_or_else(|| StateError::BackendUnavailable {
-                message: format!("savepoint '{savepoint_id}' not found"),
-                source: None,
-            })?;
+        let meta =
+            self.index
+                .remove(savepoint_id)
+                .ok_or_else(|| StateError::BackendUnavailable {
+                    message: format!("savepoint '{savepoint_id}' not found"),
+                    source: None,
+                })?;
 
         // Best-effort durable delete: if storage is configured, remove the
         // `savepoints/{epoch}/` directory. Failures are logged but do not
         // undo the in-memory removal (the user explicitly requested deletion).
-        if let Some(storage) = &self.storage {
-            if let Err(e) = checkpoint_io::delete_savepoint(
-                storage.as_ref(),
-                &self.job_id,
-                meta.epoch,
-            ) {
-                tracing::warn!(
-                    savepoint_id = savepoint_id,
-                    epoch = meta.epoch,
-                    error = %e,
-                    "failed to delete durable savepoint copy; in-memory index entry removed"
-                );
-            }
+        if let Some(storage) = &self.storage
+            && let Err(e) =
+                checkpoint_io::delete_savepoint(storage.as_ref(), &self.job_id, meta.epoch)
+        {
+            tracing::warn!(
+                savepoint_id = savepoint_id,
+                epoch = meta.epoch,
+                error = %e,
+                "failed to delete durable savepoint copy; in-memory index entry removed"
+            );
         }
 
         Ok(meta)

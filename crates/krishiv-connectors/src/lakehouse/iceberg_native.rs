@@ -126,7 +126,12 @@ pub mod native {
                 ident,
                 root,
                 pending: Mutex::new(HashMap::new()),
-                snap_counter: AtomicI64::new(0),
+                // Seed snap_counter with (pid << 32) so staged filenames are
+                // unique across processes. Within one session the counter
+                // increments monotonically, guaranteeing no collision even if
+                // two sessions on the same host share the same root (e.g.
+                // crash recovery).
+                snap_counter: AtomicI64::new((std::process::id() as i64) << 32),
             })
         }
 

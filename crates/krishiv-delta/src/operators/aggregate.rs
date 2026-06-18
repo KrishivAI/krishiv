@@ -8,8 +8,9 @@
 //!   2. Apply delta to running state
 //!   3. Compute new aggregate for the row's group → emit insertion (+1)
 //!
-//! MAX and MIN are handled via a BTreeMap multiset per group, which tracks the
-//! full distribution of values (needed to correctly handle retractions).
+//! Each aggregation expression has its own state so a `[Count, Sum]` spec
+//! does not double-count or cross-contaminate (Sum's `sum` and Count's
+//! `count` are distinct fields).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -56,56 +57,83 @@ impl Aggregation {
             | Self::Max { output_col, .. } => output_col,
         }
     }
+
+    fn input_col(&self) -> Option<&str> {
+        match self {
+            Self::Sum { input_col, .. }
+            | Self::Avg { input_col, .. }
+            | Self::Min { input_col, .. }
+            | Self::Max { input_col, .. } => Some(input_col),
+            Self::Count { .. } => None,
+        }
+    }
 }
 
-// ── Running state per group ────────────────────────────────────────────────────
+// ── Per-aggregation state ──────────────────────────────────────────────────────
 
+/// Separate running state for ONE aggregation expression.
+/// A group's full state is `Vec<AggState>` indexed by position in `aggregations`.
 #[derive(Debug, Default, Clone)]
-struct GroupState {
+struct AggState {
     sum: f64,
     count: i64,
     /// For MIN/MAX: multiset of (value_str → cumulative weight).
-    /// We use String keys for simplicity; a proper impl would use typed values.
-    min_max_set: BTreeMap<String, i64>,
+    /// Typed per value (not string-sorted) via BTreeMap<f64, i64>.
+    min_max_set: BTreeMap<i64, i64>,
 }
 
-impl GroupState {
-    fn apply_delta(&mut self, value_str: &str, numeric_val: f64, weight: i64) {
-        self.sum += numeric_val * weight as f64;
-        self.count += weight;
-        let entry = self.min_max_set.entry(value_str.to_string()).or_insert(0);
-        *entry += weight;
-        if *entry == 0 {
-            self.min_max_set.remove(value_str);
+impl AggState {
+    fn apply_delta_for_agg(&mut self, agg: &Aggregation, input_val_str: &str, weight: i64) {
+        match agg {
+            Aggregation::Sum { .. } => {
+                let numeric = input_val_str.parse::<f64>().unwrap_or(0.0);
+                self.sum += numeric * weight as f64;
+                self.count += weight;
+            }
+            Aggregation::Count { .. } => {
+                self.count += weight;
+            }
+            Aggregation::Avg { .. } => {
+                let numeric = input_val_str.parse::<f64>().unwrap_or(0.0);
+                self.sum += numeric * weight as f64;
+                self.count += weight;
+            }
+            Aggregation::Min { .. } => {
+                let numeric = input_val_str.parse::<i64>().unwrap_or(0);
+                let entry = self.min_max_set.entry(numeric).or_insert(0);
+                *entry += weight;
+                if *entry == 0 {
+                    self.min_max_set.remove(&numeric);
+                }
+                // Min/Max still tracks count for empty-group detection
+                self.count += weight;
+            }
+            Aggregation::Max { .. } => {
+                let numeric = input_val_str.parse::<i64>().unwrap_or(0);
+                let entry = self.min_max_set.entry(numeric).or_insert(0);
+                *entry += weight;
+                if *entry == 0 {
+                    self.min_max_set.remove(&numeric);
+                }
+                self.count += weight;
+            }
         }
     }
 
-    fn current_sum(&self) -> f64 {
-        self.sum
-    }
-
-    fn current_count(&self) -> i64 {
-        self.count
-    }
-
-    fn current_avg(&self) -> Option<f64> {
-        if self.count == 0 {
-            None
-        } else {
-            Some(self.sum / self.count as f64)
+    fn current_value(&self, agg: &Aggregation) -> Option<f64> {
+        match agg {
+            Aggregation::Sum { .. } => Some(self.sum),
+            Aggregation::Count { .. } => Some(self.count as f64),
+            Aggregation::Avg { .. } => {
+                if self.count == 0 {
+                    None
+                } else {
+                    Some(self.sum / self.count as f64)
+                }
+            }
+            Aggregation::Min { .. } => self.min_max_set.keys().next().map(|&v| v as f64),
+            Aggregation::Max { .. } => self.min_max_set.keys().next_back().map(|&v| v as f64),
         }
-    }
-
-    fn current_min(&self) -> Option<&str> {
-        self.min_max_set.keys().next().map(String::as_str)
-    }
-
-    fn current_max(&self) -> Option<&str> {
-        self.min_max_set.keys().next_back().map(String::as_str)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.count == 0
     }
 }
 
@@ -116,8 +144,8 @@ pub struct IncrementalAggOp {
     group_by: Vec<String>,
     aggregations: Vec<Aggregation>,
     output_schema: SchemaRef,
-    /// state[group_key] → running aggregate state per group
-    state: AHashMap<Vec<String>, GroupState>,
+    /// state[group_key] → per-aggregation running state (one entry per aggregation)
+    state: AHashMap<Vec<String>, Vec<AggState>>,
 }
 
 impl IncrementalAggOp {
@@ -131,6 +159,15 @@ impl IncrementalAggOp {
             input_schema
                 .field_with_name(col)
                 .map_err(|_| DeltaError::ColumnNotFound(col.clone()))?;
+        }
+
+        // Validate input columns for each agg
+        for agg in &aggregations {
+            if let Some(input_col) = agg.input_col() {
+                input_schema
+                    .field_with_name(input_col)
+                    .map_err(|_| DeltaError::ColumnNotFound(input_col.to_string()))?;
+            }
         }
 
         // Build output schema: group-by columns + aggregate output columns
@@ -172,9 +209,9 @@ impl IncrementalAggOp {
     /// Apply one tick of incremental aggregation.
     ///
     /// For each row in `delta`:
-    /// 1. Look up the group's current state.
+    /// 1. Look up the group's current state (per-aggregation).
     /// 2. Emit retraction of old aggregate output (if group was non-empty).
-    /// 3. Apply delta weight to state.
+    /// 3. Apply delta weight to each aggregation's state independently.
     /// 4. Emit insertion of new aggregate output (if group is now non-empty).
     pub fn apply(&mut self, delta: DeltaBatch) -> DeltaResult<DeltaBatch> {
         if delta.is_empty() {
@@ -195,7 +232,7 @@ impl IncrementalAggOp {
             .collect::<DeltaResult<Vec<_>>>()?;
 
         // Track which groups were touched, and their before/after states.
-        let mut touched: AHashMap<Vec<String>, (Option<GroupState>, ())> = AHashMap::new();
+        let mut touched: AHashMap<Vec<String>, (Option<Vec<AggState>>, ())> = AHashMap::new();
 
         for row in 0..data.num_rows() {
             let group_key: Vec<String> = group_col_indices
@@ -211,57 +248,68 @@ impl IncrementalAggOp {
 
             let w = weights.value(row);
 
-            // Apply delta to each aggregation's state
-            let group_state = self.state.entry(group_key.clone()).or_default();
-            for agg in &self.aggregations {
-                match agg {
-                    Aggregation::Sum { input_col, .. }
-                    | Aggregation::Avg { input_col, .. }
-                    | Aggregation::Min { input_col, .. }
-                    | Aggregation::Max { input_col, .. } => {
-                        if let Ok(col_idx) = data.schema().index_of(input_col) {
-                            let val_str = scalar_to_string(data.column(col_idx), row);
-                            let numeric = val_str.parse::<f64>().unwrap_or(0.0);
-                            group_state.apply_delta(&val_str, numeric, w);
-                        }
-                    }
-                    Aggregation::Count { .. } => {
-                        group_state.count += w;
-                    }
-                }
+            // Apply delta to each aggregation's state independently.
+            // Each aggregation has its own AggState, so [Count, Sum] does not
+            // double-count and Sum + Min do not cross-contaminate.
+            let group_state = self
+                .state
+                .entry(group_key.clone())
+                .or_insert_with(|| vec![AggState::default(); self.aggregations.len()]);
+
+            // Ensure the state vector matches the aggregation count
+            // (handles the case where a new aggregation was added after state was created)
+            if group_state.len() < self.aggregations.len() {
+                group_state.resize(self.aggregations.len(), AggState::default());
             }
 
-            // GC empty groups
-            if self
-                .state
-                .get(&group_key)
-                .map(GroupState::is_empty)
-                .unwrap_or(false)
-            {
-                self.state.remove(&group_key);
+            for (ai, agg) in self.aggregations.iter().enumerate() {
+                let input_val_str = match agg.input_col() {
+                    Some(col) => {
+                        if let Ok(idx) = data.schema().index_of(col) {
+                            scalar_to_string(data.column(idx), row)
+                        } else {
+                            "NULL".to_string()
+                        }
+                    }
+                    None => "".to_string(),
+                };
+                group_state[ai].apply_delta_for_agg(agg, &input_val_str, w);
+            }
+
+            // GC empty groups: a group is empty when ALL its per-agg states are empty
+            if let Some(states) = self.state.get(&group_key) {
+                let all_empty = states.iter().all(|s| s.count == 0);
+                if all_empty {
+                    self.state.remove(&group_key);
+                }
             }
         }
 
         // Build output: retraction of old agg + insertion of new agg for each touched group
-        let mut out_group_rows: Vec<Vec<String>> = Vec::new(); // group key values
+        let mut out_group_rows: Vec<Vec<String>> = Vec::new();
         let mut out_weights: Vec<i64> = Vec::new();
-        let mut agg_values: Vec<Vec<Option<f64>>> = Vec::new(); // [row][agg_idx] → value
+        let mut agg_values: Vec<Vec<Option<f64>>> = Vec::new();
 
-        for (group_key, (before_state, ())) in &touched {
-            // Retraction: if there was a non-empty state before, emit -1
-            if let Some(before) = before_state
-                && !before.is_empty()
-            {
-                let vals = compute_agg_values(before, &self.aggregations);
+        for (group_key, (before_states, ())) in &touched {
+            let has_before = before_states
+                .as_ref()
+                .map(|s| s.iter().any(|a| a.count != 0))
+                .unwrap_or(false);
+            let has_after = self
+                .state
+                .get(group_key)
+                .map(|s| s.iter().any(|a| a.count != 0))
+                .unwrap_or(false);
+
+            if has_before {
+                let vals = compute_agg_values(before_states.as_ref().unwrap(), &self.aggregations);
                 out_group_rows.push(group_key.clone());
                 out_weights.push(-1);
                 agg_values.push(vals);
             }
-            // Insertion: if there is now a non-empty state, emit +1
-            if let Some(after) = self.state.get(group_key)
-                && !after.is_empty()
-            {
-                let vals = compute_agg_values(after, &self.aggregations);
+            if has_after {
+                let after_states = self.state.get(group_key).unwrap();
+                let vals = compute_agg_values(after_states, &self.aggregations);
                 out_group_rows.push(group_key.clone());
                 out_weights.push(1);
                 agg_values.push(vals);
@@ -272,7 +320,6 @@ impl IncrementalAggOp {
             return DeltaBatch::empty(self.output_schema.clone());
         }
 
-        // Build output RecordBatch
         build_output_batch(
             &out_group_rows,
             &out_weights,
@@ -284,16 +331,11 @@ impl IncrementalAggOp {
     }
 }
 
-fn compute_agg_values(state: &GroupState, aggregations: &[Aggregation]) -> Vec<Option<f64>> {
+fn compute_agg_values(states: &[AggState], aggregations: &[Aggregation]) -> Vec<Option<f64>> {
     aggregations
         .iter()
-        .map(|agg| match agg {
-            Aggregation::Sum { .. } => Some(state.current_sum()),
-            Aggregation::Count { .. } => Some(state.current_count() as f64),
-            Aggregation::Avg { .. } => state.current_avg(),
-            Aggregation::Min { .. } => state.current_min().and_then(|s| s.parse::<f64>().ok()),
-            Aggregation::Max { .. } => state.current_max().and_then(|s| s.parse::<f64>().ok()),
-        })
+        .enumerate()
+        .map(|(ai, agg)| states[ai].current_value(agg))
         .collect()
 }
 
@@ -470,7 +512,7 @@ mod tests {
         op.apply(d1).unwrap();
         // Count for c1 should be 2
         assert_eq!(
-            op.state.get(&vec!["c1".to_string()]).map(|s| s.count),
+            op.state.get(&vec!["c1".to_string()]).map(|s| s[0].count),
             Some(2)
         );
     }

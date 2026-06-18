@@ -216,7 +216,8 @@ impl ClusterControlPlane {
         // a stale coordinator remains Active after etcd lease expiry but before
         // the next renew tick. Default: 15s / 3 = 5s (unchanged for default config).
         let renew_interval_secs = (self.leader.lease_duration_s() / 3).max(1);
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(renew_interval_secs));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(renew_interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;

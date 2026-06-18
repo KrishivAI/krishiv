@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
+use crate::arrow_compat::PyArrowBatch;
 use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::PyImportError;
 use pyo3::prelude::*;
-use crate::arrow_compat::PyArrowBatch;
 
 /// One record batch from a query or stream window.
 #[pyclass(name = "Batch", from_py_object)]

@@ -105,7 +105,12 @@ impl IncrementalJoinOp {
     /// * `delta_left` — changes to the left relation this tick (may be empty)
     /// * `delta_right` — changes to the right relation this tick (may be empty)
     ///
-    /// Returns the combined output delta: `(ΔA ⋈ B_trace) ∪ (A_trace ⋈ ΔB)`.
+    /// Returns the combined output delta: `(ΔA ⋈ B_trace) ∪ (A_trace ⋈ ΔB) ∪ (ΔA ⋈ ΔB)`.
+    ///
+    /// Note: The full bilinear identity is:
+    ///   Δ(A⋈B) = (ΔA ⋈ B_trace) + (A_trace ⋈ ΔB) + (ΔA ⋈ ΔB)
+    /// The ΔA⋈ΔB term captures same-tick inserts on both sides that would
+    /// otherwise never meet (each probes the other's *old* trace).
     pub fn apply(
         &mut self,
         delta_left: Option<DeltaBatch>,
@@ -133,6 +138,19 @@ impl IncrementalJoinOp {
             }
         }
 
+        // Step 1.5: ΔA ⋈ ΔB — same-tick cross term
+        // Both deltas arrive in the same tick. Probe ΔB's keys against ΔA's
+        // data to catch pairs where both sides were updated simultaneously.
+        if let (Some(dl), Some(dr)) = (&delta_left, &delta_right)
+            && !dl.is_empty()
+            && !dr.is_empty()
+        {
+            let cross_result = self.join_deltas(dl, dr)?;
+            if !cross_result.is_empty() {
+                output_parts.push(cross_result);
+            }
+        }
+
         // Step 3: update traces AFTER probe (traces reflect state from previous ticks)
         if let Some(dl) = delta_left {
             self.left_trace.insert(dl);
@@ -152,6 +170,56 @@ impl IncrementalJoinOp {
     }
 
     // ── Internal probe methods ─────────────────────────────────────────────────
+
+    fn join_deltas(
+        &self,
+        delta_left: &DeltaBatch,
+        delta_right: &DeltaBatch,
+    ) -> DeltaResult<DeltaBatch> {
+        // ΔA ⋈ ΔB: same-tick cross term
+        let left_data = delta_left.data_batch();
+        let right_data = delta_right.data_batch();
+        let left_weights = delta_left.weights();
+        let right_weights = delta_right.weights();
+
+        let left_key_indices = col_indices(&left_data, &self.left_key_cols)?;
+        let right_key_indices = col_indices(&right_data, &self.right_key_cols)?;
+
+        let mut out_left_rows: Vec<usize> = Vec::new();
+        let mut out_right_rows: Vec<usize> = Vec::new();
+        let mut out_weights: Vec<i64> = Vec::new();
+
+        for li in 0..left_data.num_rows() {
+            for ri in 0..right_data.num_rows() {
+                if keys_match(
+                    &left_data,
+                    &left_key_indices,
+                    li,
+                    &right_data,
+                    &right_key_indices,
+                    ri,
+                ) {
+                    out_left_rows.push(li);
+                    out_right_rows.push(ri);
+                    out_weights.push(left_weights.value(li) * right_weights.value(ri));
+                }
+            }
+        }
+
+        if out_left_rows.is_empty() {
+            return DeltaBatch::empty(self.output_schema.clone());
+        }
+
+        build_join_batch(
+            &left_data,
+            &right_data,
+            &self.right_key_cols,
+            &out_left_rows,
+            &out_right_rows,
+            out_weights,
+            &self.output_schema,
+        )
+    }
 
     fn probe_left_against_right_trace(&self, delta_left: &DeltaBatch) -> DeltaResult<DeltaBatch> {
         // For each row in delta_left, look up matching rows in right_trace.

@@ -43,6 +43,12 @@ pub struct RdkafkaTransactionalSink {
     topic: String,
     /// True when a Kafka transaction has been opened but not yet committed/aborted.
     transaction_open: bool,
+    /// The epoch of the currently open transaction (if any). Used to reject
+    /// duplicate or non-monotonic `prepare` calls.
+    current_epoch: Option<u64>,
+    /// Transaction timeout in milliseconds. Must be ≤ broker
+    /// `transaction.max.timeout.ms` (default 15 min).
+    transaction_timeout_ms: u32,
 }
 
 impl RdkafkaTransactionalSink {
@@ -50,16 +56,49 @@ impl RdkafkaTransactionalSink {
     ///
     /// Calls `init_transactions()` during construction so the producer is
     /// immediately ready to begin transactions.
+    ///
+    /// `transactional_id` must be stable across epochs for the same task slot
+    /// (e.g. `"{job_id}/{task_slot}"`) — this ensures Kafka's zombie fencing
+    /// works correctly. Per-epoch IDs would break fencing.
+    ///
+    /// `transaction_timeout_ms` defaults to 30 seconds. Must be ≤ the broker's
+    /// `transaction.max.timeout.ms` setting.
     pub fn new(
         bootstrap_servers: impl AsRef<str>,
         topic: impl Into<String>,
         transactional_id: impl AsRef<str>,
     ) -> ConnectorResult<Self> {
+        Self::with_timeout(
+            bootstrap_servers,
+            topic,
+            transactional_id,
+            Duration::from_secs(30),
+        )
+    }
+
+    /// Like [`Self::new`] with an explicit transaction timeout.
+    pub fn with_timeout(
+        bootstrap_servers: impl AsRef<str>,
+        topic: impl Into<String>,
+        transactional_id: impl AsRef<str>,
+        transaction_timeout: Duration,
+    ) -> ConnectorResult<Self> {
+        let timeout_ms: u32 =
+            transaction_timeout
+                .as_millis()
+                .try_into()
+                .map_err(|_| ConnectorError::Config {
+                    message: format!(
+                        "transaction timeout {transaction_timeout:?} exceeds u32::MAX ms"
+                    ),
+                })?;
+
         let mut cfg = ClientConfig::new();
         cfg.set("bootstrap.servers", bootstrap_servers.as_ref())
             .set("transactional.id", transactional_id.as_ref())
             .set("enable.idempotence", "true")
-            .set("message.timeout.ms", "30000");
+            .set("message.timeout.ms", timeout_ms.to_string())
+            .set("transaction.timeout.ms", timeout_ms.to_string());
 
         let producer: ThreadedProducer<rdkafka::producer::DefaultProducerContext> =
             cfg.create().map_err(|e| ConnectorError::Kafka {
@@ -78,7 +117,19 @@ impl RdkafkaTransactionalSink {
             producer,
             topic: topic.into(),
             transaction_open: false,
+            current_epoch: None,
+            transaction_timeout_ms: timeout_ms,
         })
+    }
+
+    /// Derive a stable `transactional.id` from `{job_id}/{task_slot}`.
+    ///
+    /// The transactional ID must be **stable across epochs** for the same task
+    /// slot so that Kafka's zombie fencing correctly rejects stale producers.
+    /// Per-epoch IDs (`{job_id}/{task_slot}/{epoch}`) would allow a zombie
+    /// with an older epoch to commit after the current producer has progressed.
+    pub fn transactional_id(job_id: &str, task_slot: &str) -> String {
+        format!("krishiv-kafka-txn/{job_id}/{task_slot}")
     }
 }
 
@@ -94,16 +145,44 @@ impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
 
     /// Serialize `batch` as Arrow IPC bytes and send it to Kafka inside an open
     /// transaction.  Begins a new transaction if one is not already open.
+    ///
+    /// # One-outstanding-handle semantics
+    ///
+    /// Kafka's EOS protocol allows only one open transaction per producer at a
+    /// time. This sink enforces that: a second `prepare` while a transaction is
+    /// still open returns `ConnectorError::TransactionBusy`. The coordinator
+    /// must `commit` or `abort` the current handle before calling `prepare`
+    /// again. This matches the `TwoPhaseCommitSink` contract: per-handle
+    /// isolation.
     fn prepare(&mut self, epoch: u64, batch: &RecordBatch) -> ConnectorResult<Self::Handle> {
-        if !self.transaction_open {
-            self.producer
-                .begin_transaction()
-                .map_err(|e| ConnectorError::Kafka {
-                    message: format!("rdkafka begin_transaction failed: {e}"),
-                    retriable: false,
-                })?;
-            self.transaction_open = true;
+        if self.transaction_open {
+            return Err(ConnectorError::Protocol {
+                message: format!(
+                    "transaction for epoch {} is still open; commit or abort it first",
+                    self.current_epoch.unwrap_or(0)
+                ),
+            });
         }
+
+        // Validate epoch monotonicity to catch stale retries.
+        if let Some(current) = self.current_epoch
+            && epoch <= current
+        {
+            return Err(ConnectorError::Config {
+                message: format!(
+                    "prepare epoch {epoch} is not greater than current epoch {current}"
+                ),
+            });
+        }
+
+        self.producer
+            .begin_transaction()
+            .map_err(|e| ConnectorError::Kafka {
+                message: format!("rdkafka begin_transaction failed: {e}"),
+                retriable: false,
+            })?;
+        self.transaction_open = true;
+        self.current_epoch = Some(epoch);
 
         // Serialize the batch as Arrow IPC stream bytes.
         let mut ipc_buf: Vec<u8> = Vec::new();
@@ -144,13 +223,15 @@ impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
             // Already committed — idempotent.
             return Ok(());
         }
+        let timeout = Duration::from_millis(self.transaction_timeout_ms as u64);
         self.producer
-            .commit_transaction(TRANSACTION_TIMEOUT)
+            .commit_transaction(timeout)
             .map_err(|e| ConnectorError::Kafka {
                 message: format!("rdkafka commit_transaction failed: {e}"),
                 retriable: true,
             })?;
         self.transaction_open = false;
+        self.current_epoch = None;
         Ok(())
     }
 
@@ -160,13 +241,15 @@ impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
             // Nothing staged — idempotent.
             return Ok(());
         }
+        let timeout = Duration::from_millis(self.transaction_timeout_ms as u64);
         self.producer
-            .abort_transaction(TRANSACTION_TIMEOUT)
+            .abort_transaction(timeout)
             .map_err(|e| ConnectorError::Kafka {
                 message: format!("rdkafka abort_transaction failed: {e}"),
                 retriable: true,
             })?;
         self.transaction_open = false;
+        self.current_epoch = None;
         Ok(())
     }
 }

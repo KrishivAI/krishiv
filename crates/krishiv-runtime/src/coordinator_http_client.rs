@@ -884,9 +884,9 @@ pub async fn execute_coordinator_ivm_restore_delta(
     let body = IvmRestoreDeltaBody {
         checkpoint_delta_b64: b64,
     };
-    let resp = apply_coordinator_bearer(client.post(format!(
-        "{base}/api/v1/ivm/jobs/{job_id}/restore-delta"
-    )))
+    let resp = apply_coordinator_bearer(
+        client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/restore-delta")),
+    )
     .json(&body)
     .send()
     .await

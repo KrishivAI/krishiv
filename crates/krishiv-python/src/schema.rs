@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
+use crate::arrow_compat::PyArrowSchema;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple, PyType};
-use crate::arrow_compat::PyArrowSchema;
 
 use crate::errors::SchemaError;
 

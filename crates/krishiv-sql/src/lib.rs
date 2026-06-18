@@ -935,6 +935,7 @@ impl SqlEngine {
             .unwrap_or_else(|e| e.into_inner())
             .insert(name);
         self.has_streaming_sources.store(true, Ordering::Release);
+        self.invalidate_plan_cache();
         Ok(())
     }
 

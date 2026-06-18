@@ -207,14 +207,26 @@ impl CheckpointSource for ParquetSource {
 // ParquetSink
 // ---------------------------------------------------------------------------
 
-/// A bounded, idempotent sink that writes record batches to a Parquet file.
+/// A bounded sink that writes record batches to a Parquet file.
 ///
 /// The file is created lazily on the first call to [`Sink::write_batch`].
 /// Call [`Sink::flush`] to close the writer and finalise the file.
+///
+/// # Not idempotent
+///
+/// After `flush` the file is finalised and closed. A subsequent
+/// `write_batch` returns `ConnectorError::Unsupported`. Replaying the
+/// same batch before `flush` duplicates rows; replaying after `flush`
+/// loses the first write (the file is re-created). Use
+/// [`TwoPhaseCommitSink`][crate::TwoPhaseCommitSink] for exactly-once
+/// Parquet writes.
 pub struct ParquetSink {
     path: PathBuf,
     schema: Option<SchemaRef>,
     writer: Option<ArrowWriter<File>>,
+    /// True after `flush` has been called. All subsequent `write_batch`
+    /// calls are rejected to prevent silent data loss (truncation on reopen).
+    closed: bool,
 }
 
 impl ParquetSink {
@@ -227,18 +239,22 @@ impl ParquetSink {
             path: path.as_ref().to_path_buf(),
             schema: None,
             writer: None,
+            closed: false,
         })
     }
 }
 
 impl Sink for ParquetSink {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new()
-            .with_bounded()
-            .with_idempotent()
+        ConnectorCapabilities::new().with_bounded()
     }
 
     async fn write_batch(&mut self, batch: RecordBatch) -> ConnectorResult<()> {
+        if self.closed {
+            return Err(ConnectorError::Unsupported {
+                message: "ParquetSink is closed after flush; write_batch rejected".into(),
+            });
+        }
         if self.writer.is_none() {
             let schema = batch.schema();
             let file = File::create(&self.path).map_err(|e| {
@@ -268,7 +284,20 @@ impl Sink for ParquetSink {
             writer.close().map_err(|e| {
                 ConnectorError::Parquet(format!("failed to close Parquet writer: {e}"))
             })?;
+            // fsync the file so flush is actually durable (crash-safe).
+            // Without this, the OS page cache may not be flushed on crash,
+            // leaving an empty or truncated file.
+            let file = std::fs::File::open(&self.path).map_err(|e| {
+                ConnectorError::Parquet(format!(
+                    "failed to open '{}' for fsync: {e}",
+                    self.path.display()
+                ))
+            })?;
+            file.sync_all().map_err(|e| {
+                ConnectorError::Parquet(format!("failed to fsync '{}': {e}", self.path.display()))
+            })?;
         }
+        self.closed = true;
         Ok(())
     }
 }
@@ -365,13 +394,13 @@ mod tests {
     }
 
     #[test]
-    fn parquet_sink_reports_bounded_and_idempotent_capabilities() {
+    fn parquet_sink_reports_bounded_capabilities() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sink_caps.parquet");
         let sink = ParquetSink::create(&path).unwrap();
         let caps = sink.capabilities();
         assert!(caps.is_bounded());
-        assert!(caps.is_idempotent());
+        assert!(!caps.is_idempotent());
         assert!(!caps.is_unbounded());
         assert!(!caps.is_rewindable());
         assert!(!caps.is_transactional());

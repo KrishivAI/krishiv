@@ -1516,7 +1516,9 @@ impl Session {
 
     /// Create a SQL view in the current session.
     pub fn create_view(&self, name: &str, query: &str) -> Result<()> {
-        let sql = format!("CREATE VIEW {name} AS {query}");
+        // Quote the identifier to prevent SQL injection.
+        let safe_name = quote_identifier(name);
+        let sql = format!("CREATE VIEW {safe_name} AS {query}");
         let df = self.sql(&sql)?;
         // CREATE VIEW returns no rows; we just need to execute it.
         let _ = krishiv_common::async_util::block_on(df.collect_async())?;
@@ -1525,7 +1527,8 @@ impl Session {
 
     /// Drop a table or view from the session.
     pub fn drop_table(&self, name: &str) -> Result<()> {
-        let sql = format!("DROP TABLE {name}");
+        let safe_name = quote_identifier(name);
+        let sql = format!("DROP TABLE {safe_name}");
         let df = self.sql(&sql)?;
         let _ = krishiv_common::async_util::block_on(df.collect_async())?;
         Ok(())
@@ -1673,6 +1676,14 @@ pub(crate) async fn runtime_collect_batch_sql(
         .collect_batch_sql_async(query, tables, is_streaming)
         .await
         .map_err(KrishivError::from)
+}
+
+// ── Identifier quoting ──────────────────────────────────────────────────────
+
+/// Quote a SQL identifier with double quotes, escaping any embedded `"` as `""`.
+/// Prevents SQL injection when interpolating user-provided names into SQL.
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[cfg(test)]

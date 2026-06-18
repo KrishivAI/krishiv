@@ -568,8 +568,7 @@ pub async fn api_ivm_register_vector_view(
     };
 
     // Spawn and detach; the background task runs until the flow is dropped.
-    spawn_vector_view(&flow, spec)
-        .map_err(ivm_err)?;
+    spawn_vector_view(&flow, spec).map_err(ivm_err)?;
 
     Ok(Json(RegisterVectorViewResponse {
         success: true,

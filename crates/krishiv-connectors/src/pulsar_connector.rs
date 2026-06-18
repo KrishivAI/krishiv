@@ -183,6 +183,12 @@ impl PulsarSource {
                     ts_col.append_value(msg.payload.metadata.publish_time as i64);
                     data_col.append_value(&msg.payload.data);
                     count += 1;
+                    // Ack the message so the subscription cursor advances.
+                    // Without this, on restart every un-acked message is
+                    // re-delivered from subscription start.
+                    if let Err(e) = self.consumer.ack(&msg).await {
+                        tracing::warn!(error = %e, "pulsar ack failed; will retry on next batch");
+                    }
                 }
                 Ok(None) => break,
                 Err(e) => {

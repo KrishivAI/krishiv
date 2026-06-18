@@ -64,14 +64,17 @@ impl IncrementalView {
                 .map_err(|_| DeltaError::Operator("view output lock poisoned".into()))?;
             *guard = Some(output.clone());
         }
-        // Update materialized snapshot for materialized views
+        // Update materialized snapshot for materialized views.
+        // Apply the delta to the prior full snapshot — don't replace it with
+        // just the delta's positive rows (that would lose prior state).
         if self.spec.is_materialized {
-            let positive = output.filter_positive()?;
             let mut snap = self
                 .snapshot
                 .lock()
                 .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-            *snap = Some(positive);
+            let current = snap.take();
+            let updated = crate::operators::stream::apply_delta(current, &output)?;
+            *snap = Some(updated);
         }
         let _ = self.sender.send(Some(output));
         Ok(())

@@ -1,9 +1,10 @@
 //! Typed, lazy reader and writer builders.
 
-use std::collections::{BTreeMap, hash_map::DefaultHasher};
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use twox_hash::XxHash64;
 
 use arrow::array::UInt32Array;
 use arrow::compute::take;
@@ -614,7 +615,7 @@ fn distribute_batches(
                 partitions,
             } = &layout.distribution
             {
-                let mut hasher = DefaultHasher::new();
+                let mut hasher = XxHash64::with_seed(0);
                 for column in columns {
                     let index = batch
                         .schema()

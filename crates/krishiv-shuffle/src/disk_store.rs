@@ -207,13 +207,13 @@ impl LocalDiskShuffleStore {
         // Fast path: if the in-memory map already has a token, check
         // monotonicity without an FS read. A stale incoming token is rejected
         // here (same as enforce_monotonic_lease would do).
-        if let Some(mem_token) = memory {
-            if incoming < mem_token {
-                return Err(crate::ShuffleError::StaleLeaseToken {
-                    expected: mem_token,
-                    actual: incoming,
-                });
-            }
+        if let Some(mem_token) = memory
+            && incoming < mem_token
+        {
+            return Err(crate::ShuffleError::StaleLeaseToken {
+                expected: mem_token,
+                actual: incoming,
+            });
         }
 
         // Phase 1: read persisted lease (if needed) in spawn_blocking.
@@ -289,7 +289,9 @@ impl ShuffleStore for LocalDiskShuffleStore {
         // Use the async variant so blocking FS operations (lease read/persist)
         // are offloaded to spawn_blocking.
         {
-            let _ = self.resolve_lease_token_async(&partition.id, lease_token).await?;
+            let _ = self
+                .resolve_lease_token_async(&partition.id, lease_token)
+                .await?;
         }
 
         let final_path = self.partition_path(&partition.id)?;

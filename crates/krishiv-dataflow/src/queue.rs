@@ -41,10 +41,11 @@ impl OperatorQueueMetrics {
 /// Sending half of an `OperatorQueue`.
 ///
 /// Data messages block when the bounded channel is full (backpressure).
-/// Barrier messages are always sent without blocking.
+/// Barrier messages use an unbounded channel so they always bypass backpressure
+/// and never block, preventing checkpoint-protocol deadlock.
 pub struct OperatorQueueSender {
     pub(crate) data_tx: tokio::sync::mpsc::Sender<arrow::record_batch::RecordBatch>,
-    pub(crate) barrier_tx: tokio::sync::mpsc::Sender<u64>,
+    pub(crate) barrier_tx: tokio::sync::mpsc::UnboundedSender<u64>,
 }
 
 impl OperatorQueueSender {
@@ -59,11 +60,11 @@ impl OperatorQueueSender {
             .map_err(|_| OperatorQueueError::Closed)
     }
 
-    /// Send a barrier. Blocks until space is available in the barrier queue.
+    /// Send a barrier. Never blocks — the unbounded channel bypasses
+    /// backpressure, preventing checkpoint-protocol deadlock.
     pub async fn send_barrier(&self, epoch: u64) -> Result<(), OperatorQueueError> {
         self.barrier_tx
             .send(epoch)
-            .await
             .map_err(|_| OperatorQueueError::Closed)
     }
 }
@@ -71,7 +72,7 @@ impl OperatorQueueSender {
 /// Receiving half of an `OperatorQueue`.
 pub struct OperatorQueueReceiver {
     pub(crate) data_rx: tokio::sync::mpsc::Receiver<arrow::record_batch::RecordBatch>,
-    pub(crate) barrier_rx: tokio::sync::mpsc::Receiver<u64>,
+    pub(crate) barrier_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
     pub(crate) capacity: usize,
     /// P0.5: deferred barrier epochs that arrived while we were waiting for data.
     /// Uses VecDeque for O(1) front-pop (vs Vec::remove(0) which is O(n)).
@@ -133,12 +134,13 @@ pub enum OperatorQueueError {
 
 /// Create a bounded operator queue with `capacity` data slots.
 ///
-/// Barriers also use a bounded channel (M2: cap=64) to prevent unbounded memory growth
-/// from rapid checkpoint storms. Dropping barriers is safe because they are idempotent
-/// and the coordinator will retry via try_tick on the next interval.
+/// Barriers use an unbounded channel so they always bypass backpressure,
+/// preventing checkpoint-protocol deadlock. This matches the module-level
+/// contract: "Barriers always bypass backpressure — they are delivered on a
+/// separate unbounded channel."
 pub fn operator_queue(capacity: usize) -> (OperatorQueueSender, OperatorQueueReceiver) {
     let (data_tx, data_rx) = tokio::sync::mpsc::channel(capacity.max(1));
-    let (barrier_tx, barrier_rx) = tokio::sync::mpsc::channel(64);
+    let (barrier_tx, barrier_rx) = tokio::sync::mpsc::unbounded_channel();
     let sender = OperatorQueueSender {
         data_tx,
         barrier_tx,

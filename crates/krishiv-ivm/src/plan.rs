@@ -30,6 +30,7 @@ use krishiv_delta::{
 ///
 /// Variants other than `DiffBased` are O(Δ): they operate only on the
 /// incoming delta and maintain state across ticks.
+#[allow(clippy::large_enum_variant)]
 pub enum ViewPlan {
     /// Stateful group-by aggregate over one source (or upstream view).
     Aggregate {

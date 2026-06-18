@@ -245,10 +245,10 @@ impl IncrementalFlow {
         let source_name = source_name.into();
         {
             let mut inner = self.inner.lock().map_err(lock_err)?;
-            if let Some(last) = inner.source_ordinals.get(&source_name) {
-                if *last == ordinal {
-                    return Ok(()); // Same offset — nothing new.
-                }
+            if let Some(last) = inner.source_ordinals.get(&source_name)
+                && *last == ordinal
+            {
+                return Ok(()); // Same offset — nothing new.
             }
             inner.source_ordinals.insert(source_name.clone(), ordinal);
         } // Release lock before calling feed_source.
@@ -568,12 +568,12 @@ impl IncrementalFlow {
 
             if plan_is_incremental {
                 // Register the previous snapshot for downstream DiffBased views.
-                if let Some(prev) = view_full_outputs.get(view_name) {
-                    if prev.num_rows() > 0 {
-                        let schema = prev.schema();
-                        if let Ok(table) = MemTable::try_new(schema, vec![vec![prev.clone()]]) {
-                            let _ = ctx.register_table(view_name.as_str(), Arc::new(table));
-                        }
+                if let Some(prev) = view_full_outputs.get(view_name)
+                    && prev.num_rows() > 0
+                {
+                    let schema = prev.schema();
+                    if let Ok(table) = MemTable::try_new(schema, vec![vec![prev.clone()]]) {
+                        let _ = ctx.register_table(view_name.as_str(), Arc::new(table));
                     }
                 }
             } else {
@@ -708,12 +708,12 @@ impl IncrementalFlow {
             active_views += 1;
 
             // Provenance (DiffBased only).
-            if plan_kind == ViewPlanKind::DiffBased {
-                if let (Some(input_hs), Some(prov)) = (&input_hashes, &mut inner.provenance) {
-                    let output_hs = crate::provenance::hash_all_rows(&output_delta.data_batch());
-                    for &ih in input_hs {
-                        prov.record_many(ih, output_hs.iter().copied());
-                    }
+            if plan_kind == ViewPlanKind::DiffBased
+                && let (Some(input_hs), Some(prov)) = (&input_hashes, &mut inner.provenance)
+            {
+                let output_hs = crate::provenance::hash_all_rows(&output_delta.data_batch());
+                for &ih in input_hs {
+                    prov.record_many(ih, output_hs.iter().copied());
                 }
             }
 

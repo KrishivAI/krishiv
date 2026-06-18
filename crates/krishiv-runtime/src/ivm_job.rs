@@ -293,11 +293,8 @@ impl IvmJobHandle {
                 .checkpoint_delta()
                 .map_err(|e| crate::RuntimeError::transport(e.to_string())),
             Self::Remote(j) => {
-                crate::execute_coordinator_ivm_checkpoint_delta(
-                    &j.coordinator_http,
-                    &j.job_id,
-                )
-                .await
+                crate::execute_coordinator_ivm_checkpoint_delta(&j.coordinator_http, &j.job_id)
+                    .await
             }
         }
     }
@@ -310,12 +307,8 @@ impl IvmJobHandle {
                 .restore_delta(bytes)
                 .map_err(|e| crate::RuntimeError::transport(e.to_string())),
             Self::Remote(j) => {
-                crate::execute_coordinator_ivm_restore_delta(
-                    &j.coordinator_http,
-                    &j.job_id,
-                    bytes,
-                )
-                .await
+                crate::execute_coordinator_ivm_restore_delta(&j.coordinator_http, &j.job_id, bytes)
+                    .await
             }
         }
     }

@@ -422,7 +422,10 @@ impl FlightClientPool {
             Err(e) => {
                 // Mark this endpoint as unhealthy on connection failure
                 self.mark_endpoint_unhealthy(&endpoint).await;
-                // Try failover
+                // Drop the write lock before failover to prevent reentrant
+                // deadlock (failover_if_needed acquires channel.write).
+                drop(guard);
+                // Try failover (only if there are alternate endpoints).
                 if self.endpoints.len() > 1 {
                     self.failover_if_needed().await;
                 }

@@ -1012,8 +1012,7 @@ impl TaskRecord {
         // Record assignment time when the task starts running so the stall-detection loop
         // can identify hung tasks. Initialize last_progress_ms to the same value.
         if self.state == TaskState::Running {
-            let now_ms =
-                u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+            let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
             self.assigned_at_ms = Some(now_ms);
             self.last_progress_ms = Some(now_ms);
         } else if self.state.is_terminal() {

@@ -101,19 +101,35 @@ impl Trace {
     }
 
     fn cascade_merge(&mut self, level: usize) {
-        if self.levels[level].len() < MERGE_THRESHOLD || level + 1 >= NUM_LEVELS {
+        if self.levels[level].len() < MERGE_THRESHOLD {
+            return;
+        }
+        // If we're at the top level, consolidate in place instead of discarding.
+        // Without this, the top level grows without bound and probe latency
+        // degrades linearly with total history.
+        if level + 1 >= NUM_LEVELS {
+            let batches: Vec<DeltaBatch> = std::mem::take(&mut self.levels[level]);
+            if let Ok(merged) = DeltaBatch::concat(&batches) {
+                if let Ok(consolidated) = consolidate_batch(merged, &[], &self.data_schema) {
+                    self.levels[level].push(consolidated);
+                } else {
+                    // Restore on error.
+                    self.levels[level] = batches;
+                }
+            } else {
+                self.levels[level] = batches;
+            }
             return;
         }
         let batches: Vec<DeltaBatch> = std::mem::take(&mut self.levels[level]);
-        if let Ok(merged) = DeltaBatch::concat(&batches) {
-            // Consolidate: sort by key columns, sum weights, drop zeros.
-            if let Ok(consolidated) =
-                consolidate_batch(merged, &self.key_col_names, &self.data_schema)
-            {
+        if let Ok(merged) = DeltaBatch::concat(&batches)
+            && let Ok(consolidated) = consolidate_batch(merged, &[], &self.data_schema) {
                 self.levels[level + 1].push(consolidated);
                 self.cascade_merge(level + 1);
+                return;
             }
-        }
+        // On error, restore the batches to the current level so no data is lost.
+        self.levels[level] = batches;
     }
 
     // ── Probe ────────────────────────────────────────────────────────────────
@@ -226,7 +242,7 @@ impl Trace {
             return Ok(empty);
         }
         let merged = DeltaBatch::concat(&all)?;
-        let consolidated = consolidate_batch(merged, &self.key_col_names, &self.data_schema)?;
+        let consolidated = consolidate_batch(merged, &[], &self.data_schema)?;
         consolidated.filter_positive()
     }
 }

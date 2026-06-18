@@ -201,20 +201,21 @@ impl KrishivFlightSqlService {
 
     /// Check table-level access policy if configured.
     ///
-    /// Extracts the table name from a simple `SELECT ... FROM <table>` pattern.
-    /// When no policy is configured, all access is allowed.
-    #[allow(clippy::result_large_err)]
+    /// Uses the AST-based `krishiv_sql::referenced_table_names` to extract
+    /// ALL referenced tables (supports subqueries, CTEs, JOINs, etc. — the
+    /// previous `extract_from_table` scanner was easily bypassed).
     fn check_table_access(&self, query: &str) -> Result<(), Status> {
         let Some(policy) = &self.policy else {
             return Ok(());
         };
-        // Simple heuristic: extract table name after FROM keyword.
-        if let Some(table_name) = extract_from_table(query)
-            && !policy.check_table_access(&table_name)
-        {
-            return Err(Status::permission_denied(format!(
-                "access denied to table: {table_name}"
-            )));
+        let table_names = krishiv_sql::referenced_table_names(query)
+            .map_err(|_| Status::internal("failed to parse query for table-access policy check"))?;
+        for table_name in &table_names {
+            if !policy.check_table_access(table_name) {
+                return Err(Status::permission_denied(format!(
+                    "access denied to table: {table_name}"
+                )));
+            }
         }
         Ok(())
     }
@@ -243,16 +244,6 @@ impl KrishivFlightSqlService {
 }
 
 /// Simple heuristic to extract the table name from `FROM <table>` in a query.
-fn extract_from_table(query: &str) -> Option<String> {
-    let upper = query.to_uppercase();
-    let from_pos = upper.find(" FROM ")?;
-    let rest = query[from_pos + 6..].trim_start();
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == ';' || c == ')')
-        .unwrap_or(rest.len());
-    let table = rest[..end].trim().to_string();
-    if table.is_empty() { None } else { Some(table) }
-}
 
 #[tonic::async_trait]
 impl FlightSqlService for KrishivFlightSqlService {
@@ -301,11 +292,19 @@ impl FlightSqlService for KrishivFlightSqlService {
 
         // Authenticate if an auth provider is configured.
         let subject = self.authenticate_request(&request)?;
-        self.validate_transaction_id(query.transaction_id.as_deref(), subject.as_deref())
+        let transaction_id = query.transaction_id.unwrap_or_default();
+        self.validate_transaction_id(Some(&transaction_id), subject.as_deref())
             .await?;
 
+        // Encode the transaction id into the ticket so that do_get_statement
+        // can re-validate it. Format: [4-byte txn_id_len][txn_id][query].
+        let txn_len = (transaction_id.len() as u32).to_be_bytes();
+        let mut handle = Vec::with_capacity(4 + transaction_id.len() + query.query.len());
+        handle.extend_from_slice(&txn_len);
+        handle.extend_from_slice(&transaction_id);
+        handle.extend_from_slice(query.query.as_bytes());
         let ticket_query = TicketStatementQuery {
-            statement_handle: query.query.into_bytes().into(),
+            statement_handle: handle.into(),
         };
         let ticket = Ticket {
             ticket: ticket_query.as_any().encode_to_vec().into(),
@@ -334,9 +333,31 @@ impl FlightSqlService for KrishivFlightSqlService {
         }
 
         // Authenticate if an auth provider is configured.
-        self.authenticate_request(&request)?;
+        let subject = self.authenticate_request(&request)?;
 
-        let query = std::str::from_utf8(&ticket.statement_handle)
+        // Decode the ticket: [4-byte txn_len][txn_id][query].
+        let handle = &ticket.statement_handle;
+        let (transaction_id, query_bytes): (Option<Vec<u8>>, &[u8]) = if handle.len() >= 4 {
+            let txn_len = u32::from_be_bytes([handle[0], handle[1], handle[2], handle[3]]) as usize;
+            let txn_end = 4 + txn_len;
+            if txn_len > 0 && handle.len() >= txn_end {
+                let txn = handle[4..txn_end].to_vec();
+                let query = &handle[txn_end..];
+                (Some(txn), query)
+            } else {
+                // Legacy ticket or no transaction.
+                (None, &handle[4.min(handle.len())..])
+            }
+        } else {
+            (None, handle)
+        };
+
+        // Re-validate the transaction id. Even though get_flight_info_statement
+        // checked it, the ticket could have been reused after EndTransaction.
+        self.validate_transaction_id(transaction_id.as_deref(), subject.as_deref())
+            .await?;
+
+        let query = std::str::from_utf8(query_bytes)
             .map_err(|e| Status::invalid_argument(format!("invalid query encoding: {e}")))?;
 
         // Check table access if a policy is configured.

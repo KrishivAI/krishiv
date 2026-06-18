@@ -349,12 +349,12 @@ impl StreamingDataFrame {
 // ── DeduplicatingStream ───────────────────────────────────────────────────────
 
 /// Stream adapter that removes rows whose dedup-column value set has been seen
-/// before. Uses a `HashSet<u64>` keyed by a simple hash of concatenated
-/// column values per row.
+/// before. Uses a `HashSet<[u64; 2]>` keyed by a 128-bit XxHash64 of concatenated
+/// column values (two independent seeds, giving ~2^64 collision bound).
 struct DeduplicatingStream {
     inner: KrishivStream,
     columns: Vec<String>,
-    seen: HashSet<u64>,
+    seen: HashSet<[u64; 2]>,
 }
 
 impl DeduplicatingStream {
@@ -366,26 +366,28 @@ impl DeduplicatingStream {
         }
     }
 
-    /// Compute a stable u64 hash over the dedup-column values for a single row.
+    /// Compute a stable 128-bit hash over the dedup-column values for one row.
     ///
-    /// Uses XxHash64 with a fixed seed so the hash is deterministic across
-    /// Rust versions, process restarts, and executor instances.  `DefaultHasher`
-    /// is intentionally not stable and cannot be used here.
-    fn row_hash(batch: &RecordBatch, row: usize, columns: &[String]) -> u64 {
+    /// Uses XxHash64 with two seeds (0 and 1) for a combined 128-bit hash.
+    /// The birthday bound at ~2^64 rows makes collisions negligible for any
+    /// realistic streaming workload.
+    fn row_hash(batch: &RecordBatch, row: usize, columns: &[String]) -> [u64; 2] {
         let mut hasher = XxHash64::with_seed(0);
+        let mut hasher2 = XxHash64::with_seed(1);
         for col_name in columns {
-            // Hash the column name as a separator so ("ab","c") ≠ ("a","bc").
             col_name.hash(&mut hasher);
+            col_name.hash(&mut hasher2);
             if let Ok(col_idx) = batch.schema().index_of(col_name) {
                 let col = batch.column(col_idx);
-                // Convert to string repr for simple hashing.
                 match col.data_type() {
                     DataType::Int64 => {
                         if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
                             if arr.is_null(row) {
                                 "null".hash(&mut hasher);
+                                "null".hash(&mut hasher2);
                             } else {
                                 arr.value(row).hash(&mut hasher);
+                                arr.value(row).hash(&mut hasher2);
                             }
                         }
                     }
@@ -393,19 +395,22 @@ impl DeduplicatingStream {
                         if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
                             if arr.is_null(row) {
                                 "null".hash(&mut hasher);
+                                "null".hash(&mut hasher2);
                             } else {
                                 arr.value(row).hash(&mut hasher);
+                                arr.value(row).hash(&mut hasher2);
                             }
                         }
                     }
                     _ => {
-                        // For other types, hash the debug representation.
-                        format!("{:?}", col.slice(row, 1)).hash(&mut hasher);
+                        let s = format!("{:?}", col.slice(row, 1));
+                        s.hash(&mut hasher);
+                        s.hash(&mut hasher2);
                     }
                 }
             }
         }
-        hasher.finish()
+        [hasher.finish(), hasher2.finish()]
     }
 
     /// Filter a batch, keeping only rows whose hash has not been seen before.
