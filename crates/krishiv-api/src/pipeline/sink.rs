@@ -29,9 +29,11 @@ impl Egress {
                 Ok(())
             }
             Egress::Connector(sink) => {
-                sink.write_batch_dyn(batch).await.map_err(|e| KrishivError::Runtime {
-                    message: format!("pipeline sink write: {e}"),
-                })
+                sink.write_batch_dyn(batch)
+                    .await
+                    .map_err(|e| KrishivError::Runtime {
+                        message: format!("pipeline sink write: {e}"),
+                    })
             }
         }
     }
@@ -40,11 +42,9 @@ impl Egress {
     pub(crate) async fn flush(&mut self) -> Result<()> {
         match self {
             Egress::Memory(_) => Ok(()),
-            Egress::Connector(sink) => {
-                sink.flush_dyn().await.map_err(|e| KrishivError::Runtime {
-                    message: format!("pipeline sink flush: {e}"),
-                })
-            }
+            Egress::Connector(sink) => sink.flush_dyn().await.map_err(|e| KrishivError::Runtime {
+                message: format!("pipeline sink flush: {e}"),
+            }),
         }
     }
 }

@@ -187,10 +187,7 @@ fn infer_mode(sources: &[(String, Ingest)]) -> PipelineMode {
     // CDC source ⇒ IVM; bounded records ⇒ Batch; otherwise Stream.
     if sources.iter().any(|(_, s)| matches!(s, Ingest::Cdc(_))) {
         PipelineMode::Ivm
-    } else if sources
-        .iter()
-        .all(|(_, s)| matches!(s, Ingest::Memory(_)))
-    {
+    } else if sources.iter().all(|(_, s)| matches!(s, Ingest::Memory(_))) {
         PipelineMode::Batch
     } else {
         PipelineMode::Stream

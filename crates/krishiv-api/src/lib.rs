@@ -11,8 +11,8 @@ pub mod dataframe;
 pub mod error;
 pub mod expression;
 pub mod incremental_flow;
-pub mod pipeline;
 pub mod io;
+pub mod pipeline;
 pub mod prepared;
 pub mod process;
 pub mod query;
@@ -41,9 +41,6 @@ pub use catalog::{
 pub use compute::{
     Checkpointable, EmbeddedStreamJob, FeedableJob, IvmJob, Job, JobKind, StepReport, StreamJob,
 };
-pub use pipeline::{
-    CdcChange, Egress, Ingest, Pipeline, PipelineBuilder, PipelineMode, RunPolicy, ViewDef,
-};
 pub use dataframe::{
     Boundedness, DataFrame, ExecutionResult, ExplainMode, GroupedDataFrame, GroupingSpec, JoinType,
     PivotValue, QueryExecutionStats,
@@ -62,6 +59,9 @@ pub use io::{
 pub use krishiv_connectors::{
     DatabaseIoOptions, FileLayout, FileSortDirection, KafkaIoOptions, SchemaEvolutionMode,
     SortField, WriteDistribution, WriteMode,
+};
+pub use pipeline::{
+    CdcChange, Egress, Ingest, Pipeline, PipelineBuilder, PipelineMode, RunPolicy, ViewDef,
 };
 pub use prepared::PreparedStatement;
 pub use process::{apply_async_io, apply_process_function};

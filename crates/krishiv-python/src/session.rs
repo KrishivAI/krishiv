@@ -849,6 +849,15 @@ impl PySession {
         Ok(crate::incremental::PyIvmJob { inner: job })
     }
 
+    /// Start building a declarative pipeline (`source → transform → sink`).
+    ///
+    /// Returns a :class:`Pipeline` builder that compiles down to the imperative
+    /// core. There is no trigger stage; boundedness, watermark, and
+    /// change-events drive each mode.
+    pub fn pipeline(&self, name: String) -> crate::pipeline_api::PyPipeline {
+        crate::pipeline_api::PyPipeline::new((*self.inner).clone(), name)
+    }
+
     /// Create a [`PyStream`] backed by in-memory batches (supports windowed `collect()` / `async for`).
     #[pyo3(signature = (name, batches, watermark_column, max_lateness_ms))]
     pub fn memory_stream(

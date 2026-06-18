@@ -117,11 +117,7 @@ pub(super) async fn run_ivm(pipeline: Pipeline, policy: RunPolicy) -> Result<()>
     write_snapshots(&job, sinks).await
 }
 
-async fn maybe_step(
-    job: &IvmJob,
-    policy: RunPolicy,
-    rows_since_step: &mut usize,
-) -> Result<()> {
+async fn maybe_step(job: &IvmJob, policy: RunPolicy, rows_since_step: &mut usize) -> Result<()> {
     let should = match policy {
         RunPolicy::Once => false,
         RunPolicy::OnChange => true,
@@ -163,16 +159,21 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
         let batches = match ingest {
             Ingest::Memory(b) => b,
             Ingest::Cdc(_) => {
-                return Err(rt("CDC source is not valid in batch mode; use Memory/Connector"));
+                return Err(rt(
+                    "CDC source is not valid in batch mode; use Memory/Connector",
+                ));
             }
             Ingest::Connector(_) => {
-                return Err(rt("connector sources in batch mode are not yet wired; use Memory"));
+                return Err(rt(
+                    "connector sources in batch mode are not yet wired; use Memory",
+                ));
             }
         };
         if let Some(first) = batches.first() {
             let schema = first.schema();
             let mt = MemTable::try_new(schema, vec![batches]).map_err(rt)?;
-            ctx.register_table(sname.as_str(), Arc::new(mt)).map_err(rt)?;
+            ctx.register_table(sname.as_str(), Arc::new(mt))
+                .map_err(rt)?;
         }
     }
 
@@ -183,7 +184,8 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
         let out = df.collect().await.map_err(rt)?;
         if let Some(first) = out.first() {
             let mt = MemTable::try_new(first.schema(), vec![out.clone()]).map_err(rt)?;
-            ctx.register_table(v.name.as_str(), Arc::new(mt)).map_err(rt)?;
+            ctx.register_table(v.name.as_str(), Arc::new(mt))
+                .map_err(rt)?;
         }
         outputs.insert(v.name.clone(), out);
     }
@@ -224,14 +226,14 @@ fn ingest_schema(ingest: &Ingest) -> Option<SchemaRef> {
 
 /// Infer a view's output schema by registering the known source/upstream-view
 /// schemas as empty tables and probing the SQL with `LIMIT 0`.
-async fn infer_view_schema(
-    available: &HashMap<String, SchemaRef>,
-    sql: &str,
-) -> Result<SchemaRef> {
+async fn infer_view_schema(available: &HashMap<String, SchemaRef>, sql: &str) -> Result<SchemaRef> {
     let ctx = SessionContext::new();
     for (name, schema) in available {
-        let mt = MemTable::try_new(schema.clone(), vec![]).map_err(rt)?;
-        ctx.register_table(name.as_str(), Arc::new(mt)).map_err(rt)?;
+        // One empty partition (not zero partitions) — DataFusion rejects an
+        // empty partition list. An empty table is enough for a LIMIT 0 probe.
+        let mt = MemTable::try_new(schema.clone(), vec![vec![]]).map_err(rt)?;
+        ctx.register_table(name.as_str(), Arc::new(mt))
+            .map_err(rt)?;
     }
     let probe = format!("SELECT * FROM ({sql}) AS __pipeline_probe__ LIMIT 0");
     let df = ctx.sql(&probe).await.map_err(rt)?;
