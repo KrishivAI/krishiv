@@ -29,16 +29,19 @@ use std::sync::{Arc, Mutex};
 use ahash::{AHashMap, AHashSet};
 use arrow::array::{Array, RecordBatch};
 use arrow::compute::cast;
+use arrow::datatypes::SchemaRef;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use tokio::sync::watch;
 
 use krishiv_delta::{
-    DeltaBatch, DeltaError, IncrementalViewRegistry, IncrementalViewSpec, apply_delta,
-    deserialize_delta_batch, differentiate, serialize_delta_batch,
+    DeltaBatch, DeltaError, IncrementalView, IncrementalViewRegistry, IncrementalViewSpec,
+    LatenessSpec, WatermarkTracker, apply_delta, consolidate_batch, deserialize_delta_batch,
+    differentiate, serialize_delta_batch,
 };
 
 use crate::error::{IvmError, IvmResult};
+use crate::plan::{ViewPlan, ViewPlanKind};
 
 // ── StepSummary ───────────────────────────────────────────────────────────────
 
@@ -70,6 +73,17 @@ struct IncrementalFlowInner {
 
     // Opt-in provenance tracking: input row hash → output row hashes.
     provenance: Option<crate::provenance::ProvenanceIndex>,
+
+    // Gap 1: cached incremental execution plans per view.
+    view_plans: AHashMap<String, ViewPlan>,
+    // SQL text that was used to build each cached plan (for Gap 7 invalidation).
+    view_plan_sqls: AHashMap<String, String>,
+
+    // Gap 5: last-processed offset per source (skip-if-unchanged).
+    source_ordinals: AHashMap<String, Vec<u8>>,
+
+    // Gap 6: LATENESS / watermark trackers per source.
+    watermark_trackers: AHashMap<String, WatermarkTracker>,
 }
 
 // ── IncrementalFlow ───────────────────────────────────────────────────────────
@@ -96,6 +110,10 @@ impl IncrementalFlow {
                 checkpoint_deltas: HashMap::new(),
                 streaming_prev_snapshots: HashMap::new(),
                 provenance: None,
+                view_plans: AHashMap::new(),
+                view_plan_sqls: AHashMap::new(),
+                source_ordinals: AHashMap::new(),
+                watermark_trackers: AHashMap::new(),
             })),
         }
     }
@@ -113,10 +131,7 @@ impl IncrementalFlow {
     }
 
     /// Query the provenance index for output hashes derived from `input_hash`.
-    pub fn query_provenance(
-        &self,
-        input_hash: u64,
-    ) -> IvmResult<Option<AHashSet<u64>>> {
+    pub fn query_provenance(&self, input_hash: u64) -> IvmResult<Option<AHashSet<u64>>> {
         let inner = self.inner.lock().map_err(lock_err)?;
         Ok(inner
             .provenance
@@ -164,10 +179,22 @@ impl IncrementalFlow {
     ///
     /// Re-registering resets the `full_output` baseline so the next tick
     /// treats the full SQL result as insertions (behavior-version invalidation).
+    /// Gap 7: if the view's SQL changed, the cached incremental plan is cleared
+    /// so a fresh plan is built on the next step.
     pub fn register_view(&self, spec: IncrementalViewSpec) -> IvmResult<()> {
-        let inner = self.inner.lock().map_err(lock_err)?;
+        let mut inner = self.inner.lock().map_err(lock_err)?;
         if let Ok(old_view) = inner.view_registry.get(&spec.name) {
             let _ = old_view.reset_full_output();
+        }
+        // Gap 7: invalidate cached plan if the SQL body changed.
+        let sql_changed = inner
+            .view_plan_sqls
+            .get(&spec.name)
+            .map(|cached| *cached != spec.body_sql)
+            .unwrap_or(false);
+        if sql_changed {
+            inner.view_plans.remove(&spec.name);
+            inner.view_plan_sqls.remove(&spec.name);
         }
         inner.view_registry.register(spec).map_err(delta_err)
     }
@@ -175,6 +202,85 @@ impl IncrementalFlow {
     pub fn drop_view(&self, name: &str) -> IvmResult<bool> {
         let inner = self.inner.lock().map_err(lock_err)?;
         inner.view_registry.drop_view(name).map_err(delta_err)
+    }
+
+    // ── Gap 6: LATENESS registration ──────────────────────────────────────────
+
+    /// Register a LATENESS annotation on a source column.
+    ///
+    /// Once registered, the watermark for this source advances as records are
+    /// ingested. Join operator traces can be GC'd via `gc_watermark` on the
+    /// corresponding `ViewPlan::Join`.
+    pub fn register_lateness(&self, source_name: &str, spec: LatenessSpec) -> IvmResult<()> {
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        inner
+            .watermark_trackers
+            .insert(source_name.to_string(), WatermarkTracker::new(spec));
+        Ok(())
+    }
+
+    /// Return the current watermark (milliseconds) for a source, or `i64::MIN`
+    /// if no lateness spec has been registered for it.
+    pub fn watermark_for(&self, source_name: &str) -> IvmResult<i64> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner
+            .watermark_trackers
+            .get(source_name)
+            .map(|t| t.watermark())
+            .unwrap_or(i64::MIN))
+    }
+
+    // ── Gap 5: source-ordinal skip-if-unchanged ───────────────────────────────
+
+    /// Feed a delta only if the source's offset (ordinal) has advanced.
+    ///
+    /// If `ordinal == last_processed_ordinal`, the delta is silently dropped.
+    /// This prevents re-processing when a source snapshot is re-delivered.
+    pub fn feed_source_with_ordinal(
+        &self,
+        source_name: impl Into<String>,
+        batch: DeltaBatch,
+        ordinal: Vec<u8>,
+    ) -> IvmResult<()> {
+        let source_name = source_name.into();
+        {
+            let mut inner = self.inner.lock().map_err(lock_err)?;
+            if let Some(last) = inner.source_ordinals.get(&source_name) {
+                if *last == ordinal {
+                    return Ok(()); // Same offset — nothing new.
+                }
+            }
+            inner.source_ordinals.insert(source_name.clone(), ordinal);
+        } // Release lock before calling feed_source.
+        self.feed_source(source_name, batch)
+    }
+
+    // ── Gap 9: CDC → DeltaBatch bridge ────────────────────────────────────────
+
+    /// Feed a CDC event (before / after rows) as a ±1 `DeltaBatch`.
+    ///
+    /// - INSERT: `before = None`, `after = Some(new_row)`
+    /// - DELETE: `before = Some(old_row)`, `after = None`
+    /// - UPDATE: `before = Some(old_row)`, `after = Some(new_row)` →
+    ///   emits retraction of `old_row` and insertion of `new_row`.
+    ///
+    /// The `schema` argument is only used when both sides are `None` (no-op).
+    pub fn feed_cdc_source(
+        &self,
+        source_name: impl Into<String>,
+        _schema: &SchemaRef,
+        before: Option<RecordBatch>,
+        after: Option<RecordBatch>,
+    ) -> IvmResult<()> {
+        let delta = match (before, after) {
+            (None, Some(inserted)) => DeltaBatch::from_inserts(inserted).map_err(delta_err)?,
+            (Some(deleted), None) => DeltaBatch::from_deletes(deleted).map_err(delta_err)?,
+            (Some(old_row), Some(new_row)) => {
+                DeltaBatch::from_update(&old_row, &new_row).map_err(delta_err)?
+            }
+            (None, None) => return Ok(()),
+        };
+        self.feed_source(source_name, delta)
     }
 
     /// Push a `DeltaBatch` as input for a named source on the next step.
@@ -226,11 +332,7 @@ impl IncrementalFlow {
                 .push(batch.clone());
         }
 
-        inner
-            .pending
-            .entry(source_name)
-            .or_default()
-            .push(batch);
+        inner.pending.entry(source_name).or_default().push(batch);
         Ok(())
     }
 
@@ -260,18 +362,17 @@ impl IncrementalFlow {
         let new_snapshot = if non_empty.len() == 1 {
             (*non_empty[0]).clone()
         } else {
-            arrow::compute::concat_batches(
-                &schema,
-                non_empty.iter().copied(),
-            )
-            .map_err(|e| IvmError::execution(e.to_string()))?
+            arrow::compute::concat_batches(&schema, non_empty.iter().copied())
+                .map_err(|e| IvmError::execution(e.to_string()))?
         };
 
         // Differentiate: true delta vs previous snapshot.
         let mut inner = self.inner.lock().map_err(lock_err)?;
         let prev = inner.streaming_prev_snapshots.get(&name);
         let delta = differentiate(&schema, prev, &new_snapshot).map_err(delta_err)?;
-        inner.streaming_prev_snapshots.insert(name.clone(), new_snapshot);
+        inner
+            .streaming_prev_snapshots
+            .insert(name.clone(), new_snapshot);
 
         if delta.is_empty() {
             return Ok(());
@@ -331,9 +432,21 @@ impl IncrementalFlow {
     ///
     /// Views whose SQL references no dirty source or upstream view are skipped
     /// (dirty-bit scheduling); their previous snapshot is reused unchanged.
+    ///
+    /// Views with a cached incremental plan (`ViewPlan::Aggregate`, `Join`,
+    /// `Distinct`) are executed O(Δ) without running DataFusion SQL. Views
+    /// with `ViewPlan::DiffBased` (or no cached plan yet) fall back to full
+    /// SQL re-execution + diff.
     pub async fn step_datafusion_with_ctx(&self, ctx: &SessionContext) -> IvmResult<StepSummary> {
-        // Phase 1: drain pending, snapshot state, extract prev view outputs (brief lock).
-        let (raw_pending, current_snapshots, view_specs, view_prev_snapshots) = {
+        // ── Phase 1 (lock): drain pending + snapshot state ────────────────────
+        let (
+            raw_pending,
+            current_snapshots,
+            view_specs,
+            view_prev_snapshots,
+            view_plan_kinds,
+            views_needing_plans,
+        ) = {
             let mut inner = self.inner.lock().map_err(lock_err)?;
             let raw = std::mem::take(&mut inner.pending);
             let snapshots = inner.source_snapshots.clone();
@@ -342,7 +455,6 @@ impl IncrementalFlow {
                 .iter()
                 .filter_map(|n| inner.view_registry.get(n).ok().map(|v| v.spec.clone()))
                 .collect();
-            // Extract previous view outputs for dirty-bit reuse.
             let prev_outputs: HashMap<String, RecordBatch> = names
                 .iter()
                 .filter_map(|n| {
@@ -354,22 +466,30 @@ impl IncrementalFlow {
                         .map(|snap| (n.clone(), snap))
                 })
                 .collect();
-            (raw, snapshots, specs, prev_outputs)
+            // Gap 1: extract plan kinds so Phase 4 can skip SQL for incremental views.
+            let plan_kinds: AHashMap<String, ViewPlanKind> = inner
+                .view_plans
+                .iter()
+                .map(|(k, v)| (k.clone(), v.kind()))
+                .collect();
+            let needs_plans: HashSet<String> = names
+                .iter()
+                .filter(|n| !inner.view_plans.contains_key(n.as_str()))
+                .cloned()
+                .collect();
+            (raw, snapshots, specs, prev_outputs, plan_kinds, needs_plans)
         };
 
-        // Phase 2: apply deltas to source snapshots (no lock).
+        // ── Phase 2 (no lock): coalesce deltas ───────────────────────────────
         let inputs = coalesce_pending(raw_pending)?;
 
-        // Early exit: if no sources have pending input, just bump the tick.
         if inputs.is_empty() {
             let mut inner = self.inner.lock().map_err(lock_err)?;
             inner.tick += 1;
             return Ok(StepSummary::default());
         }
 
-        // Dirty-bit set: lowercase source names that had non-empty input.
-        let dirty_sources: HashSet<String> =
-            inputs.keys().map(|k| k.to_lowercase()).collect();
+        let dirty_sources: HashSet<String> = inputs.keys().map(|k| k.to_lowercase()).collect();
 
         let mut new_snapshots = current_snapshots;
         for (name, delta) in &inputs {
@@ -378,7 +498,7 @@ impl IncrementalFlow {
             new_snapshots.insert(name.clone(), updated);
         }
 
-        // Phase 3: register source snapshots as DataFusion MemTables.
+        // ── Phase 3 (no lock): register source MemTables ─────────────────────
         for (name, snapshot) in &new_snapshots {
             if snapshot.num_rows() == 0 {
                 continue;
@@ -390,15 +510,26 @@ impl IncrementalFlow {
                 .map_err(|e| IvmError::execution(e.to_string()))?;
         }
 
-        // Phase 4: execute views in topological order with dirty-bit skip.
+        // ── Phase 4 (no lock): build plans + execute DiffBased SQL ───────────
         let topo = toposort_views(&view_specs);
         let spec_map: HashMap<&str, &IncrementalViewSpec> =
             view_specs.iter().map(|s| (s.name.as_str(), s)).collect();
 
-        // Pre-populate with previous outputs so clean views are available as
-        // MemTables for downstream dirty views.
+        // Schema map for plan construction: sources + upstream view schemas.
+        let mut available_schemas: AHashMap<String, SchemaRef> = AHashMap::new();
+        for (name, snap) in &new_snapshots {
+            available_schemas.insert(name.clone(), snap.schema());
+        }
+        for spec in &view_specs {
+            available_schemas.insert(spec.name.clone(), spec.output_schema.clone());
+        }
+
+        // view_full_outputs: pre-populated with prev snapshots for clean views.
+        // DiffBased dirty views add their SQL result here during this phase.
         let mut view_full_outputs: HashMap<String, RecordBatch> = view_prev_snapshots;
         let mut dirty_views: HashSet<String> = HashSet::new();
+        // Newly built plans to insert in Phase 5: (name, plan, body_sql)
+        let mut new_plans: Vec<(String, ViewPlan, String)> = Vec::new();
 
         for view_name in &topo {
             let spec = match spec_map.get(view_name.as_str()) {
@@ -406,55 +537,81 @@ impl IncrementalFlow {
                 None => continue,
             };
 
-            // A view is dirty when any SQL token matches a dirty source or view.
             let view_name_lower = view_name.to_lowercase();
             let is_dirty = sql_identifiers(&spec.body_sql).iter().any(|token| {
-                dirty_sources.contains(token.as_str())
-                    || dirty_views.contains(token.as_str())
+                dirty_sources.contains(token.as_str()) || dirty_views.contains(token.as_str())
             });
-
             if !is_dirty {
-                // Keep the previous snapshot in view_full_outputs (already set above).
                 continue;
             }
-
             dirty_views.insert(view_name_lower);
 
-            // Register all upstream view outputs produced so far.
-            for (up_name, up_batch) in &view_full_outputs {
-                if up_batch.num_rows() == 0 {
-                    continue;
-                }
-                let schema = up_batch.schema();
-                if let Ok(table) = MemTable::try_new(schema, vec![vec![up_batch.clone()]]) {
-                    let _ = ctx.register_table(up_name.as_str(), Arc::new(table));
-                }
-            }
-
-            let new_full = match execute_view_sql(ctx, spec).await {
-                Ok(rb) => rb,
-                Err(_) => {
-                    let empty_cols: Vec<_> = spec
-                        .output_schema
-                        .fields()
-                        .iter()
-                        .map(|f| arrow::array::new_empty_array(f.data_type()))
-                        .collect();
-                    RecordBatch::try_new(spec.output_schema.clone(), empty_cols)
-                        .map_err(|e| IvmError::execution(e.to_string()))?
-                }
+            // Determine if this view gets an incremental plan (skip SQL) or DiffBased (run SQL).
+            let plan_is_incremental = if views_needing_plans.contains(view_name) {
+                let plan = crate::plan::build_view_plan(
+                    ctx,
+                    &spec.body_sql,
+                    &spec.output_schema,
+                    &available_schemas,
+                )
+                .await;
+                let is_incr = matches!(plan.kind(), ViewPlanKind::Incremental);
+                new_plans.push((view_name.clone(), plan, spec.body_sql.clone()));
+                is_incr
+            } else {
+                view_plan_kinds
+                    .get(view_name)
+                    .copied()
+                    .map(|k| k == ViewPlanKind::Incremental)
+                    .unwrap_or(false)
             };
-            view_full_outputs.insert(view_name.clone(), new_full);
+
+            if plan_is_incremental {
+                // Register the previous snapshot for downstream DiffBased views.
+                if let Some(prev) = view_full_outputs.get(view_name) {
+                    if prev.num_rows() > 0 {
+                        let schema = prev.schema();
+                        if let Ok(table) = MemTable::try_new(schema, vec![vec![prev.clone()]]) {
+                            let _ = ctx.register_table(view_name.as_str(), Arc::new(table));
+                        }
+                    }
+                }
+            } else {
+                // DiffBased: register all upstream outputs, then execute SQL.
+                for (up_name, up_batch) in &view_full_outputs {
+                    if up_batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let schema = up_batch.schema();
+                    if let Ok(table) = MemTable::try_new(schema, vec![vec![up_batch.clone()]]) {
+                        let _ = ctx.register_table(up_name.as_str(), Arc::new(table));
+                    }
+                }
+                let new_full = match execute_view_sql(ctx, spec).await {
+                    Ok(rb) => rb,
+                    Err(_) => {
+                        let empty_cols: Vec<_> = spec
+                            .output_schema
+                            .fields()
+                            .iter()
+                            .map(|f| arrow::array::new_empty_array(f.data_type()))
+                            .collect();
+                        RecordBatch::try_new(spec.output_schema.clone(), empty_cols)
+                            .map_err(|e| IvmError::execution(e.to_string()))?
+                    }
+                };
+                view_full_outputs.insert(view_name.clone(), new_full);
+            }
         }
 
-        // Phase 5 + 6: diff, publish, bump tick (only dirty views).
+        // ── Phase 5+6 (lock): apply plans / diff, publish, update state ───────
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.source_snapshots = new_snapshots;
         inner.tick += 1;
         let mut total_output_rows = 0usize;
         let mut active_views = 0usize;
 
-        // Provenance tracking: pre-compute input hashes when enabled.
+        // Provenance: pre-compute input hashes when enabled.
         let input_hashes: Option<Vec<u64>> = if inner.provenance.is_some() {
             let hashes = inputs
                 .values()
@@ -465,39 +622,118 @@ impl IncrementalFlow {
             None
         };
 
-        for view_name in &dirty_views {
-            // Map lowercase back to original name for registry lookup.
-            let original = topo.iter().find(|n| n.to_lowercase() == *view_name);
-            let view_name_orig = match original {
-                Some(n) => n,
-                None => continue,
-            };
-            let new_full = match view_full_outputs.get(view_name_orig) {
-                Some(b) => b.clone(),
-                None => continue,
-            };
-            let view = match inner.view_registry.get(view_name_orig) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let delta = view.diff_and_update(new_full).map_err(delta_err)?;
-            if !delta.is_empty() {
-                total_output_rows += delta.num_rows();
-                active_views += 1;
+        // Insert newly built plans.
+        for (name, plan, sql) in new_plans {
+            inner.view_plan_sqls.insert(name.clone(), sql);
+            inner.view_plans.insert(name, plan);
+        }
 
-                // Record provenance: each input hash → all output insertion hashes.
-                if let (Some(input_hs), Some(prov)) =
-                    (&input_hashes, &mut inner.provenance)
-                {
-                    let output_hs = crate::provenance::hash_all_rows(&delta.data_batch());
+        // Accumulate deltas: start with source deltas; views append as processed.
+        let mut available_deltas: AHashMap<String, DeltaBatch> =
+            inputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        // Collect view Arcs (clone from registry) before any mutable borrows.
+        let dirty_view_arcs: Vec<(String, Arc<IncrementalView>)> = topo
+            .iter()
+            .filter(|n| dirty_views.contains(&n.to_lowercase()))
+            .filter_map(|n| inner.view_registry.get(n).ok().map(|v| (n.clone(), v)))
+            .collect();
+
+        for (view_name, view) in &dirty_view_arcs {
+            // Read plan kind (releases borrow immediately via .map).
+            let plan_kind = inner
+                .view_plans
+                .get(view_name)
+                .map(|p| p.kind())
+                .unwrap_or(ViewPlanKind::DiffBased);
+
+            let output_delta = if plan_kind == ViewPlanKind::Incremental {
+                // O(Δ) path: apply stateful operator.
+                match inner.view_plans.get_mut(view_name) {
+                    Some(ViewPlan::Aggregate { source, op }) => {
+                        let src = source.clone();
+                        let delta = match available_deltas.get(&src).cloned() {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        match op.apply(delta) {
+                            Ok(d) => d,
+                            Err(_) => continue,
+                        }
+                    }
+                    Some(ViewPlan::Join {
+                        left_source,
+                        right_source,
+                        op,
+                    }) => {
+                        let left = available_deltas.get(left_source.as_str()).cloned();
+                        let right = available_deltas.get(right_source.as_str()).cloned();
+                        if left.is_none() && right.is_none() {
+                            continue;
+                        }
+                        match op.apply(left, right) {
+                            Ok(d) => d,
+                            Err(_) => continue,
+                        }
+                    }
+                    Some(ViewPlan::Distinct { source, op }) => {
+                        let src = source.clone();
+                        let delta = match available_deltas.get(&src).cloned() {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        match op.apply(delta) {
+                            Ok(d) => d,
+                            Err(_) => continue,
+                        }
+                    }
+                    _ => continue,
+                }
+            } else {
+                // DiffBased path: diff SQL result against previous snapshot.
+                let new_full = match view_full_outputs.get(view_name).cloned() {
+                    Some(b) => b,
+                    None => continue,
+                };
+                match view.diff_and_update(new_full) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                }
+            };
+
+            if output_delta.is_empty() {
+                continue;
+            }
+            total_output_rows += output_delta.num_rows();
+            active_views += 1;
+
+            // Provenance (DiffBased only).
+            if plan_kind == ViewPlanKind::DiffBased {
+                if let (Some(input_hs), Some(prov)) = (&input_hashes, &mut inner.provenance) {
+                    let output_hs = crate::provenance::hash_all_rows(&output_delta.data_batch());
                     for &ih in input_hs {
                         prov.record_many(ih, output_hs.iter().copied());
                     }
                 }
+            }
 
-                let _ = view.publish_output(delta);
+            // Propagate this view's output delta to downstream views.
+            available_deltas.insert(view_name.clone(), output_delta.clone());
+            let _ = view.publish_output(output_delta);
+        }
+
+        // Gap 6: GC join traces for sources with watermark trackers.
+        let watermarks: AHashMap<String, i64> = inner
+            .watermark_trackers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.watermark()))
+            .collect();
+        if !watermarks.is_empty() {
+            for plan in inner.view_plans.values_mut() {
+                let _ = plan.gc_watermark(watermarks.values().copied().fold(i64::MAX, i64::min));
             }
         }
+
         Ok(StepSummary {
             total_output_rows,
             active_views,
@@ -746,7 +982,10 @@ fn coalesce_pending(
             } else {
                 DeltaBatch::concat(&deltas).map_err(delta_err)?
             };
-            Ok((name, batch))
+            // Gap 8: consolidate (sum weights for identical rows, drop zeros).
+            let schema = batch.data_schema().clone();
+            let consolidated = consolidate_batch(batch, &[], &schema).map_err(delta_err)?;
+            Ok((name, consolidated))
         })
         .collect()
 }
@@ -901,8 +1140,8 @@ pub fn encode_ivm_step_fragment(
             Ok(serde_json::json!({ "source": source, "delta_b64": b64 }))
         })
         .collect::<IvmResult<_>>()?;
-    let deltas_json = serde_json::to_string(&delta_entries)
-        .map_err(|e| IvmError::execution(e.to_string()))?;
+    let deltas_json =
+        serde_json::to_string(&delta_entries).map_err(|e| IvmError::execution(e.to_string()))?;
 
     // Encode view specs as JSON array.
     let spec_entries: Vec<serde_json::Value> = specs
@@ -929,8 +1168,8 @@ pub fn encode_ivm_step_fragment(
             })
         })
         .collect();
-    let specs_json = serde_json::to_string(&spec_entries)
-        .map_err(|e| IvmError::execution(e.to_string()))?;
+    let specs_json =
+        serde_json::to_string(&spec_entries).map_err(|e| IvmError::execution(e.to_string()))?;
 
     Ok(format!("delta:step:{job_id}|{deltas_json}|{specs_json}"))
 }

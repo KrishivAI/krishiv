@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 /// Each partition is written to `{base_dir}/{job_id}/{stage_id}/{partition}.parquet`.
 /// Lease tokens are persisted to `{partition}.lease` sidecars so zombie writers
 /// are rejected after executor restart.
+#[derive(Clone)]
 pub struct LocalDiskShuffleStore {
     base_dir: PathBuf,
     lease_tokens: LeaseMap,
@@ -173,6 +174,7 @@ impl LocalDiskShuffleStore {
         })
     }
 
+    #[cfg(test)]
     fn resolve_lease_token(&self, id: &PartitionId, incoming: u64) -> ShuffleResult<u64> {
         let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
         let memory = shuffle_write_lock(&self.lease_tokens)?.get(&key).copied();
@@ -181,6 +183,67 @@ impl LocalDiskShuffleStore {
         let next = crate::lease_persistence::enforce_monotonic_lease(current, incoming)?;
         shuffle_write_lock(&self.lease_tokens)?.insert(key, next);
         self.persist_lease(id, next)?;
+        Ok(next)
+    }
+
+    /// Async variant of `resolve_lease_token` that offloads blocking filesystem
+    /// operations (`std::fs::read`, `create_dir_all`, `write`) to
+    /// `spawn_blocking` so the async executor thread is not stalled.
+    ///
+    /// The in-memory lease token map is still updated synchronously under the
+    /// `lease_tokens` lock; only the FS read/persist happens in the blocking
+    /// pool. This satisfies the AGENTS.md rule: "do not hide blocking filesystem
+    /// or database work inside async tasks."
+    async fn resolve_lease_token_async(
+        &self,
+        id: &PartitionId,
+        incoming: u64,
+    ) -> ShuffleResult<u64> {
+        let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+
+        // Check the in-memory map for the current token.
+        let memory = shuffle_write_lock(&self.lease_tokens)?.get(&key).copied();
+
+        // Fast path: if the in-memory map already has a token, check
+        // monotonicity without an FS read. A stale incoming token is rejected
+        // here (same as enforce_monotonic_lease would do).
+        if let Some(mem_token) = memory {
+            if incoming < mem_token {
+                return Err(crate::ShuffleError::StaleLeaseToken {
+                    expected: mem_token,
+                    actual: incoming,
+                });
+            }
+        }
+
+        // Phase 1: read persisted lease (if needed) in spawn_blocking.
+        let persisted: Option<u64> = if memory.is_some() {
+            None
+        } else {
+            let id_clone = id.clone();
+            let this = self.clone();
+            let result = tokio::task::spawn_blocking(move || this.load_persisted_lease(&id_clone))
+                .await
+                .map_err(|e| io_err(format!("lease read task panicked: {e}")))?;
+            result?
+        };
+
+        let current = memory.or(persisted);
+        let next = crate::lease_persistence::enforce_monotonic_lease(current, incoming)?;
+
+        // Update in-memory map.
+        shuffle_write_lock(&self.lease_tokens)?.insert(key.clone(), next);
+
+        // Phase 2: persist the new lease token in spawn_blocking.
+        // Skip the FS write if the token is unchanged.
+        if Some(next) != current {
+            let id_clone = id.clone();
+            let this = self.clone();
+            tokio::task::spawn_blocking(move || this.persist_lease(&id_clone, next))
+                .await
+                .map_err(|e| io_err(format!("lease persist task panicked: {e}")))??;
+        }
+
         Ok(next)
     }
 }
@@ -193,7 +256,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
     ) -> ShuffleResult<()> {
         crate::validate_safe_id(&id.job_id, "job_id")?;
         crate::validate_safe_id(&id.stage_id, "stage_id")?;
-        let _ = self.resolve_lease_token(&id, lease_token)?;
+        self.resolve_lease_token_async(&id, lease_token).await?;
         Ok(())
     }
 
@@ -223,8 +286,10 @@ impl ShuffleStore for LocalDiskShuffleStore {
         // writer has meanwhile advanced the token past ours, we discard the temp.
         //
         // Phase 1: validate initial token and advance it (persisted + in-memory).
+        // Use the async variant so blocking FS operations (lease read/persist)
+        // are offloaded to spawn_blocking.
         {
-            let _ = self.resolve_lease_token(&partition.id, lease_token)?;
+            let _ = self.resolve_lease_token_async(&partition.id, lease_token).await?;
         }
 
         let final_path = self.partition_path(&partition.id)?;

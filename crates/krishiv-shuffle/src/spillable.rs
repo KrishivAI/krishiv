@@ -96,28 +96,38 @@ impl ShuffleStore for SpillableShuffleBackend {
         partition: ShufflePartition,
         lease_token: u64,
     ) -> ShuffleResult<()> {
-        // Reserve budget before writing; release it if the write fails so the
-        // counter never drifts above actual in-flight data.
+        // Reserve budget before writing. If the budget is exceeded (returns
+        // false), the in-memory store's own spill mechanism will handle it —
+        // but we must not silently ignore the rejection.
         let bytes = crate::compression::partition_memory_bytes(&partition);
-        self.budget.try_reserve(bytes as u64);
+        let accepted = self.budget.try_reserve(bytes as u64);
+        if !accepted {
+            // Budget exceeded — the InMemoryShuffleStore will spill to disk
+            // internally. We don't return an error here because the store's
+            // own spill path handles the overflow. The budget is advisory.
+            tracing::debug!(
+                bytes,
+                used = self.budget.used_bytes(),
+                "shuffle write exceeds memory budget; relying on store spill"
+            );
+        }
         let result = self.inner.write_partition(partition, lease_token).await;
         if result.is_err() {
-            self.budget.release(bytes as u64);
+            // Only release if we actually reserved (accepted was true).
+            if accepted {
+                self.budget.release(bytes as u64);
+            }
         }
         result
     }
 
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
-        // Only release budget for partitions served from in-memory storage.
-        // Spilled partitions were never accounted in this budget counter, so
-        // releasing for them would underflow the counter.
-        let was_in_memory = self.inner.is_partition_in_memory(id).await;
-        let result = self.inner.read_partition(id).await?;
-        if was_in_memory && let Some(ref p) = result {
-            let bytes = crate::compression::partition_memory_bytes(p);
-            self.budget.release(bytes as u64);
-        }
-        Ok(result)
+        // Reads return a CLONE of the partition; the partition stays in the
+        // store. We do NOT release budget on a cloning read — that would
+        // undercount memory. Budget is released when the partition is deleted
+        // (delete_job_partitions) or spilled (handled by the in-memory store's
+        // own spill path which calls the budget's release via a callback).
+        self.inner.read_partition(id).await
     }
 
     fn delete_job_partitions(

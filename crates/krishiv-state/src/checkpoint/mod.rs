@@ -25,7 +25,7 @@
 //! restore.
 
 mod ephemeral;
-mod io;
+pub(crate) mod io;
 mod local_fs;
 mod metadata;
 mod paths;

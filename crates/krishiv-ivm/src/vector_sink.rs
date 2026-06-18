@@ -48,8 +48,7 @@ pub type VectorFuture<'a> = Pin<Box<dyn std::future::Future<Output = IvmResult<(
 /// idempotent upserts / deletes.
 pub trait IvmVectorSink: Send + Sync + 'static {
     /// Upsert `ids[i]` → `vectors[i]` for all rows with positive weight.
-    fn upsert_batch<'a>(&'a self, ids: &'a [String], vectors: &'a [Vec<f32>])
-        -> VectorFuture<'a>;
+    fn upsert_batch<'a>(&'a self, ids: &'a [String], vectors: &'a [Vec<f32>]) -> VectorFuture<'a>;
     /// Delete the points identified by `ids` (negative-weight rows).
     fn delete_batch<'a>(&'a self, ids: &'a [String]) -> VectorFuture<'a>;
 }
@@ -107,8 +106,7 @@ async fn apply_delta_to_sink(
     id_col: &str,
     vec_col: &str,
 ) -> IvmResult<()> {
-    let (upsert_ids, upsert_vecs, delete_ids) =
-        extract_vector_rows(delta, id_col, vec_col)?;
+    let (upsert_ids, upsert_vecs, delete_ids) = extract_vector_rows(delta, id_col, vec_col)?;
     if !upsert_ids.is_empty() {
         sink.upsert_batch(&upsert_ids, &upsert_vecs).await?;
     }
@@ -130,7 +128,9 @@ fn extract_vector_rows(
     let weights = delta.weights();
 
     let id_idx = data.schema().index_of(id_col).map_err(|_| {
-        IvmError::execution(format!("vector view: id column '{id_col}' not found in view output"))
+        IvmError::execution(format!(
+            "vector view: id column '{id_col}' not found in view output"
+        ))
     })?;
     let vec_idx = data.schema().index_of(vec_col).map_err(|_| {
         IvmError::execution(format!(
@@ -206,9 +206,7 @@ fn extract_f32_list_at(arr: &dyn Array, row: usize) -> IvmResult<Vec<f32>> {
         let f32s = value
             .as_any()
             .downcast_ref::<Float32Array>()
-            .ok_or_else(|| {
-                IvmError::execution("vector view: List element type must be Float32")
-            })?;
+            .ok_or_else(|| IvmError::execution("vector view: List element type must be Float32"))?;
         return Ok((0..f32s.len()).map(|i| f32s.value(i)).collect());
     }
     Err(IvmError::execution(format!(

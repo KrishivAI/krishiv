@@ -51,11 +51,7 @@ impl ProvenanceIndex {
     }
 
     /// Record that `input_hash` produced all hashes in `output_hashes`.
-    pub fn record_many(
-        &mut self,
-        input_hash: u64,
-        output_hashes: impl IntoIterator<Item = u64>,
-    ) {
+    pub fn record_many(&mut self, input_hash: u64, output_hashes: impl IntoIterator<Item = u64>) {
         let set = self.input_to_outputs.entry(input_hash).or_default();
         set.extend(output_hashes);
     }
@@ -101,7 +97,9 @@ pub fn hash_batch_row(batch: &RecordBatch, row: usize) -> u64 {
 
 /// Hash all rows in `batch` and return a `Vec<u64>` of row hashes.
 pub fn hash_all_rows(batch: &RecordBatch) -> Vec<u64> {
-    (0..batch.num_rows()).map(|row| hash_row(batch, row)).collect()
+    (0..batch.num_rows())
+        .map(|row| hash_row(batch, row))
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

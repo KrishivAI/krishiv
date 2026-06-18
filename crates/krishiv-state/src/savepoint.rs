@@ -15,9 +15,11 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::checkpoint::{CheckpointStorage, io as checkpoint_io};
 use crate::error::{StateError, StateResult};
 
 /// Current savepoint metadata format written by the engine.
@@ -84,14 +86,32 @@ pub struct SavepointCoordinator {
     job_id: String,
     /// In-memory index: savepoint_id → metadata.
     index: HashMap<String, SavepointMeta>,
+    /// Optional durable storage handle. When present, `delete_savepoint`
+    /// also removes the durable `savepoints/{epoch}/` copy from storage.
+    storage: Option<Arc<dyn CheckpointStorage>>,
 }
 
 impl SavepointCoordinator {
-    /// Create a new coordinator for `job_id`.
+    /// Create a new coordinator for `job_id` with no durable storage.
+    /// Use [`Self::with_storage`] to enable durable delete.
     pub fn new(job_id: impl Into<String>) -> Self {
         Self {
             job_id: job_id.into(),
             index: HashMap::new(),
+            storage: None,
+        }
+    }
+
+    /// Create a new coordinator with a durable storage handle.
+    /// When set, `delete_savepoint` also removes the durable copy.
+    pub fn with_storage(
+        job_id: impl Into<String>,
+        storage: Arc<dyn CheckpointStorage>,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            index: HashMap::new(),
+            storage: Some(storage),
         }
     }
 
@@ -138,16 +158,39 @@ impl SavepointCoordinator {
         self.index.get(savepoint_id)
     }
 
-    /// Delete a savepoint from the index.
+    /// Delete a savepoint from the index and from durable storage (if a
+    /// storage handle was provided via [`Self::with_storage`]).
     ///
-    /// Returns an error if the savepoint does not exist.
+    /// Returns the removed metadata, or an error if the savepoint does not
+    /// exist in the in-memory index.
     pub fn delete_savepoint(&mut self, savepoint_id: &str) -> StateResult<SavepointMeta> {
-        self.index
+        let meta = self
+            .index
             .remove(savepoint_id)
             .ok_or_else(|| StateError::BackendUnavailable {
                 message: format!("savepoint '{savepoint_id}' not found"),
                 source: None,
-            })
+            })?;
+
+        // Best-effort durable delete: if storage is configured, remove the
+        // `savepoints/{epoch}/` directory. Failures are logged but do not
+        // undo the in-memory removal (the user explicitly requested deletion).
+        if let Some(storage) = &self.storage {
+            if let Err(e) = checkpoint_io::delete_savepoint(
+                storage.as_ref(),
+                &self.job_id,
+                meta.epoch,
+            ) {
+                tracing::warn!(
+                    savepoint_id = savepoint_id,
+                    epoch = meta.epoch,
+                    error = %e,
+                    "failed to delete durable savepoint copy; in-memory index entry removed"
+                );
+            }
+        }
+
+        Ok(meta)
     }
 
     /// Serialise all savepoints as JSON (for durable persistence).

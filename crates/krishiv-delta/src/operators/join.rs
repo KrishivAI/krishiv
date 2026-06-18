@@ -91,6 +91,15 @@ impl IncrementalJoinOp {
         &self.output_schema
     }
 
+    /// GC both traces: drop entries with timestamp < `watermark_ms`.
+    ///
+    /// Returns the total number of rows removed across both traces.
+    pub fn gc_traces(&mut self, watermark_ms: i64) -> crate::error::DeltaResult<usize> {
+        let removed_left = self.left_trace.gc_below_watermark(watermark_ms)?;
+        let removed_right = self.right_trace.gc_below_watermark(watermark_ms)?;
+        Ok(removed_left + removed_right)
+    }
+
     /// Apply one tick of the bilinear join.
     ///
     /// * `delta_left` — changes to the left relation this tick (may be empty)

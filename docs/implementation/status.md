@@ -1,5 +1,51 @@
 # Krishiv Implementation Status
 
+## 2026-06-18 (session 2) — IVM Feldera/CocoIndex gap implementation
+
+### Work completed
+
+**[Gap 1+2] O(Δ) execution via `IncrementalPlan`**
+- New `crates/krishiv-ivm/src/plan.rs`: `ViewPlan` enum (`Aggregate`, `Join`, `Distinct`, `DiffBased`).
+- `build_view_plan()` parses SQL via DataFusion `LogicalPlan` and pattern-matches:
+  - `Aggregate` → `IncrementalAggOp` (bilinear stateful, preserves group state across ticks)
+  - `Join(Inner)` → `IncrementalJoinOp` (bilinear probe: `ΔA ⋈ B_trace + A_trace ⋈ ΔB`)
+  - `Distinct` → `IncrementalDistinctOp` (threshold tracking)
+  - Everything else → `ViewPlan::DiffBased` (safe fallback)
+- `step_datafusion_with_ctx` restructured: Phase 4 builds/caches plans; Phase 5+6 dispatches
+  via `ViewPlan` for O(Δ) or diff-based execution. `available_deltas` propagates view output
+  deltas to downstream incremental views in topological order.
+
+**[Gap 3] Plan kind cached; view re-registration invalidates plan (SQL changed → cleared)**
+
+**[Gap 4] Behavior-version trace invalidation (Gap 7 in earlier numbering)**
+- `register_view()` clears cached `ViewPlan` when `body_sql` changes.
+
+**[Gap 5] CoalescingMap consolidation (Gap 8 in earlier numbering)**
+- `coalesce_pending()` calls `consolidate_batch(batch, &[], &schema)` after concat:
+  collapses +1/-1 pairs for identical rows, normalizes Z-set before SQL or operators see input.
+
+**[Gap 6] Source ordinal skip-if-unchanged**
+- `feed_source_with_ordinal(source, batch, ordinal: Vec<u8>)`: skips feed if ordinal unchanged.
+
+**[Gap 7] LATENESS / Watermark GC**
+- `register_lateness(source_name, LatenessSpec)`: installs a `WatermarkTracker` per source.
+- `watermark_for(source_name)`: returns current watermark.
+- Post-step GC: calls `ViewPlan::gc_watermark()` on all view plans using per-source watermarks.
+- New `IncrementalJoinOp::gc_traces(watermark_ms)` GCs both `left_trace` and `right_trace`.
+
+**[Gap 8] CDC → DeltaBatch bridge**
+- `feed_cdc_source(source, schema, before, after)`: maps INSERT/UPDATE/DELETE CDC events to
+  `DeltaBatch::from_inserts`, `from_deletes`, or `from_update`.
+
+### Validation
+
+```
+cargo check --workspace   # 0 errors
+cargo test -p krishiv-ivm -p krishiv-delta --lib  # 61 tests pass
+```
+
+---
+
 ## 2026-06-18 — IVM gap closure: all 9 gaps resolved, pyo3-arrow removed
 
 ### Work completed
