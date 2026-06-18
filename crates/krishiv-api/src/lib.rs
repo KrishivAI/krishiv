@@ -61,7 +61,8 @@ pub use krishiv_connectors::{
     SortField, WriteDistribution, WriteMode,
 };
 pub use pipeline::{
-    CdcChange, Egress, Ingest, Pipeline, PipelineBuilder, PipelineMode, RunPolicy, ViewDef,
+    CdcChange, Egress, Expectation, Ingest, OnViolation, Pipeline, PipelineBuilder, PipelineMode,
+    RunPolicy, ViewDef,
 };
 pub use prepared::PreparedStatement;
 pub use process::{apply_async_io, apply_process_function};

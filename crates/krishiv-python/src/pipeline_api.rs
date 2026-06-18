@@ -31,6 +31,7 @@ fn rt_err(e: impl std::fmt::Display) -> PyErr {
 /// variant carries a `Box<dyn DynSource>` which is not `Sync` (and pyo3 requires
 /// the pyclass to be `Sync`). The Python surface only needs Memory/Cdc; the
 /// conversion to `Ingest` happens at `run` time.
+#[derive(Clone)]
 enum PyIngest {
     Memory(Vec<RecordBatch>),
     Cdc(Vec<CdcChange>),
@@ -43,6 +44,15 @@ impl From<PyIngest> for Ingest {
             PyIngest::Cdc(c) => Ingest::Cdc(c),
         }
     }
+}
+
+/// One data-quality expectation (view, name, predicate, fail-on-violation).
+#[derive(Clone)]
+struct PyExpectation {
+    view: String,
+    name: String,
+    predicate: String,
+    fail: bool,
 }
 
 /// A handle to an in-memory pipeline sink; read collected batches after `run`.
@@ -73,6 +83,15 @@ impl PyMemorySink {
         Ok(self.inner.lock().map_err(|_| rt_err("poisoned"))?.len())
     }
 
+    /// Whether no batches have been collected yet.
+    pub fn is_empty(&self) -> PyResult<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| rt_err("poisoned"))?
+            .is_empty())
+    }
+
     pub fn __repr__(&self) -> String {
         let n = self.inner.lock().map(|g| g.len()).unwrap_or(0);
         format!("MemorySink(batches={n})")
@@ -92,6 +111,7 @@ pub struct PyPipeline {
     sources: Vec<(String, PyIngest)>,
     views: Vec<(String, String, bool)>,
     sinks: Vec<(String, Arc<Mutex<Vec<RecordBatch>>>)>,
+    expectations: Vec<PyExpectation>,
 }
 
 impl PyPipeline {
@@ -103,7 +123,41 @@ impl PyPipeline {
             sources: Vec::new(),
             views: Vec::new(),
             sinks: Vec::new(),
+            expectations: Vec::new(),
         }
+    }
+
+    /// Assemble a Rust pipeline builder from the accumulated state.
+    fn to_builder(
+        &self,
+        sources: Vec<(String, PyIngest)>,
+        views: Vec<(String, String, bool)>,
+        sinks: Vec<(String, Arc<Mutex<Vec<RecordBatch>>>)>,
+        expectations: Vec<PyExpectation>,
+    ) -> krishiv_api::PipelineBuilder {
+        use krishiv_api::OnViolation;
+        let mut builder = self.session.pipeline(&self.name);
+        if let Some(m) = self.mode {
+            builder = builder.mode(m);
+        }
+        for (name, ingest) in sources {
+            builder = builder.source(name, ingest.into());
+        }
+        for (name, sql, materialized) in views {
+            builder = builder.view(name, sql, materialized);
+        }
+        for (view, handle) in sinks {
+            builder = builder.sink(view, Egress::Memory(handle));
+        }
+        for e in expectations {
+            let on = if e.fail {
+                OnViolation::Fail
+            } else {
+                OnViolation::Drop
+            };
+            builder = builder.expect(e.view, e.name, e.predicate, on);
+        }
+        builder
     }
 }
 
@@ -154,6 +208,51 @@ impl PyPipeline {
         Ok(())
     }
 
+    /// Add a data-quality expectation on a view (Spark SDP / DLT parity).
+    ///
+    /// `predicate` is a SQL boolean expression over the view's columns. Rows for
+    /// which it is not true are violations. `on_violation` ∈ {"drop", "fail"}:
+    /// "drop" filters violating rows before the sink; "fail" errors the run.
+    #[pyo3(signature = (view, name, predicate, on_violation="drop".to_string()))]
+    pub fn expect(
+        &mut self,
+        view: String,
+        name: String,
+        predicate: String,
+        on_violation: String,
+    ) -> PyResult<()> {
+        let fail = match on_violation.to_lowercase().as_str() {
+            "fail" => true,
+            "drop" => false,
+            other => {
+                return Err(rt_err(format!(
+                    "unknown on_violation '{other}'; use drop|fail"
+                )));
+            }
+        };
+        self.expectations.push(PyExpectation {
+            view,
+            name,
+            predicate,
+            fail,
+        });
+        Ok(())
+    }
+
+    /// Validate the pipeline without executing it (dry run). Raises on the first
+    /// problem (undefined sink view, schema error, dependency cycle).
+    pub fn validate(&self) -> PyResult<()> {
+        let builder = self.to_builder(
+            self.sources.clone(),
+            self.views.clone(),
+            self.sinks.clone(),
+            self.expectations.clone(),
+        );
+        crate::RUNTIME
+            .block_on(builder.build().validate())
+            .map_err(rt_err)
+    }
+
     /// Build and run the pipeline.
     ///
     /// `advance` ∈ {"once", "on_change"}; `every_rows` coalesces input by row
@@ -174,31 +273,20 @@ impl PyPipeline {
         let sources = std::mem::take(&mut self.sources);
         let views = std::mem::take(&mut self.views);
         let sinks = std::mem::take(&mut self.sinks);
+        let expectations = std::mem::take(&mut self.expectations);
 
-        let mut builder = self.session.pipeline(&self.name);
-        if let Some(m) = self.mode {
-            builder = builder.mode(m);
-        }
-        for (name, ingest) in sources {
-            builder = builder.source(name, ingest.into());
-        }
-        for (name, sql, materialized) in views {
-            builder = builder.view(name, sql, materialized);
-        }
-        for (view, handle) in sinks {
-            builder = builder.sink(view, Egress::Memory(handle));
-        }
-
+        let builder = self.to_builder(sources, views, sinks, expectations);
         crate::RUNTIME.block_on(builder.run(policy)).map_err(rt_err)
     }
 
     pub fn __repr__(&self) -> String {
         format!(
-            "Pipeline(name='{}', sources={}, views={}, sinks={})",
+            "Pipeline(name='{}', sources={}, views={}, sinks={}, expectations={})",
             self.name,
             self.sources.len(),
             self.views.len(),
-            self.sinks.len()
+            self.sinks.len(),
+            self.expectations.len(),
         )
     }
 }
@@ -253,5 +341,44 @@ mod tests {
             .expect("SUM is Float64")
             .value(0);
         assert_eq!(total, 150.0);
+    }
+
+    #[test]
+    fn py_pipeline_expectation_drop_and_validate() {
+        let session = krishiv_api::Session::builder().build().unwrap();
+        let mut pl = PyPipeline::new(session, "dq".to_string());
+        // amounts via the `amount` column of three single-row order batches.
+        pl.source_cdc(
+            "raw".to_string(),
+            vec![
+                (None, Some(order(1, 10))),
+                (None, Some(order(2, -5))),
+                (None, Some(order(3, 20))),
+            ],
+        );
+        pl.view(
+            "clean".to_string(),
+            "SELECT amount FROM raw".to_string(),
+            true,
+        );
+        pl.expect(
+            "clean".to_string(),
+            "positive".to_string(),
+            "amount > 0".to_string(),
+            "drop".to_string(),
+        )
+        .unwrap();
+        let sink = pl.sink_memory("clean".to_string());
+
+        // validate() must pass for this well-formed pipeline.
+        pl.validate().unwrap();
+
+        pl.run("once".to_string(), None).unwrap();
+        let out = sink.collect().unwrap();
+        let total_rows: usize = out.iter().map(|b| b.record_batch().num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "the -5 row should be dropped by the expectation"
+        );
     }
 }

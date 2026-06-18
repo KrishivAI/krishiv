@@ -1622,3 +1622,112 @@ fn sql_pipeline_parquet_source_and_sink() {
         .value(0);
     assert_eq!(total, 150.0);
 }
+
+// ── SDP parity: expectations + validation ───────────────────────────────────
+
+fn amounts(vals: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vals.to_vec()))],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pipeline_expectation_drop_filters_violating_rows() {
+    use crate::{OnViolation, PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // passthrough view of amounts; expect amount > 0, drop violations (-5).
+    session
+        .pipeline("dq")
+        .source_memory("raw", vec![amounts(&[10, -5, 20])])
+        .view("clean", "SELECT amount FROM raw", true)
+        .expect("clean", "positive_amount", "amount > 0", OnViolation::Drop)
+        .sink_memory("clean", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+
+    let out = sink.lock().unwrap();
+    let combined = arrow::compute::concat_batches(&out[0].schema(), out.iter()).unwrap();
+    assert_eq!(combined.num_rows(), 2, "the -5 row should be dropped");
+}
+
+#[tokio::test]
+async fn pipeline_expectation_fail_errors_on_violation() {
+    use crate::{OnViolation, PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    let err = session
+        .pipeline("dq")
+        .source_memory("raw", vec![amounts(&[10, -5])])
+        .view("clean", "SELECT amount FROM raw", true)
+        .expect("clean", "positive_amount", "amount > 0", OnViolation::Fail)
+        .sink_memory("clean", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .expect_err("FAIL expectation must error on a violation");
+    assert!(
+        err.to_string().contains("positive_amount"),
+        "error should name the expectation: {err}"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_validate_detects_undefined_sink_view() {
+    use crate::PipelineMode;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // Sink references "missing" but only "clean" is declared.
+    let pipeline = session
+        .pipeline("dq")
+        .source_memory("raw", vec![amounts(&[1])])
+        .view("clean", "SELECT amount FROM raw", true)
+        .sink_memory("missing", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .build();
+
+    let err = pipeline.validate().await.expect_err("validation must fail");
+    assert!(
+        err.to_string().contains("undefined view 'missing'"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_validate_passes_for_well_formed_pipeline() {
+    use crate::PipelineMode;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    let pipeline = session
+        .pipeline("dq")
+        .source_memory("raw", vec![amounts(&[1, 2, 3])])
+        .view("total", "SELECT SUM(amount) AS s FROM raw", true)
+        .sink_memory("total", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .build();
+
+    pipeline
+        .validate()
+        .await
+        .expect("well-formed pipeline validates");
+}

@@ -58,6 +58,26 @@ pub struct ViewDef {
     pub materialized: bool,
 }
 
+/// What to do when a row violates an [`Expectation`] (Spark SDP / DLT parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnViolation {
+    /// Drop violating rows from the view's output before it reaches the sink.
+    Drop,
+    /// Fail the pipeline run if any row violates the predicate.
+    Fail,
+}
+
+/// A data-quality constraint on a view's output: rows for which `predicate`
+/// is not true are violations.
+#[derive(Clone)]
+pub struct Expectation {
+    pub view: String,
+    pub name: String,
+    /// A SQL boolean expression over the view's output columns.
+    pub predicate: String,
+    pub on_violation: OnViolation,
+}
+
 /// A fully-built declarative pipeline, ready to [`run`](Pipeline::run).
 pub struct Pipeline {
     session: Session,
@@ -66,6 +86,7 @@ pub struct Pipeline {
     sources: Vec<(String, Ingest)>,
     views: Vec<ViewDef>,
     sinks: Vec<(String, Egress)>,
+    expectations: Vec<Expectation>,
 }
 
 /// Builder returned by [`Session::pipeline`](crate::Session::pipeline).
@@ -76,6 +97,7 @@ pub struct PipelineBuilder {
     sources: Vec<(String, Ingest)>,
     views: Vec<ViewDef>,
     sinks: Vec<(String, Egress)>,
+    expectations: Vec<Expectation>,
 }
 
 impl PipelineBuilder {
@@ -87,6 +109,7 @@ impl PipelineBuilder {
             sources: Vec::new(),
             views: Vec::new(),
             sinks: Vec::new(),
+            expectations: Vec::new(),
         }
     }
 
@@ -146,6 +169,27 @@ impl PipelineBuilder {
         self.sink(view, Egress::Memory(handle))
     }
 
+    /// Add a data-quality expectation on a view's output (Spark SDP / DLT parity).
+    ///
+    /// `predicate` is a SQL boolean expression over the view's columns. Rows for
+    /// which it is not true are violations: with [`OnViolation::Drop`] they are
+    /// filtered out before the sink; with [`OnViolation::Fail`] the run errors.
+    pub fn expect(
+        mut self,
+        view: impl Into<String>,
+        name: impl Into<String>,
+        predicate: impl Into<String>,
+        on_violation: OnViolation,
+    ) -> Self {
+        self.expectations.push(Expectation {
+            view: view.into(),
+            name: name.into(),
+            predicate: predicate.into(),
+            on_violation,
+        });
+        self
+    }
+
     /// Finalize the builder into a [`Pipeline`], inferring the mode if unset.
     pub fn build(self) -> Pipeline {
         let mode = self.mode.unwrap_or_else(|| infer_mode(&self.sources));
@@ -156,6 +200,7 @@ impl PipelineBuilder {
             sources: self.sources,
             views: self.views,
             sinks: self.sinks,
+            expectations: self.expectations,
         }
     }
 
@@ -174,6 +219,19 @@ impl Pipeline {
     /// The resolved execution mode.
     pub fn mode(&self) -> PipelineMode {
         self.mode
+    }
+
+    /// Validate the pipeline without executing it (a "dry run", à la Spark SDP).
+    ///
+    /// Checks that every sink references a declared view, that each view's SQL
+    /// is analyzable against the known source/upstream-view schemas, that
+    /// connector kinds are supported, and that the view dependency graph has no
+    /// cycles. Returns a descriptive error on the first problem found.
+    ///
+    /// Connector source schemas are not probed (that would read data), so views
+    /// over connector sources are checked structurally only.
+    pub async fn validate(&self) -> Result<()> {
+        driver::validate(&self.sources, &self.views, &self.sinks, &self.expectations).await
     }
 
     /// Run the pipeline to its mode's natural completion / advance policy.

@@ -14,7 +14,7 @@ use datafusion::prelude::SessionContext;
 use krishiv_delta::DeltaBatch;
 use krishiv_ivm::IncrementalViewSpec;
 
-use super::{Egress, Ingest, Pipeline};
+use super::{Egress, Expectation, Ingest, OnViolation, Pipeline, ViewDef};
 use crate::compute::FeedableJob;
 use crate::{IvmJob, KrishivError, Result};
 
@@ -55,6 +55,7 @@ pub(super) async fn run_incremental(pipeline: Pipeline, policy: RunPolicy) -> Re
         sources,
         views,
         sinks,
+        expectations,
         ..
     } = pipeline;
 
@@ -120,8 +121,8 @@ pub(super) async fn run_incremental(pipeline: Pipeline, policy: RunPolicy) -> Re
     // 4. Final flush step.
     job.step().await?;
 
-    // 5. Write each view's current snapshot to its sinks.
-    write_snapshots(&job, sinks).await
+    // 5. Write each view's current snapshot to its sinks (applying expectations).
+    write_snapshots(&job, sinks, &expectations).await
 }
 
 /// Drain a bounded connector source to in-memory batches, replacing any
@@ -158,9 +159,14 @@ async fn maybe_step(job: &IvmJob, policy: RunPolicy, rows_since_step: &mut usize
     Ok(())
 }
 
-async fn write_snapshots(job: &IvmJob, sinks: Vec<(String, Egress)>) -> Result<()> {
+async fn write_snapshots(
+    job: &IvmJob,
+    sinks: Vec<(String, Egress)>,
+    expectations: &[Expectation],
+) -> Result<()> {
     for (view, mut egress) in sinks {
         if let Some(snapshot) = job.snapshot(&view).await? {
+            let snapshot = apply_expectations(&view, snapshot, expectations).await?;
             if snapshot.num_rows() > 0 {
                 egress.write(snapshot).await?;
             }
@@ -170,6 +176,72 @@ async fn write_snapshots(job: &IvmJob, sinks: Vec<(String, Egress)>) -> Result<(
     Ok(())
 }
 
+/// Apply every expectation declared on `view` to its output `batch`.
+///
+/// `Drop` filters out rows where the predicate is not true; `Fail` errors if any
+/// row's predicate is explicitly false. Predicates are evaluated with DataFusion.
+async fn apply_expectations(
+    view: &str,
+    batch: RecordBatch,
+    expectations: &[Expectation],
+) -> Result<RecordBatch> {
+    let mut current = batch;
+    for exp in expectations.iter().filter(|e| e.view == view) {
+        if current.num_rows() == 0 {
+            continue;
+        }
+        let ctx = SessionContext::new();
+        let schema = current.schema();
+        let mt = MemTable::try_new(schema.clone(), vec![vec![current.clone()]]).map_err(rt)?;
+        ctx.register_table("__expect", Arc::new(mt)).map_err(rt)?;
+
+        match exp.on_violation {
+            OnViolation::Fail => {
+                let bad = ctx
+                    .sql(&format!(
+                        "SELECT COUNT(*) AS n FROM __expect WHERE NOT ({})",
+                        exp.predicate
+                    ))
+                    .await
+                    .map_err(rt)?
+                    .collect()
+                    .await
+                    .map_err(rt)?;
+                let n = bad
+                    .first()
+                    .and_then(|b| {
+                        b.column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                    })
+                    .map(|a| a.value(0))
+                    .unwrap_or(0);
+                if n > 0 {
+                    return Err(rt(format!(
+                        "expectation '{}' on view '{view}' failed: {n} row(s) violate `{}`",
+                        exp.name, exp.predicate
+                    )));
+                }
+            }
+            OnViolation::Drop => {
+                let kept = ctx
+                    .sql(&format!("SELECT * FROM __expect WHERE ({})", exp.predicate))
+                    .await
+                    .map_err(rt)?
+                    .collect()
+                    .await
+                    .map_err(rt)?;
+                current = if kept.is_empty() {
+                    RecordBatch::new_empty(schema)
+                } else {
+                    arrow::compute::concat_batches(&kept[0].schema(), &kept).map_err(rt)?
+                };
+            }
+        }
+    }
+    Ok(current)
+}
+
 // ── Batch path (self-contained DataFusion execution) ──────────────────────────
 
 pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
@@ -177,6 +249,7 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
         sources,
         views,
         sinks,
+        expectations,
         ..
     } = pipeline;
     let ctx = SessionContext::new();
@@ -214,11 +287,21 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
         outputs.insert(v.name.clone(), out);
     }
 
-    // Write each view's result to its sinks.
+    // Write each view's result to its sinks (applying expectations).
     for (view, mut egress) in sinks {
         if let Some(batches) = outputs.get(&view) {
-            for b in batches {
-                egress.write(b.clone()).await?;
+            let schema = batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
+            let combined = if batches.is_empty() {
+                RecordBatch::new_empty(schema)
+            } else {
+                arrow::compute::concat_batches(&schema, batches).map_err(rt)?
+            };
+            let checked = apply_expectations(&view, combined, &expectations).await?;
+            if checked.num_rows() > 0 {
+                egress.write(checked).await?;
             }
             egress.flush().await?;
         }
@@ -264,4 +347,122 @@ async fn infer_view_schema(available: &HashMap<String, SchemaRef>, sql: &str) ->
     let probe = format!("SELECT * FROM ({sql}) AS __pipeline_probe__ LIMIT 0");
     let df = ctx.sql(&probe).await.map_err(rt)?;
     Ok(Arc::new(df.schema().as_arrow().clone()))
+}
+
+// ── Validation (dry-run) ───────────────────────────────────────────────────────
+
+/// Validate a pipeline plan without executing it (see [`Pipeline::validate`]).
+pub(super) async fn validate(
+    sources: &[(String, Ingest)],
+    views: &[ViewDef],
+    sinks: &[(String, Egress)],
+    expectations: &[Expectation],
+) -> Result<()> {
+    use std::collections::HashSet;
+
+    let view_names: HashSet<&str> = views.iter().map(|v| v.name.as_str()).collect();
+
+    // 1. Sinks and expectations must reference declared views.
+    for (view, _) in sinks {
+        if !view_names.contains(view.as_str()) {
+            return Err(rt(format!("sink references undefined view '{view}'")));
+        }
+    }
+    for e in expectations {
+        if !view_names.contains(e.view.as_str()) {
+            return Err(rt(format!(
+                "expectation '{}' references undefined view '{}'",
+                e.name, e.view
+            )));
+        }
+    }
+
+    // 2. No cycles in the view dependency graph.
+    detect_view_cycles(views, &view_names)?;
+
+    // 3. Schema inference for views over fully-known (Memory/Cdc) sources.
+    let mut schemas: HashMap<String, SchemaRef> = HashMap::new();
+    let mut connector_sources: HashSet<&str> = HashSet::new();
+    for (name, ingest) in sources {
+        match ingest_schema(ingest) {
+            Some(s) => {
+                schemas.insert(name.clone(), s);
+            }
+            None => {
+                connector_sources.insert(name.as_str());
+            }
+        }
+    }
+    for v in views {
+        // Skip views that reference a connector source — its schema is unknown
+        // until run time, so we can only check such views structurally.
+        let refs = referenced_names(&v.sql);
+        if refs.iter().any(|r| connector_sources.contains(r.as_str())) {
+            continue;
+        }
+        let out = infer_view_schema(&schemas, &v.sql)
+            .await
+            .map_err(|e| rt(format!("view '{}' failed validation: {e}", v.name)))?;
+        schemas.insert(v.name.clone(), out);
+    }
+    Ok(())
+}
+
+/// Tokenize a SQL string into lowercased identifier-like names.
+fn referenced_names(sql: &str) -> Vec<String> {
+    sql.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// Detect a cycle in the view→view dependency graph (DFS with an active stack).
+fn detect_view_cycles(
+    views: &[ViewDef],
+    view_names: &std::collections::HashSet<&str>,
+) -> Result<()> {
+    use std::collections::{HashMap as Map, HashSet};
+
+    let deps: Map<String, Vec<String>> = views
+        .iter()
+        .map(|v| {
+            let d = referenced_names(&v.sql)
+                .into_iter()
+                .filter(|r| r != &v.name.to_lowercase() && view_names.contains(r.as_str()))
+                .collect();
+            (v.name.to_lowercase(), d)
+        })
+        .collect();
+
+    fn visit(
+        node: &str,
+        deps: &Map<String, Vec<String>>,
+        visited: &mut HashSet<String>,
+        stack: &mut HashSet<String>,
+    ) -> Result<()> {
+        if stack.contains(node) {
+            return Err(rt(format!(
+                "view dependency cycle detected involving '{node}'"
+            )));
+        }
+        if visited.contains(node) {
+            return Ok(());
+        }
+        stack.insert(node.to_string());
+        if let Some(children) = deps.get(node) {
+            for c in children {
+                visit(c, deps, visited, stack)?;
+            }
+        }
+        stack.remove(node);
+        visited.insert(node.to_string());
+        Ok(())
+    }
+
+    let mut visited = HashSet::new();
+    let mut stack = HashSet::new();
+    for v in views {
+        visit(&v.name.to_lowercase(), &deps, &mut visited, &mut stack)?;
+    }
+    Ok(())
 }
