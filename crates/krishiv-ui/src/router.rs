@@ -17,12 +17,8 @@ use crate::handlers::{
 };
 use crate::{UiError, UiResult, UiState};
 
-pub(crate) fn effective_ui_bearer_token(state: &UiState) -> Option<String> {
-    state.ui_bearer_token.clone().or_else(resolve_ui_token)
-}
-
 pub(crate) fn ui_auth_token(state: &UiState) -> Option<String> {
-    effective_ui_bearer_token(state)
+    state.ui_bearer_token.clone().or_else(resolve_ui_token)
 }
 
 pub(crate) fn resolve_ui_token() -> Option<String> {
@@ -237,13 +233,23 @@ async fn require_bearer(request: axum::extract::Request, next: Next, expected: &
     if expected.is_empty() {
         return (StatusCode::UNAUTHORIZED, "authentication not configured").into_response();
     }
+    const BEARER_PREFIX: &str = "bearer ";
     let auth = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     match auth {
-        Some(value) if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") => {
-            let token = &value[7..];
+        // Use `str::get` rather than indexing so a crafted header value whose
+        // 7-byte cut point lands inside a multi-byte UTF-8 sequence cannot
+        // panic the handler (and take down the server) — it simply falls
+        // through to the missing-token branch.
+        Some(value)
+            if value.len() > BEARER_PREFIX.len()
+                && value
+                    .get(..BEARER_PREFIX.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(BEARER_PREFIX)) =>
+        {
+            let token = value.get(BEARER_PREFIX.len()..).unwrap_or("");
             // Constant-time comparison so a timing side-channel can't be used to
             // recover the token byte-by-byte.
             if constant_time_eq::constant_time_eq(token.as_bytes(), expected.as_bytes()) {
