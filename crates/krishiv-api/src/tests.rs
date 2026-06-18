@@ -1731,3 +1731,79 @@ async fn pipeline_validate_passes_for_well_formed_pipeline() {
         .await
         .expect("well-formed pipeline validates");
 }
+
+// ── DP-A: temporary views + flows (fan-in) ──────────────────────────────────
+
+fn id_amount(id: i64, amount: i64) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![id])),
+            Arc::new(Int64Array::from(vec![amount])),
+        ],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pipeline_flows_fan_in_union() {
+    use crate::{PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // Two sources fan into one target view via append flows.
+    session
+        .pipeline("fanin")
+        .source_memory("west", vec![id_amount(1, 10)])
+        .source_memory("east", vec![id_amount(2, 20)])
+        .flow("all_orders", "SELECT id, amount FROM west")
+        .flow("all_orders", "SELECT id, amount FROM east")
+        .sink_memory("all_orders", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+
+    let out = sink.lock().unwrap();
+    let combined = arrow::compute::concat_batches(&out[0].schema(), out.iter()).unwrap();
+    assert_eq!(
+        combined.num_rows(),
+        2,
+        "both flows should be unioned into the target"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_temp_view_intermediate() {
+    use crate::{PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // temp view "big" feeds the final counted view.
+    session
+        .pipeline("tv")
+        .source_memory("raw", vec![id_amount(1, 100), id_amount(2, 50)])
+        .temp_view("big", "SELECT id, amount FROM raw WHERE amount > 60")
+        .view("count_big", "SELECT COUNT(*) AS n FROM big", true)
+        .sink_memory("count_big", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+
+    let out = sink.lock().unwrap();
+    let n = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 1, "only the amount=100 row passes the temp view filter");
+}

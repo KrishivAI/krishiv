@@ -112,6 +112,7 @@ pub struct PyPipeline {
     views: Vec<(String, String, bool)>,
     sinks: Vec<(String, Arc<Mutex<Vec<RecordBatch>>>)>,
     expectations: Vec<PyExpectation>,
+    flows: Vec<(String, String)>,
 }
 
 impl PyPipeline {
@@ -124,16 +125,19 @@ impl PyPipeline {
             views: Vec::new(),
             sinks: Vec::new(),
             expectations: Vec::new(),
+            flows: Vec::new(),
         }
     }
 
     /// Assemble a Rust pipeline builder from the accumulated state.
+    #[allow(clippy::too_many_arguments)]
     fn to_builder(
         &self,
         sources: Vec<(String, PyIngest)>,
         views: Vec<(String, String, bool)>,
         sinks: Vec<(String, Arc<Mutex<Vec<RecordBatch>>>)>,
         expectations: Vec<PyExpectation>,
+        flows: Vec<(String, String)>,
     ) -> krishiv_api::PipelineBuilder {
         use krishiv_api::OnViolation;
         let mut builder = self.session.pipeline(&self.name);
@@ -145,6 +149,9 @@ impl PyPipeline {
         }
         for (name, sql, materialized) in views {
             builder = builder.view(name, sql, materialized);
+        }
+        for (target, sql) in flows {
+            builder = builder.flow(target, sql);
         }
         for (view, handle) in sinks {
             builder = builder.sink(view, Egress::Memory(handle));
@@ -188,6 +195,19 @@ impl PyPipeline {
     #[pyo3(signature = (name, sql, materialized=false))]
     pub fn view(&mut self, name: String, sql: String, materialized: bool) {
         self.views.push((name, sql, materialized));
+    }
+
+    /// Declare a pipeline-scoped temporary view (non-materialized intermediate).
+    pub fn temp_view(&mut self, name: String, sql: String) {
+        self.views.push((name, sql, false));
+    }
+
+    /// Add an append flow into `target` (Spark SDP `CREATE FLOW … INSERT INTO`).
+    ///
+    /// `select_sql` is a full SELECT. Multiple flows with the same target are
+    /// UNION ALL-ed into one materialized view — the fan-in pattern.
+    pub fn flow(&mut self, target: String, select_sql: String) {
+        self.flows.push((target, select_sql));
     }
 
     /// Attach an in-memory sink to a view; returns a handle to read results.
@@ -247,6 +267,7 @@ impl PyPipeline {
             self.views.clone(),
             self.sinks.clone(),
             self.expectations.clone(),
+            self.flows.clone(),
         );
         crate::RUNTIME
             .block_on(builder.build().validate())
@@ -274,8 +295,9 @@ impl PyPipeline {
         let views = std::mem::take(&mut self.views);
         let sinks = std::mem::take(&mut self.sinks);
         let expectations = std::mem::take(&mut self.expectations);
+        let flows = std::mem::take(&mut self.flows);
 
-        let builder = self.to_builder(sources, views, sinks, expectations);
+        let builder = self.to_builder(sources, views, sinks, expectations, flows);
         crate::RUNTIME.block_on(builder.run(policy)).map_err(rt_err)
     }
 

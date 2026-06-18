@@ -98,6 +98,9 @@ pub struct PipelineBuilder {
     views: Vec<ViewDef>,
     sinks: Vec<(String, Egress)>,
     expectations: Vec<Expectation>,
+    /// Append flows `(target, select_sql)` — multiple with the same target are
+    /// `UNION ALL`-ed into a single view at [`build`](PipelineBuilder::build).
+    flows: Vec<(String, String)>,
 }
 
 impl PipelineBuilder {
@@ -110,6 +113,7 @@ impl PipelineBuilder {
             views: Vec::new(),
             sinks: Vec::new(),
             expectations: Vec::new(),
+            flows: Vec::new(),
         }
     }
 
@@ -154,6 +158,26 @@ impl PipelineBuilder {
         self
     }
 
+    /// Declare a pipeline-scoped temporary view (Spark SDP `CREATE TEMPORARY VIEW`).
+    ///
+    /// A temporary view is a non-materialized intermediate that other views can
+    /// reference; it is not maintained as a snapshot and exists only for the
+    /// duration of the run. Sugar over a non-materialized [`view`](Self::view).
+    pub fn temp_view(self, name: impl Into<String>, sql: impl Into<String>) -> Self {
+        self.view(name, sql, false)
+    }
+
+    /// Add an append *flow* into `target` (Spark SDP `CREATE FLOW … INSERT INTO`).
+    ///
+    /// `select_sql` is a full `SELECT` whose rows are appended to `target`.
+    /// Multiple flows with the same `target` are `UNION ALL`-ed into a single
+    /// materialized view at build time — the fan-in pattern (e.g. several
+    /// sources feeding one table).
+    pub fn flow(mut self, target: impl Into<String>, select_sql: impl Into<String>) -> Self {
+        self.flows.push((target.into(), select_sql.into()));
+        self
+    }
+
     /// Attach a sink that consumes a view's output.
     pub fn sink(mut self, view: impl Into<String>, egress: Egress) -> Self {
         self.sinks.push((view.into(), egress));
@@ -193,12 +217,33 @@ impl PipelineBuilder {
     /// Finalize the builder into a [`Pipeline`], inferring the mode if unset.
     pub fn build(self) -> Pipeline {
         let mode = self.mode.unwrap_or_else(|| infer_mode(&self.sources));
+        let mut views = self.views;
+        // Coalesce append flows by target into one materialized view each
+        // (UNION ALL of the flow SELECTs), in first-seen target order.
+        let mut order: Vec<String> = Vec::new();
+        let mut by_target: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (target, sql) in self.flows {
+            if !by_target.contains_key(&target) {
+                order.push(target.clone());
+            }
+            by_target.entry(target).or_default().push(sql);
+        }
+        for target in order {
+            let sqls = by_target.remove(&target).unwrap_or_default();
+            let union_sql = sqls.join(" UNION ALL ");
+            views.push(ViewDef {
+                name: target,
+                sql: union_sql,
+                materialized: true,
+            });
+        }
         Pipeline {
             session: self.session,
             name: self.name,
             mode,
             sources: self.sources,
-            views: self.views,
+            views,
             sinks: self.sinks,
             expectations: self.expectations,
         }
