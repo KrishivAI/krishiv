@@ -87,7 +87,7 @@ jobs:
           )
           for crate in "${CRATES[@]}"; do
             echo "==> Publishing ${crate}"
-            cargo publish -p "${crate}" --no-verify || echo "WARNING: ${crate} may already be published at this version"
+            cargo publish -p "${crate}" --no-verify --allow-dirty || echo "WARNING: ${crate} may already be published at this version"
             sleep 30
           done
 
