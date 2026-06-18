@@ -72,7 +72,9 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
         let http_slots = slots;
         tokio::spawn(async move {
             let router = executor_http_router(http_executor_id, http_slots);
-            let _ = axum::serve(listener, router).await;
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!(error = %e, "HTTP health server failed");
+            }
         });
     }
 
@@ -288,13 +290,16 @@ async fn heartbeat_loop(
         let grpc_continuous_inputs = Arc::clone(&shared_continuous_inputs);
         tokio::spawn(async move {
             use crate::transport::serve_executor_task_grpc_with_listener_and_continuous;
-            let _ = serve_executor_task_grpc_with_listener_and_continuous(
+            if let Err(e) = serve_executor_task_grpc_with_listener_and_continuous(
                 listener,
                 server_inbox,
                 grpc_loop_executors,
                 grpc_continuous_inputs,
             )
-            .await;
+            .await
+            {
+                tracing::error!(error = %e, "task gRPC server failed");
+            }
         });
     }
     let barrier_injector: SharedBarrierInjector = Default::default();
@@ -311,13 +316,16 @@ async fn heartbeat_loop(
         .with_ack_registry(barrier_ack_registry.clone())
         .with_auth_config(task_auth);
         tokio::spawn(async move {
-            let _ = Server::builder()
+            if let Err(e) = Server::builder()
                 .add_service(tonic::service::interceptor::InterceptedService::new(
                     executor_barrier_grpc_server(barrier_service),
                     krishiv_metrics::grpc::extract_trace_context,
                 ))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await;
+                .await
+            {
+                tracing::error!(error = %e, "barrier gRPC server failed");
+            }
         });
     }
 

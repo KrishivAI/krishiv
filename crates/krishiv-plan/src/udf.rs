@@ -289,7 +289,7 @@ impl ScalarUdf for MultiplyScalarUdf {
         let factor = self.factor;
         let result =
             arrow::compute::kernels::arity::unary::<Int64Type, _, Int64Type>(int_array, |x| {
-                x * factor
+                x.wrapping_mul(factor)
             });
 
         Ok(Arc::new(result))

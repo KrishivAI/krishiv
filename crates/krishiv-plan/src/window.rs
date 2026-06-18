@@ -575,7 +575,11 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
                 PlanError::Parse(String::from("count-window fragment missing cslide=<n>"))
             })?,
         },
-        _ => unreachable!("window_kind_tag is one of tw/sw/ses/cw"),
+        _ => {
+            return Err(PlanError::Parse(format!(
+                "unknown window kind tag '{window_kind_tag}'"
+            )));
+        }
     };
 
     Ok(ParsedStreamFragment {

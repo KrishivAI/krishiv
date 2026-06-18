@@ -146,7 +146,7 @@ where
 {
     pub fn new(pattern: CompiledPattern) -> Self {
         Self {
-            pattern: pattern.clone(),
+            pattern,
             states: std::collections::HashMap::new(),
             max_partitions: 1024,
             eviction_heap: BinaryHeap::new(),

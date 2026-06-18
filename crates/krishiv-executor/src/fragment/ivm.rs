@@ -183,5 +183,16 @@ pub async fn execute_ivm_fragment(
     }
 
     // Run one tick.
-    flow.step_datafusion().await.map_err(|e| e.to_string())
+    let result = flow.step_datafusion().await.map_err(|e| e.to_string());
+
+    // Write the modified flow back to shared state so subsequent ticks see
+    // view registrations and feed results from this tick.
+    {
+        let mut state = state_arc
+            .lock()
+            .map_err(|_| "ivm state lock poisoned".to_string())?;
+        state.flow = flow;
+    }
+
+    result
 }
