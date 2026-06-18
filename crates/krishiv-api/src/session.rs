@@ -1245,7 +1245,7 @@ impl Session {
         let _ = &view_entry;
         let mut ordered: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        collect_pipeline_view_deps(&sink_spec.view, &**view_reg, &mut ordered, &mut seen)
+        collect_pipeline_view_deps(&sink_spec.view, view_reg, &mut ordered, &mut seen)
             .map_err(KrishivError::from)?;
         for vname in &ordered {
             if let Some(entry) = view_reg.get(vname).map_err(KrishivError::from)? {
