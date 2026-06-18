@@ -9,4 +9,4 @@ mod error;
 mod session;
 
 pub use error::{GatewayError, GatewayResult};
-pub use session::{GatewaySession, PooledSession, SessionPool};
+pub use session::{GatewayQueryResult, GatewaySession, PooledSession, SessionPool};
