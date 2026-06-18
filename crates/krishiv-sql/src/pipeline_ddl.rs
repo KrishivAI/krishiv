@@ -138,6 +138,17 @@ impl PipelineRegistry {
             .cloned())
     }
 
+    /// Names of all declared sinks.
+    pub fn sink_names(&self) -> SqlResult<Vec<String>> {
+        Ok(self
+            .sinks
+            .read()
+            .map_err(|_| poisoned())?
+            .keys()
+            .cloned()
+            .collect())
+    }
+
     /// All declared source specs `(name, spec)`.
     pub fn sources(&self) -> SqlResult<Vec<(String, SourceSpec)>> {
         Ok(self

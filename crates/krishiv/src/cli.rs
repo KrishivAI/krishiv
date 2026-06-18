@@ -122,6 +122,11 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["table"] | ["table", "--help"] | ["table", "-h"] => {
             CliResponse::ok(crate::table_cmd::table_help())
         }
+        ["pipeline"] | ["pipeline", "--help"] | ["pipeline", "-h"] => {
+            CliResponse::ok(crate::pipeline_cmd::pipeline_help())
+        }
+        ["help", "pipeline"] => CliResponse::ok(crate::pipeline_cmd::pipeline_help()),
+        ["pipeline", rest @ ..] => crate::pipeline_cmd::run_pipeline(rest),
         ["submit"] | ["submit", "--help"] | ["submit", "-h"] => CliResponse::ok(submit_help()),
         ["jobs", "--help"] | ["jobs", "-h"] => CliResponse::ok(jobs_help()),
         ["state"] | ["state", "--help"] | ["state", "-h"] => CliResponse::ok(state_help()),

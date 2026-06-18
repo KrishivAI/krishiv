@@ -125,6 +125,8 @@ pub mod remote_client;
 pub mod cluster_cmd;
 pub mod local_cluster;
 #[doc(hidden)]
+pub mod pipeline_cmd;
+#[doc(hidden)]
 pub mod query_cli;
 #[doc(hidden)]
 pub mod stream_cmd;

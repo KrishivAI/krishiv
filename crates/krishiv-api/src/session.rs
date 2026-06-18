@@ -1145,6 +1145,51 @@ impl Session {
         Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
+    /// Names of all sinks declared via `CREATE SINK` (for CLI pipeline tooling).
+    pub fn declared_pipeline_sinks(&self) -> Result<Vec<String>> {
+        self.sql_engine
+            .pipeline_registry()
+            .sink_names()
+            .map_err(KrishivError::from)
+    }
+
+    /// Validate a SQL-declared pipeline (`dry run`) without executing it: checks
+    /// that the sink is declared, references a defined incremental view, and that
+    /// every declared source/sink connector kind is supported. Does not read data.
+    pub fn validate_pipeline(&self, sink_name: &str) -> Result<()> {
+        let pipe_reg = self.sql_engine.pipeline_registry();
+        let view_reg = self.sql_engine.incremental_view_registry();
+
+        let sink = pipe_reg
+            .sink(sink_name)
+            .map_err(KrishivError::from)?
+            .ok_or_else(|| KrishivError::Runtime {
+                message: format!("pipeline sink '{sink_name}' is not declared"),
+            })?;
+        if view_reg
+            .get(&sink.view)
+            .map_err(KrishivError::from)?
+            .is_none()
+        {
+            return Err(KrishivError::Runtime {
+                message: format!(
+                    "pipeline sink '{sink_name}' references undefined incremental view '{}'",
+                    sink.view
+                ),
+            });
+        }
+        // Connector kinds must be constructible (kind supported).
+        if let Some(c) = &sink.connector {
+            crate::pipeline::build_sink(c)?;
+        }
+        for (_, src) in pipe_reg.sources().map_err(KrishivError::from)? {
+            if let krishiv_sql::pipeline_ddl::SourceSpec::Connector(c) = src {
+                crate::pipeline::build_source(&c)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Execute a `START PIPELINE <sink>` by compiling the registered SOURCE/SINK
     /// specs + the sink's INCREMENTAL VIEW into `Session::pipeline()…run()`,
     /// returning the sink's collected output as a `DataFrame`.
