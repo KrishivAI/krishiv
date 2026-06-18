@@ -55,7 +55,7 @@ mod tests {
         assert_eq!(current_tracestate(), None);
     }
 
-    // ── KrishivMetrics counter/gauge increment tests ─────────────────────────
+    // KrishivMetrics counter/gauge increment tests
 
     #[test]
     fn inc_tasks_submitted_increments_by_one() {
@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(a_ptr, b_ptr);
     }
 
-    // ── Prometheus text format rendering (P0 fix validation) ──────────────────
+    // Prometheus text format rendering (P0 fix validation)
 
     /// Verifies the P0 format fix: exactly one HELP + TYPE per metric family.
     #[test]
@@ -220,7 +220,7 @@ mod tests {
         assert!(body.ends_with('\n'));
     }
 
-    // ── Labeled metric tests ─────────────────────────────────────────────────
+    // Labeled metric tests
 
     #[test]
     fn labeled_checkpoint_epoch_gauge() {
@@ -396,9 +396,7 @@ mod tests {
         assert!(body.contains("krishiv_tasks_total"));
     }
 
-    // ── traceparent / tracestate generation ──────────────────────────────────
-
-    // ── MetricsError Display ────────────────────────────────────────────────
+    // MetricsError Display
 
     #[test]
     fn metrics_error_display_otlp_build() {
@@ -421,7 +419,7 @@ mod tests {
         assert!(!err.to_string().is_empty());
     }
 
-    // ── MetricsConfig custom values ─────────────────────────────────────────
+    // MetricsConfig custom values
 
     #[test]
     fn metrics_config_custom_service_name() {
@@ -462,7 +460,7 @@ mod tests {
         );
     }
 
-    // ── MetricsHandle noop and shutdown ──────────────────────────────────────
+    // MetricsHandle noop and shutdown
 
     #[test]
     fn metrics_handle_noop_creates_valid_handle() {
@@ -505,7 +503,7 @@ mod tests {
         let _handle = init(config);
     }
 
-    // ── KrishivMetrics edge cases ───────────────────────────────────────────
+    // KrishivMetrics edge cases
 
     #[test]
     fn add_shuffle_bytes_written_zero() {
@@ -561,7 +559,7 @@ mod tests {
         assert!(std::str::from_utf8(body.as_bytes()).is_ok());
     }
 
-    // ── Global metrics thread safety ────────────────────────────────────────
+    // Global metrics thread safety
 
     #[test]
     fn global_metrics_thread_safety() {
@@ -611,7 +609,7 @@ mod tests {
         assert!(body.contains("krishiv_checkpoint_epoch"));
     }
 
-    // ── deployment_target unit tests ────────────────────────────────────────
+    // deployment_target unit tests
 
     #[test]
     fn resolved_deployment_target_explicit_config() {

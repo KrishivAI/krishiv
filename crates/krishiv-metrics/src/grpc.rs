@@ -91,7 +91,7 @@ pub fn extract_trace_context(req: tonic::Request<()>) -> Result<tonic::Request<(
     Ok(req)
 }
 
-// ── GrpcDurationLayer ────────────────────────────────────────────────────────
+// GrpcDurationLayer
 
 /// Tower layer that records per-RPC call duration via
 /// [`crate::global_metrics().observe_grpc_duration`].

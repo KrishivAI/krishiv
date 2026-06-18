@@ -41,7 +41,7 @@ pub struct ObservabilityReport {
     pub connector_metrics: Option<ReportConnectorMetrics>,
 }
 
-// ── Sub-structures ──────────────────────────────────────────────────────────
+// Sub-structures
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReportJob {

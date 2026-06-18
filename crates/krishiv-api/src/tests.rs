@@ -1337,6 +1337,56 @@ async fn ivm_feed_from_cdc_then_step_via_unified_api() {
     assert_eq!(report.tick, 1);
 }
 
+#[tokio::test]
+async fn dbg_ivm_snapshot_direct() {
+    use crate::{FeedableJob, IvmJob};
+    use krishiv_delta::DeltaBatch;
+    use krishiv_ivm::IncrementalViewSpec;
+    fn order(id: i64, amount: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(Int64Array::from(vec![amount])),
+            ],
+        )
+        .unwrap()
+    }
+    let session = Session::builder().build().unwrap();
+    let job: IvmJob = session.ivm("revenue").await.unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("total", DataType::Int64, true)]));
+    job.register_view(IncrementalViewSpec {
+        name: "revenue".into(),
+        body_sql: "SELECT SUM(amount) AS total FROM orders".into(),
+        output_schema: schema,
+        is_materialized: true,
+        is_recursive: false,
+        lateness: vec![],
+    })
+    .await
+    .unwrap();
+    job.feed("orders", &DeltaBatch::from_inserts(order(1, 100)).unwrap())
+        .await
+        .unwrap();
+    job.feed("orders", &DeltaBatch::from_inserts(order(2, 50)).unwrap())
+        .await
+        .unwrap();
+    let rep = job.step().await.unwrap();
+    eprintln!(
+        "STEP report: active_views={} rows={} tick={}",
+        rep.active_views, rep.total_output_rows, rep.tick
+    );
+    let snap = job.snapshot("revenue").await.unwrap();
+    eprintln!("SNAPSHOT rows: {:?}", snap.as_ref().map(|b| b.num_rows()));
+    if let Some(b) = &snap {
+        eprintln!("cols={} schema={:?}", b.num_columns(), b.schema());
+    }
+    assert!(snap.is_some(), "snapshot must exist");
+}
+
 // ── Declarative pipeline (Tier 2: source → transform → sink) ─────────────────
 
 #[tokio::test]
