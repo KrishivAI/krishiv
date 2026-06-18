@@ -120,9 +120,7 @@ impl FlightExecutionHost {
         Self::from_env()
     }
 
-    // -------------------------------------------------------------------------
     // Catalog management (shared by both backends).
-    // -------------------------------------------------------------------------
 
     fn apply_catalog_directives(&self, directives: &[FlightDirective]) -> Result<(), Status> {
         let mut catalog_map = std::collections::HashMap::new();
@@ -170,9 +168,7 @@ impl FlightExecutionHost {
         entries
     }
 
-    // -------------------------------------------------------------------------
     // Execution methods — dispatched by backend variant.
-    // -------------------------------------------------------------------------
 
     /// Execute a batch SQL query and return the result as record batches.
     ///
@@ -474,20 +470,21 @@ impl FlightExecutionHost {
     }
 }
 
-// -------------------------------------------------------------------------
 // Async bridge for blocking cluster calls.
-// -------------------------------------------------------------------------
 
-/// Run a blocking cluster operation on the current tokio worker thread.
+/// Run a blocking cluster operation off the async caller without a
+/// `spawn_blocking` / `block_on` triple-hop.
 ///
-/// Uses `block_in_place` instead of `spawn_blocking`:
-/// - Stays on the same thread pool — no cross-thread overhead.
-/// - Allows the tokio executor to continue other tasks while this one blocks.
-/// - Eliminates the `spawn_blocking → block_on → FALLBACK_RUNTIME` triple-hop.
-/// - Drops the `'static` and `Send` bounds — the closure can borrow locals.
+/// On a multi-threaded tokio runtime it uses `block_in_place`, which stays on
+/// the current worker thread and lets the executor run other tasks while this
+/// one blocks. On a current-thread/test runtime it falls back to
+/// `std::thread::scope`, spawning a dedicated OS thread so the blocking call
+/// never stalls the (single) worker.
 ///
-/// Requires a multi-threaded tokio runtime, which is always the case for a
-/// Flight SQL gRPC server. Falls back to `std::thread::scope` for test runtimes.
+/// The closure must be `Send` so the `std::thread::scope` fallback can move it
+/// into the spawned thread. A panic inside the closure is caught and surfaced
+/// as `Status::internal("run_blocking thread panicked")` rather than being
+/// allowed to unwind across the thread boundary.
 pub(crate) fn run_blocking<T: Send>(
     f: impl FnOnce() -> Result<T, krishiv_runtime::RuntimeError> + Send,
 ) -> Result<T, Status> {

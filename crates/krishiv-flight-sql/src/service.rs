@@ -157,20 +157,6 @@ impl KrishivFlightSqlService {
         self
     }
 
-    #[allow(clippy::result_large_err, dead_code)]
-    fn bearer_token<B>(&self, req: &Request<B>) -> Result<Option<String>, Status> {
-        let Some(_auth) = &self.auth else {
-            return Ok(None);
-        };
-        req.metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::to_owned)
-            .map(Some)
-            .ok_or_else(|| Status::unauthenticated("missing Bearer token"))
-    }
-
     /// Validate the `authorization: Bearer <token>` header.
     ///
     /// Returns `Ok(Some(subject))` when auth is configured and the token is
@@ -243,7 +229,7 @@ impl KrishivFlightSqlService {
     }
 }
 
-/// Simple heuristic to extract the table name from `FROM <table>` in a query.
+/// Krishiv Flight SQL service implementation.
 
 #[tonic::async_trait]
 impl FlightSqlService for KrishivFlightSqlService {
@@ -335,18 +321,27 @@ impl FlightSqlService for KrishivFlightSqlService {
         // Authenticate if an auth provider is configured.
         let subject = self.authenticate_request(&request)?;
 
-        // Decode the ticket: [4-byte txn_len][txn_id][query].
+        // Decode the ticket. Two encodings are supported:
+        //   * Prefixed: `[4-byte big-endian txn_len][txn_id][query]`, produced by
+        //     `get_flight_info_statement`. `txn_len` may be `0` (no transaction).
+        //   * Legacy: the whole handle is the raw SQL query, with no prefix.
+        //
+        // A leading `txn_len` of `0` unambiguously means a prefixed ticket with
+        // no transaction id (real SQL never starts with four NUL bytes). A
+        // claimed `txn_len` larger than the remaining handle is treated as a
+        // legacy ticket rather than a truncated prefixed one, so raw-SQL handles
+        // (whose first four bytes are ASCII SQL and parse as a huge length) are
+        // decoded as the original query instead of being silently truncated.
         let handle = &ticket.statement_handle;
         let (transaction_id, query_bytes): (Option<Vec<u8>>, &[u8]) = if handle.len() >= 4 {
             let txn_len = u32::from_be_bytes([handle[0], handle[1], handle[2], handle[3]]) as usize;
             let txn_end = 4 + txn_len;
             if txn_len > 0 && handle.len() >= txn_end {
-                let txn = handle[4..txn_end].to_vec();
-                let query = &handle[txn_end..];
-                (Some(txn), query)
+                (Some(handle[4..txn_end].to_vec()), &handle[txn_end..])
+            } else if txn_len == 0 {
+                (None, &handle[4..])
             } else {
-                // Legacy ticket or no transaction.
-                (None, &handle[4.min(handle.len())..])
+                (None, handle)
             }
         } else {
             (None, handle)
@@ -635,7 +630,7 @@ impl FlightSqlService for KrishivFlightSqlService {
         }
     }
 
-    // ── G17: Catalog introspection ────────────────────────────────────────────
+    // G17: Catalog introspection
 
     /// Return FlightInfo for a `GetDbSchemas` catalog query (G17).
     async fn get_flight_info_schemas(
@@ -667,10 +662,11 @@ impl FlightSqlService for KrishivFlightSqlService {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         self.authenticate_request(&request)?;
         let mut builder = query.into_builder();
+        // The Flight SQL catalog exposes a single (catalog, schema) namespace;
+        // list_catalog_tables always returns ("krishiv", "default") tuples, so
+        // emitting one schema row per table would produce duplicates. Emit the
+        // schema once.
         builder.append("krishiv", "default");
-        for (catalog, schema, _) in self.host.list_catalog_tables() {
-            builder.append(&catalog, &schema);
-        }
         let schema = builder.schema();
         let batch = builder
             .build()
@@ -1014,11 +1010,13 @@ impl KrishivFlightSqlService {
                     .collect();
                 let batches = if body.is_streaming {
                     // Streaming queries go through execute_sql to classify properly.
-                    let mut sql = krishiv_runtime::flight_protocol::encode_batch_sql(
-                        &body.query,
-                        &body.tables,
+                    let sql = format!(
+                        "-- krishiv:streaming=true\n{}",
+                        krishiv_runtime::flight_protocol::encode_batch_sql(
+                            &body.query,
+                            &body.tables
+                        )
                     );
-                    sql = format!("-- krishiv:streaming=true\n{sql}");
                     self.host
                         .execute_sql(&sql)
                         .await

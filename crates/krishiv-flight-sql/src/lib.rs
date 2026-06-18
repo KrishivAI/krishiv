@@ -733,6 +733,84 @@ mod tests {
         assert_eq!(result, "SELECT 'O''Brien' AS name");
     }
 
+    #[test]
+    fn substitute_sql_params_does_not_rescan_substituted_text() {
+        // A parameter value that itself contains "$1" must not be re-substituted.
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("p1", DataType::Utf8, true)]));
+        let batch =
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(StringArray::from(vec!["$1 downstream"]))
+                    as Arc<dyn arrow::array::Array>],
+            )
+            .unwrap();
+        let result = substitute_sql_params("SELECT $1 AS x", &batch);
+        assert_eq!(
+            result, "SELECT '$1 downstream' AS x",
+            "the literal substituted for $1 must not be re-scanned for placeholders"
+        );
+    }
+
+    #[test]
+    fn substitute_sql_params_handles_high_index_without_substring_collision() {
+        // With 10+ columns bound, $10 must be substituted as column 10 and the
+        // later $1 pass must not have eaten into $10. The single-pass scan
+        // consumes all digits of $10 at once.
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let fields: Vec<_> = (1..=10)
+            .map(|i| Field::new(format!("p{i}"), DataType::Utf8, true))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let cols: Vec<Arc<dyn arrow::array::Array>> = (1..=10)
+            .map(|i| {
+                Arc::new(StringArray::from(vec![format!("v{i}")])) as Arc<dyn arrow::array::Array>
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema, cols).unwrap();
+        let result = substitute_sql_params("SELECT $10, $1", &batch);
+        assert_eq!(result, "SELECT 'v10', 'v1'");
+    }
+
+    #[test]
+    fn substitute_sql_params_leaves_out_of_range_and_zero_placeholders_verbatim() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("p1", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["only"])) as Arc<dyn arrow::array::Array>],
+        )
+        .unwrap();
+        // $2 and $0 are not bound columns (only p1 exists); they must stay literal.
+        let result = substitute_sql_params("SELECT $1, $2, $0", &batch);
+        assert_eq!(result, "SELECT 'only', $2, $0");
+    }
+
+    #[test]
+    fn substitute_sql_params_preserves_multibyte_utf8() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("p1", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["café"])) as Arc<dyn arrow::array::Array>],
+        )
+        .unwrap();
+        let result = substitute_sql_params("SELECT $1 — café", &batch);
+        assert_eq!(result, "SELECT 'café' — café");
+    }
+
     #[tokio::test]
     async fn create_prepared_statement_returns_parameter_schema_for_parameterized_sql() {
         let svc = KrishivFlightSqlService::new().expect("flight host");
@@ -814,6 +892,38 @@ mod tests {
         let items: Vec<_> = result.unwrap().into_inner().collect().await;
         assert!(!items.is_empty(), "must return at least the schema message");
         assert!(items[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn do_get_schemas_emits_one_schema_row_even_with_many_tables() {
+        use arrow_flight::decode::FlightRecordBatchStream;
+        use futures::TryStreamExt as _;
+        use std::path::PathBuf;
+
+        let host = FlightExecutionHost::embedded().unwrap();
+        host.register_parquet("t1", PathBuf::from("/data/t1.parquet"));
+        host.register_parquet("t2", PathBuf::from("/data/t2.parquet"));
+        host.register_parquet("t3", PathBuf::from("/data/t3.parquet"));
+        let svc = KrishivFlightSqlService::with_host(host);
+
+        let query = CommandGetDbSchemas {
+            catalog: None,
+            db_schema_filter_pattern: None,
+        };
+        let resp = svc
+            .do_get_schemas(query, Request::new(Ticket::new(vec![])))
+            .await
+            .expect("do_get_schemas must succeed");
+        let batches: Vec<RecordBatch> =
+            FlightRecordBatchStream::new_from_flight_data(resp.into_inner().map_err(|e| e.into()))
+                .try_collect()
+                .await
+                .expect("decode schemas stream");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 1,
+            "GetDbSchemas must list the single krishiv/default schema once, not once per table"
+        );
     }
 
     #[tokio::test]
