@@ -1425,3 +1425,53 @@ async fn pipeline_batch_memory_source_to_memory_sink() {
         .value(0);
     assert_eq!(n, 4);
 }
+
+// ── SQL pipeline DDL: CREATE SOURCE / SINK + START PIPELINE ──────────────────
+
+#[test]
+fn sql_pipeline_create_source_view_sink_start() {
+    fn order(id: i64, amount: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(Int64Array::from(vec![amount])),
+            ],
+        )
+        .unwrap()
+    }
+
+    let session = Session::builder().build().unwrap();
+    // Raw data the SOURCE query reads from.
+    session
+        .register_record_batches("orders_raw", vec![order(1, 100), order(2, 50)])
+        .unwrap();
+
+    // Declarative pipeline entirely in SQL.
+    session
+        .sql("CREATE SOURCE orders AS SELECT * FROM orders_raw")
+        .unwrap();
+    session
+        .sql("CREATE INCREMENTAL VIEW revenue AS SELECT SUM(amount) AS total FROM orders")
+        .unwrap();
+    session.sql("CREATE SINK out FROM revenue").unwrap();
+
+    // START PIPELINE runs it and returns the sink output as a result set.
+    let result = session
+        .sql("START PIPELINE out")
+        .unwrap()
+        .collect()
+        .unwrap();
+    let batches = result.into_batches();
+    assert_eq!(batches.len(), 1);
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("SUM is Float64")
+        .value(0);
+    assert_eq!(total, 150.0);
+}

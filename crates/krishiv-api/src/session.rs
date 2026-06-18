@@ -1115,8 +1115,90 @@ impl Session {
     /// Asynchronously create a DataFrame from a SQL query.
     pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         let query = query.as_ref().to_owned();
-        let sql_dataframe = self.sql_engine.sql(&query).await?;
+
+        // Intercept `START PIPELINE <sink>` — the SqlEngine handles CREATE/DROP
+        // SOURCE/SINK, but execution needs the api pipeline layer.
+        if let Some(krishiv_sql::pipeline_ddl::PipelineStatement::StartPipeline { sink }) =
+            krishiv_sql::pipeline_ddl::parse_pipeline_statement(&query)
+                .map_err(KrishivError::from)?
+        {
+            return self.run_sql_pipeline(&sink).await;
+        }
+
+        self.sql_plain(&query).await
+    }
+
+    /// Run a SQL statement without the `START PIPELINE` interception. Used
+    /// internally (e.g. by `run_sql_pipeline`) to avoid async-recursion.
+    async fn sql_plain(&self, query: &str) -> Result<DataFrame> {
+        let sql_dataframe = self.sql_engine.sql(query).await?;
         Ok(self.dataframe_from_sql(sql_dataframe))
+    }
+
+    /// Execute a `START PIPELINE <sink>` by compiling the registered SOURCE/SINK
+    /// specs + the sink's INCREMENTAL VIEW into `Session::pipeline()…run()`,
+    /// returning the sink's collected output as a `DataFrame`.
+    async fn run_sql_pipeline(&self, sink_name: &str) -> Result<DataFrame> {
+        use std::sync::{Arc, Mutex};
+
+        let pipe_reg = self.sql_engine.pipeline_registry();
+        let view_reg = self.sql_engine.incremental_view_registry();
+
+        let sink_spec = pipe_reg
+            .sink(sink_name)
+            .map_err(KrishivError::from)?
+            .ok_or_else(|| KrishivError::Runtime {
+                message: format!("START PIPELINE: sink '{sink_name}' is not declared"),
+            })?;
+        let view_entry = view_reg
+            .get(&sink_spec.view)
+            .map_err(KrishivError::from)?
+            .ok_or_else(|| KrishivError::Runtime {
+                message: format!(
+                    "START PIPELINE: sink '{sink_name}' references undefined incremental view '{}'",
+                    sink_spec.view
+                ),
+            })?;
+
+        // Resolve each declared source query to batches and feed it as a source.
+        let collected: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = self
+            .pipeline(format!("sql::{sink_name}"))
+            .mode(crate::PipelineMode::Ivm);
+        for (src_name, src_spec) in pipe_reg.sources().map_err(KrishivError::from)? {
+            let batches = self
+                .sql_plain(&src_spec.query)
+                .await?
+                .collect_async()
+                .await?
+                .into_batches();
+            builder = builder.source_memory(src_name, batches);
+        }
+        // A sink reads the view's snapshot, which requires materialization —
+        // force it on regardless of how the view was declared.
+        let _ = view_entry.is_materialized;
+        builder = builder
+            .view(sink_spec.view.clone(), view_entry.body_sql.clone(), true)
+            .sink_memory(sink_spec.view.clone(), collected.clone());
+
+        builder.run(crate::RunPolicy::Once).await?;
+
+        // Return the collected output as a queryable result.
+        let out = collected
+            .lock()
+            .map_err(|_| KrishivError::Runtime {
+                message: "pipeline result mutex poisoned".into(),
+            })?
+            .clone();
+        if out.is_empty() {
+            return self.sql_plain("SELECT 1 WHERE FALSE").await;
+        }
+        let temp = format!("__pipeline_result_{sink_name}");
+        self.sql_engine
+            .register_record_batches(&temp, out)
+            .await
+            .map_err(KrishivError::from)?;
+        self.sql_plain(&format!("SELECT * FROM {temp}")).await
     }
 
     /// Execute SQL after API-key authentication and table-level policy checks.
