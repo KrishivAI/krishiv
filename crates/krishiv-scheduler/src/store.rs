@@ -883,6 +883,7 @@ impl TryFrom<PersistedTaskRecord> for TaskRecord {
             last_watermark_ms: None,
             last_source_offset: None,
             assigned_at_ms: None,
+            last_progress_ms: None,
         })
     }
 }

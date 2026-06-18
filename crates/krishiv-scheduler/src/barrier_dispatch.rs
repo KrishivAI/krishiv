@@ -148,6 +148,54 @@ impl Coordinator {
             }
         }
     }
+
+    /// Apply barrier acks with deferred post-commit FS I/O.
+    ///
+    /// Like [`Self::apply_barrier_acks`] but uses
+    /// [`Self::handle_checkpoint_ack_deferred`] so the in-memory ack processing
+    /// happens under the coordinator write lock while the post-commit work
+    /// (savepoint preservation, stop-with-savepoint) is returned for the caller
+    /// to execute **outside** the lock. This prevents filesystem I/O from
+    /// blocking heartbeats and job submissions during barrier fanout.
+    ///
+    /// Returns a list of `(job_id, epoch)` pairs that need
+    /// [`Coordinator::on_checkpoint_epoch_committed`] to be called outside the
+    /// lock.
+    pub fn apply_barrier_acks_deferred(
+        &mut self,
+        job_id: &JobId,
+        epoch: u64,
+        fencing_token: FencingToken,
+        acks: &[(TaskId, krishiv_proto::wire::v1::BarrierAck)],
+    ) -> Vec<(JobId, u64)> {
+        let mut post_commit_jobs = Vec::new();
+        for (task_id, ack) in acks {
+            let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
+            let request = CheckpointAckRequest {
+                job_id: job_id.clone(),
+                operator_id: krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
+                    .expect("task_id is non-empty, so operator_id is non-empty"),
+                task_id: task_id.clone(),
+                epoch,
+                fencing_token,
+                source_offsets: Vec::new(),
+                snapshot_path,
+            };
+            let (response, post_commit) = self.handle_checkpoint_ack_deferred(request);
+            if let Some((pc_job_id, pc_epoch)) = post_commit {
+                post_commit_jobs.push((pc_job_id, pc_epoch));
+            } else if !matches!(response, CheckpointAckResponse::Accepted) {
+                tracing::warn!(
+                    job_id = job_id.as_str(),
+                    task_id = task_id.as_str(),
+                    epoch,
+                    ?response,
+                    "barrier ack rejected during fanout"
+                );
+            }
+        }
+        post_commit_jobs
+    }
 }
 
 fn barrier_endpoint_for_record(record: &ExecutorRecord) -> Option<String> {
@@ -251,9 +299,22 @@ pub async fn drive_barrier_dispatches(
         let fencing = plan.fencing_token;
         match dispatch_barrier_plan(&plan, timeout).await {
             Ok(acks) => {
-                let mut coord = shared.write().await;
-                coord.mark_barrier_dispatched(&job_id, epoch);
-                coord.apply_barrier_acks(&job_id, epoch, fencing, &acks);
+                // Phase 1: apply barrier acks in-memory under the write lock.
+                // The sync `handle_checkpoint_ack` is called here, but we must
+                // NOT do FS I/O under the lock. The post-commit work
+                // (savepoint preservation) is deferred and executed outside.
+                let post_commit_jobs: Vec<(JobId, u64)> = {
+                    let mut coord = shared.write().await;
+                    coord.mark_barrier_dispatched(&job_id, epoch);
+                    coord.apply_barrier_acks_deferred(&job_id, epoch, fencing, &acks)
+                };
+                // Phase 2: execute deferred post-commit FS I/O (savepoint
+                // preservation, stop-with-savepoint) outside the coordinator
+                // write lock so heartbeats/submissions are not blocked.
+                for (pc_job_id, pc_epoch) in post_commit_jobs {
+                    let mut coord = shared.write().await;
+                    coord.on_checkpoint_epoch_committed(&pc_job_id, pc_epoch);
+                }
             }
             Err(e) => {
                 tracing::warn!(

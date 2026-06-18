@@ -439,6 +439,10 @@ impl LeaderElection for EtcdLeaseElection {
             .unwrap_or_else(|p| p.into_inner())
             .fencing_token
     }
+
+    fn lease_duration_s(&self) -> u64 {
+        self.lease_duration_s
+    }
 }
 
 impl fmt::Display for EtcdLeaseElection {

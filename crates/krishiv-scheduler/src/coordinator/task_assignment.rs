@@ -289,6 +289,7 @@ impl Coordinator {
                     }
                     task.output_metadata = None;
                     task.assigned_at_ms = None;
+                    task.last_progress_ms = None;
                 }
                 stage.refresh_state();
             }
@@ -326,6 +327,7 @@ impl Coordinator {
                     task.state = TaskState::Succeeded;
                     task.launch_in_flight = false;
                     task.assigned_at_ms = None;
+                    task.last_progress_ms = None;
                 }
             }
             stage.refresh_state();

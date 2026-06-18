@@ -46,6 +46,18 @@ pub trait LeaderElection: Send + Sync {
     fn fencing_token(&self) -> u64 {
         0
     }
+
+    /// Lease TTL in seconds.
+    ///
+    /// The leader loop uses this to compute a safe renew interval
+    /// (`lease_duration / 3`) so the coordinator renews well before the lease
+    /// expires, minimizing the split-brain window where a stale coordinator
+    /// remains Active after lease expiry.
+    ///
+    /// Default: returns `15` (matching the default `leader_lease_duration_s`).
+    fn lease_duration_s(&self) -> u64 {
+        15
+    }
 }
 
 /// No-op leader election that always reports this node as the leader.

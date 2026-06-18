@@ -425,6 +425,158 @@ pub async fn api_ivm_restore(
     Ok(Json(RestoreResponse { success: true }))
 }
 
+// ── POST /api/v1/ivm/jobs/{job_id}/checkpoint-delta ──────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct CheckpointDeltaResponse {
+    /// Base64-encoded delta checkpoint bytes.
+    pub checkpoint_delta_b64: String,
+}
+
+pub async fn api_ivm_checkpoint_delta(
+    State(registry): State<SharedIvmJobRegistry>,
+    Path(job_id): Path<String>,
+) -> Result<Json<CheckpointDeltaResponse>, StatusCode> {
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let bytes = flow.checkpoint_delta().map_err(ivm_err)?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+    Ok(Json(CheckpointDeltaResponse {
+        checkpoint_delta_b64: b64,
+    }))
+}
+
+// ── POST /api/v1/ivm/jobs/{job_id}/restore-delta ─────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct RestoreDeltaRequest {
+    pub checkpoint_delta_b64: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RestoreDeltaResponse {
+    pub success: bool,
+}
+
+pub async fn api_ivm_restore_delta(
+    State(registry): State<SharedIvmJobRegistry>,
+    Path(job_id): Path<String>,
+    Json(body): Json<RestoreDeltaRequest>,
+) -> Result<Json<RestoreDeltaResponse>, StatusCode> {
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &body.checkpoint_delta_b64,
+    )
+    .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
+    flow.restore_delta(&bytes).map_err(ivm_err)?;
+    Ok(Json(RestoreDeltaResponse { success: true }))
+}
+
+// ── POST /api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-bridge ───────
+
+#[derive(Debug, Deserialize)]
+pub struct StreamBridgeRequest {
+    /// Base64-encoded Arrow IPC bytes for one or more RecordBatches (full snapshot).
+    pub snapshot_ipc_b64: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreamBridgeResponse {
+    pub success: bool,
+}
+
+pub async fn api_ivm_stream_bridge(
+    State(registry): State<SharedIvmJobRegistry>,
+    Path((job_id, source_name)): Path<(String, String)>,
+    Json(body): Json<StreamBridgeRequest>,
+) -> Result<Json<StreamBridgeResponse>, StatusCode> {
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+    let ipc_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &body.snapshot_ipc_b64,
+    )
+    .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
+    // Decode Arrow IPC stream to RecordBatches.
+    let batches = {
+        use arrow::ipc::reader::StreamReader;
+        let cursor = std::io::Cursor::new(&ipc_bytes);
+        let reader = StreamReader::try_new(cursor, None)
+            .map_err(|e| ivm_err(format!("IPC stream open: {e}")))?;
+        reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ivm_err(format!("IPC stream read: {e}")))?
+    };
+    flow.feed_stream_output(source_name, &batches)
+        .map_err(ivm_err)?;
+    Ok(Json(StreamBridgeResponse { success: true }))
+}
+
+// ── POST /api/v1/ivm/jobs/{job_id}/vector-views ───────────────────────────────
+
+use std::sync::Arc;
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterVectorViewRequest {
+    pub view_name: String,
+    pub id_column: String,
+    pub vector_column: String,
+    /// Sink type: currently only "in_memory" is supported via HTTP.
+    #[serde(default = "default_sink_type")]
+    pub sink_type: String,
+}
+
+fn default_sink_type() -> String {
+    "in_memory".to_string()
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterVectorViewResponse {
+    pub success: bool,
+    pub view_name: String,
+}
+
+pub async fn api_ivm_register_vector_view(
+    State(registry): State<SharedIvmJobRegistry>,
+    Path(job_id): Path<String>,
+    Json(body): Json<RegisterVectorViewRequest>,
+) -> Result<Json<RegisterVectorViewResponse>, StatusCode> {
+    use krishiv_ivm::{VectorViewSpec, spawn_vector_view};
+
+    let flow = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+
+    if body.sink_type != "in_memory" {
+        return Err(ivm_err(format!(
+            "unsupported sink_type '{}'; only 'in_memory' is supported via HTTP",
+            body.sink_type
+        )));
+    }
+
+    let sink: Arc<dyn krishiv_ivm::IvmVectorSink> = krishiv_ivm::InMemoryVectorSink::new();
+    let spec = VectorViewSpec {
+        view_name: body.view_name.clone(),
+        id_column: body.id_column.clone(),
+        vector_column: body.vector_column.clone(),
+        sink,
+    };
+
+    // Spawn and detach; the background task runs until the flow is dropped.
+    spawn_vector_view(&flow, spec)
+        .map_err(ivm_err)?;
+
+    Ok(Json(RegisterVectorViewResponse {
+        success: true,
+        view_name: body.view_name,
+    }))
+}
+
 // ── Router builder ────────────────────────────────────────────────────────────
 
 use axum::Router;
@@ -458,6 +610,10 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
             "/api/v1/ivm/jobs/{job_id}/sources/{source_name}/feed",
             post(api_ivm_feed_source),
         )
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-bridge",
+            post(api_ivm_stream_bridge),
+        )
         .route("/api/v1/ivm/jobs/{job_id}/step", post(api_ivm_step))
         .route(
             "/api/v1/ivm/jobs/{job_id}/views/{view_name}/snap",
@@ -472,5 +628,17 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
             post(api_ivm_checkpoint),
         )
         .route("/api/v1/ivm/jobs/{job_id}/restore", post(api_ivm_restore))
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/checkpoint-delta",
+            post(api_ivm_checkpoint_delta),
+        )
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/restore-delta",
+            post(api_ivm_restore_delta),
+        )
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/vector-views",
+            post(api_ivm_register_vector_view),
+        )
         .with_state(state)
 }

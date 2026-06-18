@@ -6,6 +6,7 @@
 use pyo3::prelude::*;
 
 mod agg;
+pub mod arrow_compat;
 mod batch;
 mod blocking_session;
 mod dataframe;

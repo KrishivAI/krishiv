@@ -68,8 +68,10 @@ pub fn project_batch(batch: DeltaBatch, output_columns: &[&str]) -> DeltaResult<
         .map(|&i| schema.field(i).clone())
         .collect();
     let out_schema = Arc::new(Schema::new(out_fields));
-    let out_cols: Vec<Arc<dyn Array>> =
-        col_indices.iter().map(|&i| data.column(i).clone()).collect();
+    let out_cols: Vec<Arc<dyn Array>> = col_indices
+        .iter()
+        .map(|&i| data.column(i).clone())
+        .collect();
 
     map_batch(batch, |_| {
         RecordBatch::try_new(out_schema, out_cols).map_err(DeltaError::Arrow)
@@ -94,7 +96,10 @@ impl ProjectOp {
             })
             .collect::<DeltaResult<Vec<_>>>()?;
         let output_schema = Arc::new(Schema::new(fields));
-        Ok(Self { output_columns, output_schema })
+        Ok(Self {
+            output_columns,
+            output_schema,
+        })
     }
 
     pub fn output_schema(&self) -> &SchemaRef {

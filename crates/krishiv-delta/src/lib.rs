@@ -40,8 +40,8 @@
 //! | recursive | `operators::recursive` | Fixed-point loop |
 
 pub mod behavior_version;
-pub mod delta_batch;
 pub mod coalesce;
+pub mod delta_batch;
 pub mod error;
 pub mod lateness;
 pub mod operators;
@@ -51,11 +51,10 @@ pub mod view;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use behavior_version::{LogicFingerprint, MemoKey};
-pub use delta_batch::{
-    DeltaBatch, Weight, WEIGHT_COLUMN,
-    deserialize_delta_batch, serialize_delta_batch,
-};
 pub use coalesce::CoalescingMap;
+pub use delta_batch::{
+    DeltaBatch, WEIGHT_COLUMN, Weight, deserialize_delta_batch, serialize_delta_batch,
+};
 pub use error::{DeltaError, DeltaResult};
 pub use lateness::{LatenessSpec, SourceOrdinal, WatermarkTracker};
 pub use operators::aggregate::{Aggregation, IncrementalAggOp};

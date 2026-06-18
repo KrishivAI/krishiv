@@ -6,7 +6,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple, PyType};
-use pyo3_arrow::PySchema as ArrowPySchema;
+use crate::arrow_compat::PyArrowSchema;
 
 use crate::errors::SchemaError;
 
@@ -104,7 +104,7 @@ impl PySchema {
     #[classmethod]
     fn arrow_schema(cls: &Bound<'_, PyType>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let schema = Self::arrow_schema_from_class(cls)?;
-        let py_schema = ArrowPySchema::new(schema);
+        let py_schema = PyArrowSchema::new(schema);
         Ok(py_schema.into_pyobject(py)?.into_any().unbind())
     }
 

@@ -26,9 +26,10 @@ use krishiv_scheduler::SharedIvmJobRegistry;
 
 use crate::{
     RemoteStepSummary, RuntimeError, RuntimeResult, execute_coordinator_ivm_checkpoint,
-    execute_coordinator_ivm_create_job, execute_coordinator_ivm_feed_source,
-    execute_coordinator_ivm_register_view, execute_coordinator_ivm_restore,
-    execute_coordinator_ivm_step,
+    execute_coordinator_ivm_checkpoint_delta, execute_coordinator_ivm_create_job,
+    execute_coordinator_ivm_feed_source, execute_coordinator_ivm_register_view,
+    execute_coordinator_ivm_restore, execute_coordinator_ivm_restore_delta,
+    execute_coordinator_ivm_step, execute_coordinator_ivm_stream_bridge,
 };
 
 // ── RemoteIvmJob ──────────────────────────────────────────────────────────────
@@ -100,6 +101,31 @@ impl RemoteIvmJob {
     /// Restore this job from previously captured checkpoint bytes.
     pub async fn restore(&self, bytes: &[u8]) -> RuntimeResult<()> {
         execute_coordinator_ivm_restore(&self.coordinator_http, &self.job_id, bytes).await
+    }
+
+    /// Retrieve a delta checkpoint (incremental deltas since last call).
+    pub async fn checkpoint_delta(&self) -> RuntimeResult<Vec<u8>> {
+        execute_coordinator_ivm_checkpoint_delta(&self.coordinator_http, &self.job_id).await
+    }
+
+    /// Apply delta checkpoint bytes on top of restored state.
+    pub async fn restore_delta(&self, bytes: &[u8]) -> RuntimeResult<()> {
+        execute_coordinator_ivm_restore_delta(&self.coordinator_http, &self.job_id, bytes).await
+    }
+
+    /// Push streaming micro-batch snapshots; coordinator computes deltas via differentiate.
+    pub async fn feed_stream_output(
+        &self,
+        source_name: &str,
+        batches: &[arrow::record_batch::RecordBatch],
+    ) -> RuntimeResult<()> {
+        execute_coordinator_ivm_stream_bridge(
+            &self.coordinator_http,
+            &self.job_id,
+            source_name,
+            batches,
+        )
+        .await
     }
 }
 
@@ -206,12 +232,101 @@ impl IvmJobHandle {
         }
     }
 
+    /// Register or update an incremental view (embedded and remote).
+    pub async fn register_view(&self, spec: IncrementalViewSpec) -> RuntimeResult<()> {
+        match self {
+            Self::Embedded(j) => j.register_view(spec),
+            Self::Remote(j) => j.register_view(&spec).await,
+        }
+    }
+
+    /// Feed a streaming micro-batch snapshot, deriving deltas via differentiate.
+    pub async fn feed_stream_output(
+        &self,
+        source_name: &str,
+        batches: &[arrow::record_batch::RecordBatch],
+    ) -> RuntimeResult<()> {
+        match self {
+            Self::Embedded(j) => j
+                .flow()
+                .feed_stream_output(source_name, batches)
+                .map_err(|e| crate::RuntimeError::plan_rejected(e.to_string())),
+            Self::Remote(j) => {
+                crate::execute_coordinator_ivm_stream_bridge(
+                    &j.coordinator_http,
+                    &j.job_id,
+                    source_name,
+                    batches,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Enable delta checkpoint accumulation (embedded only; remote is always enabled).
+    pub fn enable_delta_checkpoints(&self) -> RuntimeResult<()> {
+        match self {
+            Self::Embedded(j) => j
+                .flow()
+                .enable_delta_checkpoints()
+                .map_err(|e| crate::RuntimeError::plan_rejected(e.to_string())),
+            Self::Remote(_) => Ok(()),
+        }
+    }
+
+    /// Enable content-addressed input dedup (embedded only).
+    pub fn enable_input_dedup(&self) -> RuntimeResult<()> {
+        match self {
+            Self::Embedded(j) => j
+                .flow()
+                .enable_input_dedup()
+                .map_err(|e| crate::RuntimeError::plan_rejected(e.to_string())),
+            Self::Remote(_) => Ok(()),
+        }
+    }
+
+    /// Retrieve a delta checkpoint (deltas accumulated since last call).
+    pub async fn checkpoint_delta(&self) -> RuntimeResult<Vec<u8>> {
+        match self {
+            Self::Embedded(j) => j
+                .flow()
+                .checkpoint_delta()
+                .map_err(|e| crate::RuntimeError::transport(e.to_string())),
+            Self::Remote(j) => {
+                crate::execute_coordinator_ivm_checkpoint_delta(
+                    &j.coordinator_http,
+                    &j.job_id,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Apply delta checkpoint bytes on top of an existing restored state.
+    pub async fn restore_delta(&self, bytes: &[u8]) -> RuntimeResult<()> {
+        match self {
+            Self::Embedded(j) => j
+                .flow()
+                .restore_delta(bytes)
+                .map_err(|e| crate::RuntimeError::transport(e.to_string())),
+            Self::Remote(j) => {
+                crate::execute_coordinator_ivm_restore_delta(
+                    &j.coordinator_http,
+                    &j.job_id,
+                    bytes,
+                )
+                .await
+            }
+        }
+    }
+
     /// Advance one tick. Returns `(active_views, tick)`.
     pub async fn step(&self) -> RuntimeResult<(usize, u64)> {
         match self {
             Self::Embedded(j) => {
                 let summary = j.step().await?;
-                Ok((summary.active_views, 0))
+                let tick = j.flow().tick().unwrap_or(0);
+                Ok((summary.active_views, tick))
             }
             Self::Remote(j) => {
                 let s = j.step().await?;

@@ -11,6 +11,8 @@ use crate::error::KrishivError;
 
 impl From<IvmError> for KrishivError {
     fn from(e: IvmError) -> Self {
-        KrishivError::Runtime { message: e.to_string() }
+        KrishivError::Runtime {
+            message: e.to_string(),
+        }
     }
 }

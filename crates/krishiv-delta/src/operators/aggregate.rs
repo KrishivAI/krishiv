@@ -25,11 +25,25 @@ use crate::error::{DeltaError, DeltaResult};
 
 #[derive(Debug, Clone)]
 pub enum Aggregation {
-    Sum { input_col: String, output_col: String },
-    Count { output_col: String },
-    Avg { input_col: String, output_col: String },
-    Min { input_col: String, output_col: String },
-    Max { input_col: String, output_col: String },
+    Sum {
+        input_col: String,
+        output_col: String,
+    },
+    Count {
+        output_col: String,
+    },
+    Avg {
+        input_col: String,
+        output_col: String,
+    },
+    Min {
+        input_col: String,
+        output_col: String,
+    },
+    Max {
+        input_col: String,
+        output_col: String,
+    },
 }
 
 impl Aggregation {
@@ -75,7 +89,11 @@ impl GroupState {
     }
 
     fn current_avg(&self) -> Option<f64> {
-        if self.count == 0 { None } else { Some(self.sum / self.count as f64) }
+        if self.count == 0 {
+            None
+        } else {
+            Some(self.sum / self.count as f64)
+        }
     }
 
     fn current_min(&self) -> Option<&str> {
@@ -129,15 +147,22 @@ impl IncrementalAggOp {
         for agg in &aggregations {
             let output_type = match agg {
                 Aggregation::Count { .. } => DataType::Int64,
-                Aggregation::Sum { .. } | Aggregation::Avg { .. }
-                | Aggregation::Min { .. } | Aggregation::Max { .. } => DataType::Float64,
+                Aggregation::Sum { .. }
+                | Aggregation::Avg { .. }
+                | Aggregation::Min { .. }
+                | Aggregation::Max { .. } => DataType::Float64,
             };
             out_fields.push(Arc::new(Field::new(agg.output_col(), output_type, true)));
         }
 
         let output_schema = Arc::new(Schema::new(out_fields));
 
-        Ok(Self { group_by, aggregations, output_schema, state: AHashMap::new() })
+        Ok(Self {
+            group_by,
+            aggregations,
+            output_schema,
+            state: AHashMap::new(),
+        })
     }
 
     pub fn output_schema(&self) -> &SchemaRef {
@@ -207,7 +232,12 @@ impl IncrementalAggOp {
             }
 
             // GC empty groups
-            if self.state.get(&group_key).map(GroupState::is_empty).unwrap_or(false) {
+            if self
+                .state
+                .get(&group_key)
+                .map(GroupState::is_empty)
+                .unwrap_or(false)
+            {
                 self.state.remove(&group_key);
             }
         }
@@ -261,12 +291,8 @@ fn compute_agg_values(state: &GroupState, aggregations: &[Aggregation]) -> Vec<O
             Aggregation::Sum { .. } => Some(state.current_sum()),
             Aggregation::Count { .. } => Some(state.current_count() as f64),
             Aggregation::Avg { .. } => state.current_avg(),
-            Aggregation::Min { .. } => {
-                state.current_min().and_then(|s| s.parse::<f64>().ok())
-            }
-            Aggregation::Max { .. } => {
-                state.current_max().and_then(|s| s.parse::<f64>().ok())
-            }
+            Aggregation::Min { .. } => state.current_min().and_then(|s| s.parse::<f64>().ok()),
+            Aggregation::Max { .. } => state.current_max().and_then(|s| s.parse::<f64>().ok()),
         })
         .collect()
 }
@@ -292,8 +318,10 @@ fn build_output_batch(
     for (ai, agg) in aggregations.iter().enumerate() {
         match agg {
             Aggregation::Count { .. } => {
-                let vals: Int64Array =
-                    agg_values.iter().map(|row| row[ai].map(|v| v as i64)).collect();
+                let vals: Int64Array = agg_values
+                    .iter()
+                    .map(|row| row[ai].map(|v| v as i64))
+                    .collect();
                 cols.push(Arc::new(vals) as Arc<dyn Array>);
             }
             _ => {
@@ -318,19 +346,39 @@ fn build_output_batch(
 fn scalar_to_string(arr: &dyn Array, row: usize) -> String {
     use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     "NULL".to_string()
 }
@@ -412,13 +460,18 @@ mod tests {
         let mut op = IncrementalAggOp::new(
             &order_schema(),
             vec!["customer_id".into()],
-            vec![Aggregation::Count { output_col: "cnt".into() }],
+            vec![Aggregation::Count {
+                output_col: "cnt".into(),
+            }],
         )
         .unwrap();
 
         let d1 = DeltaBatch::from_inserts(order_batch(&["c1", "c1"], &[10.0, 20.0])).unwrap();
         op.apply(d1).unwrap();
         // Count for c1 should be 2
-        assert_eq!(op.state.get(&vec!["c1".to_string()]).map(|s| s.count), Some(2));
+        assert_eq!(
+            op.state.get(&vec!["c1".to_string()]).map(|s| s.count),
+            Some(2)
+        );
     }
 }

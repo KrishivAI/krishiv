@@ -270,31 +270,44 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             if let Err(e) = CheckpointCoordinator::commit_storage(commit).await {
                 // Storage write failed — abort the in-flight epoch so the
                 // coordinator does not hang on awaiting-acks timeout.
-                let mut inner = self.coordinator.checkpoint_inner.write().await;
-                if let Some(coord) = inner.coordinators.get_mut(&job_id) {
-                    coord.abort_epoch(&format!("checkpoint storage write failed: {e}"));
-                }
+                //
+                // Lock order: acquire checkpoint_inner, mutate, extract a clone
+                // of the coordinators map, RELEASE checkpoint_inner, then
+                // acquire coordinator.write() to sync. Never hold both.
+                let coordinators_snapshot = {
+                    let mut inner = self.coordinator.checkpoint_inner.write().await;
+                    if let Some(coord) = inner.coordinators.get_mut(&job_id) {
+                        coord.abort_epoch(&format!("checkpoint storage write failed: {e}"));
+                    }
+                    inner.coordinators.clone()
+                };
                 krishiv_metrics::global_metrics().inc_checkpoint_failed(job_id.as_str());
-                // Sync inner → outer coordinator after abort.
+                // Sync inner → outer coordinator after abort (checkpoint_inner released).
                 let mut coordinator = self.coordinator.write().await;
                 coordinator
                     .checkpoint_coordinators
-                    .clone_from(&inner.coordinators);
+                    .clone_from(&coordinators_snapshot);
                 return Err(tonic::Status::internal(format!(
                     "checkpoint commit failed: {e}"
                 )));
             }
 
-            // Phase 3: finalize commit under checkpoint inner lock.
-            {
+            // Phase 3: finalize commit under checkpoint inner lock, then sync
+            // to the outer coordinator. The two locks are never held
+            // simultaneously — extract the clone under checkpoint_inner,
+            // release it, then take coordinator.write().
+            let (finalize_result, coordinators_snapshot) = {
                 let mut inner = self.coordinator.checkpoint_inner.write().await;
-                let finalize_result = inner.finalize_ack(&job_id, ack_epoch);
-                // Sync inner → outer coordinator even if finalization failed so
-                // callers observe the authoritative checkpoint-inner state.
+                let result = inner.finalize_ack(&job_id, ack_epoch);
+                // Clone the coordinators map for syncing to the outer
+                // coordinator after releasing checkpoint_inner.
+                (result, inner.coordinators.clone())
+            };
+            {
                 let mut coordinator = self.coordinator.write().await;
                 coordinator
                     .checkpoint_coordinators
-                    .clone_from(&inner.coordinators);
+                    .clone_from(&coordinators_snapshot);
                 finalize_result.map_err(|error| {
                     tonic::Status::internal(format!("checkpoint finalize failed: {error}"))
                 })?;
@@ -359,8 +372,12 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
                 .load(std::sync::atomic::Ordering::SeqCst);
             if token > 0 { Some(token) } else { None }
         };
-        let mut checkpoint_inner = self.coordinator.checkpoint_inner.write().await;
+        // Lock order: acquire coordinator.write() first (outer lock), then
+        // checkpoint_inner.write() (shard lock). Never acquire checkpoint_inner
+        // before coordinator — that inverts the documented 4-level lock order
+        // and deadlocks against advance_heartbeat_tick / submit_job.
         let mut coordinator = self.coordinator.write().await;
+        let mut checkpoint_inner = self.coordinator.checkpoint_inner.write().await;
         let restore_result = if req.from_savepoint {
             coordinator.restore_job_from_savepoint(
                 &req.job_id,

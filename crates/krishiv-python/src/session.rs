@@ -572,7 +572,7 @@ impl PySession {
         name: String,
         schema: &pyo3::Bound<'_, pyo3::PyAny>,
     ) -> PyResult<()> {
-        let py_schema: pyo3_arrow::PySchema = schema.extract()?;
+        let py_schema: crate::arrow_compat::PyArrowSchema = schema.extract()?;
         let schema_ref = py_schema.into_inner();
         self.inner
             .register_unbounded(&name, schema_ref)
@@ -589,7 +589,7 @@ impl PySession {
         schema: &pyo3::Bound<'_, pyo3::PyAny>,
         capacity: usize,
     ) -> PyResult<()> {
-        let py_schema: pyo3_arrow::PySchema = schema.extract()?;
+        let py_schema: crate::arrow_compat::PyArrowSchema = schema.extract()?;
         let schema_ref = py_schema.into_inner();
         self.inner
             .register_unbounded_with_capacity(&name, schema_ref, capacity)

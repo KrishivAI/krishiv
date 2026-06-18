@@ -217,9 +217,8 @@ fn extract_f32_list_at(arr: &dyn Array, row: usize) -> IvmResult<Vec<f32>> {
     )))
 }
 
-// ── InMemoryVectorSink (for tests) ────────────────────────────────────────────
+// ── InMemoryVectorSink (for tests and in-process HTTP use) ───────────────────
 
-#[cfg(test)]
 pub mod testing {
     use super::*;
     use std::collections::HashMap;

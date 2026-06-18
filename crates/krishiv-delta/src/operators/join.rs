@@ -60,10 +60,8 @@ impl IncrementalJoinOp {
         right_key_cols: Vec<String>,
         join_type: IncrJoinType,
     ) -> DeltaResult<Self> {
-        let left_key_refs: Vec<&str> =
-            left_key_cols.iter().map(String::as_str).collect();
-        let right_key_refs: Vec<&str> =
-            right_key_cols.iter().map(String::as_str).collect();
+        let left_key_refs: Vec<&str> = left_key_cols.iter().map(String::as_str).collect();
+        let right_key_refs: Vec<&str> = right_key_cols.iter().map(String::as_str).collect();
 
         let left_trace = Trace::new(left_schema.clone(), &left_key_refs)?;
         let right_trace = Trace::new(right_schema.clone(), &right_key_refs)?;
@@ -161,11 +159,7 @@ impl IncrementalJoinOp {
             return DeltaBatch::empty(self.output_schema.clone());
         }
 
-        self.build_join_output_left_probe(
-            &left_data,
-            left_weights,
-            &right_matches,
-        )
+        self.build_join_output_left_probe(&left_data, left_weights, &right_matches)
     }
 
     fn probe_right_against_left_trace(&self, delta_right: &DeltaBatch) -> DeltaResult<DeltaBatch> {
@@ -179,11 +173,7 @@ impl IncrementalJoinOp {
             return DeltaBatch::empty(self.output_schema.clone());
         }
 
-        self.build_join_output_right_probe(
-            &left_matches,
-            &right_data,
-            right_weights,
-        )
+        self.build_join_output_right_probe(&left_matches, &right_data, right_weights)
     }
 
     /// Build output rows: for each (left_row, right_row) pair where join keys match,
@@ -206,7 +196,14 @@ impl IncrementalJoinOp {
 
         for li in 0..left_data.num_rows() {
             for ri in 0..right_data.num_rows() {
-                if keys_match(left_data, &left_key_indices, li, &right_data, &right_key_indices, ri) {
+                if keys_match(
+                    left_data,
+                    &left_key_indices,
+                    li,
+                    &right_data,
+                    &right_key_indices,
+                    ri,
+                ) {
                     out_left_rows.push(li);
                     out_right_rows.push(ri);
                     out_weights.push(left_weights.value(li) * right_weights.value(ri));
@@ -247,7 +244,14 @@ impl IncrementalJoinOp {
 
         for li in 0..left_data.num_rows() {
             for ri in 0..right_data.num_rows() {
-                if keys_match(&left_data, &left_key_indices, li, right_data, &right_key_indices, ri) {
+                if keys_match(
+                    &left_data,
+                    &left_key_indices,
+                    li,
+                    right_data,
+                    &right_key_indices,
+                    ri,
+                ) {
                     out_left_rows.push(li);
                     out_right_rows.push(ri);
                     out_weights.push(left_weights.value(li) * right_weights.value(ri));
@@ -286,7 +290,10 @@ fn col_indices(batch: &RecordBatch, cols: &[String]) -> DeltaResult<Vec<usize>> 
 
 fn project_columns(batch: &RecordBatch, col_names: &[String]) -> DeltaResult<RecordBatch> {
     let indices = col_indices(batch, col_names)?;
-    let fields: Vec<_> = indices.iter().map(|&i| Arc::new(batch.schema().field(i).clone())).collect();
+    let fields: Vec<_> = indices
+        .iter()
+        .map(|&i| Arc::new(batch.schema().field(i).clone()))
+        .collect();
     let cols: Vec<Arc<dyn Array>> = indices.iter().map(|&i| batch.column(i).clone()).collect();
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?)
 }
@@ -299,29 +306,42 @@ fn keys_match(
     right_indices: &[usize],
     ri: usize,
 ) -> bool {
-    left_indices.iter().zip(right_indices.iter()).all(|(&lk, &rk)| {
-        let la = left.column(lk);
-        let ra = right.column(rk);
-        scalar_eq(la, li, ra, ri)
-    })
+    left_indices
+        .iter()
+        .zip(right_indices.iter())
+        .all(|(&lk, &rk)| {
+            let la = left.column(lk);
+            let ra = right.column(rk);
+            scalar_eq(la, li, ra, ri)
+        })
 }
 
 fn scalar_eq(a: &dyn Array, ai: usize, b: &dyn Array, bi: usize) -> bool {
     use arrow::array::{Int32Array, Int64Array, StringArray};
-    if a.is_null(ai) && b.is_null(bi) { return true; }
-    if a.is_null(ai) || b.is_null(bi) { return false; }
+    if a.is_null(ai) && b.is_null(bi) {
+        return true;
+    }
+    if a.is_null(ai) || b.is_null(bi) {
+        return false;
+    }
     if let (Some(av), Some(bv)) = (
         a.as_any().downcast_ref::<Int64Array>(),
         b.as_any().downcast_ref::<Int64Array>(),
-    ) { return av.value(ai) == bv.value(bi); }
+    ) {
+        return av.value(ai) == bv.value(bi);
+    }
     if let (Some(av), Some(bv)) = (
         a.as_any().downcast_ref::<Int32Array>(),
         b.as_any().downcast_ref::<Int32Array>(),
-    ) { return av.value(ai) == bv.value(bi); }
+    ) {
+        return av.value(ai) == bv.value(bi);
+    }
     if let (Some(av), Some(bv)) = (
         a.as_any().downcast_ref::<StringArray>(),
         b.as_any().downcast_ref::<StringArray>(),
-    ) { return av.value(ai) == bv.value(bi); }
+    ) {
+        return av.value(ai) == bv.value(bi);
+    }
     false
 }
 
@@ -334,12 +354,10 @@ fn build_join_batch(
     weights: Vec<i64>,
     output_schema: &SchemaRef,
 ) -> DeltaResult<DeltaBatch> {
-    let left_indices = arrow::array::UInt64Array::from(
-        left_rows.iter().map(|&r| r as u64).collect::<Vec<_>>(),
-    );
-    let right_indices = arrow::array::UInt64Array::from(
-        right_rows.iter().map(|&r| r as u64).collect::<Vec<_>>(),
-    );
+    let left_indices =
+        arrow::array::UInt64Array::from(left_rows.iter().map(|&r| r as u64).collect::<Vec<_>>());
+    let right_indices =
+        arrow::array::UInt64Array::from(right_rows.iter().map(|&r| r as u64).collect::<Vec<_>>());
 
     let left_cols: Vec<Arc<dyn Array>> = left_data
         .columns()
@@ -436,7 +454,11 @@ mod tests {
         // Tick 2: insert left (orders) — should join with right trace
         let o = DeltaBatch::from_inserts(orders_batch(&[100, 101], &[1, 2])).unwrap();
         let out2 = op.apply(Some(o), None).unwrap();
-        assert_eq!(out2.num_rows(), 2, "two orders should join with two customers");
+        assert_eq!(
+            out2.num_rows(),
+            2,
+            "two orders should join with two customers"
+        );
         assert!(out2.weights().iter().all(|w| w == Some(1)));
     }
 

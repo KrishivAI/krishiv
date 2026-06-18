@@ -22,23 +22,46 @@ fn prune_sent_set(set: &mut indexmap::IndexSet<(JobId, ExecutorId, u64)>) {
 impl Coordinator {
     /// Route a checkpoint ack to the correct per-job coordinator.
     pub fn handle_checkpoint_ack(&mut self, ack: CheckpointAckRequest) -> CheckpointAckResponse {
+        let (res, post_commit) = self.handle_checkpoint_ack_deferred(ack);
+        if let Some((job_id, epoch)) = post_commit {
+            self.on_checkpoint_epoch_committed(&job_id, epoch);
+        }
+        res
+    }
+
+    /// In-memory checkpoint ack processing without the post-commit FS I/O.
+    ///
+    /// Returns `(response, Option<(job_id, epoch)>)` — when the second element
+    /// is `Some`, the caller must invoke [`Self::on_checkpoint_epoch_committed`]
+    /// **outside** any coordinator lock to avoid blocking heartbeats/submissions
+    /// on filesystem I/O (savepoint preservation, stop-with-savepoint).
+    ///
+    /// This is the lock-safe entry point for async callers (barrier dispatch,
+    /// gRPC) that cannot afford to hold the write lock during FS I/O.
+    pub fn handle_checkpoint_ack_deferred(
+        &mut self,
+        ack: CheckpointAckRequest,
+    ) -> (CheckpointAckResponse, Option<(JobId, u64)>) {
         tracing::debug!(
             job_id = %ack.job_id,
             epoch = ack.epoch,
             fencing_token = ack.fencing_token.as_u64(),
-            "handling checkpoint ack"
+            "handling checkpoint ack (deferred)"
         );
 
         let job_id = ack.job_id.clone();
 
-        let res = match self.checkpoint_coordinators.get_mut(&job_id) {
-            None => CheckpointAckResponse::JobNotFound,
+        let (res, post_commit) = match self.checkpoint_coordinators.get_mut(&job_id) {
+            None => (CheckpointAckResponse::JobNotFound, None),
             Some(coord) => {
                 let coordinator_token = coord.fencing_token();
                 if ack.fencing_token.as_u64() != coordinator_token.as_u64() {
-                    return CheckpointAckResponse::StaleFencingToken {
-                        current_token: coordinator_token.as_u64(),
-                    };
+                    return (
+                        CheckpointAckResponse::StaleFencingToken {
+                            current_token: coordinator_token.as_u64(),
+                        },
+                        None,
+                    );
                 }
 
                 let current_epoch = coord.current_epoch();
@@ -48,18 +71,22 @@ impl Coordinator {
                         CHECKPOINT_EPOCHS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                         record_checkpoint_epoch(job_id.as_str(), ack.epoch);
                         krishiv_metrics::global_metrics().inc_checkpoint_committed(job_id.as_str());
-                        self.on_checkpoint_epoch_committed(&job_id, ack.epoch);
-                        CheckpointAckResponse::Accepted
+                        // Defer post-commit FS I/O to the caller.
+                        (CheckpointAckResponse::Accepted, Some((job_id, ack.epoch)))
                     }
-                    Ok(false) => CheckpointAckResponse::StaleEpoch { current_epoch },
-                    Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
+                    // Ack accepted but quorum not yet reached — this is NOT
+                    // stale. Return Accepted so barrier fanout doesn't log
+                    // spurious rejections for N-1 of N acks. Matches the async
+                    // path (coordinator_sharded.rs handle_ack Ok(false)).
+                    Ok(false) => (CheckpointAckResponse::Accepted, None),
+                    Err(_) => (CheckpointAckResponse::StaleEpoch { current_epoch }, None),
                 }
             }
         };
 
         self.notify.notify_waiters();
 
-        res
+        (res, post_commit)
     }
 
     /// Post-commit processing for a durably committed checkpoint epoch.
@@ -186,7 +213,6 @@ impl Coordinator {
                     );
                 }
 
-                let current_epoch = coord.current_epoch();
                 let is_quorum = coord.receive_ack_async(ack.clone()).await;
                 // Release the borrow on `self.checkpoint_coordinators` before
                 // calling self.* methods.
@@ -203,7 +229,9 @@ impl Coordinator {
                     krishiv_metrics::global_metrics().inc_checkpoint_committed(job_id.as_str());
                     (CheckpointAckResponse::Accepted, pending)
                 } else {
-                    (CheckpointAckResponse::StaleEpoch { current_epoch }, None)
+                    // Ack accepted but quorum not yet reached — not stale.
+                    // Matches the async sharded path (coordinator_sharded.rs).
+                    (CheckpointAckResponse::Accepted, None)
                 }
             }
         };

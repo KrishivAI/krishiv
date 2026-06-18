@@ -67,6 +67,9 @@ struct IncrementalFlowInner {
     // Streaming → IVM bridge: previous materialized snapshot per source.
     // Used by feed_stream_output to differentiate consecutive snapshots.
     streaming_prev_snapshots: HashMap<String, RecordBatch>,
+
+    // Opt-in provenance tracking: input row hash → output row hashes.
+    provenance: Option<crate::provenance::ProvenanceIndex>,
 }
 
 // ── IncrementalFlow ───────────────────────────────────────────────────────────
@@ -92,8 +95,52 @@ impl IncrementalFlow {
                 delta_checkpoint_enabled: false,
                 checkpoint_deltas: HashMap::new(),
                 streaming_prev_snapshots: HashMap::new(),
+                provenance: None,
             })),
         }
+    }
+
+    /// Enable opt-in provenance tracking (input row hash → output row hashes).
+    ///
+    /// Once enabled, each `step_datafusion` call records the mapping from every
+    /// input insertion hash to the output hashes produced that tick. Use
+    /// `query_provenance` to look up which output rows a given input row produced,
+    /// enabling automatic retraction without Z-set algebra.
+    pub fn enable_provenance_tracking(&self) -> IvmResult<()> {
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        inner.provenance = Some(crate::provenance::ProvenanceIndex::new());
+        Ok(())
+    }
+
+    /// Query the provenance index for output hashes derived from `input_hash`.
+    pub fn query_provenance(
+        &self,
+        input_hash: u64,
+    ) -> IvmResult<Option<AHashSet<u64>>> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner
+            .provenance
+            .as_ref()
+            .and_then(|p| p.outputs_for(input_hash))
+            .cloned())
+    }
+
+    /// Remove the provenance record for `input_hash` (call after retracting its outputs).
+    pub fn forget_provenance(&self, input_hash: u64) -> IvmResult<()> {
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        if let Some(ref mut p) = inner.provenance {
+            p.forget(input_hash);
+        }
+        Ok(())
+    }
+
+    /// Take all pending input deltas (for external dispatch, e.g. executor fragments).
+    ///
+    /// Extracts and clears the current pending queue without running a tick.
+    /// Use this to encode a `delta:step:` fragment for executor-side execution.
+    pub fn take_pending(&self) -> IvmResult<HashMap<String, Vec<DeltaBatch>>> {
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        Ok(std::mem::take(&mut inner.pending))
     }
 
     /// Enable content-addressed dedup for all sources.
@@ -407,6 +454,17 @@ impl IncrementalFlow {
         let mut total_output_rows = 0usize;
         let mut active_views = 0usize;
 
+        // Provenance tracking: pre-compute input hashes when enabled.
+        let input_hashes: Option<Vec<u64>> = if inner.provenance.is_some() {
+            let hashes = inputs
+                .values()
+                .flat_map(|delta| crate::provenance::hash_all_rows(&delta.data_batch()))
+                .collect();
+            Some(hashes)
+        } else {
+            None
+        };
+
         for view_name in &dirty_views {
             // Map lowercase back to original name for registry lookup.
             let original = topo.iter().find(|n| n.to_lowercase() == *view_name);
@@ -426,6 +484,17 @@ impl IncrementalFlow {
             if !delta.is_empty() {
                 total_output_rows += delta.num_rows();
                 active_views += 1;
+
+                // Record provenance: each input hash → all output insertion hashes.
+                if let (Some(input_hs), Some(prov)) =
+                    (&input_hashes, &mut inner.provenance)
+                {
+                    let output_hs = crate::provenance::hash_all_rows(&delta.data_batch());
+                    for &ih in input_hs {
+                        prov.record_many(ih, output_hs.iter().copied());
+                    }
+                }
+
                 let _ = view.publish_output(delta);
             }
         }
@@ -806,4 +875,62 @@ fn delta_err(e: DeltaError) -> IvmError {
 
 fn lock_err<T>(_: T) -> IvmError {
     IvmError::execution("incremental flow lock poisoned")
+}
+
+// ── Fragment encoding helpers (for Gap-2 executor dispatch) ───────────────────
+
+/// Encode pending deltas and view specs into a `delta:step:` fragment body.
+///
+/// Format: `delta:step:{job_id}|{pending_deltas_json}|{view_specs_json}`
+///
+/// The resulting string can be dispatched to an executor that runs
+/// `execute_ivm_fragment` to perform the SQL step remotely.
+pub fn encode_ivm_step_fragment(
+    job_id: &str,
+    pending: &HashMap<String, DeltaBatch>,
+    specs: &[IncrementalViewSpec],
+) -> IvmResult<String> {
+    use base64::Engine;
+
+    // Encode deltas as JSON array of {source, delta_b64}.
+    let delta_entries: Vec<serde_json::Value> = pending
+        .iter()
+        .map(|(source, delta)| {
+            let ipc = serialize_delta_batch(delta).map_err(delta_err)?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&ipc);
+            Ok(serde_json::json!({ "source": source, "delta_b64": b64 }))
+        })
+        .collect::<IvmResult<_>>()?;
+    let deltas_json = serde_json::to_string(&delta_entries)
+        .map_err(|e| IvmError::execution(e.to_string()))?;
+
+    // Encode view specs as JSON array.
+    let spec_entries: Vec<serde_json::Value> = specs
+        .iter()
+        .map(|s| {
+            let fields: Vec<serde_json::Value> = s
+                .output_schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "name": f.name(),
+                        "data_type": format!("{:?}", f.data_type()),
+                        "nullable": f.is_nullable()
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "name": s.name,
+                "body_sql": s.body_sql,
+                "output_schema_fields": fields,
+                "is_materialized": s.is_materialized,
+                "is_recursive": s.is_recursive
+            })
+        })
+        .collect();
+    let specs_json = serde_json::to_string(&spec_entries)
+        .map_err(|e| IvmError::execution(e.to_string()))?;
+
+    Ok(format!("delta:step:{job_id}|{deltas_json}|{specs_json}"))
 }

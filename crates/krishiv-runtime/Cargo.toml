@@ -16,6 +16,7 @@ krishiv-common = { path = "../krishiv-common" }
 krishiv-ivm = { path = "../krishiv-ivm" }
 krishiv-sql = { path = "../krishiv-sql" }
 dashmap = { workspace = true }
+datafusion = { workspace = true }
 reqwest = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }

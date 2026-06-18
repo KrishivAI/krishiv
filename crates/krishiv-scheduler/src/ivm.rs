@@ -25,8 +25,12 @@ impl IvmJobRegistry {
 
     /// Create a new IVM job. Idempotent: returns `Ok` if the job already exists.
     pub fn create(&self, job_id: String) -> Result<(), IvmError> {
-        let mut jobs = self.jobs.lock().map_err(|_| IvmError::execution("registry lock poisoned"))?;
-        jobs.entry(job_id).or_insert_with(|| Arc::new(IncrementalFlow::new()));
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| IvmError::execution("registry lock poisoned"))?;
+        jobs.entry(job_id)
+            .or_insert_with(|| Arc::new(IncrementalFlow::new()));
         Ok(())
     }
 
@@ -37,12 +41,18 @@ impl IvmJobRegistry {
 
     /// Delete a job. Returns `true` if the job existed.
     pub fn delete(&self, job_id: &str) -> bool {
-        self.jobs.lock().map(|mut j| j.remove(job_id).is_some()).unwrap_or(false)
+        self.jobs
+            .lock()
+            .map(|mut j| j.remove(job_id).is_some())
+            .unwrap_or(false)
     }
 
     /// List all job IDs.
     pub fn job_ids(&self) -> Vec<String> {
-        self.jobs.lock().map(|j| j.keys().cloned().collect()).unwrap_or_default()
+        self.jobs
+            .lock()
+            .map(|j| j.keys().cloned().collect())
+            .unwrap_or_default()
     }
 }
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::PyImportError;
 use pyo3::prelude::*;
-use pyo3_arrow::PyRecordBatch;
+use crate::arrow_compat::PyArrowBatch;
 
 /// One record batch from a query or stream window.
 #[pyclass(name = "Batch", from_py_object)]
@@ -30,7 +30,7 @@ impl PyBatch {
 impl PyBatch {
     #[new]
     fn py_new(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let py_batch: PyRecordBatch = obj.extract()?;
+        let py_batch: PyArrowBatch = obj.extract()?;
         Ok(Self::from_record_batch(py_batch.into_inner()))
     }
     #[getter]
@@ -45,7 +45,7 @@ impl PyBatch {
 
     pub fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let batch = (*self.batch).clone();
-        let py_batch = PyRecordBatch::new(batch);
+        let py_batch = PyArrowBatch::new(batch);
         Ok(py_batch.into_pyobject(py)?.into_any().unbind())
     }
 

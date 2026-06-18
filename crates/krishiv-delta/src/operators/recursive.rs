@@ -21,8 +21,7 @@ pub const DEFAULT_MAX_ITERATIONS: usize = 1000;
 
 /// A recursive step function: given the current delta batch and the accumulated
 /// state, produce the next delta batch.
-pub type RecursiveStepFn =
-    Box<dyn FnMut(&DeltaBatch, &DeltaBatch) -> DeltaResult<DeltaBatch>>;
+pub type RecursiveStepFn = Box<dyn FnMut(&DeltaBatch, &DeltaBatch) -> DeltaResult<DeltaBatch>>;
 
 /// Recursive incremental view operator.
 ///
@@ -134,12 +133,15 @@ mod tests {
         ]));
         let empty = DeltaBatch::empty(schema).unwrap();
         let mut op = RecursiveOp::with_default_limit(empty.clone());
-        let out = op.apply(empty, |_, _| Ok(DeltaBatch::empty(
-            Arc::new(Schema::new(vec![
-                Field::new("src", DataType::Int32, false),
-                Field::new("dst", DataType::Int32, false),
-            ]))
-        ).unwrap())).unwrap();
+        let out = op
+            .apply(empty, |_, _| {
+                Ok(DeltaBatch::empty(Arc::new(Schema::new(vec![
+                    Field::new("src", DataType::Int32, false),
+                    Field::new("dst", DataType::Int32, false),
+                ])))
+                .unwrap())
+            })
+            .unwrap();
         assert!(out.is_empty());
     }
 

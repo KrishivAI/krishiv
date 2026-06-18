@@ -31,7 +31,9 @@ pub struct IncrementalDistinctOp {
 
 impl IncrementalDistinctOp {
     pub fn new() -> Self {
-        Self { counts: AHashMap::new() }
+        Self {
+            counts: AHashMap::new(),
+        }
     }
 
     /// Apply one tick of DISTINCT to the incoming delta.
@@ -124,9 +126,8 @@ fn build_output(
         row_indices.push(0);
     }
 
-    let take_indices = arrow::array::UInt64Array::from(
-        row_indices.iter().map(|&r| r as u64).collect::<Vec<_>>(),
-    );
+    let take_indices =
+        arrow::array::UInt64Array::from(row_indices.iter().map(|&r| r as u64).collect::<Vec<_>>());
 
     let mut cols: Vec<Arc<dyn Array>> = original_data
         .columns()
@@ -147,16 +148,32 @@ fn build_output(
 fn scalar_to_string(arr: &dyn Array, row: usize) -> String {
     use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     "NULL".to_string()
 }

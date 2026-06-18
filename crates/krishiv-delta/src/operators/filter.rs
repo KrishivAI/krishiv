@@ -54,13 +54,22 @@ pub enum FilterValue {
 
 impl FilterOp {
     pub fn col_gt(column: impl Into<String>, threshold: i64) -> Self {
-        Self { column: column.into(), value: FilterValue::Int64Gt(threshold) }
+        Self {
+            column: column.into(),
+            value: FilterValue::Int64Gt(threshold),
+        }
     }
     pub fn col_ge(column: impl Into<String>, threshold: i64) -> Self {
-        Self { column: column.into(), value: FilterValue::Int64Ge(threshold) }
+        Self {
+            column: column.into(),
+            value: FilterValue::Int64Ge(threshold),
+        }
     }
     pub fn col_eq_str(column: impl Into<String>, val: impl Into<String>) -> Self {
-        Self { column: column.into(), value: FilterValue::StringEq(val.into()) }
+        Self {
+            column: column.into(),
+            value: FilterValue::StringEq(val.into()),
+        }
     }
 
     pub fn apply(&self, batch: DeltaBatch) -> DeltaResult<DeltaBatch> {
@@ -79,7 +88,9 @@ impl FilterOp {
                         .downcast_ref::<arrow::array::Int64Array>()
                         .ok_or_else(|| DeltaError::Operator("expected Int64 column".into()))?;
                     let t = *threshold;
-                    arr.iter().map(|v| Some(v.unwrap_or(i64::MIN) > t)).collect()
+                    arr.iter()
+                        .map(|v| Some(v.unwrap_or(i64::MIN) > t))
+                        .collect()
                 }
                 FilterValue::Int64Ge(threshold) => {
                     let arr = col
@@ -87,7 +98,9 @@ impl FilterOp {
                         .downcast_ref::<arrow::array::Int64Array>()
                         .ok_or_else(|| DeltaError::Operator("expected Int64 column".into()))?;
                     let t = *threshold;
-                    arr.iter().map(|v| Some(v.unwrap_or(i64::MIN) >= t)).collect()
+                    arr.iter()
+                        .map(|v| Some(v.unwrap_or(i64::MIN) >= t))
+                        .collect()
                 }
                 FilterValue::Int64Lt(threshold) => {
                     let arr = col
@@ -95,7 +108,9 @@ impl FilterOp {
                         .downcast_ref::<arrow::array::Int64Array>()
                         .ok_or_else(|| DeltaError::Operator("expected Int64 column".into()))?;
                     let t = *threshold;
-                    arr.iter().map(|v| Some(v.unwrap_or(i64::MIN) < t)).collect()
+                    arr.iter()
+                        .map(|v| Some(v.unwrap_or(i64::MIN) < t))
+                        .collect()
                 }
                 FilterValue::Int64Le(threshold) => {
                     let arr = col
@@ -103,7 +118,9 @@ impl FilterOp {
                         .downcast_ref::<arrow::array::Int64Array>()
                         .ok_or_else(|| DeltaError::Operator("expected Int64 column".into()))?;
                     let t = *threshold;
-                    arr.iter().map(|v| Some(v.unwrap_or(i64::MAX) <= t)).collect()
+                    arr.iter()
+                        .map(|v| Some(v.unwrap_or(i64::MAX) <= t))
+                        .collect()
                 }
                 FilterValue::Int64Eq(expected) => {
                     let arr = col
@@ -118,7 +135,9 @@ impl FilterOp {
                         .as_any()
                         .downcast_ref::<arrow::array::StringArray>()
                         .ok_or_else(|| DeltaError::Operator("expected String column".into()))?;
-                    arr.iter().map(|v| Some(v == Some(expected.as_str()))).collect()
+                    arr.iter()
+                        .map(|v| Some(v == Some(expected.as_str())))
+                        .collect()
                 }
             };
             Ok(mask)
@@ -136,9 +155,11 @@ mod tests {
     use std::sync::Arc;
 
     fn amount_batch(amounts: &[i64]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("amount", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Int64,
+            false,
+        )]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(amounts.to_vec()))]).unwrap()
     }
 

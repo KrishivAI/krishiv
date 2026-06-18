@@ -357,12 +357,16 @@ fn checkpoint_coordinator_rejects_non_quorum_ack_as_stale_epoch() {
     }
 
     // Send one ack — NOT enough for quorum (needs 2).
+    // The ack is accepted (recorded in pending_acks) but quorum is not reached.
+    // Per the corrected semantics (matching the async sharded path), a
+    // non-quorum ack returns Accepted, not StaleEpoch. StaleEpoch is reserved
+    // for actual Err results (epoch mismatch, fencing failure, etc.).
     let ack = make_ack(&job_id, "task-1", 1, FencingToken::initial(), None);
     let response = coordinator.handle_checkpoint_ack(ack);
     assert_eq!(
         response,
-        CheckpointAckResponse::StaleEpoch { current_epoch: 1 },
-        "single ack with 2 expected tasks must return StaleEpoch, not Accepted"
+        CheckpointAckResponse::Accepted,
+        "single ack with 2 expected tasks must return Accepted (ack recorded, quorum pending)"
     );
 
     // Notify entries must NOT have been cleared by a non-quorum ack.
@@ -440,6 +444,264 @@ async fn shared_submit_job_refreshes_checkpoint_inner() {
     assert!(
         checkpoint_inner.coordinators.contains_key(&job_id),
         "SharedCoordinator::submit_job must keep CheckpointInner current"
+    );
+}
+
+// ── Tier 1A regression tests ────────────────────────────────────────────────
+
+/// Regression for fix #4: `Ok(false)` (ack accepted, quorum not reached) must
+/// return `Accepted`, not `StaleEpoch`. The async sharded path already does
+/// this; the sync path was returning `StaleEpoch`, causing barrier fanout to
+/// log N-1 spurious "rejected" per checkpoint round.
+#[test]
+fn non_quorum_ack_returns_accepted_not_stale_epoch() {
+    let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+    let storage_path = storage.base_dir().to_string_lossy().to_string();
+
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-nq-accepted").unwrap());
+    coordinator
+        .register_executor(ExecutorDescriptor::new(
+            ExecutorId::try_new("exec-nq-accepted").unwrap(),
+            "pod-nq-accepted",
+            1,
+        ))
+        .unwrap();
+
+    let job_id = JobId::try_new("job-nq-accepted").unwrap();
+    let spec = JobSpec::new(job_id.clone(), "nq-accepted", JobKind::Streaming)
+        .with_checkpoint(5000, &storage_path)
+        .with_stage(
+            StageSpec::new(StageId::try_new("stage-nq-a").unwrap(), "stage")
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("task-nq-1").unwrap(),
+                    "stream:tw",
+                ))
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("task-nq-2").unwrap(),
+                    "stream:tw",
+                )),
+        );
+    coordinator.submit_job(spec).unwrap();
+
+    {
+        let coord = coordinator.checkpoint_coordinator_mut(&job_id).unwrap();
+        coord.set_expected_task_count(2);
+        coord.initiate().unwrap();
+    }
+
+    // First ack: accepted but not quorum.
+    let ack1 = make_ack(&job_id, "task-nq-1", 1, FencingToken::initial(), None);
+    let response1 = coordinator.handle_checkpoint_ack(ack1);
+    assert_eq!(
+        response1,
+        CheckpointAckResponse::Accepted,
+        "non-quorum ack must return Accepted (ack recorded, quorum pending)"
+    );
+
+    // Second ack: quorum reached, still Accepted.
+    let ack2 = make_ack(&job_id, "task-nq-2", 1, FencingToken::initial(), None);
+    let response2 = coordinator.handle_checkpoint_ack(ack2);
+    assert_eq!(
+        response2,
+        CheckpointAckResponse::Accepted,
+        "quorum-reaching ack must return Accepted"
+    );
+}
+
+/// Regression for fix #4 (deferred variant): `handle_checkpoint_ack_deferred`
+/// returns `(Accepted, Some(_))` on quorum, `(Accepted, None)` on non-quorum,
+/// and never returns `StaleEpoch` for `Ok(false)`.
+#[test]
+fn deferred_ack_returns_post_commit_only_on_quorum() {
+    let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+    let storage_path = storage.base_dir().to_string_lossy().to_string();
+
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-deferred").unwrap());
+    coordinator
+        .register_executor(ExecutorDescriptor::new(
+            ExecutorId::try_new("exec-deferred").unwrap(),
+            "pod-deferred",
+            1,
+        ))
+        .unwrap();
+
+    let job_id = JobId::try_new("job-deferred").unwrap();
+    let spec = JobSpec::new(job_id.clone(), "deferred", JobKind::Streaming)
+        .with_checkpoint(5000, &storage_path)
+        .with_stage(
+            StageSpec::new(StageId::try_new("stage-def").unwrap(), "stage")
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("task-def-1").unwrap(),
+                    "stream:tw",
+                ))
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("task-def-2").unwrap(),
+                    "stream:tw",
+                )),
+        );
+    coordinator.submit_job(spec).unwrap();
+
+    {
+        let coord = coordinator.checkpoint_coordinator_mut(&job_id).unwrap();
+        coord.set_expected_task_count(2);
+        coord.initiate().unwrap();
+    }
+
+    // Non-quorum: no post-commit work.
+    let ack1 = make_ack(&job_id, "task-def-1", 1, FencingToken::initial(), None);
+    let (response1, post1) = coordinator.handle_checkpoint_ack_deferred(ack1);
+    assert_eq!(response1, CheckpointAckResponse::Accepted);
+    assert!(post1.is_none(), "non-quorum ack must not trigger post-commit");
+
+    // Quorum: post-commit work returned for caller to execute outside lock.
+    let ack2 = make_ack(&job_id, "task-def-2", 1, FencingToken::initial(), None);
+    let (response2, post2) = coordinator.handle_checkpoint_ack_deferred(ack2);
+    assert_eq!(response2, CheckpointAckResponse::Accepted);
+    assert_eq!(
+        post2,
+        Some((job_id.clone(), 1)),
+        "quorum ack must return post-commit work"
+    );
+}
+
+/// Regression for fix #5: circuit-breaker assignment clearing is synchronous.
+/// When an executor exceeds the failure threshold, its assignments are cleared
+/// inline under the coordinator write lock — no `tokio::spawn` race.
+#[test]
+fn circuit_breaker_clears_assignments_synchronously() {
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-cb-sync").unwrap());
+    let exec_id = ExecutorId::try_new("exec-cb-bad").unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-cb-bad", 2))
+        .unwrap();
+
+    let job_id = JobId::try_new("job-cb-sync").unwrap();
+    let spec = JobSpec::new(job_id.clone(), "cb-sync", JobKind::Batch)
+        .with_stage(
+            StageSpec::new(StageId::try_new("stage-cb").unwrap(), "stage")
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("task-cb-1").unwrap(),
+                    "batch",
+                ))
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("task-cb-2").unwrap(),
+                    "batch",
+                )),
+        );
+    coordinator.submit_job(spec).unwrap();
+
+    // Simulate assigning tasks to the bad executor.
+    {
+        let jc = coordinator.job_coordinator(&job_id).unwrap();
+        let mut record = jc.write_record();
+        for stage in record.stages_mut() {
+            for task in stage.tasks_mut() {
+                task.assigned_executor = Some(exec_id.clone());
+                task.state = TaskState::Running;
+                task.launch_in_flight = false;
+                task.attempt = 1;
+            }
+        }
+    }
+
+    // Directly trigger the circuit breaker by recording failures up to the
+    // threshold, then verify the sync clearing path clears assignments.
+    let threshold = coordinator.config.circuit_breaker_failure_threshold();
+    let mut exceeded = false;
+    for _ in 0..threshold {
+        exceeded = coordinator.executors.record_task_failure(&exec_id, threshold);
+    }
+    assert!(exceeded, "circuit breaker must trip after threshold failures");
+
+    // Call the sync clearing method directly (as the fixed code does).
+    let jc = coordinator.job_coordinator(&job_id).unwrap();
+    let cleared = jc.clear_assignments_for_bad_executor_and_count_sync(&exec_id);
+    assert_eq!(cleared, 2, "both tasks must be cleared from the bad executor");
+
+    // Verify assignments are cleared.
+    let record = jc.read_record();
+    for stage in record.stages() {
+        for task in stage.tasks() {
+            assert_ne!(
+                task.assigned_executor(),
+                Some(&exec_id),
+                "bad executor assignments must be cleared after circuit breaker"
+            );
+        }
+    }
+}
+
+/// Regression for fix #3: stall detection uses `last_progress_ms` (refreshed
+/// on status updates) instead of only `assigned_at_ms`. A task that reports
+/// progress (output metadata) within the stall window must NOT be flagged.
+#[test]
+fn stall_detection_respects_progress_updates() {
+    use krishiv_common::async_util::unix_now_ms;
+
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-stall-progress").unwrap());
+    coordinator.config = coordinator
+        .config
+        .with_task_stall_timeout_ms(60_000); // 1 minute stall timeout
+
+    let exec_id = ExecutorId::try_new("exec-stall").unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-stall", 1))
+        .unwrap();
+
+    let job_id = JobId::try_new("job-stall-progress").unwrap();
+    let spec = JobSpec::new(job_id.clone(), "stall-progress", JobKind::Batch)
+        .with_stage(
+            StageSpec::new(StageId::try_new("stage-stall").unwrap(), "stage")
+                .with_task(TaskSpec::new(
+                    TaskId::try_new("task-stall-1").unwrap(),
+                    "batch",
+                )),
+        );
+    coordinator.submit_job(spec).unwrap();
+
+    // Simulate a task that was assigned 2 minutes ago (past the 1-min timeout).
+    {
+        let jc = coordinator.job_coordinator(&job_id).unwrap();
+        let mut record = jc.write_record();
+        for stage in record.stages_mut() {
+            for task in stage.tasks_mut() {
+                task.assigned_executor = Some(exec_id.clone());
+                task.state = TaskState::Running;
+                task.launch_in_flight = false;
+                let two_min_ago = u64::try_from(unix_now_ms()).unwrap_or(0) - 120_000;
+                task.assigned_at_ms = Some(two_min_ago);
+                // last_progress_ms is None — no progress reported.
+                task.last_progress_ms = None;
+            }
+        }
+    }
+
+    // Should be flagged as stalled (no progress, assigned 2 min ago).
+    let stalled = coordinator.collect_stall_cancel_work();
+    assert_eq!(stalled.len(), 1, "task with no progress for >1 min must be flagged");
+
+    // Now simulate a progress update (output metadata) that refreshes
+    // last_progress_ms to "just now".
+    {
+        let jc = coordinator.job_coordinator(&job_id).unwrap();
+        let mut record = jc.write_record();
+        for stage in record.stages_mut() {
+            for task in stage.tasks_mut() {
+                task.last_progress_ms =
+                    Some(u64::try_from(unix_now_ms()).unwrap_or(0));
+            }
+        }
+    }
+
+    // Should NOT be flagged — progress was reported recently.
+    let stalled = coordinator.collect_stall_cancel_work();
+    assert!(
+        stalled.is_empty(),
+        "task with recent progress must NOT be flagged as stalled"
     );
 }
 

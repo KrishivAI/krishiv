@@ -829,6 +829,138 @@ struct IvmRestoreBody {
     checkpoint_b64: String,
 }
 
+// ── Delta checkpoint ───────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct IvmCheckpointDeltaResponse {
+    checkpoint_delta_b64: String,
+}
+
+/// Retrieve a delta checkpoint from a remote IVM job (deltas since last call).
+pub async fn execute_coordinator_ivm_checkpoint_delta(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<Vec<u8>> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let resp = apply_coordinator_bearer(
+        client.post(format!("{base}/api/v1/ivm/jobs/{job_id}/checkpoint-delta")),
+    )
+    .json(&serde_json::Value::Null)
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm checkpoint-delta: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm checkpoint-delta HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: IvmCheckpointDeltaResponse = resp
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm checkpoint-delta decode: {e}")))?;
+    base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &parsed.checkpoint_delta_b64,
+    )
+    .map_err(|e| RuntimeError::transport(format!("checkpoint-delta base64 decode: {e}")))
+}
+
+#[derive(serde::Serialize)]
+struct IvmRestoreDeltaBody {
+    checkpoint_delta_b64: String,
+}
+
+/// Apply delta checkpoint bytes on a remote IVM job.
+pub async fn execute_coordinator_ivm_restore_delta(
+    coordinator_http: &str,
+    job_id: &str,
+    bytes: &[u8],
+) -> RuntimeResult<()> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let body = IvmRestoreDeltaBody {
+        checkpoint_delta_b64: b64,
+    };
+    let resp = apply_coordinator_bearer(client.post(format!(
+        "{base}/api/v1/ivm/jobs/{job_id}/restore-delta"
+    )))
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm restore-delta: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm restore-delta HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
+}
+
+// ── Streaming → IVM bridge ─────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct IvmStreamBridgeBody {
+    snapshot_ipc_b64: String,
+}
+
+/// Push streaming micro-batch snapshots to an IVM source via the stream-bridge endpoint.
+///
+/// The coordinator calls `feed_stream_output` which differentiates consecutive snapshots
+/// and pushes the resulting delta to the IVM source.
+pub async fn execute_coordinator_ivm_stream_bridge(
+    coordinator_http: &str,
+    job_id: &str,
+    source_name: &str,
+    batches: &[arrow::record_batch::RecordBatch],
+) -> RuntimeResult<()> {
+    use arrow::ipc::writer::StreamWriter;
+
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+
+    // Encode all batches as a single Arrow IPC stream.
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .ok_or_else(|| RuntimeError::transport("stream-bridge: no batches provided"))?;
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &schema)
+            .map_err(|e| RuntimeError::transport(format!("stream-bridge IPC writer: {e}")))?;
+        for batch in batches {
+            writer
+                .write(batch)
+                .map_err(|e| RuntimeError::transport(format!("stream-bridge IPC write: {e}")))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| RuntimeError::transport(format!("stream-bridge IPC finish: {e}")))?;
+    }
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buf);
+
+    let body = IvmStreamBridgeBody {
+        snapshot_ipc_b64: b64,
+    };
+    let resp = apply_coordinator_bearer(client.post(format!(
+        "{base}/api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-bridge"
+    )))
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm stream-bridge: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm stream-bridge HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
+}
+
 /// Restore an IVM job on the coordinator from checkpoint bytes.
 pub async fn execute_coordinator_ivm_restore(
     coordinator_http: &str,

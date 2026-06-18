@@ -1166,7 +1166,9 @@ impl Coordinator {
                         continue;
                     }
                     if let Some(assigned_ms) = task.assigned_at_ms
-                        && now_ms.saturating_sub(assigned_ms) > stall_timeout_ms
+                        && now_ms.saturating_sub(
+                            task.last_progress_ms.unwrap_or(assigned_ms),
+                        ) > stall_timeout_ms
                     {
                         let executor_endpoint = task
                             .assigned_executor()
@@ -1218,6 +1220,7 @@ impl Coordinator {
                     ));
                     task.launch_in_flight = false;
                     task.assigned_at_ms = None;
+                    task.last_progress_ms = None;
                 }
             }
         }

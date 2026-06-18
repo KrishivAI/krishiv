@@ -6,10 +6,10 @@
 
 pub mod blocking;
 pub mod catalog;
-pub mod incremental_flow;
 pub mod dataframe;
 pub mod error;
 pub mod expression;
+pub mod incremental_flow;
 pub mod io;
 pub mod prepared;
 pub mod process;
@@ -46,6 +46,7 @@ pub use expression::{
     EXPRESSION_FORMAT_VERSION, Expr, ExprDataType, ExprField, IntervalUnit, Literal, NullOrdering,
     ScalarValue, SortDirection, TimeUnit, avg, col, count, count_all, function, lit, max, min, sum,
 };
+pub use incremental_flow::{IncrementalFlow, StepSummary};
 pub use io::{
     CsvReadOptions, DataFormat, DataFrameReader, DataFrameWriter, FileReadOptions,
     FileWriteOptions, JsonReadOptions, MalformedRecordPolicy, ParquetReadOptions,
@@ -57,7 +58,6 @@ pub use krishiv_connectors::{
 pub use prepared::PreparedStatement;
 pub use process::{apply_async_io, apply_process_function};
 pub use query::{QueryCompletion, QueryHandle, QueryId, QueryProgress, QueryStatus};
-pub use incremental_flow::{IncrementalFlow, StepSummary};
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
 pub use streaming_builder::{

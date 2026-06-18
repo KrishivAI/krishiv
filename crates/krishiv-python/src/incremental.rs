@@ -283,50 +283,50 @@ impl PyIncrementalFlow {
                 let py_cb = PyDeltaBatch { inner: cb };
                 if let Err(e) = py_inputs.set_item(&name, Py::new(py, py_cb).expect("Py::new")) {
                     callback_err = Some(e);
-                    return Err(krishiv_api::KrishivError::Runtime {
-                        message: "step_with: failed to build input dict".into(),
-                    });
+                    return Err(krishiv_ivm::IvmError::Execution(
+                        "step_with: failed to build input dict".into(),
+                    ));
                 }
             }
             // Call the Python function
             let py_result = match compute.call1((py_inputs,)) {
                 Err(e) => {
                     callback_err = Some(e);
-                    return Err(krishiv_api::KrishivError::Runtime {
-                        message: "step_with: callback raised an exception".into(),
-                    });
+                    return Err(krishiv_ivm::IvmError::Execution(
+                        "step_with: callback raised an exception".into(),
+                    ));
                 }
                 Ok(v) => v,
             };
             // Expect a dict[str, DeltaBatch] return value
-            let py_dict = match py_result.downcast::<pyo3::types::PyDict>() {
+            let py_dict = match py_result.cast_into::<pyo3::types::PyDict>() {
                 Err(_) => {
                     callback_err = Some(PyRuntimeError::new_err(
                         "step_with callback must return a dict[str, DeltaBatch]",
                     ));
-                    return Err(krishiv_api::KrishivError::Runtime {
-                        message: "step_with: callback did not return a dict".into(),
-                    });
+                    return Err(krishiv_ivm::IvmError::Execution(
+                        "step_with: callback did not return a dict".into(),
+                    ));
                 }
                 Ok(d) => d,
             };
             let mut out: HashMap<String, DeltaBatch> = HashMap::new();
             for (k, v) in py_dict.iter() {
-                let view_name: String = match k.extract() {
+                let view_name: String = match k.extract::<String>() {
                     Err(e) => {
-                        callback_err = Some(e);
-                        return Err(krishiv_api::KrishivError::Runtime {
-                            message: "step_with: dict key must be str".into(),
-                        });
+                        callback_err = Some(e.into());
+                        return Err(krishiv_ivm::IvmError::Execution(
+                            "step_with: dict key must be str".into(),
+                        ));
                     }
                     Ok(s) => s,
                 };
-                let py_cb: PyRef<'_, PyDeltaBatch> = match v.extract() {
+                let py_cb: PyRef<'_, PyDeltaBatch> = match v.extract::<PyRef<'_, PyDeltaBatch>>() {
                     Err(e) => {
-                        callback_err = Some(e);
-                        return Err(krishiv_api::KrishivError::Runtime {
-                            message: "step_with: dict value must be DeltaBatch".into(),
-                        });
+                        callback_err = Some(e.into());
+                        return Err(krishiv_ivm::IvmError::Execution(
+                            "step_with: dict value must be DeltaBatch".into(),
+                        ));
                     }
                     Ok(c) => c,
                 };

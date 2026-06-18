@@ -135,6 +135,18 @@ impl JobCoordinator {
         &self,
         executor_id: &ExecutorId,
     ) -> usize {
+        self.clear_assignments_for_bad_executor_and_count_sync(executor_id)
+    }
+
+    /// Sync variant — safe to call under the coordinator write lock.
+    ///
+    /// Clears `assigned_executor` and `launch_in_flight` for every task
+    /// assigned to `executor_id`, preventing the task-launch loop from
+    /// re-pushing work to a bad executor before the clearing completes.
+    pub fn clear_assignments_for_bad_executor_and_count_sync(
+        &self,
+        executor_id: &ExecutorId,
+    ) -> usize {
         let mut job = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let mut count = 0;
         for stage in job.stages_mut() {

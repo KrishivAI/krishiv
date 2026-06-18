@@ -861,10 +861,14 @@ pub struct TaskRecord {
     /// Last committed source offset reported by the executor for this streaming task.
     /// Connector-specific encoding; `None` for batch tasks.
     pub(crate) last_source_offset: Option<Vec<u8>>,
-    /// Wall-clock timestamp (ms since UNIX epoch) when the task most recently
     /// Wall-clock ms when the task most recently entered Running state.
     /// Used by stall detection to identify hung tasks.
     pub(crate) assigned_at_ms: Option<u64>,
+    /// Wall-clock ms of the most recent progress signal (heartbeat, output
+    /// metadata, or streaming progress report). Falls back to `assigned_at_ms`
+    /// when no progress has been reported. Used by stall detection so that
+    /// long-running tasks that are actively making progress are not killed.
+    pub(crate) last_progress_ms: Option<u64>,
 }
 
 impl TaskRecord {
@@ -882,6 +886,7 @@ impl TaskRecord {
             last_watermark_ms: None,
             last_source_offset: None,
             assigned_at_ms: None,
+            last_progress_ms: None,
         }
     }
 
@@ -1005,12 +1010,21 @@ impl TaskRecord {
             self.last_failure_reason = update.message().map(ToOwned::to_owned);
         }
         // Record assignment time when the task starts running so the stall-detection loop
-        // can identify hung tasks.
+        // can identify hung tasks. Initialize last_progress_ms to the same value.
         if self.state == TaskState::Running {
-            self.assigned_at_ms =
-                Some(u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0));
+            let now_ms =
+                u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+            self.assigned_at_ms = Some(now_ms);
+            self.last_progress_ms = Some(now_ms);
         } else if self.state.is_terminal() {
             self.assigned_at_ms = None;
+            self.last_progress_ms = None;
+        } else if update.output_metadata().is_some() || update.message().is_some() {
+            // Non-terminal status updates (output metadata, progress messages)
+            // refresh the progress timestamp so stall detection doesn't kill
+            // long-running tasks that are actively producing output.
+            self.last_progress_ms =
+                Some(u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0));
         }
         Ok(TaskUpdateOutcome::Applied)
     }

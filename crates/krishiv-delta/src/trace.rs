@@ -173,8 +173,7 @@ impl Trace {
             return Ok(());
         }
         let merged = DeltaBatch::concat(&all)?;
-        let consolidated =
-            consolidate_batch(merged, &self.key_col_names, &self.data_schema)?;
+        let consolidated = consolidate_batch(merged, &self.key_col_names, &self.data_schema)?;
         self.total_rows = consolidated.num_rows();
         self.levels[NUM_LEVELS - 1].push(consolidated);
         Ok(())
@@ -197,13 +196,14 @@ impl Trace {
                 }
                 let ts_col = data.column(ts_idx);
                 // Try Int64 first (epoch ms), then TimestampMillisecond.
-                let mask: BooleanArray = if let Some(arr) =
-                    ts_col.as_any().downcast_ref::<Int64Array>()
-                {
-                    arr.iter().map(|v| Some(v.unwrap_or(i64::MIN) >= watermark_ms)).collect()
-                } else {
-                    continue;
-                };
+                let mask: BooleanArray =
+                    if let Some(arr) = ts_col.as_any().downcast_ref::<Int64Array>() {
+                        arr.iter()
+                            .map(|v| Some(v.unwrap_or(i64::MIN) >= watermark_ms))
+                            .collect()
+                    } else {
+                        continue;
+                    };
                 let before = batch.num_rows();
                 *batch = batch.filter_mask(&mask)?;
                 removed += before - batch.num_rows();
@@ -226,8 +226,7 @@ impl Trace {
             return Ok(empty);
         }
         let merged = DeltaBatch::concat(&all)?;
-        let consolidated =
-            consolidate_batch(merged, &self.key_col_names, &self.data_schema)?;
+        let consolidated = consolidate_batch(merged, &self.key_col_names, &self.data_schema)?;
         consolidated.filter_positive()
     }
 }
@@ -258,8 +257,8 @@ fn extract_key(batch: &RecordBatch, key_indices: &[usize], row: usize) -> KeyTup
 
 fn array_scalar_to_string(arr: &dyn Array, row: usize) -> String {
     use arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-        Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     macro_rules! try_downcast {
         ($t:ty) => {
@@ -293,10 +292,7 @@ fn array_scalar_to_string(arr: &dyn Array, row: usize) -> String {
     format!("<unsupported:{}>", arr.data_type())
 }
 
-fn build_key_set(
-    keys: &RecordBatch,
-    key_indices: &[usize],
-) -> ahash::AHashSet<KeyTuple> {
+fn build_key_set(keys: &RecordBatch, key_indices: &[usize]) -> ahash::AHashSet<KeyTuple> {
     let mut set = ahash::AHashSet::new();
     for row in 0..keys.num_rows() {
         set.insert(extract_key(keys, key_indices, row));

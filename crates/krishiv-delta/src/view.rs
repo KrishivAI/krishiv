@@ -58,17 +58,19 @@ impl IncrementalView {
     /// Publish a new output delta (called by the step engine).
     pub fn publish_output(&self, output: DeltaBatch) -> DeltaResult<()> {
         {
-            let mut guard = self.last_output.lock().map_err(|_| {
-                DeltaError::Operator("view output lock poisoned".into())
-            })?;
+            let mut guard = self
+                .last_output
+                .lock()
+                .map_err(|_| DeltaError::Operator("view output lock poisoned".into()))?;
             *guard = Some(output.clone());
         }
         // Update materialized snapshot for materialized views
         if self.spec.is_materialized {
             let positive = output.filter_positive()?;
-            let mut snap = self.snapshot.lock().map_err(|_| {
-                DeltaError::Operator("snapshot lock poisoned".into())
-            })?;
+            let mut snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
             *snap = Some(positive);
         }
         let _ = self.sender.send(Some(output));
@@ -101,9 +103,10 @@ impl IncrementalView {
     /// Used by `step_datafusion`: the caller runs the view SQL to get a fresh
     /// full result, then calls this to obtain the true incremental delta.
     pub fn diff_and_update(&self, new_full: RecordBatch) -> DeltaResult<DeltaBatch> {
-        let mut guard = self.full_output.lock().map_err(|_| {
-            DeltaError::Operator("full_output lock poisoned".into())
-        })?;
+        let mut guard = self
+            .full_output
+            .lock()
+            .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
         let delta = differentiate(&self.spec.output_schema, guard.as_ref(), &new_full)?;
         *guard = Some(new_full);
         Ok(delta)
@@ -113,9 +116,10 @@ impl IncrementalView {
     /// all rows as new insertions. Call this when `body_sql` changes
     /// (behavior_version invalidation).
     pub fn reset_full_output(&self) -> DeltaResult<()> {
-        let mut guard = self.full_output.lock().map_err(|_| {
-            DeltaError::Operator("full_output lock poisoned".into())
-        })?;
+        let mut guard = self
+            .full_output
+            .lock()
+            .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
         *guard = None;
         Ok(())
     }
@@ -141,24 +145,27 @@ impl IncrementalViewRegistry {
         let name = spec.name.clone();
         let (view, receiver) = IncrementalView::new(spec);
         {
-            let mut views = self.views.lock().map_err(|_| {
-                DeltaError::Operator("registry lock poisoned".into())
-            })?;
+            let mut views = self
+                .views
+                .lock()
+                .map_err(|_| DeltaError::Operator("registry lock poisoned".into()))?;
             views.insert(name.clone(), Arc::new(view));
         }
         {
-            let mut receivers = self.receivers.lock().map_err(|_| {
-                DeltaError::Operator("registry lock poisoned".into())
-            })?;
+            let mut receivers = self
+                .receivers
+                .lock()
+                .map_err(|_| DeltaError::Operator("registry lock poisoned".into()))?;
             receivers.insert(name, receiver);
         }
         Ok(())
     }
 
     pub fn get(&self, name: &str) -> DeltaResult<Arc<IncrementalView>> {
-        let views = self.views.lock().map_err(|_| {
-            DeltaError::Operator("registry lock poisoned".into())
-        })?;
+        let views = self
+            .views
+            .lock()
+            .map_err(|_| DeltaError::Operator("registry lock poisoned".into()))?;
         views
             .get(name)
             .cloned()
@@ -166,9 +173,10 @@ impl IncrementalViewRegistry {
     }
 
     pub fn view_names(&self) -> DeltaResult<Vec<String>> {
-        let views = self.views.lock().map_err(|_| {
-            DeltaError::Operator("registry lock poisoned".into())
-        })?;
+        let views = self
+            .views
+            .lock()
+            .map_err(|_| DeltaError::Operator("registry lock poisoned".into()))?;
         Ok(views.keys().cloned().collect())
     }
 
@@ -180,9 +188,10 @@ impl IncrementalViewRegistry {
     }
 
     pub fn drop_view(&self, name: &str) -> DeltaResult<bool> {
-        let mut views = self.views.lock().map_err(|_| {
-            DeltaError::Operator("registry lock poisoned".into())
-        })?;
+        let mut views = self
+            .views
+            .lock()
+            .map_err(|_| DeltaError::Operator("registry lock poisoned".into()))?;
         Ok(views.remove(name).is_some())
     }
 }
@@ -223,7 +232,10 @@ mod tests {
     #[test]
     fn registry_get_missing_returns_error() {
         let reg = IncrementalViewRegistry::new();
-        assert!(matches!(reg.get("missing"), Err(DeltaError::ViewNotFound(_))));
+        assert!(matches!(
+            reg.get("missing"),
+            Err(DeltaError::ViewNotFound(_))
+        ));
     }
 
     #[test]

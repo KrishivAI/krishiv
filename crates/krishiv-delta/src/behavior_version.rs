@@ -7,8 +7,8 @@
 //! bumped), any cached Trace state for that operator is invalidated and
 //! recomputed from scratch.
 
-use twox_hash::XxHash64;
 use std::hash::Hasher;
+use twox_hash::XxHash64;
 
 /// A stable 64-bit fingerprint of an operator's logic identity.
 ///
@@ -48,7 +48,10 @@ pub struct MemoKey {
 
 impl MemoKey {
     pub fn new(fingerprint: LogicFingerprint, partition_id: u32) -> Self {
-        Self { fingerprint, partition_id }
+        Self {
+            fingerprint,
+            partition_id,
+        }
     }
 
     pub fn single(fingerprint: LogicFingerprint) -> Self {

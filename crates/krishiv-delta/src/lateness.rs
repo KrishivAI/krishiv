@@ -19,19 +19,28 @@ pub struct LatenessSpec {
 
 impl LatenessSpec {
     pub fn new(column: impl Into<String>, lateness_ms: i64) -> Self {
-        Self { column: column.into(), lateness_ms }
+        Self {
+            column: column.into(),
+            lateness_ms,
+        }
     }
 
     /// Parse a human-readable duration string like "5 minutes", "1 hour", "30 seconds".
     pub fn parse_duration(s: &str) -> Option<i64> {
         let s = s.trim();
-        if let Some(n) = s.strip_suffix(" minutes").or_else(|| s.strip_suffix(" minute")) {
+        if let Some(n) = s
+            .strip_suffix(" minutes")
+            .or_else(|| s.strip_suffix(" minute"))
+        {
             return n.trim().parse::<i64>().ok().map(|v| v * 60_000);
         }
         if let Some(n) = s.strip_suffix(" hours").or_else(|| s.strip_suffix(" hour")) {
             return n.trim().parse::<i64>().ok().map(|v| v * 3_600_000);
         }
-        if let Some(n) = s.strip_suffix(" seconds").or_else(|| s.strip_suffix(" second")) {
+        if let Some(n) = s
+            .strip_suffix(" seconds")
+            .or_else(|| s.strip_suffix(" second"))
+        {
             return n.trim().parse::<i64>().ok().map(|v| v * 1_000);
         }
         if let Some(n) = s.strip_suffix("ms") {
@@ -52,7 +61,10 @@ pub struct WatermarkTracker {
 
 impl WatermarkTracker {
     pub fn new(spec: LatenessSpec) -> Self {
-        Self { max_observed_ts: i64::MIN, spec }
+        Self {
+            max_observed_ts: i64::MIN,
+            spec,
+        }
     }
 
     /// Update the high-water mark given a new observed timestamp.
@@ -98,7 +110,10 @@ pub struct SourceOrdinal {
 
 impl SourceOrdinal {
     pub fn new(source_name: impl Into<String>, offset: Vec<u8>) -> Self {
-        Self { source_name: source_name.into(), last_processed: offset }
+        Self {
+            source_name: source_name.into(),
+            last_processed: offset,
+        }
     }
 }
 

@@ -55,8 +55,10 @@ impl DeltaBatch {
         let data_schema = before.schema();
         let retractions = Self::with_uniform_weight(before.clone(), -1)?;
         let insertions = Self::with_uniform_weight(after.clone(), 1)?;
-        Self::concat(&[retractions, insertions])
-            .map(|mut cb| { cb.data_schema = data_schema; cb })
+        Self::concat(&[retractions, insertions]).map(|mut cb| {
+            cb.data_schema = data_schema;
+            cb
+        })
     }
 
     /// Construct directly from a batch that already has a `_weight` column.
@@ -80,9 +82,7 @@ impl DeltaBatch {
                 "_weight column must be Int64".into(),
             ));
         }
-        let data_schema = Arc::new(Schema::new(
-            inner.schema().fields()[..ncols - 1].to_vec(),
-        ));
+        let data_schema = Arc::new(Schema::new(inner.schema().fields()[..ncols - 1].to_vec()));
         Ok(Self { inner, data_schema })
     }
 
@@ -171,7 +171,10 @@ impl DeltaBatch {
             self.inner.columns()[..self.inner.num_columns() - 1].to_vec();
         cols.push(Arc::new(negated));
         let inner = RecordBatch::try_new(self.inner.schema(), cols)?;
-        Ok(Self { inner, data_schema: self.data_schema.clone() })
+        Ok(Self {
+            inner,
+            data_schema: self.data_schema.clone(),
+        })
     }
 
     /// Concatenate multiple `DeltaBatch`es with identical data schemas.
@@ -192,13 +195,19 @@ impl DeltaBatch {
         let weights = self.weights();
         let mask: BooleanArray = weights.iter().map(|w| Some(w.unwrap_or(0) != 0)).collect();
         let inner = filter_record_batch(&self.inner, &mask)?;
-        Ok(Self { inner, data_schema: self.data_schema.clone() })
+        Ok(Self {
+            inner,
+            data_schema: self.data_schema.clone(),
+        })
     }
 
     /// Apply a boolean mask to this batch (keeps rows where mask is true).
     pub fn filter_mask(&self, mask: &BooleanArray) -> DeltaResult<Self> {
         let inner = filter_record_batch(&self.inner, mask)?;
-        Ok(Self { inner, data_schema: self.data_schema.clone() })
+        Ok(Self {
+            inner,
+            data_schema: self.data_schema.clone(),
+        })
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -331,7 +340,7 @@ mod tests {
         assert_eq!(cb.num_rows(), 2);
         let w = cb.weights();
         assert_eq!(w.value(0), -1); // before retracted
-        assert_eq!(w.value(1), 1);  // after inserted
+        assert_eq!(w.value(1), 1); // after inserted
     }
 
     #[test]

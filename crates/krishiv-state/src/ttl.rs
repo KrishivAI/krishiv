@@ -276,11 +276,17 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     /// P0.16: The snapshot contains raw (non-TTL-prefixed) values.  We re-encode
     /// them with a fresh `expires_at_ms = now + ttl_ms` so that loaded state has
     /// the full configured TTL duration remaining.
+    ///
+    /// Crash-safety: writes new entries first (idempotent overwrites), then
+    /// deletes keys not in the new set. A crash after writes but before deletes
+    /// leaves a superset (old + new) — never an empty backend. This is the
+    /// opposite of the previous clear-then-insert pattern which left the
+    /// backend empty on mid-restore crash.
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
         let entries = decode_snapshot_entries(bytes)?;
         let now_ms = self.now_ms();
         let expires_at_ms = now_ms + self.config.ttl_ms as i64;
-        // Pre-compute entries so the clear+insert phase has no fallible computation.
+        // Pre-compute entries so the write phase has no fallible computation.
         let precomputed: Vec<(Namespace, Vec<u8>, Vec<u8>)> = entries
             .iter()
             .map(|(op_id, state_name, key, raw_value)| {
@@ -289,12 +295,30 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
                 (ns, key.clone(), encoded)
             })
             .collect();
+
+        // Phase 1: Write all new entries (idempotent overwrites). A crash here
+        // leaves the backend with old state + partially-written new state —
+        // never empty.
+        for (ns, key, encoded) in &precomputed {
+            self.inner.put(ns, key.clone(), encoded.clone())?;
+        }
+
+        // Phase 2: Build the set of (namespace, key) pairs that are in the new
+        // snapshot, then delete keys that exist in the backend but NOT in the
+        // new snapshot.
+        let new_keys: std::collections::HashSet<(Namespace, Vec<u8>)> = precomputed
+            .iter()
+            .map(|(ns, key, _)| (ns.clone(), key.clone()))
+            .collect();
+
         let namespaces = self.inner.list_namespaces()?;
         for ns in &namespaces {
-            self.inner.clear_namespace(ns)?;
-        }
-        for (ns, key, encoded) in precomputed {
-            self.inner.put(&ns, key, encoded)?;
+            let existing_keys = self.inner.list_keys(ns)?;
+            for key in existing_keys {
+                if !new_keys.contains(&(ns.clone(), key.clone())) {
+                    self.inner.delete(ns, &key)?;
+                }
+            }
         }
         Ok(())
     }

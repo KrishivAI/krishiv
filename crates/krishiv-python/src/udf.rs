@@ -58,14 +58,14 @@ impl krishiv_plan::udf::ScalarUdf for PythonScalarUdf {
                 .unwrap_or(false);
 
             if is_arrow_native {
-                let py_batch = pyo3_arrow::PyRecordBatch::new(batch.clone());
+                let py_batch = crate::arrow_compat::PyArrowBatch::new(batch.clone());
                 let result = self.callable.call1(py, (py_batch,)).map_err(|e| {
                     krishiv_plan::udf::UdfError::Execution {
                         message: format!("arrow-native UDF call failed: {e}"),
                     }
                 })?;
                 let out_batch: RecordBatch = result
-                    .extract::<pyo3_arrow::PyRecordBatch>(py)
+                    .extract::<crate::arrow_compat::PyArrowBatch>(py)
                     .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: format!("arrow-native UDF must return a pyarrow.RecordBatch: {e}"),
                     })?
@@ -750,7 +750,7 @@ impl krishiv_plan::udf::TableUdf for PythonTableUdf {
                 }
             })?;
             let batch: RecordBatch = result
-                .extract::<pyo3_arrow::PyRecordBatch>(py)
+                .extract::<crate::arrow_compat::PyArrowBatch>(py)
                 .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                     message: format!("UDTF must return a pyarrow.RecordBatch: {e}"),
                 })?

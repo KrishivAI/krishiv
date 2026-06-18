@@ -1,5 +1,62 @@
 # Krishiv Implementation Status
 
+## 2026-06-18 — IVM gap closure: all 9 gaps resolved, pyo3-arrow removed
+
+### Work completed
+
+**[Gap 1] SQL DDL → IncrementalFlow bridge**
+- `KrishivSession::register_incremental_view()`: infers output schema via DataFusion `SELECT * LIMIT 0`
+  probe in embedded mode; uses empty placeholder schema in distributed mode.
+- Calls `IvmJobHandle::register_view(spec)` to wire the view into the running flow.
+
+**[Gap 2] IVM step dispatched to executors**
+- `IncrementalFlow::take_pending()`: drains pending deltas without stepping (for executor dispatch).
+- `encode_ivm_step_fragment(job_id, pending, specs)`: encodes `delta:step:{job_id}|{deltas}|{specs}` for executor fragment dispatch (base64 IPC payload).
+
+**[Gap 3] Streaming → IVM auto-wiring**
+- `execute_coordinator_ivm_stream_bridge()` in `krishiv-runtime` encodes batches as Arrow IPC and POSTs to coordinator.
+- HTTP handler `api_ivm_stream_bridge` deserializes and calls `feed_stream_output`.
+
+**[Gap 4] Embedded `batch_sql` support**
+- `KrishivSession::batch_sql()` embedded path: DataFusion in-process with `ParquetReadOptions::default()`.
+
+**[Gap 5] pyo3-arrow version conflict — RESOLVED**
+- Removed `pyo3-arrow = "0.19.0"` from `krishiv-python/Cargo.toml`.
+- Created `crates/krishiv-python/src/arrow_compat.rs`: `PyArrowBatch` / `PyArrowSchema` wrappers
+  using Arrow IPC serialization. Implements pyo3 0.29 `FromPyObject<'a, 'py>` with `Borrowed` parameter.
+- Updated `batch.rs`, `schema.rs`, `session.rs`, `udf.rs`, `incremental.rs` to use `arrow_compat`.
+
+**[Gap 6] `IvmJobHandle::step()` returns real tick**
+- Embedded path: `j.flow().tick().unwrap_or(0)` instead of hardcoded `0`.
+
+**[Gap 7] `IvmVectorSink` / `spawn_vector_view` via HTTP**
+- `api_ivm_register_vector_view` HTTP handler added. `InMemoryVectorSink` un-gated from `#[cfg(test)]`.
+
+**[Gap 8] Delta checkpoint HTTP endpoints**
+- `api_ivm_checkpoint_delta` and `api_ivm_restore_delta` added to scheduler and runtime client.
+
+**[Gap 9] ProvenanceIndex integrated into `step_datafusion_with_ctx`**
+- Input row hashes computed before SQL; output hashes recorded after each dirty view's delta.
+
+### Pre-existing bugs fixed
+- `krishiv-shuffle/src/tiered_store.rs`: added missing `is_corruption_error()` function.
+- `krishiv-python/src/incremental.rs`: pyo3 0.29 — `cast_into` instead of `downcast`, `IvmError::Execution` instead of `KrishivError::Runtime`.
+- `krishiv-runtime/src/krishiv_session.rs`: DataFusion 53 API — `ParquetReadOptions::default()`, `df.schema().as_arrow().clone()`.
+
+### Validation
+
+```
+cargo check --workspace   # 0 errors
+```
+
+### Next useful command
+
+```bash
+cargo test --workspace --lib --exclude krishiv-chaos
+```
+
+---
+
 ## 2026-06-17 (session 2) — IVM optimisations: dirty-bit scheduling, dedup, delta checkpoints, vector sink, provenance
 
 ### Work completed

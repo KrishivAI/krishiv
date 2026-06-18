@@ -29,10 +29,10 @@ pub mod cep_sql;
 mod connector_table;
 pub mod create_function_ddl;
 pub mod grammar;
+pub mod incremental_view;
 pub mod introspection_sql;
 mod kafka_table;
 mod lakehouse;
-pub mod incremental_view;
 pub mod live_table;
 pub mod pivot_sql;
 pub mod recursive_cte;
@@ -975,9 +975,7 @@ impl SqlEngine {
     }
 
     /// Shared incremental-view registry for `CREATE INCREMENTAL VIEW` DDL.
-    pub fn incremental_view_registry(
-        &self,
-    ) -> &Arc<incremental_view::IncrementalViewRegistry> {
+    pub fn incremental_view_registry(&self) -> &Arc<incremental_view::IncrementalViewRegistry> {
         &self.incremental_view_registry
     }
 
@@ -1490,15 +1488,12 @@ impl SqlEngine {
         }
 
         // ── Intercept CREATE/DECLARE/REFRESH/DROP INCREMENTAL VIEW ───────────
-        if incremental_view::execute_incremental_view_ddl(
-            &self.incremental_view_registry,
-            query,
-        )?
-        .is_some()
+        if incremental_view::execute_incremental_view_ddl(&self.incremental_view_registry, query)?
+            .is_some()
         {
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
             return Ok(
-                self.attach_query_metadata(self.make_sql_df("incremental-view-ddl", empty), query),
+                self.attach_query_metadata(self.make_sql_df("incremental-view-ddl", empty), query)
             );
         }
 

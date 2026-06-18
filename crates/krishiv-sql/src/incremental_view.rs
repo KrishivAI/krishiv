@@ -131,9 +131,7 @@ impl IncrementalViewRegistry {
 /// Parse incremental-view DDL statements from a SQL string.
 ///
 /// Returns `Ok(None)` if the statement is not an incremental-view DDL.
-pub fn parse_incremental_view_statement(
-    sql: &str,
-) -> SqlResult<Option<IncrementalViewStatement>> {
+pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<IncrementalViewStatement>> {
     let trimmed = sql.trim().trim_end_matches(';');
     let upper = trimmed.to_uppercase();
 
@@ -241,7 +239,10 @@ pub fn execute_incremental_view_ddl(
             Ok(Some(name.clone()))
         }
 
-        IncrementalViewStatement::DeclareRecursive { ref name, ref body_sql } => {
+        IncrementalViewStatement::DeclareRecursive {
+            ref name,
+            ref body_sql,
+        } => {
             registry.register(
                 name.clone(),
                 IncrementalViewEntry {
@@ -319,8 +320,14 @@ fn find_lateness_clause_start(upper: &str) -> Option<usize> {
     let mut i = 0usize;
     while i + keyword.len() <= bytes.len() {
         match bytes[i] {
-            b'(' => { depth += 1; i += 1; }
-            b')' => { depth = depth.saturating_sub(1); i += 1; }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
             _ if depth == 0 && bytes[i..].starts_with(keyword) => {
                 // Ensure it's a word boundary
                 let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
@@ -331,7 +338,9 @@ fn find_lateness_clause_start(upper: &str) -> Option<usize> {
                 }
                 i += 1;
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
     None
@@ -362,7 +371,11 @@ fn parse_lateness_clauses(lateness_str: &str) -> Vec<LatenessAnnotation> {
         let col = tokens[0].trim_matches(',').to_string();
         // tokens[1] should be INTERVAL (case-insensitive)
         let interval_str = tokens[2].trim_matches('\'');
-        let unit_str = if tokens.len() >= 4 { tokens[3].trim_matches(',') } else { "" };
+        let unit_str = if tokens.len() >= 4 {
+            tokens[3].trim_matches(',')
+        } else {
+            ""
+        };
         let n: u64 = interval_str.parse().unwrap_or(0);
         let ms = match unit_str.to_uppercase().as_str() {
             "SECOND" | "SECONDS" => n * 1000,
@@ -373,18 +386,23 @@ fn parse_lateness_clauses(lateness_str: &str) -> Vec<LatenessAnnotation> {
             _ => n * 60_000, // default: treat as minutes
         };
 
-        result.push(LatenessAnnotation { column: col, lateness_ms: ms });
+        result.push(LatenessAnnotation {
+            column: col,
+            lateness_ms: ms,
+        });
 
         // Advance past this clause
-        let consumed_upper: String = upper_rem.chars().take(
-            "LATENESS ".len() + stripped.len()
-                - stripped.trim_start().len()
-        ).collect();
+        let consumed_upper: String = upper_rem
+            .chars()
+            .take("LATENESS ".len() + stripped.len() - stripped.trim_start().len())
+            .collect();
         let _ = consumed_upper; // advance is approximate; find next LATENESS
         // Find next "LATENESS" or ", LATENESS" in remaining
         let next = remaining[1..].to_uppercase().find("LATENESS");
         match next {
-            Some(pos) => { remaining = &remaining[1 + pos..]; }
+            Some(pos) => {
+                remaining = &remaining[1 + pos..];
+            }
             None => break,
         }
     }
@@ -416,7 +434,10 @@ mod tests {
         let stmt = parse_incremental_view_statement(sql).unwrap().unwrap();
         assert!(matches!(
             stmt,
-            IncrementalViewStatement::Create { is_materialized: true, .. }
+            IncrementalViewStatement::Create {
+                is_materialized: true,
+                ..
+            }
         ));
     }
 
@@ -491,11 +512,8 @@ mod tests {
     #[test]
     fn execute_ddl_create_and_drop() {
         let reg = IncrementalViewRegistry::new();
-        let name = execute_incremental_view_ddl(
-            &reg,
-            "CREATE INCREMENTAL VIEW v AS SELECT 1",
-        )
-        .unwrap();
+        let name =
+            execute_incremental_view_ddl(&reg, "CREATE INCREMENTAL VIEW v AS SELECT 1").unwrap();
         assert_eq!(name.as_deref(), Some("v"));
         assert!(reg.contains("v"));
 
@@ -506,8 +524,7 @@ mod tests {
     #[test]
     fn execute_ddl_refresh_missing_returns_error() {
         let reg = IncrementalViewRegistry::new();
-        let err =
-            execute_incremental_view_ddl(&reg, "REFRESH INCREMENTAL VIEW nonexistent");
+        let err = execute_incremental_view_ddl(&reg, "REFRESH INCREMENTAL VIEW nonexistent");
         assert!(err.is_err());
     }
 }

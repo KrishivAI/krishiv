@@ -268,11 +268,20 @@ impl Coordinator {
                 );
 
                 if let Some(jc) = self.job_coordinator(&job_id) {
-                    let jc = jc.clone();
-                    let eid = executor_id_for_circuit.clone();
-                    tokio::spawn(async move {
-                        let _ = jc.clear_assignments_for_bad_executor_and_count(&eid).await;
-                    });
+                    // Clear assignments SYNCHRONOUSLY under the coordinator
+                    // write lock (which is already held here). The previous
+                    // tokio::spawn raced with the task-launch loop: notify
+                    // fired before clearing completed, so the launcher could
+                    // re-assign tasks back to the bad executor.
+                    let cleared = jc.clear_assignments_for_bad_executor_and_count_sync(
+                        &executor_id_for_circuit,
+                    );
+                    tracing::debug!(
+                        job_id = %job_id,
+                        executor_id = %executor_id_for_circuit,
+                        cleared_count = cleared,
+                        "circuit breaker: assignments cleared synchronously"
+                    );
                 } else if let Ok(mut job) = self.find_job_mut(&job_id) {
                     for stage in job.stages_mut() {
                         for task in stage.tasks_mut() {
@@ -289,6 +298,8 @@ impl Coordinator {
                     executor_id = %executor_id_for_circuit,
                     "circuit breaker triggered; assignments cleared via JCP or fallback"
                 );
+                // Fire notify AFTER clearing completes so the task-launch loop
+                // sees the updated (cleared) assignments.
                 self.notify.notify_waiters();
             }
         } else if terminal_state == TaskState::Succeeded {

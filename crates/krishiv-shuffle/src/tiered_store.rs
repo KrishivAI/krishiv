@@ -1,8 +1,12 @@
 use crate::{
-    PartitionId, ShufflePartition, ShuffleResult, ShuffleStore, ShuffleStream,
+    PartitionId, ShuffleError, ShufflePartition, ShuffleResult, ShuffleStore, ShuffleStream,
     disk_store::LocalDiskShuffleStore, object_store::ObjectStoreShuffleStore,
 };
 use std::sync::Arc;
+
+fn is_corruption_error(e: &ShuffleError) -> bool {
+    matches!(e, ShuffleError::ContentHashMismatch { .. })
+}
 
 /// A hybrid tiered shuffle store:
 /// 1. Low-latency P2P fetches via local disk.
@@ -48,11 +52,22 @@ impl ShuffleStore for TieredShuffleStore {
     }
 
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
-        // Try local disk first. Only fall through on a clean miss (Ok(None));
-        // propagate real errors rather than silently falling back to remote
-        // and potentially returning corrupt data to the caller.
-        if let Some(part) = self.local.read_partition(id).await? {
-            return Ok(Some(part));
+        // Try local disk first. On a clean miss (Ok(None)), fall through to
+        // remote. On a corruption-class error (ContentHashMismatch), also fall
+        // back to remote — the remote tier performs its own independent BLAKE3
+        // verification, so falling back is safe and preserves availability.
+        // Non-corruption errors (auth, permission, I/O) are propagated.
+        match self.local.read_partition(id).await {
+            Ok(Some(part)) => return Ok(Some(part)),
+            Ok(None) => {}
+            Err(e) if is_corruption_error(&e) => {
+                tracing::warn!(
+                    partition = ?id,
+                    error = %e,
+                    "Tiered Shuffle: local partition corrupt, falling back to remote object store"
+                );
+            }
+            Err(e) => return Err(e),
         }
 
         // Local miss after executor restart or eviction; fall back to the
@@ -65,9 +80,18 @@ impl ShuffleStore for TieredShuffleStore {
     }
 
     async fn stream_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShuffleStream>> {
-        // Same fall-through policy as read_partition: only on clean miss.
-        if let Some(stream) = self.local.stream_partition(id).await? {
-            return Ok(Some(stream));
+        // Same fall-through policy as read_partition: clean miss or corruption.
+        match self.local.stream_partition(id).await {
+            Ok(Some(stream)) => return Ok(Some(stream)),
+            Ok(None) => {}
+            Err(e) if is_corruption_error(&e) => {
+                tracing::warn!(
+                    partition = ?id,
+                    error = %e,
+                    "Tiered Shuffle: local stream corrupt, falling back to remote object store"
+                );
+            }
+            Err(e) => return Err(e),
         }
 
         tracing::info!(

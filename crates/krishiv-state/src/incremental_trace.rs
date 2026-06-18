@@ -95,8 +95,10 @@ impl TraceStateNamespace {
 
         let count = matching.len();
         if count > 0 {
-            let entries: Vec<(&Namespace, &[u8])> =
-                matching.iter().map(|k| (&self.namespace, k.as_slice())).collect();
+            let entries: Vec<(&Namespace, &[u8])> = matching
+                .iter()
+                .map(|k| (&self.namespace, k.as_slice()))
+                .collect();
             guard.delete_batch(&entries)?;
         }
         Ok(count)

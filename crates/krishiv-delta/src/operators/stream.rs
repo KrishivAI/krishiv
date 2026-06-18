@@ -126,10 +126,7 @@ pub fn differentiate(
 ///
 /// Positive-weight rows in `delta` are insertions; negative-weight rows are
 /// retractions. The result contains only rows with net positive weight.
-pub fn apply_delta(
-    current: Option<RecordBatch>,
-    delta: &DeltaBatch,
-) -> DeltaResult<RecordBatch> {
+pub fn apply_delta(current: Option<RecordBatch>, delta: &DeltaBatch) -> DeltaResult<RecordBatch> {
     match current {
         None => delta.filter_positive(),
         Some(prev) => {
@@ -142,8 +139,7 @@ pub fn apply_delta(
             let prev_db = DeltaBatch::from_inserts(prev)?;
             let merged = DeltaBatch::concat(&[prev_db, delta.clone()])?;
             // Full consolidation: group by ALL columns (empty key_columns slice).
-            let consolidated =
-                consolidate_batch(merged, &[], delta.data_schema())?;
+            let consolidated = consolidate_batch(merged, &[], delta.data_schema())?;
             consolidated.filter_positive()
         }
     }
@@ -225,9 +221,9 @@ fn take_rb(batch: &RecordBatch, indices: &[u32]) -> DeltaResult<RecordBatch> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn mk_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
@@ -265,7 +261,11 @@ mod tests {
         let delta = differentiate(&s, Some(&prev), &next).unwrap();
         let positives = delta.filter_positive().unwrap();
         assert_eq!(positives.num_rows(), 1, "only row 2 is new");
-        let ids = positives.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = positives
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(ids.value(0), 2);
     }
 
@@ -315,7 +315,11 @@ mod tests {
         let del = DeltaBatch::from_deletes(mk_batch(&[1])).unwrap();
         let snap = apply_delta(Some(initial), &del).unwrap();
         assert_eq!(snap.num_rows(), 1);
-        let ids = snap.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = snap
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(ids.value(0), 2);
     }
 
@@ -335,13 +339,19 @@ mod tests {
         let mut op = IntegrateOp::new();
         let s = mk_schema();
 
-        let snap1 = op.apply(&DeltaBatch::from_inserts(mk_batch(&[1])).unwrap()).unwrap();
+        let snap1 = op
+            .apply(&DeltaBatch::from_inserts(mk_batch(&[1])).unwrap())
+            .unwrap();
         assert_eq!(snap1.num_rows(), 1);
 
-        let snap2 = op.apply(&DeltaBatch::from_inserts(mk_batch(&[2])).unwrap()).unwrap();
+        let snap2 = op
+            .apply(&DeltaBatch::from_inserts(mk_batch(&[2])).unwrap())
+            .unwrap();
         assert_eq!(snap2.num_rows(), 2);
 
-        let snap3 = op.apply(&DeltaBatch::from_deletes(mk_batch(&[1])).unwrap()).unwrap();
+        let snap3 = op
+            .apply(&DeltaBatch::from_deletes(mk_batch(&[1])).unwrap())
+            .unwrap();
         assert_eq!(snap3.num_rows(), 1, "row 1 retracted");
 
         op.reset();
