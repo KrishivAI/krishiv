@@ -27,10 +27,14 @@ use crate::{SqlError, SqlResult};
 /// A parsed pipeline DDL statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipelineStatement {
-    /// `CREATE SOURCE <name> AS <query>` — a bounded query source.
-    CreateSource { name: String, query: String },
-    /// `CREATE SINK <name> FROM <view>` — collect a view's output.
-    CreateSink { name: String, view: String },
+    /// `CREATE SOURCE <name> AS <query>` or `... FROM <CONNECTOR>(...)`.
+    CreateSource { name: String, source: SourceSpec },
+    /// `CREATE SINK <name> FROM <view> [INTO <CONNECTOR>(...)]`.
+    CreateSink {
+        name: String,
+        view: String,
+        connector: Option<ConnectorSpec>,
+    },
     /// `START PIPELINE <sink_name>` — run the pipeline feeding `sink_name`.
     StartPipeline { sink: String },
     /// `DROP SOURCE <name>`.
@@ -41,16 +45,42 @@ pub enum PipelineStatement {
 
 // ── Registry ────────────────────────────────────────────────────────────────
 
-/// A declared source: a bounded SQL query whose rows are fed as insertions.
+/// A connector reference: a kind (`parquet`, `kafka`, …) plus key/value options.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceSpec {
-    pub query: String,
+pub struct ConnectorSpec {
+    pub kind: String,
+    pub options: HashMap<String, String>,
 }
 
-/// A declared sink: which view's output it collects.
+impl ConnectorSpec {
+    /// Fetch a required option, or a descriptive error if it is missing.
+    pub fn require(&self, key: &str) -> SqlResult<&str> {
+        self.options
+            .get(key)
+            .map(String::as_str)
+            .ok_or_else(|| SqlError::Unsupported {
+                feature: format!("connector '{}' requires option '{key}'", self.kind),
+            })
+    }
+}
+
+/// A declared source: either a bounded SQL query (fed as insertions) or a
+/// connector (e.g. `PARQUET(path='…')`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceSpec {
+    /// `AS <query>` — rows from a bounded query.
+    Query(String),
+    /// `FROM <CONNECTOR>(...)` — rows pulled from a connector.
+    Connector(ConnectorSpec),
+}
+
+/// A declared sink: which view's output it collects, and optionally where it is
+/// written (a connector). With no connector, the output is returned as a result
+/// set by `START PIPELINE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkSpec {
     pub view: String,
+    pub connector: Option<ConnectorSpec>,
 }
 
 /// SQL-layer registry of declared pipeline sources and sinks (metadata only).
@@ -144,30 +174,52 @@ pub fn parse_pipeline_statement(sql: &str) -> SqlResult<Option<PipelineStatement
 
     if upper.starts_with("CREATE SOURCE ") {
         let rest = &trimmed["CREATE SOURCE ".len()..];
-        let (name, query) = split_keyword(rest, " AS ").ok_or_else(|| SqlError::Unsupported {
-            feature: "CREATE SOURCE requires '<name> AS <query>'".into(),
-        })?;
-        require_nonempty(&name)?;
-        if query.trim().is_empty() {
-            return Err(SqlError::Unsupported {
-                feature: "CREATE SOURCE requires a query after AS".into(),
-            });
+        // `... AS <query>` (query source) or `... FROM <CONNECTOR>(...)`.
+        if let Some((name, query)) = split_keyword(rest, " AS ") {
+            require_nonempty(&name)?;
+            if query.trim().is_empty() {
+                return Err(SqlError::Unsupported {
+                    feature: "CREATE SOURCE requires a query after AS".into(),
+                });
+            }
+            return Ok(Some(PipelineStatement::CreateSource {
+                name,
+                source: SourceSpec::Query(query.trim().to_string()),
+            }));
         }
-        return Ok(Some(PipelineStatement::CreateSource {
-            name,
-            query: query.trim().to_string(),
-        }));
+        if let Some((name, conn)) = split_keyword(rest, " FROM ") {
+            require_nonempty(&name)?;
+            return Ok(Some(PipelineStatement::CreateSource {
+                name,
+                source: SourceSpec::Connector(parse_connector_spec(&conn)?),
+            }));
+        }
+        return Err(SqlError::Unsupported {
+            feature: "CREATE SOURCE requires '<name> AS <query>' or '<name> FROM <connector>(...)'"
+                .into(),
+        });
     }
 
     if upper.starts_with("CREATE SINK ") {
         let rest = &trimmed["CREATE SINK ".len()..];
-        let (name, view) = split_keyword(rest, " FROM ").ok_or_else(|| SqlError::Unsupported {
-            feature: "CREATE SINK requires '<name> FROM <view>'".into(),
-        })?;
+        let (name, after_from) =
+            split_keyword(rest, " FROM ").ok_or_else(|| SqlError::Unsupported {
+                feature: "CREATE SINK requires '<name> FROM <view>'".into(),
+            })?;
         require_nonempty(&name)?;
+        // Optional `INTO <CONNECTOR>(...)` after the view.
+        let (view, connector) = if let Some((view, conn)) = split_keyword(&after_from, " INTO ") {
+            (view, Some(parse_connector_spec(&conn)?))
+        } else {
+            (after_from.trim().to_string(), None)
+        };
         let view = view.trim().to_string();
         require_nonempty(&view)?;
-        return Ok(Some(PipelineStatement::CreateSink { name, view }));
+        return Ok(Some(PipelineStatement::CreateSink {
+            name,
+            view,
+            connector,
+        }));
     }
 
     if upper.starts_with("START PIPELINE ") {
@@ -201,12 +253,16 @@ pub fn execute_pipeline_ddl(registry: &PipelineRegistry, sql: &str) -> SqlResult
         return Ok(None);
     };
     match stmt {
-        PipelineStatement::CreateSource { name, query } => {
-            registry.register_source(name.clone(), SourceSpec { query })?;
+        PipelineStatement::CreateSource { name, source } => {
+            registry.register_source(name.clone(), source)?;
             Ok(Some(name))
         }
-        PipelineStatement::CreateSink { name, view } => {
-            registry.register_sink(name.clone(), SinkSpec { view })?;
+        PipelineStatement::CreateSink {
+            name,
+            view,
+            connector,
+        } => {
+            registry.register_sink(name.clone(), SinkSpec { view, connector })?;
             Ok(Some(name))
         }
         PipelineStatement::DropSource { name } => {
@@ -243,6 +299,39 @@ fn require_nonempty(s: &str) -> SqlResult<()> {
     }
 }
 
+/// Parse a connector reference of the form `KIND(key='value', key2='value2')`.
+/// Keys are lowercased; values are unquoted (single or double quotes).
+fn parse_connector_spec(s: &str) -> SqlResult<ConnectorSpec> {
+    let s = s.trim();
+    let open = s.find('(').ok_or_else(|| SqlError::Unsupported {
+        feature: "connector spec must be '<KIND>(key='value', ...)'".into(),
+    })?;
+    let close = s.rfind(')').ok_or_else(|| SqlError::Unsupported {
+        feature: "connector spec missing closing ')'".into(),
+    })?;
+    if close < open {
+        return Err(SqlError::Unsupported {
+            feature: "connector spec has malformed parentheses".into(),
+        });
+    }
+    let kind = s[..open].trim().to_lowercase();
+    require_nonempty(&kind)?;
+
+    let mut options = HashMap::new();
+    for part in s[open + 1..close].split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (k, v) = part.split_once('=').ok_or_else(|| SqlError::Unsupported {
+            feature: format!("connector option '{part}' must be 'key=value'"),
+        })?;
+        let v = v.trim().trim_matches(['\'', '"']);
+        options.insert(k.trim().to_lowercase(), v.to_string());
+    }
+    Ok(ConnectorSpec { kind, options })
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -250,27 +339,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_create_source() {
+    fn parse_create_source_query() {
         let s = parse_pipeline_statement("CREATE SOURCE orders AS SELECT * FROM raw").unwrap();
         assert_eq!(
             s,
             Some(PipelineStatement::CreateSource {
                 name: "orders".into(),
-                query: "SELECT * FROM raw".into(),
+                source: SourceSpec::Query("SELECT * FROM raw".into()),
             })
         );
     }
 
     #[test]
-    fn parse_create_sink() {
-        let s = parse_pipeline_statement("CREATE SINK out FROM revenue;").unwrap();
+    fn parse_create_source_connector() {
+        let s =
+            parse_pipeline_statement("CREATE SOURCE orders FROM PARQUET(path='/data/o.parquet')")
+                .unwrap();
+        let Some(PipelineStatement::CreateSource {
+            name,
+            source: SourceSpec::Connector(spec),
+        }) = s
+        else {
+            panic!("expected connector source");
+        };
+        assert_eq!(name, "orders");
+        assert_eq!(spec.kind, "parquet");
+        assert_eq!(spec.require("path").unwrap(), "/data/o.parquet");
+    }
+
+    #[test]
+    fn parse_create_sink_plain_and_connector() {
+        // Plain (memory result) sink.
         assert_eq!(
-            s,
+            parse_pipeline_statement("CREATE SINK out FROM revenue;").unwrap(),
             Some(PipelineStatement::CreateSink {
                 name: "out".into(),
                 view: "revenue".into(),
+                connector: None,
             })
         );
+        // Connector sink.
+        let Some(PipelineStatement::CreateSink {
+            name,
+            view,
+            connector: Some(spec),
+        }) = parse_pipeline_statement(
+            "CREATE SINK out FROM revenue INTO PARQUET(path='/o.parquet')",
+        )
+        .unwrap()
+        else {
+            panic!("expected connector sink");
+        };
+        assert_eq!((name.as_str(), view.as_str()), ("out", "revenue"));
+        assert_eq!(spec.kind, "parquet");
+        assert_eq!(spec.require("path").unwrap(), "/o.parquet");
     }
 
     #[test]
@@ -302,8 +424,8 @@ mod tests {
         execute_pipeline_ddl(&reg, "CREATE SOURCE orders AS SELECT * FROM raw").unwrap();
         execute_pipeline_ddl(&reg, "CREATE SINK out FROM revenue").unwrap();
         assert_eq!(
-            reg.source("orders").unwrap().unwrap().query,
-            "SELECT * FROM raw"
+            reg.source("orders").unwrap().unwrap(),
+            SourceSpec::Query("SELECT * FROM raw".into())
         );
         assert_eq!(reg.sink("out").unwrap().unwrap().view, "revenue");
         // START PIPELINE is not consumed by the registry layer.

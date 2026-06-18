@@ -1564,3 +1564,61 @@ async fn pipeline_stream_connector_source_to_connector_sink() {
         .value(0);
     assert_eq!(total, 150.0);
 }
+
+#[test]
+fn sql_pipeline_parquet_source_and_sink() {
+    let dir = tempdir().unwrap();
+    let in_path = dir.path().join("orders.parquet");
+    let out_path = dir.path().join("revenue.parquet");
+
+    // Write input parquet: orders[id, amount] = (1,100),(2,50).
+    {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![100, 50])),
+            ],
+        )
+        .unwrap();
+        let file = File::create(&in_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    let session = Session::builder().build().unwrap();
+    // Fully connector-backed SQL pipeline: parquet source → view → parquet sink.
+    session
+        .sql(format!(
+            "CREATE SOURCE orders FROM PARQUET(path='{}')",
+            in_path.display()
+        ))
+        .unwrap();
+    session
+        .sql("CREATE INCREMENTAL VIEW revenue AS SELECT SUM(amount) AS total FROM orders")
+        .unwrap();
+    session
+        .sql(format!(
+            "CREATE SINK out FROM revenue INTO PARQUET(path='{}')",
+            out_path.display()
+        ))
+        .unwrap();
+    session.sql("START PIPELINE out").unwrap();
+
+    // Read the output parquet the sink wrote.
+    let result = session.read_parquet(&out_path).unwrap().collect().unwrap();
+    let batches = result.into_batches();
+    assert_eq!(batches.len(), 1);
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("SUM is Float64")
+        .value(0);
+    assert_eq!(total, 150.0);
+}

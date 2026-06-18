@@ -21,9 +21,12 @@
 //!     .await?;
 //! ```
 
+mod connector_factory;
 mod driver;
 mod sink;
 mod source;
+
+pub(crate) use connector_factory::{build_sink, build_source};
 
 pub use driver::RunPolicy;
 pub use sink::Egress;

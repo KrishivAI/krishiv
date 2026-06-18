@@ -1160,28 +1160,54 @@ impl Session {
                 ),
             })?;
 
-        // Resolve each declared source query to batches and feed it as a source.
+        // Resolve each declared source (query → batches, or connector) and feed it.
         let collected: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
         let mut builder = self
             .pipeline(format!("sql::{sink_name}"))
             .mode(crate::PipelineMode::Ivm);
         for (src_name, src_spec) in pipe_reg.sources().map_err(KrishivError::from)? {
-            let batches = self
-                .sql_plain(&src_spec.query)
-                .await?
-                .collect_async()
-                .await?
-                .into_batches();
-            builder = builder.source_memory(src_name, batches);
+            builder = match src_spec {
+                krishiv_sql::pipeline_ddl::SourceSpec::Query(q) => {
+                    let batches = self
+                        .sql_plain(&q)
+                        .await?
+                        .collect_async()
+                        .await?
+                        .into_batches();
+                    builder.source_memory(src_name, batches)
+                }
+                krishiv_sql::pipeline_ddl::SourceSpec::Connector(spec) => {
+                    let src = crate::pipeline::build_source(&spec)?;
+                    builder.source(src_name, crate::pipeline::Ingest::Connector(src))
+                }
+            };
         }
+
         // A sink reads the view's snapshot, which requires materialization —
         // force it on regardless of how the view was declared.
         let _ = view_entry.is_materialized;
-        builder = builder
-            .view(sink_spec.view.clone(), view_entry.body_sql.clone(), true)
-            .sink_memory(sink_spec.view.clone(), collected.clone());
+        builder = builder.view(sink_spec.view.clone(), view_entry.body_sql.clone(), true);
+
+        // A connector sink writes the output out-of-band; a plain sink collects
+        // it in memory to return as a result set.
+        let has_connector_sink = sink_spec.connector.is_some();
+        builder = match sink_spec.connector {
+            Some(spec) => {
+                let sink = crate::pipeline::build_sink(&spec)?;
+                builder.sink(
+                    sink_spec.view.clone(),
+                    crate::pipeline::Egress::Connector(sink),
+                )
+            }
+            None => builder.sink_memory(sink_spec.view.clone(), collected.clone()),
+        };
 
         builder.run(crate::RunPolicy::Once).await?;
+
+        // Connector sinks send output to their destination — return an empty ack.
+        if has_connector_sink {
+            return self.sql_plain("SELECT 1 WHERE FALSE").await;
+        }
 
         // Return the collected output as a queryable result.
         let out = collected
