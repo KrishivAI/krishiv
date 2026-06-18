@@ -116,7 +116,7 @@ pub fn record_batch_from_py(ob: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
     let batch_list = pyo3::types::PyList::new(py, [ob])?;
     let table = table_cls.call_method1("from_batches", (batch_list,))?;
 
-    let sink_cls = ipc.getattr("MockOutputStream")?;
+    let sink_cls = pa.getattr("BufferOutputStream")?;
     let sink = sink_cls.call0()?;
     let writer_cls = ipc.getattr("new_stream")?;
     let writer = writer_cls.call1((&sink, table.getattr("schema")?))?;

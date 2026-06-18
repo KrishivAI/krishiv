@@ -1,5 +1,57 @@
 # Krishiv Implementation Status
 
+## 2026-06-18 — Delta batch mode examples + 3 bug fixes
+
+Added 14 real-life delta batch mode examples (7 Python, 5 Rust, 2 SQL CLI) and
+fixed 3 bugs discovered during implementation.
+
+### Bug fixes
+1. **PyArrow IPC `MockOutputStream` removed** (`arrow_compat.rs:119`) — PyArrow 24
+   removed `MockOutputStream`. Changed to `pa.BufferOutputStream` (root module).
+2. **Delta time-travel returns latest for all versions** (`lib.rs:1416-1425`) —
+   `SqlEngine::read_delta` used the same table name for all versions. When a
+   second version was registered, it deregistered the first. Fixed by including
+   the version in the table name: `delta_{path}_v{N}`.
+3. **Python `write_delta` binding missing** (`lakehouse.rs`) — Added
+   `write_delta(path, batches, mode, schema_evolution)` Python binding so
+   Python examples can write Delta tables (previously only Rust could).
+
+### New examples (14 total, embedded mode)
+**Python** (`examples/delta-batch/python/`):
+- `01_product_catalog.py` — CRUD with append/overwrite, time-travel audit
+- `02_employee_records.py` — HR onboarding with daily appends
+- `03_financial_ledger.py` — Bank balance snapshots with overwrite
+- `04_user_sessions.py` — Web analytics session tracking
+- `05_iot_sensor_aggregation.py` — IoT sensor SQL aggregation
+- `06_etl_pipeline.py` — ETL staging/cleaning/validation workflow
+- `07_feature_store_lineage.py` — ML feature store versioning
+
+**Rust** (`examples/rust/src/bin/`):
+- `06_ecommerce_orders.rs` — E-commerce analytics with SQL
+- `07_inventory_management.rs` — Warehouse stock tracking
+- `08_clickstream_analytics.rs` — Funnel analysis on clickstream
+- `09_multi_table_join.rs` — Cross-table JOIN queries
+- `10_cdc_ingestion.rs` — Change Data Capture pipeline
+- `11_merge_upsert.rs` — MERGE/UPSERT for slowly changing dimensions
+- `12_schema_evolution.rs` — Schema evolution across versions
+
+**SQL CLI** (`examples/delta-batch/sql/`):
+- `13_cli_basic_delta.sh` — Basic Delta via `krishiv table read`
+- `14_cli_time_travel.sh` — Time-travel audit via CLI `--version`
+
+### Gate status
+- `cargo test -p krishiv-connectors` — 75/75 passed
+- `cargo test -p krishiv-delta` — 62/62 passed
+- `cargo test -p krishiv-sql` — 351/351 passed
+- `cargo test -p krishiv-api` — 138/138 passed
+- `cargo test -p krishiv-python --lib` — 44/44 passed
+- All 7 Python examples pass end-to-end
+
+### Next
+- Build & run Rust examples (blocked on rocksdb compile time)
+
+---
+
 ## 2026-06-18 — Unified compute API (one Session, one Job model, one feed())
 
 Removed duplicate session/job abstractions and collapsed the IVM feed surface

@@ -1419,7 +1419,11 @@ impl SqlEngine {
         version: Option<i64>,
     ) -> SqlResult<SqlDataFrame> {
         let path = path.as_ref();
-        let table = format!("delta_{}", path.replace(['/', '.', '-'], "_"));
+        let base = path.replace(['/', '.', '-'], "_");
+        let table = match version {
+            Some(v) => format!("delta_{base}_v{v}"),
+            None => format!("delta_{base}"),
+        };
         lakehouse::register_delta_uri(&self.context, &table, path, version).await?;
         self.sql(format!("SELECT * FROM {table}")).await
     }

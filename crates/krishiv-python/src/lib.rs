@@ -163,6 +163,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(memo::memo_transform_call, m)?)?;
 
     m.add_function(wrap_pyfunction!(lakehouse::read_delta, m)?)?;
+    m.add_function(wrap_pyfunction!(lakehouse::write_delta, m)?)?;
     m.add_function(wrap_pyfunction!(lakehouse::read_hudi, m)?)?;
     m.add_function(wrap_pyfunction!(lakehouse::write_hudi_append, m)?)?;
     m.add_function(wrap_pyfunction!(lakehouse::write_hudi_upsert, m)?)?;

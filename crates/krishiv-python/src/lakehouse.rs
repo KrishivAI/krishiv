@@ -3,6 +3,7 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
+use crate::batch::PyBatch;
 use crate::{PyDataFrame, PySession, RUNTIME};
 
 #[pyfunction]
@@ -16,6 +17,38 @@ pub fn read_delta(
         .block_on(session.inner.read_delta_async(path, version))
         .map(|df| PyDataFrame { inner: df })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Write RecordBatches to a Delta Lake table.
+///
+/// ``path``    — local filesystem path to the Delta table directory.
+/// ``batches`` — list of ``Batch`` objects to write.
+/// ``mode``    — ``"append"`` (default) or ``"overwrite"``.
+/// ``schema_evolution`` — whether to allow schema evolution (currently unused).
+#[pyfunction]
+#[pyo3(signature = (path, batches, *, mode = "append", schema_evolution = false))]
+pub fn write_delta(
+    path: String,
+    batches: Vec<PyBatch>,
+    mode: &str,
+    schema_evolution: bool,
+) -> PyResult<()> {
+    let write_mode = match mode.to_lowercase().as_str() {
+        "overwrite" => krishiv_connectors::lakehouse::DeltaWriteMode::Overwrite,
+        "merge" => krishiv_connectors::lakehouse::DeltaWriteMode::Merge,
+        _ => krishiv_connectors::lakehouse::DeltaWriteMode::Append,
+    };
+    let record_batches: Vec<arrow::record_batch::RecordBatch> = batches
+        .into_iter()
+        .map(|b| b.record_batch().clone())
+        .collect();
+    RUNTIME.block_on(krishiv_connectors::lakehouse::write_delta(
+        path,
+        record_batches,
+        write_mode,
+        schema_evolution,
+    ))
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 #[pyfunction]
