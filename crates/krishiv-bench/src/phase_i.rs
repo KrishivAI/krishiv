@@ -22,7 +22,7 @@ mod phase_i_tests {
         SqlEngine::new()
     }
 
-    // ── TPC-H synthetic fixtures ─────────────────────────────────────────────
+    // TPC-H synthetic fixtures
 
     async fn register_tpch_synthetic(engine: &SqlEngine) {
         // Minimal lineitem
@@ -218,7 +218,7 @@ mod phase_i_tests {
         assert_eq!(total_cols, 8, "Q10 column count wrong");
     }
 
-    // ── Nexmark synthetic fixtures ────────────────────────────────────────────
+    // Nexmark synthetic fixtures
 
     async fn register_nexmark_synthetic(engine: &SqlEngine) {
         let bid_schema = Arc::new(Schema::new(vec![
@@ -298,7 +298,7 @@ mod phase_i_tests {
             .await
             .expect("Nexmark Q2 must not error");
         let batches = df.collect().await.expect("collect");
-        assert!(batches[0].num_columns() == 2);
+        assert_eq!(batches[0].num_columns(), 2);
     }
 
     #[tokio::test]
@@ -334,7 +334,7 @@ mod phase_i_tests {
         assert_eq!(batches[0].num_columns(), 2);
     }
 
-    // ── Baseline regression: queries must complete within a time bound ───────
+    // Baseline regression: queries must complete within a time bound
 
     #[tokio::test]
     async fn tpch_and_nexmark_complete_within_timeout() {

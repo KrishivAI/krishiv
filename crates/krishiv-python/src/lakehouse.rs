@@ -42,13 +42,14 @@ pub fn write_delta(
         .into_iter()
         .map(|b| b.record_batch().clone())
         .collect();
-    RUNTIME.block_on(krishiv_connectors::lakehouse::write_delta(
-        path,
-        record_batches,
-        write_mode,
-        schema_evolution,
-    ))
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    RUNTIME
+        .block_on(krishiv_connectors::lakehouse::write_delta(
+            path,
+            record_batches,
+            write_mode,
+            schema_evolution,
+        ))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 #[pyfunction]

@@ -1,9 +1,9 @@
 //! TPC-H benchmark gates for Krishiv R10 (embedded engine).
 //!
 //! These benchmarks measure query execution time against the TPC-H dataset
-//! across a scale-factor ladder. They are gated against the targets defined in
-//! Keep benchmark thresholds in code or in the minimal docs when they are
-//! reintroduced as enforced gates.
+//! across a scale-factor ladder. Enforced thresholds are intentionally not
+//! baked in here; keep any reintroduced gates in code or in the minimal docs
+//! when they are added back as enforced gates.
 //!
 //! To run: cargo bench -p krishiv-bench --bench tpch_sf10
 //! Data paths: set one env var per scale factor, each pointing to a directory
