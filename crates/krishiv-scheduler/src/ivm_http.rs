@@ -261,7 +261,7 @@ pub async fn api_ivm_feed_source(
         .map_err(ivm_err)?
         .drop_zeros()
         .map_err(ivm_err)?;
-    flow.feed_source(source_name, delta).map_err(ivm_err)?;
+    flow.feed(source_name, delta).map_err(ivm_err)?;
     Ok(Json(FeedSourceResponse { success: true }))
 }
 
@@ -299,7 +299,9 @@ pub async fn api_ivm_feed_stream_delta(
         .map_err(ivm_err)?
         .drop_zeros()
         .map_err(ivm_err)?;
-    flow.feed_stream_delta(source_name, delta).map_err(ivm_err)?;
+    // Pre-computed delta: feed directly (same as /feed; the distinct route is
+    // kept for coordinator API/wire compatibility with CDC-native producers).
+    flow.feed(source_name, delta).map_err(ivm_err)?;
     Ok(Json(FeedStreamDeltaResponse { success: true }))
 }
 
@@ -554,8 +556,7 @@ pub async fn api_ivm_stream_bridge(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ivm_err(format!("IPC stream read: {e}")))?
     };
-    flow.feed_stream_output(source_name, &batches)
-        .map_err(ivm_err)?;
+    flow.feed_snapshot(source_name, &batches).map_err(ivm_err)?;
     Ok(Json(StreamBridgeResponse { success: true }))
 }
 

@@ -6,6 +6,7 @@
 
 pub mod blocking;
 pub mod catalog;
+pub mod compute;
 pub mod dataframe;
 pub mod error;
 pub mod expression;
@@ -35,6 +36,9 @@ pub use blocking::BlockingSession;
 pub use catalog::{
     FunctionIdentifier, FunctionMetadata, Identifier, Namespace, TableIdentifier, TableMetadata,
     ViewIdentifier,
+};
+pub use compute::{
+    Checkpointable, EmbeddedStreamJob, FeedableJob, IvmJob, Job, JobKind, StepReport, StreamJob,
 };
 pub use dataframe::{
     Boundedness, DataFrame, ExecutionResult, ExplainMode, GroupedDataFrame, GroupingSpec, JoinType,

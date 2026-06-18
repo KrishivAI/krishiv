@@ -1296,3 +1296,43 @@ fn describe_and_live_table_sql_intercepts_work() {
             .unwrap()
     );
 }
+
+// ── Unified compute API: mode-aware ivm() + one feed() ──────────────────────
+
+#[tokio::test]
+async fn embedded_session_ivm_returns_embedded_job() {
+    use crate::{IvmJob, Job, JobKind};
+
+    let session = Session::builder().build().unwrap();
+    let job = session.ivm("revenue").await.unwrap();
+    // Regression guard for the embedded-on-remote bug: an embedded session must
+    // hand out an embedded IVM job.
+    assert!(matches!(job, IvmJob::Embedded(_)));
+    assert_eq!(job.kind(), JobKind::Ivm);
+    assert_eq!(job.job_id(), "revenue");
+}
+
+#[tokio::test]
+async fn ivm_feed_from_cdc_then_step_via_unified_api() {
+    use crate::{FeedableJob, IvmJob};
+    use krishiv_delta::DeltaBatch;
+
+    fn batch(ids: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(ids.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    let session = Session::builder().build().unwrap();
+    let job: IvmJob = session.ivm("orders_job").await.unwrap();
+
+    // The one feed primitive + a DeltaBatch constructor (replaces feed_cdc_source).
+    let insert = DeltaBatch::from_cdc(None, Some(batch(&[1, 2])))
+        .unwrap()
+        .unwrap();
+    job.feed("orders", &insert).await.unwrap();
+    let report = job.step().await.unwrap();
+    assert_eq!(report.tick, 1);
+}

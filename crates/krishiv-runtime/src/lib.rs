@@ -9,7 +9,6 @@
 use std::fmt;
 
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
-use krishiv_scheduler::{IvmJobRegistry, SharedIvmJobRegistry};
 
 pub mod continuous_stream;
 mod coordinator_http_client;
@@ -20,7 +19,6 @@ pub mod flight_protocol;
 pub mod in_process;
 pub mod in_process_cluster;
 pub mod ivm_job;
-pub mod krishiv_session;
 pub mod local_streaming;
 mod plan;
 pub mod stream_kafka;
@@ -34,10 +32,10 @@ pub use coordinator_http_client::{
     execute_coordinator_continuous_push, execute_coordinator_continuous_register,
     execute_coordinator_ivm_checkpoint, execute_coordinator_ivm_checkpoint_delta,
     execute_coordinator_ivm_create_job, execute_coordinator_ivm_feed_source,
-    execute_coordinator_ivm_register_view, execute_coordinator_ivm_restore,
-    execute_coordinator_ivm_restore_delta, execute_coordinator_ivm_step,
-    execute_coordinator_ivm_feed_stream_delta, execute_coordinator_ivm_stream_bridge,
-    execute_coordinator_physical_plan,
+    execute_coordinator_ivm_feed_stream_delta, execute_coordinator_ivm_register_view,
+    execute_coordinator_ivm_restore, execute_coordinator_ivm_restore_delta,
+    execute_coordinator_ivm_snapshot, execute_coordinator_ivm_step,
+    execute_coordinator_ivm_stream_bridge, execute_coordinator_physical_plan,
 };
 pub use execution_runtime::{
     BatchTableRegistration, ClusterEndpoints, ExecutionPlacement, ExecutionRuntime,
@@ -51,8 +49,8 @@ pub use flight_action::{
 };
 pub use in_process::{BatchSqlTable, InProcessStreamingRuntime};
 pub use in_process_cluster::{InProcessCluster, plan_spec_to_local};
-pub use ivm_job::{EmbeddedIvmJob, IvmJobHandle, RemoteIvmJob};
-pub use krishiv_session::KrishivSession;
+pub use ivm_job::{EmbeddedIvmJob, RemoteIvmJob};
+pub use krishiv_scheduler::{IvmJobRegistry, SharedIvmJobRegistry};
 pub use local_streaming::{
     LocalWindowExecutionSpec, LocalWindowKind, execute_streaming_window, execute_windowed_stream,
 };

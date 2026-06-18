@@ -537,6 +537,7 @@ impl SessionBuilder {
             config: Arc::new(DashMap::from_iter(self.config)),
             auth: self.auth,
             policy: self.policy,
+            ivm_registry: Arc::new(krishiv_runtime::IvmJobRegistry::new()),
         })
     }
 }
@@ -562,6 +563,8 @@ pub struct Session {
     config: Arc<DashMap<String, String>>,
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
+    /// Per-session registry of embedded IVM jobs created via [`Session::ivm`].
+    ivm_registry: krishiv_runtime::SharedIvmJobRegistry,
 }
 
 impl fmt::Debug for Session {
@@ -1168,13 +1171,53 @@ impl Session {
         self.sql_engine.incremental_view_registry()
     }
 
-    /// Create a new [`IncrementalFlow`] bound to this session.
+    // ── Unified compute entry points ──────────────────────────────────────────
+
+    /// Run a one-shot batch SQL query, returning a [`DataFrame`].
     ///
-    /// The returned flow shares the session's incremental-view registry so
-    /// that views registered via `CREATE INCREMENTAL VIEW` SQL are visible
-    /// in the flow.
-    pub fn incremental(&self) -> crate::incremental_flow::IncrementalFlow {
-        crate::incremental_flow::IncrementalFlow::new()
+    /// This is an alias for [`sql`](Self::sql) that names the execution mode at
+    /// the call site, symmetric with [`ivm`](Self::ivm) and [`stream`](Self::stream).
+    pub fn batch(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+        self.sql(query)
+    }
+
+    /// Create or attach to an incremental-view-maintenance job by name.
+    ///
+    /// Mode-aware: a session built for distributed execution (with a coordinator
+    /// URL) returns a remote job; otherwise an in-process embedded job. The
+    /// returned [`IvmJob`](crate::IvmJob) exposes the same `feed`/`step`/
+    /// `snapshot`/`checkpoint` surface in both modes.
+    pub async fn ivm(&self, name: &str) -> Result<crate::IvmJob> {
+        match self.mode {
+            ExecutionMode::Distributed => {
+                let url = self.coordinator_url.as_deref().ok_or_else(|| {
+                    KrishivError::unsupported(
+                        "distributed IVM requires a coordinator URL; call with_coordinator()",
+                    )
+                })?;
+                crate::IvmJob::remote(url, name).await
+            }
+            ExecutionMode::Embedded | ExecutionMode::SingleNode => {
+                crate::IvmJob::embedded(&self.ivm_registry, name)
+            }
+        }
+    }
+
+    /// Submit a continuous windowed streaming job and return a [`StreamJob`]
+    /// handle for pushing input and draining output.
+    ///
+    /// The embedded variant wraps this session's continuous-stream registry; in
+    /// distributed mode use [`RemoteStreamingJob`](krishiv_runtime::RemoteStreamingJob)
+    /// directly (wired into `StreamJob::Remote`).
+    pub fn stream(
+        &self,
+        name: impl Into<String>,
+        spec: LocalWindowExecutionSpec,
+    ) -> Result<crate::StreamJob> {
+        let job_id = self.submit_stream_job(name, spec)?;
+        Ok(crate::StreamJob::Embedded(Box::new(
+            crate::compute::EmbeddedStreamJob::new(self.clone(), job_id),
+        )))
     }
 
     /// Execute a SQL query with a wall-clock timeout.

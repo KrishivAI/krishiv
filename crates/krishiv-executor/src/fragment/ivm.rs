@@ -178,7 +178,7 @@ pub async fn execute_ivm_fragment(
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &pd.delta_b64)
                 .map_err(|e| format!("base64 decode delta for '{}': {e}", pd.source))?;
         let delta = deserialize_delta_batch(&ipc_bytes).map_err(|e| e.to_string())?;
-        flow.feed_source(pd.source.clone(), delta)
+        flow.feed(pd.source.clone(), delta)
             .map_err(|e| e.to_string())?;
     }
 

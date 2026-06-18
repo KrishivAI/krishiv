@@ -1,36 +1,39 @@
-//! Python bindings for incremental view maintenance.
+//! Python bindings for incremental view maintenance (IVM).
 //!
-//! Exposes `IncrementalFlow`, `DeltaBatch`, and `StepSummary` to Python.
-//!
-//! # Typical usage
+//! Exposes [`PyDeltaBatch`], [`PyStepSummary`], and the mode-aware
+//! [`PyIvmJob`] handle. Obtain a job from a session — the session picks the
+//! embedded or remote backend automatically:
 //!
 //! ```python
 //! import krishiv
 //! import pyarrow as pa
 //!
-//! flow = krishiv.IncrementalFlow()
-//! schema = pa.schema([pa.field("id", pa.int32()), pa.field("amount", pa.float64())])
-//! flow.register_view("revenue", "SELECT sum(amount) AS total FROM orders",
-//!                    schema, is_materialized=True)
+//! session = krishiv.Session()                 # embedded
+//! job = session.ivm("revenue")
 //!
-//! batch = make_example_batch()   # or collect from a query result
-//! cb = krishiv.DeltaBatch.from_inserts(batch)
-//! flow.feed_source("orders", cb)
+//! class Revenue(krishiv.Schema):
+//!     total: float
+//! job.register_view("revenue", "SELECT sum(amount) AS total FROM orders",
+//!                   Revenue, is_materialized=True)
 //!
-//! summary = flow.step()
-//! print(summary)
-//! snap = flow.snapshot("revenue")   # -> Batch or None
+//! batch = make_example_batch()
+//! job.feed("orders", krishiv.DeltaBatch.from_inserts(batch))
+//! summary = job.step()
+//! snap = job.snapshot("revenue")              # -> Batch or None
 //! ```
 
-use krishiv_api::{IncrementalFlow, StepSummary};
+use krishiv_api::{Checkpointable, FeedableJob, IvmJob, Job, StepReport};
 use krishiv_delta::{DeltaBatch, IncrementalViewSpec, LatenessSpec};
-use krishiv_runtime::RemoteIvmJob;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
 use crate::batch::PyBatch;
 use crate::schema::PySchema;
+
+fn rt_err(e: impl std::fmt::Display) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
 
 // ── PyDeltaBatch ─────────────────────────────────────────────────────────────
 
@@ -48,14 +51,10 @@ pub struct PyDeltaBatch {
 impl PyDeltaBatch {
     /// Construct a `DeltaBatch` from a :class:`Batch`, treating all rows as
     /// insertions (weight = +1).
-    ///
-    /// The ``batch`` must be a :class:`krishiv.Batch` (e.g., from a query
-    /// result or :func:`make_example_batch`).
     #[staticmethod]
     pub fn from_inserts(batch: PyRef<'_, PyBatch>) -> PyResult<Self> {
         let rb = batch.record_batch().clone();
-        let inner =
-            DeltaBatch::from_inserts(rb).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let inner = DeltaBatch::from_inserts(rb).map_err(rt_err)?;
         Ok(Self { inner })
     }
 
@@ -64,9 +63,26 @@ impl PyDeltaBatch {
     #[staticmethod]
     pub fn from_deletes(batch: PyRef<'_, PyBatch>) -> PyResult<Self> {
         let rb = batch.record_batch().clone();
-        let inner =
-            DeltaBatch::from_deletes(rb).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let inner = DeltaBatch::from_deletes(rb).map_err(rt_err)?;
         Ok(Self { inner })
+    }
+
+    /// Construct a `DeltaBatch` from a CDC change event.
+    ///
+    /// - INSERT: ``before=None, after=batch``
+    /// - DELETE: ``before=batch, after=None``
+    /// - UPDATE: ``before=old, after=new`` (retract old, insert new)
+    /// - no-op:  ``before=None, after=None`` → returns ``None``
+    #[staticmethod]
+    #[pyo3(signature = (before=None, after=None))]
+    pub fn from_cdc(
+        before: Option<PyRef<'_, PyBatch>>,
+        after: Option<PyRef<'_, PyBatch>>,
+    ) -> PyResult<Option<Self>> {
+        let before = before.map(|b| b.record_batch().clone());
+        let after = after.map(|b| b.record_batch().clone());
+        let opt = DeltaBatch::from_cdc(before, after).map_err(rt_err)?;
+        Ok(opt.map(|inner| Self { inner }))
     }
 
     /// Return the underlying batch (includes the ``_weight`` column) as a
@@ -93,7 +109,7 @@ impl PyDeltaBatch {
 
 // ── PyStepSummary ─────────────────────────────────────────────────────────────
 
-/// Summary returned by :meth:`IncrementalFlow.step`.
+/// Summary returned by :meth:`IvmJob.step`.
 #[pyclass(name = "StepSummary")]
 pub struct PyStepSummary {
     /// Total number of output rows emitted across all views this tick.
@@ -102,75 +118,58 @@ pub struct PyStepSummary {
     /// Number of views that produced non-empty output this tick.
     #[pyo3(get)]
     pub active_views: usize,
+    /// The tick counter after this step.
+    #[pyo3(get)]
+    pub tick: u64,
 }
 
 #[pymethods]
 impl PyStepSummary {
     pub fn __repr__(&self) -> String {
         format!(
-            "StepSummary(total_output_rows={}, active_views={})",
-            self.total_output_rows, self.active_views
+            "StepSummary(total_output_rows={}, active_views={}, tick={})",
+            self.total_output_rows, self.active_views, self.tick
         )
     }
 }
 
-impl From<StepSummary> for PyStepSummary {
-    fn from(s: StepSummary) -> Self {
+impl From<StepReport> for PyStepSummary {
+    fn from(s: StepReport) -> Self {
         Self {
             total_output_rows: s.total_output_rows,
             active_views: s.active_views,
+            tick: s.tick,
         }
     }
 }
 
-// ── PyIncrementalFlow ─────────────────────────────────────────────────────────
+// ── PyIvmJob ──────────────────────────────────────────────────────────────────
 
-/// Driver for an incremental view maintenance pipeline.
+/// Mode-aware handle to an incremental-view-maintenance job.
 ///
-/// Create via :meth:`Session.incremental` or directly with
-/// :class:`IncrementalFlow()`.
+/// Obtain via :meth:`Session.ivm`. The same handle works whether the session is
+/// embedded (in-process) or distributed (remote coordinator) — the session
+/// chooses the backend, and every method behaves identically.
 ///
-/// Thread-safe: the flow can be shared across threads — all state is protected
-/// internally by a Mutex.
-#[pyclass(name = "IncrementalFlow")]
+/// All methods are synchronous wrappers that drive the shared Krishiv Tokio
+/// runtime; in distributed mode they issue coordinator HTTP calls.
+#[pyclass(name = "IvmJob")]
 #[derive(Clone)]
-pub struct PyIncrementalFlow {
-    pub(crate) inner: IncrementalFlow,
+pub struct PyIvmJob {
+    pub(crate) inner: IvmJob,
 }
 
 #[pymethods]
-impl PyIncrementalFlow {
-    /// Create a new, empty incremental flow.
-    #[new]
-    pub fn py_new() -> Self {
-        Self {
-            inner: IncrementalFlow::new(),
-        }
+impl PyIvmJob {
+    /// The job's stable identifier.
+    #[getter]
+    pub fn job_id(&self) -> &str {
+        self.inner.job_id()
     }
 
-    /// Register an incremental view programmatically.
+    /// Register or update an incremental view on this job.
     ///
-    /// Parameters
-    /// ----------
-    /// name : str
-    ///     Logical view name.
-    /// body_sql : str
-    ///     SQL body (for documentation; DataFusion-driven execution wired in a
-    ///     later phase).
-    /// schema : type
-    ///     A :class:`krishiv.Schema` subclass declaring the output columns.
-    /// is_materialized : bool, optional
-    ///     If ``True``, the view maintains a full snapshot (default ``False``).
-    /// is_recursive : bool, optional
-    ///     If ``True``, the view participates in fixed-point iteration
-    ///     (default ``False``).
-    ///
-    /// Example::
-    ///
-    ///     class Revenue(krishiv.Schema):
-    ///         total: float
-    ///
-    ///     flow.register_view("revenue", "SELECT sum(amount) AS total FROM orders", Revenue)
+    /// ``schema`` is a :class:`krishiv.Schema` subclass declaring output columns.
     #[pyo3(signature = (name, body_sql, schema, is_materialized=false, is_recursive=false))]
     pub fn register_view(
         &self,
@@ -189,15 +188,13 @@ impl PyIncrementalFlow {
             is_recursive,
             lateness: vec![],
         };
-        self.inner
-            .register_view(spec)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        crate::RUNTIME
+            .block_on(self.inner.register_view(spec))
+            .map_err(rt_err)
     }
 
-    /// Register an incremental view with LATENESS annotations.
-    ///
-    /// ``schema`` is a :class:`krishiv.Schema` subclass. ``lateness_ms`` maps
-    /// column name → lateness in milliseconds.
+    /// Register an incremental view with LATENESS annotations
+    /// (``lateness_ms`` maps column name → lateness in milliseconds).
     #[pyo3(signature = (name, body_sql, schema, lateness_ms, is_materialized=false, is_recursive=false))]
     pub fn register_view_with_lateness(
         &self,
@@ -211,9 +208,9 @@ impl PyIncrementalFlow {
         let output_schema = PySchema::arrow_schema_from_class(schema)?;
         let lateness = lateness_ms
             .into_iter()
-            .map(|(col, ms)| LatenessSpec {
-                column: col,
-                lateness_ms: ms,
+            .map(|(column, lateness_ms)| LatenessSpec {
+                column,
+                lateness_ms,
             })
             .collect();
         let spec = IncrementalViewSpec {
@@ -224,344 +221,88 @@ impl PyIncrementalFlow {
             is_recursive,
             lateness,
         };
-        self.inner
-            .register_view(spec)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        crate::RUNTIME
+            .block_on(self.inner.register_view(spec))
+            .map_err(rt_err)
     }
 
-    /// Push a :class:`DeltaBatch` as input delta for a named source.
+    /// Feed a :class:`DeltaBatch` as input for a named source.
     ///
-    /// The delta is buffered until the next :meth:`step` call.
-    pub fn feed_source(&self, source_name: String, batch: PyRef<'_, PyDeltaBatch>) -> PyResult<()> {
-        self.inner
-            .feed_source(source_name, batch.inner.clone())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    /// Build the delta with :meth:`DeltaBatch.from_inserts`,
+    /// :meth:`DeltaBatch.from_deletes`, or :meth:`DeltaBatch.from_cdc`.
+    /// Buffered until the next :meth:`step`.
+    pub fn feed(&self, source: String, delta: PyRef<'_, PyDeltaBatch>) -> PyResult<()> {
+        let delta = delta.inner.clone();
+        crate::RUNTIME
+            .block_on(async { self.inner.feed(&source, &delta).await })
+            .map_err(rt_err)
     }
 
-    /// Wrap a plain :class:`Batch` as all-insertions and feed it to a source (G1).
-    ///
-    /// Equivalent to ``flow.feed_source(name, DeltaBatch.from_inserts(batch))``.
-    /// Use this for shuffle-write output or any non-CDC source that emits
-    /// plain :class:`Batch` objects without weight annotations.
-    pub fn feed_source_from_batch(
-        &self,
-        source_name: String,
-        batch: PyRef<'_, PyBatch>,
-    ) -> PyResult<()> {
-        let rb = batch.record_batch().clone();
-        self.inner
-            .feed_source_from_record_batch(source_name, rb)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    /// Feed a full streaming snapshot; differentiated against the previous
+    /// snapshot for this source.
+    pub fn feed_snapshot(&self, source: String, batches: Vec<PyRef<'_, PyBatch>>) -> PyResult<()> {
+        let rbs: Vec<_> = batches.iter().map(|b| b.record_batch().clone()).collect();
+        crate::RUNTIME
+            .block_on(async { self.inner.feed_snapshot(&source, &rbs).await })
+            .map_err(rt_err)
     }
 
-    /// Feed a pre-computed :class:`DeltaBatch` directly without snapshot diffing (G4).
-    ///
-    /// Use for CDC-native producers (Debezium, Kafka CDC) that already emit
-    /// weighted ±1 batches and do not need `feed_stream_output` overhead.
-    pub fn feed_stream_delta(
-        &self,
-        source_name: String,
-        delta: PyRef<'_, PyDeltaBatch>,
-    ) -> PyResult<()> {
-        self.inner
-            .feed_stream_delta(source_name, delta.inner.clone())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Advance one clock tick (synchronous).
-    ///
-    /// Drains all pending input deltas, publishes output deltas to all
-    /// registered views, and increments the tick counter.
-    ///
-    /// Returns a :class:`StepSummary` with aggregate statistics for this tick.
+    /// Advance one tick. Returns a :class:`StepSummary`.
     pub fn step(&self) -> PyResult<PyStepSummary> {
-        self.inner
-            .step()
-            .map(PyStepSummary::from)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Advance one clock tick asynchronously.
-    ///
-    /// Equivalent to ``await asyncio.to_thread(flow.step)`` — runs the tick
-    /// on the shared Krishiv Tokio runtime so the asyncio event loop is not
-    /// blocked. Returns a :class:`StepSummary`.
-    pub async fn step_async(&self) -> PyResult<PyStepSummary> {
-        self.step()
-    }
-
-    /// Advance one clock tick with a Python computation callback.
-    ///
-    /// ``compute`` is called with a ``dict[str, DeltaBatch]`` (source deltas)
-    /// and should return a ``dict[str, DeltaBatch]`` (output deltas per view).
-    /// The returned deltas are published to each view's watch channel.
-    ///
-    /// Example::
-    ///
-    ///     summary = flow.step_with(lambda inputs: {
-    ///         "revenue": compute_revenue_delta(inputs.get("orders"))
-    ///     })
-    pub fn step_with(&self, py: Python<'_>, compute: &Bound<'_, PyAny>) -> PyResult<PyStepSummary> {
-        use std::collections::HashMap;
-
-        let mut callback_err: Option<PyErr> = None;
-
-        let result = self.inner.step_with(|inputs| {
-            // Build Python dict: { source_name: PyDeltaBatch }
-            let py_inputs = pyo3::types::PyDict::new(py);
-            for (name, cb) in inputs {
-                let py_cb = PyDeltaBatch { inner: cb };
-                if let Err(e) = py_inputs.set_item(&name, Py::new(py, py_cb).expect("Py::new")) {
-                    callback_err = Some(e);
-                    return Err(krishiv_ivm::IvmError::Execution(
-                        "step_with: failed to build input dict".into(),
-                    ));
-                }
-            }
-            // Call the Python function
-            let py_result = match compute.call1((py_inputs,)) {
-                Err(e) => {
-                    callback_err = Some(e);
-                    return Err(krishiv_ivm::IvmError::Execution(
-                        "step_with: callback raised an exception".into(),
-                    ));
-                }
-                Ok(v) => v,
-            };
-            // Expect a dict[str, DeltaBatch] return value
-            let py_dict = match py_result.cast_into::<pyo3::types::PyDict>() {
-                Err(_) => {
-                    callback_err = Some(PyRuntimeError::new_err(
-                        "step_with callback must return a dict[str, DeltaBatch]",
-                    ));
-                    return Err(krishiv_ivm::IvmError::Execution(
-                        "step_with: callback did not return a dict".into(),
-                    ));
-                }
-                Ok(d) => d,
-            };
-            let mut out: HashMap<String, DeltaBatch> = HashMap::new();
-            for (k, v) in py_dict.iter() {
-                let view_name: String = match k.extract::<String>() {
-                    Err(e) => {
-                        callback_err = Some(e.into());
-                        return Err(krishiv_ivm::IvmError::Execution(
-                            "step_with: dict key must be str".into(),
-                        ));
-                    }
-                    Ok(s) => s,
-                };
-                let py_cb: PyRef<'_, PyDeltaBatch> = match v.extract::<PyRef<'_, PyDeltaBatch>>() {
-                    Err(e) => {
-                        callback_err = Some(e.into());
-                        return Err(krishiv_ivm::IvmError::Execution(
-                            "step_with: dict value must be DeltaBatch".into(),
-                        ));
-                    }
-                    Ok(c) => c,
-                };
-                out.insert(view_name, py_cb.inner.clone());
-            }
-            Ok(out)
-        });
-
-        // Re-raise any Python exception captured inside the closure.
-        if let Some(e) = callback_err {
-            return Err(e);
-        }
-        result
-            .map(PyStepSummary::from)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Return the latest materialized snapshot for a view as a
-    /// :class:`Batch`, or ``None`` if no snapshot is available.
-    ///
-    /// Only valid for views registered with ``is_materialized=True``.
-    /// All rows have implicit weight +1 (the snapshot is a pure insertion set).
-    pub fn snapshot(&self, name: String) -> PyResult<Option<PyBatch>> {
-        self.inner
-            .snapshot(&name)
-            .map(|opt| opt.map(PyBatch::from_record_batch))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Return the latest materialized snapshot as a :class:`DeltaBatch`
-    /// with all rows weighted +1, or ``None`` if no snapshot is available (G3).
-    ///
-    /// Unlike :meth:`snapshot`, this makes the all-insertion weight contract
-    /// explicit: the returned :class:`DeltaBatch` can be passed directly to
-    /// another :class:`IncrementalFlow` as a seed delta.
-    pub fn snapshot_as_delta(&self, name: String) -> PyResult<Option<PyDeltaBatch>> {
-        let opt = self
-            .inner
-            .snapshot(&name)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match opt {
-            None => Ok(None),
-            Some(rb) => {
-                let inner = DeltaBatch::from_inserts(rb)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok(Some(PyDeltaBatch { inner }))
-            }
-        }
-    }
-
-    /// Return the names of all registered views.
-    pub fn view_names(&self) -> PyResult<Vec<String>> {
-        self.inner
-            .view_names()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Current tick count (incremented on each :meth:`step` call).
-    #[getter]
-    pub fn tick(&self) -> PyResult<u64> {
-        self.inner
-            .tick()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Drop a registered view and stop emitting output for it.
-    /// Drop a registered view. Returns ``True`` if the view existed.
-    ///
-    /// Note: full removal from the operator graph will be wired in a later
-    /// phase. This currently only checks existence.
-    pub fn drop_view(&self, name: String) -> PyResult<bool> {
-        let names = self
-            .inner
-            .view_names()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(names.contains(&name))
-    }
-
-    pub fn __repr__(&self) -> PyResult<String> {
-        let tick = self
-            .inner
-            .tick()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(format!("IncrementalFlow(tick={tick})"))
-    }
-}
-
-// ── PyRemoteIvmJob ────────────────────────────────────────────────────────────
-
-/// Handle to an IVM job running on a remote coordinator.
-///
-/// Obtain via :func:`krishiv.connect_ivm` or
-/// :meth:`Session.connect_ivm`.
-///
-/// All methods are synchronous wrappers around async coordinator HTTP calls
-/// that run on the shared Krishiv Tokio runtime.
-///
-/// Example::
-///
-///     job = krishiv.connect_ivm("http://coordinator:8080", "revenue")
-///     job.feed_source("orders", delta)
-///     summary = job.step()
-///     print(summary)
-#[pyclass(name = "RemoteIvmJob")]
-pub struct PyRemoteIvmJob {
-    pub(crate) inner: RemoteIvmJob,
-}
-
-#[pymethods]
-impl PyRemoteIvmJob {
-    /// Connect to an existing IVM job on the coordinator.
-    ///
-    /// ``coordinator_url`` — base URL of the coordinator HTTP API,
-    ///   e.g. ``"http://localhost:8080"``.
-    /// ``job_name`` — job name / ID. Creates the job if it doesn't exist.
-    #[new]
-    pub fn py_new(coordinator_url: String, job_name: String) -> PyResult<Self> {
-        use crate::RUNTIME;
-        let inner = RUNTIME
-            .block_on(RemoteIvmJob::create(&coordinator_url, Some(&job_name)))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    /// The coordinator-assigned job ID.
-    #[getter]
-    pub fn job_id(&self) -> &str {
-        self.inner.job_id()
-    }
-
-    /// Register or update an incremental view on this job.
-    ///
-    /// Parameters
-    /// ----------
-    /// name : str
-    ///     Logical view name.
-    /// body_sql : str
-    ///     SQL body for the view.
-    /// schema : type
-    ///     A :class:`krishiv.Schema` subclass declaring output columns.
-    /// is_materialized : bool, optional
-    ///     Maintain a full snapshot (default ``False``).
-    /// is_recursive : bool, optional
-    ///     Participate in fixed-point iteration (default ``False``).
-    #[pyo3(signature = (name, body_sql, schema, is_materialized=false, is_recursive=false))]
-    pub fn register_view(
-        &self,
-        name: String,
-        body_sql: String,
-        schema: &Bound<'_, PyType>,
-        is_materialized: bool,
-        is_recursive: bool,
-    ) -> PyResult<()> {
-        use crate::RUNTIME;
-        let output_schema = PySchema::arrow_schema_from_class(schema)?;
-        let spec = IncrementalViewSpec {
-            name,
-            body_sql,
-            output_schema,
-            is_materialized,
-            is_recursive,
-            lateness: vec![],
-        };
-        RUNTIME
-            .block_on(self.inner.register_view(&spec))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Push a :class:`DeltaBatch` as input delta for a named source.
-    pub fn feed_source(&self, source_name: String, batch: PyRef<'_, PyDeltaBatch>) -> PyResult<()> {
-        use crate::RUNTIME;
-        RUNTIME
-            .block_on(self.inner.feed_source(&source_name, &batch.inner))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Advance one clock tick on the coordinator.
-    ///
-    /// Returns a :class:`StepSummary`-like tuple ``(active_views, total_output_rows, tick)``.
-    pub fn step(&self) -> PyResult<(usize, usize, u64)> {
-        use crate::RUNTIME;
-        RUNTIME
+        crate::RUNTIME
             .block_on(self.inner.step())
-            .map(|s| (s.active_views, s.total_output_rows, s.tick))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map(PyStepSummary::from)
+            .map_err(rt_err)
     }
 
-    /// Retrieve a serialized checkpoint from the coordinator as bytes.
+    /// Read the current materialized snapshot of a view, or ``None``.
+    pub fn snapshot(&self, view: String) -> PyResult<Option<PyBatch>> {
+        crate::RUNTIME
+            .block_on(async { self.inner.snapshot(&view).await })
+            .map(|opt| opt.map(PyBatch::from_record_batch))
+            .map_err(rt_err)
+    }
+
+    /// Enable delta-checkpoint accumulation (embedded only; remote always on).
+    pub fn enable_delta_checkpoints(&self) -> PyResult<()> {
+        self.inner.enable_delta_checkpoints().map_err(rt_err)
+    }
+
+    /// Enable content-addressed input dedup (embedded only).
+    pub fn enable_input_dedup(&self) -> PyResult<()> {
+        self.inner.enable_input_dedup().map_err(rt_err)
+    }
+
+    /// Serialize a full checkpoint to bytes.
     pub fn checkpoint(&self) -> PyResult<Vec<u8>> {
-        use crate::RUNTIME;
-        RUNTIME
+        crate::RUNTIME
             .block_on(self.inner.checkpoint())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(rt_err)
     }
 
-    /// Restore this job from previously captured checkpoint bytes.
+    /// Restore from a full checkpoint.
     pub fn restore(&self, bytes: Vec<u8>) -> PyResult<()> {
-        use crate::RUNTIME;
-        RUNTIME
-            .block_on(self.inner.restore(&bytes))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        crate::RUNTIME
+            .block_on(async { self.inner.restore(&bytes).await })
+            .map_err(rt_err)
+    }
+
+    /// Serialize only the deltas accumulated since the last call.
+    pub fn checkpoint_delta(&self) -> PyResult<Vec<u8>> {
+        crate::RUNTIME
+            .block_on(self.inner.checkpoint_delta())
+            .map_err(rt_err)
+    }
+
+    /// Apply delta-checkpoint bytes on top of restored state.
+    pub fn restore_delta(&self, bytes: Vec<u8>) -> PyResult<()> {
+        crate::RUNTIME
+            .block_on(async { self.inner.restore_delta(&bytes).await })
+            .map_err(rt_err)
     }
 
     pub fn __repr__(&self) -> String {
-        format!("RemoteIvmJob(job_id='{}')", self.inner.job_id())
+        format!("IvmJob(job_id='{}')", self.inner.job_id())
     }
 }
 
@@ -573,6 +314,7 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     fn make_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -580,100 +322,35 @@ mod tests {
             .expect("valid batch")
     }
 
-    fn make_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]))
-    }
-
     #[test]
     fn delta_batch_from_inserts_num_rows() {
-        let batch = make_batch();
-        let cb = DeltaBatch::from_inserts(batch).expect("from_inserts");
+        let cb = DeltaBatch::from_inserts(make_batch()).expect("from_inserts");
         let py_cb = PyDeltaBatch { inner: cb };
         assert_eq!(py_cb.num_rows(), 3);
         assert!(!py_cb.is_empty());
     }
 
     #[test]
-    fn delta_batch_from_deletes_num_rows() {
-        let batch = make_batch();
-        let cb = DeltaBatch::from_deletes(batch).expect("from_deletes");
-        let py_cb = PyDeltaBatch { inner: cb };
+    fn delta_batch_from_cdc_insert_and_noop() {
+        // INSERT
+        let inner = DeltaBatch::from_cdc(None, Some(make_batch()))
+            .expect("from_cdc")
+            .expect("insert produces a delta");
+        let py_cb = PyDeltaBatch { inner };
         assert_eq!(py_cb.num_rows(), 3);
+        // no-op
+        assert!(DeltaBatch::from_cdc(None, None).unwrap().is_none());
     }
 
     #[test]
-    fn incremental_flow_register_and_list_views() {
-        let flow = IncrementalFlow::new();
-        let schema = make_schema();
-        let spec = IncrementalViewSpec {
-            name: "v1".to_string(),
-            body_sql: "SELECT x FROM t".to_string(),
-            output_schema: schema,
-            is_materialized: false,
-            is_recursive: false,
-            lateness: vec![],
-        };
-        flow.register_view(spec).expect("register");
-        let py_flow = PyIncrementalFlow { inner: flow };
-        let names = py_flow.view_names().expect("view_names");
-        assert!(names.contains(&"v1".to_string()));
-    }
-
-    #[test]
-    fn incremental_flow_step_increments_tick() {
-        let flow = PyIncrementalFlow::py_new();
-        assert_eq!(flow.tick().unwrap(), 0);
-        flow.step().expect("step");
-        assert_eq!(flow.tick().unwrap(), 1);
-    }
-
-    #[test]
-    fn incremental_flow_feed_and_step() {
-        let flow = PyIncrementalFlow::py_new();
-        let schema = make_schema();
-        let spec = IncrementalViewSpec {
-            name: "v1".to_string(),
-            body_sql: "SELECT x FROM t".to_string(),
-            output_schema: schema,
-            is_materialized: false,
-            is_recursive: false,
-            lateness: vec![],
-        };
-        flow.inner.register_view(spec).expect("register");
-        let cb = DeltaBatch::from_inserts(make_batch()).expect("cb");
-        let py_cb = PyDeltaBatch { inner: cb };
-        flow.inner
-            .feed_source("t", py_cb.inner.clone())
-            .expect("feed");
-        let summary = flow.step().expect("step");
-        assert_eq!(flow.tick().unwrap(), 1);
-        // No DataFusion computation wired yet — output rows = 0.
-        let _ = summary.total_output_rows;
-    }
-
-    #[test]
-    fn incremental_flow_snapshot_none_before_step() {
-        let flow = PyIncrementalFlow::py_new();
-        let schema = make_schema();
-        let spec = IncrementalViewSpec {
-            name: "v1".to_string(),
-            body_sql: "SELECT x FROM t".to_string(),
-            output_schema: schema,
-            is_materialized: false,
-            is_recursive: false,
-            lateness: vec![],
-        };
-        flow.inner.register_view(spec).expect("register");
-        let snap = flow.snapshot("v1".to_string()).expect("snapshot");
-        assert!(snap.is_none());
-    }
-
-    #[test]
-    fn delta_batch_is_empty_for_empty_batch() {
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-        let empty = RecordBatch::new_empty(schema);
-        let cb = DeltaBatch::from_inserts(empty).expect("from_inserts");
-        let py_cb = PyDeltaBatch { inner: cb };
-        assert!(py_cb.is_empty());
+    fn step_summary_carries_tick() {
+        let summary = PyStepSummary::from(StepReport {
+            active_views: 2,
+            total_output_rows: 5,
+            tick: 7,
+        });
+        assert_eq!(summary.tick, 7);
+        assert_eq!(summary.active_views, 2);
+        assert_eq!(summary.total_output_rows, 5);
     }
 }

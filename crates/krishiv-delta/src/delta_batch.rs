@@ -68,6 +68,28 @@ impl DeltaBatch {
         })
     }
 
+    /// Build a `DeltaBatch` from a CDC change event by dispatching on the
+    /// before/after pair:
+    ///
+    /// - INSERT `(None, Some(after))`   → all `+1` (via [`from_inserts`](Self::from_inserts))
+    /// - DELETE `(Some(before), None)`  → all `-1` (via [`from_deletes`](Self::from_deletes))
+    /// - UPDATE `(Some(before), Some(after))` → retract+insert (via [`from_update`](Self::from_update))
+    /// - no-op  `(None, None)`          → `Ok(None)` (nothing to feed)
+    ///
+    /// Returning `Option` means callers skip `feed` entirely on the no-op case
+    /// without needing a schema to build an empty batch.
+    pub fn from_cdc(
+        before: Option<RecordBatch>,
+        after: Option<RecordBatch>,
+    ) -> DeltaResult<Option<Self>> {
+        Ok(match (before, after) {
+            (None, Some(after)) => Some(Self::from_inserts(after)?),
+            (Some(before), None) => Some(Self::from_deletes(before)?),
+            (Some(before), Some(after)) => Some(Self::from_update(&before, &after)?),
+            (None, None) => None,
+        })
+    }
+
     /// Construct directly from a batch that already has a `_weight` column.
     pub fn from_weighted(inner: RecordBatch) -> DeltaResult<Self> {
         let ncols = inner.num_columns();
@@ -204,10 +226,7 @@ impl DeltaBatch {
     /// rows should be removed afterwards with [`drop_zeros`](Self::drop_zeros).
     pub fn normalize_weights(&self) -> DeltaResult<Self> {
         let weights = self.weights();
-        let clamped: Int64Array = weights
-            .iter()
-            .map(|w| w.map(|v| v.signum()))
-            .collect();
+        let clamped: Int64Array = weights.iter().map(|w| w.map(|v| v.signum())).collect();
         let mut cols: Vec<Arc<dyn Array>> =
             self.inner.columns()[..self.inner.num_columns() - 1].to_vec();
         cols.push(Arc::new(clamped));
@@ -430,7 +449,10 @@ mod tests {
     fn serialize_has_magic_prefix() {
         let cb = DeltaBatch::from_inserts(small_batch(&[1])).unwrap();
         let bytes = serialize_delta_batch(&cb).unwrap();
-        assert!(bytes.starts_with(b"DLT1"), "versioned bytes must start with DLT1 magic");
+        assert!(
+            bytes.starts_with(b"DLT1"),
+            "versioned bytes must start with DLT1 magic"
+        );
     }
 
     #[test]
@@ -447,6 +469,34 @@ mod tests {
         let restored = deserialize_delta_batch(&legacy).unwrap();
         assert_eq!(restored.num_rows(), 1);
         assert_eq!(restored.weights().value(0), 1);
+    }
+
+    #[test]
+    fn from_cdc_dispatches_all_arms() {
+        // INSERT: (None, Some)
+        let ins = DeltaBatch::from_cdc(None, Some(small_batch(&[1, 2])))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ins.num_rows(), 2);
+        assert!(ins.weights().iter().all(|w| w == Some(1)));
+
+        // DELETE: (Some, None)
+        let del = DeltaBatch::from_cdc(Some(small_batch(&[3])), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(del.num_rows(), 1);
+        assert_eq!(del.weights().value(0), -1);
+
+        // UPDATE: (Some, Some) → retract before, insert after
+        let upd = DeltaBatch::from_cdc(Some(small_batch(&[4])), Some(small_batch(&[5])))
+            .unwrap()
+            .unwrap();
+        assert_eq!(upd.num_rows(), 2);
+        assert_eq!(upd.weights().value(0), -1);
+        assert_eq!(upd.weights().value(1), 1);
+
+        // NO-OP: (None, None) → None
+        assert!(DeltaBatch::from_cdc(None, None).unwrap().is_none());
     }
 
     #[test]

@@ -838,14 +838,15 @@ impl PySession {
         crate::live_table::create_live_table(name, query, self.inner.live_table_registry().clone())
     }
 
-    /// Create a new :class:`IncrementalFlow` backed by this session.
+    /// Create or attach to an incremental-view-maintenance job by name.
     ///
-    /// The returned flow shares the session's incremental view registry so
-    /// that SQL DDL like ``CREATE INCREMENTAL VIEW`` is visible to the flow.
-    pub fn incremental(&self) -> crate::incremental::PyIncrementalFlow {
-        crate::incremental::PyIncrementalFlow {
-            inner: self.inner.incremental(),
-        }
+    /// Mode-aware: an embedded session returns an in-process job; a session
+    /// connected to a coordinator returns a remote job. The returned
+    /// :class:`IvmJob` exposes the same ``feed`` / ``step`` / ``snapshot`` /
+    /// ``checkpoint`` surface in both modes.
+    pub fn ivm(&self, name: String) -> PyResult<crate::incremental::PyIvmJob> {
+        let job = block_on_async(self.inner.ivm(&name)).map_err(map_krishiv_error)?;
+        Ok(crate::incremental::PyIvmJob { inner: job })
     }
 
     /// Create a [`PyStream`] backed by in-memory batches (supports windowed `collect()` / `async for`).

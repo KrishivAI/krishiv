@@ -47,7 +47,7 @@ pub use errors::{
     SchemaError, UdfError,
 };
 pub use expression::PyColumn;
-pub use incremental::{PyDeltaBatch, PyIncrementalFlow, PyRemoteIvmJob, PyStepSummary};
+pub use incremental::{PyDeltaBatch, PyIvmJob, PyStepSummary};
 pub use job_status::PyJobStatus;
 pub use live_table::{PyChangeFeedIter, PyLiveTable};
 pub use prepared::PyPreparedStatement;
@@ -121,7 +121,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<windows::PyWindowSpec>()?;
     m.add_class::<agg::PyAggExpr>()?;
     m.add_class::<incremental::PyDeltaBatch>()?;
-    m.add_class::<incremental::PyIncrementalFlow>()?;
+    m.add_class::<incremental::PyIvmJob>()?;
     m.add_class::<incremental::PyStepSummary>()?;
     m.add_class::<live_table::PyLiveTable>()?;
     m.add_class::<live_table::PyChangeFeedIter>()?;
@@ -182,8 +182,6 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<streaming::PyStreamingQuery>()?;
     m.add_class::<streaming::PyDataStreamWriter>()?;
     m.add_class::<streaming::PyRemoteStreamingJob>()?;
-    m.add_class::<incremental::PyRemoteIvmJob>()?;
-    m.add_function(wrap_pyfunction!(connect_ivm, m)?)?;
     m.add_function(wrap_pyfunction!(connect_streaming, m)?)?;
 
     // Process function / stateful operator (Phase G parity)
@@ -206,37 +204,10 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // ── Convenience module-level connection functions ─────────────────────────────
-
-/// Connect to a remote IVM job on the coordinator.
-///
-/// Creates the job if it doesn't exist yet (idempotent).
-///
-/// Parameters
-/// ----------
-/// coordinator_url : str
-///     Base URL of the coordinator HTTP API, e.g. ``"http://localhost:8080"``.
-/// job_name : str
-///     Job name used as the job ID.
-///
-/// Returns
-/// -------
-/// RemoteIvmJob
-///     Handle to the remote IVM job.
-///
-/// Example::
-///
-///     import krishiv
-///     job = krishiv.connect_ivm("http://coordinator:8080", "revenue")
-///     job.register_view("total_revenue", "SELECT sum(amount) AS total FROM orders", RevenueSchema)
-///     job.feed_source("orders", delta)
-///     active_views, tick = job.step()
-#[pyo3::pyfunction]
-pub fn connect_ivm(
-    coordinator_url: String,
-    job_name: String,
-) -> pyo3::PyResult<incremental::PyRemoteIvmJob> {
-    incremental::PyRemoteIvmJob::py_new(coordinator_url, job_name)
-}
+//
+// IVM jobs are obtained via `Session.ivm(name)` (mode-aware), not a free
+// function — a distributed session yields a remote job, an embedded session an
+// in-process one. See `incremental::PyIvmJob`.
 
 /// Connect to a remote continuous streaming job on the coordinator.
 ///

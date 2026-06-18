@@ -867,6 +867,49 @@ pub async fn execute_coordinator_ivm_checkpoint_delta(
     .map_err(|e| RuntimeError::transport(format!("checkpoint-delta base64 decode: {e}")))
 }
 
+#[derive(serde::Deserialize)]
+struct IvmSnapshotResponse {
+    snapshot_ipc_b64: Option<String>,
+}
+
+/// Retrieve the current materialized snapshot of a view from a remote IVM job.
+///
+/// Returns `None` if the view has no snapshot yet. The coordinator serializes
+/// the snapshot as an all-`+1` `DeltaBatch`; this strips the weight column and
+/// returns the underlying data rows.
+pub async fn execute_coordinator_ivm_snapshot(
+    coordinator_http: &str,
+    job_id: &str,
+    view_name: &str,
+) -> RuntimeResult<Option<arrow::record_batch::RecordBatch>> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let resp = apply_coordinator_bearer(client.get(format!(
+        "{base}/api/v1/ivm/jobs/{job_id}/views/{view_name}/snap"
+    )))
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm snapshot: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm snapshot HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: IvmSnapshotResponse = resp
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm snapshot decode: {e}")))?;
+    let Some(b64) = parsed.snapshot_ipc_b64 else {
+        return Ok(None);
+    };
+    let ipc = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &b64)
+        .map_err(|e| RuntimeError::transport(format!("snapshot base64 decode: {e}")))?;
+    let delta = krishiv_ivm::deserialize_delta_batch(&ipc)
+        .map_err(|e| RuntimeError::transport(format!("snapshot delta decode: {e}")))?;
+    Ok(Some(delta.data_batch()))
+}
+
 #[derive(serde::Serialize)]
 struct IvmRestoreDeltaBody {
     checkpoint_delta_b64: String,

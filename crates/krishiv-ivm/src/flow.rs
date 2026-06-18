@@ -20,7 +20,7 @@
 //!   re-delivered insertion rows (at-least-once delivery resilience).
 //! * **Delta checkpoints**: accumulate per-source `DeltaBatch`es and serialise
 //!   only the incremental slice since the last checkpoint.
-//! * **Streaming bridge**: `feed_stream_output` converts micro-batch output
+//! * **Streaming bridge**: `feed_snapshot` converts micro-batch output
 //!   (all-positive `RecordBatch`es) into source `DeltaBatch`es.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -68,7 +68,7 @@ struct IncrementalFlowInner {
     checkpoint_deltas: HashMap<String, Vec<DeltaBatch>>,
 
     // Streaming → IVM bridge: previous materialized snapshot per source.
-    // Used by feed_stream_output to differentiate consecutive snapshots.
+    // Used by feed_snapshot to differentiate consecutive snapshots.
     streaming_prev_snapshots: HashMap<String, RecordBatch>,
 
     // Opt-in provenance tracking: input row hash → output row hashes.
@@ -98,9 +98,16 @@ pub struct IncrementalFlow {
 
 impl IncrementalFlow {
     pub fn new() -> Self {
+        Self::with_registry(IncrementalViewRegistry::new())
+    }
+
+    /// Create a flow that shares an existing view registry with other components
+    /// (e.g. the SQL engine). Views registered via SQL DDL (`CREATE INCREMENTAL
+    /// VIEW`) are visible to this flow, and vice versa.
+    pub fn with_registry(view_registry: IncrementalViewRegistry) -> Self {
         Self {
             inner: Arc::new(Mutex::new(IncrementalFlowInner {
-                view_registry: IncrementalViewRegistry::new(),
+                view_registry,
                 pending: HashMap::new(),
                 tick: 0,
                 source_snapshots: HashMap::new(),
@@ -230,13 +237,15 @@ impl IncrementalFlow {
             .unwrap_or(i64::MIN))
     }
 
-    // ── Gap 5: source-ordinal skip-if-unchanged ───────────────────────────────
+    // ── Source-ordinal skip-if-unchanged ──────────────────────────────────────
 
     /// Feed a delta only if the source's offset (ordinal) has advanced.
     ///
     /// If `ordinal == last_processed_ordinal`, the delta is silently dropped.
     /// This prevents re-processing when a source snapshot is re-delivered.
-    pub fn feed_source_with_ordinal(
+    /// Stateful: owns the per-source `source_ordinals` map, so it cannot be a
+    /// `DeltaBatch` constructor — it stays a method on the flow.
+    pub fn feed_if_advanced(
         &self,
         source_name: impl Into<String>,
         batch: DeltaBatch,
@@ -251,43 +260,21 @@ impl IncrementalFlow {
                 return Ok(()); // Same offset — nothing new.
             }
             inner.source_ordinals.insert(source_name.clone(), ordinal);
-        } // Release lock before calling feed_source.
-        self.feed_source(source_name, batch)
-    }
-
-    // ── Gap 9: CDC → DeltaBatch bridge ────────────────────────────────────────
-
-    /// Feed a CDC event (before / after rows) as a ±1 `DeltaBatch`.
-    ///
-    /// - INSERT: `before = None`, `after = Some(new_row)`
-    /// - DELETE: `before = Some(old_row)`, `after = None`
-    /// - UPDATE: `before = Some(old_row)`, `after = Some(new_row)` →
-    ///   emits retraction of `old_row` and insertion of `new_row`.
-    ///
-    /// The `schema` argument is only used when both sides are `None` (no-op).
-    pub fn feed_cdc_source(
-        &self,
-        source_name: impl Into<String>,
-        _schema: &SchemaRef,
-        before: Option<RecordBatch>,
-        after: Option<RecordBatch>,
-    ) -> IvmResult<()> {
-        let delta = match (before, after) {
-            (None, Some(inserted)) => DeltaBatch::from_inserts(inserted).map_err(delta_err)?,
-            (Some(deleted), None) => DeltaBatch::from_deletes(deleted).map_err(delta_err)?,
-            (Some(old_row), Some(new_row)) => {
-                DeltaBatch::from_update(&old_row, &new_row).map_err(delta_err)?
-            }
-            (None, None) => return Ok(()),
-        };
-        self.feed_source(source_name, delta)
+        } // Release lock before calling feed.
+        self.feed(source_name, batch)
     }
 
     /// Push a `DeltaBatch` as input for a named source on the next step.
     ///
+    /// This is the single canonical feed primitive. Build the `DeltaBatch` with
+    /// the appropriate constructor first:
+    /// - `DeltaBatch::from_inserts(batch)` — plain rows / batch / shuffle output
+    /// - `DeltaBatch::from_deletes(batch)` — retractions
+    /// - `DeltaBatch::from_cdc(before, after)` — CDC INSERT/DELETE/UPDATE
+    ///
     /// If content-addressed dedup is enabled, insertion rows already seen in a
     /// prior tick are silently dropped.
-    pub fn feed_source(&self, source_name: impl Into<String>, batch: DeltaBatch) -> IvmResult<()> {
+    pub fn feed(&self, source_name: impl Into<String>, batch: DeltaBatch) -> IvmResult<()> {
         let source_name = source_name.into();
         let mut inner = self.inner.lock().map_err(lock_err)?;
 
@@ -336,17 +323,20 @@ impl IncrementalFlow {
         Ok(())
     }
 
-    /// Feed streaming micro-batch output into IVM by differentiating consecutive snapshots.
+    /// Feed a full streaming snapshot into IVM by differentiating against the
+    /// previously-fed snapshot for this source.
     ///
     /// Streaming jobs typically output a **full materialized snapshot** each tick.
     /// This method calls `differentiate(prev_snapshot, new_snapshot)` to extract the
-    /// true delta (insertions and retractions) before pushing it to `feed_source`.
+    /// true delta (insertions and retractions) before pushing it to `feed`.
     ///
     /// On the first call for a source, all rows are treated as insertions (no previous
     /// snapshot). Identical consecutive snapshots produce an empty delta and no tick work.
     ///
-    /// Use `feed_source` directly if your streaming job already produces `DeltaBatch`es.
-    pub fn feed_stream_output(
+    /// Stateful: owns the per-source `streaming_prev_snapshots` map (which
+    /// participates in checkpoint/restore), so it cannot be a `DeltaBatch`
+    /// constructor. Use `feed` directly if your producer already emits `DeltaBatch`es.
+    pub fn feed_snapshot(
         &self,
         source_name: impl Into<String>,
         batches: &[RecordBatch],
@@ -916,40 +906,6 @@ impl IncrementalFlow {
         }
         Ok(())
     }
-
-    // ── G1: shuffle / RecordBatch convenience feed ────────────────────────────
-
-    /// Wrap a plain `RecordBatch` as all-insertions and feed it to a source.
-    ///
-    /// Use this when the producer (e.g. a shuffle-write output, a Parquet scan,
-    /// or any non-CDC source) emits `RecordBatch`es with no weight column.
-    /// Equivalent to `feed_source(source, DeltaBatch::from_inserts(batch))`.
-    pub fn feed_source_from_record_batch(
-        &self,
-        source_name: impl Into<String>,
-        batch: RecordBatch,
-    ) -> IvmResult<()> {
-        let delta = DeltaBatch::from_inserts(batch).map_err(delta_err)?;
-        self.feed_source(source_name, delta)
-    }
-
-    // ── G4: feed_stream_delta — pre-computed delta fast path ──────────────────
-
-    /// Feed a pre-computed `DeltaBatch` directly to a source without snapshot diffing.
-    ///
-    /// Use this when the upstream producer already emits ±1 `DeltaBatch`es
-    /// (e.g. a CDC-native Kafka connector, a Debezium reader) and you do not
-    /// want the overhead of materialising a full snapshot for `differentiate`.
-    ///
-    /// Unlike `feed_stream_output`, this does NOT update the streaming-bridge
-    /// prev-snapshot for the source; the two paths are independent.
-    pub fn feed_stream_delta(
-        &self,
-        source_name: impl Into<String>,
-        delta: DeltaBatch,
-    ) -> IvmResult<()> {
-        self.feed_source(source_name, delta)
-    }
 }
 
 impl Default for IncrementalFlow {
@@ -1236,7 +1192,7 @@ mod integration_tests {
 
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
-    use krishiv_delta::{DeltaBatch, serialize_delta_batch, deserialize_delta_batch};
+    use krishiv_delta::{DeltaBatch, deserialize_delta_batch, serialize_delta_batch};
 
     use super::IncrementalFlow;
 
@@ -1254,7 +1210,7 @@ mod integration_tests {
 
         // Feed 3 rows.
         let batch = DeltaBatch::from_inserts(make_batch(&[1, 2, 3])).unwrap();
-        flow.feed_source("src", batch).unwrap();
+        flow.feed("src", batch).unwrap();
         flow.step().unwrap();
 
         // Checkpoint: full baseline.
@@ -1268,39 +1224,63 @@ mod integration_tests {
 
         // Snapshot should still have exactly 3 rows (duplicates cancelled).
         let snap = flow.source_snapshot("src").unwrap().unwrap();
-        assert_eq!(snap.num_rows(), 3, "stacked restore must not duplicate rows");
+        assert_eq!(
+            snap.num_rows(),
+            3,
+            "stacked restore must not duplicate rows"
+        );
     }
 
-    // ── G1: feed_source_from_record_batch ─────────────────────────────────────
+    // ── feed() with DeltaBatch::from_inserts (was feed_source_from_record_batch) ──
 
     #[tokio::test]
-    async fn feed_source_from_record_batch_creates_insertions() {
+    async fn feed_from_inserts_creates_insertions() {
         let flow = IncrementalFlow::new();
-        let rb = make_batch(&[10, 20]);
-        flow.feed_source_from_record_batch("s", rb).unwrap();
+        let delta = DeltaBatch::from_inserts(make_batch(&[10, 20])).unwrap();
+        flow.feed("s", delta).unwrap();
         // step_datafusion updates source_snapshots; step() alone does not.
         flow.step_datafusion().await.unwrap();
         let snap = flow.source_snapshot("s").unwrap().unwrap();
         assert_eq!(snap.num_rows(), 2);
     }
 
-    // ── G4: feed_stream_delta ─────────────────────────────────────────────────
+    // ── feed() with a pre-computed delta (was feed_stream_delta) ──────────────
 
     #[tokio::test]
-    async fn feed_stream_delta_bypasses_differentiate() {
+    async fn feed_precomputed_delta_applies_directly() {
         let flow = IncrementalFlow::new();
         let insert_delta = DeltaBatch::from_inserts(make_batch(&[1, 2])).unwrap();
-        flow.feed_stream_delta("src", insert_delta).unwrap();
+        flow.feed("src", insert_delta).unwrap();
         flow.step_datafusion().await.unwrap();
         let snap = flow.source_snapshot("src").unwrap().unwrap();
         assert_eq!(snap.num_rows(), 2);
 
-        // Feed a retraction via stream_delta.
+        // Feed a retraction.
         let retract_delta = DeltaBatch::from_deletes(make_batch(&[1])).unwrap();
-        flow.feed_stream_delta("src", retract_delta).unwrap();
+        flow.feed("src", retract_delta).unwrap();
         flow.step_datafusion().await.unwrap();
         let snap2 = flow.source_snapshot("src").unwrap().unwrap();
         assert_eq!(snap2.num_rows(), 1, "retraction must remove row 1");
+    }
+
+    // ── feed() with DeltaBatch::from_cdc (was feed_cdc_source) ────────────────
+
+    #[tokio::test]
+    async fn feed_from_cdc_update_retracts_and_inserts() {
+        let flow = IncrementalFlow::new();
+        // Seed a row, then CDC-update it.
+        flow.feed("src", DeltaBatch::from_inserts(make_batch(&[1])).unwrap())
+            .unwrap();
+        flow.step_datafusion().await.unwrap();
+
+        let update = DeltaBatch::from_cdc(Some(make_batch(&[1])), Some(make_batch(&[2])))
+            .unwrap()
+            .expect("update produces a delta");
+        flow.feed("src", update).unwrap();
+        flow.step_datafusion().await.unwrap();
+
+        let snap = flow.source_snapshot("src").unwrap().unwrap();
+        assert_eq!(snap.num_rows(), 1, "update replaces row 1 with row 2");
     }
 
     // ── 3c: serialization versioning ──────────────────────────────────────────

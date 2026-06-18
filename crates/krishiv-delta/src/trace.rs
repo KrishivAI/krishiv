@@ -123,11 +123,12 @@ impl Trace {
         }
         let batches: Vec<DeltaBatch> = std::mem::take(&mut self.levels[level]);
         if let Ok(merged) = DeltaBatch::concat(&batches)
-            && let Ok(consolidated) = consolidate_batch(merged, &[], &self.data_schema) {
-                self.levels[level + 1].push(consolidated);
-                self.cascade_merge(level + 1);
-                return;
-            }
+            && let Ok(consolidated) = consolidate_batch(merged, &[], &self.data_schema)
+        {
+            self.levels[level + 1].push(consolidated);
+            self.cascade_merge(level + 1);
+            return;
+        }
         // On error, restore the batches to the current level so no data is lost.
         self.levels[level] = batches;
     }
