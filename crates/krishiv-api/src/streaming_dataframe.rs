@@ -348,6 +348,11 @@ impl StreamingDataFrame {
 
 // ── DeduplicatingStream ───────────────────────────────────────────────────────
 
+/// Maximum number of unique keys tracked by [`DeduplicatingStream`] before the
+/// seen set is cleared.  This bounds memory usage at ~8 bytes × capacity for
+/// high-cardinality streams where exact dedup is impractical.
+const DEDUP_SEEN_CAPACITY: usize = 10_000_000;
+
 /// Stream adapter that removes rows whose dedup-column value set has been seen
 /// before. Uses a `HashSet<[u64; 2]>` keyed by a 128-bit XxHash64 of concatenated
 /// column values (two independent seeds, giving ~2^64 collision bound).
@@ -371,46 +376,54 @@ impl DeduplicatingStream {
     /// Uses XxHash64 with two seeds (0 and 1) for a combined 128-bit hash.
     /// The birthday bound at ~2^64 rows makes collisions negligible for any
     /// realistic streaming workload.
-    fn row_hash(batch: &RecordBatch, row: usize, columns: &[String]) -> [u64; 2] {
+    ///
+    /// Returns `Err` if a named column is not present in the batch schema.
+    fn row_hash(
+        batch: &RecordBatch,
+        row: usize,
+        columns: &[String],
+    ) -> std::result::Result<[u64; 2], String> {
         let mut hasher = XxHash64::with_seed(0);
         let mut hasher2 = XxHash64::with_seed(1);
         for col_name in columns {
             col_name.hash(&mut hasher);
             col_name.hash(&mut hasher2);
-            if let Ok(col_idx) = batch.schema().index_of(col_name) {
-                let col = batch.column(col_idx);
-                match col.data_type() {
-                    DataType::Int64 => {
-                        if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                            if arr.is_null(row) {
-                                "null".hash(&mut hasher);
-                                "null".hash(&mut hasher2);
-                            } else {
-                                arr.value(row).hash(&mut hasher);
-                                arr.value(row).hash(&mut hasher2);
-                            }
+            let col_idx = batch
+                .schema()
+                .index_of(col_name)
+                .map_err(|_| format!("dedup column '{col_name}' not found in batch schema"))?;
+            let col = batch.column(col_idx);
+            match col.data_type() {
+                DataType::Int64 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                        if arr.is_null(row) {
+                            "null".hash(&mut hasher);
+                            "null".hash(&mut hasher2);
+                        } else {
+                            arr.value(row).hash(&mut hasher);
+                            arr.value(row).hash(&mut hasher2);
                         }
                     }
-                    DataType::Utf8 => {
-                        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                            if arr.is_null(row) {
-                                "null".hash(&mut hasher);
-                                "null".hash(&mut hasher2);
-                            } else {
-                                arr.value(row).hash(&mut hasher);
-                                arr.value(row).hash(&mut hasher2);
-                            }
+                }
+                DataType::Utf8 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        if arr.is_null(row) {
+                            "null".hash(&mut hasher);
+                            "null".hash(&mut hasher2);
+                        } else {
+                            arr.value(row).hash(&mut hasher);
+                            arr.value(row).hash(&mut hasher2);
                         }
                     }
-                    _ => {
-                        let s = format!("{:?}", col.slice(row, 1));
-                        s.hash(&mut hasher);
-                        s.hash(&mut hasher2);
-                    }
+                }
+                _ => {
+                    let s = format!("{:?}", col.slice(row, 1));
+                    s.hash(&mut hasher);
+                    s.hash(&mut hasher2);
                 }
             }
         }
-        [hasher.finish(), hasher2.finish()]
+        Ok([hasher.finish(), hasher2.finish()])
     }
 
     /// Filter a batch, keeping only rows whose hash has not been seen before.
@@ -420,7 +433,13 @@ impl DeduplicatingStream {
     ) -> std::result::Result<Option<RecordBatch>, String> {
         let mut keep_indices: Vec<usize> = Vec::new();
         for row in 0..batch.num_rows() {
-            let h = Self::row_hash(&batch, row, &self.columns);
+            // Bound memory: clear the seen set when it exceeds the capacity
+            // limit. This trades exact dedup for bounded memory on high-
+            // cardinality streams where tracking all unique keys is impractical.
+            if self.seen.len() >= DEDUP_SEEN_CAPACITY {
+                self.seen.clear();
+            }
+            let h = Self::row_hash(&batch, row, &self.columns)?;
             if self.seen.insert(h) {
                 keep_indices.push(row);
             }
@@ -678,8 +697,8 @@ pub fn interval_join(
     let mut join = PerKeyIntervalJoin::new(spec);
     let mut pairs = Vec::new();
 
-    // Helper: extract i64 event time from a single-column lookup.
-    let get_times = |batch: &RecordBatch, col: &str| -> Result<Vec<i64>> {
+    // Helper: extract (row_index, i64 event time) pairs, skipping nulls.
+    let get_times = |batch: &RecordBatch, col: &str| -> Result<Vec<(usize, i64)>> {
         let idx = batch
             .schema()
             .index_of(col)
@@ -694,13 +713,14 @@ pub fn interval_join(
                 message: format!("event time column '{col}' must be Int64"),
             })?;
         Ok((0..arr.len())
-            .map(|i| if arr.is_null(i) { 0 } else { arr.value(i) })
+            .filter(|&i| !arr.is_null(i))
+            .map(|i| (i, arr.value(i)))
             .collect())
     };
 
     for batch in left_batches {
         let times = get_times(batch, left_time_col)?;
-        for (i, &t) in times.iter().enumerate() {
+        for &(i, t) in &times {
             let row = batch.slice(i, 1);
             let matched = join.push_left("", t, row);
             pairs.extend(matched);
@@ -708,7 +728,7 @@ pub fn interval_join(
     }
     for batch in right_batches {
         let times = get_times(batch, right_time_col)?;
-        for (i, &t) in times.iter().enumerate() {
+        for &(i, t) in &times {
             let row = batch.slice(i, 1);
             let matched = join.push_right("", t, row);
             pairs.extend(matched);

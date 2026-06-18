@@ -253,9 +253,7 @@ impl SessionBuilder {
             builder = builder.with_target_parallelism(nz);
         }
 
-        if let Ok(val) = std::env::var("KRISHIV_SHUFFLE_PARTITIONS")
-            .or_else(|_| std::env::var("KRIVISH_SHUFFLE_PARTITIONS"))
-        {
+        if let Ok(val) = std::env::var("KRISHIV_SHUFFLE_PARTITIONS") {
             let n: u32 = val.trim().parse().map_err(|_| {
                 KrishivError::unsupported(format!(
                     "KRISHIV_SHUFFLE_PARTITIONS must be a positive integer, got '{val}'"
@@ -911,13 +909,17 @@ impl Session {
 
     /// Names of table UDTFs registered on this session.
     pub fn table_udf_names(&self) -> Vec<String> {
-        self.udf_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .table_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        match self.udf_registry.read() {
+            Ok(guard) => guard.table_names().into_iter().map(str::to_owned).collect(),
+            Err(e) => {
+                tracing::warn!("UDF registry lock poisoned: {e}; returning empty table UDF list");
+                e.into_inner()
+                    .table_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            }
+        }
     }
 
     /// Register a local Parquet path as a SQL table.
@@ -1289,7 +1291,10 @@ impl Session {
             .register_record_batches(&temp, out)
             .await
             .map_err(KrishivError::from)?;
-        self.sql_plain(&format!("SELECT * FROM {temp}")).await
+        let result = self.sql_plain(&format!("SELECT * FROM \"{temp}\"")).await;
+        // Clean up the temporary table to prevent accumulation across calls.
+        let _ = self.sql_engine.deregister_table(&temp);
+        result
     }
 
     /// Execute SQL after API-key authentication and table-level policy checks.
@@ -1894,12 +1899,19 @@ impl Session {
 }
 
 fn parquet_scan_table_name(path: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("scan");
     let sanitized: String = stem
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    format!("_krishiv_parquet_{sanitized}")
+    // Include a short hash of the full path to prevent collisions when files
+    // in different directories share the same stem.
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    let path_hash = hasher.finish();
+    format!("_krishiv_parquet_{sanitized}_{path_hash:x}")
 }
 
 pub(crate) async fn runtime_collect_batch_sql(
