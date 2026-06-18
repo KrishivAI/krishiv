@@ -31,8 +31,8 @@ fn all_cfs() -> Vec<ColumnFamilyDescriptor> {
 
 /// RocksDB-backed durable metadata store for the coordinator.
 ///
-/// Five column families — events, jobs, executors, metadata, continuous_snapshots —
-/// are created on first open and must exist on subsequent opens.
+/// Six column families — events, jobs, executors, metadata, continuous_snapshots,
+/// job_history — are created on first open and must exist on subsequent opens.
 pub struct RocksDbMetadataStore {
     db: DB,
     events: Vec<EventLogEvent>,
@@ -96,6 +96,8 @@ impl RocksDbMetadataStore {
                     && let Ok(evt) = EventLogEvent::try_from(pe)
                 {
                     events.push(evt);
+                } else {
+                    tracing::warn!("failed to deserialize event record from events CF, skipping");
                 }
             }
         }
@@ -112,6 +114,8 @@ impl RocksDbMetadataStore {
                     && let Ok(job) = JobRecord::try_from(pj)
                 {
                     jobs.push(job);
+                } else {
+                    tracing::warn!("failed to deserialize job record from jobs CF, skipping");
                 }
             }
         }
@@ -128,6 +132,10 @@ impl RocksDbMetadataStore {
                     && let Ok(ex) = ExecutorDescriptor::try_from(pe)
                 {
                     executors.push(ex);
+                } else {
+                    tracing::warn!(
+                        "failed to deserialize executor record from executors CF, skipping"
+                    );
                 }
             }
         }
@@ -143,6 +151,8 @@ impl RocksDbMetadataStore {
                 let key = String::from_utf8_lossy(&k).into_owned();
                 if let Ok(snapshot) = ContinuousSnapshot::decode(&v) {
                     continuous_snapshots.insert(key, snapshot);
+                } else {
+                    tracing::warn!(key = %key, "failed to decode continuous snapshot from CF, skipping");
                 }
             }
         }
@@ -158,6 +168,10 @@ impl RocksDbMetadataStore {
                 let (_, v) = item.map_err(Self::store_err)?;
                 if let Ok(rec) = serde_json::from_slice::<JobHistoryRecord>(&v) {
                     history.push(rec);
+                } else {
+                    tracing::warn!(
+                        "failed to deserialize job history record from job_history CF, skipping"
+                    );
                 }
             }
             // Most-recent first: sort descending by completed_at_ms

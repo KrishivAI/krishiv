@@ -1200,6 +1200,7 @@ impl Coordinator {
                 if stage.stage_id() != &item.stage_id {
                     continue;
                 }
+                let mut stage_affected = false;
                 for task in stage.tasks_mut() {
                     if task.task_id() != &item.task_id || task.attempt() != item.attempt {
                         continue;
@@ -1220,8 +1221,13 @@ impl Coordinator {
                     task.launch_in_flight = false;
                     task.assigned_at_ms = None;
                     task.last_progress_ms = None;
+                    stage_affected = true;
+                }
+                if stage_affected {
+                    stage.refresh_state();
                 }
             }
+            record.refresh_state();
         }
     }
 

@@ -509,13 +509,30 @@ impl Coordinator {
                     task_id: task_id.clone(),
                     attempt: attempt_id,
                 }),
-                TaskState::Failed => Some(EventLogEvent::TaskFailed {
-                    job_id: job_id.clone(),
-                    stage_id: stage_id.clone(),
-                    task_id: task_id.clone(),
-                    attempt: attempt_id,
-                    reason: String::new(),
-                }),
+                TaskState::Failed => {
+                    let reason = self
+                        .find_job(&job_id)
+                        .ok()
+                        .and_then(|job| {
+                            job.stages()
+                                .iter()
+                                .find(|s| s.stage_id() == &stage_id)
+                                .and_then(|s| {
+                                    s.tasks()
+                                        .iter()
+                                        .find(|t| t.task_id() == &task_id && t.attempt() == attempt)
+                                        .and_then(|t| t.last_failure_reason().map(str::to_owned))
+                                })
+                        })
+                        .unwrap_or_default();
+                    Some(EventLogEvent::TaskFailed {
+                        job_id: job_id.clone(),
+                        stage_id: stage_id.clone(),
+                        task_id: task_id.clone(),
+                        attempt: attempt_id,
+                        reason,
+                    })
+                }
                 _ => None,
             };
             if let Some(event) = event {

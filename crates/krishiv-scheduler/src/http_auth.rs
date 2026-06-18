@@ -6,6 +6,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use crate::auth::configured_coordinator_bearer_tokens;
+use constant_time_eq::constant_time_eq;
 
 /// Resolve the set of bearer tokens accepted for coordinator HTTP.
 ///
@@ -36,7 +37,10 @@ pub async fn require_coordinator_bearer(
     match auth {
         Some(value) if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") => {
             let token = value[7..].trim();
-            if expected.iter().any(|t| t == token) {
+            if expected
+                .iter()
+                .any(|t| constant_time_eq(t.as_bytes(), token.as_bytes()))
+            {
                 next.run(request).await
             } else {
                 (StatusCode::UNAUTHORIZED, "invalid bearer token").into_response()

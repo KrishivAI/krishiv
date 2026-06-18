@@ -642,6 +642,7 @@ impl CheckpointCoordinator {
 
         self.state = CheckpointCoordinatorState::Committed { epoch };
         self.pending_is_savepoint = false;
+        self.pending_savepoint_label = None;
         self.awaiting_elapsed_ms = 0;
         Ok(epoch)
     }

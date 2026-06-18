@@ -39,7 +39,9 @@ impl CheckpointBarrierTracker {
         if ack.epoch != self.epoch || ack.job_id != self.job_id {
             return false;
         }
-        self.received_acks.insert(ack.task_id.clone());
+        if !self.received_acks.insert(ack.task_id.clone()) {
+            return false;
+        }
         self.ack_details.push(ack.clone());
         self.is_complete()
     }
