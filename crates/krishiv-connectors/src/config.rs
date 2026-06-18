@@ -1,4 +1,5 @@
-//! config.
+//! Key-value configuration bag for connector instantiation with sensitive
+//! field redaction.
 
 use std::collections::BTreeMap;
 

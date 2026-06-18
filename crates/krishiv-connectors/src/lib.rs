@@ -57,6 +57,7 @@ pub mod vector;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
 pub mod certification;
 
 // Root re-exports for perfect compatibility

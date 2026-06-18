@@ -277,7 +277,10 @@ pub fn arrow_cell_to_bytes(col: &dyn Array, row: usize) -> Option<Vec<u8>> {
                 .downcast_ref::<arrow::array::BinaryArray>()
                 .map(|arr| arr.value(row).to_vec());
         }
-        _ => format!("{:?}", col.data_type()),
+        _ => {
+            tracing::warn!(data_type = ?col.data_type(), "unsupported Arrow data type for HBase; skipping cell");
+            return None;
+        }
     };
     Some(s.into_bytes())
 }

@@ -1,8 +1,4 @@
-//! S3-compatible object store source and sink implementations.
-//!
-//! Uses the `object_store` crate to read/write Parquet data from/to any
-//! S3-compatible object store (AWS S3, MinIO, GCS, Azure Blob via the
-//! object_store abstraction layer).
+//! S3-compatible object store source (Parquet streaming) and sink (buffered + atomic upload).
 
 use std::any::Any;
 use std::pin::Pin;
@@ -454,7 +450,7 @@ mod tests {
             .unwrap();
         sink.flush().await.unwrap();
 
-        let mut source = S3Source::open(store, path).await.unwrap();
+        let source = S3Source::open(store, path).await.unwrap();
         // Verify the source can be opened and schema probed successfully.
         let _ = source.schema();
     }

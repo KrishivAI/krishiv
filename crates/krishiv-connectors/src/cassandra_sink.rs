@@ -100,8 +100,11 @@ impl CassandraSink {
         let cols = column_names.join(", ");
 
         let insert_cql = format!(
-            "INSERT INTO {}.{} ({}) VALUES ({})",
-            self.config.keyspace, self.config.table, cols, placeholders,
+            "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({})",
+            self.config.keyspace.replace('"', "\"\""),
+            self.config.table.replace('"', "\"\""),
+            cols,
+            placeholders,
         );
 
         let mut cql_batch = Batch::new(BatchType::Unlogged);
@@ -178,7 +181,10 @@ pub fn arrow_scalar_to_cql(col: &dyn Array, row: usize, dt: &DataType) -> Option
             .as_any()
             .downcast_ref::<arrow::array::BinaryArray>()
             .map(|arr| CqlValue::Blob(arr.value(row).to_vec()))?,
-        _ => CqlValue::Text(format!("{dt:?}")),
+        _ => {
+            tracing::warn!(data_type = ?dt, "unsupported Arrow data type for Cassandra; skipping column");
+            return None;
+        }
     };
     Some(val)
 }

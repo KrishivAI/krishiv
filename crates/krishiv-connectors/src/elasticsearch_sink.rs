@@ -225,18 +225,24 @@ fn arrow_scalar_to_json(col: &dyn Array, row: usize) -> JsonValue {
             .as_any()
             .downcast_ref::<Float32Array>()
             .map(|arr| {
-                JsonValue::Number(
-                    serde_json::Number::from_f64(arr.value(row) as f64).unwrap_or_else(|| 0.into()),
-                )
+                let v = arr.value(row);
+                if v.is_nan() || v.is_infinite() {
+                    JsonValue::Null
+                } else {
+                    JsonValue::Number(serde_json::Number::from_f64(v as f64).unwrap_or(0.into()))
+                }
             })
             .unwrap_or(JsonValue::Null),
         DataType::Float64 => col
             .as_any()
             .downcast_ref::<Float64Array>()
             .map(|arr| {
-                JsonValue::Number(
-                    serde_json::Number::from_f64(arr.value(row)).unwrap_or_else(|| 0.into()),
-                )
+                let v = arr.value(row);
+                if v.is_nan() || v.is_infinite() {
+                    JsonValue::Null
+                } else {
+                    JsonValue::Number(serde_json::Number::from_f64(v).unwrap_or(0.into()))
+                }
             })
             .unwrap_or(JsonValue::Null),
         DataType::Utf8 => col
@@ -244,7 +250,10 @@ fn arrow_scalar_to_json(col: &dyn Array, row: usize) -> JsonValue {
             .downcast_ref::<StringArray>()
             .map(|arr| JsonValue::String(arr.value(row).to_owned()))
             .unwrap_or(JsonValue::Null),
-        _ => JsonValue::String(format!("{:?}", col.data_type())),
+        _ => {
+            tracing::warn!(data_type = ?col.data_type(), "unsupported Arrow data type for Elasticsearch; mapping to null");
+            JsonValue::Null
+        }
     }
 }
 

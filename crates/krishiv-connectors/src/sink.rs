@@ -62,9 +62,6 @@ impl<T: Sink + Send> DynSink for T {
     }
 }
 
-/// Compatibility path for the canonical Parquet source offset type.
-pub use crate::offset::ParquetOffset;
-
 // ---------------------------------------------------------------------------
 // AtLeastOnceSinkContract
 // ---------------------------------------------------------------------------

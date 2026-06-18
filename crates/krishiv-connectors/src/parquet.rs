@@ -1,4 +1,4 @@
-//! Parquet source and sink implementations.
+//! Parquet file source (lazy reader with cursor/rewind) and sink (write + fsync).
 
 use std::any::Any;
 use std::fs::File;

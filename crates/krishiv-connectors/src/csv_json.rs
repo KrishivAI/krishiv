@@ -1,8 +1,4 @@
-//! E6.3 — Enhanced CSV and JSON file sources with schema inference.
-//!
-//! Both connectors use the Arrow-native readers (`arrow-csv` / `arrow-json`)
-//! and support optional schema inference from the first *N* rows.
-//!
+//! CSV and NDJSON sources with schema inference.
 //! # CSV source
 //!
 //! ```text

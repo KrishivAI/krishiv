@@ -1,4 +1,4 @@
-//! Multi-table CDC fan-out (R14 S3.2).
+//! Routes CDC events from a source to per-table Delta stores with schema normalization and fan-out.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

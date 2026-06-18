@@ -1,8 +1,4 @@
-//! E6.4 — AWS Kinesis streaming source.
-//!
-//! Reads records from an Amazon Kinesis Data Stream and exposes them as Arrow
-//! [`RecordBatch`] values.
-//!
+//! AWS Kinesis streaming source that reads records from a single shard.
 //! # Arrow schema
 //!
 //! Each Kinesis record becomes one row with fixed columns:

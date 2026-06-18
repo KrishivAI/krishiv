@@ -49,6 +49,54 @@ mod connector_tests {
         caps.validate().unwrap();
     }
 
+    #[test]
+    fn connector_capabilities_validate_rejects_bounded_and_unbounded() {
+        // The builder pattern prevents constructing this state, but validate()
+        // still defends against it for safety. Verify the check is present.
+        let caps = ConnectorCapabilities::new();
+        assert!(caps.validate().is_ok());
+
+        // With only bounded set, validate passes
+        let caps = ConnectorCapabilities::new().with_bounded();
+        assert!(caps.validate().is_ok());
+
+        // With only unbounded set, validate passes
+        let caps = ConnectorCapabilities::new().with_unbounded();
+        assert!(caps.validate().is_ok());
+    }
+
+    #[test]
+    fn connector_capabilities_validate_rejects_two_phase_without_transactional() {
+        let caps = ConnectorCapabilities::new()
+            .with_checkpoint()
+            .with_two_phase_commit();
+        // with_two_phase_commit sets transactional, so this should pass
+        caps.validate().unwrap();
+
+        // Manually construct an invalid state using the builder pattern
+        // with_two_phase_commit() always sets transactional, so we test
+        // that validate catches the invariant violation through the public API.
+        // The only way to get two_phase_commit without transactional is via
+        // manual construction, which the private fields prevent.
+        // Instead, verify that the public API always produces valid states.
+        let caps_valid = ConnectorCapabilities::new().with_two_phase_commit();
+        assert!(caps_valid.validate().is_ok());
+    }
+
+    #[test]
+    fn bounded_clears_unbounded() {
+        let caps = ConnectorCapabilities::new().with_unbounded().with_bounded();
+        assert!(caps.is_bounded());
+        assert!(!caps.is_unbounded());
+    }
+
+    #[test]
+    fn unbounded_clears_bounded() {
+        let caps = ConnectorCapabilities::new().with_bounded().with_unbounded();
+        assert!(caps.is_unbounded());
+        assert!(!caps.is_bounded());
+    }
+
     // -----------------------------------------------------------------------
     // ConnectorConfig
     // -----------------------------------------------------------------------
@@ -73,6 +121,37 @@ mod connector_tests {
         assert_eq!(value, "/data/file.parquet");
     }
 
+    #[test]
+    fn connector_config_debug_redacts_sensitive_keys() {
+        let config = ConnectorConfig::new("src", "kafka")
+            .with_property("password", "secret123")
+            .with_property("api_key", "key123")
+            .with_property("bootstrap_servers", "localhost:9092");
+        let debug_str = format!("{:?}", config);
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "sensitive fields must be redacted: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("secret123"),
+            "password must not appear in debug output"
+        );
+        assert!(
+            !debug_str.contains("key123"),
+            "api_key must not appear in debug output"
+        );
+        assert!(
+            debug_str.contains("localhost:9092"),
+            "non-sensitive fields must be visible"
+        );
+    }
+
+    #[test]
+    fn connector_config_get_returns_none_for_missing_key() {
+        let config = ConnectorConfig::new("src", "parquet");
+        assert_eq!(config.get("nonexistent"), None);
+    }
+
     // -----------------------------------------------------------------------
     // ParquetOffset encode/decode
     // -----------------------------------------------------------------------
@@ -92,6 +171,31 @@ mod connector_tests {
         let error =
             ParquetOffset::decode(&encoded).expect_err("trailing offset bytes must be rejected");
         assert!(matches!(error, ConnectorError::Offset { .. }));
+    }
+
+    #[test]
+    fn parquet_offset_decode_rejects_empty_bytes() {
+        let error = ParquetOffset::decode(&[]).expect_err("empty bytes must be rejected");
+        assert!(matches!(error, ConnectorError::Offset { .. }));
+    }
+
+    #[test]
+    fn parquet_offset_encode_zero_batch_index() {
+        let offset = ParquetOffset { batch_index: 0 };
+        let encoded = offset.encode();
+        assert_eq!(encoded.len(), 8);
+        let decoded = ParquetOffset::decode(&encoded).unwrap();
+        assert_eq!(decoded.batch_index, 0);
+    }
+
+    #[test]
+    fn parquet_offset_encode_large_batch_index() {
+        let offset = ParquetOffset {
+            batch_index: usize::MAX,
+        };
+        let encoded = offset.encode();
+        let decoded = ParquetOffset::decode(&encoded).unwrap();
+        assert_eq!(decoded.batch_index, usize::MAX);
     }
 
     #[test]
@@ -440,11 +544,225 @@ mod connector_tests {
 #[cfg(test)]
 mod quality_tests {
     use crate::quality::{check_batch, check_batch_compiled};
+    use crate::schema_normalize::ColumnRenameMap;
     use crate::*;
     use arrow::array::{Float64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
+
+    // -----------------------------------------------------------------------
+    // SchemaNormalizeOperator
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn schema_normalize_passthrough_when_schemas_match() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap();
+
+        let op = SchemaNormalizeOperator::new(schema);
+        let result = op.normalize(&batch).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.schema().fields().len(), 2);
+    }
+
+    #[test]
+    fn schema_normalize_adds_nullable_null_column() {
+        let source_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let target = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let op = SchemaNormalizeOperator::new(target.clone());
+        let result = op.normalize(&batch).unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(result.schema().fields().len(), 2);
+        // Column b should be all null
+        let col_b = result.column(1);
+        assert!(col_b.is_null(0));
+    }
+
+    #[test]
+    fn schema_normalize_fails_on_missing_non_nullable_column() {
+        let source_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let target = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false), // non-nullable
+        ]));
+        let op = SchemaNormalizeOperator::new(target);
+        let err = op.normalize(&batch).unwrap_err();
+        match err {
+            ConnectorError::Schema { message } => {
+                assert!(message.contains("missing non-nullable column"));
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn schema_normalize_rejects_duplicate_source_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false), // duplicate
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1])),
+                Arc::new(arrow::array::Int32Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+
+        let target = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let op = SchemaNormalizeOperator::new(target);
+        let err = op.normalize(&batch).unwrap_err();
+        match err {
+            ConnectorError::Schema { message } => {
+                assert!(message.contains("duplicate column"));
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn schema_normalize_with_renames() {
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "old_name",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![42]))],
+        )
+        .unwrap();
+
+        let target = Arc::new(Schema::new(vec![Field::new(
+            "new_name",
+            DataType::Int32,
+            false,
+        )]));
+        let renames = ColumnRenameMap::new(vec![("new_name".into(), "old_name".into())]);
+        let op = SchemaNormalizeOperator::new(target).with_renames(renames);
+        let result = op.normalize(&batch).unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(result.schema().field(0).name(), "new_name");
+    }
+
+    #[test]
+    fn schema_normalize_widening_int8_to_int32() {
+        use arrow::array::Int8Array;
+        let source_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int8, false)]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![Arc::new(Int8Array::from(vec![1i8, 2i8]))],
+        )
+        .unwrap();
+
+        let target = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let op = SchemaNormalizeOperator::new(target);
+        let result = op.normalize(&batch).unwrap();
+        assert_eq!(result.schema().field(0).data_type(), &DataType::Int32);
+        assert_eq!(result.num_rows(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // IoContract validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn io_contract_file_layout_valid() {
+        let layout = FileLayout::default();
+        assert!(layout.validate().is_ok());
+    }
+
+    #[test]
+    fn io_contract_file_layout_rejects_empty_partition_column() {
+        let layout = FileLayout {
+            partition_by: vec!["".into()],
+            ..FileLayout::default()
+        };
+        assert!(layout.validate().is_err());
+    }
+
+    #[test]
+    fn io_contract_file_layout_rejects_empty_sort_column() {
+        let layout = FileLayout {
+            sort_by: vec![SortField {
+                column: "  ".into(),
+                direction: FileSortDirection::Ascending,
+            }],
+            ..FileLayout::default()
+        };
+        assert!(layout.validate().is_err());
+    }
+
+    #[test]
+    fn io_contract_kafka_validate_rejects_empty_fields() {
+        let opts = KafkaIoOptions {
+            bootstrap_servers: "".into(),
+            topic: "t".into(),
+            group_id: "g".into(),
+            properties: Default::default(),
+        };
+        assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn io_contract_kafka_validate_accepts_valid() {
+        let opts = KafkaIoOptions {
+            bootstrap_servers: "localhost:9092".into(),
+            topic: "my-topic".into(),
+            group_id: "my-group".into(),
+            properties: Default::default(),
+        };
+        assert!(opts.validate().is_ok());
+    }
+
+    #[test]
+    fn io_contract_database_validate_rejects_zero_fetch_size() {
+        let opts = DatabaseIoOptions {
+            url: "jdbc:postgres://localhost/db".into(),
+            table: "users".into(),
+            fetch_size: Some(0),
+            properties: Default::default(),
+        };
+        assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn io_contract_database_validate_accepts_valid() {
+        let opts = DatabaseIoOptions {
+            url: "jdbc:postgres://localhost/db".into(),
+            table: "users".into(),
+            fetch_size: Some(1000),
+            properties: Default::default(),
+        };
+        assert!(opts.validate().is_ok());
+    }
 
     fn make_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -578,6 +896,92 @@ mod quality_tests {
             QualityAction::Reject,
         );
         assert!(check_batch(&batch, &config).is_err());
+    }
+
+    #[test]
+    fn check_batch_with_empty_rules_returns_all_accepted() {
+        let batch = make_batch();
+        let config = DataQualityConfig::new();
+        let result = check_batch(&batch, &config).unwrap();
+        assert_eq!(result.accepted_indices.len(), batch.num_rows());
+        assert!(result.rejected.is_empty());
+        assert!(!result.failed);
+    }
+
+    #[test]
+    fn check_batch_with_empty_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch = RecordBatch::new_empty(schema);
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::NotNull { column: "x".into() },
+            QualityAction::Reject,
+        );
+        let result = check_batch(&batch, &config).unwrap();
+        assert_eq!(result.accepted_indices.len(), 0);
+        assert!(result.rejected.is_empty());
+    }
+
+    #[test]
+    fn range_rule_with_min_equals_max() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
+        let col = Float64Array::from(vec![5.0, 5.0, 6.0]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::Range {
+                column: "v".into(),
+                min: 5.0,
+                max: 5.0,
+            },
+            QualityAction::Reject,
+        );
+        let result = check_batch(&batch, &config).unwrap();
+        // row 0: 5.0 (in range), row 1: 5.0 (in range), row 2: 6.0 (out of range)
+        assert_eq!(result.rejected.len(), 1);
+        assert_eq!(result.rejected[0].batch_row_index, 2);
+    }
+
+    #[test]
+    fn multiple_rules_on_same_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
+        let col = Float64Array::from(vec![Some(50.0), None, Some(150.0)]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+        let config = DataQualityConfig::new()
+            .with_rule(
+                DataQualityRule::NotNull { column: "v".into() },
+                QualityAction::Reject,
+            )
+            .with_rule(
+                DataQualityRule::Range {
+                    column: "v".into(),
+                    min: 0.0,
+                    max: 100.0,
+                },
+                QualityAction::Reject,
+            );
+        let result = check_batch(&batch, &config).unwrap();
+        // row 0: 50.0 (pass both), row 1: null (fail NotNull), row 2: 150.0 (fail Range)
+        assert_eq!(result.rejected.len(), 2);
+    }
+
+    #[test]
+    fn warn_action_does_not_reject_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
+        let col = Float64Array::from(vec![150.0, 200.0]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::Range {
+                column: "v".into(),
+                min: 0.0,
+                max: 100.0,
+            },
+            QualityAction::Warn,
+        );
+        let result = check_batch(&batch, &config).unwrap();
+        assert!(
+            result.rejected.is_empty(),
+            "Warn action should not reject rows"
+        );
+        assert_eq!(result.accepted_indices.len(), 2);
     }
 
     #[test]

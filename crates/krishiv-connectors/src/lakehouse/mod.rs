@@ -633,12 +633,13 @@ impl LakehouseTable for MemoryLakehouseTable {
     }
 
     async fn delete_where(&self, predicate: &LakehousePredicate) -> Result<(), LakehouseError> {
-        let current = self.state.lock().await.all_batches();
+        let mut guard = self.state.lock().await;
+        let current = guard.all_batches();
         let rewritten = current
             .iter()
             .map(|batch| filter_mutation_rows(batch, predicate, false))
             .collect::<Result<Vec<_>, _>>()?;
-        self.state.lock().await.replace_layer(rewritten);
+        guard.replace_layer(rewritten);
         Ok(())
     }
 
@@ -647,12 +648,13 @@ impl LakehouseTable for MemoryLakehouseTable {
         predicate: &LakehousePredicate,
         assignments: &[LakehouseAssignment],
     ) -> Result<(), LakehouseError> {
-        let current = self.state.lock().await.all_batches();
+        let mut guard = self.state.lock().await;
+        let current = guard.all_batches();
         let rewritten = current
             .iter()
             .map(|batch| update_mutation_rows(batch, predicate, assignments))
             .collect::<Result<Vec<_>, _>>()?;
-        self.state.lock().await.replace_layer(rewritten);
+        guard.replace_layer(rewritten);
         Ok(())
     }
 
@@ -667,13 +669,14 @@ impl LakehouseTable for MemoryLakehouseTable {
             });
         }
         let incoming_keys = collect_keys(&batches, key_columns)?;
-        let current = self.state.lock().await.all_batches();
+        let mut guard = self.state.lock().await;
+        let current = guard.all_batches();
         let mut rewritten = current
             .iter()
             .map(|batch| filter_keys(batch, key_columns, &incoming_keys))
             .collect::<Result<Vec<_>, _>>()?;
         rewritten.extend(batches);
-        self.state.lock().await.replace_layer(rewritten);
+        guard.replace_layer(rewritten);
         Ok(())
     }
 

@@ -1,8 +1,4 @@
-//! E6.1 — Avro file source and sink.
-//!
-//! Reads and writes [Apache Avro] container files as Arrow [`RecordBatch`]
-//! streams using the `apache-avro` crate.
-//!
+//! Avro file source/sink with bidirectional Arrow-Avro schema and value conversion.
 //! # Type mapping
 //!
 //! | Avro type          | Arrow type    |

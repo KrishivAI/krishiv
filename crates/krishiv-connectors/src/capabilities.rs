@@ -81,7 +81,7 @@ impl ConnectorCapabilities {
     pub fn with_bounded(mut self) -> Self {
         self.bounded = true;
         self.unbounded = false;
-        debug_assert!(!self.bounded || !self.unbounded);
+        debug_assert!(self.bounded ^ self.unbounded);
         self
     }
 
@@ -92,7 +92,7 @@ impl ConnectorCapabilities {
     pub fn with_unbounded(mut self) -> Self {
         self.unbounded = true;
         self.bounded = false;
-        debug_assert!(!self.bounded || !self.unbounded);
+        debug_assert!(self.bounded ^ self.unbounded);
         self
     }
 

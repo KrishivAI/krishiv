@@ -1,4 +1,4 @@
-//! Transactional Kafka sink for exactly-once Kafka→Kafka (R16 S5.1, ADR-R16.4).
+//! In-memory transactional Kafka sink for certification tests.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

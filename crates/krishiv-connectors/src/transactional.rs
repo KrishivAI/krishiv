@@ -1,4 +1,4 @@
-//! Kafka transactional producer batching (R14 S4.1).
+//! In-memory transactional producer for tests and rdkafka wrapper.
 
 use std::collections::BTreeMap;
 

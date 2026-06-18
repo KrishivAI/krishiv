@@ -1,4 +1,4 @@
-//! Two-phase commit.
+//! Two-phase commit trait, in-memory test impl, local Parquet impl, and epoch transaction log.
 
 use crate::capabilities::ConnectorCapabilities;
 use crate::error::{ConnectorError, ConnectorResult};

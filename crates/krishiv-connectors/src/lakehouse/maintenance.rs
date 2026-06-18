@@ -22,27 +22,32 @@ use crate::lakehouse::LakehouseError;
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Collect all data-file paths for a specific snapshot via the iceberg scan API.
-/// Returns an empty set on any error (best-effort; callers tolerate missing paths).
+///
+/// Returns an error if the snapshot cannot be scanned, preventing silent data
+/// loss during orphan file cleanup.
 async fn file_paths_for_snapshot(
     table: &iceberg::table::Table,
     snapshot_id: i64,
-) -> HashSet<String> {
-    let scan = match table.scan().snapshot_id(snapshot_id).build() {
-        Ok(s) => s,
-        Err(_) => return HashSet::new(),
-    };
-    let task_stream = match scan.plan_files().await {
-        Ok(s) => s,
-        Err(_) => return HashSet::new(),
-    };
-    let tasks: Vec<iceberg::scan::FileScanTask> = match task_stream.try_collect().await {
-        Ok(t) => t,
-        Err(_) => return HashSet::new(),
-    };
-    tasks
+) -> Result<HashSet<String>, LakehouseError> {
+    let scan = table.scan().snapshot_id(snapshot_id).build().map_err(|e| {
+        LakehouseError::Io(std::io::Error::other(format!(
+            "failed to build scan for snapshot {snapshot_id}: {e}"
+        )))
+    })?;
+    let task_stream = scan.plan_files().await.map_err(|e| {
+        LakehouseError::Io(std::io::Error::other(format!(
+            "failed to plan files for snapshot {snapshot_id}: {e}"
+        )))
+    })?;
+    let tasks: Vec<iceberg::scan::FileScanTask> = task_stream.try_collect().await.map_err(|e| {
+        LakehouseError::Io(std::io::Error::other(format!(
+            "failed to collect file tasks for snapshot {snapshot_id}: {e}"
+        )))
+    })?;
+    Ok(tasks
         .into_iter()
         .map(|t| t.data_file_path().to_string())
-        .collect()
+        .collect())
 }
 
 // ── expire_snapshots ──────────────────────────────────────────────────────────
@@ -102,14 +107,14 @@ pub async fn expire_snapshots(
     // anything still needed by the live history.
     let mut kept_files: HashSet<String> = HashSet::new();
     for snap_id in &kept_ids {
-        let paths = file_paths_for_snapshot(&table, *snap_id).await;
+        let paths = file_paths_for_snapshot(&table, *snap_id).await?;
         kept_files.extend(paths);
     }
 
     // Delete data files referenced ONLY by expired snapshots.
     let mut files_deleted = 0usize;
     for snap_id in &to_expire {
-        let expiring_files = file_paths_for_snapshot(&table, *snap_id).await;
+        let expiring_files = file_paths_for_snapshot(&table, *snap_id).await?;
         for path in expiring_files {
             if !kept_files.contains(&path) {
                 match file_io.delete(&path).await {
@@ -202,7 +207,7 @@ pub async fn remove_orphan_files(
 
     // Collect data files for all live snapshots via scan.
     for snapshot in metadata.snapshots() {
-        let paths = file_paths_for_snapshot(&table, snapshot.snapshot_id()).await;
+        let paths = file_paths_for_snapshot(&table, snapshot.snapshot_id()).await?;
         referenced.extend(paths);
     }
 
@@ -301,7 +306,7 @@ pub async fn remove_orphan_files(
             );
         } else {
             for snap_id in expired_ids {
-                let expiring_files = file_paths_for_snapshot(&table, snap_id).await;
+                let expiring_files = file_paths_for_snapshot(&table, snap_id).await?;
                 for path in expiring_files {
                     if referenced.contains(&path) {
                         continue;

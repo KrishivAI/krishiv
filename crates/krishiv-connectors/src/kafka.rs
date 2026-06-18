@@ -1,8 +1,4 @@
-//! Kafka source and sink connectors.
-//!
-//! Broker-backed implementations are gated behind the `kafka` feature. Without
-//! that feature, constructors remain available for configuration validation but
-//! data methods return [`ConnectorError::Unsupported`] and advertise no runtime
+//! Kafka source/sink with feature-gated rdkafka backend, offset types, and in-memory test harness.
 //! capabilities.
 
 use std::any::Any;

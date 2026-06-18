@@ -1,4 +1,4 @@
-//! source.
+//! Source trait, checkpoint source trait, and dynamic dispatch adapter.
 
 use std::any::Any;
 use std::future::Future;
@@ -41,7 +41,7 @@ pub trait Source {
     /// observability signal rather than silently producing incorrect results.
     fn reset(&mut self) {
         if self.capabilities().is_rewindable() {
-            tracing::error!(
+            tracing::warn!(
                 "rewindable source with capabilities {:?} does not override reset(); \
                  reset will be a no-op and may produce incorrect results",
                 self.capabilities()

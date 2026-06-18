@@ -1,4 +1,4 @@
-//! error.
+//! Connector error types and result alias.
 
 // ---------------------------------------------------------------------------
 // Error and Result

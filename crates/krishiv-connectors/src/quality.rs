@@ -1,4 +1,5 @@
-//! quality.
+//! Data quality rules, compiled rule evaluation, dead-letter routing, and
+//! quality hooks for the connector layer.
 
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::sink::{DynSink, Sink};
@@ -611,9 +612,13 @@ impl DeadLetterSink {
             });
         }
 
+        // Build a HashSet for O(1) membership tests instead of O(N) Vec::contains.
+        let accepted_set: std::collections::HashSet<usize> =
+            result.accepted_indices.iter().copied().collect();
+
         // Build accepted batch (rows not in the rejected set).
         let keep_mask: BooleanArray = (0..batch.num_rows())
-            .map(|i| Some(result.accepted_indices.contains(&i)))
+            .map(|i| Some(accepted_set.contains(&i)))
             .collect();
         let accepted = arrow::compute::filter_record_batch(batch, &keep_mask).map_err(|e| {
             ConnectorError::Schema {
@@ -626,7 +631,7 @@ impl DeadLetterSink {
             && !result.rejected.is_empty()
         {
             let reject_mask: BooleanArray = (0..batch.num_rows())
-                .map(|i| Some(!result.accepted_indices.contains(&i)))
+                .map(|i| Some(!accepted_set.contains(&i)))
                 .collect();
             let rejected_batch =
                 arrow::compute::filter_record_batch(batch, &reject_mask).map_err(|e| {
@@ -648,7 +653,7 @@ impl DeadLetterSink {
             let mut rejected_row_cursor = 0usize;
             let mut error_strings: Vec<Option<&str>> = vec![None; rejected_batch.num_rows()];
             for orig_row in 0..batch.num_rows() {
-                if !result.accepted_indices.contains(&orig_row) {
+                if !accepted_set.contains(&orig_row) {
                     if rejected_row_cursor < error_strings.len() {
                         error_strings[rejected_row_cursor] = error_by_row.get(&orig_row).copied();
                     }

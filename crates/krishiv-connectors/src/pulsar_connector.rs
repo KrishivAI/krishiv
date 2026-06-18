@@ -1,8 +1,4 @@
-//! E6.5 — Apache Pulsar streaming source.
-//!
-//! Reads messages from an Apache Pulsar topic and exposes them as Arrow
-//! [`RecordBatch`] values.  Backed by the `pulsar` Rust client (v6.x).
-//!
+//! Apache Pulsar streaming source that consumes messages from a Pulsar topic.
 //! # Arrow schema
 //!
 //! | Column            | Arrow type  | Notes                             |
