@@ -11,6 +11,7 @@ pub mod dataframe;
 pub mod error;
 pub mod expression;
 pub mod incremental_flow;
+pub mod pipeline;
 pub mod io;
 pub mod prepared;
 pub mod process;
@@ -39,6 +40,9 @@ pub use catalog::{
 };
 pub use compute::{
     Checkpointable, EmbeddedStreamJob, FeedableJob, IvmJob, Job, JobKind, StepReport, StreamJob,
+};
+pub use pipeline::{
+    CdcChange, Egress, Ingest, Pipeline, PipelineBuilder, PipelineMode, RunPolicy, ViewDef,
 };
 pub use dataframe::{
     Boundedness, DataFrame, ExecutionResult, ExplainMode, GroupedDataFrame, GroupingSpec, JoinType,

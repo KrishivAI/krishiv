@@ -1220,6 +1220,17 @@ impl Session {
         )))
     }
 
+    /// Start building a declarative pipeline (`source → transform → sink`).
+    ///
+    /// The returned [`PipelineBuilder`](crate::PipelineBuilder) compiles down to
+    /// the imperative core (`ivm`/`stream`/`batch`) — it adds connectors and a
+    /// driver loop, not a second engine. There is no trigger stage: boundedness,
+    /// watermark, and change-events drive each mode; the optional
+    /// [`RunPolicy`](crate::RunPolicy) only coalesces input.
+    pub fn pipeline(&self, name: impl Into<String>) -> crate::PipelineBuilder {
+        crate::pipeline::PipelineBuilder::new(self.clone(), name)
+    }
+
     /// Execute a SQL query with a wall-clock timeout.
     ///
     /// Returns `KrishivError::Runtime` if the query does not produce a result

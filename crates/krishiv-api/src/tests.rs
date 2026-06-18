@@ -1336,3 +1336,91 @@ async fn ivm_feed_from_cdc_then_step_via_unified_api() {
     let report = job.step().await.unwrap();
     assert_eq!(report.tick, 1);
 }
+
+// ── Declarative pipeline (Tier 2: source → transform → sink) ─────────────────
+
+#[tokio::test]
+async fn pipeline_ivm_cdc_source_to_memory_sink() {
+    use crate::pipeline::CdcChange;
+    use crate::RunPolicy;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn order(id: i64, amount: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(Int64Array::from(vec![amount])),
+            ],
+        )
+        .unwrap()
+    }
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // CDC source → incremental SUM view → in-memory sink. Mode inferred as IVM.
+    session
+        .pipeline("revenue")
+        .source_cdc(
+            "orders",
+            vec![
+                CdcChange::insert(order(1, 100)),
+                CdcChange::insert(order(2, 50)),
+            ],
+        )
+        .view("revenue", "SELECT SUM(amount) AS total FROM orders", true)
+        .sink_memory("revenue", sink.clone())
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+
+    let out = sink.lock().unwrap();
+    assert_eq!(out.len(), 1, "sink should receive one snapshot batch");
+    let total = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 150, "SUM(amount) over the two CDC inserts");
+}
+
+#[tokio::test]
+async fn pipeline_batch_memory_source_to_memory_sink() {
+    use crate::RunPolicy;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn rows(ids: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(ids.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    session
+        .pipeline("count_job")
+        .source_memory("items", vec![rows(&[1, 2, 3, 4])])
+        .view("counted", "SELECT COUNT(*) AS n FROM items", false)
+        .sink_memory("counted", sink.clone())
+        .mode(crate::PipelineMode::Batch)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+
+    let out = sink.lock().unwrap();
+    let n = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 4);
+}
