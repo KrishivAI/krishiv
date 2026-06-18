@@ -34,6 +34,7 @@ pub mod introspection_sql;
 mod kafka_table;
 mod lakehouse;
 pub mod live_table;
+pub mod pipeline_ddl;
 pub mod pivot_sql;
 pub mod recursive_cte;
 pub mod sqlstate;
@@ -365,6 +366,8 @@ pub struct SqlEngine {
     live_table_registry: Arc<live_table::LiveTableRegistry>,
     /// Incremental-view DDL registry shared across SQL and session APIs.
     incremental_view_registry: Arc<incremental_view::IncrementalViewRegistry>,
+    /// Pipeline DDL registry (CREATE SOURCE / CREATE SINK metadata).
+    pipeline_registry: Arc<pipeline_ddl::PipelineRegistry>,
     /// Cancelled operation IDs and progress snapshots for query lifecycle control.
     operation_registry: Arc<OperationRegistry>,
 }
@@ -635,6 +638,7 @@ impl SqlEngine {
             iceberg_catalogs: Arc::new(std::sync::RwLock::new(Vec::new())),
             live_table_registry: Arc::new(live_table::LiveTableRegistry::new()),
             incremental_view_registry: Arc::new(incremental_view::IncrementalViewRegistry::new()),
+            pipeline_registry: Arc::new(pipeline_ddl::PipelineRegistry::new()),
             operation_registry: Arc::new(OperationRegistry::new()),
         })
     }
@@ -978,6 +982,11 @@ impl SqlEngine {
     /// Shared incremental-view registry for `CREATE INCREMENTAL VIEW` DDL.
     pub fn incremental_view_registry(&self) -> &Arc<incremental_view::IncrementalViewRegistry> {
         &self.incremental_view_registry
+    }
+
+    /// Shared pipeline registry for `CREATE SOURCE` / `CREATE SINK` DDL.
+    pub fn pipeline_registry(&self) -> &Arc<pipeline_ddl::PipelineRegistry> {
+        &self.pipeline_registry
     }
 
     /// Shared operation registry for cancellation and progress reporting.
@@ -1410,7 +1419,11 @@ impl SqlEngine {
         version: Option<i64>,
     ) -> SqlResult<SqlDataFrame> {
         let path = path.as_ref();
-        let table = format!("delta_{}", path.replace(['/', '.', '-'], "_"));
+        let base = path.replace(['/', '.', '-'], "_");
+        let table = match version {
+            Some(v) => format!("delta_{base}_v{v}"),
+            None => format!("delta_{base}"),
+        };
         lakehouse::register_delta_uri(&self.context, &table, path, version).await?;
         self.sql(format!("SELECT * FROM {table}")).await
     }
@@ -1496,6 +1509,14 @@ impl SqlEngine {
             return Ok(
                 self.attach_query_metadata(self.make_sql_df("incremental-view-ddl", empty), query)
             );
+        }
+
+        // ── Intercept CREATE/DROP SOURCE / SINK (pipeline DDL) ───────────────
+        // `START PIPELINE` is NOT handled here — it is executed by the
+        // `krishiv-api` session, which can reach `Session::pipeline()`.
+        if pipeline_ddl::execute_pipeline_ddl(&self.pipeline_registry, query)?.is_some() {
+            let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("pipeline-ddl", empty), query));
         }
 
         // ── Intercept SET shuffle.partitions = N ─────────────────────────────

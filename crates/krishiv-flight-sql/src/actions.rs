@@ -14,7 +14,7 @@ impl From<Status> for KrishivActionError {
     }
 }
 
-// ── G16 helpers: prepared statement parameter binding ─────────────────────────
+// Prepared statement parameter binding helpers.
 
 /// Count the highest `$N` positional placeholder index in `sql`.
 pub(crate) fn count_sql_params(sql: &str) -> usize {
@@ -62,10 +62,23 @@ pub(crate) fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, Status> {
     Ok(buf)
 }
 
-/// Substitute `$N` placeholders in `sql` with SQL literal values from `batch` row 0.
+/// Substitute `$N` placeholders in `sql` with SQL literal values from `batch`
+/// row 0.
 ///
-/// Substitution is applied from the highest index to the lowest so that `$10`
-/// is not partially replaced before `$1`.
+/// The scan is single-pass over the original SQL text: each `$N` is replaced
+/// with the literal for column `N` (1-indexed) and the substituted text is
+/// copied verbatim, never re-scanned. This avoids two classes of bug that the
+/// previous reverse `str::replace` approach had:
+///
+/// * a parameter value containing `$N` text would be re-substituted; and
+/// * `$100` would be partially matched by the `$1` / `$10` replacements when
+///   fewer than 100 parameters were bound.
+///
+/// `$` not followed by a digit, or `$N` where `N` is `0` or greater than the
+/// number of columns, is left untouched. `$` and ASCII digits are single-byte
+/// ASCII and can never appear inside a multi-byte UTF-8 sequence, so scanning
+/// the bytes is UTF-8 safe; verbatim text is copied via `&str` slices taken at
+/// valid character boundaries.
 pub(crate) fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
     use arrow::array::{
         BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -147,19 +160,41 @@ pub(crate) fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
         }
     }
 
-    if batch.num_rows() == 0 {
+    let ncols = batch.num_columns();
+    if ncols == 0 || batch.num_rows() == 0 {
         return sql.to_string();
     }
-    let mut result = sql.to_string();
-    let ncols = batch.num_columns();
-    for i in (1..=ncols).rev() {
-        let placeholder = format!("${i}");
-        if result.contains(&placeholder) {
-            let literal = col_literal(batch.column(i - 1).as_ref(), 0);
-            result = result.replace(&placeholder, &literal);
+
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 64);
+    let mut text_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let digit_start = i + 1;
+            let mut j = digit_start;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > digit_start
+                && let Ok(n) = sql[digit_start..j].parse::<usize>()
+                && (1..=ncols).contains(&n)
+            {
+                if text_start < i {
+                    out.push_str(&sql[text_start..i]);
+                }
+                out.push_str(&col_literal(batch.column(n - 1).as_ref(), 0));
+                i = j;
+                text_start = j;
+                continue;
+            }
         }
+        i += 1;
     }
-    result
+    if text_start < bytes.len() {
+        out.push_str(&sql[text_start..]);
+    }
+    out
 }
 
 pub(crate) fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionError> {

@@ -184,22 +184,27 @@ impl IncrementalFlow {
 
     /// Register or re-register an incremental view.
     ///
-    /// Re-registering resets the `full_output` baseline so the next tick
-    /// treats the full SQL result as insertions (behavior-version invalidation).
-    /// Gap 7: if the view's SQL changed, the cached incremental plan is cleared
-    /// so a fresh plan is built on the next step.
+    /// **Idempotent**: re-registering a view with an identical spec (same SQL,
+    /// materialized, recursive flags) is a no-op that **preserves the view's
+    /// accumulated state** — this is what lets a named pipeline run incrementally
+    /// across repeated `run()` calls instead of recomputing from scratch.
+    ///
+    /// When the spec *changes*, the view is re-registered: its `full_output`
+    /// baseline is reset (behavior-version invalidation — the next tick treats
+    /// the full SQL result as insertions) and the cached incremental plan is
+    /// cleared so a fresh plan is built.
     pub fn register_view(&self, spec: IncrementalViewSpec) -> IvmResult<()> {
         let mut inner = self.inner.lock().map_err(lock_err)?;
-        if let Ok(old_view) = inner.view_registry.get(&spec.name) {
-            let _ = old_view.reset_full_output();
-        }
-        // Gap 7: invalidate cached plan if the SQL body changed.
-        let sql_changed = inner
-            .view_plan_sqls
-            .get(&spec.name)
-            .map(|cached| *cached != spec.body_sql)
-            .unwrap_or(false);
-        if sql_changed {
+        if let Ok(existing) = inner.view_registry.get(&spec.name) {
+            let unchanged = existing.spec.body_sql == spec.body_sql
+                && existing.spec.is_materialized == spec.is_materialized
+                && existing.spec.is_recursive == spec.is_recursive;
+            if unchanged {
+                // Identical re-registration — keep the view and its state.
+                return Ok(());
+            }
+            // Spec changed: reset the baseline and invalidate the cached plan.
+            let _ = existing.reset_full_output();
             inner.view_plans.remove(&spec.name);
             inner.view_plan_sqls.remove(&spec.name);
         }

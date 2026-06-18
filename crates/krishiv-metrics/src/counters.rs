@@ -1,12 +1,30 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-// ── Process metrics (Prometheus text) ─────────────────────────────────────────
+// Process metrics rendered in Prometheus text exposition format.
 
+/// Default latency histogram bucket upper bounds, in seconds.
 const LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
+
+/// Escape a Prometheus label value per the text exposition format: `\`, `"`,
+/// and `\n` must be escaped so a malicious or unusual label cannot break the
+/// exposition format or inject metric lines.
+fn escape_label_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
 
 /// Thread-safe OpenTelemetry-aligned latency histogram.
 #[derive(Debug)]
@@ -32,8 +50,15 @@ impl Default for KrishivHistogram {
 }
 
 impl KrishivHistogram {
-    /// Record a duration observation.
+    /// Record a duration observation in seconds.
+    ///
+    /// Non-finite or negative durations are dropped: the sum is stored as
+    /// unsigned microseconds and could not represent them, and recording them
+    /// would corrupt the count/bucket tallies relative to the sum.
     pub fn observe(&self, value_secs: f64) {
+        if !value_secs.is_finite() || value_secs < 0.0 {
+            return;
+        }
         let micros = (value_secs * 1_000_000.0) as u64;
         self.sum_micros.fetch_add(micros, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
@@ -48,7 +73,7 @@ impl KrishivHistogram {
         self.counts[bucket_idx].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Snapshot the current count, sum, counts per bucket, and number of buckets.
+    /// Snapshot the current count, sum, per-bucket counts, and bucket count.
     pub fn snapshot(&self) -> (u64, f64, Vec<u64>, u64) {
         let count = self.count.load(Ordering::Relaxed);
         let sum = self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
@@ -87,7 +112,7 @@ pub struct KrishivMetrics {
     /// Executor slots used per executor (gauge).
     executor_slots_used: dashmap::DashMap<String, AtomicU64>,
     /// Source offset lag (broker_offset - consumer_offset) per (job_id, source_id).
-    pub source_offset_lag: dashmap::DashMap<String, AtomicI64>,
+    source_offset_lag: dashmap::DashMap<String, AtomicI64>,
     /// Streaming rows emitted per (job_id, task_id) (counter).
     streaming_rows: dashmap::DashMap<String, AtomicU64>,
     /// State backend key count per job_id (gauge).
@@ -132,7 +157,7 @@ pub fn global_metrics() -> &'static KrishivMetrics {
 }
 
 impl KrishivMetrics {
-    // ── Global (unlabeled) counters/gauges ────────────────────────────────
+    // Global (unlabeled) counters/gauges
 
     /// Record a submitted task.
     pub fn inc_tasks_submitted(&self) {
@@ -251,7 +276,7 @@ impl KrishivMetrics {
         self.job_queue_depth.store(depth, Ordering::Relaxed);
     }
 
-    // ── Labeled per-job checkpoint metrics ────────────────────────────────
+    // Labeled per-job checkpoint metrics
 
     /// Set the current committed checkpoint epoch gauge for a job.
     pub fn set_checkpoint_epoch(&self, job_id: &str, epoch: u64) {
@@ -288,7 +313,7 @@ impl KrishivMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── Labeled per-job watermark / offset metrics ─────────────────────────
+    // Labeled per-job watermark / offset metrics
 
     /// Set the current global low watermark (ms) for a streaming job.
     pub fn set_watermark_ms(&self, job_id: &str, watermark_ms: i64) {
@@ -308,7 +333,7 @@ impl KrishivMetrics {
             .store(lag, Ordering::Relaxed);
     }
 
-    // ── Labeled per-job/stage task attempt counters ────────────────────────
+    // Labeled per-job/stage task attempt counters
 
     /// Record a task attempt submission for a given job and stage.
     pub fn inc_task_attempt_submitted(&self, job_id: &str, stage_id: &str) {
@@ -356,7 +381,7 @@ impl KrishivMetrics {
         self.task_attempts.retain(|k, _| !k.starts_with(&prefix));
     }
 
-    // ── Executor slot gauges ──────────────────────────────────────────────
+    // Executor slot gauges
 
     /// Set the number of slots currently used on an executor.
     pub fn set_executor_slots_used(&self, executor_id: &str, slots: u64) {
@@ -366,7 +391,7 @@ impl KrishivMetrics {
             .store(slots, Ordering::Relaxed);
     }
 
-    // ── Streaming rows counter ────────────────────────────────────────────
+    // Streaming rows counter
 
     /// Add rows emitted by a streaming task.
     pub fn add_streaming_rows(&self, job_id: &str, task_id: &str, rows: u64) {
@@ -386,7 +411,7 @@ impl KrishivMetrics {
             .store(rows, Ordering::Relaxed);
     }
 
-    // ── State backend gauges ──────────────────────────────────────────────
+    // State backend gauges
 
     /// Set the key count for a state backend.
     pub fn set_state_key_count(&self, job_id: &str, count: u64) {
@@ -404,7 +429,7 @@ impl KrishivMetrics {
             .store(bytes, Ordering::Relaxed);
     }
 
-    // ── Shuffle partition progress gauges ──────────────────────────────────
+    // Shuffle partition progress gauges
 
     /// Set shuffle partition counts for a (job_id, stage_id) pair.
     pub fn set_shuffle_partitions(
@@ -446,7 +471,7 @@ impl KrishivMetrics {
             .retain(|k, _| !k.starts_with(&prefix));
     }
 
-    // ── Duration observation histograms ────────────────────────────────────
+    // Duration observation histograms
 
     /// Record a gRPC call duration in seconds.
     pub fn observe_grpc_duration(&self, path: &str, duration_secs: f64) {
@@ -464,67 +489,90 @@ impl KrishivMetrics {
             .observe(duration_secs);
     }
 
-    // ── Prometheus rendering ──────────────────────────────────────────────
+    // Prometheus rendering
 
     /// Render Prometheus exposition format for Krishiv counters/gauges.
     ///
     /// Emits valid Prometheus text format: exactly one `# HELP` and `# TYPE` line
-    /// per metric family, followed by all labeled samples for that family.
+    /// per metric family, followed by all labeled samples for that family.  Label
+    /// values are escaped per the exposition format specification.
     pub fn render_prometheus(&self) -> String {
         let mut out = String::with_capacity(8192);
 
-        // ── Global (unlabeled) metrics ──────────────────────────────────
+        // Global (unlabeled) metrics
 
         let submitted = self.tasks_submitted.load(Ordering::Relaxed);
         let succeeded = self.tasks_succeeded.load(Ordering::Relaxed);
         let failed = self.tasks_failed.load(Ordering::Relaxed);
-        out.push_str("# HELP krishiv_tasks_total Tasks submitted to the coordinator\n");
-        out.push_str("# TYPE krishiv_tasks_total counter\n");
-        out.push_str(&format!(
-            "krishiv_tasks_total{{status=\"submitted\"}} {submitted}\n"
-        ));
-        out.push_str(&format!(
-            "krishiv_tasks_total{{status=\"succeeded\"}} {succeeded}\n"
-        ));
-        out.push_str(&format!(
-            "krishiv_tasks_total{{status=\"failed\"}} {failed}\n"
-        ));
+        writeln!(
+            out,
+            "# HELP krishiv_tasks_total Tasks submitted to the coordinator"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_tasks_total counter").unwrap();
+        writeln!(
+            out,
+            "krishiv_tasks_total{{status=\"submitted\"}} {submitted}"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "krishiv_tasks_total{{status=\"succeeded\"}} {succeeded}"
+        )
+        .unwrap();
+        writeln!(out, "krishiv_tasks_total{{status=\"failed\"}} {failed}").unwrap();
 
         let running = self.tasks_running.load(Ordering::Relaxed);
-        out.push_str("# HELP krishiv_tasks_running Currently running tasks\n");
-        out.push_str("# TYPE krishiv_tasks_running gauge\n");
-        out.push_str(&format!("krishiv_tasks_running {running}\n"));
+        writeln!(out, "# HELP krishiv_tasks_running Currently running tasks").unwrap();
+        writeln!(out, "# TYPE krishiv_tasks_running gauge").unwrap();
+        writeln!(out, "krishiv_tasks_running {running}").unwrap();
 
         let executor_lost = self.executor_lost.load(Ordering::Relaxed);
-        out.push_str(
-            "# HELP krishiv_executor_lost_total Executors marked lost (heartbeat timeout)\n",
-        );
-        out.push_str("# TYPE krishiv_executor_lost_total counter\n");
-        out.push_str(&format!("krishiv_executor_lost_total {executor_lost}\n"));
+        writeln!(
+            out,
+            "# HELP krishiv_executor_lost_total Executors marked lost (heartbeat timeout)"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_executor_lost_total counter").unwrap();
+        writeln!(out, "krishiv_executor_lost_total {executor_lost}").unwrap();
 
         let shuffle_bytes = self.shuffle_bytes_written.load(Ordering::Relaxed);
-        out.push_str("# HELP krishiv_shuffle_bytes_written_total Shuffle bytes written\n");
-        out.push_str("# TYPE krishiv_shuffle_bytes_written_total counter\n");
-        out.push_str(&format!(
-            "krishiv_shuffle_bytes_written_total {shuffle_bytes}\n"
-        ));
+        writeln!(
+            out,
+            "# HELP krishiv_shuffle_bytes_written_total Shuffle bytes written"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_shuffle_bytes_written_total counter").unwrap();
+        writeln!(out, "krishiv_shuffle_bytes_written_total {shuffle_bytes}").unwrap();
 
         let queue_depth = self.job_queue_depth.load(Ordering::Relaxed);
-        out.push_str("# HELP krishiv_job_queue_depth Pending jobs in admission queue\n");
-        out.push_str("# TYPE krishiv_job_queue_depth gauge\n");
-        out.push_str(&format!("krishiv_job_queue_depth {queue_depth}\n"));
+        writeln!(
+            out,
+            "# HELP krishiv_job_queue_depth Pending jobs in admission queue"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_job_queue_depth gauge").unwrap();
+        writeln!(out, "krishiv_job_queue_depth {queue_depth}").unwrap();
 
         let spill_bytes = self.spill_bytes_total.load(Ordering::Relaxed);
-        out.push_str("# HELP krishiv_spill_bytes_total Bytes spilled to local disk\n");
-        out.push_str("# TYPE krishiv_spill_bytes_total counter\n");
-        out.push_str(&format!("krishiv_spill_bytes_total {spill_bytes}\n"));
+        writeln!(
+            out,
+            "# HELP krishiv_spill_bytes_total Bytes spilled to local disk"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_spill_bytes_total counter").unwrap();
+        writeln!(out, "krishiv_spill_bytes_total {spill_bytes}").unwrap();
 
         let spill_files = self.spill_files_total.load(Ordering::Relaxed);
-        out.push_str("# HELP krishiv_spill_files_total Spill events (spill files written)\n");
-        out.push_str("# TYPE krishiv_spill_files_total counter\n");
-        out.push_str(&format!("krishiv_spill_files_total {spill_files}\n"));
+        writeln!(
+            out,
+            "# HELP krishiv_spill_files_total Spill events (spill files written)"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_spill_files_total counter").unwrap();
+        writeln!(out, "krishiv_spill_files_total {spill_files}").unwrap();
 
-        // ── Labeled per-operator memory gauge ────────────────────────────
+        // Labeled per-operator memory gauge
 
         let op_mem_entries: BTreeMap<String, u64> = self
             .operator_memory_bytes
@@ -532,43 +580,46 @@ impl KrishivMetrics {
             .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
             .collect();
         if !op_mem_entries.is_empty() {
-            out.push_str(
-                "# HELP krishiv_operator_memory_bytes Peak memory observed per operator kind\n",
-            );
-            out.push_str("# TYPE krishiv_operator_memory_bytes gauge\n");
+            writeln!(
+                out,
+                "# HELP krishiv_operator_memory_bytes Peak memory observed per operator kind"
+            )
+            .unwrap();
+            writeln!(out, "# TYPE krishiv_operator_memory_bytes gauge").unwrap();
             for (operator, bytes) in &op_mem_entries {
-                out.push_str(&format!(
-                    "krishiv_operator_memory_bytes{{operator=\"{operator}\"}} {bytes}\n"
-                ));
+                writeln!(
+                    out,
+                    "krishiv_operator_memory_bytes{{operator=\"{}\"}} {bytes}",
+                    escape_label_value(operator)
+                )
+                .unwrap();
             }
         }
 
-        // ── Labeled checkpoint epoch gauge ───────────────────────────────
+        // Labeled checkpoint epoch gauge — always emit the family so alerting
+        // rules have a stable baseline even when no job has registered an epoch.
 
         let epoch_entries: BTreeMap<String, u64> = self
             .checkpoint_epoch
             .iter()
             .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
             .collect();
-        // Always emit gauge even when empty so alerting rules have a baseline.
-        if epoch_entries.is_empty() {
-            out.push_str(
-                "# HELP krishiv_checkpoint_epoch Current committed checkpoint epoch per job\n",
-            );
-            out.push_str("# TYPE krishiv_checkpoint_epoch gauge\n");
-        } else {
-            out.push_str(
-                "# HELP krishiv_checkpoint_epoch Current committed checkpoint epoch per job\n",
-            );
-            out.push_str("# TYPE krishiv_checkpoint_epoch gauge\n");
-            for (job_id, epoch) in &epoch_entries {
-                out.push_str(&format!(
-                    "krishiv_checkpoint_epoch{{job_id=\"{job_id}\"}} {epoch}\n"
-                ));
-            }
+        writeln!(
+            out,
+            "# HELP krishiv_checkpoint_epoch Current committed checkpoint epoch per job"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_checkpoint_epoch gauge").unwrap();
+        for (job_id, epoch) in &epoch_entries {
+            writeln!(
+                out,
+                "krishiv_checkpoint_epoch{{job_id=\"{}\"}} {epoch}",
+                escape_label_value(job_id)
+            )
+            .unwrap();
         }
 
-        // ── Labeled watermark gauge ─────────────────────────────────────
+        // Labeled watermark gauge
 
         let wm_entries: BTreeMap<String, i64> = self
             .watermark_ms
@@ -576,18 +627,23 @@ impl KrishivMetrics {
             .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
             .collect();
         if !wm_entries.is_empty() {
-            out.push_str(
-                "# HELP krishiv_watermark_ms Current global low watermark per streaming job\n",
-            );
-            out.push_str("# TYPE krishiv_watermark_ms gauge\n");
+            writeln!(
+                out,
+                "# HELP krishiv_watermark_ms Current global low watermark per streaming job"
+            )
+            .unwrap();
+            writeln!(out, "# TYPE krishiv_watermark_ms gauge").unwrap();
             for (job_id, wm) in &wm_entries {
-                out.push_str(&format!(
-                    "krishiv_watermark_ms{{job_id=\"{job_id}\"}} {wm}\n"
-                ));
+                writeln!(
+                    out,
+                    "krishiv_watermark_ms{{job_id=\"{}\"}} {wm}",
+                    escape_label_value(job_id)
+                )
+                .unwrap();
             }
         }
 
-        // ── Labeled checkpoint epoch counters ───────────────────────────
+        // Labeled checkpoint epoch counters
 
         let cp_counter_entries: BTreeMap<String, (u64, u64, u64)> = self
             .checkpoint_epochs
@@ -605,22 +661,33 @@ impl KrishivMetrics {
             })
             .collect();
         if !cp_counter_entries.is_empty() {
-            out.push_str("# HELP krishiv_checkpoint_epochs_total Checkpoint epochs committed/aborted/failed per job\n");
-            out.push_str("# TYPE krishiv_checkpoint_epochs_total counter\n");
+            writeln!(
+                out,
+                "# HELP krishiv_checkpoint_epochs_total Checkpoint epochs committed/aborted/failed per job"
+            )
+            .unwrap();
+            writeln!(out, "# TYPE krishiv_checkpoint_epochs_total counter").unwrap();
             for (job_id, (committed, aborted, failed_cp)) in &cp_counter_entries {
-                out.push_str(&format!(
-                    "krishiv_checkpoint_epochs_total{{job_id=\"{job_id}\",status=\"committed\"}} {committed}\n"
-                ));
-                out.push_str(&format!(
-                    "krishiv_checkpoint_epochs_total{{job_id=\"{job_id}\",status=\"aborted\"}} {aborted}\n"
-                ));
-                out.push_str(&format!(
-                    "krishiv_checkpoint_epochs_total{{job_id=\"{job_id}\",status=\"failed\"}} {failed_cp}\n"
-                ));
+                let job = escape_label_value(job_id);
+                writeln!(
+                    out,
+                    "krishiv_checkpoint_epochs_total{{job_id=\"{job}\",status=\"committed\"}} {committed}"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "krishiv_checkpoint_epochs_total{{job_id=\"{job}\",status=\"aborted\"}} {aborted}"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "krishiv_checkpoint_epochs_total{{job_id=\"{job}\",status=\"failed\"}} {failed_cp}"
+                )
+                .unwrap();
             }
         }
 
-        // ── Labeled task attempt counters ───────────────────────────────
+        // Labeled task attempt counters
 
         let ta_entries: BTreeMap<String, (u64, u64, u64, u64)> = self
             .task_attempts
@@ -639,27 +706,41 @@ impl KrishivMetrics {
             })
             .collect();
         if !ta_entries.is_empty() {
-            out.push_str("# HELP krishiv_task_attempts_total Task attempts per job and stage\n");
-            out.push_str("# TYPE krishiv_task_attempts_total counter\n");
+            writeln!(
+                out,
+                "# HELP krishiv_task_attempts_total Task attempts per job and stage"
+            )
+            .unwrap();
+            writeln!(out, "# TYPE krishiv_task_attempts_total counter").unwrap();
             for (key, (submitted_ta, succeeded_ta, failed_ta, retrying)) in &ta_entries {
                 // key is "job_id:stage_id"
-                let (job_id, stage_id) = key.split_once(':').unwrap_or((key, ""));
-                out.push_str(&format!(
-                    "krishiv_task_attempts_total{{job_id=\"{job_id}\",stage_id=\"{stage_id}\",status=\"submitted\"}} {submitted_ta}\n"
-                ));
-                out.push_str(&format!(
-                    "krishiv_task_attempts_total{{job_id=\"{job_id}\",stage_id=\"{stage_id}\",status=\"succeeded\"}} {succeeded_ta}\n"
-                ));
-                out.push_str(&format!(
-                    "krishiv_task_attempts_total{{job_id=\"{job_id}\",stage_id=\"{stage_id}\",status=\"failed\"}} {failed_ta}\n"
-                ));
-                out.push_str(&format!(
-                    "krishiv_task_attempts_total{{job_id=\"{job_id}\",stage_id=\"{stage_id}\",status=\"retrying\"}} {retrying}\n"
-                ));
+                let (job_id, stage_id) = key.split_once(':').unwrap_or((key.as_str(), ""));
+                let job = escape_label_value(job_id);
+                let stage = escape_label_value(stage_id);
+                writeln!(
+                    out,
+                    "krishiv_task_attempts_total{{job_id=\"{job}\",stage_id=\"{stage}\",status=\"submitted\"}} {submitted_ta}"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "krishiv_task_attempts_total{{job_id=\"{job}\",stage_id=\"{stage}\",status=\"succeeded\"}} {succeeded_ta}"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "krishiv_task_attempts_total{{job_id=\"{job}\",stage_id=\"{stage}\",status=\"failed\"}} {failed_ta}"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "krishiv_task_attempts_total{{job_id=\"{job}\",stage_id=\"{stage}\",status=\"retrying\"}} {retrying}"
+                )
+                .unwrap();
             }
         }
 
-        // ── Labeled executor slots gauge ────────────────────────────────
+        // Labeled executor slots gauge
 
         let es_entries: BTreeMap<String, u64> = self
             .executor_slots_used
@@ -667,16 +748,23 @@ impl KrishivMetrics {
             .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
             .collect();
         if !es_entries.is_empty() {
-            out.push_str("# HELP krishiv_executor_slots_used Task slots in use per executor\n");
-            out.push_str("# TYPE krishiv_executor_slots_used gauge\n");
+            writeln!(
+                out,
+                "# HELP krishiv_executor_slots_used Task slots in use per executor"
+            )
+            .unwrap();
+            writeln!(out, "# TYPE krishiv_executor_slots_used gauge").unwrap();
             for (executor_id, slots) in &es_entries {
-                out.push_str(&format!(
-                    "krishiv_executor_slots_used{{executor_id=\"{executor_id}\"}} {slots}\n"
-                ));
+                writeln!(
+                    out,
+                    "krishiv_executor_slots_used{{executor_id=\"{}\"}} {slots}",
+                    escape_label_value(executor_id)
+                )
+                .unwrap();
             }
         }
 
-        // ── Labeled source offset lag gauge ─────────────────────────────
+        // Labeled source offset lag gauge
 
         let lag_entries: BTreeMap<String, i64> = self
             .source_offset_lag
@@ -684,17 +772,25 @@ impl KrishivMetrics {
             .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
             .collect();
         if !lag_entries.is_empty() {
-            out.push_str("# HELP krishiv_source_offset_lag Source offset lag per job and source\n");
-            out.push_str("# TYPE krishiv_source_offset_lag gauge\n");
+            writeln!(
+                out,
+                "# HELP krishiv_source_offset_lag Source offset lag per job and source"
+            )
+            .unwrap();
+            writeln!(out, "# TYPE krishiv_source_offset_lag gauge").unwrap();
             for (key, lag) in &lag_entries {
-                let (job_id, source_id) = key.split_once(':').unwrap_or((key, ""));
-                out.push_str(&format!(
-                    "krishiv_source_offset_lag{{job_id=\"{job_id}\",source_id=\"{source_id}\"}} {lag}\n"
-                ));
+                let (job_id, source_id) = key.split_once(':').unwrap_or((key.as_str(), ""));
+                writeln!(
+                    out,
+                    "krishiv_source_offset_lag{{job_id=\"{}\",source_id=\"{}\"}} {lag}",
+                    escape_label_value(job_id),
+                    escape_label_value(source_id)
+                )
+                .unwrap();
             }
         }
 
-        // ── Labeled streaming rows counter ──────────────────────────────
+        // Labeled streaming rows counter
 
         let sr_entries: BTreeMap<String, u64> = self
             .streaming_rows
@@ -702,19 +798,25 @@ impl KrishivMetrics {
             .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
             .collect();
         if !sr_entries.is_empty() {
-            out.push_str(
-                "# HELP krishiv_streaming_rows_emitted_total Rows emitted by streaming tasks\n",
-            );
-            out.push_str("# TYPE krishiv_streaming_rows_emitted_total counter\n");
+            writeln!(
+                out,
+                "# HELP krishiv_streaming_rows_emitted_total Rows emitted by streaming tasks"
+            )
+            .unwrap();
+            writeln!(out, "# TYPE krishiv_streaming_rows_emitted_total counter").unwrap();
             for (key, rows) in &sr_entries {
-                let (job_id, task_id) = key.split_once(':').unwrap_or((key, ""));
-                out.push_str(&format!(
-                    "krishiv_streaming_rows_emitted_total{{job_id=\"{job_id}\",task_id=\"{task_id}\"}} {rows}\n"
-                ));
+                let (job_id, task_id) = key.split_once(':').unwrap_or((key.as_str(), ""));
+                writeln!(
+                    out,
+                    "krishiv_streaming_rows_emitted_total{{job_id=\"{}\",task_id=\"{}\"}} {rows}",
+                    escape_label_value(job_id),
+                    escape_label_value(task_id)
+                )
+                .unwrap();
             }
         }
 
-        // ── Labeled state backend gauges ────────────────────────────────
+        // Labeled state backend gauges
 
         let sk_entries: BTreeMap<String, u64> = self
             .state_key_count
@@ -727,25 +829,39 @@ impl KrishivMetrics {
             .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
             .collect();
         if !sk_entries.is_empty() {
-            out.push_str("# HELP krishiv_state_key_count Key count per state backend\n");
-            out.push_str("# TYPE krishiv_state_key_count gauge\n");
+            writeln!(
+                out,
+                "# HELP krishiv_state_key_count Key count per state backend"
+            )
+            .unwrap();
+            writeln!(out, "# TYPE krishiv_state_key_count gauge").unwrap();
             for (job_id, count) in &sk_entries {
-                out.push_str(&format!(
-                    "krishiv_state_key_count{{job_id=\"{job_id}\"}} {count}\n"
-                ));
+                writeln!(
+                    out,
+                    "krishiv_state_key_count{{job_id=\"{}\"}} {count}",
+                    escape_label_value(job_id)
+                )
+                .unwrap();
             }
         }
         if !sb_entries.is_empty() {
-            out.push_str("# HELP krishiv_state_bytes Byte size per state backend\n");
-            out.push_str("# TYPE krishiv_state_bytes gauge\n");
+            writeln!(
+                out,
+                "# HELP krishiv_state_bytes Byte size per state backend"
+            )
+            .unwrap();
+            writeln!(out, "# TYPE krishiv_state_bytes gauge").unwrap();
             for (job_id, bytes) in &sb_entries {
-                out.push_str(&format!(
-                    "krishiv_state_bytes{{job_id=\"{job_id}\"}} {bytes}\n"
-                ));
+                writeln!(
+                    out,
+                    "krishiv_state_bytes{{job_id=\"{}\"}} {bytes}",
+                    escape_label_value(job_id)
+                )
+                .unwrap();
             }
         }
 
-        // ── Labeled shuffle partition gauges ────────────────────────────
+        // Labeled shuffle partition gauges
 
         let sp_entries: BTreeMap<String, (u64, u64, u64)> = self
             .shuffle_partitions
@@ -763,107 +879,100 @@ impl KrishivMetrics {
             })
             .collect();
         if !sp_entries.is_empty() {
-            out.push_str(
-                "# HELP krishiv_shuffle_partitions Shuffle partition counts per job and stage\n",
-            );
-            out.push_str("# TYPE krishiv_shuffle_partitions gauge\n");
+            writeln!(
+                out,
+                "# HELP krishiv_shuffle_partitions Shuffle partition counts per job and stage"
+            )
+            .unwrap();
+            writeln!(out, "# TYPE krishiv_shuffle_partitions gauge").unwrap();
             for (key, (pending, available, failed_sp)) in &sp_entries {
-                let (job_id, stage_id) = key.split_once(':').unwrap_or((key, ""));
-                out.push_str(&format!(
-                    "krishiv_shuffle_partitions{{job_id=\"{job_id}\",stage_id=\"{stage_id}\",state=\"pending\"}} {pending}\n"
-                ));
-                out.push_str(&format!(
-                    "krishiv_shuffle_partitions{{job_id=\"{job_id}\",stage_id=\"{stage_id}\",state=\"available\"}} {available}\n"
-                ));
-                out.push_str(&format!(
-                    "krishiv_shuffle_partitions{{job_id=\"{job_id}\",stage_id=\"{stage_id}\",state=\"failed\"}} {failed_sp}\n"
-                ));
+                let (job_id, stage_id) = key.split_once(':').unwrap_or((key.as_str(), ""));
+                let job = escape_label_value(job_id);
+                let stage = escape_label_value(stage_id);
+                writeln!(
+                    out,
+                    "krishiv_shuffle_partitions{{job_id=\"{job}\",stage_id=\"{stage}\",state=\"pending\"}} {pending}"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "krishiv_shuffle_partitions{{job_id=\"{job}\",stage_id=\"{stage}\",state=\"available\"}} {available}"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "krishiv_shuffle_partitions{{job_id=\"{job}\",stage_id=\"{stage}\",state=\"failed\"}} {failed_sp}"
+                )
+                .unwrap();
             }
         }
 
-        // ── Latency histogram for gRPC call durations ────────────────────
+        // Latency histograms
 
-        let mut grpc_entries = BTreeMap::new();
-        for entry in self.grpc_call_duration.iter() {
-            let path = entry.key().clone();
-            let (count, sum, counts, _) = entry.value().snapshot();
-            grpc_entries.insert(path, (count, sum, counts));
-        }
-
-        if !grpc_entries.is_empty() {
-            out.push_str(
-                "# HELP krishiv_grpc_call_duration_seconds gRPC call duration in seconds\n",
-            );
-            out.push_str("# TYPE krishiv_grpc_call_duration_seconds histogram\n");
-            for (path, (count, sum, counts)) in &grpc_entries {
-                out.push_str(&format!(
-                    "krishiv_grpc_call_duration_seconds_sum{{path=\"{path}\"}} {:.6}\n",
-                    sum
-                ));
-                out.push_str(&format!(
-                    "krishiv_grpc_call_duration_seconds_count{{path=\"{path}\"}} {}\n",
-                    count
-                ));
-
-                let mut cumulative = 0;
-                for (i, &bucket) in LATENCY_BUCKETS.iter().enumerate() {
-                    cumulative += counts.get(i).copied().unwrap_or(0);
-                    out.push_str(&format!(
-                        "krishiv_grpc_call_duration_seconds_bucket{{path=\"{path}\",le=\"{}\"}} {}\n",
-                        bucket, cumulative
-                    ));
-                }
-                cumulative += counts.get(LATENCY_BUCKETS.len()).copied().unwrap_or(0);
-                out.push_str(&format!(
-                    "krishiv_grpc_call_duration_seconds_bucket{{path=\"{path}\",le=\"+Inf\"}} {}\n",
-                    cumulative
-                ));
-            }
-        }
-
-        // ── Latency histogram for checkpoint commit phases ───────────────
-
-        let mut cp_latency_entries = BTreeMap::new();
-        for entry in self.checkpoint_commit_duration.iter() {
-            let phase = entry.key().clone();
-            let (count, sum, counts, _) = entry.value().snapshot();
-            cp_latency_entries.insert(phase, (count, sum, counts));
-        }
-
-        if !cp_latency_entries.is_empty() {
-            out.push_str("# HELP krishiv_checkpoint_commit_duration_seconds Checkpoint commit duration per phase in seconds\n");
-            out.push_str("# TYPE krishiv_checkpoint_commit_duration_seconds histogram\n");
-            for (phase, (count, sum, counts)) in &cp_latency_entries {
-                out.push_str(&format!(
-                    "krishiv_checkpoint_commit_duration_seconds_sum{{phase=\"{phase}\"}} {:.6}\n",
-                    sum
-                ));
-                out.push_str(&format!(
-                    "krishiv_checkpoint_commit_duration_seconds_count{{phase=\"{phase}\"}} {}\n",
-                    count
-                ));
-
-                let mut cumulative = 0;
-                for (i, &bucket) in LATENCY_BUCKETS.iter().enumerate() {
-                    cumulative += counts.get(i).copied().unwrap_or(0);
-                    out.push_str(&format!(
-                        "krishiv_checkpoint_commit_duration_seconds_bucket{{phase=\"{phase}\",le=\"{}\"}} {}\n",
-                        bucket, cumulative
-                    ));
-                }
-                cumulative += counts.get(LATENCY_BUCKETS.len()).copied().unwrap_or(0);
-                out.push_str(&format!(
-                    "krishiv_checkpoint_commit_duration_seconds_bucket{{phase=\"{phase}\",le=\"+Inf\"}} {}\n",
-                    cumulative
-                ));
-            }
-        }
+        render_histogram(
+            &mut out,
+            "krishiv_grpc_call_duration_seconds",
+            "gRPC call duration in seconds",
+            "path",
+            &self.grpc_call_duration,
+        );
+        render_histogram(
+            &mut out,
+            "krishiv_checkpoint_commit_duration_seconds",
+            "Checkpoint commit duration per phase in seconds",
+            "phase",
+            &self.checkpoint_commit_duration,
+        );
 
         out
     }
 }
 
-// ── W3C tracestate propagation ─────────────────────────────────────────────
+/// Render a labeled histogram family in Prometheus text format.
+///
+/// Each entry's per-bucket counts are stored non-cumulatively and accumulated
+/// here into the cumulative bucket counts required by the exposition format.
+fn render_histogram(
+    out: &mut String,
+    metric: &str,
+    help: &str,
+    label: &str,
+    map: &dashmap::DashMap<String, KrishivHistogram>,
+) {
+    let mut entries = BTreeMap::new();
+    for entry in map.iter() {
+        let key = entry.key().clone();
+        let (count, sum, counts, _) = entry.value().snapshot();
+        entries.insert(key, (count, sum, counts));
+    }
+    if entries.is_empty() {
+        return;
+    }
+    writeln!(out, "# HELP {metric} {help}").unwrap();
+    writeln!(out, "# TYPE {metric} histogram").unwrap();
+    for (label_value, (count, sum, counts)) in &entries {
+        let value = escape_label_value(label_value);
+        writeln!(out, "{metric}_sum{{{label}=\"{value}\"}} {:.6}", sum).unwrap();
+        writeln!(out, "{metric}_count{{{label}=\"{value}\"}} {count}").unwrap();
+        let mut cumulative = 0u64;
+        for (i, &bucket) in LATENCY_BUCKETS.iter().enumerate() {
+            cumulative += counts.get(i).copied().unwrap_or(0);
+            writeln!(
+                out,
+                "{metric}_bucket{{{label}=\"{value}\",le=\"{bucket}\"}} {cumulative}"
+            )
+            .unwrap();
+        }
+        cumulative += counts.get(LATENCY_BUCKETS.len()).copied().unwrap_or(0);
+        writeln!(
+            out,
+            "{metric}_bucket{{{label}=\"{value}\",le=\"+Inf\"}} {cumulative}"
+        )
+        .unwrap();
+    }
+}
+
+// W3C tracestate propagation
 
 /// Returns the W3C `tracestate` header value for the currently active `tracing` span,
 /// or `None` when no span is active or no tracestate is set.
@@ -882,5 +991,75 @@ pub fn current_tracestate() -> Option<String> {
         None
     } else {
         Some(state.header().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn histogram_drops_negative_and_non_finite_durations() {
+        let h = KrishivHistogram::default();
+        h.observe(-1.0);
+        h.observe(f64::NAN);
+        h.observe(f64::INFINITY);
+        let (count, sum, counts, _) = h.snapshot();
+        assert_eq!(count, 0, "negative/NaN/inf observations must be dropped");
+        assert_eq!(sum, 0.0);
+        assert!(counts.iter().all(|c| *c == 0));
+    }
+
+    #[test]
+    fn histogram_records_finite_positive_durations() {
+        let h = KrishivHistogram::default();
+        h.observe(0.003);
+        h.observe(0.3);
+        let (count, sum, _, _) = h.snapshot();
+        assert_eq!(count, 2);
+        assert!((sum - 0.303).abs() < 1e-6);
+    }
+
+    #[test]
+    fn escape_label_value_escapes_special_characters() {
+        assert_eq!(escape_label_value("plain"), "plain");
+        // backslash -> \\
+        assert_eq!(escape_label_value("a\\b"), "a\\\\b");
+        // double quote -> \"
+        assert_eq!(escape_label_value("a\"b"), "a\\\"b");
+        // newline -> \n
+        assert_eq!(escape_label_value("a\nb"), "a\\nb");
+    }
+
+    #[test]
+    fn render_prometheus_escapes_job_id_with_special_characters() {
+        let m = KrishivMetrics::default();
+        m.set_checkpoint_epoch("job\"evil", 3);
+        let body = m.render_prometheus();
+        assert!(
+            body.contains(r#"krishiv_checkpoint_epoch{job_id="job\"evil"} 3"#),
+            "label value with a quote must be escaped, got: {body}"
+        );
+    }
+
+    #[test]
+    fn render_prometheus_escapes_newline_in_labeled_metric() {
+        let m = KrishivMetrics::default();
+        m.set_executor_slots_used("exec\ninject", 1);
+        let body = m.render_prometheus();
+        assert!(
+            body.contains(r#"krishiv_executor_slots_used{executor_id="exec\ninject"} 1"#),
+            "newline in label value must be escaped, got: {body}"
+        );
+        // The rendered body must not contain a literal newline inside the label.
+        assert!(!body.contains("exec\ninject"));
+    }
+
+    #[test]
+    fn render_prometheus_emits_checkpoint_epoch_family_when_empty() {
+        let m = KrishivMetrics::default();
+        let body = m.render_prometheus();
+        assert!(body.contains("# HELP krishiv_checkpoint_epoch"));
+        assert!(body.contains("# TYPE krishiv_checkpoint_epoch gauge"));
     }
 }

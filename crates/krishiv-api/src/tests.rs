@@ -1336,3 +1336,537 @@ async fn ivm_feed_from_cdc_then_step_via_unified_api() {
     let report = job.step().await.unwrap();
     assert_eq!(report.tick, 1);
 }
+
+// ── Declarative pipeline (Tier 2: source → transform → sink) ─────────────────
+
+#[tokio::test]
+async fn pipeline_ivm_cdc_source_to_memory_sink() {
+    use crate::RunPolicy;
+    use crate::pipeline::CdcChange;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn order(id: i64, amount: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(Int64Array::from(vec![amount])),
+            ],
+        )
+        .unwrap()
+    }
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // CDC source → incremental SUM view → in-memory sink. Mode inferred as IVM.
+    session
+        .pipeline("revenue")
+        .source_cdc(
+            "orders",
+            vec![
+                CdcChange::insert(order(1, 100)),
+                CdcChange::insert(order(2, 50)),
+            ],
+        )
+        .view("revenue", "SELECT SUM(amount) AS total FROM orders", true)
+        .sink_memory("revenue", sink.clone())
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+
+    let out = sink.lock().unwrap();
+    assert_eq!(out.len(), 1, "sink should receive one snapshot batch");
+    // IncrementalAggOp emits SUM as Float64.
+    let total = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("SUM output column is Float64")
+        .value(0);
+    assert_eq!(total, 150.0, "SUM(amount) over the two CDC inserts");
+}
+
+#[tokio::test]
+async fn pipeline_batch_memory_source_to_memory_sink() {
+    use crate::RunPolicy;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn rows(ids: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(ids.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    session
+        .pipeline("count_job")
+        .source_memory("items", vec![rows(&[1, 2, 3, 4])])
+        .view("counted", "SELECT COUNT(*) AS n FROM items", false)
+        .sink_memory("counted", sink.clone())
+        .mode(crate::PipelineMode::Batch)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+
+    let out = sink.lock().unwrap();
+    let n = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 4);
+}
+
+// ── SQL pipeline DDL: CREATE SOURCE / SINK + START PIPELINE ──────────────────
+
+#[test]
+fn sql_pipeline_create_source_view_sink_start() {
+    fn order(id: i64, amount: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(Int64Array::from(vec![amount])),
+            ],
+        )
+        .unwrap()
+    }
+
+    let session = Session::builder().build().unwrap();
+    // Raw data the SOURCE query reads from.
+    session
+        .register_record_batches("orders_raw", vec![order(1, 100), order(2, 50)])
+        .unwrap();
+
+    // Declarative pipeline entirely in SQL.
+    session
+        .sql("CREATE SOURCE orders AS SELECT * FROM orders_raw")
+        .unwrap();
+    session
+        .sql("CREATE INCREMENTAL VIEW revenue AS SELECT SUM(amount) AS total FROM orders")
+        .unwrap();
+    session.sql("CREATE SINK out FROM revenue").unwrap();
+
+    // START PIPELINE runs it and returns the sink output as a result set.
+    let result = session
+        .sql("START PIPELINE out")
+        .unwrap()
+        .collect()
+        .unwrap();
+    let batches = result.into_batches();
+    assert_eq!(batches.len(), 1);
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("SUM is Float64")
+        .value(0);
+    assert_eq!(total, 150.0);
+}
+
+// ── Connector-backed pipeline + streaming-mode inference ────────────────────
+
+/// A bounded in-memory connector source (drains a queue of batches).
+struct VecSource {
+    batches: std::collections::VecDeque<RecordBatch>,
+}
+
+impl krishiv_connectors::Source for VecSource {
+    fn capabilities(&self) -> krishiv_connectors::ConnectorCapabilities {
+        krishiv_connectors::ConnectorCapabilities::new().with_bounded()
+    }
+    async fn read_batch(&mut self) -> krishiv_connectors::ConnectorResult<Option<RecordBatch>> {
+        Ok(self.batches.pop_front())
+    }
+    fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
+}
+
+/// An in-memory connector sink (collects written batches).
+struct VecSink {
+    out: std::sync::Arc<std::sync::Mutex<Vec<RecordBatch>>>,
+}
+
+impl krishiv_connectors::Sink for VecSink {
+    fn capabilities(&self) -> krishiv_connectors::ConnectorCapabilities {
+        krishiv_connectors::ConnectorCapabilities::new()
+    }
+    async fn write_batch(&mut self, batch: RecordBatch) -> krishiv_connectors::ConnectorResult<()> {
+        self.out.lock().unwrap().push(batch);
+        Ok(())
+    }
+    async fn flush(&mut self) -> krishiv_connectors::ConnectorResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn pipeline_stream_connector_source_to_connector_sink() {
+    use crate::pipeline::{Egress, Ingest};
+    use crate::{PipelineMode, RunPolicy};
+    use std::collections::VecDeque;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn order(id: i64, amount: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(Int64Array::from(vec![amount])),
+            ],
+        )
+        .unwrap()
+    }
+
+    let src = VecSource {
+        batches: VecDeque::from(vec![order(1, 100), order(2, 50)]),
+    };
+    let collected: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let sink = VecSink {
+        out: collected.clone(),
+    };
+
+    let session = Session::builder().build().unwrap();
+    let pipeline = session
+        .pipeline("conn")
+        .source("orders", Ingest::Connector(Box::new(src)))
+        .view("revenue", "SELECT SUM(amount) AS total FROM orders", true)
+        .sink("revenue", Egress::Connector(Box::new(sink)))
+        .build();
+
+    // A connector record source infers Stream mode.
+    assert_eq!(pipeline.mode(), PipelineMode::Stream);
+    pipeline.run(RunPolicy::Once).await.unwrap();
+
+    let out = collected.lock().unwrap();
+    assert_eq!(out.len(), 1, "connector sink should receive one batch");
+    let total = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("SUM is Float64")
+        .value(0);
+    assert_eq!(total, 150.0);
+}
+
+#[test]
+fn sql_pipeline_parquet_source_and_sink() {
+    let dir = tempdir().unwrap();
+    let in_path = dir.path().join("orders.parquet");
+    let out_path = dir.path().join("revenue.parquet");
+
+    // Write input parquet: orders[id, amount] = (1,100),(2,50).
+    {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![100, 50])),
+            ],
+        )
+        .unwrap();
+        let file = File::create(&in_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    let session = Session::builder().build().unwrap();
+    // Fully connector-backed SQL pipeline: parquet source → view → parquet sink.
+    session
+        .sql(format!(
+            "CREATE SOURCE orders FROM PARQUET(path='{}')",
+            in_path.display()
+        ))
+        .unwrap();
+    session
+        .sql("CREATE INCREMENTAL VIEW revenue AS SELECT SUM(amount) AS total FROM orders")
+        .unwrap();
+    session
+        .sql(format!(
+            "CREATE SINK out FROM revenue INTO PARQUET(path='{}')",
+            out_path.display()
+        ))
+        .unwrap();
+    session.sql("START PIPELINE out").unwrap();
+
+    // Read the output parquet the sink wrote.
+    let result = session.read_parquet(&out_path).unwrap().collect().unwrap();
+    let batches = result.into_batches();
+    assert_eq!(batches.len(), 1);
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("SUM is Float64")
+        .value(0);
+    assert_eq!(total, 150.0);
+}
+
+// ── SDP parity: expectations + validation ───────────────────────────────────
+
+fn amounts(vals: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vals.to_vec()))],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pipeline_expectation_drop_filters_violating_rows() {
+    use crate::{OnViolation, PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // passthrough view of amounts; expect amount > 0, drop violations (-5).
+    session
+        .pipeline("dq")
+        .source_memory("raw", vec![amounts(&[10, -5, 20])])
+        .view("clean", "SELECT amount FROM raw", true)
+        .expect("clean", "positive_amount", "amount > 0", OnViolation::Drop)
+        .sink_memory("clean", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+
+    let out = sink.lock().unwrap();
+    let combined = arrow::compute::concat_batches(&out[0].schema(), out.iter()).unwrap();
+    assert_eq!(combined.num_rows(), 2, "the -5 row should be dropped");
+}
+
+#[tokio::test]
+async fn pipeline_expectation_fail_errors_on_violation() {
+    use crate::{OnViolation, PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    let err = session
+        .pipeline("dq")
+        .source_memory("raw", vec![amounts(&[10, -5])])
+        .view("clean", "SELECT amount FROM raw", true)
+        .expect("clean", "positive_amount", "amount > 0", OnViolation::Fail)
+        .sink_memory("clean", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .expect_err("FAIL expectation must error on a violation");
+    assert!(
+        err.to_string().contains("positive_amount"),
+        "error should name the expectation: {err}"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_validate_detects_undefined_sink_view() {
+    use crate::PipelineMode;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // Sink references "missing" but only "clean" is declared.
+    let pipeline = session
+        .pipeline("dq")
+        .source_memory("raw", vec![amounts(&[1])])
+        .view("clean", "SELECT amount FROM raw", true)
+        .sink_memory("missing", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .build();
+
+    let err = pipeline.validate().await.expect_err("validation must fail");
+    assert!(
+        err.to_string().contains("undefined view 'missing'"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_validate_passes_for_well_formed_pipeline() {
+    use crate::PipelineMode;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    let pipeline = session
+        .pipeline("dq")
+        .source_memory("raw", vec![amounts(&[1, 2, 3])])
+        .view("total", "SELECT SUM(amount) AS s FROM raw", true)
+        .sink_memory("total", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .build();
+
+    pipeline
+        .validate()
+        .await
+        .expect("well-formed pipeline validates");
+}
+
+// ── DP-A: temporary views + flows (fan-in) ──────────────────────────────────
+
+fn id_amount(id: i64, amount: i64) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![id])),
+            Arc::new(Int64Array::from(vec![amount])),
+        ],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pipeline_flows_fan_in_union() {
+    use crate::{PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // Two sources fan into one target view via append flows.
+    session
+        .pipeline("fanin")
+        .source_memory("west", vec![id_amount(1, 10)])
+        .source_memory("east", vec![id_amount(2, 20)])
+        .flow("all_orders", "SELECT id, amount FROM west")
+        .flow("all_orders", "SELECT id, amount FROM east")
+        .sink_memory("all_orders", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+
+    let out = sink.lock().unwrap();
+    let combined = arrow::compute::concat_batches(&out[0].schema(), out.iter()).unwrap();
+    assert_eq!(
+        combined.num_rows(),
+        2,
+        "both flows should be unioned into the target"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_temp_view_intermediate() {
+    use crate::{PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+
+    // temp view "big" feeds the final counted view.
+    session
+        .pipeline("tv")
+        .source_memory("raw", vec![id_amount(1, 100), id_amount(2, 50)])
+        .temp_view("big", "SELECT id, amount FROM raw WHERE amount > 60")
+        .view("count_big", "SELECT COUNT(*) AS n FROM big", true)
+        .sink_memory("count_big", sink.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+
+    let out = sink.lock().unwrap();
+    let n = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 1, "only the amount=100 row passes the temp view filter");
+}
+
+// ── DP-B: persistent incremental runs + refresh (full-refresh) ──────────────
+
+#[tokio::test]
+async fn pipeline_persistent_incremental_and_refresh() {
+    use crate::{PipelineMode, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn sum_of(sink: &StdArc<Mutex<Vec<RecordBatch>>>) -> f64 {
+        let out = sink.lock().unwrap();
+        out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("SUM is Float64")
+            .value(0)
+    }
+
+    let session = Session::builder().build().unwrap();
+
+    // Run 1: SUM over [10] = 10.
+    let s1: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    session
+        .pipeline("acc")
+        .source_memory("raw", vec![amounts(&[10])])
+        .view("total", "SELECT SUM(amount) AS s FROM raw", true)
+        .sink_memory("total", s1.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+    assert_eq!(sum_of(&s1), 10.0);
+
+    // Run 2 (same pipeline name): feed only the NEW row [5] → accumulates to 15.
+    let s2: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    session
+        .pipeline("acc")
+        .source_memory("raw", vec![amounts(&[5])])
+        .view("total", "SELECT SUM(amount) AS s FROM raw", true)
+        .sink_memory("total", s2.clone())
+        .mode(PipelineMode::Ivm)
+        .run(RunPolicy::Once)
+        .await
+        .unwrap();
+    assert_eq!(
+        sum_of(&s2),
+        15.0,
+        "persistent run accumulates across invocations"
+    );
+
+    // Refresh: reset state, then feed [100] → 100 (not 115).
+    let s3: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    session
+        .pipeline("acc")
+        .source_memory("raw", vec![amounts(&[100])])
+        .view("total", "SELECT SUM(amount) AS s FROM raw", true)
+        .sink_memory("total", s3.clone())
+        .mode(PipelineMode::Ivm)
+        .refresh(RunPolicy::Once)
+        .await
+        .unwrap();
+    assert_eq!(sum_of(&s3), 100.0, "refresh resets to a fresh state");
+}

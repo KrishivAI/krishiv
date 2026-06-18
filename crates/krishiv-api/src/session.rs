@@ -1115,8 +1115,181 @@ impl Session {
     /// Asynchronously create a DataFrame from a SQL query.
     pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         let query = query.as_ref().to_owned();
-        let sql_dataframe = self.sql_engine.sql(&query).await?;
+
+        // Intercept START / REFRESH PIPELINE — the SqlEngine handles CREATE/DROP
+        // SOURCE/SINK, but execution needs the api pipeline layer.
+        use krishiv_sql::pipeline_ddl::PipelineStatement;
+        match krishiv_sql::pipeline_ddl::parse_pipeline_statement(&query)
+            .map_err(KrishivError::from)?
+        {
+            Some(PipelineStatement::StartPipeline { sink }) => {
+                return self.run_sql_pipeline(&sink).await;
+            }
+            Some(PipelineStatement::RefreshPipeline { sink, full }) => {
+                if full {
+                    // Full refresh: reset the persisted job before re-running.
+                    self.reset_ivm_job(&format!("sql::{sink}"));
+                }
+                return self.run_sql_pipeline(&sink).await;
+            }
+            _ => {}
+        }
+
+        self.sql_plain(&query).await
+    }
+
+    /// Run a SQL statement without the `START PIPELINE` interception. Used
+    /// internally (e.g. by `run_sql_pipeline`) to avoid async-recursion.
+    async fn sql_plain(&self, query: &str) -> Result<DataFrame> {
+        let sql_dataframe = self.sql_engine.sql(query).await?;
         Ok(self.dataframe_from_sql(sql_dataframe))
+    }
+
+    /// Names of all sinks declared via `CREATE SINK` (for CLI pipeline tooling).
+    pub fn declared_pipeline_sinks(&self) -> Result<Vec<String>> {
+        self.sql_engine
+            .pipeline_registry()
+            .sink_names()
+            .map_err(KrishivError::from)
+    }
+
+    /// Validate a SQL-declared pipeline (`dry run`) without executing it: checks
+    /// that the sink is declared, references a defined incremental view, and that
+    /// every declared source/sink connector kind is supported. Does not read data.
+    pub fn validate_pipeline(&self, sink_name: &str) -> Result<()> {
+        let pipe_reg = self.sql_engine.pipeline_registry();
+        let view_reg = self.sql_engine.incremental_view_registry();
+
+        let sink = pipe_reg
+            .sink(sink_name)
+            .map_err(KrishivError::from)?
+            .ok_or_else(|| KrishivError::Runtime {
+                message: format!("pipeline sink '{sink_name}' is not declared"),
+            })?;
+        if view_reg
+            .get(&sink.view)
+            .map_err(KrishivError::from)?
+            .is_none()
+        {
+            return Err(KrishivError::Runtime {
+                message: format!(
+                    "pipeline sink '{sink_name}' references undefined incremental view '{}'",
+                    sink.view
+                ),
+            });
+        }
+        // Connector kinds must be constructible (kind supported).
+        if let Some(c) = &sink.connector {
+            crate::pipeline::build_sink(c)?;
+        }
+        for (_, src) in pipe_reg.sources().map_err(KrishivError::from)? {
+            if let krishiv_sql::pipeline_ddl::SourceSpec::Connector(c) = src {
+                crate::pipeline::build_source(&c)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute a `START PIPELINE <sink>` by compiling the registered SOURCE/SINK
+    /// specs + the sink's INCREMENTAL VIEW into `Session::pipeline()…run()`,
+    /// returning the sink's collected output as a `DataFrame`.
+    async fn run_sql_pipeline(&self, sink_name: &str) -> Result<DataFrame> {
+        use std::sync::{Arc, Mutex};
+
+        let pipe_reg = self.sql_engine.pipeline_registry();
+        let view_reg = self.sql_engine.incremental_view_registry();
+
+        let sink_spec = pipe_reg
+            .sink(sink_name)
+            .map_err(KrishivError::from)?
+            .ok_or_else(|| KrishivError::Runtime {
+                message: format!("START PIPELINE: sink '{sink_name}' is not declared"),
+            })?;
+        let view_entry = view_reg
+            .get(&sink_spec.view)
+            .map_err(KrishivError::from)?
+            .ok_or_else(|| KrishivError::Runtime {
+                message: format!(
+                    "START PIPELINE: sink '{sink_name}' references undefined incremental view '{}'",
+                    sink_spec.view
+                ),
+            })?;
+
+        // Resolve each declared source (query → batches, or connector) and feed it.
+        let collected: Arc<Mutex<Vec<RecordBatch>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = self
+            .pipeline(format!("sql::{sink_name}"))
+            .mode(crate::PipelineMode::Ivm);
+        for (src_name, src_spec) in pipe_reg.sources().map_err(KrishivError::from)? {
+            builder = match src_spec {
+                krishiv_sql::pipeline_ddl::SourceSpec::Query(q) => {
+                    let batches = self
+                        .sql_plain(&q)
+                        .await?
+                        .collect_async()
+                        .await?
+                        .into_batches();
+                    builder.source_memory(src_name, batches)
+                }
+                krishiv_sql::pipeline_ddl::SourceSpec::Connector(spec) => {
+                    let src = crate::pipeline::build_source(&spec)?;
+                    builder.source(src_name, crate::pipeline::Ingest::Connector(src))
+                }
+            };
+        }
+
+        // A view may reference upstream incremental views (not just sources), so
+        // register the transitive view closure feeding the sink, in dependency
+        // order. All are materialized so downstream views can read their output
+        // and the sink can read its view's snapshot.
+        let _ = &view_entry;
+        let mut ordered: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        collect_pipeline_view_deps(&sink_spec.view, view_reg, &mut ordered, &mut seen)
+            .map_err(KrishivError::from)?;
+        for vname in &ordered {
+            if let Some(entry) = view_reg.get(vname).map_err(KrishivError::from)? {
+                builder = builder.view(vname.clone(), entry.body_sql.clone(), true);
+            }
+        }
+
+        // A connector sink writes the output out-of-band; a plain sink collects
+        // it in memory to return as a result set.
+        let has_connector_sink = sink_spec.connector.is_some();
+        builder = match sink_spec.connector {
+            Some(spec) => {
+                let sink = crate::pipeline::build_sink(&spec)?;
+                builder.sink(
+                    sink_spec.view.clone(),
+                    crate::pipeline::Egress::Connector(sink),
+                )
+            }
+            None => builder.sink_memory(sink_spec.view.clone(), collected.clone()),
+        };
+
+        builder.run(crate::RunPolicy::Once).await?;
+
+        // Connector sinks send output to their destination — return an empty ack.
+        if has_connector_sink {
+            return self.sql_plain("SELECT 1 WHERE FALSE").await;
+        }
+
+        // Return the collected output as a queryable result.
+        let out = collected
+            .lock()
+            .map_err(|_| KrishivError::Runtime {
+                message: "pipeline result mutex poisoned".into(),
+            })?
+            .clone();
+        if out.is_empty() {
+            return self.sql_plain("SELECT 1 WHERE FALSE").await;
+        }
+        let temp = format!("__pipeline_result_{sink_name}");
+        self.sql_engine
+            .register_record_batches(&temp, out)
+            .await
+            .map_err(KrishivError::from)?;
+        self.sql_plain(&format!("SELECT * FROM {temp}")).await
     }
 
     /// Execute SQL after API-key authentication and table-level policy checks.
@@ -1218,6 +1391,29 @@ impl Session {
         Ok(crate::StreamJob::Embedded(Box::new(
             crate::compute::EmbeddedStreamJob::new(self.clone(), job_id),
         )))
+    }
+
+    /// Start building a declarative pipeline (`source → transform → sink`).
+    ///
+    /// The returned [`PipelineBuilder`](crate::PipelineBuilder) compiles down to
+    /// the imperative core (`ivm`/`stream`/`batch`) — it adds connectors and a
+    /// driver loop, not a second engine. There is no trigger stage: boundedness,
+    /// watermark, and change-events drive each mode; the optional
+    /// [`RunPolicy`](crate::RunPolicy) only coalesces input.
+    ///
+    /// A named pipeline's IVM job **persists across runs** (the registry is keyed
+    /// by name), so repeated `run()` calls feed new input incrementally. Use
+    /// [`reset_ivm_job`](Self::reset_ivm_job) or `Pipeline::refresh` to start
+    /// fresh ("full refresh").
+    pub fn pipeline(&self, name: impl Into<String>) -> crate::PipelineBuilder {
+        crate::pipeline::PipelineBuilder::new(self.clone(), name)
+    }
+
+    /// Drop a persisted embedded IVM job by name so the next `ivm`/pipeline run
+    /// starts from fresh, empty state (the "full refresh" primitive). Returns
+    /// `true` if a job existed.
+    pub fn reset_ivm_job(&self, name: &str) -> bool {
+        self.ivm_registry.delete(name)
     }
 
     /// Execute a SQL query with a wall-clock timeout.
@@ -1727,6 +1923,35 @@ pub(crate) async fn runtime_collect_batch_sql(
 /// Prevents SQL injection when interpolating user-provided names into SQL.
 fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Collect the transitive closure of incremental views that `view` depends on,
+/// in dependency order (upstream views before downstream). A token in a view's
+/// SQL that resolves to a registered incremental view is treated as a dependency;
+/// everything else (sources, columns, keywords) is ignored.
+fn collect_pipeline_view_deps(
+    view: &str,
+    reg: &krishiv_sql::incremental_view::IncrementalViewRegistry,
+    ordered: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+) -> krishiv_sql::SqlResult<()> {
+    if seen.contains(view) {
+        return Ok(());
+    }
+    seen.insert(view.to_string());
+    if let Some(entry) = reg.get(view)? {
+        for token in entry
+            .body_sql
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| !t.is_empty())
+        {
+            if token != view && reg.get(token)?.is_some() {
+                collect_pipeline_view_deps(token, reg, ordered, seen)?;
+            }
+        }
+        ordered.push(view.to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ pub mod error;
 pub mod expression;
 pub mod incremental_flow;
 pub mod io;
+pub mod pipeline;
 pub mod prepared;
 pub mod process;
 pub mod query;
@@ -58,6 +59,10 @@ pub use io::{
 pub use krishiv_connectors::{
     DatabaseIoOptions, FileLayout, FileSortDirection, KafkaIoOptions, SchemaEvolutionMode,
     SortField, WriteDistribution, WriteMode,
+};
+pub use pipeline::{
+    CdcChange, Egress, Expectation, Ingest, OnViolation, Pipeline, PipelineBuilder, PipelineMode,
+    RunPolicy, ViewDef,
 };
 pub use prepared::PreparedStatement;
 pub use process::{apply_async_io, apply_process_function};
