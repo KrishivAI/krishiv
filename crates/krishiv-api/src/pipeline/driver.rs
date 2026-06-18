@@ -41,7 +41,14 @@ fn rt(msg: impl std::fmt::Display) -> KrishivError {
 
 // ── IVM path ────────────────────────────────────────────────────────────────
 
-pub(super) async fn run_ivm(pipeline: Pipeline, policy: RunPolicy) -> Result<()> {
+/// Incremental path shared by `Ivm` and `Stream` modes: register the views,
+/// feed every source (CDC → `from_cdc`; records → inserts; connector → drained),
+/// advance per policy, then write each view's snapshot to its sinks.
+///
+/// `Stream` differs from `Ivm` only in intent — an unbounded source feeds an
+/// append-only stream. Bounded connector sources are drained up front; true
+/// unbounded continuous looping is a future increment.
+pub(super) async fn run_incremental(pipeline: Pipeline, policy: RunPolicy) -> Result<()> {
     let Pipeline {
         session,
         name,
@@ -50,6 +57,9 @@ pub(super) async fn run_ivm(pipeline: Pipeline, policy: RunPolicy) -> Result<()>
         sinks,
         ..
     } = pipeline;
+
+    // 0. Normalize connector sources by draining them to in-memory batches.
+    let sources = normalize_sources(sources).await?;
 
     // 1. Source schemas (for view-schema inference).
     let mut schemas: HashMap<String, SchemaRef> = HashMap::new();
@@ -102,11 +112,8 @@ pub(super) async fn run_ivm(pipeline: Pipeline, policy: RunPolicy) -> Result<()>
                     }
                 }
             }
-            Ingest::Connector(_) => {
-                return Err(rt(
-                    "connector sources in pipeline IVM mode are not yet wired; use Memory/Cdc",
-                ));
-            }
+            // Connectors were drained to Memory in step 0.
+            Ingest::Connector(_) => unreachable!("connector sources are normalized to Memory"),
         }
     }
 
@@ -115,6 +122,26 @@ pub(super) async fn run_ivm(pipeline: Pipeline, policy: RunPolicy) -> Result<()>
 
     // 5. Write each view's current snapshot to its sinks.
     write_snapshots(&job, sinks).await
+}
+
+/// Drain a bounded connector source to in-memory batches, replacing any
+/// `Ingest::Connector` with `Ingest::Memory`. Memory/Cdc sources pass through.
+async fn normalize_sources(sources: Vec<(String, Ingest)>) -> Result<Vec<(String, Ingest)>> {
+    let mut out = Vec::with_capacity(sources.len());
+    for (name, ingest) in sources {
+        let ingest = match ingest {
+            Ingest::Connector(mut src) => {
+                let mut batches = Vec::new();
+                while let Some(b) = src.read_batch_dyn().await.map_err(rt)? {
+                    batches.push(b);
+                }
+                Ingest::Memory(batches)
+            }
+            other => other,
+        };
+        out.push((name, ingest));
+    }
+    Ok(out)
 }
 
 async fn maybe_step(job: &IvmJob, policy: RunPolicy, rows_since_step: &mut usize) -> Result<()> {
@@ -154,7 +181,8 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
     } = pipeline;
     let ctx = SessionContext::new();
 
-    // Register sources as in-memory tables.
+    // Drain connector sources first, then register all sources as tables.
+    let sources = normalize_sources(sources).await?;
     for (sname, ingest) in sources {
         let batches = match ingest {
             Ingest::Memory(b) => b,
@@ -163,11 +191,7 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
                     "CDC source is not valid in batch mode; use Memory/Connector",
                 ));
             }
-            Ingest::Connector(_) => {
-                return Err(rt(
-                    "connector sources in batch mode are not yet wired; use Memory",
-                ));
-            }
+            Ingest::Connector(_) => unreachable!("connector sources are normalized to Memory"),
         };
         if let Some(first) = batches.first() {
             let schema = first.schema();
@@ -204,11 +228,13 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
 
 // ── Stream path ───────────────────────────────────────────────────────────────
 
-pub(super) async fn run_stream(_pipeline: Pipeline, _policy: RunPolicy) -> Result<()> {
-    Err(rt(
-        "streaming pipelines require a window spec; use session.stream() directly for now \
-         (declarative streaming wiring is the next driver increment)",
-    ))
+/// Streaming pipeline: an unbounded/append-only record source feeding an
+/// incremental view. Shares the incremental engine with `Ivm` — the difference
+/// is intent (records are append-only inserts rather than CDC changes). Bounded
+/// connector sources are drained up front; for true unbounded sources the
+/// driver processes all currently-available batches per the advance policy.
+pub(super) async fn run_stream(pipeline: Pipeline, policy: RunPolicy) -> Result<()> {
+    run_incremental(pipeline, policy).await
 }
 
 // ── Schema inference ──────────────────────────────────────────────────────────

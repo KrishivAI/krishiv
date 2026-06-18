@@ -1475,3 +1475,92 @@ fn sql_pipeline_create_source_view_sink_start() {
         .value(0);
     assert_eq!(total, 150.0);
 }
+
+// ── Connector-backed pipeline + streaming-mode inference ────────────────────
+
+/// A bounded in-memory connector source (drains a queue of batches).
+struct VecSource {
+    batches: std::collections::VecDeque<RecordBatch>,
+}
+
+impl krishiv_connectors::Source for VecSource {
+    fn capabilities(&self) -> krishiv_connectors::ConnectorCapabilities {
+        krishiv_connectors::ConnectorCapabilities::new().with_bounded()
+    }
+    async fn read_batch(&mut self) -> krishiv_connectors::ConnectorResult<Option<RecordBatch>> {
+        Ok(self.batches.pop_front())
+    }
+    fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
+}
+
+/// An in-memory connector sink (collects written batches).
+struct VecSink {
+    out: std::sync::Arc<std::sync::Mutex<Vec<RecordBatch>>>,
+}
+
+impl krishiv_connectors::Sink for VecSink {
+    fn capabilities(&self) -> krishiv_connectors::ConnectorCapabilities {
+        krishiv_connectors::ConnectorCapabilities::new()
+    }
+    async fn write_batch(&mut self, batch: RecordBatch) -> krishiv_connectors::ConnectorResult<()> {
+        self.out.lock().unwrap().push(batch);
+        Ok(())
+    }
+    async fn flush(&mut self) -> krishiv_connectors::ConnectorResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn pipeline_stream_connector_source_to_connector_sink() {
+    use crate::pipeline::{Egress, Ingest};
+    use crate::{PipelineMode, RunPolicy};
+    use std::collections::VecDeque;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn order(id: i64, amount: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(Int64Array::from(vec![amount])),
+            ],
+        )
+        .unwrap()
+    }
+
+    let src = VecSource {
+        batches: VecDeque::from(vec![order(1, 100), order(2, 50)]),
+    };
+    let collected: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let sink = VecSink {
+        out: collected.clone(),
+    };
+
+    let session = Session::builder().build().unwrap();
+    let pipeline = session
+        .pipeline("conn")
+        .source("orders", Ingest::Connector(Box::new(src)))
+        .view("revenue", "SELECT SUM(amount) AS total FROM orders", true)
+        .sink("revenue", Egress::Connector(Box::new(sink)))
+        .build();
+
+    // A connector record source infers Stream mode.
+    assert_eq!(pipeline.mode(), PipelineMode::Stream);
+    pipeline.run(RunPolicy::Once).await.unwrap();
+
+    let out = collected.lock().unwrap();
+    assert_eq!(out.len(), 1, "connector sink should receive one batch");
+    let total = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("SUM is Float64")
+        .value(0);
+    assert_eq!(total, 150.0);
+}

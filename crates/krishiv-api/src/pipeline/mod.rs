@@ -176,7 +176,7 @@ impl Pipeline {
     /// Run the pipeline to its mode's natural completion / advance policy.
     pub async fn run(self, policy: RunPolicy) -> Result<()> {
         match self.mode {
-            PipelineMode::Ivm => driver::run_ivm(self, policy).await,
+            PipelineMode::Ivm => driver::run_incremental(self, policy).await,
             PipelineMode::Batch => driver::run_batch(self).await,
             PipelineMode::Stream => driver::run_stream(self, policy).await,
         }
