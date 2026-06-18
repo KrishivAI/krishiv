@@ -214,8 +214,17 @@ impl SchemaProvider for IcebergSchemaBridge {
                 let provider = iceberg_table_provider(table).await?;
                 Ok(Some(provider))
             }
-            // A missing table is not an error for DataFusion resolution.
-            Err(_) => Ok(None),
+            // A missing table is not an error for DataFusion resolution — it
+            // simply means the name is not registered in this schema.  Only
+            // treat "table not found" as Ok(None); propagate other errors.
+            Err(e) => {
+                let msg = e.to_string().to_ascii_lowercase();
+                if msg.contains("not found") || msg.contains("does not exist") {
+                    Ok(None)
+                } else {
+                    Err(datafusion::error::DataFusionError::External(Box::new(e)))
+                }
+            }
         }
     }
 

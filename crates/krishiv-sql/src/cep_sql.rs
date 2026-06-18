@@ -126,22 +126,15 @@ pub fn plan_match_recognize(stmt: MatchRecognizeStatement, query: &str) -> Logic
 /// event-time order. Completed pattern matches are concatenated and returned as
 /// a single output `RecordBatch` per match (one row per stage event).
 ///
-/// `source_is_streaming` must be `false`; this function buffers all source
-/// rows in memory, which is incompatible with unbounded streaming sources.
-/// The `sql()` method guards this before calling, but direct callers must pass
-/// the correct flag.
+/// This function buffers all source rows in memory, which is incompatible with
+/// unbounded streaming sources.  For streaming sources, use
+/// [`execute_streaming_match_recognize`] instead.
 pub fn execute_match_recognize(
     stmt: MatchRecognizeStatement,
     source_batches: &[RecordBatch],
-    source_is_streaming: bool,
 ) -> SqlResult<Vec<RecordBatch>> {
     use arrow::array::Int64Array;
     use std::collections::HashMap;
-
-    // Streaming sources are handled via execute_streaming_match_recognize; this
-    // function only accepts pre-collected bounded batches.  Callers that pass
-    // source_is_streaming=true should use the streaming variant instead.
-    let _ = source_is_streaming; // both paths now go through execute_match_recognize
 
     if source_batches.is_empty() {
         return Ok(Vec::new());
@@ -494,7 +487,7 @@ mod tests {
         let batch =
             make_batch_with_key_ts(&["u1", "u1", "u1", "u2"], &[1_000, 2_000, 3_000, 9_000]);
 
-        let result = execute_match_recognize(stmt, &[batch], false).unwrap();
+        let result = execute_match_recognize(stmt, &[batch]).unwrap();
         assert_eq!(result.len(), 1, "expected one completed A→B→C match for u1");
         assert_eq!(
             result[0].num_rows(),
@@ -522,7 +515,7 @@ mod tests {
 
         // B arrives 200 ms after A — past the 100 ms window.
         let batch = make_batch_with_key_ts(&["u1", "u1"], &[0, 200]);
-        let result = execute_match_recognize(stmt, &[batch], false).unwrap();
+        let result = execute_match_recognize(stmt, &[batch]).unwrap();
         assert!(result.is_empty(), "expired window must not produce a match");
     }
 
@@ -541,7 +534,7 @@ mod tests {
             event_time_column: "ts".to_string(),
             pattern,
         };
-        let result = execute_match_recognize(stmt, &[], false).unwrap();
+        let result = execute_match_recognize(stmt, &[]).unwrap();
         assert!(result.is_empty());
     }
 
@@ -581,7 +574,7 @@ mod tests {
             pattern,
         };
 
-        let result = execute_match_recognize(stmt, &[batch], false).unwrap();
+        let result = execute_match_recognize(stmt, &[batch]).unwrap();
         assert_eq!(
             result.len(),
             2,
@@ -633,7 +626,7 @@ mod tests {
             pattern,
         };
 
-        let result = execute_match_recognize(stmt, &[batch], false).unwrap();
+        let result = execute_match_recognize(stmt, &[batch]).unwrap();
         assert_eq!(
             result.len(),
             1,
@@ -676,7 +669,7 @@ mod tests {
             pattern,
         };
 
-        let result = execute_match_recognize(stmt, &[batch], false).unwrap();
+        let result = execute_match_recognize(stmt, &[batch]).unwrap();
         assert!(
             result.is_empty(),
             "event 1 ms past window_ms must not match (expired partial)"

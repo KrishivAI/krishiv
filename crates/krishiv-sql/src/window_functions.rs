@@ -67,7 +67,8 @@ fn make_tumble_end() -> datafusion::logical_expr::ScalarUDF {
 
 /// HOP_START(ts_ms, slide_ms, window_size_ms) → start of the hop window slot containing `ts`.
 ///
-/// Returns `floor(ts / slide) * slide`.
+/// Returns `floor(ts / slide) * slide` using Euclidean floor division so
+/// negative timestamps map to the correct preceding window boundary.
 fn make_hop_start() -> datafusion::logical_expr::ScalarUDF {
     create_udf(
         "hop_start",
@@ -76,7 +77,7 @@ fn make_hop_start() -> datafusion::logical_expr::ScalarUDF {
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
             apply3(&args[0], &args[1], &args[2], |t, sl, _sz| {
-                if sl != 0 { (t / sl) * sl } else { t }
+                if sl != 0 { t - t.rem_euclid(sl) } else { t }
             })
         }),
     )
@@ -93,7 +94,11 @@ fn make_hop_end() -> datafusion::logical_expr::ScalarUDF {
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
             apply3(&args[0], &args[1], &args[2], |t, sl, sz| {
-                if sl != 0 { (t / sl) * sl + sz } else { t }
+                if sl != 0 {
+                    t - t.rem_euclid(sl) + sz
+                } else {
+                    t
+                }
             })
         }),
     )

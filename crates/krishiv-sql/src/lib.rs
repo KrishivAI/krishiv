@@ -1368,12 +1368,14 @@ impl SqlEngine {
     ) -> SqlResult<SqlDataFrame> {
         let path = path.as_ref().to_string_lossy().into_owned();
         let mut options = datafusion::prelude::ParquetReadOptions::default();
-        if let Some(bs) = opts.batch_size {
+        if opts.batch_size.is_some() {
             options = options.parquet_pruning(true);
-            // DataFusion propagates batch_size via SessionConfig; set it on the
-            // inner session context rather than the options struct (no direct field).
-            let _ = bs; // recorded in options below via set_parquet_pushdown_filters
         }
+        // NOTE: `batch_size` is not yet propagated here because DataFusion's
+        // ParquetReadOptions has no batch_size field — it lives on SessionConfig.
+        // Callers should set batch_size on the SqlEngine's session config before
+        // calling this method (via `SessionContext::new_with_state` with a config
+        // that has `execution.batch_size` set).
         let dataframe = self.context.read_parquet(path, options).await?;
         Ok(self.make_sql_df("parquet-read", dataframe))
     }
@@ -1786,7 +1788,7 @@ impl SqlEngine {
                     streaming_limit
                 );
             }
-            let results = cep_sql::execute_match_recognize(stmt, &source_batches, false)?;
+            let results = cep_sql::execute_match_recognize(stmt, &source_batches)?;
             let cep_table = next_ephemeral_name("cep_result");
             lakehouse::register_scan_batches(&self.context, &cep_table, results).await?;
             let dataframe = self

@@ -30,19 +30,19 @@ async fn file_paths_for_snapshot(
     snapshot_id: i64,
 ) -> Result<HashSet<String>, LakehouseError> {
     let scan = table.scan().snapshot_id(snapshot_id).build().map_err(|e| {
-        LakehouseError::Io(std::io::Error::other(format!(
+        LakehouseError::Io(format!(
             "failed to build scan for snapshot {snapshot_id}: {e}"
-        )))
+        ))
     })?;
     let task_stream = scan.plan_files().await.map_err(|e| {
-        LakehouseError::Io(std::io::Error::other(format!(
+        LakehouseError::Io(format!(
             "failed to plan files for snapshot {snapshot_id}: {e}"
-        )))
+        ))
     })?;
     let tasks: Vec<iceberg::scan::FileScanTask> = task_stream.try_collect().await.map_err(|e| {
-        LakehouseError::Io(std::io::Error::other(format!(
+        LakehouseError::Io(format!(
             "failed to collect file tasks for snapshot {snapshot_id}: {e}"
-        )))
+        ))
     })?;
     Ok(tasks
         .into_iter()

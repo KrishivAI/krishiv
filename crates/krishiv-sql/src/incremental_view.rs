@@ -150,7 +150,7 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
                 feature: "CREATE INCREMENTAL VIEW".into(),
             })?;
         let (name, body_with_lateness) = split_name_and_body(rest)?;
-        let (body_sql, lateness) = split_body_and_lateness(&body_with_lateness);
+        let (body_sql, lateness) = split_body_and_lateness(&body_with_lateness)?;
         return Ok(Some(IncrementalViewStatement::Create {
             name,
             body_sql,
@@ -167,7 +167,7 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
                 feature: "DECLARE RECURSIVE VIEW".into(),
             })?;
         let (name, body_sql) = split_name_and_body(rest)?;
-        let (body_sql, _lateness) = split_body_and_lateness(&body_sql);
+        let (body_sql, _lateness) = split_body_and_lateness(&body_sql)?;
         return Ok(Some(IncrementalViewStatement::DeclareRecursive {
             name,
             body_sql,
@@ -296,19 +296,21 @@ fn split_name_and_body(rest: &str) -> SqlResult<(String, String)> {
 /// where unit is SECOND | MINUTE | HOUR | DAY.
 ///
 /// If no LATENESS clause is found, returns `(body, vec![])`.
-fn split_body_and_lateness(body_with_lateness: &str) -> (String, Vec<LatenessAnnotation>) {
+fn split_body_and_lateness(
+    body_with_lateness: &str,
+) -> SqlResult<(String, Vec<LatenessAnnotation>)> {
     let upper = body_with_lateness.to_uppercase();
 
     // Find the LAST occurrence of LATENESS (it follows the body SQL).
     // We look for the keyword followed by a valid column name and INTERVAL.
     let Some(lat_pos) = find_lateness_clause_start(&upper) else {
-        return (body_with_lateness.trim().to_string(), vec![]);
+        return Ok((body_with_lateness.trim().to_string(), vec![]));
     };
 
     let body_sql = body_with_lateness[..lat_pos].trim().to_string();
     let lateness_str = &body_with_lateness[lat_pos..];
-    let lateness = parse_lateness_clauses(lateness_str);
-    (body_sql, lateness)
+    let lateness = parse_lateness_clauses(lateness_str)?;
+    Ok((body_sql, lateness))
 }
 
 /// Find the byte offset of the first top-level LATENESS keyword in `upper`.
@@ -347,7 +349,7 @@ fn find_lateness_clause_start(upper: &str) -> Option<usize> {
 }
 
 /// Parse one or more `LATENESS <col> INTERVAL '<n>' <unit>` clauses.
-fn parse_lateness_clauses(lateness_str: &str) -> Vec<LatenessAnnotation> {
+fn parse_lateness_clauses(lateness_str: &str) -> SqlResult<Vec<LatenessAnnotation>> {
     // Tokenize: split on LATENESS keyword (handling multiple)
     let upper = lateness_str.to_uppercase();
     let mut result = Vec::new();
@@ -376,14 +378,23 @@ fn parse_lateness_clauses(lateness_str: &str) -> Vec<LatenessAnnotation> {
         } else {
             ""
         };
-        let n: u64 = interval_str.parse().unwrap_or(0);
+        let n: u64 = interval_str.parse().map_err(|_| SqlError::Unsupported {
+            feature: format!("LATENESS INTERVAL value '{interval_str}' is not a valid integer"),
+        })?;
         let ms = match unit_str.to_uppercase().as_str() {
             "SECOND" | "SECONDS" => n * 1000,
             "MINUTE" | "MINUTES" => n * 60_000,
             "HOUR" | "HOURS" => n * 3_600_000,
             "DAY" | "DAYS" => n * 86_400_000,
             "MILLISECOND" | "MILLISECONDS" | "MS" => n,
-            _ => n * 60_000, // default: treat as minutes
+            _ => {
+                return Err(SqlError::Unsupported {
+                    feature: format!(
+                        "LATENESS interval unit '{unit_str}' is not supported \
+                         (expected SECOND, MINUTE, HOUR, DAY, or MILLISECOND)"
+                    ),
+                });
+            }
         };
 
         result.push(LatenessAnnotation {
@@ -408,7 +419,7 @@ fn parse_lateness_clauses(lateness_str: &str) -> Vec<LatenessAnnotation> {
     }
 
     let _ = upper; // suppress unused warning
-    result
+    Ok(result)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

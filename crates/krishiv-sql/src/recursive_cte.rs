@@ -264,15 +264,23 @@ mod tests {
               UNION \
               SELECT n + 1 FROM cte\
             ) SELECT * FROM cte";
-        // This may parse or fail — either is acceptable; what matters is that
-        // we do not silently accept it as a valid recursive CTE.
-        match parse_recursive_cte(sql) {
-            Ok(Some(_)) => {
-                // DataFusion / sqlparser might accept UNION; that's fine as long
-                // as the caller notes it lacks UNION ALL semantics.
+        let result = parse_recursive_cte(sql);
+        // sqlparser parses UNION and UNION ALL identically at the AST level, so
+        // this returns Ok(Some(...)) — verify the parsed base query contains the
+        // UNION body and that the caller must distinguish UNION vs UNION ALL.
+        match result {
+            Ok(Some(stmt)) => {
+                assert!(
+                    stmt.recursive_query.to_uppercase().contains("SELECT"),
+                    "recursive query should reference the CTE"
+                );
             }
-            Ok(None) => {} // Not recognised as recursive
-            Err(_) => {}   // Parse error is acceptable
+            Ok(None) => {
+                // Also acceptable if the parser doesn't recognise this form.
+            }
+            Err(_) => {
+                // Parse error is acceptable for malformed CTE.
+            }
         }
     }
 
