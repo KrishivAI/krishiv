@@ -11,5 +11,5 @@ s = ks.Session(); pl = s.pipeline("batch_sum")
 pl.source_memory("orders", [B({"amount": [100, 50, 25, 75]})])
 pl.view("revenue", "SELECT SUM(amount) AS total FROM orders", materialized=True)
 sink = pl.sink_memory("revenue"); pl.mode("ivm"); pl.run("once")
-total = sink.collect()[0].to_pandas()["total"][0]
+total = sink.collect()[0].to_arrow().column("total")[0].as_py()
 print(f"[01] total revenue = {total}"); assert total == 250

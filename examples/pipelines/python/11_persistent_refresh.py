@@ -14,7 +14,7 @@ def run(vals, refresh=False):
     pl.view("total", "SELECT SUM(amount) AS s FROM raw", materialized=True)
     sink = pl.sink_memory("total"); pl.mode("ivm")
     (pl.refresh if refresh else pl.run)("once")
-    return sink.collect()[0].to_pandas()["s"][0]
+    return sink.collect()[0].to_arrow().column("s")[0].as_py()
 a = run([10]); b = run([5]); c = run([100], refresh=True)
 print(f"[11] run1={a} run2(incremental)={b} run3(refresh)={c}")
 assert (a, b, c) == (10, 15, 100)

@@ -12,5 +12,5 @@ pl.source_memory("raw", [B({"amount": [100, 50, 300, 20]})])
 pl.temp_view("big", "SELECT amount FROM raw WHERE amount >= 100")
 pl.view("big_count", "SELECT COUNT(*) AS n FROM big", materialized=True)
 sink = pl.sink_memory("big_count"); pl.mode("ivm"); pl.run("once")
-n = sink.collect()[0].to_pandas()["n"][0]
+n = sink.collect()[0].to_arrow().column("n")[0].as_py()
 print(f"[09] big via temp view = {n}"); assert n == 2
