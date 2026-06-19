@@ -88,10 +88,13 @@ impl AqeRule for AutoPartitionRule {
             return None;
         }
 
-        // Compute target partition count.
-        let target =
-            u64::from(self.max_buckets).min(total_bytes.div_ceil(self.target_partition_bytes));
-        let target = target.max(1) as u32;
+        // Compute target partition count via the shared cross-mode sizing brain.
+        let target = krishiv_common::partition::recommend_buckets(
+            total_bytes,
+            1,
+            self.max_buckets,
+            self.target_partition_bytes,
+        );
 
         self.stamp_target(plan, target)
     }

@@ -24,6 +24,53 @@ const PARTITION_KEY_HASH_DOMAIN: &[u8] = b"krishiv.partition-key.v1\0";
 /// this via durability profile or explicit config.
 pub const TARGET_BYTES_PER_PARTITION: u64 = 128 * 1024 * 1024;
 
+/// The single byte→bucket decision shared by every execution mode.
+///
+/// Returns the recommended partition/bucket count for `bytes` of data so each
+/// bucket holds roughly `target_bytes_per_partition`, clamped to
+/// `[min_buckets, max_buckets]`. This is the one place the auto-partitioning
+/// formula lives — batch (AQE `AutoPartitionRule`), streaming
+/// (`StreamingPartitionAdvisor`), bounded windows, and incremental views all
+/// call it so the system self-tunes identically regardless of mode.
+///
+/// Always returns at least 1. Callers express mode-specific caps via the
+/// `min`/`max` bounds (e.g. executor count, input row count, advisor floor).
+pub fn recommend_buckets(
+    bytes: u64,
+    min_buckets: u32,
+    max_buckets: u32,
+    target_bytes_per_partition: u64,
+) -> u32 {
+    let target = target_bytes_per_partition.max(1);
+    let raw = bytes.div_ceil(target).max(1);
+    let raw = u32::try_from(raw).unwrap_or(u32::MAX);
+    let lo = min_buckets.max(1);
+    let hi = max_buckets.max(lo);
+    raw.clamp(lo, hi)
+}
+
+/// [`recommend_buckets`] using the default [`TARGET_BYTES_PER_PARTITION`].
+pub fn recommend_buckets_default(bytes: u64, min_buckets: u32, max_buckets: u32) -> u32 {
+    recommend_buckets(bytes, min_buckets, max_buckets, TARGET_BYTES_PER_PARTITION)
+}
+
+/// Map a serialized record key to one of `num_groups` virtual key groups.
+///
+/// This is the **keyed-semantics** hash (SHA-256 + the `krishiv.partition-key`
+/// domain, sub-tagged `keygroup`) — the *same family* as the typed Arrow keyed
+/// partitioner ([`partition_record_batches_by_key`]). Streaming key groups and
+/// incremental-view sharding both route through here, so a given key lands in a
+/// consistent group regardless of mode. (Non-keyed shuffle *routing* keeps its
+/// own XxHash64 domain — speed over distribution — and must never be aliased.)
+pub fn key_group_for_bytes(key: &[u8], num_groups: u16) -> u16 {
+    let groups = num_groups.max(1);
+    let digest = sha256_bytes_multi(&[PARTITION_KEY_HASH_DOMAIN, b"keygroup\0", key]);
+    let hash = u64::from_le_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ]);
+    (hash % u64::from(groups)) as u16
+}
+
 /// A shard index produced by the SHA-256 keyed-semantics partitioner.
 ///
 /// Intentionally not `From<usize>` or `Into<usize>`: callers must name `.0`
@@ -270,6 +317,22 @@ mod tests {
 
     fn row_count(shards: &[Vec<RecordBatch>]) -> usize {
         shards.iter().flatten().map(RecordBatch::num_rows).sum()
+    }
+
+    #[test]
+    fn recommend_buckets_sizes_and_clamps() {
+        let mib = 1024 * 1024;
+        // ~500 MiB at 128 MiB/partition → 4 buckets.
+        assert_eq!(recommend_buckets(500 * mib, 1, 1024, 128 * mib), 4);
+        // Always at least 1, even for tiny/zero input.
+        assert_eq!(recommend_buckets(0, 1, 1024, 128 * mib), 1);
+        assert_eq!(recommend_buckets(10, 1, 1024, 128 * mib), 1);
+        // Upper clamp (executor cap).
+        assert_eq!(recommend_buckets(100 * 1024 * mib, 1, 8, 128 * mib), 8);
+        // Lower clamp (advisor floor).
+        assert_eq!(recommend_buckets(1, 4, 32, 128 * mib), 4);
+        // min > max is coerced (max wins-as-floor).
+        assert_eq!(recommend_buckets(10 * 1024 * mib, 10, 2, 128 * mib), 10);
     }
 
     #[test]

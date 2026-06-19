@@ -69,13 +69,17 @@ pub async fn execute_bounded_window_coordinated(
         if executor_count == 0 {
             return Err(SchedulerError::NoExecutors);
         }
-        // Compute shard count from data size, capped by available executors.
-        let data_based_shards = total_data_bytes.div_ceil(TARGET_BYTES_PER_SHARD);
-        let data_based_shards = data_based_shards.max(1) as usize;
-        (
-            executor_count.min(data_based_shards.min(input_row_count.max(1))),
-            coord.coordinator_id().to_string(),
-        )
+        // Shared cross-mode sizing brain: data-size driven, capped by available
+        // executors and by input row count (never more shards than rows).
+        let max_shards = u32::try_from(executor_count.min(input_row_count.max(1)))
+            .unwrap_or(u32::MAX);
+        let shard_limit = krishiv_common::partition::recommend_buckets(
+            total_data_bytes,
+            1,
+            max_shards,
+            TARGET_BYTES_PER_SHARD,
+        ) as usize;
+        (shard_limit, coord.coordinator_id().to_string())
     };
 
     let mut shards = if input_row_count == 0 {

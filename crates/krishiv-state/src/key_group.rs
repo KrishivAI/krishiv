@@ -1,6 +1,5 @@
 //! Key-group hashing for state rescaling (ADR-R16.3).
 
-use std::hash::{Hash, Hasher};
 use std::ops::RangeInclusive;
 
 /// Number of key groups (Flink-style fixed parallelism for rescaling).
@@ -28,10 +27,17 @@ impl KeyGroupRange {
 }
 
 /// Hash a record key into `[0, NUM_KEY_GROUPS)`.
+///
+/// Delegates to the shared keyed-semantics hash in `krishiv-common` (SHA-256 +
+/// the `krishiv.partition-key` domain) so streaming key groups, incremental-view
+/// sharding, and the typed Arrow keyed partitioner all use one hash family.
+///
+/// **Note:** this is the durable key-group routing for rescalable state. The
+/// hash family changed from XxHash64 to the SHA-256 keyed domain to unify
+/// partitioning across modes; checkpoints written by an older build remap their
+/// key→group assignment and should be taken fresh (or migrated) on upgrade.
 pub fn key_group_for_key(key: &[u8]) -> u16 {
-    let mut h = twox_hash::XxHash64::with_seed(0);
-    key.hash(&mut h);
-    (h.finish() % u64::from(NUM_KEY_GROUPS)) as u16
+    krishiv_common::partition::key_group_for_bytes(key, NUM_KEY_GROUPS)
 }
 
 /// Assign key groups evenly across `parallelism` task slots.
@@ -81,5 +87,21 @@ mod tests {
         assert_eq!(four.len(), 4);
         assert_eq!(two.len(), 2);
         assert!(two[0].end < two[1].start);
+    }
+
+    #[test]
+    fn key_group_uses_shared_keyed_hash() {
+        // Routes through the one shared keyed-semantics hash in krishiv-common,
+        // is deterministic, and stays in range — so streaming key groups and
+        // incremental-view sharding agree for the same key.
+        for key in [b"customer-42".as_slice(), b"acct-7", b"", b"\x00\x01\x02"] {
+            let kg = key_group_for_key(key);
+            assert!(kg < NUM_KEY_GROUPS);
+            assert_eq!(kg, key_group_for_key(key)); // stable
+            assert_eq!(
+                kg,
+                krishiv_common::partition::key_group_for_bytes(key, NUM_KEY_GROUPS)
+            );
+        }
     }
 }

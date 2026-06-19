@@ -371,10 +371,13 @@ impl StreamingPartitionAdvisor {
         }
         self.observations += 1;
 
-        let target_f = (self.ema_bytes / STREAMING_TARGET_BYTES_PER_PARTITION as f64).ceil();
-        let target = (target_f as u32)
-            .max(1)
-            .clamp(self.min_buckets, self.max_buckets);
+        // Same shared sizing brain as batch/bounded-window/IVM, fed by the EMA.
+        let target = krishiv_common::partition::recommend_buckets(
+            self.ema_bytes as u64,
+            self.min_buckets,
+            self.max_buckets,
+            STREAMING_TARGET_BYTES_PER_PARTITION,
+        );
         self.current_buckets = target;
         target
     }
