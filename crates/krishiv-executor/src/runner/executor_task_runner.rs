@@ -1,6 +1,6 @@
 use std::fmt;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
@@ -20,8 +20,9 @@ use crate::{
 };
 
 use super::partition::{
-    DEFAULT_BATCH_TASK_TIMEOUT_SECS, default_streaming_task_timeout_secs,
-    MAX_CHECKPOINT_ACK_RETRIES, collect_missing_shuffle_partitions, format_failure_message,
+    DEFAULT_BATCH_TASK_TIMEOUT_SECS, MAX_CHECKPOINT_ACK_RETRIES,
+    collect_missing_shuffle_partitions, default_streaming_task_timeout_secs,
+    format_failure_message,
 };
 use super::task_output::{
     CheckpointStateHandle, ExecutorTaskOutput, ExecutorTaskRunReport, RestoredJobCheckpoint,

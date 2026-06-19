@@ -32,15 +32,14 @@ impl Coordinator {
         if matches!(outcome, SubmitOutcome::Accepted)
             && let Some(ask) = spec.memory_limit_bytes()
             && ask > 0
+            && self.executors.cluster_available_memory_bytes().is_none()
         {
-            if self.executors.cluster_available_memory_bytes().is_none() {
-                tracing::debug!(
-                    job_id = %spec.job_id(),
-                    memory_ask = ask,
-                    "job declares a memory ask but no executor has reported memory \
-                     capacity; skipping admission check"
-                );
-            }
+            tracing::debug!(
+                job_id = %spec.job_id(),
+                memory_ask = ask,
+                "job declares a memory ask but no executor has reported memory \
+                 capacity; skipping admission check"
+            );
         }
         if matches!(outcome, SubmitOutcome::Accepted)
             && let Some(ask) = spec.memory_limit_bytes()

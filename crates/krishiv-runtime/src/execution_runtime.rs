@@ -210,11 +210,7 @@ pub trait ExecutionRuntime: Send + Sync {
 /// absent or all batches are empty.  Matches the logic used by the executor's
 /// streaming fragment (`compute_input_watermark`) so embedded and distributed
 /// modes produce the same watermark for the same inputs.
-fn compute_watermark_ms(
-    batches: &[RecordBatch],
-    event_time_col: &str,
-    lag_ms: u64,
-) -> Option<i64> {
+fn compute_watermark_ms(batches: &[RecordBatch], event_time_col: &str, lag_ms: u64) -> Option<i64> {
     use arrow::array::{
         Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray,
@@ -226,14 +222,21 @@ fn compute_watermark_ms(
         let col_idx = batch.schema().index_of(event_time_col).ok()?;
         let col = batch.column(col_idx);
         let col_max: Option<i64> = match col.data_type() {
-            DataType::Int64 => col
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .and_then(|arr| (0..arr.len()).filter(|&i| arr.is_valid(i)).map(|i| arr.value(i)).max()),
+            DataType::Int64 => col.as_any().downcast_ref::<Int64Array>().and_then(|arr| {
+                (0..arr.len())
+                    .filter(|&i| arr.is_valid(i))
+                    .map(|i| arr.value(i))
+                    .max()
+            }),
             DataType::Timestamp(TimeUnit::Millisecond, _) => col
                 .as_any()
                 .downcast_ref::<TimestampMillisecondArray>()
-                .and_then(|arr| (0..arr.len()).filter(|&i| arr.is_valid(i)).map(|i| arr.value(i)).max()),
+                .and_then(|arr| {
+                    (0..arr.len())
+                        .filter(|&i| arr.is_valid(i))
+                        .map(|i| arr.value(i))
+                        .max()
+                }),
             DataType::Timestamp(TimeUnit::Microsecond, _) => col
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
@@ -341,8 +344,14 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
         input_batches: Vec<RecordBatch>,
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<(Vec<RecordBatch>, Option<i64>)> {
-        let watermark = compute_watermark_ms(&input_batches, &spec.event_time_column, spec.watermark_lag_ms);
-        let batches = self.cluster.collect_bounded_window(topic, input_batches, spec)?;
+        let watermark = compute_watermark_ms(
+            &input_batches,
+            &spec.event_time_column,
+            spec.watermark_lag_ms,
+        );
+        let batches = self
+            .cluster
+            .collect_bounded_window(topic, input_batches, spec)?;
         Ok((batches, watermark))
     }
 
