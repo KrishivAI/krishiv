@@ -218,8 +218,20 @@ pub fn redistribute_snapshots(
             Some(existing) => {
                 // Watermarks are 8-byte LE i64 values: keep the minimum.
                 if existing.3.len() == 8 && entry.3.len() == 8 {
-                    let old = i64::from_le_bytes(existing.3[..8].try_into().expect("8 bytes"));
-                    let new = i64::from_le_bytes(entry.3[..8].try_into().expect("8 bytes"));
+                    let old_bytes: [u8; 8] =
+                        existing.3[..8]
+                            .try_into()
+                            .map_err(|_| StateError::SnapshotCorrupt {
+                                message: "watermark value is not 8 bytes".into(),
+                            })?;
+                    let new_bytes: [u8; 8] =
+                        entry.3[..8]
+                            .try_into()
+                            .map_err(|_| StateError::SnapshotCorrupt {
+                                message: "watermark value is not 8 bytes".into(),
+                            })?;
+                    let old = i64::from_le_bytes(old_bytes);
+                    let new = i64::from_le_bytes(new_bytes);
                     if new < old {
                         existing.3 = entry.3;
                     }

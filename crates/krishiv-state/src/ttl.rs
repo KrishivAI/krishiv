@@ -119,7 +119,10 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         // Use watermark-aware now_ms() so that writes and reads agree on the
         // effective clock, preventing keys from appearing immediately expired
         // when the event-time watermark lags wall-clock time.
-        let expires_at_ms = self.now_ms() + self.config.ttl_ms as i64;
+        let expires_at_ms = self
+            .now_ms()
+            .checked_add(self.config.ttl_ms as i64)
+            .unwrap_or(i64::MAX);
         self.inner
             .put(namespace, key, Self::encode(value, expires_at_ms))
     }
@@ -285,7 +288,9 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
         let entries = decode_snapshot_entries(bytes)?;
         let now_ms = self.now_ms();
-        let expires_at_ms = now_ms + self.config.ttl_ms as i64;
+        let expires_at_ms = now_ms
+            .checked_add(self.config.ttl_ms as i64)
+            .unwrap_or(i64::MAX);
         // Pre-compute entries so the write phase has no fallible computation.
         let precomputed: Vec<(Namespace, Vec<u8>, Vec<u8>)> = entries
             .iter()

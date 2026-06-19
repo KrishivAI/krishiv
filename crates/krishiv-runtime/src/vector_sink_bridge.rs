@@ -47,9 +47,7 @@ impl VectorSinkBridge {
 impl krishiv_ivm::IvmVectorSink for VectorSinkBridge {
     fn upsert_batch<'a>(&'a self, ids: &'a [String], vectors: &'a [Vec<f32>]) -> VectorFuture<'a> {
         Box::pin(async move {
-            let epoch = self
-                .epoch
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let epoch = self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let payloads: Vec<HashMap<String, PayloadValue>> =
                 (0..ids.len()).map(|_| HashMap::new()).collect();
             let batch = EmbeddingBatch::new(ids.to_vec(), vectors.to_vec(), payloads, epoch);

@@ -152,9 +152,9 @@ where
             Err(e) => return Err(e),
         }
     }
-    unreachable!(
-        "all transient retries exhaust the delay list and return early; non-transient errors return immediately"
-    )
+    Err(RuntimeError::transport(
+        "all transient retries exhausted for flight request",
+    ))
 }
 
 /// Map a physical plan to a SQL statement understood by the Krishiv Flight SQL service.

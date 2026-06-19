@@ -87,11 +87,19 @@ impl RocksDbStateBackend {
             })
     }
 
+    /// Snapshot the RocksDB backend state to bytes.
+    ///
+    /// **WARNING**: This performs synchronous I/O and blocks the calling thread.
+    /// In async contexts, wrap the caller in `tokio::task::spawn_blocking`.
     pub async fn snapshot_async(&self) -> StateResult<Vec<u8>> {
         use crate::backend::StateBackend;
         self.snapshot()
     }
 
+    /// Restore RocksDB backend state from a snapshot.
+    ///
+    /// **WARNING**: This performs synchronous I/O and blocks the calling thread.
+    /// In async contexts, wrap the caller in `tokio::task::spawn_blocking`.
     pub async fn load_snapshot_async(&mut self, bytes: Vec<u8>) -> StateResult<()> {
         use crate::backend::StateBackend;
         self.load_snapshot(&bytes)
