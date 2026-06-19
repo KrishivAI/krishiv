@@ -1,5 +1,51 @@
 # Krishiv Implementation Status
 
+## 2026-06-19 — Fix `checkpoints list` path-escape false-positive
+
+**Bug:** `LocalFsCheckpointStorage::full_path` compared a non-canonical relative
+path against a canonical absolute base when the target directory didn't exist yet,
+causing `cargo test --workspace --lib` to fail with:
+`checkpoint error: path escapes storage base directory: ./krishiv-checkpoints/job-1/checkpoints`
+
+**Root cause:** In the `else` branch (parent doesn't exist), `canonical_parent`
+was left as raw `parent.to_path_buf()` (relative). `canonical_base` was the
+canonicalized absolute result of `self.base_dir.canonicalize()`, so
+`canonical_parent.starts_with(&canonical_base)` always returned false.
+
+**Fix (`local_fs.rs`):** When parent doesn't exist, strip `self.base_dir` from
+the parent path and rejoin onto `canonical_base`. Phase 1 already guarantees no
+`..` or absolute components in the sub-path, so this is safe.
+
+### Validation
+- `cargo test -p krishiv --lib cli::tests::checkpoints_list_returns_no_checkpoints` — 1 passed
+- `cargo test -p krishiv-state --lib` — 302 passed
+
+### Next useful command
+`cargo test --workspace --lib`
+
+---
+
+## 2026-06-19 — Web CI deploy asset fix
+
+Fixed the Cloudflare Workers deployment path for `krishiv.ai` after the live
+site served HTML but returned 404 for `_next/static/chunks/*` assets.
+
+### What changed
+- Added the OpenNext `ASSETS` binding in `web/wrangler.jsonc`, pointing Wrangler
+  at `.open-next/assets` so `_next/static` files are uploaded and served.
+- Enabled the web deploy GitHub Actions workflow on pushes to `main` that touch
+  web files or the workflow itself.
+
+### Validation
+- `pnpm opennextjs-cloudflare build`
+- `pnpm exec wrangler deploy --dry-run` — exited 0 and reported `env.ASSETS`
+  plus 21 files read from `.open-next/assets`; Wrangler also emitted a sandbox
+  log-file warning for `/root/.config/.wrangler/logs`.
+- `pnpm run typecheck`
+
+### Next useful command
+`git push origin main`
+
 ## 2026-06-19 — Main merge conflict resolution
 
 Merged `origin/main` into `codex/build-production-quality-web-application-12qqbz`
