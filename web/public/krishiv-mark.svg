@@ -1,19 +1,35 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="Krishiv mark">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Krishiv mark">
   <title>Krishiv mark</title>
-  <desc>K monogram with three trishul prongs at top: Batch, Streaming, Incremental.</desc>
-  <rect width="48" height="48" rx="10" fill="#0B1020"/>
-  <g fill="#F59E0B">
-    <!-- Trishul: left prong (shorter) -->
-    <rect x="4"  y="10" width="5" height="12" rx="2"/>
-    <!-- Trishul: center prong (tallest) -->
-    <rect x="11" y="6"  width="5" height="16" rx="2"/>
-    <!-- Trishul: right prong (shorter) -->
-    <rect x="18" y="10" width="5" height="12" rx="2"/>
-    <!-- K: vertical stem -->
-    <rect x="8"  y="22" width="9" height="20" rx="1"/>
-  </g>
-  <!-- K: upper arm -->
-  <line x1="17" y1="32" x2="42" y2="20" stroke="#F59E0B" stroke-width="7" stroke-linecap="round"/>
-  <!-- K: lower arm -->
-  <line x1="17" y1="32" x2="42" y2="44" stroke="#F59E0B" stroke-width="7" stroke-linecap="round"/>
+  <desc>Geometric K mark built from columnar data blocks, streaming paths, and runtime nodes.</desc>
+  <defs>
+    <linearGradient id="krishiv-frame" x1="6" y1="6" x2="58" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F59E0B"/>
+      <stop offset="0.52" stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#6366F1"/>
+    </linearGradient>
+    <linearGradient id="krishiv-spine" x1="17" y1="12" x2="31" y2="52" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FBBF24"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+    <linearGradient id="krishiv-upper" x1="30" y1="32" x2="51" y2="14" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F5F7FB"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+    <linearGradient id="krishiv-lower" x1="30" y1="32" x2="53" y2="50" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F5F7FB"/>
+      <stop offset="1" stop-color="#6366F1"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="58" height="58" rx="14" fill="#0B1020"/>
+  <rect x="3.5" y="3.5" width="57" height="57" rx="13.5" fill="none" stroke="url(#krishiv-frame)" stroke-opacity="0.72"/>
+  <path d="M29 32L49 15" fill="none" stroke="url(#krishiv-upper)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M29 32L51 49" fill="none" stroke="url(#krishiv-lower)" stroke-width="10" stroke-linecap="round"/>
+  <rect x="16" y="11" width="14" height="42" rx="4" fill="url(#krishiv-spine)"/>
+  <rect x="20" y="16" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
+  <rect x="20" y="28" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
+  <rect x="20" y="40" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
+  <path d="M8 20h8M8 32h8M8 44h8" fill="none" stroke="#38BDF8" stroke-width="2.5" stroke-linecap="round" opacity="0.78"/>
+  <circle cx="49" cy="15" r="4" fill="#38BDF8"/>
+  <circle cx="51" cy="49" r="4" fill="#6366F1"/>
+  <circle cx="32" cy="32" r="3.5" fill="#22C55E"/>
 </svg>

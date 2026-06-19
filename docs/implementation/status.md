@@ -1,5 +1,29 @@
 # Krishiv Implementation Status
 
+## 2026-06-19 — Web and docs logo refresh
+
+Redesigned the Krishiv SVG asset set to better match the dark web theme and
+the framework's batch SQL, streaming, state/checkpoint, and lakehouse focus.
+
+### What changed
+- Replaced all source SVG logo/mark files in `web/public` and `docs/assets`
+  with a shared dark framed K/data-flow mark using the site palette.
+- Updated horizontal wordmarks to avoid unsupported AI claims and describe
+  Krishiv as a Rust-native batch SQL, streaming, and lakehouse compute
+  framework.
+- Updated the web header to render `/krishiv-mark.svg` instead of an older
+  inline SVG, keeping the nav logo aligned with the asset files.
+
+### Validation
+- XML parsed all six source SVG files with Python's standard XML parser.
+- `pnpm run typecheck`
+- `pnpm run build`
+
+### Next useful command
+`git status --short --branch`
+
+---
+
 ## 2026-06-19 — Fix `checkpoints list` path-escape false-positive
 
 **Bug:** `LocalFsCheckpointStorage::full_path` compared a non-canonical relative

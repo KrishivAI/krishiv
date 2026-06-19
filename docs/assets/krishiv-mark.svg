@@ -1,36 +1,35 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
   <title id="title">Krishiv mark</title>
-  <desc id="desc">A geometric K-shaped data-flow mark representing Krishiv's shared batch and streaming engine.</desc>
+  <desc id="desc">Geometric K mark built from columnar data blocks, streaming paths, and runtime nodes.</desc>
   <defs>
-    <linearGradient id="ring" x1="42" y1="42" x2="214" y2="214" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#10B981"/>
-      <stop offset="0.48" stop-color="#2563EB"/>
-      <stop offset="1" stop-color="#7C3AED"/>
+    <linearGradient id="krishiv-frame" x1="24" y1="24" x2="232" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F59E0B"/>
+      <stop offset="0.52" stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#6366F1"/>
     </linearGradient>
-    <linearGradient id="core" x1="82" y1="70" x2="176" y2="194" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#E0F2FE"/>
-      <stop offset="0.58" stop-color="#93C5FD"/>
-      <stop offset="1" stop-color="#34D399"/>
+    <linearGradient id="krishiv-spine" x1="68" y1="48" x2="124" y2="208" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FBBF24"/>
+      <stop offset="1" stop-color="#F59E0B"/>
     </linearGradient>
-    <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
-      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#0F172A" flood-opacity="0.18"/>
-    </filter>
+    <linearGradient id="krishiv-upper" x1="120" y1="128" x2="204" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F5F7FB"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+    <linearGradient id="krishiv-lower" x1="120" y1="128" x2="212" y2="200" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F5F7FB"/>
+      <stop offset="1" stop-color="#6366F1"/>
+    </linearGradient>
   </defs>
-
-  <rect width="256" height="256" rx="52" fill="#0B1020"/>
-  <circle cx="128" cy="128" r="94" fill="none" stroke="url(#ring)" stroke-width="12" stroke-linecap="round"/>
-  <path d="M62 128h38" fill="none" stroke="#38BDF8" stroke-width="12" stroke-linecap="round"/>
-  <path d="M156 54v36" fill="none" stroke="#34D399" stroke-width="12" stroke-linecap="round"/>
-  <path d="M190 180l-26-26" fill="none" stroke="#F59E0B" stroke-width="12" stroke-linecap="round"/>
-
-  <g filter="url(#soft-shadow)">
-    <path d="M82 68h34v120H82z" fill="url(#core)"/>
-    <path d="M120 128l56-60h42l-66 68 70 52h-48l-54-42z" fill="#F8FAFC"/>
-    <path d="M120 128l56-60h42l-66 68 70 52h-48l-54-42z" fill="#C4B5FD" opacity="0.18"/>
-    <path d="M92 86h14v18H92zm0 34h14v18H92zm0 34h14v18H92z" fill="#0B1020" opacity="0.65"/>
-  </g>
-
-  <circle cx="62" cy="128" r="10" fill="#38BDF8"/>
-  <circle cx="156" cy="54" r="10" fill="#34D399"/>
-  <circle cx="190" cy="180" r="10" fill="#F59E0B"/>
+  <rect x="12" y="12" width="232" height="232" rx="56" fill="#0B1020"/>
+  <rect x="14" y="14" width="228" height="228" rx="54" fill="none" stroke="url(#krishiv-frame)" stroke-width="4" stroke-opacity="0.72"/>
+  <path d="M116 128L196 60" fill="none" stroke="url(#krishiv-upper)" stroke-width="40" stroke-linecap="round"/>
+  <path d="M116 128L204 196" fill="none" stroke="url(#krishiv-lower)" stroke-width="40" stroke-linecap="round"/>
+  <rect x="64" y="44" width="56" height="168" rx="16" fill="url(#krishiv-spine)"/>
+  <rect x="80" y="64" width="24" height="28" rx="6" fill="#0B1020" opacity="0.66"/>
+  <rect x="80" y="112" width="24" height="28" rx="6" fill="#0B1020" opacity="0.66"/>
+  <rect x="80" y="160" width="24" height="28" rx="6" fill="#0B1020" opacity="0.66"/>
+  <path d="M32 80h32M32 128h32M32 176h32" fill="none" stroke="#38BDF8" stroke-width="10" stroke-linecap="round" opacity="0.78"/>
+  <circle cx="196" cy="60" r="16" fill="#38BDF8"/>
+  <circle cx="204" cy="196" r="16" fill="#6366F1"/>
+  <circle cx="128" cy="128" r="14" fill="#22C55E"/>
 </svg>

@@ -1,20 +1,44 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 210 52" role="img" aria-label="Krishiv">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 88" role="img" aria-label="Krishiv">
   <title>Krishiv</title>
-  <desc>Krishiv wordmark — Rust-native compute engine for batch, streaming, and incremental processing.</desc>
-  <rect width="210" height="52" rx="10" fill="#0B1020"/>
-  <!-- Mark (48×48 content at offset 2,2) -->
-  <g transform="translate(2,2)" fill="#F59E0B">
-    <rect x="4"  y="10" width="5" height="12" rx="2"/>
-    <rect x="11" y="6"  width="5" height="16" rx="2"/>
-    <rect x="18" y="10" width="5" height="12" rx="2"/>
-    <rect x="8"  y="22" width="9" height="20" rx="1"/>
+  <desc>Krishiv wordmark for a Rust-native batch SQL, streaming, and lakehouse compute framework.</desc>
+  <defs>
+    <linearGradient id="krishiv-logo-frame" x1="10" y1="10" x2="70" y2="70" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F59E0B"/>
+      <stop offset="0.52" stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#6366F1"/>
+    </linearGradient>
+    <linearGradient id="krishiv-logo-spine" x1="24" y1="18" x2="40" y2="70" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FBBF24"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+    <linearGradient id="krishiv-logo-word" x1="96" y1="28" x2="224" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F5F7FB"/>
+      <stop offset="0.72" stop-color="#DDE7F5"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+  <rect width="360" height="88" rx="18" fill="#0B1020"/>
+  <rect x="0.5" y="0.5" width="359" height="87" rx="17.5" fill="none" stroke="#2A3858" opacity="0.8"/>
+  <g transform="translate(8 8)">
+    <rect x="3" y="3" width="58" height="58" rx="14" fill="#0B1020"/>
+    <rect x="3.5" y="3.5" width="57" height="57" rx="13.5" fill="none" stroke="url(#krishiv-logo-frame)" stroke-opacity="0.72"/>
+    <path d="M29 32L49 15" fill="none" stroke="#DDF7FF" stroke-width="10" stroke-linecap="round"/>
+    <path d="M29 32L51 49" fill="none" stroke="#C4B5FD" stroke-width="10" stroke-linecap="round"/>
+    <rect x="16" y="11" width="14" height="42" rx="4" fill="url(#krishiv-logo-spine)"/>
+    <rect x="20" y="16" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
+    <rect x="20" y="28" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
+    <rect x="20" y="40" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
+    <path d="M8 20h8M8 32h8M8 44h8" fill="none" stroke="#38BDF8" stroke-width="2.5" stroke-linecap="round" opacity="0.78"/>
+    <circle cx="49" cy="15" r="4" fill="#38BDF8"/>
+    <circle cx="51" cy="49" r="4" fill="#6366F1"/>
+    <circle cx="32" cy="32" r="3.5" fill="#22C55E"/>
   </g>
-  <g transform="translate(2,2)">
-    <line x1="17" y1="32" x2="42" y2="20" stroke="#F59E0B" stroke-width="7" stroke-linecap="round"/>
-    <line x1="17" y1="32" x2="42" y2="44" stroke="#F59E0B" stroke-width="7" stroke-linecap="round"/>
+  <text x="92" y="44" fill="url(#krishiv-logo-word)" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="31" font-weight="800" letter-spacing="0">Krishiv</text>
+  <text x="94" y="65" fill="#A8B3C7" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="11" font-weight="600" letter-spacing="0">Batch SQL / streaming / lakehouse runtime</text>
+  <g transform="translate(282 26)">
+    <rect width="54" height="24" rx="12" fill="#121A2E" stroke="#2A3858"/>
+    <circle cx="16" cy="12" r="4" fill="#F59E0B"/>
+    <circle cx="28" cy="12" r="4" fill="#38BDF8"/>
+    <circle cx="40" cy="12" r="4" fill="#22C55E"/>
   </g>
-  <!-- Wordmark -->
-  <text x="60" y="35" fill="#F5F7FB"
-    font-family="Inter, ui-sans-serif, system-ui, -apple-system, sans-serif"
-    font-size="26" font-weight="700" letter-spacing="-0.03em">Krishiv</text>
 </svg>
