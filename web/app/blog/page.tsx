@@ -1,32 +1,3 @@
 import Link from 'next/link';
-import { SiteHeader } from '@/components/SiteHeader';
-import { blog } from '@/lib/source';
-import { basePath } from '@/lib/base-path';
-
-export const metadata = {
-  title: 'Blog',
-  description: 'Engineering updates, release notes, and architecture notes from Krishiv.',
-};
-
-export default function BlogIndex() {
-  const posts = blog.getPages().sort((a, b) => String(b.data.date ?? '').localeCompare(String(a.data.date ?? '')));
-
-  return (
-    <main className="home-shell">
-      <div className="home-container list-page">
-        <SiteHeader />
-        <span className="eyebrow">Blog</span>
-        <h1>Engineering notes from Krishiv.</h1>
-        <p className="section-lead">Release updates, architecture decisions, benchmark notes, and docs changes.</p>
-        <div className="grid two">
-          {posts.map((post) => (
-            <Link className="card list-item" href={`${basePath}${post.url}`} key={post.url}>
-              <h3>{post.data.title}</h3>
-              <p>{post.data.description}</p>
-            </Link>
-          ))}
-        </div>
-      </div>
-    </main>
-  );
-}
+import { Badge, SiteShell } from '@/components/Shell';
+export default function Blog(){return <SiteShell><main className="container"><section className="page-hero"><Badge tone="orange">Blog</Badge><h1>Technical notes from the Krishiv engine.</h1><p className="lead">Editorial updates separate implemented capabilities from in-progress work.</p></section><Link className="card" style={{display:'block'}} href="/blog/introducing-krishiv"><Badge tone="blue">Engineering</Badge><h2>Introducing Krishiv: One Engine for Batch, Streaming, and Incremental Data Processing</h2><p className="muted">A codebase-grounded overview of the unified engine vision.</p></Link></main></SiteShell>}
