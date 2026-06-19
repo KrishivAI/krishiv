@@ -1,5 +1,31 @@
 # Krishiv Implementation Status
 
+## 2026-06-19 — Fumadocs public web scaffold
+
+Added a root-level `web/` Fumadocs/Next.js public website scaffold while leaving
+the existing repository `docs/` tree intact for development documentation.
+
+### What changed
+- Added a standalone Fumadocs/Next.js app under `web/` with landing page, docs
+  routes, blog routes, changelog, roadmap, examples, search endpoint, shared
+  layout options, version metadata, and initial MDX content.
+- Added `web/versions.json` for release-branch docs metadata (`latest` and
+  `v0.1` placeholders).
+- Added `just` recipes for installing, developing, building, and type-checking
+  the web app.
+
+### Validation
+- `npm install` is currently blocked by npm registry/proxy 403 responses in the
+  environment, so Node dependency installation, build, type-check, and screenshot
+  capture are pending.
+
+### Next
+- Re-run `cd web && npm install`, then `npm run build` and capture a screenshot
+  from `npm run dev` once registry access is available.
+
+---
+
+
 ## 2026-06-18 — Delta batch mode examples + 3 bug fixes
 
 Added 14 real-life delta batch mode examples (7 Python, 5 Rust, 2 SQL CLI) and

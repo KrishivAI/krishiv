@@ -1,0 +1,16 @@
+---
+title: Quickstart
+description: Run a minimal SQL query with the Krishiv CLI.
+---
+
+# Quickstart
+
+```bash
+cargo run -p krishiv -- sql --query "SELECT 1 AS value"
+```
+
+Then inspect the plan:
+
+```bash
+cargo run -p krishiv -- explain --query "SELECT 1 AS value"
+```

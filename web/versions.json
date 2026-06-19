@@ -1,0 +1,15 @@
+[
+  {
+    "label": "Latest",
+    "slug": "latest",
+    "branch": "main",
+    "version": "unreleased",
+    "default": true
+  },
+  {
+    "label": "0.1",
+    "slug": "v0.1",
+    "branch": "release/v0.1",
+    "version": "0.1.x"
+  }
+]

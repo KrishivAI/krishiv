@@ -1,0 +1,21 @@
+{
+  "title": "Krishiv Docs",
+  "pages": [
+    "index",
+    "getting-started",
+    "concepts",
+    "runtime-modes",
+    "batch-sql",
+    "streaming",
+    "ivm",
+    "lakehouse",
+    "connectors",
+    "deployment",
+    "python",
+    "rust",
+    "cli",
+    "examples",
+    "reference",
+    "contributing"
+  ]
+}
