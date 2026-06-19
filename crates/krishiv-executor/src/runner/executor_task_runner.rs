@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::record_batch::RecordBatch;
@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::partition::{
-    DEFAULT_BATCH_TASK_TIMEOUT_SECS, DEFAULT_STREAMING_TASK_TIMEOUT_SECS,
+    DEFAULT_BATCH_TASK_TIMEOUT_SECS, default_streaming_task_timeout_secs,
     MAX_CHECKPOINT_ACK_RETRIES, collect_missing_shuffle_partitions, format_failure_message,
 };
 use super::task_output::{
@@ -41,7 +41,7 @@ pub struct ExecutorTaskRunner {
     /// Shared SQL engine — one instance per runner rather than per-fragment.
     pub(crate) sql_engine: Arc<SqlEngine>,
     /// Per-task checkpoint state keyed by task id.
-    pub(crate) checkpoint_runners: Arc<DashMap<TaskId, TaskRunner>>,
+    pub(crate) checkpoint_runners: Arc<DashMap<TaskId, Arc<Mutex<TaskRunner>>>>,
     /// Attempts currently executing on this executor (P1-19).
     pub(crate) running_attempts: Option<Arc<DashMap<String, TaskAttemptRef>>>,
     /// Optional continuous streaming drain hook (in-process cluster).
@@ -531,7 +531,7 @@ impl ExecutorTaskRunner {
                 // task_timeout_secs explicitly in the task spec.
                 let timeout_secs = assignment
                     .task_timeout_secs()
-                    .unwrap_or(DEFAULT_STREAMING_TASK_TIMEOUT_SECS);
+                    .unwrap_or_else(default_streaming_task_timeout_secs);
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
                     execute_streaming_fragment(
@@ -566,13 +566,21 @@ impl ExecutorTaskRunner {
                 )
                 .await
                 {
-                    Ok(Ok(summary)) => {
-                        tracing::debug!(
-                            active_views = summary.active_views,
-                            rows = summary.total_output_rows,
-                            "IVM tick complete"
+                    Ok(Ok(_summary)) => {
+                        // The scheduler never dispatches delta:step: fragments today — IVM
+                        // runs centrally on the coordinator (see ivm_http.rs:api_ivm_step).
+                        // If this branch is reached it means a fragment was accidentally
+                        // wired up; fail loudly instead of silently returning empty output.
+                        tracing::error!(
+                            "delta:step fragment reached executor — IVM must run centrally \
+                             on the coordinator; this is a scheduler wiring bug"
                         );
-                        Ok(ExecutorTaskOutput::sql(0, 0, 0))
+                        Err(ExecutorError::InvalidAssignment {
+                            message: "delta:step fragments are not dispatched by the scheduler; \
+                                      IVM runs centrally on the coordinator \
+                                      (see ivm_http.rs:api_ivm_step)"
+                                .into(),
+                        })
                     }
                     Ok(Err(e)) => Err(ExecutorError::InvalidAssignment {
                         message: format!("IVM step failed: {e}"),
@@ -831,29 +839,29 @@ impl ExecutorTaskRunner {
     where
         S: CoordinatorExecutorService + Clone + 'static,
     {
-        // Take ownership of the TaskRunner out of the DashMap so we don't hold
-        // a shard lock across blocking file I/O (snapshot + write_bytes).
+        // Get-or-create the Arc<Mutex<TaskRunner>>; the entry stays in the DashMap
+        // throughout the blocking I/O so concurrent barriers for the same task_id
+        // find the existing Arc rather than creating a fresh TaskRunner with
+        // last_acked_epoch=0 and producing phantom acks.
         let task_id = assignment.task_id().clone();
-        let mut task_runner = self
+        let runner_arc = self
             .checkpoint_runners
-            .remove(&task_id)
-            .map(|(_, v)| v)
-            .unwrap_or_else(|| TaskRunner::new(task_id.clone()));
-        // DashMap shard lock is now fully released.
+            .entry(task_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(TaskRunner::new(task_id.clone()))))
+            .clone();
+        // DashMap shard lock is now fully released; runner_arc keeps state alive.
 
         let ack = tokio::task::spawn_blocking(move || {
-            task_runner
-                .handle_initiate_checkpoint(req, &state, storage.as_ref())
-                .map(|ack| (ack, task_runner))
+            let mut runner = runner_arc
+                .lock()
+                .map_err(|_| ExecutorError::LocalExecution {
+                    message: "checkpoint runner lock poisoned".into(),
+                })?;
+            runner.handle_initiate_checkpoint(req, &state, storage.as_ref())
         })
         .await
         .map_err(|error| tonic::Status::internal(error.to_string()))?
         .map_err(|error| tonic::Status::internal(error.to_string()))?;
-
-        let (ack, task_runner) = ack;
-
-        // Re-insert the updated runner (last_acked_epoch was updated).
-        self.checkpoint_runners.insert(task_id, task_runner);
 
         self.send_checkpoint_ack_with_retries(ack, coordinator)
             .await
@@ -1153,7 +1161,9 @@ impl ExecutorTaskRunner {
                 let task_id = entry.value().task_id().clone();
                 self.checkpoint_runners
                     .entry(task_id.clone())
-                    .or_insert_with(|| TaskRunner::new(task_id))
+                    .or_insert_with(|| Arc::new(Mutex::new(TaskRunner::new(task_id))))
+                    .lock()
+                    .unwrap()
                     .apply_restored_epoch(cmd.epoch);
             }
         }

@@ -947,6 +947,11 @@ impl TaskRecord {
         if !state.source_offset.is_empty() {
             self.last_source_offset = Some(state.source_offset.clone());
         }
+        // Executor heartbeat confirms this task is alive — refresh the progress
+        // timestamp so stall detection does not kill long-windowing tasks that
+        // are accumulating data without yet emitting output rows.
+        self.last_progress_ms =
+            Some(u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0));
     }
 
     pub(crate) fn cancel(&mut self) {

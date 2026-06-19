@@ -6,7 +6,7 @@ use krishiv_common::MemoryBudget;
 use krishiv_dataflow::ContinuousWindowExecutor;
 use krishiv_plan::udf::ResourceLimits;
 
-use crate::fragment::common::task_fragment_body;
+use crate::fragment::common::{build_hot_key_reports, task_fragment_body};
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
 use krishiv_dataflow::execute_bounded_window;
@@ -471,11 +471,11 @@ fn execute_loop_fragment(
         .ok()
         .map(|s| s.key_column)
         .unwrap_or_default();
-    let hot_key_reports = build_streaming_hot_key_reports(
+    let hot_key_reports = build_hot_key_reports(
         &output_batches,
         &key_column,
         assignment.job_id(),
-        assignment.stage_id(),
+        assignment.stage_id().as_str(),
     );
     let mut output = ExecutorTaskOutput::streaming_window(
         total_rows,
@@ -683,11 +683,11 @@ pub(crate) async fn execute_streaming_fragment(
         total_rows as u64,
     );
 
-    let hot_key_reports = build_streaming_hot_key_reports(
+    let hot_key_reports = build_hot_key_reports(
         &collected_batches,
         &plan_spec.key_column,
         assignment.job_id(),
-        assignment.stage_id(),
+        assignment.stage_id().as_str(),
     );
     let mut output = ExecutorTaskOutput::streaming_window(
         total_rows,
@@ -749,7 +749,7 @@ async fn execute_streaming_with_batches(
     let total_batches = collected.len();
     let column_count = collected.first().map(|b| b.num_columns()).unwrap_or(0);
     let hot_key_reports =
-        build_streaming_hot_key_reports(&collected, &spec.key_column, job_id, stage_id);
+        build_hot_key_reports(&collected, &spec.key_column, job_id, stage_id.as_str());
     let mut output =
         ExecutorTaskOutput::streaming_window(total_rows, total_batches, column_count, collected);
     if let Some(wm) = observed_watermark_ms {
@@ -794,117 +794,6 @@ fn advise_streaming_buckets(
             1
         }
     }
-}
-
-/// Build hot-key reports from output batches for coordinator-side skew detection.
-///
-/// Scans `key_column` across all batches using the SpaceSaving tracker and
-/// returns reports for keys whose heat score exceeds 0.10 (≥10 % of rows in
-/// the sample). An empty slice or a missing key column produces an empty Vec.
-///
-/// Each key value is rendered as a plain string using the column's concrete type
-/// (e.g. `"bot"` for Utf8, `"42"` for Int64). The previous `format!("{:?}",
-/// col.slice(i, 1))` approach emitted the full Arrow debug representation
-/// (`StringArray\n[\n  "bot",\n]`), which inflated memory usage ~20× and made
-/// hot-key report keys unreadable by downstream consumers.
-fn build_streaming_hot_key_reports(
-    batches: &[arrow::record_batch::RecordBatch],
-    key_column: &str,
-    job_id: &krishiv_proto::JobId,
-    stage_id: &krishiv_proto::StageId,
-) -> Vec<krishiv_proto::HeartbeatHotKeyReport> {
-    use arrow::array::{
-        Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
-    };
-    use arrow::datatypes::DataType;
-    use krishiv_dataflow::adaptive::HeavyHittersTracker;
-
-    let mut tracker = HeavyHittersTracker::new(64);
-
-    let key_idx = batches
-        .first()
-        .and_then(|b| b.schema().index_of(key_column).ok());
-
-    if let Some(kidx) = key_idx {
-        for batch in batches {
-            let col = batch.column(kidx);
-            // Extract a plain string representation for each non-null row using
-            // the column's concrete Arrow type. This avoids the debug-format
-            // overhead and produces human-readable keys for coordinator logs.
-            match col.data_type() {
-                DataType::Utf8 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_owned());
-                            }
-                        }
-                    }
-                }
-                DataType::LargeUtf8 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_owned());
-                            }
-                        }
-                    }
-                }
-                DataType::Utf8View => {
-                    if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_owned());
-                            }
-                        }
-                    }
-                }
-                DataType::Int32 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_string());
-                            }
-                        }
-                    }
-                }
-                DataType::Int64 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_string());
-                            }
-                        }
-                    }
-                }
-                DataType::Boolean => {
-                    if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_string());
-                            }
-                        }
-                    }
-                }
-                // Unsupported key types are silently skipped — the tracker
-                // stays empty and the caller gets an empty report Vec.
-                _ => {}
-            }
-        }
-    }
-
-    tracker
-        .hot_keys(0.10)
-        .into_iter()
-        .map(|report| krishiv_proto::HeartbeatHotKeyReport {
-            key: report.key,
-            estimated_count: report.estimated_count,
-            max_error: report.max_error,
-            heat_score: report.heat_score,
-            job_id: job_id.clone(),
-            source_id: stage_id.to_string(),
-        })
-        .collect()
 }
 
 /// Compute the event-time watermark from input batches.

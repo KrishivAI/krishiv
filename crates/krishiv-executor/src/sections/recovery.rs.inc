@@ -383,7 +383,9 @@ mod phase3_recovery {
         let task_id = TaskId::try_new("task-p3-kafka").unwrap();
         let mut stale = TaskRunner::new(task_id.clone());
         stale.last_acked_epoch = 9;
-        runner.checkpoint_runners.insert(task_id.clone(), stale);
+        runner
+            .checkpoint_runners
+            .insert(task_id.clone(), Arc::new(Mutex::new(stale)));
 
         // Seal epoch 2 with Kafka offsets and no operator snapshots.
         let ack = CheckpointAckRequest {
@@ -413,9 +415,10 @@ mod phase3_recovery {
         assert_eq!(restored[0].partition, 1);
         assert_eq!(restored[0].offset, 77);
 
-        let task_runner = runner.checkpoint_runners.get(&task_id).unwrap();
+        let task_runner_arc = runner.checkpoint_runners.get(&task_id).unwrap();
         assert_eq!(
-            task_runner.last_acked_epoch, 2,
+            task_runner_arc.lock().unwrap().last_acked_epoch,
+            2,
             "task epoch must reset to the restored epoch so pre-rollback \
              barriers are rejected as stale"
         );

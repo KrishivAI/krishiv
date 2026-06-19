@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
-//! IVM (DeltaBatch) fragment execution for distributed mode.
+//! IVM (DeltaBatch) fragment execution — future distributed path, NOT currently active.
 //!
-//! The coordinator dispatches `delta:step:{job_id}|{encoded_deltas_b64}|{view_specs_json}`
-//! task fragments to executors. Each executor maintains a long-lived
-//! `IncrementalFlow` per job (keyed by job_id), applying deltas and running SQL
-//! across ticks without re-creating the DataFusion context each time.
+//! IVM computation currently runs centrally on the coordinator via
+//! `api_ivm_step` in `ivm_http.rs`. The `delta:step:` task fragment format
+//! defined here is a **future optimization** for distributing IVM ticks to
+//! executors. The scheduler never dispatches these fragments today; reaching
+//! this code path is a bug and the executor will return an error.
 //!
 //! # Fragment format
 //!

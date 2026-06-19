@@ -13,8 +13,21 @@ pub(crate) const DEFAULT_BATCH_TASK_TIMEOUT_SECS: u64 = 3600;
 /// Default streaming task safety timeout in seconds (5 minutes).
 /// Streaming fragments run continuously, but a deadlocked window operator
 /// would block forever without this guard (R6). Operators that legitimately
-/// need longer windows should set `task_timeout_secs` explicitly.
+/// need longer windows should set `task_timeout_secs` explicitly in the task
+/// spec, or override the cluster-wide default via the
+/// `KRISHIV_STREAMING_TASK_TIMEOUT_SECS` environment variable.
 pub(crate) const DEFAULT_STREAMING_TASK_TIMEOUT_SECS: u64 = 300;
+
+/// Return the effective streaming task timeout, checking
+/// `KRISHIV_STREAMING_TASK_TIMEOUT_SECS` before the compiled-in default.
+/// Per-task `task_timeout_secs` still takes precedence over both.
+pub(crate) fn default_streaming_task_timeout_secs() -> u64 {
+    std::env::var("KRISHIV_STREAMING_TASK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STREAMING_TASK_TIMEOUT_SECS)
+}
+
 pub(crate) const MAX_CHECKPOINT_ACK_RETRIES: u8 = 3;
 
 /// Maximum bytes used in the failure message sent to the coordinator.  Larger

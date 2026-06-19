@@ -32,6 +32,19 @@ impl Coordinator {
         if matches!(outcome, SubmitOutcome::Accepted)
             && let Some(ask) = spec.memory_limit_bytes()
             && ask > 0
+        {
+            if self.executors.cluster_available_memory_bytes().is_none() {
+                tracing::debug!(
+                    job_id = %spec.job_id(),
+                    memory_ask = ask,
+                    "job declares a memory ask but no executor has reported memory \
+                     capacity; skipping admission check"
+                );
+            }
+        }
+        if matches!(outcome, SubmitOutcome::Accepted)
+            && let Some(ask) = spec.memory_limit_bytes()
+            && ask > 0
             && let Some(available) = self.executors.cluster_available_memory_bytes()
             && ask > available
         {
@@ -186,6 +199,14 @@ impl Coordinator {
         &mut self,
         update: TaskStatusUpdate,
     ) -> SchedulerResult<TaskUpdateOutcome> {
+        // Callers must drain pending_sink_finalize after every call via
+        // take_pending_sink_finalize().  A non-empty vec here means a previous
+        // caller forgot to drain, which would cause blocking I/O under the write lock.
+        debug_assert!(
+            self.pending_sink_finalize.is_empty(),
+            "pending_sink_finalize not drained before next apply_task_update call; \
+             caller must call take_pending_sink_finalize() after every apply_task_update"
+        );
         self.ensure_active()?;
         self.executors
             .validate_lease(update.executor_id(), update.lease_generation())?;

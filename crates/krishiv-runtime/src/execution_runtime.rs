@@ -204,6 +204,72 @@ pub trait ExecutionRuntime: Send + Sync {
     }
 }
 
+/// Compute the event-time watermark from a slice of batches.
+///
+/// Returns `max(event_time_column) - lag_ms`, or `None` when the column is
+/// absent or all batches are empty.  Matches the logic used by the executor's
+/// streaming fragment (`compute_input_watermark`) so embedded and distributed
+/// modes produce the same watermark for the same inputs.
+fn compute_watermark_ms(
+    batches: &[RecordBatch],
+    event_time_col: &str,
+    lag_ms: u64,
+) -> Option<i64> {
+    use arrow::array::{
+        Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow::datatypes::{DataType, TimeUnit};
+
+    let mut max_ts: Option<i64> = None;
+    for batch in batches {
+        let col_idx = batch.schema().index_of(event_time_col).ok()?;
+        let col = batch.column(col_idx);
+        let col_max: Option<i64> = match col.data_type() {
+            DataType::Int64 => col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .and_then(|arr| (0..arr.len()).filter(|&i| arr.is_valid(i)).map(|i| arr.value(i)).max()),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => col
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .and_then(|arr| (0..arr.len()).filter(|&i| arr.is_valid(i)).map(|i| arr.value(i)).max()),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => col
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .and_then(|arr| {
+                    (0..arr.len())
+                        .filter(|&i| arr.is_valid(i))
+                        .map(|i| arr.value(i) / 1_000)
+                        .max()
+                }),
+            DataType::Timestamp(TimeUnit::Second, _) => col
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .and_then(|arr| {
+                    (0..arr.len())
+                        .filter(|&i| arr.is_valid(i))
+                        .map(|i| arr.value(i) * 1_000)
+                        .max()
+                }),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .and_then(|arr| {
+                    (0..arr.len())
+                        .filter(|&i| arr.is_valid(i))
+                        .map(|i| arr.value(i) / 1_000_000)
+                        .max()
+                }),
+            _ => None,
+        };
+        if let Some(ts) = col_max {
+            max_ts = Some(max_ts.unwrap_or(i64::MIN).max(ts));
+        }
+    }
+    max_ts.map(|ts| ts - lag_ms as i64)
+}
+
 fn tables_to_batch_sql(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> {
     // Skip the allocation entirely for the common empty-table case (most
     // queries in embedded mode don't register parquet tables).
@@ -267,6 +333,17 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
     ) -> RuntimeResult<Vec<RecordBatch>> {
         self.cluster
             .collect_bounded_window(topic, input_batches, spec)
+    }
+
+    fn collect_bounded_window_with_watermark(
+        &self,
+        topic: &str,
+        input_batches: Vec<RecordBatch>,
+        spec: &LocalWindowExecutionSpec,
+    ) -> RuntimeResult<(Vec<RecordBatch>, Option<i64>)> {
+        let watermark = compute_watermark_ms(&input_batches, &spec.event_time_column, spec.watermark_lag_ms);
+        let batches = self.cluster.collect_bounded_window(topic, input_batches, spec)?;
+        Ok((batches, watermark))
     }
 
     fn collect_batch_sql(
@@ -364,6 +441,25 @@ impl RemoteExecutionRuntime {
     /// Call this after construction when running inside a Tokio runtime.
     pub async fn start_health_checks(&self) {
         self.pool.start_health_checks().await;
+    }
+
+    /// Spawn health checks as a background Tokio task.  Safe to call from a
+    /// sync context as long as a Tokio runtime is already running (e.g. from
+    /// within a `#[tokio::main]` or any async call-chain).  Logs a warning and
+    /// skips if no runtime is available.
+    pub fn spawn_health_checks(&self) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let pool = self.pool.clone();
+                handle.spawn(async move { pool.start_health_checks().await });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Flight client health checks not started: \
+                     spawn_health_checks called outside a Tokio runtime context"
+                );
+            }
+        }
     }
 }
 
@@ -693,12 +789,14 @@ pub fn build_execution_runtime(
                     "SingleNodeDaemon placement requires a local Flight SQL coordinator URL",
                 )
             })?;
-            Ok(Arc::new(RemoteExecutionRuntime::new(
+            let rt = RemoteExecutionRuntime::new(
                 url,
                 RuntimeMode::SingleNode,
                 coordinator_grpc_url,
                 ExecutionPlacement::SingleNodeDaemon,
-            )?))
+            )?;
+            rt.spawn_health_checks();
+            Ok(Arc::new(rt))
         }
         (RuntimeMode::Distributed, ExecutionPlacement::RemoteClusterRequired) => {
             let url = coordinator_flight_url.ok_or_else(|| {
@@ -706,12 +804,14 @@ pub fn build_execution_runtime(
                     "Distributed placement requires an explicit remote Flight SQL coordinator URL",
                 )
             })?;
-            Ok(Arc::new(RemoteExecutionRuntime::new(
+            let rt = RemoteExecutionRuntime::new(
                 url,
                 RuntimeMode::Distributed,
                 coordinator_grpc_url,
                 ExecutionPlacement::RemoteClusterRequired,
-            )?))
+            )?;
+            rt.spawn_health_checks();
+            Ok(Arc::new(rt))
         }
         (RuntimeMode::Embedded, _) => Err(RuntimeError::unsupported(
             "Embedded mode only supports LocalInProcess placement",

@@ -11,9 +11,9 @@ use krishiv_proto::{ExecutorTaskAssignment, TaskRuntimeStats};
 use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDescriptor};
 
 use super::common::{
-    parse_local_parquet_partitions, read_connector_parquet_partitions, read_inline_ipc_partitions,
-    read_object_parquet_partitions, read_shuffle_flight_partitions, sql_query_from_fragment,
-    task_fragment_body, write_object_parquet_sink_for_task,
+    build_hot_key_reports, parse_local_parquet_partitions, read_connector_parquet_partitions,
+    read_inline_ipc_partitions, read_object_parquet_partitions, read_shuffle_flight_partitions,
+    sql_query_from_fragment, task_fragment_body, write_object_parquet_sink_for_task,
 };
 use crate::runner::{
     ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, SHUFFLE_WRITE_PREFIX,
@@ -737,7 +737,13 @@ async fn execute_memory_kafka_to_parquet(
         runner
             .checkpoint_runners
             .entry(task_id.clone())
-            .or_insert_with(|| crate::runner::TaskRunner::new(task_id))
+            .or_insert_with(|| {
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::runner::TaskRunner::new(task_id),
+                ))
+            })
+            .lock()
+            .unwrap()
             .kafka_source_offsets = vec![offset];
     }
 
@@ -915,7 +921,13 @@ async fn execute_broker_kafka_two_phase(
         runner
             .checkpoint_runners
             .entry(task_id.clone())
-            .or_insert_with(|| crate::runner::TaskRunner::new(task_id))
+            .or_insert_with(|| {
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::runner::TaskRunner::new(task_id),
+                ))
+            })
+            .lock()
+            .unwrap()
             .kafka_source_offsets = offsets.offsets;
     }
 
@@ -1200,94 +1212,3 @@ fn shuffle_seed_from_job_id(job_id: &str) -> u64 {
     hasher.finish()
 }
 
-fn build_hot_key_reports(
-    batches: &[arrow::record_batch::RecordBatch],
-    key_column: &str,
-    job_id: &krishiv_proto::JobId,
-    stage_id: &str,
-) -> Vec<krishiv_proto::HeartbeatHotKeyReport> {
-    use arrow::array::{
-        Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
-    };
-    use arrow::datatypes::DataType;
-    use krishiv_dataflow::adaptive::HeavyHittersTracker;
-
-    let mut tracker = HeavyHittersTracker::new(64);
-    let key_idx = batches
-        .first()
-        .and_then(|b| b.schema().index_of(key_column).ok());
-    if let Some(kidx) = key_idx {
-        for batch in batches {
-            let col = batch.column(kidx);
-            match col.data_type() {
-                DataType::Utf8 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_owned());
-                            }
-                        }
-                    }
-                }
-                DataType::LargeUtf8 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_owned());
-                            }
-                        }
-                    }
-                }
-                DataType::Utf8View => {
-                    if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_owned());
-                            }
-                        }
-                    }
-                }
-                DataType::Int32 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_string());
-                            }
-                        }
-                    }
-                }
-                DataType::Int64 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_string());
-                            }
-                        }
-                    }
-                }
-                DataType::Boolean => {
-                    if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
-                        for i in 0..arr.len() {
-                            if arr.is_valid(i) {
-                                tracker.observe(arr.value(i).to_string());
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    tracker
-        .hot_keys(0.10)
-        .into_iter()
-        .map(|report| krishiv_proto::HeartbeatHotKeyReport {
-            key: report.key,
-            estimated_count: report.estimated_count,
-            max_error: report.max_error,
-            heat_score: report.heat_score,
-            job_id: job_id.clone(),
-            source_id: stage_id.to_string(),
-        })
-        .collect()
-}

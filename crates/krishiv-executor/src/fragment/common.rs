@@ -4,10 +4,13 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
+use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray};
+use arrow::datatypes::DataType;
 use krishiv_proto::{
-    InputPartitionDescriptor, OutputContract, OutputContractDescriptor, TaskState,
-    TransportDisposition,
+    HeartbeatHotKeyReport, InputPartitionDescriptor, JobId, OutputContract,
+    OutputContractDescriptor, TaskState, TransportDisposition,
 };
+use krishiv_dataflow::adaptive::HeavyHittersTracker;
 
 use crate::runner::{
     CONNECTOR_PARQUET_PARTITION_PREFIX, LocalParquetPartition, OBJECT_PARQUET_PARTITION_PREFIX,
@@ -634,6 +637,99 @@ pub(crate) fn read_inline_ipc_partitions(
         result.push((table_name, batches));
     }
     Ok(result)
+}
+
+/// Track key-column heavy hitters across a slice of `RecordBatch`es and return
+/// the set of keys that each carry ≥10% of the total row count.
+///
+/// Used by both batch shuffle-write and streaming window fragments so that hot-key
+/// detection logic is not duplicated between them.  `source_id` is whatever
+/// identifier the coordinator uses to correlate the report back to the originating
+/// stage/partition (stage_id for batch, stage_id.to_string() for streaming).
+pub(crate) fn build_hot_key_reports(
+    batches: &[arrow::record_batch::RecordBatch],
+    key_column: &str,
+    job_id: &JobId,
+    source_id: &str,
+) -> Vec<HeartbeatHotKeyReport> {
+    let mut tracker = HeavyHittersTracker::new(64);
+    let key_idx = batches
+        .first()
+        .and_then(|b| b.schema().index_of(key_column).ok());
+    if let Some(kidx) = key_idx {
+        for batch in batches {
+            let col = batch.column(kidx);
+            match col.data_type() {
+                DataType::Utf8 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_owned());
+                            }
+                        }
+                    }
+                }
+                DataType::LargeUtf8 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_owned());
+                            }
+                        }
+                    }
+                }
+                DataType::Utf8View => {
+                    if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_owned());
+                            }
+                        }
+                    }
+                }
+                DataType::Int32 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_string());
+                            }
+                        }
+                    }
+                }
+                DataType::Int64 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_string());
+                            }
+                        }
+                    }
+                }
+                DataType::Boolean => {
+                    if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
+                        for i in 0..arr.len() {
+                            if arr.is_valid(i) {
+                                tracker.observe(arr.value(i).to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    tracker
+        .hot_keys(0.10)
+        .into_iter()
+        .map(|report| HeartbeatHotKeyReport {
+            key: report.key,
+            estimated_count: report.estimated_count,
+            max_error: report.max_error,
+            heat_score: report.heat_score,
+            job_id: job_id.clone(),
+            source_id: source_id.to_string(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

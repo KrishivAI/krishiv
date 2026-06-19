@@ -1,5 +1,80 @@
 # Krishiv Implementation Status
 
+## 2026-06-19 — Coordinator/Scheduler/Executor audit fixes
+
+Applied all actionable findings from the P0–P2 audit across coordinator,
+scheduler, and executor components.
+
+### What changed
+
+**E-1 (P0) — IVM executor path fails loudly instead of silently succeeding**
+- `fragment/ivm.rs`: corrected module doc comment (path is future-only, not current).
+- `executor_task_runner.rs`: `DeltaBatch` dispatch now returns `Err` with a
+  clear message if a `delta:step:` fragment somehow reaches the executor, instead
+  of silently returning empty output. Prevents accidental coordinator↔executor
+  IVM wire-up from passing silently.
+
+**E-3 (P0) — checkpoint_runners DashMap remove+reinsert gap closed**
+- `executor_task_runner.rs`: Changed `checkpoint_runners` type from
+  `DashMap<TaskId, TaskRunner>` to `DashMap<TaskId, Arc<Mutex<TaskRunner>>>`.
+- `initiate_checkpoint_and_deliver_ack` no longer removes the entry from the map
+  during blocking I/O; a concurrent barrier arriving in that window now finds the
+  existing Arc (and blocks on the Mutex) rather than creating a fresh `TaskRunner`
+  with `last_acked_epoch=0` and producing phantom acks.
+- `batch.rs`, `recovery.rs.inc`, `executor_task_runner.rs:restore_job_from_checkpoint`
+  all updated consistently.
+
+**C-2 (P1) — Undrained `pending_sink_finalize` detected early**
+- `coordinator/job_lifecycle.rs`: Added `debug_assert` at the top of
+  `apply_task_update` that `pending_sink_finalize` is empty; catches callers that
+  forget `take_pending_sink_finalize()` in debug builds before they cause
+  blocking I/O under the coordinator write lock.
+
+**D-2 (P1) — Flight health checks wired into session construction (#73)**
+- `execution_runtime.rs`: Added `spawn_health_checks()` to `RemoteExecutionRuntime`
+  that uses `Handle::try_current()` to schedule `pool.start_health_checks()` as a
+  background Tokio task.
+- `build_execution_runtime` now calls `spawn_health_checks()` for both
+  `SingleNodeDaemon` and `RemoteClusterRequired` placements. Stale Flight channels
+  are now recycled automatically.
+
+**E-2 (P1) — Streaming task timeout is env-configurable**
+- `runner/partition.rs`: Added `default_streaming_task_timeout_secs()` that reads
+  `KRISHIV_STREAMING_TASK_TIMEOUT_SECS` before falling back to 300 s.
+- `executor_task_runner.rs`: Streaming dispatch now calls
+  `default_streaming_task_timeout_secs()` instead of the constant so operators
+  that need longer windows can override without per-task spec changes.
+
+**C-6 (P2) — Stall detection no longer false-triggers on windowing tasks**
+- `job/record.rs:apply_streaming_state`: Refreshes `last_progress_ms` whenever
+  an executor heartbeat includes streaming task state for this task. Long-windowing
+  tasks that are accumulating data without yet emitting output rows are now treated
+  as "making progress" as long as the executor is heartbeating.
+
+**E-4 (P2) — Hot-key report logic unified**
+- `fragment/common.rs`: Added `build_hot_key_reports(batches, key_column, job_id, source_id)`.
+- `fragment/batch.rs`: Removed local `build_hot_key_reports`; imports from `common`.
+- `fragment/streaming.rs`: Removed local `build_streaming_hot_key_reports`; imports
+  from `common` and passes `stage_id.as_str()` at call sites.
+
+**D-1 (P2) — Watermark propagated from in-process runtime**
+- `execution_runtime.rs:InProcessExecutionRuntime`: Overrides
+  `collect_bounded_window_with_watermark` to compute the event-time watermark from
+  input batches before running the window, matching the logic in the executor's
+  streaming fragment. Embedded and single-node sessions now return a real watermark
+  instead of `None`.
+
+**S-1 (P3) — Memory admission logs when capacity is unknown**
+- `coordinator/job_lifecycle.rs`: Added `debug!` log when a job with a memory ask
+  is admitted but no executor has reported memory capacity.
+
+### Validation
+- `cargo check --workspace` — clean (only pre-existing PyO3 deprecation warnings)
+- `cargo test --workspace --lib` — running
+
+### Next useful command
+`cargo test --workspace --lib`
+
 ## 2026-06-19 — PySpark-shaped Python SQL functions namespace + pytest coverage
 
 Added the first migration-oriented Python SQL API slice after comparing Krishiv

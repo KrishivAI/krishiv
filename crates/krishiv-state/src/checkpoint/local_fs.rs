@@ -62,7 +62,12 @@ impl LocalFsCheckpointStorage {
                     path: format!("cannot canonicalize parent {}: {e}", parent.display()),
                 })?
         } else {
-            parent.to_path_buf()
+            // Parent doesn't exist yet (path not yet written). Phase 1 guarantees
+            // `candidate` was built as `self.base_dir.join(clean)` with no `..` or
+            // absolute components, so stripping the base prefix and re-joining onto
+            // the canonical base produces a correct absolute path for the check below.
+            let rel = parent.strip_prefix(&self.base_dir).unwrap_or(parent);
+            canonical_base.join(rel)
         };
 
         // Phase 3: verify the resolved parent (and therefore the file) stays
