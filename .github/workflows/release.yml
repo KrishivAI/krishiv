@@ -1,0 +1,354 @@
+name: Release
+
+# Triggered when a GitHub Release is published (via UI or gh CLI).
+# Workflow:
+#   1. just release 0.2.0   (bumps version, commits, tags, pushes)
+#   2. GitHub → Releases → Draft a new release → select tag → set notes / pre-release flag
+#   3. Click Publish → this workflow fires, builds all artifacts, uploads to the release
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/krishiv
+  CXXFLAGS: "-include cstdint"
+  RUSTC_WRAPPER: sccache
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  # ── 1. Validate release readiness ───────────────────────────────────────────
+  # Python-only validation — no Rust toolchain needed.
+  validate:
+    name: Validate
+    runs-on: self-hosted
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - name: Extract version metadata
+        id: meta
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          IS_PRE="${{ github.event.release.prerelease }}"
+          echo "version=${VERSION}"      >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRE}" >> "$GITHUB_OUTPUT"
+          echo "Tag=${TAG}  Version=${VERSION}  PreRelease=${IS_PRE}"
+      - name: Validate tag and project metadata
+        run: python3 scripts/check_release.py --tag "${{ github.event.release.tag_name }}"
+      - name: Validate API parity manifest
+        run: python3 scripts/check_parity_manifest.py
+      - name: Validate migration notes (stable only)
+        if: github.event.release.prerelease == false
+        run: python3 scripts/check_migration_notes.py
+
+  # ── 2a. Cargo binaries ──────────────────────────────────────────────────────
+  build-binary:
+    name: Binary (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: self-hosted
+            extra_sys_deps: musl-tools
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            extra_sys_deps: ""
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: binary-${{ matrix.target }}
+          extra-apt: ${{ matrix.extra_sys_deps }}
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build -p krishiv --profile release-max --features full --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          NAME="krishiv-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release-max/krishiv" "dist/${NAME}/"
+          cp README.md LICENSE "dist/${NAME}/"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          sha256sum "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.tar.gz*
+          retention-days: 7
+
+  # ── 2b. Python wheels (maturin, multi-platform) ──────────────────────────────
+  build-wheels:
+    name: Wheel (${{ matrix.os }} / ${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: self-hosted
+            target: x86_64
+            manylinux: auto
+          - os: self-hosted
+            target: aarch64
+            manylinux: auto
+          - os: macos-14
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - os: macos-13
+            target: x86_64-apple-darwin
+            manylinux: "off"
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - uses: actions/setup-python@v5
+        if: runner.os == 'macOS'
+        with:
+          python-version: "3.11"
+      - name: Install Python (self-hosted)
+        if: runner.os != 'macOS'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \
+            python3-pip python3-venv python3-dev
+      - uses: PyO3/maturin-action@v1
+        env:
+          RUSTC_WRAPPER: ""
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          command: build
+          args: --release --out dist/ --find-interpreter
+          working-directory: crates/krishiv-python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          retention-days: 7
+
+  # ── 2c. Docker image (multi-platform via buildx) ─────────────────────────────
+  # Single universal image: mode is selected at runtime via KRISHIV_MODE env var.
+  docker:
+    name: Docker
+    needs: validate
+    runs-on: self-hosted
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.is_prerelease == 'false' }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.build
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            FEATURES=full
+            PROFILE=release-max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=docker
+          cache-to: type=gha,scope=docker,mode=max
+
+  # ── 2d. Helm chart ───────────────────────────────────────────────────────────
+  helm:
+    name: Helm Chart
+    needs: validate
+    runs-on: self-hosted
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.0
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stamp Chart.yaml with release version
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          sed -i "s/^version:.*/version: ${VERSION}/" k8s/helm/krishiv/Chart.yaml
+          sed -i 's/^appVersion:.*/appVersion: "'"${VERSION}"'"/' k8s/helm/krishiv/Chart.yaml
+      - name: Package
+        run: |
+          mkdir -p dist/helm
+          helm package k8s/helm/krishiv --destination dist/helm
+      - name: Push chart to OCI registry
+        run: helm push dist/helm/krishiv-*.tgz oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: dist/helm/*.tgz
+          retention-days: 7
+
+  # ── 3. Generate SBOM ────────────────────────────────────────────────────────
+  # Python-only — no Rust toolchain needed.
+  sbom:
+    name: SBOM
+    needs: validate
+    runs-on: self-hosted
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - name: Generate SBOM
+        run: |
+          python3 scripts/generate_sbom.py \
+            --output sbom-${{ needs.validate.outputs.version }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom-*.json
+          retention-days: 7
+
+  # ── 4. Upload artifacts to the GitHub Release ────────────────────────────────
+  upload-assets:
+    name: Upload Release Assets
+    needs: [validate, build-binary, build-wheels, docker, helm, sbom]
+    runs-on: self-hosted
+    permissions:
+      contents: write
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist/
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist/wheels/
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: helm-chart
+          path: dist/helm/
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/wheels/*.whl
+            dist/helm/*.tgz
+            dist/sbom-*.json
+
+  # ── 5a. Publish Python wheels to PyPI (stable only) ─────────────────────────
+  publish-pypi:
+    name: Publish PyPI
+    needs: [validate, upload-assets]
+    if: needs.validate.outputs.is_prerelease == 'false'
+    runs-on: self-hosted
+    environment:
+      name: pypi-publish
+      url: https://pypi.org/project/krishiv/
+    permissions:
+      id-token: write
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist/
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  # ── 5b. Publish crates to crates.io (stable only) ───────────────────────────
+  publish-crates:
+    name: Publish Crates.io
+    needs: [validate, upload-assets]
+    if: needs.validate.outputs.is_prerelease == 'false'
+    runs-on: self-hosted
+    environment: crates-publish
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - uses: ./.github/actions/rust-setup
+      - name: Publish crates in topological order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -e
+          CRATES=(
+            krishiv-common
+            krishiv-proto
+            krishiv-metrics
+            krishiv-plan
+            krishiv-dataflow
+            krishiv-state
+            krishiv-shuffle
+            krishiv-connectors
+            krishiv-sql
+            krishiv-scheduler
+            krishiv-executor
+            krishiv-runtime
+            krishiv-api
+            krishiv-flight-sql
+            krishiv-operator
+            krishiv-ui
+            krishiv
+          )
+          for crate in "${CRATES[@]}"; do
+            echo "==> Publishing ${crate}"
+            cargo publish -p "${crate}" --no-verify || echo "WARNING: ${crate} may already be published at this version"
+            sleep 30
+          done

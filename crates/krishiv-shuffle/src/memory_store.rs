@@ -1,0 +1,438 @@
+use crate::{
+    LocalDiskShuffleStore, PartitionId, ShuffleError, ShufflePartition, ShuffleResult,
+    ShuffleStore,
+    compression::partition_memory_bytes,
+    error::{shuffle_read_lock, shuffle_write_lock},
+    store::{LeaseMap, PartitionKey},
+};
+use ahash::{AHashMap, AHashSet};
+use indexmap::IndexSet;
+use std::sync::{Arc, RwLock};
+use tokio::sync::Mutex;
+
+/// An in-memory shuffle store backed by an `AHashMap` under an `RwLock`.
+///
+/// Used for testing and single-node deployments where shuffle data does
+/// not need to survive process restarts. When configured with
+/// [`Self::with_max_bytes`] and [`Self::with_spill_store`], partitions are
+/// spilled to a [`LocalDiskShuffleStore`] once the in-memory byte cap is exceeded.
+pub struct InMemoryShuffleStore {
+    // key: (job_id, stage_id, partition) → latest accepted partition
+    partitions: Arc<RwLock<AHashMap<PartitionKey, ShufflePartition>>>,
+    // key: (job_id, stage_id, partition) → current assignment lease token
+    lease_tokens: LeaseMap,
+    max_bytes: Option<usize>,
+    bytes_used: Arc<RwLock<usize>>,
+    spill_store: Option<Arc<LocalDiskShuffleStore>>,
+    spill_order: Arc<RwLock<IndexSet<PartitionKey>>>,
+    spilled: Arc<RwLock<AHashSet<PartitionKey>>>,
+    spill_lock: Arc<Mutex<()>>,
+    // Content hashes for partition determinism verification
+    content_hashes: Arc<RwLock<AHashMap<PartitionKey, [u8; 32]>>>,
+}
+
+/// Stable content hash for partition determinism verification.
+///
+/// Uses XxHash64 over the actual IPC bytes of every record batch so that a
+/// write that mutates batch data (not just the metadata) is detected. The
+/// hash covers batch count and row count as a fast header check, then mixes
+/// in the first 64 bytes of each batch's Arrow IPC buffer for content
+/// sampling. Full IPC serialisation would be more thorough but is too
+/// expensive to run on every write.
+fn compute_simple_partition_hash(partition: &ShufflePartition) -> [u8; 32] {
+    use std::hash::Hasher as _;
+    use twox_hash::XxHash64;
+
+    let mut h = XxHash64::with_seed(0xcafe_babe_dead_beef);
+    // Mix ID so two partitions with identical data but different IDs don't collide.
+    h.write(partition.id.job_id.as_bytes());
+    h.write(partition.id.stage_id.as_bytes());
+    h.write_u32(partition.id.partition);
+    // Cover batch count and total row count as a fast header.
+    h.write_usize(partition.batches.len());
+    let total_rows: usize = partition.batches.iter().map(|b| b.num_rows()).sum();
+    h.write_usize(total_rows);
+    // Sample actual column data from each batch's first few column buffers.
+    for batch in &partition.batches {
+        h.write_usize(batch.num_columns());
+        for col in batch.columns() {
+            // Hash the first 64 bytes of each array's data buffer.
+            let buf = col.to_data();
+            for raw_buf in buf.buffers() {
+                let sample = &raw_buf.as_slice()[..raw_buf.len().min(64)];
+                h.write(sample);
+            }
+        }
+    }
+    let digest = h.finish();
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&digest.to_be_bytes());
+    // Fill remaining bytes with XOR-rotated variants for better avalanche.
+    out[8..16].copy_from_slice(&digest.rotate_left(17).to_be_bytes());
+    out[16..24].copy_from_slice(&digest.rotate_left(37).to_be_bytes());
+    out[24..32].copy_from_slice(&(!digest).to_be_bytes());
+    out
+}
+
+impl Default for InMemoryShuffleStore {
+    fn default() -> Self {
+        Self {
+            partitions: Arc::new(RwLock::new(AHashMap::default())),
+            lease_tokens: Arc::new(RwLock::new(AHashMap::default())),
+            max_bytes: None,
+            bytes_used: Arc::new(RwLock::new(0)),
+            spill_store: None,
+            spill_order: Arc::new(RwLock::new(IndexSet::default())),
+            spilled: Arc::new(RwLock::new(AHashSet::default())),
+            spill_lock: Arc::new(Mutex::new(())),
+            content_hashes: Arc::new(RwLock::new(AHashMap::default())),
+        }
+    }
+}
+
+/// Default in-memory shuffle capacity (128 MiB).
+pub const DEFAULT_SHUFFLE_MEMORY_BYTES: usize = 128 * 1024 * 1024;
+
+impl InMemoryShuffleStore {
+    pub fn new() -> Self {
+        let max_bytes = std::env::var("KRISHIV_SHUFFLE_MEMORY_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SHUFFLE_MEMORY_BYTES);
+        Self {
+            partitions: Arc::new(RwLock::new(AHashMap::default())),
+            lease_tokens: Arc::new(RwLock::new(AHashMap::default())),
+            max_bytes: Some(max_bytes),
+            bytes_used: Arc::new(RwLock::new(0)),
+            spill_store: None,
+            spill_order: Arc::new(RwLock::new(IndexSet::default())),
+            spilled: Arc::new(RwLock::new(AHashSet::default())),
+            spill_lock: Arc::new(Mutex::new(())),
+            content_hashes: Arc::new(RwLock::new(AHashMap::default())),
+        }
+    }
+
+    pub fn new_unbounded() -> Self {
+        Self {
+            partitions: Arc::new(RwLock::new(AHashMap::default())),
+            lease_tokens: Arc::new(RwLock::new(AHashMap::default())),
+            max_bytes: None,
+            bytes_used: Arc::new(RwLock::new(0)),
+            spill_store: None,
+            spill_order: Arc::new(RwLock::new(IndexSet::default())),
+            spilled: Arc::new(RwLock::new(AHashSet::default())),
+            spill_lock: Arc::new(Mutex::new(())),
+            content_hashes: Arc::new(RwLock::new(AHashMap::default())),
+        }
+    }
+
+    /// Set the in-memory byte cap. When exceeded, oldest partitions spill to disk.
+    #[must_use]
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Attach a disk store used to spill partitions evicted from memory.
+    #[must_use]
+    pub fn with_spill_store(mut self, spill_store: Arc<LocalDiskShuffleStore>) -> Self {
+        self.spill_store = Some(spill_store);
+        self
+    }
+
+    /// Returns `true` if the partition is currently held in memory (not spilled).
+    ///
+    /// Used by budget-aware wrappers to decide whether to credit back budget
+    /// when a partition is consumed by a read.
+    pub async fn is_partition_in_memory(&self, id: &PartitionId) -> bool {
+        let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+        let Ok(spilled) = shuffle_read_lock(&self.spilled) else {
+            return false;
+        };
+        !spilled.contains(&key)
+    }
+
+    async fn ensure_memory_capacity_locked(
+        &self,
+        incoming_key: &PartitionKey,
+        incoming_size: usize,
+        old_size: usize,
+    ) -> ShuffleResult<()> {
+        let Some(max_bytes) = self.max_bytes else {
+            return Ok(());
+        };
+
+        loop {
+            let current_bytes = {
+                let used = shuffle_read_lock(&self.bytes_used)?;
+                used.saturating_sub(old_size)
+            };
+            let projected = current_bytes.saturating_add(incoming_size);
+            if projected <= max_bytes {
+                return Ok(());
+            }
+
+            let Some(spill) = self.spill_store.as_ref() else {
+                return Err(ShuffleError::MemoryLimitExceeded {
+                    max_bytes,
+                    current_bytes,
+                    incoming_bytes: incoming_size,
+                });
+            };
+
+            let key_to_spill = {
+                let order = shuffle_read_lock(&self.spill_order)?;
+                let parts = shuffle_read_lock(&self.partitions)?;
+                order
+                    .iter()
+                    .find(|k| **k != *incoming_key && parts.contains_key(*k))
+                    .cloned()
+            };
+            let Some(key_to_spill) = key_to_spill else {
+                return Err(ShuffleError::MemoryLimitExceeded {
+                    max_bytes,
+                    current_bytes,
+                    incoming_bytes: incoming_size,
+                });
+            };
+
+            // Read partition data under lock (clone is cheap — Arc bumps).
+            // Do NOT remove from partitions yet; only remove after the spill
+            // write succeeds, so a spill failure doesn't lose data.
+            let (spill_partition, spill_size, spill_token, spill_hash) = {
+                let parts = shuffle_read_lock(&self.partitions)?;
+                let Some(partition) = parts.get(&key_to_spill).cloned() else {
+                    continue;
+                };
+                let spill_size = partition_memory_bytes(&partition);
+                let spill_token = shuffle_read_lock(&self.lease_tokens)?
+                    .get(&key_to_spill)
+                    .copied()
+                    .unwrap_or(0);
+                let spill_hash = compute_simple_partition_hash(&partition);
+                (partition, spill_size, spill_token, spill_hash)
+            };
+
+            // Spill to disk. If this fails, the partition stays in memory
+            // and no data is lost — the caller can retry.
+            spill.write_partition(spill_partition, spill_token).await?;
+
+            // Spill succeeded — now safely remove from memory and account.
+            // Acquire all three locks in the same scope to prevent a window
+            // where the partition is absent from both partitions and spilled
+            // (which would cause read_partition to return None).
+            {
+                let mut parts = shuffle_write_lock(&self.partitions)?;
+                let mut spilled = shuffle_write_lock(&self.spilled)?;
+                let mut used = shuffle_write_lock(&self.bytes_used)?;
+                let mut hashes = shuffle_write_lock(&self.content_hashes)?;
+                let current_token = shuffle_read_lock(&self.lease_tokens)?
+                    .get(&key_to_spill)
+                    .copied()
+                    .unwrap_or(0);
+                if current_token == spill_token
+                    && let Some(current_part) = parts.get(&key_to_spill)
+                {
+                    let current_hash = compute_simple_partition_hash(current_part);
+                    if current_hash == spill_hash {
+                        parts.remove(&key_to_spill);
+                        hashes.remove(&key_to_spill);
+                        spilled.insert(key_to_spill);
+                        *used = used.saturating_sub(spill_size);
+                    } else {
+                        tracing::info!(
+                            "spill-to-disk cleanup skipped for {:?}: partition was modified during write",
+                            key_to_spill
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl ShuffleStore for InMemoryShuffleStore {
+    async fn register_partition_lease(
+        &self,
+        id: PartitionId,
+        lease_token: u64,
+    ) -> ShuffleResult<()> {
+        let key = (id.job_id, id.stage_id, id.partition);
+        let mut leases = shuffle_write_lock(&self.lease_tokens)?;
+        if let Some(&expected) = leases.get(&key)
+            && lease_token < expected
+        {
+            return Err(ShuffleError::StaleLeaseToken {
+                expected,
+                actual: lease_token,
+            });
+        }
+        leases.insert(key, lease_token);
+        Ok(())
+    }
+
+    async fn write_partition(
+        &self,
+        partition: ShufflePartition,
+        lease_token: u64,
+    ) -> ShuffleResult<()> {
+        let key = (
+            partition.id.job_id.clone(),
+            partition.id.stage_id.clone(),
+            partition.id.partition,
+        );
+
+        let computed_hash = compute_simple_partition_hash(&partition);
+        let new_size = partition_memory_bytes(&partition);
+
+        {
+            let leases = shuffle_read_lock(&self.lease_tokens)?;
+            if let Some(&expected) = leases.get(&key)
+                && lease_token < expected
+            {
+                return Err(ShuffleError::StaleLeaseToken {
+                    expected,
+                    actual: lease_token,
+                });
+            }
+        }
+
+        let _write_guard = self.spill_lock.lock().await;
+        let old_size = {
+            let parts = shuffle_read_lock(&self.partitions)?;
+            parts.get(&key).map(partition_memory_bytes).unwrap_or(0)
+        };
+
+        if let (Some(max_bytes), Some(spill)) = (self.max_bytes, self.spill_store.as_ref())
+            && new_size > max_bytes
+        {
+            spill.write_partition(partition, lease_token).await?;
+
+            {
+                let mut leases = shuffle_write_lock(&self.lease_tokens)?;
+                if let Some(&expected) = leases.get(&key)
+                    && lease_token < expected
+                {
+                    return Err(ShuffleError::StaleLeaseToken {
+                        expected,
+                        actual: lease_token,
+                    });
+                }
+                leases.insert(key.clone(), lease_token);
+            }
+
+            {
+                let mut parts = shuffle_write_lock(&self.partitions)?;
+                let removed_size = parts
+                    .remove(&key)
+                    .map(|p| partition_memory_bytes(&p))
+                    .unwrap_or(0);
+                let mut order = shuffle_write_lock(&self.spill_order)?;
+                order.swap_remove(&key); // O(1) removal; order is approximate LRU
+                let mut spilled = shuffle_write_lock(&self.spilled)?;
+                spilled.insert(key.clone());
+                let mut used = shuffle_write_lock(&self.bytes_used)?;
+                *used = used.saturating_sub(removed_size);
+                let mut hashes = shuffle_write_lock(&self.content_hashes)?;
+                hashes.remove(&key);
+            }
+            return Ok(());
+        }
+
+        // Ensure capacity BEFORE mutating accounting state. If the spill
+        // fails, no state has changed yet and we can safely retry.
+        self.ensure_memory_capacity_locked(&key, new_size, old_size)
+            .await?;
+
+        {
+            let mut leases = shuffle_write_lock(&self.lease_tokens)?;
+            if let Some(&expected) = leases.get(&key)
+                && lease_token < expected
+            {
+                return Err(ShuffleError::StaleLeaseToken {
+                    expected,
+                    actual: lease_token,
+                });
+            }
+            leases.insert(key.clone(), lease_token);
+        }
+
+        // Update partitions and bytes_used atomically in a single lock scope.
+        // This avoids the tear where bytes_used undercounts between the old-size
+        // subtraction and new-size addition, which would cause ensure_memory_capacity
+        // to incorrectly skip needed spills.
+        {
+            let committed_key = key.clone();
+            let mut parts = shuffle_write_lock(&self.partitions)?;
+            let old_size = parts.get(&key).map(partition_memory_bytes).unwrap_or(0);
+            parts.insert(key.clone(), partition);
+            let mut order = shuffle_write_lock(&self.spill_order)?;
+            // O(1) remove (swap_remove) + O(1) insert replaces O(n) retain.
+            // Order is approximate LRU; exact FIFO is not required for eviction.
+            order.swap_remove(&key);
+            order.insert(committed_key.clone());
+            let mut spilled = shuffle_write_lock(&self.spilled)?;
+            spilled.remove(&committed_key);
+            let mut used = shuffle_write_lock(&self.bytes_used)?;
+            *used = used.saturating_sub(old_size).saturating_add(new_size);
+            let mut hashes = shuffle_write_lock(&self.content_hashes)?;
+            hashes.insert(committed_key, computed_hash);
+        }
+        Ok(())
+    }
+
+    async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
+        let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+
+        let (from_spill, data) = {
+            let parts_guard = shuffle_read_lock(&self.partitions)?;
+            let spilled_guard = shuffle_read_lock(&self.spilled)?;
+            let hashes_guard = shuffle_read_lock(&self.content_hashes)?;
+
+            if spilled_guard.contains(&key) {
+                (true, None)
+            } else if let Some(partition) = parts_guard.get(&key) {
+                if let Some(&stored_hash) = hashes_guard.get(&key) {
+                    let computed = compute_simple_partition_hash(partition);
+                    if computed != stored_hash {
+                        return Err(ShuffleError::ContentHashMismatch {
+                            partition: format!("{:?}", key),
+                            expected: format!("{:02x?}", stored_hash),
+                            actual: format!("{:02x?}", computed),
+                        });
+                    }
+                }
+                (false, Some(partition.clone()))
+            } else {
+                (false, None)
+            }
+        };
+
+        if from_spill {
+            match &self.spill_store {
+                Some(spill) => spill.read_partition(id).await,
+                None => Ok(None),
+            }
+        } else {
+            Ok(data)
+        }
+    }
+
+    async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()> {
+        // Acquire locks in the same order as write_partition: lease_tokens → partitions → spilled → spill_order.
+        shuffle_write_lock(&self.content_hashes)?.retain(|(jid, _, _), _| jid != job_id);
+        shuffle_write_lock(&self.lease_tokens)?.retain(|(jid, _, _), _| jid != job_id);
+        shuffle_write_lock(&self.partitions)?.retain(|(jid, _, _), _| jid != job_id);
+        shuffle_write_lock(&self.spilled)?.retain(|(jid, _, _)| jid != job_id);
+        shuffle_write_lock(&self.spill_order)?.retain(|(jid, _, _)| jid != job_id);
+        if let Some(spill) = &self.spill_store {
+            spill.delete_job_partitions(job_id).await?;
+        }
+        let mut total = 0usize;
+        for partition in shuffle_read_lock(&self.partitions)?.values() {
+            total += partition_memory_bytes(partition);
+        }
+        *shuffle_write_lock(&self.bytes_used)? = total;
+        Ok(())
+    }
+}

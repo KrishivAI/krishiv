@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}SQL · Krishiv{% endblock %}
+{% block head_extra %}<script src="assets/krishiv-sql.js" defer></script>{% endblock %}
+{% block content %}
+<h1 class="page-heading">SQL Editor</h1>
+
+<form class="sql-form">
+  <textarea name="query" rows="8" placeholder="SELECT * FROM ...">SELECT 1 AS col</textarea>
+  <div class="toolbar">
+    <button type="submit" class="btn">Run Query</button>
+    <span id="spinner" class="htmx-indicator">Running&hellip;</span>
+  </div>
+</form>
+
+<div id="results">
+  <div class="empty">Submit a query to see results.</div>
+</div>
+
+<template id="result-template">
+  <div class="table-wrap">
+    <table>
+      <thead><tr></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <p class="meta"></p>
+</template>
+{% endblock %}

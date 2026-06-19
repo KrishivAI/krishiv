@@ -1,0 +1,441 @@
+# Krishiv single-node k3s / single-host Kubernetes deployment.
+#
+# Topology:
+#   coordinator (1 pod)   — gRPC :9090, HTTP :18080  NodePort :30080
+#   executor    (2 pods)  — task gRPC :50055, health HTTP :8080
+#   flight-server (1 pod) — Arrow Flight :50051       NodePort :30051
+#
+# Usage:
+#   kubectl apply -f k8s/direct/krishiv-distributed.yaml
+#
+# Prerequisites:
+#   - Namespace krishiv-system must exist
+#   - Container image localhost/krishiv:local must be imported into k3s containerd
+#   - Secret krishiv-system/krishiv-coordinator-auth with key `token` must exist
+#     (optional key `tokens` may hold comma/newline separated rotation tokens;
+#      coordinator pods reload the mounted Secret every 30 seconds)
+#   - Secret krishiv-system/krishiv-executor-task-auth with key `token` must exist
+#   - For multi-node: replace hostPath /tmp with a PVC or object-store data path
+
+---
+# ── Namespace ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: krishiv-system
+
+---
+# ── ServiceAccounts ───────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: krishiv-coordinator
+  namespace: krishiv-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: krishiv-executor
+  namespace: krishiv-system
+
+---
+# ── RBAC: coordinator needs read on pods for health checks ────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: krishiv-coordinator
+  namespace: krishiv-system
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: krishiv-coordinator
+  namespace: krishiv-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: krishiv-coordinator
+subjects:
+  - kind: ServiceAccount
+    name: krishiv-coordinator
+    namespace: krishiv-system
+
+---
+# ── NetworkPolicy: executor can only reach coordinator ────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: krishiv-executor-egress
+  namespace: krishiv-system
+spec:
+  podSelector:
+    matchLabels:
+      app: krishiv-executor
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: krishiv-coordinator
+      ports:
+        - port: 9090
+          protocol: TCP
+        - port: 18080
+          protocol: TCP
+    # Allow DNS resolution
+    - ports:
+        - port: 53
+          protocol: UDP
+
+---
+# ── Coordinator persistent storage (R1) ───────────────────────────────────────
+# emptyDir would lose all job state on pod restart. Use a PVC instead so that
+# the coordinator can recover in-flight jobs after a restart.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: krishiv-coordinator-data
+  namespace: krishiv-system
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+# ── Coordinator ────────────────────────────────────────────────────────────────
+# For HA: set replicas: 3, --metadata-backend etcd, and set env var
+# KRISHIV_ETCD_ENDPOINTS. The etcd leader election and metadata backends are
+# already implemented (feature = "etcd") — only config changes are needed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coordinator
+  namespace: krishiv-system
+spec:
+  replicas: 1  # Increase to 3+ for HA with etcd leader election
+  selector:
+    matchLabels:
+      app: krishiv-coordinator
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: krishiv-coordinator
+    spec:
+      serviceAccountName: krishiv-coordinator
+      containers:
+        - name: coordinator
+          image: localhost/krishiv:local
+          imagePullPolicy: Never
+          command:
+            - /usr/local/bin/krishiv
+            - coordinator
+            - --grpc-addr
+            - 0.0.0.0:9090
+            - --http-addr
+            - 0.0.0.0:18080
+            # dev-local: volatile in-memory metadata, safe for single-node dev/test.
+            # For production (single-node-durable) replace with:
+            #   --durability-profile single-node-durable
+            #   --metadata-backend redb  (requires --features redb build)
+            #   --metadata-path /data/coordinator-meta.redb
+            # For HA (distributed-durable) replace with:
+            #   --durability-profile distributed-durable
+            #   --metadata-backend etcd
+            #   --leader-backend etcd
+            #   --etcd-endpoints http://etcd:2379
+            - --durability-profile
+            - dev-local
+          ports:
+            - name: grpc
+              containerPort: 9090
+            - name: http
+              containerPort: 18080
+          env:
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-coordinator-auth
+                  key: token
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-coordinator-auth
+                  key: tokens
+                  optional: true
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN_FILE
+              value: /var/run/krishiv/coordinator-auth/token
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS_FILE
+              value: /var/run/krishiv/coordinator-auth/tokens
+            - name: KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS
+              value: "30"
+            - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-executor-task-auth
+                  key: token
+          volumeMounts:
+            - name: coordinator-auth
+              mountPath: /var/run/krishiv/coordinator-auth
+              readOnly: true
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 18080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 18080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+      volumes:
+        - name: coordinator-auth
+          secret:
+            secretName: krishiv-coordinator-auth
+        - name: data
+          persistentVolumeClaim:
+            claimName: krishiv-coordinator-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator
+  namespace: krishiv-system
+spec:
+  selector:
+    app: krishiv-coordinator
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: 9090
+    - name: http
+      port: 18080
+      targetPort: 18080
+
+---
+# NodePort for external access to coordinator HTTP (diagnostics / jobs API)
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator-ext
+  namespace: krishiv-system
+spec:
+  type: NodePort
+  selector:
+    app: krishiv-coordinator
+  ports:
+    - name: http
+      port: 18080
+      targetPort: 18080
+      nodePort: 30080
+
+---
+# ── Executor ──────────────────────────────────────────────────────────────────
+# Each pod advertises its real pod IP (via POD_IP downward API) so the
+# coordinator can call back on the task gRPC service.
+# Data is delivered via InlineIpc in the task assignment — no shared filesystem
+# or hostPath mount is required.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: executor
+  namespace: krishiv-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: krishiv-executor
+  template:
+    metadata:
+      labels:
+        app: krishiv-executor
+    spec:
+      serviceAccountName: krishiv-executor
+      # Spread executor replicas across nodes so a single node failure
+      # does not take down the entire compute layer (O5).
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: krishiv-executor
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: executor
+          image: localhost/krishiv:local
+          imagePullPolicy: Never
+          command:
+            - /usr/local/bin/krishiv
+            - executor
+            - --connect
+            - --coordinator
+            - http://coordinator.krishiv-system.svc:9090
+            - --heartbeat-interval-secs
+            - "10"
+            - --slots
+            - "2"
+            - --http-addr
+            - 0.0.0.0:8080
+            # dev-local profile: ephemeral window state + explicit shuffle dir.
+            # For single-node-durable (survives restart):
+            #   --durability-profile single-node-durable
+            #   (shuffle-dir and state-dir are auto-selected from /tmp defaults)
+            - --durability-profile
+            - dev-local
+            # S5: Explicit shuffle dir overrides the dev-local default (in-memory)
+            # so multi-stage queries don't exhaust executor pod memory.
+            - --shuffle-dir
+            - /tmp/krishiv-shuffle
+          ports:
+            - name: health
+              containerPort: 8080
+            - name: task-grpc
+              containerPort: 50055
+            - name: barrier-grpc
+              containerPort: 50056
+          env:
+            - name: KRISHIV_EXECUTOR_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH
+              value: "true"
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-coordinator-auth
+                  key: token
+            - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-executor-task-auth
+                  key: token
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+          # Graceful shutdown: ask the executor to stop accepting new tasks and
+          # drain in-flight work before SIGTERM is sent (C5).
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "curl -sf -X POST http://localhost:8080/internal/drain || sleep 5"
+      terminationGracePeriodSeconds: 60
+
+---
+# ── Flight Server ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flight-server
+  namespace: krishiv-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: krishiv-flight
+  template:
+    metadata:
+      labels:
+        app: krishiv-flight
+    spec:
+      containers:
+        - name: flight
+          image: localhost/krishiv:local
+          imagePullPolicy: Never
+          command:
+            - /usr/local/bin/krishiv
+            - flight-server
+          env:
+            - name: KRISHIV_FLIGHT_ADDR
+              value: "0.0.0.0:50051"
+            - name: KRISHIV_COORDINATOR_HTTP
+              value: "http://coordinator.krishiv-system.svc:18080"
+          ports:
+            - name: flight
+              containerPort: 50051
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+
+---
+# NodePort for external access to Flight SQL
+apiVersion: v1
+kind: Service
+metadata:
+  name: flight-server
+  namespace: krishiv-system
+spec:
+  type: NodePort
+  selector:
+    app: krishiv-flight
+  ports:
+    - name: flight
+      port: 50051
+      targetPort: 50051
+      nodePort: 30051

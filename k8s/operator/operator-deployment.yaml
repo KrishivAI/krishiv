@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: krishiv-operator
+  namespace: krishiv-system
+  labels:
+    app.kubernetes.io/name: krishiv
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/part-of: krishiv
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: krishiv
+      app.kubernetes.io/component: operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: krishiv
+        app.kubernetes.io/component: operator
+        app.kubernetes.io/part-of: krishiv
+    spec:
+      serviceAccountName: krishiv-controller
+      containers:
+        - name: operator
+          image: localhost/krishiv:local
+          imagePullPolicy: Never
+          command:
+            - krishiv-operator
+          args:
+            - --namespace
+            - $(KRISHIV_NAMESPACE)
+            - --coordinator-id
+            - $(KRISHIV_COORDINATOR_ID)
+            - --executor-grpc-addr
+            - 0.0.0.0:9090
+          ports:
+            - name: grpc
+              containerPort: 9090
+            - name: http
+              containerPort: 8080
+          env:
+            - name: KRISHIV_COORDINATOR_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: KRISHIV_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-coordinator-auth
+                  key: token
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-coordinator-auth
+                  key: tokens
+                  optional: true
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN_FILE
+              value: /var/run/krishiv/coordinator-auth/token
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS_FILE
+              value: /var/run/krishiv/coordinator-auth/tokens
+            - name: KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS
+              value: "30"
+            - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-executor-task-auth
+                  key: token
+          volumeMounts:
+            - name: coordinator-auth
+              mountPath: /var/run/krishiv/coordinator-auth
+              readOnly: true
+      volumes:
+        - name: coordinator-auth
+          secret:
+            secretName: krishiv-coordinator-auth

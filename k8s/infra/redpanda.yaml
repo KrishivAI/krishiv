@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda-service
+  labels:
+    app: redpanda
+spec:
+  ports:
+  - port: 9092
+    name: kafka
+  clusterIP: None
+  selector:
+    app: redpanda
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redpanda
+spec:
+  selector:
+    matchLabels:
+      app: redpanda
+  serviceName: redpanda-service
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: redpanda
+    spec:
+      containers:
+      - name: redpanda
+        image: docker.redpanda.com/redpandadata/redpanda:latest
+        imagePullPolicy: Never
+        args:
+        - redpanda
+        - start
+        - --smp
+        - "1"
+        - --reserve-memory
+        - 0M
+        - --overprovisioned
+        - --node-id
+        - "0"
+        - --kafka-addr
+        - "PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:9094"
+        - --advertise-kafka-addr
+        - "PLAINTEXT://redpanda-0.redpanda-service.default.svc.cluster.local:9092,OUTSIDE://localhost:9094"
+        ports:
+        - containerPort: 9092
+          name: kafka
+        - containerPort: 9094
+          name: kafka-outside

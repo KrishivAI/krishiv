@@ -1,0 +1,21 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: krishiv-kafka-streaming-sql
+spec:
+  template:
+    spec:
+      containers:
+      - name: kafka-streaming-sql
+        image: ubuntu:24.04
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          echo "=== Krishiv Native Kafka Streaming SQL (K8s Job) ==="
+          /krishiv/examples/rust/target/debug/kafka_streaming_sql
+        env:
+        - name: BOOTSTRAP
+          value: "redpanda-0.redpanda-service.default.svc.cluster.local:9092"
+      restartPolicy: Never
+  backoffLimit: 0

@@ -1,0 +1,25 @@
+[package]
+name = "krishiv-rust-examples"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+arrow = { version = "58.3.0", features = ["json"] }
+futures = "0.3"
+krishiv = { path = "../../crates/krishiv" }
+krishiv-api = { path = "../../crates/krishiv-api" }
+krishiv-sql = { path = "../../crates/krishiv-sql" }
+krishiv-common = { path = "../../crates/krishiv-common" }
+krishiv-dataflow = { path = "../../crates/krishiv-dataflow" }
+krishiv-connectors = { path = "../../crates/krishiv-connectors", features = ["lakehouse", "delta", "hudi"] }
+krishiv-runtime = { path = "../../crates/krishiv-runtime" }
+parquet = "58.3.0"
+rdkafka = { version = "0.39", optional = false, default-features = false, features = ["tokio"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Checkpoints · {{ job_id }} · Krishiv{% endblock %}
+{% block content %}
+<div class="breadcrumb">
+  <a href="/ui">Jobs</a><span class="sep">/</span><a href="/ui/jobs/{{ job_id }}">{{ job_id }}</a><span class="sep">/</span>Checkpoints
+</div>
+
+{% if epochs.len() == 0 %}
+<div class="empty">No checkpoint epochs exist for this job.</div>
+{% else %}
+
+<section class="section">
+  <h2>Epoch Timeline</h2>
+  <div class="ckpt-timeline">
+    {% for epoch in epochs %}
+    <div class="ckpt-node">
+      <div class="ckpt-dot{% if self.is_latest(epoch) %} latest{% endif %}"></div>
+      <span class="ckpt-label">Epoch {{ epoch }}</span>
+      {% if self.is_latest(epoch) %}
+      <span class="tag">latest</span>
+      {% endif %}
+    </div>
+    {% if !loop.last %}<div class="ckpt-line"></div>{% endif %}
+    {% endfor %}
+  </div>
+</section>
+
+<section class="section">
+  <h2>All Epochs</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Epoch</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for epoch in epochs %}
+        <tr>
+          <td>{{ epoch }}</td>
+          <td>{% if self.is_latest(epoch) %}<span class="state-dot committed">committed</span>{% else %}<span class="tag">historical</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,2825 @@
+{
+  "items": [
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_catalog_bridge.rs#L43",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_catalog_bridge.rs::fn::catalog_name::pub fn catalog_name(&self) -> &str",
+      "kind": "fn",
+      "name": "catalog_name",
+      "replacement": null,
+      "signature": "pub fn catalog_name(&self) -> &str",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_catalog_bridge.rs#L35",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_catalog_bridge.rs::fn::new::pub fn new(catalog: Arc<KrishivCatalog>, catalog_name: impl Into<String>) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(catalog: Arc<KrishivCatalog>, catalog_name: impl Into<String>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_catalog_bridge.rs#L27",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_catalog_bridge.rs::struct::IcebergCatalogBridge::#[derive(Clone)] pub struct IcebergCatalogBridge",
+      "kind": "struct",
+      "name": "IcebergCatalogBridge",
+      "replacement": null,
+      "signature": "#[derive(Clone)] pub struct IcebergCatalogBridge",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L130",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::base_url::pub fn base_url(&self) -> &Url",
+      "kind": "fn",
+      "name": "base_url",
+      "replacement": null,
+      "signature": "pub fn base_url(&self) -> &Url",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L138",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::catalog_prefix::pub fn catalog_prefix(&self) -> Option<&str>",
+      "kind": "fn",
+      "name": "catalog_prefix",
+      "replacement": null,
+      "signature": "pub fn catalog_prefix(&self) -> Option<&str>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L227",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::config::pub fn config(&self) -> &BTreeMap<String, String>",
+      "kind": "fn",
+      "name": "config",
+      "replacement": null,
+      "signature": "pub fn config(&self) -> &BTreeMap<String, String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L219",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::into_metadata::pub fn into_metadata(self) -> serde_json::Value",
+      "kind": "fn",
+      "name": "into_metadata",
+      "replacement": null,
+      "signature": "pub fn into_metadata(self) -> serde_json::Value",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L150",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::max_response_bytes::pub fn max_response_bytes(&self) -> usize",
+      "kind": "fn",
+      "name": "max_response_bytes",
+      "replacement": null,
+      "signature": "pub fn max_response_bytes(&self) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L215",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::metadata::pub fn metadata(&self) -> &serde_json::Value",
+      "kind": "fn",
+      "name": "metadata",
+      "replacement": null,
+      "signature": "pub fn metadata(&self) -> &serde_json::Value",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L212",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::metadata_location::pub fn metadata_location(&self) -> &str",
+      "kind": "fn",
+      "name": "metadata_location",
+      "replacement": null,
+      "signature": "pub fn metadata_location(&self) -> &str",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L193",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::name::pub fn name(&self) -> &str",
+      "kind": "fn",
+      "name": "name",
+      "replacement": null,
+      "signature": "pub fn name(&self) -> &str",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L189",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::namespace::pub fn namespace(&self) -> &str",
+      "kind": "fn",
+      "name": "namespace",
+      "replacement": null,
+      "signature": "pub fn namespace(&self) -> &str",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L49",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::new::pub fn new(base_url: impl AsRef<str>) -> CatalogResult<Self>",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(base_url: impl AsRef<str>) -> CatalogResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L287",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::new::pub fn new(config: RestCatalogConfig) -> CatalogResult<Self>",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(config: RestCatalogConfig) -> CatalogResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L179",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::new::pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> CatalogResult<Self>",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> CatalogResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L146",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::page_size::pub fn page_size(&self) -> u32",
+      "kind": "fn",
+      "name": "page_size",
+      "replacement": null,
+      "signature": "pub fn page_size(&self) -> u32",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L142",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::timeout::pub fn timeout(&self) -> Duration",
+      "kind": "fn",
+      "name": "timeout",
+      "replacement": null,
+      "signature": "pub fn timeout(&self) -> Duration",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L134",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::warehouse::pub fn warehouse(&self) -> Option<&str>",
+      "kind": "fn",
+      "name": "warehouse",
+      "replacement": null,
+      "signature": "pub fn warehouse(&self) -> Option<&str>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L87",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::with_bearer_token::pub fn with_bearer_token(mut self, token: impl Into<String>) -> CatalogResult<Self>",
+      "kind": "fn",
+      "name": "with_bearer_token",
+      "replacement": null,
+      "signature": "pub fn with_bearer_token(mut self, token: impl Into<String>) -> CatalogResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L79",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::with_catalog_prefix::pub fn with_catalog_prefix(mut self, prefix: impl Into<String>) -> CatalogResult<Self>",
+      "kind": "fn",
+      "name": "with_catalog_prefix",
+      "replacement": null,
+      "signature": "pub fn with_catalog_prefix(mut self, prefix: impl Into<String>) -> CatalogResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L304",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::with_http_client::pub fn with_http_client(config: RestCatalogConfig, client: Client) -> CatalogResult<Self>",
+      "kind": "fn",
+      "name": "with_http_client",
+      "replacement": null,
+      "signature": "pub fn with_http_client(config: RestCatalogConfig, client: Client) -> CatalogResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L121",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::with_max_response_bytes::pub fn with_max_response_bytes(mut self, limit: usize) -> CatalogResult<Self>",
+      "kind": "fn",
+      "name": "with_max_response_bytes",
+      "replacement": null,
+      "signature": "pub fn with_max_response_bytes(mut self, limit: usize) -> CatalogResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L108",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::with_page_size::pub fn with_page_size(mut self, page_size: u32) -> CatalogResult<Self>",
+      "kind": "fn",
+      "name": "with_page_size",
+      "replacement": null,
+      "signature": "pub fn with_page_size(mut self, page_size: u32) -> CatalogResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L97",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::with_timeout::pub fn with_timeout(mut self, timeout: Duration) -> CatalogResult<Self>",
+      "kind": "fn",
+      "name": "with_timeout",
+      "replacement": null,
+      "signature": "pub fn with_timeout(mut self, timeout: Duration) -> CatalogResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L68",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::fn::with_warehouse::pub fn with_warehouse(mut self, warehouse: impl Into<String>) -> CatalogResult<Self>",
+      "kind": "fn",
+      "name": "with_warehouse",
+      "replacement": null,
+      "signature": "pub fn with_warehouse(mut self, warehouse: impl Into<String>) -> CatalogResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L278",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::struct::GenericRestCatalog::#[derive(Clone)] pub struct GenericRestCatalog",
+      "kind": "struct",
+      "name": "GenericRestCatalog",
+      "replacement": null,
+      "signature": "#[derive(Clone)] pub struct GenericRestCatalog",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L172",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::struct::IcebergTableId::#[derive(Debug, Clone, PartialEq, Eq, Hash)] pub struct IcebergTableId",
+      "kind": "struct",
+      "name": "IcebergTableId",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq, Hash)] pub struct IcebergTableId",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L204",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::struct::LoadedIcebergTable::#[derive(Clone, PartialEq)] pub struct LoadedIcebergTable",
+      "kind": "struct",
+      "name": "LoadedIcebergTable",
+      "replacement": null,
+      "signature": "#[derive(Clone, PartialEq)] pub struct LoadedIcebergTable",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L36",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::struct::RestCatalogConfig::#[derive(Clone)] pub struct RestCatalogConfig",
+      "kind": "struct",
+      "name": "RestCatalogConfig",
+      "replacement": null,
+      "signature": "#[derive(Clone)] pub struct RestCatalogConfig",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_rest.rs#L256",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_rest.rs::trait::IcebergCatalogClient::#[async_trait] pub trait IcebergCatalogClient: Send + Sync",
+      "kind": "trait",
+      "name": "IcebergCatalogClient",
+      "replacement": null,
+      "signature": "#[async_trait] pub trait IcebergCatalogClient: Send + Sync",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_table_provider.rs#L31",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_table_provider.rs::fn::iceberg_table_provider::pub async fn iceberg_table_provider(table: Table) -> DfResult<Arc<dyn TableProvider>>",
+      "kind": "fn",
+      "name": "iceberg_table_provider",
+      "replacement": null,
+      "signature": "pub async fn iceberg_table_provider(table: Table) -> DfResult<Arc<dyn TableProvider>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/iceberg_table_provider.rs#L37",
+      "id": "crates/krishiv-sql/src/catalog/iceberg_table_provider.rs::fn::iceberg_table_provider_at_snapshot::pub async fn iceberg_table_provider_at_snapshot(",
+      "kind": "fn",
+      "name": "iceberg_table_provider_at_snapshot",
+      "replacement": null,
+      "signature": "pub async fn iceberg_table_provider_at_snapshot(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/local_catalog.rs#L68",
+      "id": "crates/krishiv-sql/src/catalog/local_catalog.rs::fn::new::pub async fn new(warehouse: &Path) -> Result<Self, LakehouseError>",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub async fn new(warehouse: &Path) -> Result<Self, LakehouseError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/local_catalog.rs#L95",
+      "id": "crates/krishiv-sql/src/catalog/local_catalog.rs::fn::warehouse::pub fn warehouse(&self) -> &Path",
+      "kind": "fn",
+      "name": "warehouse",
+      "replacement": null,
+      "signature": "pub fn warehouse(&self) -> &Path",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/local_catalog.rs#L55",
+      "id": "crates/krishiv-sql/src/catalog/local_catalog.rs::struct::LocalCatalog::#[derive(Debug)] pub struct LocalCatalog",
+      "kind": "struct",
+      "name": "LocalCatalog",
+      "replacement": null,
+      "signature": "#[derive(Debug)] pub struct LocalCatalog",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L46",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::enum::CatalogError::#[derive(Debug, thiserror::Error)] pub enum CatalogError",
+      "kind": "enum",
+      "name": "CatalogError",
+      "replacement": null,
+      "signature": "#[derive(Debug, thiserror::Error)] pub enum CatalogError",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L111",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::enum::FieldType::#[derive(Debug, Clone, PartialEq, Eq)] pub enum FieldType",
+      "kind": "enum",
+      "name": "FieldType",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub enum FieldType",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L270",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::empty::pub fn empty() -> Self",
+      "kind": "fn",
+      "name": "empty",
+      "replacement": null,
+      "signature": "pub fn empty() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L287",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::field_count::pub fn field_count(&self) -> usize",
+      "kind": "fn",
+      "name": "field_count",
+      "replacement": null,
+      "signature": "pub fn field_count(&self) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L232",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::field_type::pub fn field_type(&self) -> &FieldType",
+      "kind": "fn",
+      "name": "field_type",
+      "replacement": null,
+      "signature": "pub fn field_type(&self) -> &FieldType",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L292",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::get_field::pub fn get_field(&self, name: &str) -> Option<&CatalogField>",
+      "kind": "fn",
+      "name": "get_field",
+      "replacement": null,
+      "signature": "pub fn get_field(&self, name: &str) -> Option<&CatalogField>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L627",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::invalidate::pub fn invalidate(&self, name: &str)",
+      "kind": "fn",
+      "name": "invalidate",
+      "replacement": null,
+      "signature": "pub fn invalidate(&self, name: &str)",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L227",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::name::pub fn name(&self) -> &str",
+      "kind": "fn",
+      "name": "name",
+      "replacement": null,
+      "signature": "pub fn name(&self) -> &str",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L379",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::name::pub fn name(&self) -> &str#2",
+      "kind": "fn",
+      "name": "name",
+      "replacement": null,
+      "signature": "pub fn name(&self) -> &str",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L316",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new() -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L461",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new() -> Self#2",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L545",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new() -> Self#3",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L609",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new(catalog: Arc<RwLock<super::InMemoryCatalog>>) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(catalog: Arc<RwLock<super::InMemoryCatalog>>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L265",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new(fields: Vec<CatalogField>) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(fields: Vec<CatalogField>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L218",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new(name: impl Into<String>, field_type: FieldType, nullable: bool) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(name: impl Into<String>, field_type: FieldType, nullable: bool) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L363",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new(name: impl Into<String>, schema: TableSchema) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(name: impl Into<String>, schema: TableSchema) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L237",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::nullable::pub fn nullable(&self) -> bool",
+      "kind": "fn",
+      "name": "nullable",
+      "replacement": null,
+      "signature": "pub fn nullable(&self) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L469",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::register_table_with_batches::pub fn register_table_with_batches(",
+      "kind": "fn",
+      "name": "register_table_with_batches",
+      "replacement": null,
+      "signature": "pub fn register_table_with_batches(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L384",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::schema::pub fn schema(&self) -> &TableSchema",
+      "kind": "fn",
+      "name": "schema",
+      "replacement": null,
+      "signature": "pub fn schema(&self) -> &TableSchema",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L389",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::statistics::pub fn statistics(&self) -> Option<&ColumnStatistics>",
+      "kind": "fn",
+      "name": "statistics",
+      "replacement": null,
+      "signature": "pub fn statistics(&self) -> Option<&ColumnStatistics>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L483",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::table_batches::pub fn table_batches(",
+      "kind": "fn",
+      "name": "table_batches",
+      "replacement": null,
+      "signature": "pub fn table_batches(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L165",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::to_arrow::pub fn to_arrow(&self) -> arrow::datatypes::DataType",
+      "kind": "fn",
+      "name": "to_arrow",
+      "replacement": null,
+      "signature": "pub fn to_arrow(&self) -> arrow::datatypes::DataType",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L244",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::to_arrow_field::pub fn to_arrow_field(&self) -> arrow::datatypes::Field",
+      "kind": "fn",
+      "name": "to_arrow_field",
+      "replacement": null,
+      "signature": "pub fn to_arrow_field(&self) -> arrow::datatypes::Field",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L277",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::to_arrow_schema::pub fn to_arrow_schema(&self) -> arrow::datatypes::Schema",
+      "kind": "fn",
+      "name": "to_arrow_schema",
+      "replacement": null,
+      "signature": "pub fn to_arrow_schema(&self) -> arrow::datatypes::Schema",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L343",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::with_max::pub fn with_max(mut self, max: impl Into<String>) -> Self",
+      "kind": "fn",
+      "name": "with_max",
+      "replacement": null,
+      "signature": "pub fn with_max(mut self, max: impl Into<String>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L336",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::with_min::pub fn with_min(mut self, min: impl Into<String>) -> Self",
+      "kind": "fn",
+      "name": "with_min",
+      "replacement": null,
+      "signature": "pub fn with_min(mut self, min: impl Into<String>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L329",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::with_null_count::pub fn with_null_count(mut self, count: u64) -> Self",
+      "kind": "fn",
+      "name": "with_null_count",
+      "replacement": null,
+      "signature": "pub fn with_null_count(mut self, count: u64) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L322",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::with_row_count::pub fn with_row_count(mut self, count: u64) -> Self",
+      "kind": "fn",
+      "name": "with_row_count",
+      "replacement": null,
+      "signature": "pub fn with_row_count(mut self, count: u64) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L373",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::with_stats::pub fn with_stats(mut self, stats: ColumnStatistics) -> Self",
+      "kind": "fn",
+      "name": "with_stats",
+      "replacement": null,
+      "signature": "pub fn with_stats(mut self, stats: ColumnStatistics) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L209",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::CatalogField::#[derive(Debug, Clone, PartialEq, Eq)] pub struct CatalogField",
+      "kind": "struct",
+      "name": "CatalogField",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub struct CatalogField",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L302",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::ColumnStatistics::#[derive(Debug, Clone, PartialEq, Eq, Default)] pub struct ColumnStatistics",
+      "kind": "struct",
+      "name": "ColumnStatistics",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq, Default)] pub struct ColumnStatistics",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L594",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::DataFusionCatalogBridge::pub struct DataFusionCatalogBridge",
+      "kind": "struct",
+      "name": "DataFusionCatalogBridge",
+      "replacement": null,
+      "signature": "pub struct DataFusionCatalogBridge",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L453",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::InMemoryCatalog::pub struct InMemoryCatalog",
+      "kind": "struct",
+      "name": "InMemoryCatalog",
+      "replacement": null,
+      "signature": "pub struct InMemoryCatalog",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L539",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::InMemorySchemaRegistry::#[derive(Debug, Default)] pub struct InMemorySchemaRegistry",
+      "kind": "struct",
+      "name": "InMemorySchemaRegistry",
+      "replacement": null,
+      "signature": "#[derive(Debug, Default)] pub struct InMemorySchemaRegistry",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L354",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::TableMetadata::#[derive(Debug, Clone)] pub struct TableMetadata",
+      "kind": "struct",
+      "name": "TableMetadata",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct TableMetadata",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L258",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::TableSchema::#[derive(Debug, Clone, PartialEq, Eq)] pub struct TableSchema",
+      "kind": "struct",
+      "name": "TableSchema",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub struct TableSchema",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L415",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::trait::CatalogProvider::pub trait CatalogProvider",
+      "kind": "trait",
+      "name": "CatalogProvider",
+      "replacement": null,
+      "signature": "pub trait CatalogProvider",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L529",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::trait::SchemaRegistry::pub trait SchemaRegistry: Send + Sync",
+      "kind": "trait",
+      "name": "SchemaRegistry",
+      "replacement": null,
+      "signature": "pub trait SchemaRegistry: Send + Sync",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L399",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::trait::TableProvider::pub trait TableProvider",
+      "kind": "trait",
+      "name": "TableProvider",
+      "replacement": null,
+      "signature": "pub trait TableProvider",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L96",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::type::CatalogResult::pub type CatalogResult<T> = Result<T, CatalogError>",
+      "kind": "type",
+      "name": "CatalogResult",
+      "replacement": null,
+      "signature": "pub type CatalogResult<T> = Result<T, CatalogError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L104",
+      "id": "crates/krishiv-sql/src/catalog/mod.rs::type::LakehouseError::pub type LakehouseError = CatalogError",
+      "kind": "type",
+      "name": "LakehouseError",
+      "replacement": null,
+      "signature": "pub type LakehouseError = CatalogError",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/postgres_catalog.rs#L78",
+      "id": "crates/krishiv-sql/src/catalog/postgres_catalog.rs::fn::migrate::pub async fn migrate(&self) -> Result<(), CatalogError>",
+      "kind": "fn",
+      "name": "migrate",
+      "replacement": null,
+      "signature": "pub async fn migrate(&self) -> Result<(), CatalogError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/postgres_catalog.rs#L60",
+      "id": "crates/krishiv-sql/src/catalog/postgres_catalog.rs::fn::new::pub async fn new(database_url: &str, warehouse: &str) -> Result<Self, CatalogError>",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub async fn new(database_url: &str, warehouse: &str) -> Result<Self, CatalogError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/postgres_catalog.rs#L50",
+      "id": "crates/krishiv-sql/src/catalog/postgres_catalog.rs::struct::PostgresCatalog::#[derive(Debug)] pub struct PostgresCatalog",
+      "kind": "struct",
+      "name": "PostgresCatalog",
+      "replacement": null,
+      "signature": "#[derive(Debug)] pub struct PostgresCatalog",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/rest_catalog_wrapper.rs#L55",
+      "id": "crates/krishiv-sql/src/catalog/rest_catalog_wrapper.rs::fn::inner::pub fn inner(&self) -> &RestCatalog",
+      "kind": "fn",
+      "name": "inner",
+      "replacement": null,
+      "signature": "pub fn inner(&self) -> &RestCatalog",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/rest_catalog_wrapper.rs#L34",
+      "id": "crates/krishiv-sql/src/catalog/rest_catalog_wrapper.rs::fn::new::pub async fn new(",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub async fn new(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/rest_catalog_wrapper.rs#L24",
+      "id": "crates/krishiv-sql/src/catalog/rest_catalog_wrapper.rs::struct::KrishivRestCatalog::#[derive(Debug, Clone)] pub struct KrishivRestCatalog",
+      "kind": "struct",
+      "name": "KrishivRestCatalog",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct KrishivRestCatalog",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L38",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::enum::KrishivCatalog::#[derive(Clone)] pub enum KrishivCatalog",
+      "kind": "enum",
+      "name": "KrishivCatalog",
+      "replacement": null,
+      "signature": "#[derive(Clone)] pub enum KrishivCatalog",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L109",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::as_iceberg::pub fn as_iceberg(&self) -> Arc<dyn Catalog + Send + Sync>",
+      "kind": "fn",
+      "name": "as_iceberg",
+      "replacement": null,
+      "signature": "pub fn as_iceberg(&self) -> Arc<dyn Catalog + Send + Sync>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L155",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::create_table::pub async fn create_table(",
+      "kind": "fn",
+      "name": "create_table",
+      "replacement": null,
+      "signature": "pub async fn create_table(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L194",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::drop_table::pub async fn drop_table(&self, namespace: &str, table: &str) -> Result<(), CatalogError>",
+      "kind": "fn",
+      "name": "drop_table",
+      "replacement": null,
+      "signature": "pub async fn drop_table(&self, namespace: &str, table: &str) -> Result<(), CatalogError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L121",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::list_namespaces::pub async fn list_namespaces(&self) -> Result<Vec<String>, CatalogError>",
+      "kind": "fn",
+      "name": "list_namespaces",
+      "replacement": null,
+      "signature": "pub async fn list_namespaces(&self) -> Result<Vec<String>, CatalogError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L134",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::list_tables::pub async fn list_tables(&self, namespace: &str) -> Result<Vec<String>, CatalogError>",
+      "kind": "fn",
+      "name": "list_tables",
+      "replacement": null,
+      "signature": "pub async fn list_tables(&self, namespace: &str) -> Result<Vec<String>, CatalogError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L145",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::load_table::pub async fn load_table(&self, namespace: &str, table: &str) -> Result<Table, CatalogError>",
+      "kind": "fn",
+      "name": "load_table",
+      "replacement": null,
+      "signature": "pub async fn load_table(&self, namespace: &str, table: &str) -> Result<Table, CatalogError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L84",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::local::pub async fn local(warehouse: &Path) -> Result<Self, CatalogError>",
+      "kind": "fn",
+      "name": "local",
+      "replacement": null,
+      "signature": "pub async fn local(warehouse: &Path) -> Result<Self, CatalogError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L71",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::memory::pub async fn memory(warehouse: &str) -> Result<Self, CatalogError>",
+      "kind": "fn",
+      "name": "memory",
+      "replacement": null,
+      "signature": "pub async fn memory(warehouse: &str) -> Result<Self, CatalogError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L91",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::postgres::pub async fn postgres(database_url: &str, warehouse: &str) -> Result<Self, CatalogError>",
+      "kind": "fn",
+      "name": "postgres",
+      "replacement": null,
+      "signature": "pub async fn postgres(database_url: &str, warehouse: &str) -> Result<Self, CatalogError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L98",
+      "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::rest::pub async fn rest(",
+      "kind": "fn",
+      "name": "rest",
+      "replacement": null,
+      "signature": "pub async fn rest(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L133",
+      "id": "crates/krishiv-sql/src/cep_sql.rs::fn::execute_match_recognize::pub fn execute_match_recognize(",
+      "kind": "fn",
+      "name": "execute_match_recognize",
+      "replacement": null,
+      "signature": "pub fn execute_match_recognize(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L272",
+      "id": "crates/krishiv-sql/src/cep_sql.rs::fn::execute_streaming_match_recognize::pub fn execute_streaming_match_recognize(",
+      "kind": "fn",
+      "name": "execute_streaming_match_recognize",
+      "replacement": null,
+      "signature": "pub fn execute_streaming_match_recognize(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L38",
+      "id": "crates/krishiv-sql/src/cep_sql.rs::fn::parse_match_recognize::pub fn parse_match_recognize(sql: &str) -> SqlResult<Option<MatchRecognizeStatement>>",
+      "kind": "fn",
+      "name": "parse_match_recognize",
+      "replacement": null,
+      "signature": "pub fn parse_match_recognize(sql: &str) -> SqlResult<Option<MatchRecognizeStatement>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L97",
+      "id": "crates/krishiv-sql/src/cep_sql.rs::fn::plan_match_recognize::pub fn plan_match_recognize(stmt: MatchRecognizeStatement, query: &str) -> LogicalPlan",
+      "kind": "fn",
+      "name": "plan_match_recognize",
+      "replacement": null,
+      "signature": "pub fn plan_match_recognize(stmt: MatchRecognizeStatement, query: &str) -> LogicalPlan",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L27",
+      "id": "crates/krishiv-sql/src/cep_sql.rs::struct::MatchRecognizeStatement::#[derive(Debug, Clone)] pub struct MatchRecognizeStatement",
+      "kind": "struct",
+      "name": "MatchRecognizeStatement",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct MatchRecognizeStatement",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L111",
+      "id": "crates/krishiv-sql/src/connector_table.rs::fn::bounded::pub fn bounded(connector_kind: &'static str, registry: Arc<ConnectorRegistry>) -> Self",
+      "kind": "fn",
+      "name": "bounded",
+      "replacement": null,
+      "signature": "pub fn bounded(connector_kind: &'static str, registry: Arc<ConnectorRegistry>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L50",
+      "id": "crates/krishiv-sql/src/connector_table.rs::fn::connector_config_from_ddl::pub fn connector_config_from_ddl(kind: &str, cmd: &CreateExternalTable) -> ConnectorConfig",
+      "kind": "fn",
+      "name": "connector_config_from_ddl",
+      "replacement": null,
+      "signature": "pub fn connector_config_from_ddl(kind: &str, cmd: &CreateExternalTable) -> ConnectorConfig",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L27",
+      "id": "crates/krishiv-sql/src/connector_table.rs::fn::register_connector_table_factories::pub fn register_connector_table_factories(",
+      "kind": "fn",
+      "name": "register_connector_table_factories",
+      "replacement": null,
+      "signature": "pub fn register_connector_table_factories(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L22",
+      "id": "crates/krishiv-sql/src/connector_table.rs::fn::shared_connector_registry::pub fn shared_connector_registry() -> Arc<ConnectorRegistry>",
+      "kind": "fn",
+      "name": "shared_connector_registry",
+      "replacement": null,
+      "signature": "pub fn shared_connector_registry() -> Arc<ConnectorRegistry>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L118",
+      "id": "crates/krishiv-sql/src/connector_table.rs::fn::streaming::pub fn streaming(streaming_sources: Arc<RwLock<HashSet<String>>>) -> Self",
+      "kind": "fn",
+      "name": "streaming",
+      "replacement": null,
+      "signature": "pub fn streaming(streaming_sources: Arc<RwLock<HashSet<String>>>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L96",
+      "id": "crates/krishiv-sql/src/connector_table.rs::struct::ConnectorTableFactory::pub struct ConnectorTableFactory",
+      "kind": "struct",
+      "name": "ConnectorTableFactory",
+      "replacement": null,
+      "signature": "pub struct ConnectorTableFactory",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L71",
+      "id": "crates/krishiv-sql/src/create_function_ddl.rs::fn::is_create_function_returns_table::pub fn is_create_function_returns_table(sql: &str) -> bool",
+      "kind": "fn",
+      "name": "is_create_function_returns_table",
+      "replacement": null,
+      "signature": "pub fn is_create_function_returns_table(sql: &str) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L81",
+      "id": "crates/krishiv-sql/src/create_function_ddl.rs::fn::parse_create_function::pub fn parse_create_function(sql: &str) -> Result<CreateFunctionDdl, String>",
+      "kind": "fn",
+      "name": "parse_create_function",
+      "replacement": null,
+      "signature": "pub fn parse_create_function(sql: &str) -> Result<CreateFunctionDdl, String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L208",
+      "id": "crates/krishiv-sql/src/create_function_ddl.rs::fn::try_new::pub fn try_new(",
+      "kind": "fn",
+      "name": "try_new",
+      "replacement": null,
+      "signature": "pub fn try_new(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L321",
+      "id": "crates/krishiv-sql/src/create_function_ddl.rs::fn::try_new::pub fn try_new(#2",
+      "kind": "fn",
+      "name": "try_new",
+      "replacement": null,
+      "signature": "pub fn try_new(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L190",
+      "id": "crates/krishiv-sql/src/create_function_ddl.rs::struct::ClosureTableUdf::#[derive(Clone)] pub struct ClosureTableUdf",
+      "kind": "struct",
+      "name": "ClosureTableUdf",
+      "replacement": null,
+      "signature": "#[derive(Clone)] pub struct ClosureTableUdf",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L35",
+      "id": "crates/krishiv-sql/src/create_function_ddl.rs::struct::ColumnDef::#[derive(Debug, Clone, PartialEq, Eq)] pub struct ColumnDef",
+      "kind": "struct",
+      "name": "ColumnDef",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub struct ColumnDef",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L49",
+      "id": "crates/krishiv-sql/src/create_function_ddl.rs::struct::CreateFunctionDdl::#[derive(Debug, Clone)] pub struct CreateFunctionDdl",
+      "kind": "struct",
+      "name": "CreateFunctionDdl",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct CreateFunctionDdl",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L42",
+      "id": "crates/krishiv-sql/src/create_function_ddl.rs::struct::FunctionArgDef::#[derive(Debug, Clone, PartialEq, Eq)] pub struct FunctionArgDef",
+      "kind": "struct",
+      "name": "FunctionArgDef",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub struct FunctionArgDef",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L302",
+      "id": "crates/krishiv-sql/src/create_function_ddl.rs::struct::SqlBodyTableUdf::#[derive(Clone)] pub struct SqlBodyTableUdf",
+      "kind": "struct",
+      "name": "SqlBodyTableUdf",
+      "replacement": null,
+      "signature": "#[derive(Clone)] pub struct SqlBodyTableUdf",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L187",
+      "id": "crates/krishiv-sql/src/create_function_ddl.rs::type::UdtfBodyFn::pub type UdtfBodyFn = Arc<dyn Fn(&[ScalarValue]) -> Result<RecordBatch, UdfError> + Send + Sync>",
+      "kind": "type",
+      "name": "UdtfBodyFn",
+      "replacement": null,
+      "signature": "pub type UdtfBodyFn = Arc<dyn Fn(&[ScalarValue]) -> Result<RecordBatch, UdfError> + Send + Sync>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grammar.rs#L10",
+      "id": "crates/krishiv-sql/src/grammar.rs::enum::FeatureStatus::#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum FeatureStatus",
+      "kind": "enum",
+      "name": "FeatureStatus",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum FeatureStatus",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grammar.rs#L23",
+      "id": "crates/krishiv-sql/src/grammar.rs::fn::as_str::pub fn as_str(self) -> &'static str",
+      "kind": "fn",
+      "name": "as_str",
+      "replacement": null,
+      "signature": "pub fn as_str(self) -> &'static str",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grammar.rs#L89",
+      "id": "crates/krishiv-sql/src/grammar.rs::fn::feature_matrix::pub fn feature_matrix() -> &'static [FeatureEntry]",
+      "kind": "fn",
+      "name": "feature_matrix",
+      "replacement": null,
+      "signature": "pub fn feature_matrix() -> &'static [FeatureEntry]",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grammar.rs#L103",
+      "id": "crates/krishiv-sql/src/grammar.rs::fn::features_by_status::pub fn features_by_status(status: FeatureStatus) -> Vec<&'static FeatureEntry>",
+      "kind": "fn",
+      "name": "features_by_status",
+      "replacement": null,
+      "signature": "pub fn features_by_status(status: FeatureStatus) -> Vec<&'static FeatureEntry>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grammar.rs#L94",
+      "id": "crates/krishiv-sql/src/grammar.rs::fn::features_for_category::pub fn features_for_category(category: &str) -> Vec<&'static FeatureEntry>",
+      "kind": "fn",
+      "name": "features_for_category",
+      "replacement": null,
+      "signature": "pub fn features_for_category(category: &str) -> Vec<&'static FeatureEntry>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grammar.rs#L40",
+      "id": "crates/krishiv-sql/src/grammar.rs::struct::FeatureEntry::#[derive(Debug, Clone)] pub struct FeatureEntry",
+      "kind": "struct",
+      "name": "FeatureEntry",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct FeatureEntry",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L20",
+      "id": "crates/krishiv-sql/src/introspection_sql.rs::enum::ExplainSqlMode::#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum ExplainSqlMode",
+      "kind": "enum",
+      "name": "ExplainSqlMode",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum ExplainSqlMode",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L13",
+      "id": "crates/krishiv-sql/src/introspection_sql.rs::enum::IntrospectionStatement::#[derive(Debug, Clone, PartialEq, Eq)] pub enum IntrospectionStatement",
+      "kind": "enum",
+      "name": "IntrospectionStatement",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub enum IntrospectionStatement",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L116",
+      "id": "crates/krishiv-sql/src/introspection_sql.rs::fn::describe_table::pub async fn describe_table(context: &SessionContext, table: &str) -> SqlResult<RecordBatch>",
+      "kind": "fn",
+      "name": "describe_table",
+      "replacement": null,
+      "signature": "pub async fn describe_table(context: &SessionContext, table: &str) -> SqlResult<RecordBatch>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L158",
+      "id": "crates/krishiv-sql/src/introspection_sql.rs::fn::explain_query::pub fn explain_query(query: &str, mode: ExplainSqlMode) -> SqlResult<String>",
+      "kind": "fn",
+      "name": "explain_query",
+      "replacement": null,
+      "signature": "pub fn explain_query(query: &str, mode: ExplainSqlMode) -> SqlResult<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L176",
+      "id": "crates/krishiv-sql/src/introspection_sql.rs::fn::explain_result_batch::pub fn explain_result_batch(text: &str) -> SqlResult<RecordBatch>",
+      "kind": "fn",
+      "name": "explain_result_batch",
+      "replacement": null,
+      "signature": "pub fn explain_result_batch(text: &str) -> SqlResult<RecordBatch>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L28",
+      "id": "crates/krishiv-sql/src/introspection_sql.rs::fn::parse_introspection_statement::pub fn parse_introspection_statement(sql: &str) -> SqlResult<Option<IntrospectionStatement>>",
+      "kind": "fn",
+      "name": "parse_introspection_statement",
+      "replacement": null,
+      "signature": "pub fn parse_introspection_statement(sql: &str) -> SqlResult<Option<IntrospectionStatement>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/kafka_table.rs#L149",
+      "id": "crates/krishiv-sql/src/kafka_table.rs::fn::create_kafka_streaming_table::pub fn create_kafka_streaming_table(",
+      "kind": "fn",
+      "name": "create_kafka_streaming_table",
+      "replacement": null,
+      "signature": "pub fn create_kafka_streaming_table(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/kafka_table.rs#L36",
+      "id": "crates/krishiv-sql/src/kafka_table.rs::fn::new::pub fn new(schema: SchemaRef, source: KafkaSource) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(schema: SchemaRef, source: KafkaSource) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lakehouse/as_of.rs#L18",
+      "id": "crates/krishiv-sql/src/lakehouse/as_of.rs::fn::preprocess_as_of_sql::pub fn preprocess_as_of_sql(sql: &str) -> Result<(String, Vec<AsOfTableRef>), String>",
+      "kind": "fn",
+      "name": "preprocess_as_of_sql",
+      "replacement": null,
+      "signature": "pub fn preprocess_as_of_sql(sql: &str) -> Result<(String, Vec<AsOfTableRef>), String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lakehouse/as_of.rs#L11",
+      "id": "crates/krishiv-sql/src/lakehouse/as_of.rs::struct::AsOfTableRef::#[derive(Debug, Clone, PartialEq, Eq)] pub struct AsOfTableRef",
+      "kind": "struct",
+      "name": "AsOfTableRef",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub struct AsOfTableRef",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lakehouse/merge.rs#L47",
+      "id": "crates/krishiv-sql/src/lakehouse/merge.rs::fn::execute_merge_sql::pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec<RecordBatch>>",
+      "kind": "fn",
+      "name": "execute_merge_sql",
+      "replacement": null,
+      "signature": "pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec<RecordBatch>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lakehouse/merge.rs#L32",
+      "id": "crates/krishiv-sql/src/lakehouse/merge.rs::struct::MergeResult::#[derive(Debug, Clone, Default, PartialEq, Eq)] pub struct MergeResult",
+      "kind": "struct",
+      "name": "MergeResult",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, Default, PartialEq, Eq)] pub struct MergeResult",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lakehouse/merge.rs#L40",
+      "id": "crates/krishiv-sql/src/lakehouse/merge.rs::struct::MergeTargetUnsupportedError::#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)] #[error(\"MERGE INTO is only supported for delta: and iceberg: targets (got {target})\")] pub struct MergeTargetUnsupportedError",
+      "kind": "struct",
+      "name": "MergeTargetUnsupportedError",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)] #[error(\"MERGE INTO is only supported for delta: and iceberg: targets (got {target})\")] pub struct MergeTargetUnsupportedError",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L171",
+      "id": "crates/krishiv-sql/src/lakehouse/providers.rs::fn::apply_as_of_refs::pub async fn apply_as_of_refs(",
+      "kind": "fn",
+      "name": "apply_as_of_refs",
+      "replacement": null,
+      "signature": "pub async fn apply_as_of_refs(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L22",
+      "id": "crates/krishiv-sql/src/lakehouse/providers.rs::fn::register_delta_uri::pub async fn register_delta_uri(",
+      "kind": "fn",
+      "name": "register_delta_uri",
+      "replacement": null,
+      "signature": "pub async fn register_delta_uri(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L46",
+      "id": "crates/krishiv-sql/src/lakehouse/providers.rs::fn::register_hudi_uri::pub async fn register_hudi_uri(",
+      "kind": "fn",
+      "name": "register_hudi_uri",
+      "replacement": null,
+      "signature": "pub async fn register_hudi_uri(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L149",
+      "id": "crates/krishiv-sql/src/lakehouse/providers.rs::fn::register_scan_batches::pub async fn register_scan_batches(",
+      "kind": "fn",
+      "name": "register_scan_batches",
+      "replacement": null,
+      "signature": "pub async fn register_scan_batches(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2114",
+      "id": "crates/krishiv-sql/src/lib.rs::enum::GroupingMode::pub enum GroupingMode<'a>",
+      "kind": "enum",
+      "name": "GroupingMode",
+      "replacement": null,
+      "signature": "pub enum GroupingMode<'a>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L175",
+      "id": "crates/krishiv-sql/src/lib.rs::enum::SqlError::#[non_exhaustive] #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)] pub enum SqlError",
+      "kind": "enum",
+      "name": "SqlError",
+      "replacement": null,
+      "signature": "#[non_exhaustive] #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)] pub enum SqlError",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2046",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::cancel::pub fn cancel(&self, operation_id: u64)",
+      "kind": "fn",
+      "name": "cancel",
+      "replacement": null,
+      "signature": "pub fn cancel(&self, operation_id: u64)",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2086",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::cancelled_ids::pub fn cancelled_ids(&self) -> Vec<u64>",
+      "kind": "fn",
+      "name": "cancelled_ids",
+      "replacement": null,
+      "signature": "pub fn cancelled_ids(&self) -> Vec<u64>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1145",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::clear_plan_cache::pub fn clear_plan_cache(&self)",
+      "kind": "fn",
+      "name": "clear_plan_cache",
+      "replacement": null,
+      "signature": "pub fn clear_plan_cache(&self)",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2636",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::collect::pub async fn collect(&self) -> SqlResult<Vec<RecordBatch>>",
+      "kind": "fn",
+      "name": "collect",
+      "replacement": null,
+      "signature": "pub async fn collect(&self) -> SqlResult<Vec<RecordBatch>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2659",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::collect_with_stats::pub async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)>",
+      "kind": "fn",
+      "name": "collect_with_stats",
+      "replacement": null,
+      "signature": "pub async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L942",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::deregister_streaming_source::pub fn deregister_streaming_source(&self, name: &str) -> SqlResult<()>",
+      "kind": "fn",
+      "name": "deregister_streaming_source",
+      "replacement": null,
+      "signature": "pub fn deregister_streaming_source(&self, name: &str) -> SqlResult<()>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L981",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::deregister_table::pub fn deregister_table(&self, name: &str) -> SqlResult<()>",
+      "kind": "fn",
+      "name": "deregister_table",
+      "replacement": null,
+      "signature": "pub fn deregister_table(&self, name: &str) -> SqlResult<()>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2641",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::execute_stream::pub async fn execute_stream(&self) -> SqlResult<SqlStream>",
+      "kind": "fn",
+      "name": "execute_stream",
+      "replacement": null,
+      "signature": "pub async fn execute_stream(&self) -> SqlResult<SqlStream>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1850",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::execute_with_operation_id::pub async fn execute_with_operation_id(",
+      "kind": "fn",
+      "name": "execute_with_operation_id",
+      "replacement": null,
+      "signature": "pub async fn execute_with_operation_id(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1833",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::execute_with_timeout::pub async fn execute_with_timeout(",
+      "kind": "fn",
+      "name": "execute_with_timeout",
+      "replacement": null,
+      "signature": "pub async fn execute_with_timeout(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2625",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::explain::pub async fn explain(&self) -> SqlResult<String>",
+      "kind": "fn",
+      "name": "explain",
+      "replacement": null,
+      "signature": "pub async fn explain(&self) -> SqlResult<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2620",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::explain_logical::pub fn explain_logical(&self) -> String",
+      "kind": "fn",
+      "name": "explain_logical",
+      "replacement": null,
+      "signature": "pub fn explain_logical(&self) -> String",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L3783",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::explain_sql::pub fn explain_sql(query: impl Into<String>) -> SqlResult<String>",
+      "kind": "fn",
+      "name": "explain_sql",
+      "replacement": null,
+      "signature": "pub fn explain_sql(query: impl Into<String>) -> SqlResult<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L3792",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::explain_sql_optimized::pub fn explain_sql_optimized(query: impl Into<String>, optimizer: &Optimizer) -> SqlResult<String>",
+      "kind": "fn",
+      "name": "explain_sql_optimized",
+      "replacement": null,
+      "signature": "pub fn explain_sql_optimized(query: impl Into<String>, optimizer: &Optimizer) -> SqlResult<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L3803",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::explain_sql_with_cost::pub fn explain_sql_with_cost(",
+      "kind": "fn",
+      "name": "explain_sql_with_cost",
+      "replacement": null,
+      "signature": "pub fn explain_sql_with_cost(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2053",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::is_cancelled::pub fn is_cancelled(&self, operation_id: u64) -> bool",
+      "kind": "fn",
+      "name": "is_cancelled",
+      "replacement": null,
+      "signature": "pub fn is_cancelled(&self, operation_id: u64) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1043",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::is_streaming_query::pub fn is_streaming_query(&self, sql: &str) -> SqlResult<bool>",
+      "kind": "fn",
+      "name": "is_streaming_query",
+      "replacement": null,
+      "signature": "pub fn is_streaming_query(&self, sql: &str) -> SqlResult<bool>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L909",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::is_streaming_source::pub fn is_streaming_source(&self, table_name: &str) -> bool",
+      "kind": "fn",
+      "name": "is_streaming_source",
+      "replacement": null,
+      "signature": "pub fn is_streaming_source(&self, table_name: &str) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1081",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::krishiv_catalog::pub fn krishiv_catalog(&self) -> Option<&Arc<RwLock<InMemoryCatalog>>>",
+      "kind": "fn",
+      "name": "krishiv_catalog",
+      "replacement": null,
+      "signature": "pub fn krishiv_catalog(&self) -> Option<&Arc<RwLock<InMemoryCatalog>>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2586",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::krishiv_logical_plan::pub fn krishiv_logical_plan(&self) -> LogicalPlan",
+      "kind": "fn",
+      "name": "krishiv_logical_plan",
+      "replacement": null,
+      "signature": "pub fn krishiv_logical_plan(&self) -> LogicalPlan",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L969",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::live_table_registry::pub fn live_table_registry(&self) -> &Arc<live_table::LiveTableRegistry>",
+      "kind": "fn",
+      "name": "live_table_registry",
+      "replacement": null,
+      "signature": "pub fn live_table_registry(&self) -> &Arc<live_table::LiveTableRegistry>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L229",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::logical_plan::pub fn logical_plan(&self) -> &LogicalPlan",
+      "kind": "fn",
+      "name": "logical_plan",
+      "replacement": null,
+      "signature": "pub fn logical_plan(&self) -> &LogicalPlan",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L500",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::memory_limit_bytes::pub fn memory_limit_bytes(&self) -> Option<usize>",
+      "kind": "fn",
+      "name": "memory_limit_bytes",
+      "replacement": null,
+      "signature": "pub fn memory_limit_bytes(&self) -> Option<usize>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L394",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::new::pub fn new() -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2039",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::new::pub fn new() -> Self#2",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L409",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::new_with_memory_limit::pub fn new_with_memory_limit(memory_limit_bytes: Option<usize>) -> Self",
+      "kind": "fn",
+      "name": "new_with_memory_limit",
+      "replacement": null,
+      "signature": "pub fn new_with_memory_limit(memory_limit_bytes: Option<usize>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L974",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::operation_registry::pub fn operation_registry(&self) -> &Arc<OperationRegistry>",
+      "kind": "fn",
+      "name": "operation_registry",
+      "replacement": null,
+      "signature": "pub fn operation_registry(&self) -> &Arc<OperationRegistry>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2792",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::parse_public_expression::pub fn parse_public_expression(sql: &str) -> SqlResult<krishiv_plan::expression::Expr>",
+      "kind": "fn",
+      "name": "parse_public_expression",
+      "replacement": null,
+      "signature": "pub fn parse_public_expression(sql: &str) -> SqlResult<krishiv_plan::expression::Expr>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L3753",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::plan_sql::pub fn plan_sql(query: impl Into<String>) -> SqlResult<SqlPlan>",
+      "kind": "fn",
+      "name": "plan_sql",
+      "replacement": null,
+      "signature": "pub fn plan_sql(query: impl Into<String>) -> SqlResult<SqlPlan>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L3841",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::pretty_batches::pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String>",
+      "kind": "fn",
+      "name": "pretty_batches",
+      "replacement": null,
+      "signature": "pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2078",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::progress::pub fn progress(&self, operation_id: u64) -> Option<(u64, u64)>",
+      "kind": "fn",
+      "name": "progress",
+      "replacement": null,
+      "signature": "pub fn progress(&self, operation_id: u64) -> Option<(u64, u64)>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L224",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::query::pub fn query(&self) -> &str",
+      "kind": "fn",
+      "name": "query",
+      "replacement": null,
+      "signature": "pub fn query(&self) -> &str",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2558",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::query::pub fn query(&self) -> Option<&str>",
+      "kind": "fn",
+      "name": "query",
+      "replacement": null,
+      "signature": "pub fn query(&self) -> Option<&str>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L285",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::query_memory_limit_from_env::pub fn query_memory_limit_from_env() -> Option<usize>",
+      "kind": "fn",
+      "name": "query_memory_limit_from_env",
+      "replacement": null,
+      "signature": "pub fn query_memory_limit_from_env() -> Option<usize>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1363",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::read_csv::pub async fn read_csv(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame>",
+      "kind": "fn",
+      "name": "read_csv",
+      "replacement": null,
+      "signature": "pub async fn read_csv(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1369",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::read_csv_with_options::pub async fn read_csv_with_options(",
+      "kind": "fn",
+      "name": "read_csv_with_options",
+      "replacement": null,
+      "signature": "pub async fn read_csv_with_options(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1397",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::read_delta::pub async fn read_delta(",
+      "kind": "fn",
+      "name": "read_delta",
+      "replacement": null,
+      "signature": "pub async fn read_delta(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1409",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::read_hudi::pub async fn read_hudi(",
+      "kind": "fn",
+      "name": "read_hudi",
+      "replacement": null,
+      "signature": "pub async fn read_hudi(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1387",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::read_json::pub async fn read_json(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame>",
+      "kind": "fn",
+      "name": "read_json",
+      "replacement": null,
+      "signature": "pub async fn read_json(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1285",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::read_parquet::pub async fn read_parquet(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame>",
+      "kind": "fn",
+      "name": "read_parquet",
+      "replacement": null,
+      "signature": "pub async fn read_parquet(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1345",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::read_parquet_with_options::pub async fn read_parquet_with_options(",
+      "kind": "fn",
+      "name": "read_parquet_with_options",
+      "replacement": null,
+      "signature": "pub async fn read_parquet_with_options(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L3822",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::referenced_table_names::pub fn referenced_table_names(query: impl AsRef<str>) -> SqlResult<Vec<String>>",
+      "kind": "fn",
+      "name": "referenced_table_names",
+      "replacement": null,
+      "signature": "pub fn referenced_table_names(query: impl AsRef<str>) -> SqlResult<Vec<String>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L773",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_kafka_source::pub fn register_kafka_source(",
+      "kind": "fn",
+      "name": "register_kafka_source",
+      "replacement": null,
+      "signature": "pub fn register_kafka_source(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1248",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_parquet::pub async fn register_parquet(",
+      "kind": "fn",
+      "name": "register_parquet",
+      "replacement": null,
+      "signature": "pub async fn register_parquet(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1299",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_record_batches::pub async fn register_record_batches(",
+      "kind": "fn",
+      "name": "register_record_batches",
+      "replacement": null,
+      "signature": "pub async fn register_record_batches(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L924",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_streaming_source_name::pub fn register_streaming_source_name(&self, table_name: impl Into<String>) -> SqlResult<()>",
+      "kind": "fn",
+      "name": "register_streaming_source_name",
+      "replacement": null,
+      "signature": "pub fn register_streaming_source_name(&self, table_name: impl Into<String>) -> SqlResult<()>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L648",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_streaming_table::pub fn register_streaming_table(",
+      "kind": "fn",
+      "name": "register_streaming_table",
+      "replacement": null,
+      "signature": "pub fn register_streaming_table(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L674",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_streaming_table_with_capacity::pub fn register_streaming_table_with_capacity(",
+      "kind": "fn",
+      "name": "register_streaming_table_with_capacity",
+      "replacement": null,
+      "signature": "pub fn register_streaming_table_with_capacity(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1016",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_table_udf_fn::pub fn register_table_udf_fn(",
+      "kind": "fn",
+      "name": "register_table_udf_fn",
+      "replacement": null,
+      "signature": "pub fn register_table_udf_fn(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2061",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::remove::pub fn remove(&self, operation_id: u64)",
+      "kind": "fn",
+      "name": "remove",
+      "replacement": null,
+      "signature": "pub fn remove(&self, operation_id: u64)",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L278",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::resolve_query_memory_limit_bytes::pub fn resolve_query_memory_limit_bytes(raw: Option<&str>) -> Option<usize>",
+      "kind": "fn",
+      "name": "resolve_query_memory_limit_bytes",
+      "replacement": null,
+      "signature": "pub fn resolve_query_memory_limit_bytes(raw: Option<&str>) -> Option<usize>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L259",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::resolve_streaming_match_recognize_limit::pub fn resolve_streaming_match_recognize_limit(raw: Option<&str>) -> usize",
+      "kind": "fn",
+      "name": "resolve_streaming_match_recognize_limit",
+      "replacement": null,
+      "signature": "pub fn resolve_streaming_match_recognize_limit(raw: Option<&str>) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L505",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::shuffle_partitions::pub fn shuffle_partitions(&self) -> Option<u32>",
+      "kind": "fn",
+      "name": "shuffle_partitions",
+      "replacement": null,
+      "signature": "pub fn shuffle_partitions(&self) -> Option<u32>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1423",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::sql::pub async fn sql(&self, query: impl AsRef<str>) -> SqlResult<SqlDataFrame>",
+      "kind": "fn",
+      "name": "sql",
+      "replacement": null,
+      "signature": "pub async fn sql(&self, query: impl AsRef<str>) -> SqlResult<SqlDataFrame>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L847",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::sql_to_kafka::pub async fn sql_to_kafka(",
+      "kind": "fn",
+      "name": "sql_to_kafka",
+      "replacement": null,
+      "signature": "pub async fn sql_to_kafka(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L267",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::streaming_match_recognize_limit_from_env::pub fn streaming_match_recognize_limit_from_env() -> usize",
+      "kind": "fn",
+      "name": "streaming_match_recognize_limit_from_env",
+      "replacement": null,
+      "signature": "pub fn streaming_match_recognize_limit_from_env() -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1214",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::sync_aggregate_udfs::pub async fn sync_aggregate_udfs(&self) -> SqlResult<()>",
+      "kind": "fn",
+      "name": "sync_aggregate_udfs",
+      "replacement": null,
+      "signature": "pub async fn sync_aggregate_udfs(&self) -> SqlResult<()>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1240",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::sync_all_udfs::pub async fn sync_all_udfs(&self) -> SqlResult<()>",
+      "kind": "fn",
+      "name": "sync_all_udfs",
+      "replacement": null,
+      "signature": "pub async fn sync_all_udfs(&self) -> SqlResult<()>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1151",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::sync_scalar_udfs::pub async fn sync_scalar_udfs(&self) -> SqlResult<()>",
+      "kind": "fn",
+      "name": "sync_scalar_udfs",
+      "replacement": null,
+      "signature": "pub async fn sync_scalar_udfs(&self) -> SqlResult<()>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1170",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::sync_scalar_udfs_with_limits::pub async fn sync_scalar_udfs_with_limits(",
+      "kind": "fn",
+      "name": "sync_scalar_udfs_with_limits",
+      "replacement": null,
+      "signature": "pub async fn sync_scalar_udfs_with_limits(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1195",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::sync_scalar_udfs_with_limits_for_policy::pub async fn sync_scalar_udfs_with_limits_for_policy(",
+      "kind": "fn",
+      "name": "sync_scalar_udfs_with_limits_for_policy",
+      "replacement": null,
+      "signature": "pub async fn sync_scalar_udfs_with_limits_for_policy(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1182",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::sync_scalar_udfs_with_limits_for_profile::pub async fn sync_scalar_udfs_with_limits_for_profile(",
+      "kind": "fn",
+      "name": "sync_scalar_udfs_with_limits_for_profile",
+      "replacement": null,
+      "signature": "pub async fn sync_scalar_udfs_with_limits_for_profile(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1227",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::sync_table_udfs::pub async fn sync_table_udfs(&self) -> SqlResult<()>",
+      "kind": "fn",
+      "name": "sync_table_udfs",
+      "replacement": null,
+      "signature": "pub async fn sync_table_udfs(&self) -> SqlResult<()>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L517",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::table_row_counts::pub fn table_row_counts(&self) -> Arc<std::sync::RwLock<HashMap<String, u64>>>",
+      "kind": "fn",
+      "name": "table_row_counts",
+      "replacement": null,
+      "signature": "pub fn table_row_counts(&self) -> Arc<std::sync::RwLock<HashMap<String, u64>>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L495",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::target_parallelism::pub fn target_parallelism(&self) -> NonZeroUsize",
+      "kind": "fn",
+      "name": "target_parallelism",
+      "replacement": null,
+      "signature": "pub fn target_parallelism(&self) -> NonZeroUsize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L454",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::try_new::pub fn try_new() -> SqlResult<Self>",
+      "kind": "fn",
+      "name": "try_new",
+      "replacement": null,
+      "signature": "pub fn try_new() -> SqlResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2071",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::update_progress::pub fn update_progress(&self, operation_id: u64, rows_scanned: u64, rows_emitted: u64)",
+      "kind": "fn",
+      "name": "update_progress",
+      "replacement": null,
+      "signature": "pub fn update_progress(&self, operation_id: u64, rows_scanned: u64, rows_emitted: u64)",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1095",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::with_iceberg_catalog::pub fn with_iceberg_catalog(",
+      "kind": "fn",
+      "name": "with_iceberg_catalog",
+      "replacement": null,
+      "signature": "pub fn with_iceberg_catalog(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L464",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::with_in_memory_catalog::pub fn with_in_memory_catalog(catalog: Arc<RwLock<InMemoryCatalog>>) -> SqlResult<Self>",
+      "kind": "fn",
+      "name": "with_in_memory_catalog",
+      "replacement": null,
+      "signature": "pub fn with_in_memory_catalog(catalog: Arc<RwLock<InMemoryCatalog>>) -> SqlResult<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L543",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::with_shuffle_partitions::pub fn with_shuffle_partitions(self, n: Option<u32>) -> Self",
+      "kind": "fn",
+      "name": "with_shuffle_partitions",
+      "replacement": null,
+      "signature": "pub fn with_shuffle_partitions(self, n: Option<u32>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L489",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::with_target_parallelism::pub fn with_target_parallelism(mut self, n: NonZeroUsize) -> Self",
+      "kind": "fn",
+      "name": "with_target_parallelism",
+      "replacement": null,
+      "signature": "pub fn with_target_parallelism(mut self, n: NonZeroUsize) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L903",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::with_udf_limits::pub fn with_udf_limits(mut self, limits: krishiv_plan::udf::ResourceLimits) -> Self",
+      "kind": "fn",
+      "name": "with_udf_limits",
+      "replacement": null,
+      "signature": "pub fn with_udf_limits(mut self, limits: krishiv_plan::udf::ResourceLimits) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1116",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::with_udf_registry::pub fn with_udf_registry(",
+      "kind": "fn",
+      "name": "with_udf_registry",
+      "replacement": null,
+      "signature": "pub fn with_udf_registry(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L148",
+      "id": "crates/krishiv-sql/src/lib.rs::struct::CsvReaderOptions::#[derive(Debug, Clone, Default)] pub struct CsvReaderOptions",
+      "kind": "struct",
+      "name": "CsvReaderOptions",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, Default)] pub struct CsvReaderOptions",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L166",
+      "id": "crates/krishiv-sql/src/lib.rs::struct::CsvWriterOptions::#[derive(Debug, Clone, Default)] pub struct CsvWriterOptions",
+      "kind": "struct",
+      "name": "CsvWriterOptions",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, Default)] pub struct CsvWriterOptions",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2031",
+      "id": "crates/krishiv-sql/src/lib.rs::struct::OperationRegistry::#[derive(Clone, Default)] pub struct OperationRegistry",
+      "kind": "struct",
+      "name": "OperationRegistry",
+      "replacement": null,
+      "signature": "#[derive(Clone, Default)] pub struct OperationRegistry",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L141",
+      "id": "crates/krishiv-sql/src/lib.rs::struct::ParquetReaderOptions::#[derive(Debug, Clone, Default)] pub struct ParquetReaderOptions",
+      "kind": "struct",
+      "name": "ParquetReaderOptions",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, Default)] pub struct ParquetReaderOptions",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L157",
+      "id": "crates/krishiv-sql/src/lib.rs::struct::ParquetWriterOptions::#[derive(Debug, Clone, Default)] pub struct ParquetWriterOptions",
+      "kind": "struct",
+      "name": "ParquetWriterOptions",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, Default)] pub struct ParquetWriterOptions",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2489",
+      "id": "crates/krishiv-sql/src/lib.rs::struct::SqlDataFrame::#[derive(Clone)] pub struct SqlDataFrame",
+      "kind": "struct",
+      "name": "SqlDataFrame",
+      "replacement": null,
+      "signature": "#[derive(Clone)] pub struct SqlDataFrame",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L313",
+      "id": "crates/krishiv-sql/src/lib.rs::struct::SqlEngine::#[derive(Clone)] pub struct SqlEngine",
+      "kind": "struct",
+      "name": "SqlEngine",
+      "replacement": null,
+      "signature": "#[derive(Clone)] pub struct SqlEngine",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2720",
+      "id": "crates/krishiv-sql/src/lib.rs::struct::SqlExecutionStats::#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub struct SqlExecutionStats",
+      "kind": "struct",
+      "name": "SqlExecutionStats",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub struct SqlExecutionStats",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L216",
+      "id": "crates/krishiv-sql/src/lib.rs::struct::SqlPlan::#[derive(Debug, Clone, PartialEq, Eq)] pub struct SqlPlan",
+      "kind": "struct",
+      "name": "SqlPlan",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub struct SqlPlan",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2019",
+      "id": "crates/krishiv-sql/src/lib.rs::struct::TaggedQueryResult::pub struct TaggedQueryResult",
+      "kind": "struct",
+      "name": "TaggedQueryResult",
+      "replacement": null,
+      "signature": "pub struct TaggedQueryResult",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2120",
+      "id": "crates/krishiv-sql/src/lib.rs::trait::KrishivDataFrameOps::#[async_trait::async_trait] pub trait KrishivDataFrameOps: Send + Sync",
+      "kind": "trait",
+      "name": "KrishivDataFrameOps",
+      "replacement": null,
+      "signature": "#[async_trait::async_trait] pub trait KrishivDataFrameOps: Send + Sync",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L58",
+      "id": "crates/krishiv-sql/src/lib.rs::type::SqlResult::pub type SqlResult<T> = Result<T, SqlError>",
+      "kind": "type",
+      "name": "SqlResult",
+      "replacement": null,
+      "signature": "pub type SqlResult<T> = Result<T, SqlError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L65",
+      "id": "crates/krishiv-sql/src/lib.rs::type::SqlStream::pub type SqlStream =",
+      "kind": "type",
+      "name": "SqlStream",
+      "replacement": null,
+      "signature": "pub type SqlStream =",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L11",
+      "id": "crates/krishiv-sql/src/live_table.rs::enum::LiveTableStatement::#[derive(Debug, Clone, PartialEq, Eq)] pub enum LiveTableStatement",
+      "kind": "enum",
+      "name": "LiveTableStatement",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub enum LiveTableStatement",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L67",
+      "id": "crates/krishiv-sql/src/live_table.rs::fn::contains::pub fn contains(&self, name: &str) -> SqlResult<bool>",
+      "kind": "fn",
+      "name": "contains",
+      "replacement": null,
+      "signature": "pub fn contains(&self, name: &str) -> SqlResult<bool>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L198",
+      "id": "crates/krishiv-sql/src/live_table.rs::fn::execute_live_table_ddl::pub fn execute_live_table_ddl(",
+      "kind": "fn",
+      "name": "execute_live_table_ddl",
+      "replacement": null,
+      "signature": "pub fn execute_live_table_ddl(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L33",
+      "id": "crates/krishiv-sql/src/live_table.rs::fn::new::pub fn new() -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L84",
+      "id": "crates/krishiv-sql/src/live_table.rs::fn::parse_live_table_statement::pub fn parse_live_table_statement(sql: &str) -> SqlResult<Option<LiveTableStatement>>",
+      "kind": "fn",
+      "name": "parse_live_table_statement",
+      "replacement": null,
+      "signature": "pub fn parse_live_table_statement(sql: &str) -> SqlResult<Option<LiveTableStatement>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L147",
+      "id": "crates/krishiv-sql/src/live_table.rs::fn::plan_live_table::pub fn plan_live_table(stmt: LiveTableStatement) -> LogicalPlan",
+      "kind": "fn",
+      "name": "plan_live_table",
+      "replacement": null,
+      "signature": "pub fn plan_live_table(stmt: LiveTableStatement) -> LogicalPlan",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L74",
+      "id": "crates/krishiv-sql/src/live_table.rs::fn::query::pub fn query(&self, name: &str) -> SqlResult<Option<String>>",
+      "kind": "fn",
+      "name": "query",
+      "replacement": null,
+      "signature": "pub fn query(&self, name: &str) -> SqlResult<Option<String>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L52",
+      "id": "crates/krishiv-sql/src/live_table.rs::fn::register::pub fn register(",
+      "kind": "fn",
+      "name": "register",
+      "replacement": null,
+      "signature": "pub fn register(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L60",
+      "id": "crates/krishiv-sql/src/live_table.rs::fn::remove_table::pub fn remove_table(&self, name: &str) -> SqlResult<bool>",
+      "kind": "fn",
+      "name": "remove_table",
+      "replacement": null,
+      "signature": "pub fn remove_table(&self, name: &str) -> SqlResult<bool>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L39",
+      "id": "crates/krishiv-sql/src/live_table.rs::fn::try_register::pub fn try_register(",
+      "kind": "fn",
+      "name": "try_register",
+      "replacement": null,
+      "signature": "pub fn try_register(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L27",
+      "id": "crates/krishiv-sql/src/live_table.rs::struct::LiveTableRegistry::#[derive(Debug, Default)] pub struct LiveTableRegistry",
+      "kind": "struct",
+      "name": "LiveTableRegistry",
+      "replacement": null,
+      "signature": "#[derive(Debug, Default)] pub struct LiveTableRegistry",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L41",
+      "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::contains_pivot::pub fn contains_pivot(sql: &str) -> bool",
+      "kind": "fn",
+      "name": "contains_pivot",
+      "replacement": null,
+      "signature": "pub fn contains_pivot(sql: &str) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L46",
+      "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::contains_unpivot::pub fn contains_unpivot(sql: &str) -> bool",
+      "kind": "fn",
+      "name": "contains_unpivot",
+      "replacement": null,
+      "signature": "pub fn contains_unpivot(sql: &str) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L71",
+      "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::parse_pivot::pub fn parse_pivot(sql: &str) -> SqlResult<Option<PivotClause>>",
+      "kind": "fn",
+      "name": "parse_pivot",
+      "replacement": null,
+      "signature": "pub fn parse_pivot(sql: &str) -> SqlResult<Option<PivotClause>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L194",
+      "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::parse_unpivot::pub fn parse_unpivot(sql: &str) -> SqlResult<Option<UnpivotClause>>",
+      "kind": "fn",
+      "name": "parse_unpivot",
+      "replacement": null,
+      "signature": "pub fn parse_unpivot(sql: &str) -> SqlResult<Option<UnpivotClause>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L155",
+      "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::rewrite_pivot::pub fn rewrite_pivot(sql: &str) -> SqlResult<String>",
+      "kind": "fn",
+      "name": "rewrite_pivot",
+      "replacement": null,
+      "signature": "pub fn rewrite_pivot(sql: &str) -> SqlResult<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L293",
+      "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::rewrite_pivot_unpivot::pub fn rewrite_pivot_unpivot(sql: &str) -> SqlResult<String>",
+      "kind": "fn",
+      "name": "rewrite_pivot_unpivot",
+      "replacement": null,
+      "signature": "pub fn rewrite_pivot_unpivot(sql: &str) -> SqlResult<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L266",
+      "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::rewrite_unpivot::pub fn rewrite_unpivot(sql: &str) -> SqlResult<String>",
+      "kind": "fn",
+      "name": "rewrite_unpivot",
+      "replacement": null,
+      "signature": "pub fn rewrite_unpivot(sql: &str) -> SqlResult<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L54",
+      "id": "crates/krishiv-sql/src/pivot_sql.rs::struct::PivotClause::#[derive(Debug, Clone)] pub struct PivotClause",
+      "kind": "struct",
+      "name": "PivotClause",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct PivotClause",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L179",
+      "id": "crates/krishiv-sql/src/pivot_sql.rs::struct::UnpivotClause::#[derive(Debug, Clone)] pub struct UnpivotClause",
+      "kind": "struct",
+      "name": "UnpivotClause",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct UnpivotClause",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/recursive_cte.rs#L135",
+      "id": "crates/krishiv-sql/src/recursive_cte.rs::fn::build_recursive_cte_op::pub fn build_recursive_cte_op(stmt: &RecursiveCteStatement) -> NodeOp",
+      "kind": "fn",
+      "name": "build_recursive_cte_op",
+      "replacement": null,
+      "signature": "pub fn build_recursive_cte_op(stmt: &RecursiveCteStatement) -> NodeOp",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/recursive_cte.rs#L165",
+      "id": "crates/krishiv-sql/src/recursive_cte.rs::fn::execute_recursive_cte::pub fn execute_recursive_cte<E, R>(",
+      "kind": "fn",
+      "name": "execute_recursive_cte",
+      "replacement": null,
+      "signature": "pub fn execute_recursive_cte<E, R>(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/recursive_cte.rs#L57",
+      "id": "crates/krishiv-sql/src/recursive_cte.rs::fn::parse_recursive_cte::pub fn parse_recursive_cte(sql: &str) -> SqlResult<Option<RecursiveCteStatement>>",
+      "kind": "fn",
+      "name": "parse_recursive_cte",
+      "replacement": null,
+      "signature": "pub fn parse_recursive_cte(sql: &str) -> SqlResult<Option<RecursiveCteStatement>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/recursive_cte.rs#L147",
+      "id": "crates/krishiv-sql/src/recursive_cte.rs::struct::RecursiveCteResult::#[derive(Debug)] pub struct RecursiveCteResult",
+      "kind": "struct",
+      "name": "RecursiveCteResult",
+      "replacement": null,
+      "signature": "#[derive(Debug)] pub struct RecursiveCteResult",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/recursive_cte.rs#L40",
+      "id": "crates/krishiv-sql/src/recursive_cte.rs::struct::RecursiveCteStatement::#[derive(Debug, Clone)] pub struct RecursiveCteStatement",
+      "kind": "struct",
+      "name": "RecursiveCteStatement",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct RecursiveCteStatement",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/sqlstate.rs#L71",
+      "id": "crates/krishiv-sql/src/sqlstate.rs::fn::from_sql_error::pub fn from_sql_error(error: &SqlError) -> Self",
+      "kind": "fn",
+      "name": "from_sql_error",
+      "replacement": null,
+      "signature": "pub fn from_sql_error(error: &SqlError) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/sqlstate.rs#L44",
+      "id": "crates/krishiv-sql/src/sqlstate.rs::fn::sqlstate_for::pub fn sqlstate_for(error: &SqlError) -> &'static str",
+      "kind": "fn",
+      "name": "sqlstate_for",
+      "replacement": null,
+      "signature": "pub fn sqlstate_for(error: &SqlError) -> &'static str",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/sqlstate.rs#L61",
+      "id": "crates/krishiv-sql/src/sqlstate.rs::struct::SqlStateError::#[derive(Debug, Clone, PartialEq, Eq)] pub struct SqlStateError",
+      "kind": "struct",
+      "name": "SqlStateError",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub struct SqlStateError",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L26",
+      "id": "crates/krishiv-sql/src/streaming.rs::enum::ContinuousInputError::#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)] pub enum ContinuousInputError",
+      "kind": "enum",
+      "name": "ContinuousInputError",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)] pub enum ContinuousInputError",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L147",
+      "id": "crates/krishiv-sql/src/streaming.rs::fn::close::pub fn close(&self) -> Result<bool, ContinuousInputError>",
+      "kind": "fn",
+      "name": "close",
+      "replacement": null,
+      "signature": "pub fn close(&self) -> Result<bool, ContinuousInputError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L187",
+      "id": "crates/krishiv-sql/src/streaming.rs::fn::create_continuous_table::pub fn create_continuous_table(",
+      "kind": "fn",
+      "name": "create_continuous_table",
+      "replacement": null,
+      "signature": "pub fn create_continuous_table(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L196",
+      "id": "crates/krishiv-sql/src/streaming.rs::fn::create_continuous_table_with_capacity::pub fn create_continuous_table_with_capacity(",
+      "kind": "fn",
+      "name": "create_continuous_table_with_capacity",
+      "replacement": null,
+      "signature": "pub fn create_continuous_table_with_capacity(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L156",
+      "id": "crates/krishiv-sql/src/streaming.rs::fn::is_closed::pub fn is_closed(&self) -> Result<bool, ContinuousInputError>",
+      "kind": "fn",
+      "name": "is_closed",
+      "replacement": null,
+      "signature": "pub fn is_closed(&self) -> Result<bool, ContinuousInputError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L57",
+      "id": "crates/krishiv-sql/src/streaming.rs::fn::new::pub fn new(schema: SchemaRef, receiver: mpsc::Receiver<RecordBatch>) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(schema: SchemaRef, receiver: mpsc::Receiver<RecordBatch>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L120",
+      "id": "crates/krishiv-sql/src/streaming.rs::fn::schema::pub fn schema(&self) -> &SchemaRef",
+      "kind": "fn",
+      "name": "schema",
+      "replacement": null,
+      "signature": "pub fn schema(&self) -> &SchemaRef",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L135",
+      "id": "crates/krishiv-sql/src/streaming.rs::fn::send::pub async fn send(&self, batch: RecordBatch) -> Result<(), ContinuousInputError>",
+      "kind": "fn",
+      "name": "send",
+      "replacement": null,
+      "signature": "pub async fn send(&self, batch: RecordBatch) -> Result<(), ContinuousInputError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L125",
+      "id": "crates/krishiv-sql/src/streaming.rs::fn::try_send::pub fn try_send(&self, batch: RecordBatch) -> Result<(), ContinuousInputError>",
+      "kind": "fn",
+      "name": "try_send",
+      "replacement": null,
+      "signature": "pub fn try_send(&self, batch: RecordBatch) -> Result<(), ContinuousInputError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L43",
+      "id": "crates/krishiv-sql/src/streaming.rs::struct::ChannelPartitionStream::pub struct ChannelPartitionStream",
+      "kind": "struct",
+      "name": "ChannelPartitionStream",
+      "replacement": null,
+      "signature": "pub struct ChannelPartitionStream",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L97",
+      "id": "crates/krishiv-sql/src/streaming.rs::struct::ContinuousTableInput::pub struct ContinuousTableInput",
+      "kind": "struct",
+      "name": "ContinuousTableInput",
+      "replacement": null,
+      "signature": "pub struct ContinuousTableInput",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/subquery.rs#L26",
+      "id": "crates/krishiv-sql/src/subquery.rs::enum::SubqueryKind::#[derive(Debug, Clone, PartialEq, Eq)] pub enum SubqueryKind",
+      "kind": "enum",
+      "name": "SubqueryKind",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub enum SubqueryKind",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/subquery.rs#L55",
+      "id": "crates/krishiv-sql/src/subquery.rs::fn::detect_subqueries::pub fn detect_subqueries(sql: &str) -> SqlResult<Vec<DetectedSubquery>>",
+      "kind": "fn",
+      "name": "detect_subqueries",
+      "replacement": null,
+      "signature": "pub fn detect_subqueries(sql: &str) -> SqlResult<Vec<DetectedSubquery>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/subquery.rs#L250",
+      "id": "crates/krishiv-sql/src/subquery.rs::fn::explain_subqueries::pub fn explain_subqueries(sql: &str) -> Option<String>",
+      "kind": "fn",
+      "name": "explain_subqueries",
+      "replacement": null,
+      "signature": "pub fn explain_subqueries(sql: &str) -> Option<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/subquery.rs#L192",
+      "id": "crates/krishiv-sql/src/subquery.rs::fn::validate_no_streaming_subqueries::pub fn validate_no_streaming_subqueries(",
+      "kind": "fn",
+      "name": "validate_no_streaming_subqueries",
+      "replacement": null,
+      "signature": "pub fn validate_no_streaming_subqueries(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/subquery.rs#L42",
+      "id": "crates/krishiv-sql/src/subquery.rs::struct::DetectedSubquery::#[derive(Debug, Clone)] pub struct DetectedSubquery",
+      "kind": "struct",
+      "name": "DetectedSubquery",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct DetectedSubquery",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/udf.rs#L261",
+      "id": "crates/krishiv-sql/src/udf.rs::fn::register_single_table_udf::pub fn register_single_table_udf(",
+      "kind": "fn",
+      "name": "register_single_table_udf",
+      "replacement": null,
+      "signature": "pub fn register_single_table_udf(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/udf.rs#L112",
+      "id": "crates/krishiv-sql/src/udf.rs::fn::sync_aggregate_udfs::pub fn sync_aggregate_udfs(",
+      "kind": "fn",
+      "name": "sync_aggregate_udfs",
+      "replacement": null,
+      "signature": "pub fn sync_aggregate_udfs(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/udf.rs#L19",
+      "id": "crates/krishiv-sql/src/udf.rs::fn::sync_scalar_udfs_with_limits::pub fn sync_scalar_udfs_with_limits(",
+      "kind": "fn",
+      "name": "sync_scalar_udfs_with_limits",
+      "replacement": null,
+      "signature": "pub fn sync_scalar_udfs_with_limits(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/udf.rs#L36",
+      "id": "crates/krishiv-sql/src/udf.rs::fn::sync_scalar_udfs_with_limits_for_profile::pub fn sync_scalar_udfs_with_limits_for_profile(",
+      "kind": "fn",
+      "name": "sync_scalar_udfs_with_limits_for_profile",
+      "replacement": null,
+      "signature": "pub fn sync_scalar_udfs_with_limits_for_profile(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/udf.rs#L278",
+      "id": "crates/krishiv-sql/src/udf.rs::fn::sync_table_udfs::pub fn sync_table_udfs(",
+      "kind": "fn",
+      "name": "sync_table_udfs",
+      "replacement": null,
+      "signature": "pub fn sync_table_udfs(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/unnest_sql.rs#L86",
+      "id": "crates/krishiv-sql/src/unnest_sql.rs::fn::build_unnest_op::pub fn build_unnest_op(",
+      "kind": "fn",
+      "name": "build_unnest_op",
+      "replacement": null,
+      "signature": "pub fn build_unnest_op(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/unnest_sql.rs#L23",
+      "id": "crates/krishiv-sql/src/unnest_sql.rs::fn::contains_lateral::pub fn contains_lateral(sql: &str) -> bool",
+      "kind": "fn",
+      "name": "contains_lateral",
+      "replacement": null,
+      "signature": "pub fn contains_lateral(sql: &str) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/unnest_sql.rs#L17",
+      "id": "crates/krishiv-sql/src/unnest_sql.rs::fn::contains_unnest::pub fn contains_unnest(sql: &str) -> bool",
+      "kind": "fn",
+      "name": "contains_unnest",
+      "replacement": null,
+      "signature": "pub fn contains_unnest(sql: &str) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/unnest_sql.rs#L46",
+      "id": "crates/krishiv-sql/src/unnest_sql.rs::fn::rewrite_lateral_unnest::pub fn rewrite_lateral_unnest(sql: &str) -> String",
+      "kind": "fn",
+      "name": "rewrite_lateral_unnest",
+      "replacement": null,
+      "signature": "pub fn rewrite_lateral_unnest(sql: &str) -> String",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/window_functions.rs#L26",
+      "id": "crates/krishiv-sql/src/window_functions.rs::fn::register_window_functions::pub fn register_window_functions(ctx: &SessionContext) -> Result<(), DataFusionError>",
+      "kind": "fn",
+      "name": "register_window_functions",
+      "replacement": null,
+      "signature": "pub fn register_window_functions(ctx: &SessionContext) -> Result<(), DataFusionError>",
+      "stability": "preview"
+    }
+  ],
+  "modules": [
+    "catalog/iceberg_catalog_bridge",
+    "catalog/iceberg_rest",
+    "catalog/iceberg_table_provider",
+    "catalog/local_catalog",
+    "catalog/mod",
+    "catalog/postgres_catalog",
+    "catalog/rest_catalog_wrapper",
+    "catalog/unified",
+    "cep_sql",
+    "connector_table",
+    "create_function_ddl",
+    "grammar",
+    "introspection_sql",
+    "kafka_table",
+    "lakehouse/as_of",
+    "lakehouse/merge",
+    "lakehouse/mod",
+    "lakehouse/providers",
+    "lib",
+    "live_table",
+    "pivot_sql",
+    "recursive_cte",
+    "sql_tests",
+    "sqlstate",
+    "streaming",
+    "subquery",
+    "udf",
+    "unnest_sql",
+    "window_functions"
+  ]
+}

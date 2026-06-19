@@ -1,0 +1,47 @@
+[package]
+name = "krishiv-flight-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+krishiv-api = { path = "../krishiv-api" }
+krishiv-common = { path = "../krishiv-common" }
+krishiv-plan = { path = "../krishiv-plan" }
+krishiv-runtime = { path = "../krishiv-runtime" }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-sql = { path = "../krishiv-sql" }
+
+dashmap = { workspace = true }
+lru = "0.18"
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[features]
+kafka = ["krishiv-runtime/kafka", "krishiv-api/kafka"]
+
+[dev-dependencies]
+futures = { workspace = true }
+krishiv-proto = { path = "../krishiv-proto" }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "krishiv-flight-server"
+path = "src/bin/krishiv_flight_server.rs"
+
+[lints]
+workspace = true

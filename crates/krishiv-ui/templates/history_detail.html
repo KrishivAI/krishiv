@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}{{ record.job_id }} · History · Krishiv{% endblock %}
+{% block content %}
+<div class="breadcrumb">
+  <a href="/ui/history">History</a><span class="sep">/</span>{{ record.job_id }}
+</div>
+<h1 class="page-heading">{{ record.job_id }}</h1>
+<div class="metrics">
+  <div class="metric">
+    <div class="label">Kind</div>
+    <div class="value">{{ record.job_kind }}</div>
+  </div>
+  <div class="metric">
+    <div class="label">Final State</div>
+    <div class="value"><span class="state-dot {{ record.final_state }}">{{ record.final_state }}</span></div>
+  </div>
+  <div class="metric">
+    <div class="label">Stages</div>
+    <div class="value">{{ record.stage_count }}</div>
+  </div>
+  <div class="metric">
+    <div class="label">Tasks</div>
+    <div class="value">{{ record.task_count }}</div>
+  </div>
+  <div class="metric">
+    <div class="label">Succeeded</div>
+    <div class="value">{{ record.succeeded_task_count }}</div>
+  </div>
+  <div class="metric">
+    <div class="label">Failed</div>
+    <div class="value {% if record.failed_task_count > 0 %}bad{% endif %}">{{ record.failed_task_count }}</div>
+  </div>
+  <div class="metric">
+    <div class="label">CPU (ms)</div>
+    <div class="value">{{ record.cpu_nanos / 1000000 }}</div>
+  </div>
+  <div class="metric">
+    <div class="label">Memory Peak</div>
+    <div class="value">{{ record.memory_peak_task_bytes / 1048576 }} MB</div>
+  </div>
+  <div class="metric">
+    <div class="label">Priority</div>
+    <div class="value">{{ record.priority }}</div>
+  </div>
+  {% if record.namespace_id.is_some() %}
+  <div class="metric">
+    <div class="label">Namespace</div>
+    <div class="value">{{ record.namespace_id.as_ref().unwrap() }}</div>
+  </div>
+  {% endif %}
+  <div class="metric">
+    <div class="label">Completed At (ms)</div>
+    <div class="value">{{ record.completed_at_ms }}</div>
+  </div>
+</div>
+{% endblock %}

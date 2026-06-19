@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: krishiv-coordinator
+  namespace: krishiv-system
+  labels:
+    app.kubernetes.io/name: krishiv
+    app.kubernetes.io/component: coordinator
+    app.kubernetes.io/part-of: krishiv
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: krishiv
+    app.kubernetes.io/component: coordinator
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: grpc
+      port: 9090
+      targetPort: grpc

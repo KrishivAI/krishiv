@@ -1,11 +1,37 @@
-# Batch SQL Example Placeholder
+# Batch SQL Examples
 
-This directory will hold R1 local batch SQL examples.
+Run a literal query:
 
-Expected first example after DataFusion integration:
-
-```text
-krishiv sql --query "select * from local_table limit 10"
+```bash
+cargo run -p krishiv -- sql --query "select 1 as value"
 ```
 
-The current bootstrap slice only provides CLI help and placeholder planning.
+Explain the logical and physical plan:
+
+```bash
+cargo run -p krishiv -- explain --query "select 1 as value"
+```
+
+Submit a distributed job to the local scheduler:
+
+```bash
+cargo run -p krishiv -- submit --job-id job-demo --name demo --tasks 2 --launch
+```
+
+Show distributed status for the current process:
+
+```bash
+cargo run -p krishiv -- jobs --distributed
+```
+
+Run the embedded Parquet example using the unified `krishiv` crate:
+
+```bash
+cargo run -p krishiv-rust-examples --bin batch_sql
+```
+
+For CLI Parquet registration:
+
+```bash
+cargo run -p krishiv -- sql --parquet people=./people.parquet --query "select count(*) from people"
+```

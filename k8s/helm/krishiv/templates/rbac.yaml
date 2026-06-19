@@ -1,0 +1,53 @@
+{{- if .Values.rbac.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "krishiv.serviceAccountName" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "krishiv.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "krishiv.fullname" . }}-coordinator
+  labels:
+    {{- include "krishiv.labels" . | nindent 4 }}
+rules:
+  # Lease API for coordinator leader election (R9 HA)
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # KrishivJob CRD management
+  - apiGroups: ["krishiv.io"]
+    resources: ["krishivjobs", "krishivjobs/status", "krishivqueues"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Pod management for executor lifecycle
+  - apiGroups: [""]
+    resources: ["pods", "pods/status"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # ConfigMap for coordinator configuration
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Events for job lifecycle reporting
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "krishiv.fullname" . }}-coordinator
+  labels:
+    {{- include "krishiv.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "krishiv.fullname" . }}-coordinator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "krishiv.serviceAccountName" . }}
+    namespace: {{ .Values.namespace }}
+{{- end }}

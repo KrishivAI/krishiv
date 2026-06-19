@@ -1,0 +1,19 @@
+---
+title: Installation
+description: Development prerequisites and installation commands.
+---
+
+# Installation
+
+Krishiv is developed as a Rust 2024 workspace with Python bindings and optional deployment integrations.
+
+```bash
+rustup update stable
+cargo check --workspace
+```
+
+For Python examples, install the local package with maturin:
+
+```bash
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml
+```

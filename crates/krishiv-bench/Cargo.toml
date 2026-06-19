@@ -1,0 +1,32 @@
+[package]
+name = "krishiv-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bench]]
+name = "tpch_sf10"
+harness = false
+
+[[bench]]
+name = "tpch_distributed"
+harness = false
+
+[[bench]]
+name = "nexmark"
+harness = false
+
+[dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+krishiv-sql = { path = "../krishiv-sql" }
+krishiv-api = { path = "../krishiv-api" }
+krishiv-runtime = { path = "../krishiv-runtime" }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+parquet = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,142 @@
+[package]
+name = "krishiv-connectors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Lean embedded baseline: local Parquet only. Apache Iceberg is the primary
+# lakehouse format; enable `iceberg` or the `full` engine preset when needed.
+default = ["parquet"]
+
+# Core batch/object-store connectors
+parquet = []
+s3 = []
+two-phase = ["parquet"]
+# E6.1: Avro file source and sink
+avro = ["dep:apache-avro"]
+
+# Streaming
+kafka = ["dep:rdkafka"]
+schema-registry = [
+    "kafka",
+    "dep:apache-avro",
+    "dep:async-trait",
+    "dep:dashmap",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:prost",
+]
+state = ["dep:krishiv-state"]
+
+# Lakehouse table formats (implementation in `crate::lakehouse`)
+lakehouse = ["dep:async-trait", "dep:chrono", "dep:rocksdb", "dep:serde", "dep:tempfile", "dep:url"]
+iceberg = ["lakehouse", "dep:iceberg", "dep:iceberg-datafusion", "dep:uuid", "dep:datafusion"]
+delta = ["lakehouse"]
+hudi = ["lakehouse"]
+
+# Vector sinks (migrated from `krishiv-ai::vector_sinks`)
+vector-sinks = [
+    "dep:async-trait",
+    "dep:dashmap",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:twox-hash",
+]
+qdrant = ["vector-sinks", "dep:qdrant-client"]
+pgvector = ["vector-sinks", "dep:sqlx"]
+
+# Convenience presets
+local = ["parquet", "s3", "kafka", "two-phase"]
+# Standard full compute-engine build. AI/vector and secondary lakehouse formats
+# remain opt-in and are intentionally excluded.
+full = [
+    "local",
+    "avro",
+    "iceberg",
+    "schema-registry",
+    "state",
+]
+# Broader compatibility build for optional/experimental integrations.
+extended = ["full", "delta", "hudi", "vector-sinks", "qdrant", "pgvector"]
+exactly-once-integration = ["iceberg"]
+# E6.4: AWS Kinesis streaming source
+kinesis = ["dep:aws-sdk-kinesis", "dep:aws-config"]
+# E6.5: Apache Pulsar streaming source
+pulsar-source = ["dep:pulsar"]
+# E6.6: Elasticsearch/OpenSearch sink
+elasticsearch = ["dep:elasticsearch", "dep:url"]
+# E6.8: Apache Cassandra / ScyllaDB sink
+cassandra = ["dep:scylla"]
+# E6.7: Apache HBase connector
+hbase = ["dep:hbase-thrift", "dep:thrift"]
+
+[dependencies]
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["object_store", "async"] }
+bytes = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+krishiv-common = { path = "../krishiv-common" }
+krishiv-metrics = { path = "../krishiv-metrics" }
+krishiv-proto = { path = "../krishiv-proto" }
+chrono = { workspace = true, optional = true }
+rocksdb = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+iceberg = { workspace = true, optional = true }
+iceberg-datafusion = { workspace = true, optional = true }
+datafusion = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+krishiv-state = { path = "../krishiv-state", optional = true }
+object_store = { workspace = true }
+rdkafka = { version = "0.39", optional = true, default-features = false, features = ["tokio"] }
+regex = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tracing = { workspace = true }
+
+# schema-registry feature dependencies
+apache-avro = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+dashmap = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["json"], optional = true }
+serde = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+
+# vector-sinks feature dependencies
+qdrant-client = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+twox-hash = { workspace = true, optional = true }
+aws-sdk-kinesis = { version = "1.109.0", optional = true }
+aws-config = { version = "1.8.18", optional = true }
+pulsar = { version = "6.8.0", optional = true }
+elasticsearch = { version = "9.1.0-alpha.1", optional = true }
+scylla = { version = "1.7.0", optional = true }
+hbase-thrift = { version = "1.2.0", optional = true }
+thrift = { version = "0.17", optional = true }
+
+[dev-dependencies]
+mockito = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+proptest = { workspace = true }
+wiremock = { workspace = true }
+
+[[test]]
+name = "exactly_once"
+path = "tests/exactly_once.rs"
+required-features = ["exactly-once-integration"]
+
+[[test]]
+name = "integration_connector_lakehouse"
+path = "tests/integration_connector_lakehouse.rs"
+required-features = ["lakehouse", "iceberg"]
+
+[lints]
+workspace = true

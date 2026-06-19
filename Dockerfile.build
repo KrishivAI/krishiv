@@ -1,0 +1,102 @@
+# syntax=docker/dockerfile:1.7
+#
+# Multi-stage Dockerfile with cargo-chef for layer-cached dependency builds.
+# Dependencies compile in a separate layer; source-only changes skip that layer entirely.
+#
+# Build args:
+#   FEATURES  Cargo feature set (default: k8s)
+#             embedded | single-node | bare-metal | k8s | full
+#   PROFILE   Cargo build profile (default: release-k8s)
+#             release-k8s | release-max
+#
+# Usage:
+#   docker build -f Dockerfile.build -t localhost/krishiv:local .
+#   docker build --build-arg FEATURES=full --build-arg PROFILE=release-max \
+#       -f Dockerfile.build -t krishiv:latest .
+
+# ── Stage 0: cargo-chef base (shared between planner and builder) ─────────────
+FROM rust:1.92-slim AS chef
+RUN cargo install cargo-chef --locked
+WORKDIR /build
+
+# ── Stage 1: Planner — reads manifests, emits recipe.json ─────────────────────
+# Re-runs only when Cargo.toml or Cargo.lock changes.
+# cargo chef prepare captures the full workspace dep graph; the cook step
+# below scopes to only the packages we actually build (-p krishiv etc.),
+# so krishiv-python/pyo3 and other dev-only crate deps are never compiled.
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: Builder ──────────────────────────────────────────────────────────
+FROM chef AS builder
+
+ARG FEATURES=full
+ARG PROFILE=release-k8s
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl-dev \
+        pkg-config \
+        cmake \
+        mold \
+        clang \
+        libclang-dev \
+        g++ \
+        make \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CXXFLAGS="-include cstdint" \
+    CARGO_INCREMENTAL=0 \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+
+# Cook dependencies — cached as long as recipe.json (= Cargo.toml/Cargo.lock) is unchanged.
+# A source-only change hits this layer from cache and skips straight to the build below.
+# Use the same -p scoping as the final cargo build so we only compile needed deps.
+COPY --from=planner /build/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    set -e; \
+    PKGS="-p krishiv"; \
+    case "$FEATURES" in *k8s*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
+    cargo chef cook $PKGS \
+        --recipe-path recipe.json \
+        --no-default-features --features "$FEATURES" \
+        --profile "$PROFILE"
+
+# Copy source and build binaries (dep compilation above is already cached)
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    set -e; \
+    PKGS="-p krishiv"; \
+    case "$FEATURES" in *k8s*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
+    cargo build $PKGS \
+        --no-default-features --features "$FEATURES" \
+        --profile "$PROFILE"; \
+    mkdir -p /out; \
+    OUTDIR="target/$PROFILE"; \
+    case "$PROFILE" in dev|test) OUTDIR="target/debug" ;; esac; \
+    cp "$OUTDIR/krishiv" /out/krishiv; \
+    if [ -f "$OUTDIR/krishiv-operator" ]; then \
+        cp "$OUTDIR/krishiv-operator" /out/krishiv-operator; \
+    else \
+        touch /out/krishiv-operator; \
+    fi
+
+# ── Stage 3: Runtime ──────────────────────────────────────────────────────────
+# Must match the glibc version of the builder (rust:1.92-slim is Debian Trixie).
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/krishiv /usr/local/bin/krishiv
+# krishiv-operator is only present when FEATURES contains 'k8s'
+COPY --from=builder /out/krishiv-operator /usr/local/bin/krishiv-operator
+
+ENTRYPOINT ["/usr/local/bin/krishiv"]

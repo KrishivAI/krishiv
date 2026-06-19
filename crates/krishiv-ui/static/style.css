@@ -1,0 +1,621 @@
+:root {
+  color-scheme: light;
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --text: #0f172a;
+  --text-secondary: #475569;
+  --line: #e2e8f0;
+  --accent: #0d9488;
+  --accent-strong: #0f766e;
+  --good: #16a34a;
+  --good-bg: #f0fdf4;
+  --warn: #d97706;
+  --warn-bg: #fffbeb;
+  --bad: #dc2626;
+  --bad-bg: #fef2f2;
+  --shadow: 0 1px 3px rgba(0,0,0,.06);
+  --shadow-lg: 0 4px 12px rgba(0,0,0,.08);
+  --radius: 6px;
+  --radius-lg: 8px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #0f172a;
+    --surface: #1e293b;
+    --text: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --line: #334155;
+    --accent: #14b8a6;
+    --accent-strong: #2dd4bf;
+    --good: #4ade80;
+    --good-bg: #052e16;
+    --warn: #fbbf24;
+    --warn-bg: #451a03;
+    --bad: #f87171;
+    --bad-bg: #450a0a;
+    --shadow: 0 1px 3px rgba(0,0,0,.2);
+    --shadow-lg: 0 4px 12px rgba(0,0,0,.25);
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--accent-strong);
+  text-decoration: none;
+}
+a:hover { text-decoration: underline; }
+
+/* ── Shell ── */
+
+.shell {
+  margin: 0 auto;
+  max-width: 1120px;
+  padding: 0 24px 48px;
+}
+
+/* ── Nav ── */
+
+nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 0;
+  margin-bottom: 28px;
+  border-bottom: 1px solid var(--line);
+}
+
+nav .brand {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -.3px;
+  color: var(--text);
+}
+
+nav .links {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+nav .links a {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  padding: 4px 0;
+  border-bottom: 2px solid transparent;
+  transition: color .15s, border-color .15s;
+}
+
+nav .links a:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+nav .links a.active {
+  color: var(--accent-strong);
+  border-bottom-color: var(--accent);
+}
+
+.theme-toggle {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 8px;
+  transition: border-color .15s, color .15s;
+}
+
+.theme-toggle:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+/* ── Breadcrumb ── */
+
+.breadcrumb {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 20px;
+}
+
+.breadcrumb a {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.breadcrumb a:hover { color: var(--accent-strong); }
+
+.breadcrumb .sep {
+  margin: 0 6px;
+  color: var(--line);
+}
+
+/* ── Page heading ── */
+
+.page-heading {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 0 0 20px;
+  letter-spacing: -.3px;
+}
+
+/* ── Metric cards ── */
+
+.metrics {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(4, 1fr);
+  margin-bottom: 28px;
+}
+
+.metric {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: 16px;
+}
+
+.metric .label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  margin-bottom: 6px;
+}
+
+.metric .value {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -.5px;
+}
+
+.metric .value.good { color: var(--good); }
+.metric .value.bad { color: var(--bad); }
+.metric .value.warn { color: var(--warn); }
+
+.bad { color: var(--bad); font-weight: 700; }
+
+/* ── Section ── */
+
+.section {
+  margin-bottom: 32px;
+}
+
+.section h2 {
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  color: var(--text-secondary);
+  margin: 0 0 10px;
+}
+
+/* ── Table ── */
+
+.table-wrap {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th, td {
+  padding: 10px 14px;
+  text-align: left;
+  font-size: 13px;
+  border-bottom: 1px solid var(--line);
+}
+
+th {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  color: var(--text-secondary);
+  background: var(--bg);
+}
+
+tr:last-child td { border-bottom: none; }
+
+/* ── State badge ── */
+
+.state-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.state-dot::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.state-dot.active::before,
+.state-dot.running::before,
+.state-dot.healthy::before,
+.state-dot.succeeded::before,
+.state-dot.committed::before { background: var(--good); }
+
+.state-dot.failed::before,
+.state-dot.lost::before { background: var(--bad); }
+
+.state-dot.assigned::before,
+.state-dot.scheduling::before,
+.state-dot.accepted::before,
+.state-dot.registered::before,
+.state-dot.retrying::before,
+.state-dot.planning::before { background: var(--warn); }
+
+.state-dot.cancelled::before { background: var(--text-secondary); }
+
+/* ── Tag ── */
+
+.tag {
+  background: var(--bg);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 6px;
+}
+
+.tag.streaming {
+  background: var(--good-bg);
+  color: var(--good);
+}
+
+/* ── Empty state ── */
+
+.empty {
+  background: var(--surface);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-lg);
+  color: var(--text-secondary);
+  font-size: 13px;
+  padding: 28px;
+  text-align: center;
+}
+
+/* ── DAG ── */
+
+.dag {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 12px 0;
+}
+
+.dag-stage {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  flex-shrink: 0;
+  min-width: 140px;
+  padding: 12px 14px;
+}
+
+.dag-stage-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.dag-stage-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.dag-stage-info {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.dag-arrow {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  font-size: 16px;
+}
+
+/* ── Failure detail ── */
+
+.failure-detail {
+  background: var(--bad-bg);
+  border: 1px solid var(--bad);
+  border-radius: var(--radius);
+  color: var(--bad);
+  font-size: 11px;
+  margin-top: 4px;
+  max-width: 400px;
+  overflow: hidden;
+  padding: 5px 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Info card (executor detail) ── */
+
+.info-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: 20px;
+}
+
+.info-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+}
+
+.info-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.info-item .label {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+
+.info-item .value {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+/* ── Checkpoint timeline ── */
+
+.ckpt-timeline {
+  display: flex;
+  align-items: center;
+  overflow-x: auto;
+  padding: 16px 0;
+}
+
+.ckpt-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.ckpt-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--line);
+}
+
+.ckpt-dot.latest {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.ckpt-label {
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.ckpt-line {
+  border-top: 2px solid var(--line);
+  min-width: 24px;
+  flex-shrink: 0;
+}
+
+/* ── Health dashboard ── */
+
+.health-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, 1fr);
+  margin-bottom: 28px;
+}
+
+.health-stat {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: 16px;
+}
+
+.health-stat .stat-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.health-stat .stat-value {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -.3px;
+}
+
+.health-stat.healthy .stat-value { color: var(--good); }
+.health-stat.degraded .stat-value { color: var(--warn); }
+
+/* ── Executor cards (health page) ── */
+
+.executor-cards {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+
+.executor-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.executor-card.card-ok { border-left: 3px solid var(--good); }
+.executor-card.card-warn { border-left: 3px solid var(--warn); }
+
+.card-header {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.card-header a {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.card-body {
+  padding: 10px 14px;
+}
+
+.card-body dl {
+  display: grid;
+  gap: 4px 12px;
+  grid-template-columns: auto 1fr;
+  margin: 0;
+}
+
+.card-body dt {
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: .3px;
+  color: var(--text-secondary);
+}
+
+.card-body dd {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0;
+}
+
+/* ── SQL editor ── */
+
+.sql-form {
+  margin-bottom: 24px;
+}
+
+.sql-form textarea {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-family: "SF Mono", "Fira Code", "Cascadia Code", ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 14px;
+  width: 100%;
+  max-width: 720px;
+  resize: vertical;
+}
+
+.sql-form textarea:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.sql-form .toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.btn {
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius);
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 16px;
+  transition: background .15s;
+}
+
+.btn:hover {
+  background: var(--accent-strong);
+}
+
+.btn:active {
+  transform: scale(.97);
+}
+
+.htmx-indicator {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+#results {
+  margin-top: 20px;
+}
+
+#results table {
+  min-width: auto;
+}
+
+#results .meta {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+/* ── Refresh note ── */
+
+.refresh-note {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+@media (max-width: 768px) {
+  .shell { padding: 0 16px 36px; }
+
+  .metrics { grid-template-columns: repeat(2, 1fr); }
+
+  .health-grid { grid-template-columns: 1fr; }
+
+  .dag { flex-direction: column; align-items: stretch; }
+  .dag-arrow { transform: rotate(90deg); text-align: center; }
+
+  nav { flex-wrap: wrap; gap: 10px; }
+}

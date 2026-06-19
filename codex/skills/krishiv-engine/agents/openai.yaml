@@ -1,4 +1,7 @@
 interface:
   display_name: "Krishiv Engine"
-  short_description: "Build Krishiv engine features consistently"
-  default_prompt: "Use $krishiv-engine to implement the next Krishiv roadmap task."
+  short_description: "Work on the Krishiv Rust workspace from current code"
+  default_prompt: "Use $krishiv-engine to work on the requested Krishiv task."
+  resume_prompt: "Use $krishiv-engine. Read AGENTS.md, docs/README.md, and docs/implementation/status.md, then continue from the current worktree."
+  rate_limit_strategy: "Keep work in small durable chunks. Use docs/implementation/status.md only for concise handoff notes and resume from repo state rather than chat history."
+  supported_agent: "Codex"

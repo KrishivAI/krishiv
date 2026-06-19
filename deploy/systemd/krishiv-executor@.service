@@ -1,0 +1,29 @@
+[Unit]
+Description=Krishiv executor %i
+After=krishiv-clusterd.service
+Requires=krishiv-clusterd.service
+
+[Service]
+Type=simple
+User=krishiv
+Group=krishiv
+# single-node-durable: durable local state, shuffle, and checkpoints survive restart.
+# Task gRPC port = 5005%i, barrier gRPC port = 5006%i (0=50050/50060, 1=50051/50061, …)
+Environment=KRISHIV_DURABILITY_PROFILE=single-node-durable
+Environment=KRISHIV_COORDINATOR_ENDPOINT=http://127.0.0.1:9090
+Environment=KRISHIV_EXECUTOR_ID=exec-%i
+ExecStart=/usr/local/bin/krishiv-executor \
+    --connect \
+    --executor-id exec-%i \
+    --coordinator http://127.0.0.1:9090 \
+    --task-grpc-addr 0.0.0.0:5005%i \
+    --barrier-grpc-addr 0.0.0.0:5006%i \
+    --durability-profile single-node-durable \
+    --shuffle-dir /var/lib/krishiv/shuffle \
+    --state-dir /var/lib/krishiv/state-%i \
+    --checkpoint-uri file:///var/lib/krishiv/checkpoints
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

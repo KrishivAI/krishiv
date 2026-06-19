@@ -1,0 +1,33 @@
+[package]
+name = "krishiv-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+prost.workspace = true
+serde = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tonic.workspace = true
+tracing = { workspace = true }
+tonic-prost.workspace = true
+
+[features]
+serde = ["dep:serde"]
+
+[dev-dependencies]
+proptest = "1"
+
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

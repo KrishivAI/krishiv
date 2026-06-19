@@ -1,0 +1,43 @@
+//! Checkpoint messages.
+
+use crate::ids::*;
+
+// ── Checkpoint control-plane messages ─────────────────────────────────────────
+
+/// One source partition offset captured at the barrier boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointSourceOffset {
+    pub partition_id: PartitionId,
+    pub offset: i64,
+}
+
+/// Coordinator → Executor: begin checkpoint epoch E.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitiateCheckpointRequest {
+    pub job_id: JobId,
+    pub epoch: u64,
+    pub fencing_token: FencingToken,
+}
+
+/// Executor → Coordinator: operator snapshot complete for epoch E.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointAckRequest {
+    pub job_id: JobId,
+    pub operator_id: OperatorId,
+    pub task_id: TaskId,
+    pub epoch: u64,
+    pub fencing_token: FencingToken,
+    /// One per source partition this task owns.
+    pub source_offsets: Vec<CheckpointSourceOffset>,
+    /// None if operator has no state.
+    pub snapshot_path: Option<String>,
+}
+
+/// Response to `CheckpointAckRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointAckResponse {
+    Accepted,
+    StaleEpoch { current_epoch: u64 },
+    JobNotFound,
+    StaleFencingToken { current_token: u64 },
+}

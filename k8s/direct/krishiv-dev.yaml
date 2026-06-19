@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: krishiv-coordinator
+  labels:
+    app: krishiv-coordinator
+spec:
+  ports:
+  - port: 50051
+    name: grpc
+  clusterIP: None
+  selector:
+    app: krishiv-coordinator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: krishiv-coordinator
+spec:
+  selector:
+    matchLabels:
+      app: krishiv-coordinator
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: krishiv-coordinator
+    spec:
+      containers:
+      - name: coordinator
+        image: localhost/krishiv:local
+        imagePullPolicy: Never
+        command: ["/usr/local/bin/krishiv"]
+        args: ["coordinator", "--grpc-addr", "0.0.0.0:50051", "--durability-profile", "dev-local", "--insecure"]
+        ports:
+        - containerPort: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: krishiv-executor
+spec:
+  selector:
+    matchLabels:
+      app: krishiv-executor
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: krishiv-executor
+    spec:
+      containers:
+      - name: executor
+        image: localhost/krishiv:local
+        imagePullPolicy: Never
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        command: ["/bin/sh", "-c"]
+        args:
+        - "/usr/local/bin/krishiv executor --executor-id $POD_NAME --coordinator http://krishiv-coordinator.default.svc.cluster.local:50051 --connect"

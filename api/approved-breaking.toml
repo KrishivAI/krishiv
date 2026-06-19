@@ -1,0 +1,32 @@
+# Breaking or semantic public API changes require an entry with the exact ID
+# emitted by scripts/compare_api_surface.py, a reason, and a replacement.
+#
+# [[breaking]]
+# id = "python-public.json:/classes/DataFrame/methods/old_method"
+# reason = "Removed before 1.0 because the operation performed hidden I/O."
+# replacement = "DataFrame.new_method"
+
+[[breaking]]
+id = "python-public.json:classes/crates/krishiv-python/src/session.rs::Session/methods/Session.sql_async"
+reason = "Signature updated in main (commit 5ccd121) to align Python sql_async with the Rust Session API."
+replacement = "Session.sql_async (same name, updated signature)"
+
+[[breaking]]
+id = "python-public.json:classes/crates/krishiv-python/src/stream.rs::Stream/methods/Stream._tumbling_window_secs_body"
+reason = "Internal helper renamed/updated in main (commit 5ccd121); underscore-prefixed, not part of the stable public API."
+replacement = "Stream.tumbling_window (public stable API unchanged)"
+
+[[breaking]]
+id = "sql-public.json:items/crates/krishiv-sql/src/lib.rs::struct::SqlDataFrame::#[derive(Debug, Clone)] pub struct SqlDataFrame"
+reason = "SqlDataFrame derive set changed in main (commit 5ccd121) as part of SQL API surface cleanup."
+replacement = "SqlDataFrame (struct retained, derive set updated)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/io.rs::fn::option::pub fn option(self, key: impl Into<String>, _value: impl Into<String>) -> Result<Self>"
+reason = "Writer option() inventory id changed when implementing generic option compatibility (parameter renamed and body enabled)."
+replacement = "DataFrameWriter::option(mut self, key, value)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/streaming_dataframe.rs::struct::StreamingDataFrame::pub struct StreamingDataFrame"
+reason = "StreamingDataFrame gained Clone derive for Python streaming join bindings; inventory id updated."
+replacement = "StreamingDataFrame (#[derive(Clone)] retained)"

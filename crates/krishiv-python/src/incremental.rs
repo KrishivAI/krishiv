@@ -1,0 +1,356 @@
+//! Python bindings for incremental view maintenance (IVM).
+//!
+//! Exposes [`PyDeltaBatch`], [`PyStepSummary`], and the mode-aware
+//! [`PyIvmJob`] handle. Obtain a job from a session — the session picks the
+//! embedded or remote backend automatically:
+//!
+//! ```python
+//! import krishiv
+//! import pyarrow as pa
+//!
+//! session = krishiv.Session()                 # embedded
+//! job = session.ivm("revenue")
+//!
+//! class Revenue(krishiv.Schema):
+//!     total: float
+//! job.register_view("revenue", "SELECT sum(amount) AS total FROM orders",
+//!                   Revenue, is_materialized=True)
+//!
+//! batch = make_example_batch()
+//! job.feed("orders", krishiv.DeltaBatch.from_inserts(batch))
+//! summary = job.step()
+//! snap = job.snapshot("revenue")              # -> Batch or None
+//! ```
+
+use krishiv_api::{Checkpointable, FeedableJob, IvmJob, Job, StepReport};
+use krishiv_delta::{DeltaBatch, IncrementalViewSpec, LatenessSpec};
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::PyType;
+
+use crate::batch::PyBatch;
+use crate::schema::PySchema;
+
+fn rt_err(e: impl std::fmt::Display) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
+// ── PyDeltaBatch ─────────────────────────────────────────────────────────────
+
+/// A record batch annotated with per-row integer weights.
+///
+/// A weight of ``+1`` represents an insertion; ``-1`` represents a retraction.
+/// The weight column is stored as the last column, named ``_weight``.
+#[pyclass(name = "DeltaBatch")]
+#[derive(Clone)]
+pub struct PyDeltaBatch {
+    pub(crate) inner: DeltaBatch,
+}
+
+#[pymethods]
+impl PyDeltaBatch {
+    /// Construct a `DeltaBatch` from a :class:`Batch`, treating all rows as
+    /// insertions (weight = +1).
+    #[staticmethod]
+    pub fn from_inserts(batch: PyRef<'_, PyBatch>) -> PyResult<Self> {
+        let rb = batch.record_batch().clone();
+        let inner = DeltaBatch::from_inserts(rb).map_err(rt_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Construct a `DeltaBatch` from a :class:`Batch`, treating all rows as
+    /// deletions / retractions (weight = -1).
+    #[staticmethod]
+    pub fn from_deletes(batch: PyRef<'_, PyBatch>) -> PyResult<Self> {
+        let rb = batch.record_batch().clone();
+        let inner = DeltaBatch::from_deletes(rb).map_err(rt_err)?;
+        Ok(Self { inner })
+    }
+
+    /// Construct a `DeltaBatch` from a CDC change event.
+    ///
+    /// - INSERT: ``before=None, after=batch``
+    /// - DELETE: ``before=batch, after=None``
+    /// - UPDATE: ``before=old, after=new`` (retract old, insert new)
+    /// - no-op:  ``before=None, after=None`` → returns ``None``
+    #[staticmethod]
+    #[pyo3(signature = (before=None, after=None))]
+    pub fn from_cdc(
+        before: Option<PyRef<'_, PyBatch>>,
+        after: Option<PyRef<'_, PyBatch>>,
+    ) -> PyResult<Option<Self>> {
+        let before = before.map(|b| b.record_batch().clone());
+        let after = after.map(|b| b.record_batch().clone());
+        let opt = DeltaBatch::from_cdc(before, after).map_err(rt_err)?;
+        Ok(opt.map(|inner| Self { inner }))
+    }
+
+    /// Return the underlying batch (includes the ``_weight`` column) as a
+    /// :class:`Batch`.
+    pub fn to_batch(&self) -> PyBatch {
+        PyBatch::from_record_batch(self.inner.inner().clone())
+    }
+
+    /// Number of logical rows (before weight consolidation).
+    #[getter]
+    pub fn num_rows(&self) -> usize {
+        self.inner.num_rows()
+    }
+
+    /// Return ``True`` if the batch contains no rows.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!("DeltaBatch(rows={})", self.inner.num_rows())
+    }
+}
+
+// ── PyStepSummary ─────────────────────────────────────────────────────────────
+
+/// Summary returned by :meth:`IvmJob.step`.
+#[pyclass(name = "StepSummary")]
+pub struct PyStepSummary {
+    /// Total number of output rows emitted across all views this tick.
+    #[pyo3(get)]
+    pub total_output_rows: usize,
+    /// Number of views that produced non-empty output this tick.
+    #[pyo3(get)]
+    pub active_views: usize,
+    /// The tick counter after this step.
+    #[pyo3(get)]
+    pub tick: u64,
+}
+
+#[pymethods]
+impl PyStepSummary {
+    pub fn __repr__(&self) -> String {
+        format!(
+            "StepSummary(total_output_rows={}, active_views={}, tick={})",
+            self.total_output_rows, self.active_views, self.tick
+        )
+    }
+}
+
+impl From<StepReport> for PyStepSummary {
+    fn from(s: StepReport) -> Self {
+        Self {
+            total_output_rows: s.total_output_rows,
+            active_views: s.active_views,
+            tick: s.tick,
+        }
+    }
+}
+
+// ── PyIvmJob ──────────────────────────────────────────────────────────────────
+
+/// Mode-aware handle to an incremental-view-maintenance job.
+///
+/// Obtain via :meth:`Session.ivm`. The same handle works whether the session is
+/// embedded (in-process) or distributed (remote coordinator) — the session
+/// chooses the backend, and every method behaves identically.
+///
+/// All methods are synchronous wrappers that drive the shared Krishiv Tokio
+/// runtime; in distributed mode they issue coordinator HTTP calls.
+#[pyclass(name = "IvmJob")]
+#[derive(Clone)]
+pub struct PyIvmJob {
+    pub(crate) inner: IvmJob,
+}
+
+#[pymethods]
+impl PyIvmJob {
+    /// The job's stable identifier.
+    #[getter]
+    pub fn job_id(&self) -> &str {
+        self.inner.job_id()
+    }
+
+    /// Register or update an incremental view on this job.
+    ///
+    /// ``schema`` is a :class:`krishiv.Schema` subclass declaring output columns.
+    #[pyo3(signature = (name, body_sql, schema, is_materialized=false, is_recursive=false))]
+    pub fn register_view(
+        &self,
+        name: String,
+        body_sql: String,
+        schema: &Bound<'_, PyType>,
+        is_materialized: bool,
+        is_recursive: bool,
+    ) -> PyResult<()> {
+        let output_schema = PySchema::arrow_schema_from_class(schema)?;
+        let spec = IncrementalViewSpec {
+            name,
+            body_sql,
+            output_schema,
+            is_materialized,
+            is_recursive,
+            lateness: vec![],
+        };
+        crate::RUNTIME
+            .block_on(self.inner.register_view(spec))
+            .map_err(rt_err)
+    }
+
+    /// Register an incremental view with LATENESS annotations
+    /// (``lateness_ms`` maps column name → lateness in milliseconds).
+    #[pyo3(signature = (name, body_sql, schema, lateness_ms, is_materialized=false, is_recursive=false))]
+    pub fn register_view_with_lateness(
+        &self,
+        name: String,
+        body_sql: String,
+        schema: &Bound<'_, PyType>,
+        lateness_ms: std::collections::HashMap<String, i64>,
+        is_materialized: bool,
+        is_recursive: bool,
+    ) -> PyResult<()> {
+        let output_schema = PySchema::arrow_schema_from_class(schema)?;
+        let lateness = lateness_ms
+            .into_iter()
+            .map(|(column, lateness_ms)| LatenessSpec {
+                column,
+                lateness_ms,
+            })
+            .collect();
+        let spec = IncrementalViewSpec {
+            name,
+            body_sql,
+            output_schema,
+            is_materialized,
+            is_recursive,
+            lateness,
+        };
+        crate::RUNTIME
+            .block_on(self.inner.register_view(spec))
+            .map_err(rt_err)
+    }
+
+    /// Feed a :class:`DeltaBatch` as input for a named source.
+    ///
+    /// Build the delta with :meth:`DeltaBatch.from_inserts`,
+    /// :meth:`DeltaBatch.from_deletes`, or :meth:`DeltaBatch.from_cdc`.
+    /// Buffered until the next :meth:`step`.
+    pub fn feed(&self, source: String, delta: PyRef<'_, PyDeltaBatch>) -> PyResult<()> {
+        let delta = delta.inner.clone();
+        crate::RUNTIME
+            .block_on(async { self.inner.feed(&source, &delta).await })
+            .map_err(rt_err)
+    }
+
+    /// Feed a full streaming snapshot; differentiated against the previous
+    /// snapshot for this source.
+    pub fn feed_snapshot(&self, source: String, batches: Vec<PyRef<'_, PyBatch>>) -> PyResult<()> {
+        let rbs: Vec<_> = batches.iter().map(|b| b.record_batch().clone()).collect();
+        crate::RUNTIME
+            .block_on(async { self.inner.feed_snapshot(&source, &rbs).await })
+            .map_err(rt_err)
+    }
+
+    /// Advance one tick. Returns a :class:`StepSummary`.
+    pub fn step(&self) -> PyResult<PyStepSummary> {
+        crate::RUNTIME
+            .block_on(self.inner.step())
+            .map(PyStepSummary::from)
+            .map_err(rt_err)
+    }
+
+    /// Read the current materialized snapshot of a view, or ``None``.
+    pub fn snapshot(&self, view: String) -> PyResult<Option<PyBatch>> {
+        crate::RUNTIME
+            .block_on(async { self.inner.snapshot(&view).await })
+            .map(|opt| opt.map(PyBatch::from_record_batch))
+            .map_err(rt_err)
+    }
+
+    /// Enable delta-checkpoint accumulation (embedded only; remote always on).
+    pub fn enable_delta_checkpoints(&self) -> PyResult<()> {
+        self.inner.enable_delta_checkpoints().map_err(rt_err)
+    }
+
+    /// Enable content-addressed input dedup (embedded only).
+    pub fn enable_input_dedup(&self) -> PyResult<()> {
+        self.inner.enable_input_dedup().map_err(rt_err)
+    }
+
+    /// Serialize a full checkpoint to bytes.
+    pub fn checkpoint(&self) -> PyResult<Vec<u8>> {
+        crate::RUNTIME
+            .block_on(self.inner.checkpoint())
+            .map_err(rt_err)
+    }
+
+    /// Restore from a full checkpoint.
+    pub fn restore(&self, bytes: Vec<u8>) -> PyResult<()> {
+        crate::RUNTIME
+            .block_on(async { self.inner.restore(&bytes).await })
+            .map_err(rt_err)
+    }
+
+    /// Serialize only the deltas accumulated since the last call.
+    pub fn checkpoint_delta(&self) -> PyResult<Vec<u8>> {
+        crate::RUNTIME
+            .block_on(self.inner.checkpoint_delta())
+            .map_err(rt_err)
+    }
+
+    /// Apply delta-checkpoint bytes on top of restored state.
+    pub fn restore_delta(&self, bytes: Vec<u8>) -> PyResult<()> {
+        crate::RUNTIME
+            .block_on(async { self.inner.restore_delta(&bytes).await })
+            .map_err(rt_err)
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!("IvmJob(job_id='{}')", self.inner.job_id())
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    fn make_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+            .expect("valid batch")
+    }
+
+    #[test]
+    fn delta_batch_from_inserts_num_rows() {
+        let cb = DeltaBatch::from_inserts(make_batch()).expect("from_inserts");
+        let py_cb = PyDeltaBatch { inner: cb };
+        assert_eq!(py_cb.num_rows(), 3);
+        assert!(!py_cb.is_empty());
+    }
+
+    #[test]
+    fn delta_batch_from_cdc_insert_and_noop() {
+        // INSERT
+        let inner = DeltaBatch::from_cdc(None, Some(make_batch()))
+            .expect("from_cdc")
+            .expect("insert produces a delta");
+        let py_cb = PyDeltaBatch { inner };
+        assert_eq!(py_cb.num_rows(), 3);
+        // no-op
+        assert!(DeltaBatch::from_cdc(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn step_summary_carries_tick() {
+        let summary = PyStepSummary::from(StepReport {
+            active_views: 2,
+            total_output_rows: 5,
+            tick: 7,
+        });
+        assert_eq!(summary.tick, 7);
+        assert_eq!(summary.active_views, 2);
+        assert_eq!(summary.total_output_rows, 5);
+    }
+}

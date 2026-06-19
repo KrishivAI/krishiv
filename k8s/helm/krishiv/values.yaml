@@ -1,0 +1,83 @@
+# Default values for the Krishiv Helm chart.
+# Override with --set or a values file: helm install krishiv ./krishiv -f my-values.yaml
+
+image:
+  repository: ghcr.io/krishivai/krishiv
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+coordinator:
+  replicas: 1
+  port: 7070
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  # TLS — set cert/key as base64-encoded PEM strings to enable mTLS.
+  tls:
+    enabled: false
+    certPem: ""
+    keyPem: ""
+    caPem: ""
+
+executor:
+  replicas: 3
+  port: 7071
+  resources:
+    requests:
+      cpu: "1"
+      memory: "1Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+
+coordinatorAuth:
+  secretName: "krishiv-coordinator-auth"
+  secretKey: "token"
+  rotationSecretKey: "tokens"
+  mountPath: "/var/run/krishiv/coordinator-auth"
+  reloadIntervalSeconds: 30
+
+executorTaskAuth:
+  secretName: "krishiv-executor-task-auth"
+  secretKey: "token"
+
+operator:
+  enabled: true
+  replicas: 1
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+# Kubernetes namespace for all Krishiv resources.
+namespace: krishiv-system
+
+# Leader election lease duration in seconds (coordinator HA).
+leaderElection:
+  leaseDurationSeconds: 15
+  renewDeadlineSeconds: 10
+  retryPeriodSeconds: 2
+
+# Observability — OTLP endpoint for traces and metrics.
+# Leave empty to use the stdout exporter (development default).
+observability:
+  otlpEndpoint: ""
+  serviceName: "krishiv"
+
+# RBAC — service account and cluster role bindings.
+rbac:
+  create: true
+  serviceAccountName: "krishiv"
+
+# Storage for shuffle and checkpoint data.
+storage:
+  shuffleClass: ""        # StorageClass for shuffle PVCs; "" = cluster default
+  checkpointClass: ""     # StorageClass for checkpoint PVCs; "" = cluster default
+  checkpointSizeGi: 10

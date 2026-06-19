@@ -1,0 +1,13 @@
+apiVersion: krishiv.dev/v1alpha1
+kind: KrishivJob
+metadata:
+  name: example-batch-job
+  namespace: krishiv-system
+spec:
+  # Explicitly enable the Job Coordinator Pod (JCP) isolation
+  jcpEnabled: true
+  durabilityProfile: "tiered"
+  type: batch
+  sql: "SELECT 1 as operator_test;"
+  executors:
+    replicas: 2

@@ -1,0 +1,553 @@
+syntax = "proto3";
+
+package krishiv.transport.v1;
+
+service CoordinatorExecutor {
+  rpc RegisterExecutor(RegisterExecutorRequest) returns (RegisterExecutorResponse);
+  rpc DeregisterExecutor(DeregisterExecutorRequest) returns (DeregisterExecutorResponse);
+  rpc ExecutorHeartbeat(ExecutorHeartbeatRequest) returns (ExecutorHeartbeatResponse);
+  rpc TaskStatus(TaskStatusRequest) returns (TaskStatusResponse);
+  rpc CheckpointAck(CheckpointAckRequest) returns (CheckpointAckResponse);
+}
+
+service ExecutorTask {
+  rpc AssignTask(ExecutorTaskAssignment) returns (TaskStatusResponse);
+  rpc CancelTask(TaskCancellationRequest) returns (TaskStatusResponse);
+  rpc PushContinuousInput(PushContinuousInputRequest) returns (TaskStatusResponse);
+  rpc DrainContinuousOutput(DrainContinuousOutputRequest) returns (DrainContinuousOutputResponse);
+}
+
+// Management API for CLI-to-coordinator operations (GAP-RT-04).
+service CoordinatorManagement {
+  rpc TriggerSavepoint(TriggerSavepointRequest) returns (TriggerSavepointResponse);
+  rpc RestoreJob(RestoreJobRequest) returns (RestoreJobResponse);
+  rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+  rpc InspectState(InspectStateRequest) returns (InspectStateResponse);
+}
+
+message TransportVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+message ExecutorDescriptor {
+  string executor_id = 1;
+  string host = 2;
+  uint64 slots = 3;
+  string task_endpoint = 4;
+  // gRPC endpoint for BarrierService (ADR-R16.1); empty = derive from task_endpoint host.
+  string barrier_endpoint = 5;
+}
+
+message RegisterExecutorRequest {
+  TransportVersion version = 1;
+  ExecutorDescriptor descriptor = 2;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 3;
+  string trace_state = 4;
+}
+
+message RegisterExecutorResponse {
+  TransportVersion version = 1;
+  string executor_id = 2;
+  uint64 lease_generation = 3;
+  TransportDisposition disposition = 4;
+  string message = 5;
+}
+
+message DeregisterExecutorRequest {
+  TransportVersion version = 1;
+  string executor_id = 2;
+  uint64 lease_generation = 3;
+  string reason = 4;
+}
+
+message DeregisterExecutorResponse {
+  TransportVersion version = 1;
+  string executor_id = 2;
+  uint64 lease_generation = 3;
+  TransportDisposition disposition = 4;
+  string message = 5;
+}
+
+message TaskAttemptRef {
+  string job_id = 1;
+  string stage_id = 2;
+  string task_id = 3;
+  uint32 attempt_id = 4;
+}
+
+message StreamingProgressReport {
+  string job_id = 1;
+  string task_id = 2;
+  int64 watermark_ms = 3;
+  uint64 rows_emitted = 4;
+  uint64 batches_emitted = 5;
+  uint64 state_bytes = 6;
+  bytes source_offset = 7;
+  uint64 timestamp_ms = 8;
+}
+
+message HeartbeatHotKeyReport {
+  string key = 1;
+  uint64 estimated_count = 2;
+  uint64 max_error = 3;
+  double heat_score = 4;
+  string job_id = 5;
+  string source_id = 6;
+}
+
+// Per-task streaming re-attach state reported by the executor on the first
+// heartbeat after a coordinator restart (re-attach protocol).
+message StreamingTaskStateWire {
+  string task_id = 1;
+  uint64 watermark_ms = 2;
+  bytes source_offset = 3;
+}
+
+message ExecutorHeartbeatRequest {
+  TransportVersion version = 1;
+  string executor_id = 2;
+  uint64 lease_generation = 3;
+  ExecutorState state = 4;
+  repeated TaskAttemptRef running_attempts = 5;
+  // Per-executor resource telemetry (P0.17).
+  uint64 memory_used_bytes = 6;
+  uint64 memory_limit_bytes = 7;
+  uint32 active_task_count = 8;
+  // Per-executor network and CPU resource usage (P0.17).
+  double cpu_cores_used = 9;
+  uint64 network_bytes_sent = 10;
+  uint64 network_bytes_recv = 11;
+  // R17: per-model LLM API usage since last heartbeat.
+  repeated LlmQuotaReport llm_quota_reports = 12;
+  // Streaming progress snapshots from continuous tasks.
+  repeated StreamingProgressReport streaming_progress = 13;
+  // R7.2: hot-key frequency estimates from the executor's SpaceSaving tracker.
+  repeated HeartbeatHotKeyReport hot_key_reports = 14;
+  // Re-attach protocol: per-task streaming state for coordinator-restart recovery.
+  repeated StreamingTaskStateWire streaming_task_states = 15;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 16;
+  string trace_state = 17;
+}
+
+message InitiateCheckpointCommand {
+  string job_id = 1;
+  uint64 epoch = 2;
+  uint64 fencing_token = 3;
+}
+
+// Coordinator → executor: checkpoint epoch is durably committed.  Executors
+// commit transactional-sink output prepared at or before this epoch.
+message CheckpointCompleteCommand {
+  string job_id = 1;
+  uint64 epoch = 2;
+  uint64 fencing_token = 3;
+}
+
+// Coordinator → executor: reload job state from checkpoint `epoch`.  Executors
+// restore operator snapshots, re-seed source offsets, and abort transactional
+// sink output prepared after `epoch`.
+message RestoreFromCheckpointCommand {
+  string job_id = 1;
+  uint64 epoch = 2;
+  uint64 fencing_token = 3;
+}
+
+message ExecutorHeartbeatResponse {
+  TransportVersion version = 1;
+  uint64 lease_generation = 2;
+  TransportDisposition disposition = 3;
+  string message = 4;
+  // R17: coordinator throttle directives for LLM UDF rate limiters.
+  repeated LlmThrottleCommand llm_throttles = 5;
+  repeated InitiateCheckpointCommand initiate_checkpoints = 6;
+  // R7.2: per-source backpressure credit directives from the adaptive governor.
+  repeated HeartbeatThrottleCommand source_throttles = 7;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 8;
+  string trace_state = 9;
+  // Committed-epoch notifications driving transactional-sink commits.
+  repeated CheckpointCompleteCommand completed_checkpoints = 10;
+  // Restore directives driving executor-side state/offset reload.
+  repeated RestoreFromCheckpointCommand restore_checkpoints = 11;
+}
+
+message ShuffleWriteConfigWire {
+  string stage_id = 1;
+  uint64 num_partitions = 2;
+  repeated string key_columns = 3;
+  uint64 lease_token = 4;
+}
+
+message ShuffleReadConfigWire {
+  string stage_id = 1;
+  uint64 partition_id = 2;
+  uint64 lease_token = 3;
+}
+
+message ExecutorTaskAssignment {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string stage_id = 3;
+  string task_id = 4;
+  uint32 attempt_id = 5;
+  string executor_id = 6;
+  uint64 lease_generation = 7;
+  repeated InputPartition input_partitions = 8;
+  PlanFragment plan_fragment = 9;
+  OutputContract output_contract = 10;
+  uint64 task_timeout_secs = 11;
+  uint32 key_group_range_start = 12;
+  uint32 key_group_range_end = 13;
+  bool has_key_group_range = 14;
+  uint64 cpu_limit_nanos = 15;
+  uint64 memory_limit_bytes = 16;
+  // R4a: shuffle write/read configuration (omitted for non-shuffle tasks).
+  ShuffleWriteConfigWire shuffle_write = 17;
+  ShuffleReadConfigWire shuffle_read = 18;
+  // Explicit re-attach signal: true for continuous streaming tasks.
+  bool requires_reattach = 19;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 20;
+  string trace_state = 21;
+}
+
+message InputPartition {
+  string partition_id = 1;
+  string description = 2;
+  InputPartitionDescriptor descriptor = 3;
+}
+
+message InputPartitionDescriptor {
+  InputPartitionDescriptorKind kind = 1;
+  string table_name = 2;
+  string path = 3;
+  string object_base_dir = 4;
+  string object_path = 5;
+  string kafka_topic = 6;
+  int32 kafka_partition = 7;
+  int64 kafka_start_offset = 8;
+  repeated MemoryKafkaRecord memory_kafka_records = 9;
+  // ShuffleFlight fields.
+  string shuffle_flight_endpoint = 10;
+  string shuffle_job_id = 11;
+  string shuffle_upstream_stage_id = 12;
+  uint32 shuffle_partition_id = 13;
+  // InlineIpc fields: Arrow IPC stream bytes delivered in-band with the task assignment.
+  bytes ipc_bytes = 14;
+  // WatermarkHint: upstream stage watermark for window operator initialisation.
+  int64 watermark_ms = 15;
+}
+
+message MemoryKafkaRecord {
+  int64 id = 1;
+  string value = 2;
+}
+
+message PlanFragment {
+  string description = 1;
+  // Explicit execution model — true for streaming (continuous) tasks, false for
+  // batch (terminal) tasks. When absent (false), the executor falls back to
+  // description-based detection for backward compatibility.
+  bool is_streaming = 2;
+}
+
+message OutputContract {
+  OutputContractKind kind = 1;
+  string description = 2;
+  OutputContractDescriptor descriptor = 3;
+}
+
+message OutputContractDescriptor {
+  OutputContractDescriptorKind kind = 1;
+  string path = 2;
+  string object_base_dir = 3;
+  string object_path = 4;
+  string shuffle_partition = 5;
+}
+
+message TaskStatusRequest {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string stage_id = 3;
+  string task_id = 4;
+  uint32 attempt_id = 5;
+  string executor_id = 6;
+  uint64 lease_generation = 7;
+  TaskState state = 8;
+  string message = 9;
+  TaskOutputMetadata output_metadata = 10;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 11;
+  string trace_state = 12;
+  // Shuffle partitions found missing while fetching this task's inputs.
+  // A Failed status carrying entries here asks the coordinator to recompute
+  // the producing stage instead of only retrying this consumer task.
+  repeated MissingShufflePartitionWire missing_shuffle_partitions = 13;
+}
+
+// A shuffle partition the consumer could not fetch (producer output lost).
+message MissingShufflePartitionWire {
+  // Stage that produced the missing partition.
+  string stage_id = 1;
+  uint32 partition_id = 2;
+}
+
+// Structured shuffle partition output (replaces the parallel shuffle_partition_*
+// arrays from before the wire schema was stabilised).
+message ShufflePartitionOutputWire {
+  uint32 partition_id = 1;
+  uint64 size_bytes = 2;
+  string flight_endpoint = 3;
+}
+
+message TaskOutputMetadata {
+  string output_kind = 1;
+  uint64 row_count = 2;
+  uint64 batch_count = 3;
+  uint64 column_count = 4;
+  // Deprecated parallel arrays — superseded by shuffle_partitions (field 14).
+  // Kept for decoding messages produced before the schema migration.
+  repeated uint32 shuffle_partition_ids = 5;
+  repeated uint64 shuffle_partition_bytes = 6;
+  repeated string shuffle_flight_endpoints = 7;
+  // Runtime stats for AQE.
+  uint64 input_rows = 8;
+  uint64 output_rows = 9;
+  uint64 cpu_nanos = 10;
+  uint64 spill_bytes = 11;
+  // Arrow IPC stream bytes for each inline result batch (SQL / window collect).
+  repeated bytes inline_record_batch_ipc = 12;
+  // Peak memory used by this task in bytes (AQE input).
+  uint64 memory_bytes = 13;
+  // Structured shuffle partition outputs (preferred over fields 5-7).
+  repeated ShufflePartitionOutputWire shuffle_partitions = 14;
+  // Maximum event-time watermark (ms) emitted by streaming window tasks.
+  int64 watermark_ms = 15;
+  // True when watermark_ms carries a valid value (distinguishes 0 from absent).
+  bool has_watermark_ms = 16;
+  // True when runtime stats are present (allows zero-output tasks to carry stats).
+  bool has_runtime_stats = 17;
+  // Hot-key reports from HeavyHittersTracker observed during shuffle write.
+  repeated HeartbeatHotKeyReport hot_key_reports = 18;
+  // Staged sink files written by this task (paths relative to the sink
+  // base_dir). Populated by object-parquet sink tasks running the Phase 2.3
+  // staged commit protocol; the coordinator publishes them on job success.
+  repeated string sink_staged_files = 19;
+}
+
+message TaskCancellationRequest {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string stage_id = 3;
+  string task_id = 4;
+  uint32 attempt_id = 5;
+  string reason = 6;
+}
+
+message TaskStatusResponse {
+  TransportVersion version = 1;
+  TransportDisposition disposition = 2;
+  string message = 3;
+  // W3C traceparent header for distributed tracing.
+  string trace_parent = 4;
+  string trace_state = 5;
+}
+
+enum ExecutorState {
+  EXECUTOR_STATE_UNSPECIFIED = 0;
+  EXECUTOR_STATE_REGISTERED = 1;
+  EXECUTOR_STATE_HEALTHY = 2;
+  EXECUTOR_STATE_LOST = 3;
+  EXECUTOR_STATE_DRAINING = 4;
+  EXECUTOR_STATE_REMOVED = 5;
+}
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_PENDING = 1;
+  TASK_STATE_ASSIGNED = 2;
+  TASK_STATE_RUNNING = 3;
+  TASK_STATE_SUCCEEDED = 4;
+  TASK_STATE_FAILED = 5;
+  TASK_STATE_RETRYING = 6;
+  TASK_STATE_CANCELLED = 7;
+}
+
+enum InputPartitionDescriptorKind {
+  INPUT_PARTITION_DESCRIPTOR_KIND_UNSPECIFIED = 0;
+  INPUT_PARTITION_DESCRIPTOR_KIND_LOCAL_PARQUET = 1;
+  INPUT_PARTITION_DESCRIPTOR_KIND_CONNECTOR_PARQUET = 2;
+  INPUT_PARTITION_DESCRIPTOR_KIND_OBJECT_PARQUET = 3;
+  INPUT_PARTITION_DESCRIPTOR_KIND_MEMORY_KAFKA = 4;
+  // Arrow Flight endpoint for reading upstream shuffle output.
+  INPUT_PARTITION_DESCRIPTOR_KIND_SHUFFLE_FLIGHT = 5;
+  // Arrow IPC stream bytes delivered inline with the task assignment.
+  INPUT_PARTITION_DESCRIPTOR_KIND_INLINE_IPC = 6;
+  // Upstream stage watermark hint for window operator initialisation.
+  INPUT_PARTITION_DESCRIPTOR_KIND_WATERMARK_HINT = 7;
+}
+
+enum OutputContractDescriptorKind {
+  OUTPUT_CONTRACT_DESCRIPTOR_KIND_UNSPECIFIED = 0;
+  OUTPUT_CONTRACT_DESCRIPTOR_KIND_INLINE_RECORD_BATCHES = 1;
+  OUTPUT_CONTRACT_DESCRIPTOR_KIND_LOCAL_FILE = 2;
+  OUTPUT_CONTRACT_DESCRIPTOR_KIND_SHUFFLE = 3;
+  OUTPUT_CONTRACT_DESCRIPTOR_KIND_OBJECT_PARQUET_SINK = 4;
+  OUTPUT_CONTRACT_DESCRIPTOR_KIND_PARQUET_SINK = 5;
+}
+
+enum OutputContractKind {
+  OUTPUT_CONTRACT_KIND_UNSPECIFIED = 0;
+  OUTPUT_CONTRACT_KIND_INLINE_RECORD_BATCHES = 1;
+  OUTPUT_CONTRACT_KIND_LOCAL_FILE = 2;
+  OUTPUT_CONTRACT_KIND_SHUFFLE = 3;
+  OUTPUT_CONTRACT_KIND_SINK = 4;
+}
+
+message CheckpointSourceOffset {
+  string partition_id = 1;
+  int64 offset = 2;
+}
+
+message CheckpointAckRequest {
+  string job_id = 1;
+  string operator_id = 2;
+  string task_id = 3;
+  uint64 epoch = 4;
+  uint64 fencing_token = 5;
+  repeated CheckpointSourceOffset source_offsets = 6;
+  string snapshot_path = 7;
+}
+
+message CheckpointAckResponse {
+  oneof result {
+    CheckpointAckAccepted accepted = 1;
+    CheckpointAckStaleEpoch stale_epoch = 2;
+    CheckpointAckJobNotFound job_not_found = 3;
+    CheckpointAckStaleFencingToken stale_fencing_token = 4;
+  }
+}
+
+message CheckpointAckAccepted {}
+
+message CheckpointAckStaleEpoch {
+  uint64 current_epoch = 1;
+}
+
+message CheckpointAckJobNotFound {}
+
+message CheckpointAckStaleFencingToken {
+  uint64 current_token = 1;
+}
+
+// ── CoordinatorManagement messages ──────────────────────────────────────────
+
+message TriggerSavepointRequest {
+  string job_id = 1;
+  string label = 2;
+  // When true, the job is cancelled once the savepoint epoch is durably
+  // committed and preserved (stop-with-savepoint).
+  bool stop = 3;
+}
+
+message TriggerSavepointResponse {
+  uint64 epoch = 1;
+  string message = 2;
+}
+
+message RestoreJobRequest {
+  string job_id = 1;
+  uint64 epoch = 2;
+  string storage_path = 3;
+  // When true, `epoch` names a savepoint in the durable savepoints area.
+  bool from_savepoint = 4;
+}
+
+message RestoreJobResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ListCheckpointsRequest {
+  string job_id = 1;
+}
+
+message CheckpointEpochInfo {
+  uint64 epoch = 1;
+  bool is_savepoint = 2;
+  string savepoint_label = 3;
+}
+
+message ListCheckpointsResponse {
+  repeated CheckpointEpochInfo epochs = 1;
+}
+
+message InspectStateRequest {
+  string job_id = 1;
+  string operator_id = 2;
+}
+
+message StateSnapshotInfo {
+  string task_id = 1;
+  string snapshot_path = 2;
+}
+
+message InspectStateResponse {
+  repeated StateSnapshotInfo snapshots = 1;
+}
+
+enum TransportDisposition {
+  TRANSPORT_DISPOSITION_UNSPECIFIED = 0;
+  TRANSPORT_DISPOSITION_ACCEPTED = 1;
+  TRANSPORT_DISPOSITION_REJECTED = 2;
+  TRANSPORT_DISPOSITION_DUPLICATE = 3;
+  TRANSPORT_DISPOSITION_STALE_ATTEMPT = 4;
+  TRANSPORT_DISPOSITION_STALE_LEASE = 5;
+  TRANSPORT_DISPOSITION_UNKNOWN_JOB = 6;
+  TRANSPORT_DISPOSITION_UNKNOWN_TASK = 7;
+  TRANSPORT_DISPOSITION_UNKNOWN_EXECUTOR = 8;
+}
+
+// R17: LLM UDF quota reporting and coordinator throttling.
+message LlmQuotaReport {
+  string model = 1;
+  uint64 requests_used = 2;
+  uint64 tokens_used = 3;
+  uint64 period_ms = 4;
+}
+
+message LlmThrottleCommand {
+  string model = 1;
+  uint32 max_requests_per_minute = 2;
+  uint64 max_tokens_per_minute = 3;
+}
+
+// R7.2: coordinator → executor per-source backpressure credit.
+// rows_per_second == 0 means "clear the throttle" (unlimited).
+message HeartbeatThrottleCommand {
+  string source_id = 1;
+  uint64 rows_per_second = 2;
+  bool throttle_cleared = 3;
+}
+
+message PushContinuousInputRequest {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string task_id = 3;
+  bytes ipc_bytes = 4;
+}
+
+message DrainContinuousOutputRequest {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string task_id = 3;
+}
+
+message DrainContinuousOutputResponse {
+  TransportVersion version = 1;
+  TransportDisposition disposition = 2;
+  bytes ipc_bytes = 3;
+}

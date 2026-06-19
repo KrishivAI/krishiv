@@ -1,0 +1,333 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Krishiv Operations API",
+    "description": "Read-mostly operations surface for the Krishiv compute engine: job/stage/task snapshots, executor health, namespace quotas, completed-job history, ad-hoc SQL, and a per-job observability report. All `/api/v1/*` routes require a bearer token when the server is started with a UI token configured.",
+    "version": "1.0.0"
+  },
+  "servers": [{ "url": "/", "description": "The Krishiv UI / coordinator HTTP server" }],
+  "tags": [
+    { "name": "jobs", "description": "Live job, stage and task state" },
+    { "name": "executors", "description": "Executor registration and health" },
+    { "name": "queues", "description": "Per-namespace quota reservations" },
+    { "name": "history", "description": "Archived terminal jobs" },
+    { "name": "sql", "description": "Ad-hoc SQL execution" },
+    { "name": "diagnostics", "description": "Observability report" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer" }
+    },
+    "parameters": {
+      "limit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Page size (1..=1000, default 100).",
+        "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }
+      },
+      "offset": {
+        "name": "offset",
+        "in": "query",
+        "required": false,
+        "description": "Number of records to skip (default 0).",
+        "schema": { "type": "integer", "minimum": 0, "default": 0 }
+      }
+    },
+    "schemas": {
+      "ResourceUsage": {
+        "type": "object",
+        "properties": {
+          "cpu_nanos": { "type": "integer", "format": "int64" },
+          "memory_peak_task_bytes": { "type": "integer", "format": "int64" },
+          "memory_total_bytes": { "type": "integer", "format": "int64" },
+          "task_count": { "type": "integer", "format": "int32" }
+        }
+      },
+      "JobSummary": {
+        "type": "object",
+        "properties": {
+          "job_id": { "type": "string" },
+          "kind": { "type": "string" },
+          "state": { "type": "string" },
+          "stage_count": { "type": "integer" },
+          "task_count": { "type": "integer" },
+          "assigned_task_count": { "type": "integer" },
+          "running_task_count": { "type": "integer" },
+          "succeeded_task_count": { "type": "integer" },
+          "failed_task_count": { "type": "integer" },
+          "priority": { "type": "integer", "minimum": 0, "maximum": 255 },
+          "namespace_id": { "type": ["string", "null"] },
+          "resource_usage": { "$ref": "#/components/schemas/ResourceUsage" }
+        }
+      },
+      "Task": {
+        "type": "object",
+        "properties": {
+          "task_id": { "type": "string" },
+          "state": { "type": "string" },
+          "assigned_executor": { "type": "string" },
+          "attempt": { "type": "integer" },
+          "failure_count": { "type": "integer" },
+          "failure_reason_display": { "type": "string" },
+          "last_watermark_display": { "type": "string" },
+          "last_source_offset_display": { "type": "string" }
+        }
+      },
+      "Stage": {
+        "type": "object",
+        "properties": {
+          "stage_id": { "type": "string" },
+          "state": { "type": "string" },
+          "retry_count": { "type": "integer" },
+          "task_count": { "type": "integer" },
+          "tasks": { "type": "array", "items": { "$ref": "#/components/schemas/Task" } }
+        }
+      },
+      "JobDetail": {
+        "type": "object",
+        "properties": {
+          "summary": { "$ref": "#/components/schemas/JobSummary" },
+          "stages": { "type": "array", "items": { "$ref": "#/components/schemas/Stage" } }
+        }
+      },
+      "JobsResponse": {
+        "type": "object",
+        "properties": {
+          "jobs": { "type": "array", "items": { "$ref": "#/components/schemas/JobSummary" } },
+          "total": { "type": "integer" },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" }
+        }
+      },
+      "JobDetailResponse": {
+        "type": "object",
+        "properties": { "job": { "$ref": "#/components/schemas/JobDetail" } }
+      },
+      "JobCheckpointsResponse": {
+        "type": "object",
+        "properties": {
+          "job_id": { "type": "string" },
+          "epochs": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "latest_epoch": { "type": ["integer", "null"], "format": "int64" }
+        }
+      },
+      "Executor": {
+        "type": "object",
+        "properties": {
+          "executor_id": { "type": "string" },
+          "state": { "type": "string" },
+          "slots": { "type": "integer" },
+          "host": { "type": "string" },
+          "running_tasks": { "type": "array", "items": { "type": "string" } },
+          "last_heartbeat_tick": { "type": "integer", "format": "int64" },
+          "lease_generation": { "type": "integer", "format": "int64" },
+          "memory_used_bytes": { "type": ["integer", "null"], "format": "int64" },
+          "memory_limit_bytes": { "type": ["integer", "null"], "format": "int64" },
+          "active_task_count": { "type": ["integer", "null"], "format": "int32" }
+        }
+      },
+      "ExecutorsResponse": {
+        "type": "object",
+        "properties": {
+          "executors": { "type": "array", "items": { "$ref": "#/components/schemas/Executor" } }
+        }
+      },
+      "ExecutorDetailResponse": {
+        "type": "object",
+        "properties": { "executor": { "$ref": "#/components/schemas/Executor" } }
+      },
+      "NamespaceQuota": {
+        "type": "object",
+        "properties": {
+          "namespace_id": { "type": ["string", "null"] },
+          "cpu_nanos_reserved": { "type": "integer", "format": "int64" },
+          "memory_bytes_reserved": { "type": "integer", "format": "int64" },
+          "active_job_count": { "type": "integer" }
+        }
+      },
+      "QueuesResponse": {
+        "type": "object",
+        "properties": {
+          "namespaces": { "type": "array", "items": { "$ref": "#/components/schemas/NamespaceQuota" } }
+        }
+      },
+      "JobHistory": {
+        "type": "object",
+        "properties": {
+          "job_id": { "type": "string" },
+          "job_kind": { "type": "string" },
+          "final_state": { "type": "string" },
+          "completed_at_ms": { "type": "integer", "format": "int64" },
+          "stage_count": { "type": "integer" },
+          "task_count": { "type": "integer" },
+          "succeeded_task_count": { "type": "integer", "format": "int32" },
+          "failed_task_count": { "type": "integer", "format": "int32" },
+          "cpu_nanos": { "type": "integer", "format": "int64" },
+          "memory_peak_task_bytes": { "type": "integer", "format": "int64" },
+          "namespace_id": { "type": ["string", "null"] },
+          "priority": { "type": "integer", "minimum": 0, "maximum": 255 }
+        }
+      },
+      "JobHistoryListResponse": {
+        "type": "object",
+        "properties": {
+          "records": { "type": "array", "items": { "$ref": "#/components/schemas/JobHistory" } },
+          "total": { "type": "integer" },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" }
+        }
+      },
+      "SqlQueryRequest": {
+        "type": "object",
+        "required": ["query"],
+        "properties": { "query": { "type": "string" } }
+      },
+      "SqlQueryResponse": {
+        "type": "object",
+        "properties": {
+          "columns": { "type": "array", "items": { "type": "string" } },
+          "rows": { "type": "array", "items": { "type": "array", "items": {} } },
+          "error": { "type": ["string", "null"] },
+          "row_count": { "type": "integer" },
+          "elapsed_ms": { "type": "integer", "format": "int64" }
+        }
+      }
+    }
+  },
+  "security": [{ "bearerAuth": [] }],
+  "paths": {
+    "/api/v1/jobs": {
+      "get": {
+        "tags": ["jobs"],
+        "summary": "List jobs known to the coordinator (paginated).",
+        "parameters": [
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of job summaries.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobsResponse" } } }
+          },
+          "401": { "description": "Missing or invalid bearer token." }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}": {
+      "get": {
+        "tags": ["jobs"],
+        "summary": "Job detail with stages and tasks.",
+        "parameters": [{ "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Job detail.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobDetailResponse" } } } },
+          "404": { "description": "Unknown job." }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/checkpoints": {
+      "get": {
+        "tags": ["jobs"],
+        "summary": "Committed checkpoint epochs for a job.",
+        "parameters": [{ "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Checkpoint epochs.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobCheckpointsResponse" } } } },
+          "404": { "description": "Unknown job." }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/diagnose": {
+      "get": {
+        "tags": ["diagnostics"],
+        "summary": "Full observability report for a job (job/stage/task graph, executors, checkpoint, streaming state).",
+        "parameters": [{ "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Observability report.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "404": { "description": "Unknown job." }
+        }
+      }
+    },
+    "/api/v1/executors": {
+      "get": {
+        "tags": ["executors"],
+        "summary": "List registered executors.",
+        "responses": {
+          "200": { "description": "Executors.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ExecutorsResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/executors/{executor_id}": {
+      "get": {
+        "tags": ["executors"],
+        "summary": "Executor detail.",
+        "parameters": [{ "name": "executor_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Executor detail.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ExecutorDetailResponse" } } } },
+          "404": { "description": "Unknown executor." }
+        }
+      }
+    },
+    "/api/v1/queues": {
+      "get": {
+        "tags": ["queues"],
+        "summary": "Per-namespace quota reservations across active jobs.",
+        "responses": {
+          "200": { "description": "Namespace quotas.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueuesResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/history": {
+      "get": {
+        "tags": ["history"],
+        "summary": "List archived terminal jobs (paginated, most-recent first).",
+        "parameters": [
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" }
+        ],
+        "responses": {
+          "200": { "description": "Page of history records.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobHistoryListResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/history/{job_id}": {
+      "get": {
+        "tags": ["history"],
+        "summary": "Single archived job by id.",
+        "parameters": [{ "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "History record.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobHistory" } } } },
+          "404": { "description": "No history for this job." }
+        }
+      }
+    },
+    "/api/v1/sql": {
+      "post": {
+        "tags": ["sql"],
+        "summary": "Execute an ad-hoc SQL query (requires the server to be started with a SQL engine).",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SqlQueryRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Query result (errors are reported in the `error` field).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SqlQueryResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "tags": ["diagnostics"],
+        "summary": "This OpenAPI document.",
+        "security": [],
+        "responses": { "200": { "description": "OpenAPI 3.1 document.", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["diagnostics"],
+        "summary": "Prometheus exposition of Krishiv counters/gauges/histograms.",
+        "security": [],
+        "responses": { "200": { "description": "Prometheus text format.", "content": { "text/plain": { "schema": { "type": "string" } } } } }
+      }
+    }
+  }
+}

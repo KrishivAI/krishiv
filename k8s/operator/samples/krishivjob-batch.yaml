@@ -1,0 +1,18 @@
+apiVersion: krishiv.io/v1alpha1
+kind: KrishivJob
+metadata:
+  name: sample-batch
+  namespace: krishiv-system
+  labels:
+    app.kubernetes.io/name: krishiv
+    app.kubernetes.io/part-of: krishiv
+spec:
+  mode: batch
+  image: localhost/krishiv:local
+  tasks: 2
+  parallelism: 2
+  restartPolicy: Never
+  args:
+    - sql
+    - --query
+    - select 1 as value

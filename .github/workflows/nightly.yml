@@ -1,0 +1,151 @@
+name: Nightly
+
+# Publishes a fresh build from main every night.
+# Crates published to crates.io with READMEs generated from doc comments.
+# Python wheels built as artifacts (14-day retention).
+# Docker images temporarily disabled (re-enable when ready).
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 00:00 UTC daily
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/krishiv
+  CXXFLAGS: "-include cstdint"
+  RUSTC_WRAPPER: sccache
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # ── Publish crates to crates.io (nightly version) ──────────────────────────
+  # READMEs are generated from doc comments before publishing so crates.io
+  # displays descriptions on each crate page.
+  publish-crates:
+    name: Publish Crates.io
+    needs: []
+    runs-on: self-hosted
+    environment: crates-publish
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          clean: false
+      - uses: ./.github/actions/rust-setup
+      - name: Generate crate READMEs
+        run: |
+          cargo install cargo-readme --locked
+          CRATES=(
+            krishiv-common   krishiv-proto    krishiv-metrics   krishiv-plan
+            krishiv-dataflow krishiv-state    krishiv-shuffle   krishiv-connectors
+            krishiv-sql      krishiv-scheduler krishiv-executor krishiv-runtime
+            krishiv-api      krishiv-flight-sql krishiv-operator krishiv-ui
+            krishiv
+          )
+          DIRS=(
+            crates/krishiv-common   crates/krishiv-proto    crates/krishiv-metrics
+            crates/krishiv-plan     crates/krishiv-dataflow crates/krishiv-state
+            crates/krishiv-shuffle  crates/krishiv-connectors crates/krishiv-sql
+            crates/krishiv-scheduler crates/krishiv-executor crates/krishiv-runtime
+            crates/krishiv-api      crates/krishiv-flight-sql crates/krishiv-operator
+            crates/krishiv-ui       crates/krishiv
+          )
+          for i in "${!CRATES[@]}"; do
+            crate="${CRATES[$i]}"
+            dir="${DIRS[$i]}"
+            echo "==> README for ${crate} (${dir})"
+            cargo readme -p "${crate}" > "${dir}/README.md" 2>&1 || true
+          done
+      - name: Publish crates in topological order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -e
+          CRATES=(
+            krishiv-common
+            krishiv-proto
+            krishiv-metrics
+            krishiv-plan
+            krishiv-dataflow
+            krishiv-state
+            krishiv-shuffle
+            krishiv-connectors
+            krishiv-sql
+            krishiv-scheduler
+            krishiv-executor
+            krishiv-runtime
+            krishiv-api
+            krishiv-flight-sql
+            krishiv-operator
+            krishiv-ui
+            krishiv
+          )
+          for crate in "${CRATES[@]}"; do
+            echo "==> Publishing ${crate}"
+            cargo publish -p "${crate}" --no-verify --allow-dirty 2>&1 || true
+            echo "---"
+            sleep 30
+          done
+
+  # ── Docker nightly images ──────────────────────────────────────────────────
+  # Temporarily disabled. Re-enable when Docker CI is ready:
+  #   docker-nightly:
+  #     name: Docker Nightly
+  #     runs-on: self-hosted
+  #     steps: ...
+
+  # ── Python nightly wheels ────────────────────────────────────────────────────
+  wheels-nightly:
+    name: Nightly Wheel (${{ matrix.os }} / ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: self-hosted
+            target: x86_64
+            manylinux: auto
+          - os: self-hosted
+            target: aarch64
+            manylinux: auto
+          - os: macos-14
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - os: macos-13
+            target: x86_64-apple-darwin
+            manylinux: "off"
+    steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          clean: false
+      - uses: actions/setup-python@v5
+        if: runner.os == 'macOS'
+        with:
+          python-version: "3.11"
+      - name: Install Python (self-hosted)
+        if: runner.os != 'macOS'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \
+            python3-pip python3-venv python3-dev
+      - uses: PyO3/maturin-action@v1
+        env:
+          RUSTC_WRAPPER: ""
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          command: build
+          args: --release --out dist/ --find-interpreter
+          working-directory: crates/krishiv-python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-wheels-${{ matrix.os }}-${{ matrix.target }}-${{ github.run_id }}
+          path: dist/*.whl
+          retention-days: 14

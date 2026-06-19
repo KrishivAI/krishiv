@@ -1,15 +1,33 @@
-# Embedded Example Placeholder
+# Embedded Examples
 
-This directory will hold R1 embedded-mode examples.
+Embedded examples use the `krishiv` crate directly — the unified user-facing library
+that re-exports all public APIs under a single `use krishiv::...` import.
 
-Expected first example:
+Run local SQL over a generated Parquet file:
 
-```rust
-use krishiv_api::{ExecutionMode, Session};
-
-let session = Session::builder()
-    .with_execution_mode(ExecutionMode::Embedded)
-    .build()?;
+```bash
+cargo run -p krishiv-rust-examples --bin batch_sql
 ```
 
-The current bootstrap slice only validates the API shape.
+Run a bounded in-memory stream pipeline:
+
+```bash
+cargo run -p krishiv-rust-examples --bin memory_stream
+```
+
+The source files live under `examples/rust/src/bin/`.
+
+## Rust API Quick-Start
+
+```rust
+use krishiv::prelude::*;
+
+// Batch SQL
+let session = Session::builder().build()?;
+let result = session.sql("SELECT 1 AS n")?.collect()?;
+println!("{}", result.pretty()?);
+
+// Local stream
+let stream = session.memory_stream("events", batches);
+let out = stream.collect_bounded()?;
+```

@@ -1,0 +1,146 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: krishivjobs.krishiv.io
+  labels:
+    app.kubernetes.io/name: krishiv
+    app.kubernetes.io/part-of: krishiv
+spec:
+  group: krishiv.io
+  scope: Namespaced
+  names:
+    plural: krishivjobs
+    singular: krishivjob
+    kind: KrishivJob
+    listKind: KrishivJobList
+    shortNames:
+      - kj
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Mode
+          type: string
+          jsonPath: .spec.mode
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Tasks
+          type: integer
+          jsonPath: .spec.tasks
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - mode
+                - image
+                - tasks
+              properties:
+                mode:
+                  type: string
+                  enum:
+                    - batch
+                    - streaming
+                  description: Bounded batch or early R2 streaming execution.
+                image:
+                  type: string
+                  minLength: 1
+                  description: Container image used by executors for this job.
+                tasks:
+                  type: integer
+                  minimum: 1
+                  description: Number of static tasks for the first R2 scheduler.
+                parallelism:
+                  type: integer
+                  minimum: 1
+                  description: Maximum executor task parallelism requested by the job.
+                entrypoint:
+                  type: array
+                  items:
+                    type: string
+                  description: Optional container entrypoint override.
+                args:
+                  type: array
+                  items:
+                    type: string
+                  description: Optional container arguments.
+                restartPolicy:
+                  type: string
+                  enum:
+                    - Never
+                    - OnFailure
+                  default: Never
+                labels:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: Optional labels propagated to R2 runtime objects.
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Accepted
+                    - Planning
+                    - Running
+                    - Succeeded
+                    - Failed
+                    - Cancelled
+                coordinator:
+                  type: string
+                observedGeneration:
+                  type: integer
+                  format: int64
+                stages:
+                  type: integer
+                  minimum: 0
+                tasks:
+                  type: object
+                  properties:
+                    assigned:
+                      type: integer
+                      minimum: 0
+                    running:
+                      type: integer
+                      minimum: 0
+                    succeeded:
+                      type: integer
+                      minimum: 0
+                    failed:
+                      type: integer
+                      minimum: 0
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
