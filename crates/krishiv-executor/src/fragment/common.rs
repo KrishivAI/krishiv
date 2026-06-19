@@ -4,13 +4,15 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray};
+use arrow::array::{
+    Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+};
 use arrow::datatypes::DataType;
+use krishiv_dataflow::adaptive::HeavyHittersTracker;
 use krishiv_proto::{
     HeartbeatHotKeyReport, InputPartitionDescriptor, JobId, OutputContract,
     OutputContractDescriptor, TaskState, TransportDisposition,
 };
-use krishiv_dataflow::adaptive::HeavyHittersTracker;
 
 use crate::runner::{
     CONNECTOR_PARQUET_PARTITION_PREFIX, LocalParquetPartition, OBJECT_PARQUET_PARTITION_PREFIX,

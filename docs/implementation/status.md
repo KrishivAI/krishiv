@@ -1,5 +1,28 @@
 # Krishiv Implementation Status
 
+## 2026-06-19 — Main merge conflict resolution
+
+Merged `origin/main` into `codex/build-production-quality-web-application-12qqbz`
+and resolved the web app conflicts.
+
+### What changed
+- Resolved conflicts in the homepage, architecture page, shared shell component,
+  and global CSS by keeping the readable branch implementations.
+- Accepted `origin/main`'s web package metadata updates: pnpm package manager
+  metadata, Cloudflare scripts, and npm lockfile removal.
+- Applied required mechanical rustfmt output in executor/runtime files.
+- Fixed one scheduler clippy lint in memory-admission logging by collapsing the
+  nested capacity check.
+
+### Validation
+- `cargo fmt --check`
+- `cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings`
+- `npm --prefix web run build`
+- `npm --prefix web run typecheck`
+
+### Next useful command
+`git status --short --branch`
+
 ## 2026-06-19 — Coordinator/Scheduler/Executor audit fixes
 
 Applied all actionable findings from the P0–P2 audit across coordinator,

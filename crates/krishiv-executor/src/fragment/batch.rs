@@ -738,9 +738,9 @@ async fn execute_memory_kafka_to_parquet(
             .checkpoint_runners
             .entry(task_id.clone())
             .or_insert_with(|| {
-                std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::runner::TaskRunner::new(task_id),
-                ))
+                std::sync::Arc::new(std::sync::Mutex::new(crate::runner::TaskRunner::new(
+                    task_id,
+                )))
             })
             .lock()
             .unwrap()
@@ -922,9 +922,9 @@ async fn execute_broker_kafka_two_phase(
             .checkpoint_runners
             .entry(task_id.clone())
             .or_insert_with(|| {
-                std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::runner::TaskRunner::new(task_id),
-                ))
+                std::sync::Arc::new(std::sync::Mutex::new(crate::runner::TaskRunner::new(
+                    task_id,
+                )))
             })
             .lock()
             .unwrap()
@@ -1211,4 +1211,3 @@ fn shuffle_seed_from_job_id(job_id: &str) -> u64 {
     hasher.write(job_id.as_bytes());
     hasher.finish()
 }
-
