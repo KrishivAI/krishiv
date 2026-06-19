@@ -20,7 +20,18 @@ export function Header() {
   return (
     <header className="header">
       <Link className="brand" href="/">
-        <span className="mark">K</span>
+        <span className="mark" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" width="26" height="26">
+            <g fill="#F59E0B">
+              <rect x="4"  y="10" width="5" height="12" rx="2"/>
+              <rect x="11" y="6"  width="5" height="16" rx="2"/>
+              <rect x="18" y="10" width="5" height="12" rx="2"/>
+              <rect x="8"  y="22" width="9" height="20" rx="1"/>
+            </g>
+            <line x1="17" y1="32" x2="42" y2="20" stroke="#F59E0B" strokeWidth="7" strokeLinecap="round"/>
+            <line x1="17" y1="32" x2="42" y2="44" stroke="#F59E0B" strokeWidth="7" strokeLinecap="round"/>
+          </svg>
+        </span>
         <span>Krishiv</span>
       </Link>
       <nav className="nav" aria-label="Primary navigation">

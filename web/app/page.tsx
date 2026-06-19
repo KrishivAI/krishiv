@@ -1,15 +1,54 @@
 import Link from 'next/link';
+import type { JSX } from 'react';
 import { Badge, Section, SiteShell } from '@/components/Shell';
 import { githubUrl, publicFacts } from '@/lib/site';
 
-const layers = [
-  ['SQL · Rust · Python', 'Available'],
-  ['Unified planning layer', 'Available'],
-  ['DataFusion + Arrow', 'Available'],
-  ['Batch · Streaming · Delta Batch / IVM', 'Experimental IVM'],
-  ['Scheduler · Shuffle · Checkpointing · State', 'Preview foundations'],
-  ['Iceberg · Kafka · Parquet · S3 · ADLS · Catalogs', 'Preview / gated'],
-] as const;
+type ArchIcon = 'interfaces' | 'runtime' | 'foundation' | 'primitives' | 'ecosystem';
+
+const archLayers: Array<{ title: string; labels: string; icon: ArchIcon }> = [
+  { title: 'Interfaces', labels: 'SQL · Rust · Python', icon: 'interfaces' },
+  { title: 'Unified Runtime', labels: 'Batch · Streaming · Incremental Processing', icon: 'runtime' },
+  { title: 'Execution Foundation', labels: 'DataFusion · Apache Arrow', icon: 'foundation' },
+  { title: 'Distributed Primitives', labels: 'Scheduling · Shuffle · State · Checkpoints', icon: 'primitives' },
+  { title: 'Data Ecosystem', labels: 'Iceberg · Kafka · Parquet · Object Storage · Catalogs', icon: 'ecosystem' },
+];
+
+const layerIcons: Record<ArchIcon, JSX.Element> = {
+  interfaces: (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M5 3L1 8l4 5M11 3l4 5-4 5"/>
+    </svg>
+  ),
+  runtime: (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">
+      <circle cx="8" cy="8" r="7" opacity=".2"/>
+      <circle cx="8" cy="8" r="4" opacity=".55"/>
+      <circle cx="8" cy="8" r="1.75"/>
+    </svg>
+  ),
+  foundation: (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">
+      <path d="M9.5 2L5.5 9H9l-1.5 5.5 6.5-8H10.5z"/>
+    </svg>
+  ),
+  primitives: (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">
+      <circle cx="4" cy="4" r="2"/><circle cx="12" cy="4" r="2"/>
+      <circle cx="4" cy="12" r="2"/><circle cx="12" cy="12" r="2"/>
+      <rect x="6.25" y="3.25" width="3.5" height="1.5"/>
+      <rect x="6.25" y="11.25" width="3.5" height="1.5"/>
+      <rect x="3.25" y="6.25" width="1.5" height="3.5"/>
+      <rect x="11.25" y="6.25" width="1.5" height="3.5"/>
+    </svg>
+  ),
+  ecosystem: (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">
+      <rect x="2" y="2" width="12" height="3" rx="1.5"/>
+      <rect x="2" y="6.5" width="12" height="3" rx="1.5"/>
+      <rect x="2" y="11" width="12" height="3" rx="1.5"/>
+    </svg>
+  ),
+};
 
 const features = [
   [
@@ -19,7 +58,7 @@ const features = [
   ],
   [
     'Delta Batch / IVM',
-    'DeltaBatch carries weighted Arrow rows and IncrementalFlow maintains views across ticks. Distributed executor-side IVM remains a separate project.',
+    'DeltaBatch carries weighted Arrow rows and IncrementalFlow maintains views across ticks. Distributed executor-side IVM remains in progress.',
     'Experimental',
   ],
   [
@@ -60,6 +99,39 @@ function statusTone(status: string): 'blue' | 'green' | 'violet' {
   return 'blue';
 }
 
+function ArchDiagram() {
+  return (
+    <div className="arch-diagram" aria-label="Krishiv architecture layers">
+      {archLayers.map((layer, i) => (
+        <div key={layer.title}>
+          {i > 0 && (
+            <div
+              className="arch-connector"
+              style={{
+                '--delay-left': `${i * 0.22}s`,
+                '--delay-right': `${i * 0.22 + 0.6}s`,
+              } as React.CSSProperties}
+            >
+              <span className="arch-line arch-line-left"/>
+              <span className="arch-line arch-line-right"/>
+            </div>
+          )}
+          <div className="arch-layer">
+            <span className="arch-icon">{layerIcons[layer.icon]}</span>
+            <div>
+              <p className="arch-layer-title">{layer.title}</p>
+              <p className="arch-layer-labels">{layer.labels}</p>
+            </div>
+          </div>
+        </div>
+      ))}
+      <p className="arch-maturity-link">
+        <Link href="/product/maturity">Explore feature maturity →</Link>
+      </p>
+    </div>
+  );
+}
+
 export default function Home() {
   return (
     <SiteShell>
@@ -68,10 +140,11 @@ export default function Home() {
           <div>
             <Badge tone="orange">Open source · Built in Rust</Badge>
             <h1>
-              One Engine for <span className="gradient-text">Batch and Streaming</span>
+              One Engine for{' '}
+              <span className="gradient-text">Batch, Streaming, and Incremental Processing</span>
             </h1>
             <p className="lead">
-              Krishiv is a Rust-native compute engine for unified batch, streaming, and incremental data processing—from local development to distributed clusters.
+              Krishiv is a Rust-native compute engine that brings batch, streaming, and incremental workloads into one execution model—from local development to distributed systems.
             </p>
             <div className="actions">
               <Link className="btn btn-primary" href="/docs/latest/getting-started">
@@ -83,17 +156,7 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="diagram" aria-label="Krishiv architecture layers">
-            {layers.map(([label, status], index) => (
-              <div key={label}>
-                {index > 0 && <div className="flow-arrow">↓</div>}
-                <div className="layer">
-                  <strong>{label}</strong>
-                  <Badge tone={statusTone(status)}>{status}</Badge>
-                </div>
-              </div>
-            ))}
-          </div>
+          <ArchDiagram />
         </section>
 
         <div className="cap-strip">
