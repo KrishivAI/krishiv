@@ -6,14 +6,19 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "preview": "opennextjs-cloudflare build && wrangler dev",
-    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
-    "lint": "tsc --noEmit",
+    "start": "next start",
     "typecheck": "tsc --noEmit",
-    "cf:build": "opennextjs-cloudflare build"
+    "lint": "tsc --noEmit",
+    "cf:build": "opennextjs-cloudflare build",
+    "cf:dev": "wrangler dev",
+    "cf:deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "cf:preview": "opennextjs-cloudflare build && wrangler dev",
+    "preview": "opennextjs-cloudflare build && wrangler dev",
+    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy"
   },
   "dependencies": {
     "@types/mdx": "latest",
+    "framer-motion": "^12.40.0",
     "fumadocs-core": "latest",
     "fumadocs-mdx": "latest",
     "fumadocs-ui": "latest",
@@ -30,6 +35,5 @@
     "tailwindcss": "latest",
     "typescript": "latest",
     "wrangler": "^4.20.0"
-  },
-  "packageManager": "pnpm@10.13.1"
+  }
 }
