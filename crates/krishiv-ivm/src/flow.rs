@@ -43,6 +43,10 @@ use krishiv_delta::{
 use crate::error::{IvmError, IvmResult};
 use crate::plan::{ViewPlan, ViewPlanKind};
 
+/// Maximum number of row hashes retained per source for content-addressed dedup.
+/// When the cap is reached the oldest entries are evicted to bound memory.
+const DEDUP_SEEN_CAPACITY: usize = 10_000_000;
+
 // ── StepSummary ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone)]
@@ -60,6 +64,7 @@ struct IncrementalFlowInner {
     source_snapshots: HashMap<String, RecordBatch>,
 
     // Content-addressed dedup: opt-in per-source insertion row dedup.
+    // Capped at DEDUP_SEEN_CAPACITY entries to prevent unbounded memory growth.
     input_dedup_enabled: bool,
     seen_input_hashes: AHashMap<String, AHashSet<u64>>,
 
@@ -289,6 +294,12 @@ impl IncrementalFlow {
                 .seen_input_hashes
                 .entry(source_name.clone())
                 .or_default();
+            // Evict when capacity is exceeded to prevent unbounded growth.
+            // This may allow a small number of duplicate rows through on the
+            // next tick, which is acceptable for at-least-once semantics.
+            if seen.len() >= DEDUP_SEEN_CAPACITY {
+                seen.clear();
+            }
             let data = batch.data_batch();
             let weights = batch.weights();
             let mask: arrow::array::BooleanArray = (0..data.num_rows())
