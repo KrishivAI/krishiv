@@ -1,12 +1,7 @@
-import versions from '../versions.json';
+export const docsVersions = [
+  { label: 'Latest', slug: 'latest' },
+  { label: 'v0.1', slug: 'v0.1' },
+] as const;
 
-export type DocsVersion = {
-  label: string;
-  slug: string;
-  branch: string;
-  version: string;
-  default?: boolean;
-};
-
-export const docsVersions = versions as DocsVersion[];
-export const latestDocsVersion = docsVersions.find((version) => version.default) ?? docsVersions[0];
+export type DocsVersion = (typeof docsVersions)[number]['slug'];
+export const defaultDocsVersion: DocsVersion = 'latest';
