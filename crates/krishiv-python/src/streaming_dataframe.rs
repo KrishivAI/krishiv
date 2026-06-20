@@ -71,11 +71,18 @@ impl PyStreamingDataFrame {
         }
     }
 
-    pub async fn execute_stream_async(&self) -> PyResult<PyDataFrameStream> {
+    pub fn execute_stream_async(&self, py: Python<'_>) -> PyResult<PyDataFrameStream> {
         let inner = self.inner.clone();
-        let stream = inner
-            .execute_stream_async()
-            .await
+        let stream = py
+            .detach(move || {
+                crate::session::block_on_async(async move {
+                    inner.execute_stream_async().await.map_err(|e| {
+                        krishiv_api::KrishivError::Runtime {
+                            message: e.to_string(),
+                        }
+                    })
+                })
+            })
             .map_err(map_krishiv_error)?;
         Ok(PyDataFrameStream::from_stream(stream))
     }

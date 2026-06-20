@@ -16,7 +16,6 @@ use crate::job_status::PyJobStatus;
 use crate::live_table::PyLiveTable;
 use crate::pipeline::StreamPipeline;
 use crate::query_handle::PyQueryHandle;
-use crate::query_result::PyQueryResult;
 use crate::relation::PyRelation;
 use crate::stream::{PyStream, PyWindowedStream};
 use crate::stream_exec::spec_from_pipeline;
@@ -374,27 +373,17 @@ impl PySession {
         })
     }
 
-    /// Execute a SQL query asynchronously, returning a Python coroutine.
+    /// Compatibility entry point for SQL planning.
     ///
-    /// The coroutine resolves to a ``QueryResult`` when ``await``-ed::
+    /// The public Python package wraps this blocking native method in a
+    /// coroutine so ``await session.sql_async(...)`` is a real Python awaitable
+    /// without relying on PyO3's native coroutine polling.
     ///
-    ///     result = await session.sql_async("SELECT 1 AS n")
+    ///     df = await session.sql_async("SELECT 1 AS n")
+    ///     result = await df.collect_async()
     ///     print(result.pretty())
-    ///
-    /// Cancellation is propagated from the asyncio task through the
-    /// ``QueryHandle`` cancel channel to the Tokio executor.
-    pub async fn sql_async(&self, query: String) -> PyResult<PyQueryResult> {
-        let inner = self.inner.clone();
-        // Spawn the plan build + collect on the embedded Tokio runtime.
-        // JoinHandle::poll works from asyncio context; see query_handle.rs.
-        let join = crate::RUNTIME.spawn(async move {
-            let df = inner.sql_async(&query).await?;
-            df.collect_async().await
-        });
-        join.await
-            .map_err(|e| PyRuntimeError::new_err(format!("query task panicked: {e}")))?
-            .map(PyQueryResult::new)
-            .map_err(map_krishiv_error)
+    pub fn sql_async(&self, py: Python<'_>, query: String) -> PyResult<PyDataFrame> {
+        self.sql(py, query)
     }
 
     /// Submit a SQL query and return a ``QueryHandle`` for lifecycle management.

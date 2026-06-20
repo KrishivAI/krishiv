@@ -811,6 +811,9 @@ pub fn diff_plans(before: &PhysicalPlan, after: &PhysicalPlan) -> PlanDiff {
 }
 
 #[cfg(test)]
+mod gap_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         ExecutionKind, FieldType, JoinType, LogicalPlan, NodeOp, Partitioning, PhysicalPlan,

@@ -23,3 +23,14 @@ async def test_native_async_iteration_local_sql():
 async def test_connect_async():
     session = await ks.connect_async("http://localhost:50051")
     assert session.mode == "distributed"
+
+
+@pytest.mark.asyncio
+async def test_session_sql_async_returns_lazy_dataframe():
+    session = ks.Session.local()
+    df = await session.sql_async("SELECT 7 AS n")
+    assert isinstance(df, ks.DataFrame)
+
+    result = await df.collect_async()
+    assert result.row_count == 1
+    assert "7" in result.pretty()

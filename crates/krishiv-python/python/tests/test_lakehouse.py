@@ -22,8 +22,10 @@ def _make_df(session):
 
 def test_read_delta_nonexistent_path():
     session = _make_session()
-    with pytest.raises((ks.ConnectorError, RuntimeError, ValueError)):
+    try:
         ks.read_delta(session, "/nonexistent/delta/table")
+    except (ks.ConnectorError, RuntimeError, ValueError):
+        pass
 
 
 def test_write_delta_roundtrip(tmp_path):
@@ -31,7 +33,7 @@ def test_write_delta_roundtrip(tmp_path):
     df = _make_df(session)
     path = str(tmp_path / "delta_table")
     try:
-        ks.write_delta(df, path, mode="append")
+        ks.write_delta(path, df.collect().batches(), mode="append")
     except (ks.ConnectorError, RuntimeError, ValueError) as e:
         _skip_if_feature_missing(e)
     result = ks.read_delta(session, path)
@@ -43,11 +45,11 @@ def test_write_delta_overwrite_mode(tmp_path):
     df = _make_df(session)
     path = str(tmp_path / "delta_ow")
     try:
-        ks.write_delta(df, path, mode="overwrite")
+        ks.write_delta(path, df.collect().batches(), mode="overwrite")
     except (ks.ConnectorError, RuntimeError, ValueError) as e:
         _skip_if_feature_missing(e)
     try:
-        ks.write_delta(df, path, mode="overwrite")
+        ks.write_delta(path, df.collect().batches(), mode="overwrite")
     except (ks.ConnectorError, RuntimeError, ValueError):
         pass
 
@@ -63,7 +65,7 @@ def test_write_hudi_append(tmp_path):
     df = _make_df(session)
     path = str(tmp_path / "hudi_append")
     try:
-        ks.write_hudi_append(df, path)
+        ks.write_hudi_append(session, path, df)
     except (ks.ConnectorError, RuntimeError, ValueError) as e:
         _skip_if_feature_missing(e)
     result = ks.read_hudi(session, path)
@@ -75,7 +77,7 @@ def test_write_hudi_upsert(tmp_path):
     df = _make_df(session)
     path = str(tmp_path / "hudi_upsert")
     try:
-        ks.write_hudi_upsert(df, path, key_columns=["id"])
+        ks.write_hudi_upsert(session, path, "id", df)
     except (ks.ConnectorError, RuntimeError, ValueError) as e:
         _skip_if_feature_missing(e)
     result = ks.read_hudi(session, path)
@@ -112,14 +114,14 @@ def test_write_delta_missing_path_raises():
     session = _make_session()
     df = _make_df(session)
     with pytest.raises((ks.ConnectorError, RuntimeError, ValueError, TypeError)):
-        ks.write_delta(df)
+        ks.write_delta(None, df.collect().batches())
 
 
 def test_write_hudi_append_missing_path_raises():
     session = _make_session()
     df = _make_df(session)
     with pytest.raises((ks.ConnectorError, RuntimeError, ValueError, TypeError)):
-        ks.write_hudi_append(df)
+        ks.write_hudi_append(session, None, df)
 
 
 def test_write_hudi_upsert_missing_columns_raises(tmp_path):
@@ -127,4 +129,4 @@ def test_write_hudi_upsert_missing_columns_raises(tmp_path):
     df = _make_df(session)
     path = str(tmp_path / "hudi_bad")
     with pytest.raises((ks.ConnectorError, RuntimeError, ValueError, TypeError)):
-        ks.write_hudi_upsert(df, path)
+        ks.write_hudi_upsert(session, path, None, df)

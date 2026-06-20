@@ -20,6 +20,7 @@ from .krishiv import (  # noqa: F401
     ModeError,
     UdfError,
     ParquetSink,
+    QueryHandle,
     QueryError,
     Schema,
     SchemaError,
@@ -78,6 +79,44 @@ async def connect_async(url: str) -> Session:
     return Session.connect(url)
 
 
+async def _session_sql_async(self, query: str):
+    """Plan SQL from async code and return a lazy DataFrame."""
+    return self.sql(query)
+
+
+async def _dataframe_collect_async(self):
+    """Collect a DataFrame from async code."""
+    return self.collect()
+
+
+_native_dataframe_execute_stream_async = DataFrame.execute_stream_async
+
+
+async def _dataframe_execute_stream_async(self):
+    """Execute a DataFrame as a stream from async code."""
+    return _native_dataframe_execute_stream_async(self)
+
+
+_native_streaming_dataframe_execute_stream_async = StreamingDataFrame.execute_stream_async
+
+
+async def _streaming_dataframe_execute_stream_async(self):
+    """Execute a streaming DataFrame from async code."""
+    return _native_streaming_dataframe_execute_stream_async(self)
+
+
+async def _query_handle_collect_async(self):
+    """Await a submitted query handle."""
+    return self.collect()
+
+
+Session.sql_async = _session_sql_async
+DataFrame.collect_async = _dataframe_collect_async
+DataFrame.execute_stream_async = _dataframe_execute_stream_async
+StreamingDataFrame.execute_stream_async = _streaming_dataframe_execute_stream_async
+QueryHandle.collect_async = _query_handle_collect_async
+
+
 def _register_arrow_stream(self, job_name: str, async_gen):
     """
     Register a Python async generator of PyArrow RecordBatches to continuously feed a running stream job.
@@ -131,6 +170,7 @@ __all__ = [
     "ParquetSink",
     "KafkaSink",
     "IcebergSink",
+    "QueryHandle",
     "read_parquet",
     "read_kafka",
     "read_iceberg",

@@ -48,6 +48,9 @@ pub mod operators;
 pub mod trace;
 pub mod view;
 
+#[cfg(test)]
+mod gap_tests;
+
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use behavior_version::{LogicFingerprint, MemoKey};

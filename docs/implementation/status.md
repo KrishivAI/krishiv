@@ -1,5 +1,48 @@
 # Krishiv Implementation Status
 
+## 2026-06-19 — Python async API and stub cleanup
+
+Fixed the Python user API issues identified in the Rust/Python API review:
+async method names now expose real Python awaitables at the package layer, and
+the generated native stub no longer collapses the public surface to `Any`.
+
+### What changed
+- `Session.sql_async` now resolves to a lazy `DataFrame`, matching Rust
+  `Session::sql_async` semantics instead of eagerly collecting a `QueryResult`.
+- `DataFrame.collect_async`, `DataFrame.execute_stream_async`,
+  `StreamingDataFrame.execute_stream_async`, and `QueryHandle.collect_async` are
+  installed as top-level Python coroutine wrappers around the proven blocking
+  native methods.
+- Re-exported `QueryHandle` from top-level `krishiv`.
+- Updated the API-surface generator to detect PyO3 async methods and emit typed
+  core stubs with `object` fallback for unmapped preview methods instead of
+  `Any`.
+- Regenerated API inventories/reports/stubs and added generator regression
+  coverage for async signatures and no-`Any` output.
+- Updated Python async tests so they await `collect_async` and assert stream
+  async APIs return awaitables without forcing a streaming pipeline to terminate.
+
+### Validation
+- `cargo fmt --check`
+- `cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings`
+- `cargo check -p krishiv-python` — passes with pre-existing PyO3/source warnings.
+- `python3 scripts/check_api_surface.py`
+- `python3 -m unittest scripts.tests.test_project_scripts`
+- `python3 -m py_compile crates/krishiv-python/python/krishiv/__init__.py scripts/check_api_surface.py`
+- `maturin develop --manifest-path crates/krishiv-python/Cargo.toml` into `.venv-pytest`
+  — installs; warns that `patchelf` is missing for rpath adjustment.
+- `.venv-pytest/bin/python -m pytest -q crates/krishiv-python/python/tests/test_async.py crates/krishiv-python/python/tests/test_dataframe.py::test_collect_async crates/krishiv-python/python/tests/test_dataframe.py::test_execute_stream_async_returns_awaitable crates/krishiv-python/python/tests/test_streaming.py::test_streaming_dataframe_execute_stream_async_returns_awaitable`
+  — 6 passed.
+
+### Blockers
+- Full `.venv-pytest/bin/python -m pytest -q crates/krishiv-python/python/tests`
+  collection currently requires `pyarrow`; this venv does not have it installed.
+
+### Next useful command
+`.venv-pytest/bin/python -m pytest -q crates/krishiv-python/python/tests/test_async.py crates/krishiv-python/python/tests/test_dataframe.py::test_collect_async`
+
+---
+
 ## 2026-06-19 — Web and docs logo refresh
 
 Redesigned the Krishiv SVG asset set to better match the dark web theme and

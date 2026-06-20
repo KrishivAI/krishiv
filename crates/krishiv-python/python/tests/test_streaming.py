@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 
 import pytest
 
@@ -561,12 +562,13 @@ def test_streaming_dataframe_write_stream_raises():
         sdf.write_stream()
 
 
-def test_streaming_dataframe_execute_stream_async():
+def test_streaming_dataframe_execute_stream_async_returns_awaitable():
     session = ks.Session.local()
     df = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts")
     sdf = df.to_streaming().key_by("n").tumbling_window(1000)
     result = sdf.execute_stream_async()
-    assert result is not None
+    assert inspect.isawaitable(result)
+    result.close()
 
 
 def test_dataframe_write_stream():

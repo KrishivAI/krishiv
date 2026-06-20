@@ -96,6 +96,10 @@ class ApiSurfaceTests(unittest.TestCase):
         stub = api_surface.render_python_stub(inventory)
         self.assertIn("class DataFrame:", stub)
         self.assertIn("def collect(", stub)
+        self.assertIn("async def collect_async(self) -> QueryResult: ...", stub)
+        self.assertIn("async def sql_async(self, query: str) -> DataFrame: ...", stub)
+        self.assertNotIn("from typing import Any", stub)
+        self.assertNotIn("-> Any", stub)
         self.assertIn("class Relation:", stub)
 
     def test_compare_classifies_additive_breaking_and_semantic(self):

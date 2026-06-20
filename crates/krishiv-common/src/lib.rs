@@ -48,6 +48,8 @@ pub use production::{
 pub use stream_quality::{StreamQualityHook, StreamQualityResult};
 
 #[cfg(test)]
+mod gap_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
 

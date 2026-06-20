@@ -59,4 +59,6 @@ pub use store::{PartitionId, ShuffleBackend, ShufflePartition, ShuffleStore, Shu
 pub use tiered_store::TieredShuffleStore;
 
 #[cfg(test)]
+mod gap_tests;
+#[cfg(test)]
 mod tests;
