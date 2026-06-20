@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { Badge, SiteShell } from '@/components/Shell';
+import { DocsMobileControls } from '@/components/DocsMobile';
 import { docPages, getAllDocParams, getDoc, getGroupedPages } from '@/lib/docs-data';
 import { docsVersions } from '@/lib/versions';
 
@@ -12,8 +13,14 @@ export default async function DocPage({params}:{params:Promise<{version:string;s
   const prev=docPages[idx-1];
   const next=docPages[idx+1];
   const groups=getGroupedPages();
+  const headings = Array.from(page.body.matchAll(/<h2[^>]*>([^<]+)<\/h2>/g)).map((match) => {
+    const text = match[1].replace(/<[^>]+>/g, '');
+    const id = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    return { id, text };
+  });
   return (
     <SiteShell>
+      <DocsMobileControls title={page.title} version={version} versions={docsVersions} groups={groups} activeSlug={page.slug} headings={headings} />
       <main className="container docs-layout">
         <aside className="sidebar">
           <select className="version" defaultValue={version} aria-label="Documentation version">
@@ -49,11 +56,7 @@ export default async function DocPage({params}:{params:Promise<{version:string;s
         <aside className="toc">
           <strong>On this page</strong>
           <a href="#overview">Overview</a>
-          {page.body.includes('<h2>')&&page.body.match(/<h2[^>]*>([^<]+)<\/h2>/g)?.map(h=>{
-            const text=h.replace(/<[^>]+>/g,'');
-            const id=text.toLowerCase().replace(/[^a-z0-9]+/g,'-');
-            return <a key={id} href={`#${id}`}>{text}</a>;
-          })}
+          {headings.map(({id,text})=><a key={id} href={`#${id}`}>{text}</a>)}
         </aside>
       </main>
     </SiteShell>
