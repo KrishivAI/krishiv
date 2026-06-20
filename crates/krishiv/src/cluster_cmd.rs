@@ -15,36 +15,27 @@ const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:18080";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
     pub clusterd_grpc: String,
-    #[serde(default = "default_ui_url")]
-    pub ui_url: String,
+    #[serde(default = "default_http_addr")]
+    pub http_addr: String,
     pub metadata_path: PathBuf,
     pub data_dir: PathBuf,
     #[serde(default)]
     pub clusterd_pid: Option<u32>,
     #[serde(default)]
     pub executor_pids: Vec<u32>,
-    #[serde(default)]
-    pub ui_pid: Option<u32>,
 }
 
-fn default_ui_url() -> String {
-    ui_url_from_http_addr(DEFAULT_HTTP_ADDR)
-}
-
-fn ui_url_from_http_addr(addr: &str) -> String {
-    format!("http://{addr}/ui")
-}
-
-fn select_cluster_http_addr(preferred: Option<&str>) -> Result<String, String> {
-    if let Some(addr) = preferred {
-        return Ok(addr.to_string());
-    }
-    Ok(DEFAULT_HTTP_ADDR.to_string())
+fn default_http_addr() -> String {
+    DEFAULT_HTTP_ADDR.to_string()
 }
 
 impl ClusterConfig {
     fn path(data_dir: &Path) -> PathBuf {
         data_dir.join("cluster.json")
+    }
+
+    pub fn ui_url(&self) -> String {
+        format!("http://{}/ui", self.http_addr)
     }
 
     pub fn load(data_dir: &Path) -> Result<Self, String> {
@@ -141,11 +132,18 @@ fn parse_http_addr(args: &[&str]) -> Result<Option<String>, String> {
     Ok(addr)
 }
 
+/// Returns (task_port, barrier_port) for executor at `idx`.
+/// Stride is 2 so adjacent executors never share a port:
+///   idx=0 → (50055, 50056), idx=1 → (50057, 50058), …
+fn executor_port_pair(idx: usize) -> (u16, u16) {
+    let base = 50055u16 + (idx as u16) * 2;
+    (base, base + 1)
+}
+
 fn executor_bind_addrs(idx: usize) -> (String, String) {
-    let port = 50055u16 + idx as u16;
-    let barrier_port = 50056u16 + idx as u16;
+    let (task_port, barrier_port) = executor_port_pair(idx);
     (
-        format!("127.0.0.1:{port}"),
+        format!("127.0.0.1:{task_port}"),
         format!("127.0.0.1:{barrier_port}"),
     )
 }
@@ -164,10 +162,7 @@ fn cluster_start(args: &[&str]) -> CliResponse {
     let meta = metadata_path
         .to_str()
         .unwrap_or("/tmp/krishiv-metadata.json");
-    let http_addr = match select_cluster_http_addr(requested_http_addr.as_deref()) {
-        Ok(addr) => addr,
-        Err(e) => return CliResponse::err(e, 1),
-    };
+    let http_addr = requested_http_addr.unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_string());
     let clusterd_pid = match spawn_krishiv_daemon(
         "clusterd",
         &[
@@ -207,12 +202,11 @@ fn cluster_start(args: &[&str]) -> CliResponse {
     }
     let cfg = ClusterConfig {
         clusterd_grpc: String::from("http://127.0.0.1:9090"),
-        ui_url: ui_url_from_http_addr(&http_addr),
+        http_addr: http_addr.clone(),
         metadata_path,
         data_dir: data_dir.clone(),
         clusterd_pid: Some(clusterd_pid),
         executor_pids,
-        ui_pid: None,
     };
     if let Err(e) = cfg.save() {
         return CliResponse::err(e, 1);
@@ -220,7 +214,7 @@ fn cluster_start(args: &[&str]) -> CliResponse {
     CliResponse::ok(format!(
         "Krishiv cluster started in {}\n  clusterd: http://127.0.0.1:9090\n  UI: {}\n  executors: {executor_count}\n  export KRISHIV_COORDINATOR=http://127.0.0.1:9090\n",
         data_dir.display(),
-        cfg.ui_url
+        cfg.ui_url()
     ))
 }
 
@@ -240,11 +234,6 @@ fn cluster_stop(args: &[&str]) -> CliResponse {
             if let Err(error) = Command::new("kill").arg(pid.to_string()).status() {
                 warnings.push(format!("kill executor pid {pid} failed: {error}"));
             }
-        }
-        if let Some(pid) = cfg.ui_pid
-            && let Err(error) = Command::new("kill").arg(pid.to_string()).status()
-        {
-            warnings.push(format!("kill ui pid {pid} failed: {error}"));
         }
         if let Err(error) = fs::remove_file(ClusterConfig::path(&data_dir)) {
             warnings.push(format!(
@@ -271,11 +260,10 @@ fn cluster_status(args: &[&str]) -> CliResponse {
     };
     match ClusterConfig::load(&data_dir) {
         Ok(cfg) => CliResponse::ok(format!(
-            "clusterd={} pid={:?}\nui={} pid={:?}\nexecutors={} pids={:?}\nmetadata={}\n",
+            "clusterd={} pid={:?}\nui={}\nexecutors={} pids={:?}\nmetadata={}\n",
             cfg.clusterd_grpc,
             cfg.clusterd_pid,
-            cfg.ui_url,
-            cfg.ui_pid,
+            cfg.ui_url(),
             cfg.executor_pids.len(),
             cfg.executor_pids,
             cfg.metadata_path.display()
@@ -285,24 +273,43 @@ fn cluster_status(args: &[&str]) -> CliResponse {
 }
 
 fn cluster_verify_network(args: &[&str]) -> CliResponse {
-    let (data_dir, _) = match parse_data_dir(args) {
+    let (data_dir, default_executor_count) = match parse_data_dir(args) {
         Ok(v) => v,
         Err(e) => return CliResponse::err(e, 2),
     };
-    let _ = data_dir;
-    let ports = [9090u16, 18080, 50055, 50056, 50057, 50058];
-    let mut lines = Vec::new();
-    for port in ports {
-        let ok = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
-        lines.push(format!(
-            "port {port}: {}",
-            if ok {
-                "available (not in use)"
-            } else {
-                "in use (expected when cluster running)"
-            }
-        ));
+
+    let (executor_count, http_addr) = match ClusterConfig::load(&data_dir) {
+        Ok(cfg) => (cfg.executor_pids.len(), cfg.http_addr),
+        Err(_) => (default_executor_count, DEFAULT_HTTP_ADDR.to_string()),
+    };
+
+    let http_port: u16 = http_addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(18080);
+
+    let mut ports = vec![9090u16, http_port];
+    for i in 0..executor_count {
+        let (task, barrier) = executor_port_pair(i);
+        ports.push(task);
+        ports.push(barrier);
     }
+
+    let lines: Vec<String> = ports
+        .iter()
+        .map(|&port| {
+            let ok = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+            format!(
+                "port {port}: {}",
+                if ok {
+                    "available (not in use)"
+                } else {
+                    "in use (expected when cluster running)"
+                }
+            )
+        })
+        .collect();
+
     CliResponse::ok(format!(
         "Network check (bind probe on localhost):\n{}\n",
         lines.join("\n")
@@ -311,13 +318,26 @@ fn cluster_verify_network(args: &[&str]) -> CliResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::executor_bind_addrs;
+    use super::{executor_bind_addrs, executor_port_pair};
 
     #[test]
-    fn executor_barrier_addr_uses_loopback_host() {
-        let (task_addr, barrier_addr) = executor_bind_addrs(0);
+    fn executor_addrs_stride_2_no_collision() {
+        let (t0, b0) = executor_bind_addrs(0);
+        let (t1, b1) = executor_bind_addrs(1);
 
-        assert_eq!(task_addr, "127.0.0.1:50055");
-        assert_eq!(barrier_addr, "127.0.0.1:50056");
+        assert_eq!(t0, "127.0.0.1:50055");
+        assert_eq!(b0, "127.0.0.1:50056");
+        assert_eq!(t1, "127.0.0.1:50057");
+        assert_eq!(b1, "127.0.0.1:50058");
+
+        // No port appears twice across the first two executors.
+        let ports = [
+            executor_port_pair(0).0,
+            executor_port_pair(0).1,
+            executor_port_pair(1).0,
+            executor_port_pair(1).1,
+        ];
+        let unique: std::collections::HashSet<_> = ports.iter().collect();
+        assert_eq!(unique.len(), ports.len(), "port collision detected");
     }
 }

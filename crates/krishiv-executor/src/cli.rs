@@ -156,28 +156,50 @@ fn print_contract_summary(runtime: &ExecutorRuntime) -> crate::ExecutorResult<()
 
 async fn register_once(runtime: &mut ExecutorRuntime) -> crate::ExecutorResult<()> {
     println!("{}", runtime.startup_summary());
-    let (registration, heartbeat) = runtime
-        .register_and_heartbeat_once()
-        .await
-        .map_err(|error| error.to_string())?;
-    runtime.apply_lease_generation(registration.lease_generation());
-
-    println!(
-        "registration response version={} executor={} lease_generation={} disposition={} message={}",
-        registration.version(),
-        registration.executor_id(),
-        registration.lease_generation(),
-        registration.disposition(),
-        registration.message().unwrap_or("")
-    );
-    println!(
-        "heartbeat response version={} lease_generation={} disposition={} message={}",
-        heartbeat.version(),
-        heartbeat.lease_generation(),
-        heartbeat.disposition(),
-        heartbeat.message().unwrap_or("")
-    );
-    Ok(())
+    let mut attempt = 0u32;
+    let max_attempts = 30;
+    let base_backoff = Duration::from_millis(500);
+    loop {
+        attempt += 1;
+        match runtime.register_and_heartbeat_once().await {
+            Ok((registration, heartbeat)) => {
+                runtime.apply_lease_generation(registration.lease_generation());
+                println!(
+                    "registration response version={} executor={} lease_generation={} disposition={} message={}",
+                    registration.version(),
+                    registration.executor_id(),
+                    registration.lease_generation(),
+                    registration.disposition(),
+                    registration.message().unwrap_or("")
+                );
+                println!(
+                    "heartbeat response version={} lease_generation={} disposition={} message={}",
+                    heartbeat.version(),
+                    heartbeat.lease_generation(),
+                    heartbeat.disposition(),
+                    heartbeat.message().unwrap_or("")
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                if attempt >= max_attempts {
+                    return Err(format!(
+                        "registration failed after {max_attempts} attempts: {error}"
+                    )
+                    .into());
+                }
+                let backoff = base_backoff * 2u32.pow(attempt.min(5) - 1);
+                tracing::warn!(
+                    attempt,
+                    max_attempts,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %error,
+                    "registration failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
 }
 
 fn apply_non_stale_heartbeat_lease(
@@ -727,7 +749,7 @@ impl ExecutorCliConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1),
             coordinator_endpoint: env::var("KRISHIV_COORDINATOR_ENDPOINT")
-                .unwrap_or_else(|_| String::from("http://127.0.0.1:8080")),
+                .unwrap_or_else(|_| String::from("http://127.0.0.1:9090")),
             mode: ExecutorMode::DryRun,
             heartbeat_interval_secs: env::var("KRISHIV_HEARTBEAT_INTERVAL_SECS")
                 .ok()
@@ -950,7 +972,7 @@ impl ExecutorCliConfig {
            --executor-id <ID>           Executor id, defaults to KRISHIV_EXECUTOR_ID or exec-local\n\
            --host <HOST>                Host or pod name, defaults to HOSTNAME or localhost\n\
            --slots <N>                  Task slots, defaults to KRISHIV_TASK_SLOTS or 1\n\
-           --coordinator <URL>          Coordinator endpoint, defaults to KRISHIV_COORDINATOR_ENDPOINT or http://127.0.0.1:8080\n\
+           --coordinator <URL>          Coordinator endpoint, defaults to KRISHIV_COORDINATOR_ENDPOINT or http://127.0.0.1:9090\n\
            --register-once              Register with the coordinator, send one heartbeat, then exit\n\
            --connect                    Register with the coordinator and continue heartbeating\n\
            --heartbeat-interval-secs <N> Heartbeat interval for --connect, defaults to KRISHIV_HEARTBEAT_INTERVAL_SECS or 10\n\
@@ -1215,7 +1237,7 @@ mod tests {
         assert_eq!(config.executor_id, "exec-local");
         assert_eq!(config.host, expected_host);
         assert_eq!(config.slots, 1);
-        assert_eq!(config.coordinator_endpoint, "http://127.0.0.1:8080");
+        assert_eq!(config.coordinator_endpoint, "http://127.0.0.1:9090");
         assert_eq!(config.mode, ExecutorMode::DryRun);
         assert_eq!(config.heartbeat_interval_secs, 10);
         assert!(!config.help);
