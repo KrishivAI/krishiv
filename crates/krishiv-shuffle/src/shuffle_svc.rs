@@ -24,7 +24,7 @@ pub async fn run_shuffle_svc_from_env() -> Result<(), Box<dyn std::error::Error 
     let base_dir = std::env::var("KRISHIV_SHUFFLE_DIR")
         .unwrap_or_else(|_| String::from("/tmp/krishiv-shuffle"));
     let addr: SocketAddr = std::env::var("KRISHIV_SHUFFLE_ADDR")
-        .unwrap_or_else(|_| String::from("0.0.0.0:7072"))
+        .unwrap_or_else(|_| String::from("0.0.0.0:2004"))
         .parse()?;
     run_shuffle_svc(&base_dir, addr).await
 }

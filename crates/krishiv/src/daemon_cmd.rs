@@ -250,14 +250,14 @@ fn flight_server_help() -> &'static str {
     "Arrow Flight SQL server.\n\
      \n\
      Usage: krishiv flight-server\n\
-     Env: KRISHIV_FLIGHT_ADDR (default 127.0.0.1:50051)\n"
+     Env: KRISHIV_FLIGHT_ADDR (default 127.0.0.1:2003)\n"
 }
 
 fn shuffle_svc_help() -> &'static str {
     "Shuffle partition HTTP service.\n\
      \n\
      Usage: krishiv shuffle-svc\n\
-     Env: KRISHIV_SHUFFLE_DIR, KRISHIV_SHUFFLE_ADDR (default 0.0.0.0:7072)\n"
+     Env: KRISHIV_SHUFFLE_DIR, KRISHIV_SHUFFLE_ADDR (default 0.0.0.0:2004)\n"
 }
 
 /// CLI help snippet for main help (daemon section).

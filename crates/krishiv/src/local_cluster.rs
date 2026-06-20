@@ -11,7 +11,7 @@ use crate::process_util::{spawn_krishiv_daemon, spawn_krishiv_daemon_with_env};
 
 const DEFAULT_DATA_DIR: &str = ".krishiv/local";
 const CONFIG_FILE: &str = "cluster.json";
-const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:18080";
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:2002";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalClusterConfig {
@@ -54,7 +54,7 @@ fn select_local_http_addr(preferred: Option<&str>) -> Result<String, String> {
     if let Some(addr) = preferred {
         return Ok(addr.to_string());
     }
-    let port = get_free_port(18080).ok_or_else(|| String::from("failed to find free HTTP port"))?;
+    let port = get_free_port(2002).ok_or_else(|| String::from("failed to find free HTTP port"))?;
     Ok(format!("127.0.0.1:{port}"))
 }
 
@@ -119,12 +119,12 @@ pub fn local_help() -> String {
            krishiv local status [--data-dir <DIR>]\n\
          \n\
          After start, use:\n\
-           export KRISHIV_COORDINATOR=http://127.0.0.1:50051\n\
-           (flight-server uses KRISHIV_COORDINATOR_HTTP=http://127.0.0.1:18080 for executor-backed SQL)\n\
+           export KRISHIV_COORDINATOR=http://127.0.0.1:2003\n\
+           (flight-server uses KRISHIV_COORDINATOR_HTTP=http://127.0.0.1:2002 for executor-backed SQL)\n\
           krishiv sql --mode single-node --query 'SELECT 1'\n\
          \n\
          Web UI:\n\
-           http://127.0.0.1:18080/ui by default, or use --http-addr <HOST:PORT>.\n",
+           http://127.0.0.1:2002/ui by default, or use --http-addr <HOST:PORT>.\n",
     )
 }
 
@@ -214,7 +214,7 @@ fn run_local_start(args: &[&str]) -> CliResponse {
 
     fs::create_dir_all(&data_dir).ok();
 
-    let free_grpc_port = match get_free_port(9090) {
+    let free_grpc_port = match get_free_port(2001) {
         Some(port) => port,
         None => return CliResponse::err(String::from("failed to find free gRPC port\n"), 1),
     };
@@ -252,7 +252,7 @@ fn run_local_start(args: &[&str]) -> CliResponse {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let coordinator_http = format!("http://{http_addr}");
-    let free_flight_port = match get_free_port(50051) {
+    let free_flight_port = match get_free_port(2003) {
         Some(port) => port,
         None => {
             kill_pid_or_group(coordinator_pid);

@@ -621,13 +621,11 @@ async fn readyz(
             "coordinator is not active\n".to_owned(),
         ));
     }
-    let healthy_executors = c
-        .executors()
-        .executors
-        .values()
-        .filter(|e| e.state.can_accept_work())
-        .count();
-    if healthy_executors == 0 {
+    let has_schedulable_executor = c
+        .executor_snapshots()
+        .into_iter()
+        .any(|executor| executor.state().can_accept_work() && executor.descriptor().slots() > 0);
+    if !has_schedulable_executor {
         return Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "no healthy executors registered\n".to_owned(),
@@ -704,7 +702,7 @@ pub fn parse_coordinator_daemon_config(
         grpc_addr: env::var("KRISHIV_GRPC_ADDR")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| "0.0.0.0:9090".parse().unwrap()),
+            .unwrap_or_else(|| "0.0.0.0:2001".parse().unwrap()),
         http_addr: env::var("KRISHIV_HTTP_ADDR")
             .ok()
             .and_then(|value| value.parse().ok()),
@@ -991,7 +989,7 @@ pub fn coordinator_daemon_help() -> &'static str {
      \n\
      Options:\n\
        --coordinator-id <ID>     Coordinator id (KRISHIV_COORDINATOR_ID, default coord-local)\n\
-       --grpc-addr <HOST:PORT>     gRPC listen address (KRISHIV_GRPC_ADDR, default 0.0.0.0:9090)\n\
+       --grpc-addr <HOST:PORT>     gRPC listen address (KRISHIV_GRPC_ADDR, default 0.0.0.0:2001)\n\
        --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics /federation (optional)\n\
        --shuffle-dir <PATH>        Local shuffle store directory (optional)\n\
        --durability-profile <NAME> dev-local | single-node-durable | distributed-durable\n\
@@ -1203,7 +1201,7 @@ pub fn job_coordinator_daemon_help() -> &'static str {
      \n\
      Options:\n\
        --job-id <ID>              Job id to watch (also KRISHIV_JOB_ID)\n\
-       --coordinator-http <URL>   CCP federation HTTP endpoint (also KRISHIV_COORDINATOR_HTTP, default http://127.0.0.1:18080)\n\
+       --coordinator-http <URL>   CCP federation HTTP endpoint (also KRISHIV_COORDINATOR_HTTP, default http://127.0.0.1:2002)\n\
        --poll-interval-secs <N>   Status poll interval (also KRISHIV_JCP_POLL_INTERVAL_SECS, default 2)\n\
      \n\
      Optional env KRISHIV_JOB_SPEC_JSON to submit the job on first connect.\n"
@@ -1325,7 +1323,7 @@ mod parse_tests {
     fn parses_defaults() {
         let config = parse_coordinator_daemon_config(std::iter::empty::<String>()).unwrap();
         assert_eq!(config.coordinator_id, "coord-local");
-        assert_eq!(config.grpc_addr.port(), 9090);
+        assert_eq!(config.grpc_addr.port(), 2001);
         assert_eq!(config.durability_profile, DurabilityProfile::DevLocal);
         assert!(!config.help);
     }

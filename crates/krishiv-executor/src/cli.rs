@@ -13,6 +13,7 @@ use crate::{
     SharedBarrierInjector, SharedKeyGroupRanges, ShuffleContext, executor_barrier_grpc_server,
 };
 use axum::Router;
+use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -58,6 +59,7 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
         apply_checkpoint_default(config.checkpoint_uri.clone(), durability_profile)?;
     let slots = config.slots;
     let mut runtime = ExecutorRuntime::new(config.into_executor_config()?);
+    let readiness = ExecutorReadiness::new(task_grpc_addr.is_some(), barrier_grpc_addr.is_some());
 
     // Start optional HTTP health server (/healthz, /readyz, /metrics).
     if let Some(addr) = http_addr {
@@ -70,8 +72,9 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
         );
         let http_executor_id = runtime.config().executor_id().as_str().to_owned();
         let http_slots = slots;
+        let http_readiness = readiness.clone();
         tokio::spawn(async move {
-            let router = executor_http_router(http_executor_id, http_slots);
+            let router = executor_http_router(http_executor_id, http_slots, http_readiness);
             if let Err(e) = axum::serve(listener, router).await {
                 tracing::error!(error = %e, "HTTP health server failed");
             }
@@ -93,20 +96,105 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
                 checkpoint_uri,
                 slots,
                 durability_profile,
+                readiness,
             )
             .await
         }
     }
 }
 
-fn executor_http_router(executor_id: String, slots: usize) -> Router {
+fn executor_http_router(executor_id: String, slots: usize, readiness: ExecutorReadiness) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
-        .route("/readyz", get(|| async { "ready\n" }))
+        .route("/readyz", get(move || executor_readyz(readiness.clone())))
         .route(
             "/metrics",
             get(move || executor_metrics(executor_id.clone(), slots)),
         )
+}
+
+#[derive(Debug, Clone)]
+struct ExecutorReadiness {
+    task_grpc_required: bool,
+    barrier_grpc_required: bool,
+    registered: Arc<AtomicBool>,
+    heartbeat_ok: Arc<AtomicBool>,
+    task_grpc_ready: Arc<AtomicBool>,
+    barrier_grpc_ready: Arc<AtomicBool>,
+    backends_ready: Arc<AtomicBool>,
+}
+
+impl ExecutorReadiness {
+    fn new(task_grpc_required: bool, barrier_grpc_required: bool) -> Self {
+        Self {
+            task_grpc_required,
+            barrier_grpc_required,
+            registered: Arc::new(AtomicBool::new(false)),
+            heartbeat_ok: Arc::new(AtomicBool::new(false)),
+            task_grpc_ready: Arc::new(AtomicBool::new(false)),
+            barrier_grpc_ready: Arc::new(AtomicBool::new(false)),
+            backends_ready: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn mark_registered(&self, ready: bool) {
+        self.registered.store(ready, Ordering::Release);
+    }
+
+    fn mark_heartbeat_ok(&self, ready: bool) {
+        self.heartbeat_ok.store(ready, Ordering::Release);
+    }
+
+    fn mark_task_grpc_ready(&self) {
+        self.task_grpc_ready.store(true, Ordering::Release);
+    }
+
+    fn mark_barrier_grpc_ready(&self) {
+        self.barrier_grpc_ready.store(true, Ordering::Release);
+    }
+
+    fn mark_backends_ready(&self) {
+        self.backends_ready.store(true, Ordering::Release);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.registered.load(Ordering::Acquire)
+            && self.heartbeat_ok.load(Ordering::Acquire)
+            && self.backends_ready.load(Ordering::Acquire)
+            && (!self.task_grpc_required || self.task_grpc_ready.load(Ordering::Acquire))
+            && (!self.barrier_grpc_required || self.barrier_grpc_ready.load(Ordering::Acquire))
+    }
+
+    fn missing(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if !self.registered.load(Ordering::Acquire) {
+            missing.push("registration");
+        }
+        if !self.heartbeat_ok.load(Ordering::Acquire) {
+            missing.push("heartbeat");
+        }
+        if !self.backends_ready.load(Ordering::Acquire) {
+            missing.push("backends");
+        }
+        if self.task_grpc_required && !self.task_grpc_ready.load(Ordering::Acquire) {
+            missing.push("task-grpc");
+        }
+        if self.barrier_grpc_required && !self.barrier_grpc_ready.load(Ordering::Acquire) {
+            missing.push("barrier-grpc");
+        }
+        missing
+    }
+}
+
+async fn executor_readyz(readiness: ExecutorReadiness) -> impl IntoResponse {
+    if readiness.is_ready() {
+        (StatusCode::OK, "ready\n".to_owned())
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not ready: {}\n", readiness.missing().join(",")),
+        )
+    }
 }
 
 async fn executor_metrics(executor_id: String, slots: usize) -> impl IntoResponse {
@@ -240,6 +328,7 @@ async fn heartbeat_loop(
     checkpoint_uri: String,
     slots: usize,
     durability_profile: DurabilityProfile,
+    readiness: ExecutorReadiness,
 ) -> crate::ExecutorResult<()> {
     // Bind task/barrier listeners FIRST so the *first* register advertises real
     // endpoints — avoids the double-register race that previously bumped the
@@ -266,6 +355,7 @@ async fn heartbeat_loop(
         let endpoint = format!("http://{}:{}", advertised_host, bound_addr.port());
         runtime.set_advertised_endpoints(Some(endpoint.clone()), None);
         println!("Krishiv executor task gRPC listening on {bound_addr} (advertised {endpoint})");
+        readiness.mark_task_grpc_ready();
     }
     let barrier_listener = if let Some(addr) = barrier_grpc_addr {
         Some(
@@ -286,10 +376,13 @@ async fn heartbeat_loop(
         let endpoint = format!("http://{}:{}", advertised_host, bound_addr.port());
         runtime.set_advertised_endpoints(None, Some(endpoint.clone()));
         println!("Krishiv executor barrier gRPC listening on {bound_addr} (advertised {endpoint})");
+        readiness.mark_barrier_grpc_ready();
     }
 
     // First register (now with task/barrier endpoints already populated).
     register_once(runtime).await?;
+    readiness.mark_registered(true);
+    readiness.mark_heartbeat_ok(true);
     let initial_lease = runtime.config().lease_generation();
     let shared_lease = SharedLeaseGeneration::new(initial_lease);
     let coordinator_endpoint = runtime.config().coordinator_endpoint().to_owned();
@@ -480,6 +573,7 @@ async fn heartbeat_loop(
         .set_progress_buffer(Arc::clone(&progress_buffer));
 
     let runner = Arc::new(runner_builder);
+    readiness.mark_backends_ready();
 
     // Spawn `slots` concurrent runner tasks all reading from the same inbox;
     // without this the executor processes one task at a time regardless
@@ -568,6 +662,7 @@ async fn heartbeat_loop(
                             TransportDisposition::StaleLease
                                 | TransportDisposition::UnknownExecutor
                         ) {
+                            readiness.mark_heartbeat_ok(false);
                             tracing::warn!(
                                 disposition = %heartbeat.disposition(),
                                 "heartbeat reported lease problem; re-registering"
@@ -579,9 +674,12 @@ async fn heartbeat_loop(
                                         &shared_lease,
                                         &response,
                                     );
+                                    readiness.mark_registered(true);
+                                    readiness.mark_heartbeat_ok(true);
                                     coord_service.invalidate_channel().await;
                                 }
                                 Err(error) => {
+                                    readiness.mark_registered(false);
                                     tracing::error!(error = %error, "re-register failed");
                                 }
                             }
@@ -590,6 +688,8 @@ async fn heartbeat_loop(
                         // Only update the shared lease after confirming the
                         // heartbeat disposition is not stale (fix: lease-generation race).
                         apply_non_stale_heartbeat_lease(runtime, &shared_lease, &heartbeat);
+                        readiness.mark_registered(true);
+                        readiness.mark_heartbeat_ok(true);
                         // Restore directives first: state/offset rollback must
                         // land before any new barrier or completion work.
                         for cmd in heartbeat.restore_commands() {
@@ -659,6 +759,7 @@ async fn heartbeat_loop(
                         }
                     }
                     Err(error) => {
+                        readiness.mark_heartbeat_ok(false);
                         let text = error.to_string();
                         tracing::warn!(
                             error = %text,
@@ -675,6 +776,8 @@ async fn heartbeat_loop(
             _ = sigterm.recv() => {
                 println!("SIGTERM received — deregistering and shutting down");
                 shutdown.store(true, Ordering::Release);
+                readiness.mark_registered(false);
+                readiness.mark_heartbeat_ok(false);
                 // Give in-flight tasks a brief window to observe the shutdown
                 // flag before we tear down the gRPC channel.
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -749,7 +852,7 @@ impl ExecutorCliConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1),
             coordinator_endpoint: env::var("KRISHIV_COORDINATOR_ENDPOINT")
-                .unwrap_or_else(|_| String::from("http://127.0.0.1:9090")),
+                .unwrap_or_else(|_| String::from("http://127.0.0.1:2001")),
             mode: ExecutorMode::DryRun,
             heartbeat_interval_secs: env::var("KRISHIV_HEARTBEAT_INTERVAL_SECS")
                 .ok()
@@ -761,11 +864,11 @@ impl ExecutorCliConfig {
             task_grpc_addr: env::var("KRISHIV_TASK_GRPC_ADDR")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .or_else(|| "0.0.0.0:50055".parse().ok()),
+                .or_else(|| "0.0.0.0:2005".parse().ok()),
             barrier_grpc_addr: env::var("KRISHIV_BARRIER_GRPC_ADDR")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .or_else(|| "0.0.0.0:50056".parse().ok()),
+                .or_else(|| "0.0.0.0:2006".parse().ok()),
             shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR")
                 .ok()
                 .map(std::path::PathBuf::from),
@@ -972,12 +1075,12 @@ impl ExecutorCliConfig {
            --executor-id <ID>           Executor id, defaults to KRISHIV_EXECUTOR_ID or exec-local\n\
            --host <HOST>                Host or pod name, defaults to HOSTNAME or localhost\n\
            --slots <N>                  Task slots, defaults to KRISHIV_TASK_SLOTS or 1\n\
-           --coordinator <URL>          Coordinator endpoint, defaults to KRISHIV_COORDINATOR_ENDPOINT or http://127.0.0.1:9090\n\
+           --coordinator <URL>          Coordinator endpoint, defaults to KRISHIV_COORDINATOR_ENDPOINT or http://127.0.0.1:2001\n\
            --register-once              Register with the coordinator, send one heartbeat, then exit\n\
            --connect                    Register with the coordinator and continue heartbeating\n\
            --heartbeat-interval-secs <N> Heartbeat interval for --connect, defaults to KRISHIV_HEARTBEAT_INTERVAL_SECS or 10\n\
-           --task-grpc-addr <ADDR>      Task gRPC server address (default: KRISHIV_TASK_GRPC_ADDR or 0.0.0.0:50055; use 'off' to disable)\n\
-           --barrier-grpc-addr <ADDR>   Barrier gRPC server address (default: KRISHIV_BARRIER_GRPC_ADDR or 0.0.0.0:50056; use 'off' to disable)\n\
+           --task-grpc-addr <ADDR>      Task gRPC server address (default: KRISHIV_TASK_GRPC_ADDR or 0.0.0.0:2005; use 'off' to disable)\n\
+           --barrier-grpc-addr <ADDR>   Barrier gRPC server address (default: KRISHIV_BARRIER_GRPC_ADDR or 0.0.0.0:2006; use 'off' to disable)\n\
            --shuffle-dir <DIR>          On-disk shuffle store directory (also KRISHIV_SHUFFLE_DIR)\n\
            --shuffle-uri <URI>          Shuffle storage URI: file://path, s3://bucket/prefix (KRISHIV_SHUFFLE_URI)\n\
            --checkpoint-uri <URI>       Checkpoint storage URI: file://path, s3://bucket/prefix, memory:// (default: KRISHIV_CHECKPOINT_STORAGE, else selected by durability profile)\n\
@@ -1114,7 +1217,7 @@ fn apply_checkpoint_default(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutorCliConfig, ExecutorMode, apply_non_stale_heartbeat_lease,
+        ExecutorCliConfig, ExecutorMode, ExecutorReadiness, apply_non_stale_heartbeat_lease,
         apply_successful_reregister_lease,
     };
     use crate::grpc_client::SharedLeaseGeneration;
@@ -1164,6 +1267,25 @@ mod tests {
             LeaseGeneration::initial()
         );
         assert_eq!(shared_lease.get(), LeaseGeneration::initial());
+    }
+
+    #[test]
+    fn readiness_requires_registration_heartbeat_task_grpc_and_backends() {
+        let readiness = ExecutorReadiness::new(true, false);
+        assert!(!readiness.is_ready());
+        assert_eq!(
+            readiness.missing(),
+            vec!["registration", "heartbeat", "backends", "task-grpc"]
+        );
+
+        readiness.mark_registered(true);
+        readiness.mark_heartbeat_ok(true);
+        readiness.mark_task_grpc_ready();
+        assert!(!readiness.is_ready());
+        assert_eq!(readiness.missing(), vec!["backends"]);
+
+        readiness.mark_backends_ready();
+        assert!(readiness.is_ready());
     }
 
     #[test]
@@ -1237,7 +1359,7 @@ mod tests {
         assert_eq!(config.executor_id, "exec-local");
         assert_eq!(config.host, expected_host);
         assert_eq!(config.slots, 1);
-        assert_eq!(config.coordinator_endpoint, "http://127.0.0.1:9090");
+        assert_eq!(config.coordinator_endpoint, "http://127.0.0.1:2001");
         assert_eq!(config.mode, ExecutorMode::DryRun);
         assert_eq!(config.heartbeat_interval_secs, 10);
         assert!(!config.help);
@@ -1315,7 +1437,7 @@ mod tests {
         let config = ExecutorCliConfig::parse([
             String::from("--connect"),
             String::from("--task-grpc-addr"),
-            String::from("0.0.0.0:50055"),
+            String::from("0.0.0.0:2005"),
         ])
         .unwrap();
         let auth = ExecutorTaskAuthConfig::new(true, None);
@@ -1337,7 +1459,7 @@ mod tests {
         let config = ExecutorCliConfig::parse([
             String::from("--connect"),
             String::from("--task-grpc-addr"),
-            String::from("0.0.0.0:50055"),
+            String::from("0.0.0.0:2005"),
         ])
         .unwrap();
         let auth = ExecutorTaskAuthConfig::new(true, Some(String::from("task-secret")));

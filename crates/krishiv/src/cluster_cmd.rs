@@ -10,7 +10,7 @@ use crate::cli::CliResponse;
 use crate::process_util::spawn_krishiv_daemon;
 
 const DEFAULT_CLUSTER_DIR: &str = ".krishiv/cluster";
-const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:18080";
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:2002";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
@@ -62,7 +62,7 @@ pub fn cluster_help() -> String {
            krishiv cluster verify-network [--data-dir <DIR>]\n\
          \n\
          Web UI:\n\
-           http://127.0.0.1:18080/ui by default, or use --http-addr <HOST:PORT>.\n",
+           http://127.0.0.1:2002/ui by default, or use --http-addr <HOST:PORT>.\n",
     )
 }
 
@@ -136,7 +136,7 @@ fn parse_http_addr(args: &[&str]) -> Result<Option<String>, String> {
 /// Stride is 2 so adjacent executors never share a port:
 ///   idx=0 → (50055, 50056), idx=1 → (50057, 50058), …
 fn executor_port_pair(idx: usize) -> (u16, u16) {
-    let base = 50055u16 + (idx as u16) * 2;
+    let base = 2005u16 + (idx as u16) * 2;
     (base, base + 1)
 }
 
@@ -167,7 +167,7 @@ fn cluster_start(args: &[&str]) -> CliResponse {
         "clusterd",
         &[
             "--grpc-addr",
-            "127.0.0.1:9090",
+            "127.0.0.1:2001",
             "--http-addr",
             &http_addr,
             "--metadata-backend",
@@ -190,7 +190,7 @@ fn cluster_start(args: &[&str]) -> CliResponse {
                 "--executor-id",
                 &exec_id,
                 "--coordinator",
-                "http://127.0.0.1:9090",
+                "http://127.0.0.1:2001",
                 "--task-grpc-addr",
                 &task_addr,
                 "--barrier-grpc-addr",
@@ -201,7 +201,7 @@ fn cluster_start(args: &[&str]) -> CliResponse {
         }
     }
     let cfg = ClusterConfig {
-        clusterd_grpc: String::from("http://127.0.0.1:9090"),
+        clusterd_grpc: String::from("http://127.0.0.1:2001"),
         http_addr: http_addr.clone(),
         metadata_path,
         data_dir: data_dir.clone(),
@@ -212,7 +212,7 @@ fn cluster_start(args: &[&str]) -> CliResponse {
         return CliResponse::err(e, 1);
     }
     CliResponse::ok(format!(
-        "Krishiv cluster started in {}\n  clusterd: http://127.0.0.1:9090\n  UI: {}\n  executors: {executor_count}\n  export KRISHIV_COORDINATOR=http://127.0.0.1:9090\n",
+        "Krishiv cluster started in {}\n  clusterd: http://127.0.0.1:2001\n  UI: {}\n  executors: {executor_count}\n  export KRISHIV_COORDINATOR=http://127.0.0.1:2001\n",
         data_dir.display(),
         cfg.ui_url()
     ))
@@ -286,9 +286,9 @@ fn cluster_verify_network(args: &[&str]) -> CliResponse {
     let http_port: u16 = http_addr
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse().ok())
-        .unwrap_or(18080);
+        .unwrap_or(2002);
 
-    let mut ports = vec![9090u16, http_port];
+    let mut ports = vec![2001u16, http_port];
     for i in 0..executor_count {
         let (task, barrier) = executor_port_pair(i);
         ports.push(task);
@@ -325,10 +325,10 @@ mod tests {
         let (t0, b0) = executor_bind_addrs(0);
         let (t1, b1) = executor_bind_addrs(1);
 
-        assert_eq!(t0, "127.0.0.1:50055");
-        assert_eq!(b0, "127.0.0.1:50056");
-        assert_eq!(t1, "127.0.0.1:50057");
-        assert_eq!(b1, "127.0.0.1:50058");
+        assert_eq!(t0, "127.0.0.1:2005");
+        assert_eq!(b0, "127.0.0.1:2006");
+        assert_eq!(t1, "127.0.0.1:2007");
+        assert_eq!(b1, "127.0.0.1:2008");
 
         // No port appears twice across the first two executors.
         let ports = [
