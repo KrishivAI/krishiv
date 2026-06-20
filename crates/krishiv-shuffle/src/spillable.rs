@@ -97,6 +97,7 @@ impl ShuffleStore for SpillableShuffleBackend {
         partition: ShufflePartition,
         lease_token: u64,
     ) -> ShuffleResult<()> {
+        let id = partition.id.clone();
         let bytes = crate::compression::partition_memory_bytes(&partition);
         let accepted = self.budget.try_reserve(bytes as u64);
         if !accepted {
@@ -115,9 +116,19 @@ impl ShuffleStore for SpillableShuffleBackend {
             });
         }
         let result = self.inner.write_partition(partition, lease_token).await;
-        if result.is_err() {
-            // Roll back the reservation since the write failed.
-            self.budget.release(bytes as u64);
+        match &result {
+            Err(_) => {
+                // Roll back the reservation since the write failed.
+                self.budget.release(bytes as u64);
+            }
+            Ok(()) if !self.inner.is_partition_in_memory(&id) => {
+                // G2: The inner store spilled this partition to disk immediately
+                // (e.g. it was too large for the cap, or triggered LRU eviction
+                // of itself). Release the budget so it isn't double-counted
+                // against in-memory usage.
+                self.budget.release(bytes as u64);
+            }
+            Ok(()) => {}
         }
         result
     }

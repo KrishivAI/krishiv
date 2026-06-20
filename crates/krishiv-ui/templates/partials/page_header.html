@@ -1,0 +1,13 @@
+<div class="page-header">
+  <div class="page-header-text">
+    <h1>{{ title }}</h1>
+    {% if description %}
+    <p class="page-desc">{{ description }}</p>
+    {% endif %}
+  </div>
+  {% if actions %}
+  <div class="page-header-actions">
+    {{ actions }}
+  </div>
+  {% endif %}
+</div>

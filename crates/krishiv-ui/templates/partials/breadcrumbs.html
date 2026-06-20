@@ -1,0 +1,12 @@
+{% if crumbs.len() > 0 %}
+<nav class="breadcrumbs" aria-label="Breadcrumb">
+  {% for crumb in crumbs %}
+    {% if crumb.url.is_some() %}
+      <a href="{{ crumb.url.as_ref().unwrap() }}">{{ crumb.label }}</a>
+    {% else %}
+      <span class="crumb-current">{{ crumb.label }}</span>
+    {% endif %}
+    {% if !loop.last %}<span class="crumb-sep">/</span>{% endif %}
+  {% endfor %}
+</nav>
+{% endif %}

@@ -1,5 +1,43 @@
 # Krishiv Implementation Status
 
+## 2026-06-20 — Shuffle service deferred fixes
+
+Applied the 6 remaining architectural fixes to `krishiv-shuffle`.
+
+### Completed
+
+- **A4**: Replaced 7 separate `RwLock`s in `InMemoryShuffleStore` with a single
+  `std::sync::Mutex<InMemoryState>` — eliminates multi-lock deadlock risk; the
+  compiler enforces no `MutexGuard` is held across `.await` points.
+- **G2**: `SpillableShuffleBackend::write_partition` now releases budget after a
+  successful write if the inner store immediately spilled the partition to disk
+  (checked via new sync `is_partition_in_memory`).
+- **G6**: `FlightShuffleClient::push` streams `FlightDataEncoder` output directly
+  to `do_put` instead of collecting into `Vec<FlightData>` — removes the
+  in-memory copy of the IPC-encoded partition.
+- **A3**: `ShuffleFlightService` and `serve()` are now generic over
+  `S: ShuffleStore + Send + Sync + 'static`; `ShuffleSvcState` uses
+  `Arc<dyn ShuffleStore + Send + Sync>` — both can be backed by any store.
+
+### Validation
+
+```bash
+cargo test -p krishiv-shuffle --lib   # 132 passed, 0 failed
+cargo check --workspace               # clean (only pre-existing pyo3 deprecation warnings)
+```
+
+### Blockers
+
+None.
+
+### Next useful command
+
+```bash
+cargo test --workspace
+```
+
+---
+
 ## 2026-06-20 — Distributed deployment wiring fixes
 
 Fixed the distributed-mode deployment gaps found in the executor/coordinator

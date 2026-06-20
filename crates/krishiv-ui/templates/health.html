@@ -1,68 +1,85 @@
 {% extends "base.html" %}
 {% block title %}Health · Krishiv{% endblock %}
+{% block nav_health %}active{% endblock %}
+{% block topbar_title %}Cluster Health{% endblock %}
 {% block content %}
-<h1 class="page-heading">Cluster Health</h1>
 <div id="live-region" data-live-interval="15000">
-  <section class="section">
-    <h2>Summary</h2>
-    <div class="health-grid">
-      <div class="health-stat healthy">
-        <span class="stat-label">Healthy Executors</span>
-        <span class="stat-value">{{ self.healthy_executors() }}</span>
-      </div>
-      <div class="health-stat {% if self.lost_executors() > 0 %}degraded{% else %}healthy{% endif %}">
-        <span class="stat-label">Lost / Unhealthy</span>
-        <span class="stat-value">{{ self.lost_executors() }}</span>
-      </div>
-      <div class="health-stat">
-        <span class="stat-label">Memory Used</span>
-        <span class="stat-value">{{ self.memory_used_pct_int() }}%</span>
-      </div>
-      <div class="health-stat">
-        <span class="stat-label">Total Jobs</span>
-        <span class="stat-value">{{ jobs.len() }}</span>
-      </div>
-    </div>
-  </section>
 
-  <section class="section">
-    <h2>Executors</h2>
-    {% if executors.len() == 0 %}
-    <div class="empty">No executors registered.</div>
-    {% else %}
-    <div class="executor-cards">
-      {% for ex in executors %}
-      <div class="executor-card {% if ex.state == "Active" %}card-ok{% else %}card-warn{% endif %}">
-        <div class="card-header">
-          <a href="/ui/executors/{{ ex.executor_id }}">{{ ex.executor_id }}</a>
-        </div>
-        <div class="card-body">
-          <dl>
-            <dt>State</dt>
-            <dd>{{ ex.state }}</dd>
-            <dt>Slots</dt>
-            <dd>{{ ex.slots }}</dd>
-            <dt>Memory</dt>
-            <dd>
-              {% match ex.memory_used_bytes %}
-                {% when Some with (used) %}
-                  {% match ex.memory_limit_bytes %}
-                    {% when Some with (limit) %}
-                      {{ used / (1024*1024) }} / {{ limit / (1024*1024) }} MB
-                    {% when None %}
-                      {{ used / (1024*1024) }} MB
-                  {% endmatch %}
-                {% when None %}
-                  N/A
-              {% endmatch %}
-            </dd>
-          </dl>
-        </div>
-      </div>
-      {% endfor %}
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">Healthy Executors</div>
+      <div class="stat-value success">{{ self.healthy_executors() }}</div>
     </div>
-    {% endif %}
-  </section>
+    <div class="stat-card">
+      <div class="stat-label">Lost / Unhealthy</div>
+      <div class="stat-value {% if self.lost_executors() > 0 %}error{% endif %}">{{ self.lost_executors() }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Memory Used</div>
+      <div class="stat-value">{{ self.memory_used_pct_int() }}%</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total Jobs</div>
+      <div class="stat-value gold">{{ jobs.len() }}</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Executors</h2>
+    </div>
+    <div class="panel-body-compact">
+      {% if executors.len() == 0 %}
+      <div class="empty-state">
+        <div class="empty-icon">&#9729;</div>
+        <div class="empty-title">No executors registered</div>
+        <p class="empty-desc">Worker nodes will appear here once they connect.</p>
+      </div>
+      {% else %}
+      <div class="executor-cards" style="padding: 12px;">
+        {% for ex in executors %}
+        <div class="executor-card {% if ex.state == "active" %}card-ok{% elif ex.state == "healthy" %}card-ok{% elif ex.state == "lost" %}card-error{% else %}card-warn{% endif %}">
+          <div class="card-header">
+            <a href="/ui/executors/{{ ex.executor_id }}">{{ ex.executor_id }}</a>
+          </div>
+          <div class="card-body">
+            <dl>
+              <dt>State</dt>
+              <dd>
+                {% if ex.state == "healthy" %}
+                  <span class="badge badge-success">{{ ex.state }}</span>
+                {% elif ex.state == "active" %}
+                  <span class="badge badge-success">{{ ex.state }}</span>
+                {% elif ex.state == "lost" %}
+                  <span class="badge badge-error">{{ ex.state }}</span>
+                {% else %}
+                  <span class="badge badge-neutral">{{ ex.state }}</span>
+                {% endif %}
+              </dd>
+              <dt>Slots</dt>
+              <dd>{{ ex.slots }}</dd>
+              <dt>Memory</dt>
+              <dd>
+                {% match ex.memory_used_bytes %}
+                  {% when Some with (used) %}
+                    {% match ex.memory_limit_bytes %}
+                      {% when Some with (limit) %}
+                        {{ used / (1024*1024) }} / {{ limit / (1024*1024) }} MB
+                      {% when None %}
+                        {{ used / (1024*1024) }} MB
+                    {% endmatch %}
+                  {% when None %}
+                    N/A
+                {% endmatch %}
+              </dd>
+            </dl>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
 
   <span class="refresh-note" hidden>refreshing</span>
 </div>

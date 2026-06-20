@@ -13,9 +13,11 @@ use axum::routing::get;
 use constant_time_eq::constant_time_eq;
 use tokio::net::TcpListener;
 
+// A3: Use a trait object so the HTTP shuffle service can be backed by any
+// ShuffleStore implementation, not just LocalDiskShuffleStore.
 #[derive(Clone)]
 pub(crate) struct ShuffleSvcState {
-    pub(crate) store: Arc<LocalDiskShuffleStore>,
+    pub(crate) store: Arc<dyn ShuffleStore + Send + Sync>,
     pub(crate) token: Option<String>,
 }
 
@@ -34,7 +36,7 @@ pub async fn run_shuffle_svc(
     base_dir: impl AsRef<Path>,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let store = Arc::new(
+    let store: Arc<dyn ShuffleStore + Send + Sync> = Arc::new(
         LocalDiskShuffleStore::new(base_dir.as_ref())?.with_compression(ShuffleCompression::Lz4),
     );
     let token = std::env::var("KRISHIV_SHUFFLE_TOKEN").ok();

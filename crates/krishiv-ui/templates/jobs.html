@@ -1,103 +1,160 @@
 {% extends "base.html" %}
-{% block title %}Krishiv{% endblock %}
+{% block title %}Krishiv — Overview{% endblock %}
+{% block nav_home %}active{% endblock %}
+{% block topbar_title %}Overview{% endblock %}
 {% block content %}
 <div id="live-region" data-live-interval="15000">
-  <div class="metrics">
-    <div class="metric">
-      <div class="label">Jobs</div>
-      <div class="value">{{ jobs.len() }}</div>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">Jobs</div>
+      <div class="stat-value gold">{{ jobs.len() }}</div>
     </div>
-    <div class="metric">
-      <div class="label">Executors</div>
-      <div class="value">{{ executors.len() }}</div>
+    <div class="stat-card">
+      <div class="stat-label">Executors</div>
+      <div class="stat-value">{{ executors.len() }}</div>
     </div>
-    <div class="metric">
-      <div class="label">Running Tasks</div>
-      <div class="value">{{ self.running_tasks() }}</div>
+    <div class="stat-card">
+      <div class="stat-label">Running Tasks</div>
+      <div class="stat-value success">{{ self.running_tasks() }}</div>
     </div>
-    <div class="metric">
-      <div class="label">Failed Tasks</div>
-      <div class="value {% if self.failed_tasks() > 0 %}bad{% endif %}">{{ self.failed_tasks() }}</div>
+    <div class="stat-card">
+      <div class="stat-label">Failed Tasks</div>
+      <div class="stat-value {% if self.failed_tasks() > 0 %}error{% endif %}">{{ self.failed_tasks() }}</div>
     </div>
   </div>
 
-  <section class="section">
-    <h2>Jobs</h2>
-    {% if jobs.len() == 0 %}
-    <div class="empty">No distributed jobs are known to this coordinator process.</div>
-    {% else %}
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Job</th>
-            <th>Kind</th>
-            <th>State</th>
-            <th>Stages</th>
-            <th>Tasks</th>
-            <th>Running</th>
-            <th>Succeeded</th>
-            <th>Failed</th>
-            <th>Priority</th>
-            <th>CPU (ns)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for job in jobs %}
-          <tr>
-            <td><a href="/ui/jobs/{{ job.job_id }}">{{ job.job_id }}</a></td>
-            <td>{% if job.kind == "streaming" %}<span class="tag streaming">{{ job.kind }}</span>{% else %}{{ job.kind }}{% endif %}</td>
-            <td><span class="state-dot {{ job.state }}">{{ job.state }}</span></td>
-            <td>{{ job.stage_count }}</td>
-            <td>{{ job.task_count }}</td>
-            <td>{{ job.running_task_count }}</td>
-            <td>{{ job.succeeded_task_count }}</td>
-            <td>{% if job.failed_task_count > 0 %}<strong class="bad">{{ job.failed_task_count }}</strong>{% else %}{{ job.failed_task_count }}{% endif %}</td>
-            <td><span class="tag">{{ job.priority }}</span></td>
-            <td><span class="tag">{{ job.resource_usage.cpu_nanos }}</span></td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+  <div class="panel" style="margin-bottom: 24px;">
+    <div class="panel-header">
+      <h2>Jobs</h2>
+      {% if jobs.len() > 0 %}
+      <span class="panel-action" style="font-size: 11px; color: var(--text-soft);">{{ jobs.len() }} total</span>
+      {% endif %}
     </div>
-    {% endif %}
-  </section>
+    <div class="panel-body-compact">
+      {% if jobs.len() == 0 %}
+      <div class="empty-state">
+        <div class="empty-icon">&#9881;</div>
+        <div class="empty-title">No active jobs</div>
+        <p class="empty-desc">No distributed jobs are currently managed by this coordinator.</p>
+      </div>
+      {% else %}
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Kind</th>
+              <th>State</th>
+              <th>Stages</th>
+              <th>Tasks</th>
+              <th>Running</th>
+              <th>Succeeded</th>
+              <th>Failed</th>
+              <th>Priority</th>
+              <th>CPU (ns)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for job in jobs %}
+            <tr>
+              <td><a href="/ui/jobs/{{ job.job_id }}">{{ job.job_id }}</a></td>
+              <td>
+                {% if job.kind == "streaming" %}
+                  <span class="tag tag-streaming">{{ job.kind }}</span>
+                {% elif job.kind == "batch" %}
+                  <span class="tag tag-batch">{{ job.kind }}</span>
+                {% else %}
+                  <span class="tag">{{ job.kind }}</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if job.state == "running" %}
+                  <span class="badge badge-success">{{ job.state }}</span>
+                {% elif job.state == "active" %}
+                  <span class="badge badge-success">{{ job.state }}</span>
+                {% elif job.state == "failed" %}
+                  <span class="badge badge-error">{{ job.state }}</span>
+                {% elif job.state == "succeeded" %}
+                  <span class="badge badge-success">{{ job.state }}</span>
+                {% elif job.state == "committed" %}
+                  <span class="badge badge-success">{{ job.state }}</span>
+                {% else %}
+                  <span class="badge badge-neutral">{{ job.state }}</span>
+                {% endif %}
+              </td>
+              <td class="td-mono">{{ job.stage_count }}</td>
+              <td class="td-mono">{{ job.task_count }}</td>
+              <td class="td-mono">{{ job.running_task_count }}</td>
+              <td class="td-mono">{{ job.succeeded_task_count }}</td>
+              <td class="td-mono">{% if job.failed_task_count > 0 %}<strong style="color: var(--error);">{{ job.failed_task_count }}</strong>{% else %}{{ job.failed_task_count }}{% endif %}</td>
+              <td><span class="tag">{{ job.priority }}</span></td>
+              <td class="td-mono">{{ job.resource_usage.cpu_nanos }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
 
-  <section class="section">
-    <h2>Executors</h2>
-    {% if executors.len() == 0 %}
-    <div class="empty">No executors are registered.</div>
-    {% else %}
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Executor</th>
-            <th>State</th>
-            <th>Slots</th>
-            <th>Host</th>
-            <th>Running Tasks</th>
-            <th>Heartbeat Tick</th>
-            <th>Memory</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for executor in executors %}
-          <tr>
-            <td><a href="/ui/executors/{{ executor.executor_id }}">{{ executor.executor_id }}</a></td>
-            <td><span class="state-dot {{ executor.state }}">{{ executor.state }}</span></td>
-            <td>{{ executor.slots }}</td>
-            <td>{{ executor.host }}</td>
-            <td>{{ executor.running_tasks.len() }}</td>
-            <td>{{ executor.last_heartbeat_tick }}</td>
-            <td>{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB{% else %}&mdash;{% endif %}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Executors</h2>
+      {% if executors.len() > 0 %}
+      <span class="panel-action" style="font-size: 11px; color: var(--text-soft);">{{ executors.len() }} registered</span>
+      {% endif %}
     </div>
-    {% endif %}
-  </section>
+    <div class="panel-body-compact">
+      {% if executors.len() == 0 %}
+      <div class="empty-state">
+        <div class="empty-icon">&#9729;</div>
+        <div class="empty-title">No executors registered</div>
+        <p class="empty-desc">Workers will appear here once they connect to the coordinator.</p>
+      </div>
+      {% else %}
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Executor</th>
+              <th>State</th>
+              <th>Slots</th>
+              <th>Host</th>
+              <th>Running Tasks</th>
+              <th>Heartbeat</th>
+              <th>Memory</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for executor in executors %}
+            <tr>
+              <td><a href="/ui/executors/{{ executor.executor_id }}">{{ executor.executor_id }}</a></td>
+              <td>
+                {% if executor.state == "healthy" %}
+                  <span class="badge badge-success">{{ executor.state }}</span>
+                {% elif executor.state == "active" %}
+                  <span class="badge badge-success">{{ executor.state }}</span>
+                {% elif executor.state == "lost" %}
+                  <span class="badge badge-error">{{ executor.state }}</span>
+                {% else %}
+                  <span class="badge badge-neutral">{{ executor.state }}</span>
+                {% endif %}
+              </td>
+              <td class="td-mono">{{ executor.slots }}</td>
+              <td>{{ executor.host }}</td>
+              <td class="td-mono">{{ executor.running_tasks.len() }}</td>
+              <td class="td-mono">{{ executor.last_heartbeat_tick }}</td>
+              <td class="td-mono">{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB{% else %}&mdash;{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
 
   <span class="refresh-note" hidden>refreshing</span>
 </div>

@@ -1,17 +1,6 @@
-// krishiv-live.js — tiny vendored replacement for the narrow slice of htmx
-// this ops console actually used (periodic fragment polling + a theme toggle).
+// krishiv-live.js — vendored live-refresh + theme toggle + sidebar drawer.
 //
 // No external dependencies, no CDN, CSP-friendly (`script-src 'self'`).
-//
-// Behavior:
-//   * Any element with `id="live-region"` and a `data-live-interval` (ms)
-//     attribute is refreshed on that interval. We re-fetch the current page,
-//     parse it, and swap ONLY the `#live-region` subtree — so the nav, page
-//     heading, breadcrumb, scroll position and focus outside the region are
-//     preserved (unlike the old full-`<main>` swap).
-//   * A `.refresh-note` element (if present) is shown while a refresh is in
-//     flight, mirroring the old hx-indicator.
-//   * Any element with `data-theme-toggle` flips the document color-scheme.
 (function () {
   "use strict";
 
@@ -21,9 +10,7 @@
       if (t === "dark" || t === "light") {
         document.documentElement.style.colorScheme = t;
       }
-    } catch (e) {
-      /* localStorage may be unavailable; ignore */
-    }
+    } catch (e) { /* ignore */ }
   }
 
   function toggleTheme() {
@@ -32,9 +19,7 @@
     document.documentElement.style.colorScheme = next;
     try {
       localStorage.setItem("krishiv-theme", next);
-    } catch (e) {
-      /* ignore */
-    }
+    } catch (e) { /* ignore */ }
   }
 
   function setIndicator(visible) {
@@ -64,13 +49,12 @@
       var text = await resp.text();
       var doc = new DOMParser().parseFromString(text, "text/html");
       var fresh = doc.getElementById("live-region");
-      // Only swap if the region is still present after the await.
       var current = document.getElementById("live-region");
       if (fresh && current) {
         current.innerHTML = fresh.innerHTML;
       }
     } catch (e) {
-      /* transient network/parse error — keep the stale view, try again next tick */
+      /* transient error — keep stale view */
     } finally {
       setIndicator(false);
     }
@@ -88,6 +72,61 @@
     setInterval(refreshLiveRegion, interval);
   }
 
+  // ── Sidebar / mobile drawer ────────────────────────────────────────
+
+  function openSidebar() {
+    var sidebar = document.querySelector("[data-sidebar]");
+    var overlay = document.querySelector("[data-sidebar-overlay]");
+    if (sidebar) sidebar.classList.add("open");
+    if (overlay) overlay.classList.add("active");
+  }
+
+  function closeSidebar() {
+    var sidebar = document.querySelector("[data-sidebar]");
+    var overlay = document.querySelector("[data-sidebar-overlay]");
+    if (sidebar) sidebar.classList.remove("open");
+    if (overlay) overlay.classList.remove("active");
+  }
+
+  function initSidebar() {
+    var menuBtn = document.querySelector("[data-mobile-menu]");
+    var overlay = document.querySelector("[data-sidebar-overlay]");
+
+    if (menuBtn) {
+      menuBtn.addEventListener("click", function (e) {
+        e.preventDefault();
+        openSidebar();
+      });
+    }
+
+    if (overlay) {
+      overlay.addEventListener("click", function () {
+        closeSidebar();
+      });
+    }
+
+    // Close sidebar on Escape
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") {
+        closeSidebar();
+      }
+    });
+  }
+
+  // ── Search highlight ───────────────────────────────────────────────
+
+  function initSearch() {
+    var searchInputs = document.querySelectorAll(".topbar-search input, .sidebar-search input");
+    searchInputs.forEach(function (input) {
+      input.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") {
+          input.blur();
+          input.value = "";
+        }
+      });
+    });
+  }
+
   function init() {
     applyStoredTheme();
     document.addEventListener("click", function (evt) {
@@ -98,6 +137,8 @@
       }
     });
     startPolling();
+    initSidebar();
+    initSearch();
   }
 
   if (document.readyState === "loading") {

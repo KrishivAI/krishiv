@@ -1,18 +1,25 @@
-// krishiv-sql.js — SQL editor submission without htmx.
+// krishiv-sql.js — SQL editor submission.
 //
 // Posts the query as JSON to /api/v1/sql and renders the JSON response into
-// `#results`. Replaces the former htmx hx-post + json-enc + htmx:beforeSwap
-// approach so the page needs no external script and works under a strict
-// `script-src 'self'` CSP.
+// `#results`. CSP-friendly (`script-src 'self'`), no external dependencies.
 (function () {
   "use strict";
 
   function renderError(target, message) {
     target.innerHTML = "";
-    var p = document.createElement("p");
-    p.className = "meta";
-    p.textContent = "Error: " + message;
-    target.appendChild(p);
+    var wrapper = document.createElement("div");
+    wrapper.className = "empty-state";
+    wrapper.innerHTML =
+      '<div class="empty-icon" style="color: var(--error);">&#x2715;</div>' +
+      '<div class="empty-title" style="color: var(--error);">Query Error</div>' +
+      '<p class="empty-desc">' + escapeHtml(message) + '</p>';
+    target.appendChild(wrapper);
+  }
+
+  function escapeHtml(str) {
+    var div = document.createElement("div");
+    div.textContent = str;
+    return div.innerHTML;
   }
 
   function renderResults(target, data) {
@@ -20,9 +27,7 @@
     var clone = tpl.content.cloneNode(true);
 
     if (data.error) {
-      clone.querySelector("p.meta").textContent = "Error: " + data.error;
-      target.innerHTML = "";
-      target.appendChild(clone);
+      renderError(target, data.error);
       return;
     }
 
@@ -38,14 +43,17 @@
       var tr = document.createElement("tr");
       row.forEach(function (cell) {
         var td = document.createElement("td");
+        td.className = "td-mono";
         td.textContent = cell === null ? "NULL" : String(cell);
         tr.appendChild(td);
       });
       tbody.appendChild(tr);
     });
 
-    clone.querySelector("p.meta").textContent =
-      data.row_count + " row(s) in " + data.elapsed_ms + " ms";
+    var meta = clone.querySelector(".refresh-note");
+    if (meta) {
+      meta.textContent = data.row_count + " row(s) in " + data.elapsed_ms + " ms";
+    }
 
     target.innerHTML = "";
     target.appendChild(clone);
@@ -63,7 +71,7 @@
       evt.preventDefault();
       var query = form.querySelector("[name=query]").value;
       if (spinner) {
-        spinner.classList.add("active");
+        spinner.style.display = "inline";
       }
       try {
         var headers = window.krishivAuthHeaders
@@ -81,7 +89,7 @@
         renderError(results, String(e));
       } finally {
         if (spinner) {
-          spinner.classList.remove("active");
+          spinner.style.display = "none";
         }
       }
     });

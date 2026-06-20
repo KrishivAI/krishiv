@@ -1,0 +1,12 @@
+{% match state.as_str() %}
+  {% when "running" or "active" or "healthy" or "succeeded" or "committed" %}
+    <span class="badge badge-success">{{ state }}</span>
+  {% when "failed" or "lost" %}
+    <span class="badge badge-error">{{ state }}</span>
+  {% when "assigned" or "scheduling" or "accepted" or "registered" or "retrying" or "planning" %}
+    <span class="badge badge-warning">{{ state }}</span>
+  {% when "cancelled" %}
+    <span class="badge badge-neutral">{{ state }}</span>
+  {% else %}
+    <span class="badge badge-neutral">{{ state }}</span>
+{% endmatch %}

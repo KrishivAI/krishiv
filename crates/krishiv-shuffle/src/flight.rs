@@ -34,7 +34,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{LocalDiskShuffleStore, PartitionId, ShuffleStore, error::MAX_SHUFFLE_TICKET_LEN};
+use crate::{PartitionId, ShuffleStore, error::MAX_SHUFFLE_TICKET_LEN};
 
 fn parse_ticket(ticket_bytes: &[u8]) -> Result<(String, String, u32), Status> {
     if ticket_bytes.len() > MAX_SHUFFLE_TICKET_LEN {
@@ -56,14 +56,17 @@ fn parse_ticket(ticket_bytes: &[u8]) -> Result<(String, String, u32), Status> {
     Ok((parts[0].to_owned(), parts[1].to_owned(), partition_id))
 }
 
-/// Arrow Flight shuffle service backed by a local-disk shuffle store.
+/// Arrow Flight shuffle service backed by any [`ShuffleStore`] implementation.
+///
+/// A3: Generic over `S` so callers can back the service with `LocalDiskShuffleStore`,
+/// `InMemoryShuffleStore`, or any future backend without changing this module.
 #[derive(Clone)]
-pub struct ShuffleFlightService {
-    store: Arc<LocalDiskShuffleStore>,
+pub struct ShuffleFlightService<S: ShuffleStore + Send + Sync + 'static> {
+    store: Arc<S>,
 }
 
-impl ShuffleFlightService {
-    pub fn new(store: Arc<LocalDiskShuffleStore>) -> Self {
+impl<S: ShuffleStore + Send + Sync + 'static> ShuffleFlightService<S> {
+    pub fn new(store: Arc<S>) -> Self {
         Self { store }
     }
 }
@@ -72,7 +75,7 @@ type BoxedFlightStream<T> =
     Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
-impl FlightService for ShuffleFlightService {
+impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightService<S> {
     type HandshakeStream = BoxedFlightStream<HandshakeResponse>;
     type ListFlightsStream = BoxedFlightStream<FlightInfo>;
     type DoGetStream = BoxedFlightStream<FlightData>;
@@ -270,9 +273,9 @@ impl FlightService for ShuffleFlightService {
 ///
 /// Returns the bound local address and a join handle.  Aborting the handle
 /// stops the server.
-pub async fn serve(
+pub async fn serve<S: ShuffleStore + Send + Sync + 'static>(
     addr: SocketAddr,
-    store: Arc<LocalDiskShuffleStore>,
+    store: Arc<S>,
 ) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
@@ -523,15 +526,15 @@ impl FlightShuffleClient {
             .with_flight_descriptor(Some(descriptor))
             .with_options(IpcWriteOptions::default())
             .build(batch_stream);
-        // do_put requires a plain Stream<Item=FlightData>; collect encoder output
-        // (already in memory) to satisfy the bound.
-        let flight_data: Vec<FlightData> = encoder
-            .try_collect()
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
 
+        // G6: Stream encoder output directly to avoid buffering all FlightData in memory.
+        // Arrow IPC encoding of valid in-memory RecordBatches must not fail; any error
+        // indicates a bug (unsupported type) that would have failed earlier at batch creation.
+        let flight_stream = encoder.map(|item| {
+            item.expect("Arrow IPC encoding of a valid in-memory RecordBatch must not fail")
+        });
         client
-            .do_put(Request::new(futures::stream::iter(flight_data)))
+            .do_put(Request::new(flight_stream))
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
 

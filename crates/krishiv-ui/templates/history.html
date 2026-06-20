@@ -1,50 +1,83 @@
 {% extends "base.html" %}
 {% block title %}Job History · Krishiv{% endblock %}
+{% block nav_history %}active{% endblock %}
+{% block topbar_title %}Job History{% endblock %}
 {% block content %}
-<h1 class="page-heading">Job History</h1>
+
 {% if records.is_empty() %}
-<div class="empty">No completed jobs in history yet.</div>
+<div class="empty-state">
+  <div class="empty-icon">&#9716;</div>
+  <div class="empty-title">No history yet</div>
+  <p class="empty-desc">No completed jobs in history yet. Finished jobs will appear here.</p>
+</div>
 {% else %}
-<section class="section">
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Job ID</th>
-          <th>Kind</th>
-          <th>State</th>
-          <th>Stages</th>
-          <th>Tasks</th>
-          <th>Succeeded</th>
-          <th>Failed</th>
-          <th>CPU (ms)</th>
-          <th>Mem Peak</th>
-          <th>Completed</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for r in records %}
-        <tr>
-          <td><a href="/ui/history/{{ r.job_id }}">{{ r.job_id }}</a></td>
-          <td>{{ r.job_kind }}</td>
-          <td><span class="state-dot {{ r.final_state }}">{{ r.final_state }}</span></td>
-          <td>{{ r.stage_count }}</td>
-          <td>{{ r.task_count }}</td>
-          <td>{{ r.succeeded_task_count }}</td>
-          <td>{% if r.failed_task_count > 0 %}<strong class="bad">{{ r.failed_task_count }}</strong>{% else %}{{ r.failed_task_count }}{% endif %}</td>
-          <td>{{ r.cpu_nanos / 1000000 }}</td>
-          <td>{{ r.memory_peak_task_bytes / 1048576 }} MB</td>
-          <td>{{ r.completed_at_ms }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+
+<div class="panel">
+  <div class="panel-header">
+    <h2>Completed Jobs</h2>
+    <span class="panel-action" style="font-size: 11px; color: var(--text-soft);">{{ total }} total</span>
   </div>
-  {% if self.has_more() %}
-  <div class="pagination">
-    <a class="btn" href="/ui/history?offset={{ self.next_offset() }}&limit={{ limit }}">Next →</a>
+  <div class="panel-body-compact">
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>Job ID</th>
+            <th>Kind</th>
+            <th>State</th>
+            <th>Stages</th>
+            <th>Tasks</th>
+            <th>Succeeded</th>
+            <th>Failed</th>
+            <th>CPU (ms)</th>
+            <th>Mem Peak</th>
+            <th>Completed</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in records %}
+          <tr>
+            <td><a href="/ui/history/{{ r.job_id }}">{{ r.job_id }}</a></td>
+            <td>
+              {% if r.job_kind == "streaming" %}
+                <span class="tag tag-streaming">{{ r.job_kind }}</span>
+              {% elif r.job_kind == "batch" %}
+                <span class="tag tag-batch">{{ r.job_kind }}</span>
+              {% else %}
+                <span class="tag">{{ r.job_kind }}</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if r.final_state == "succeeded" %}
+                <span class="badge badge-success">{{ r.final_state }}</span>
+              {% elif r.final_state == "committed" %}
+                <span class="badge badge-success">{{ r.final_state }}</span>
+              {% elif r.final_state == "failed" %}
+                <span class="badge badge-error">{{ r.final_state }}</span>
+              {% else %}
+                <span class="badge badge-neutral">{{ r.final_state }}</span>
+              {% endif %}
+            </td>
+            <td class="td-mono">{{ r.stage_count }}</td>
+            <td class="td-mono">{{ r.task_count }}</td>
+            <td class="td-mono">{{ r.succeeded_task_count }}</td>
+            <td class="td-mono">{% if r.failed_task_count > 0 %}<strong style="color: var(--error);">{{ r.failed_task_count }}</strong>{% else %}{{ r.failed_task_count }}{% endif %}</td>
+            <td class="td-mono">{{ r.cpu_nanos / 1000000 }}</td>
+            <td class="td-mono">{{ r.memory_peak_task_bytes / 1048576 }} MB</td>
+            <td class="td-mono">{{ r.completed_at_ms }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   </div>
-  {% endif %}
-</section>
+</div>
+
+{% if self.has_more() %}
+<div class="pagination">
+  <a class="btn btn-secondary" href="/ui/history?offset={{ self.next_offset() }}&limit={{ limit }}">Next &rarr;</a>
+</div>
+{% endif %}
+
 {% endif %}
 {% endblock %}
