@@ -31,9 +31,9 @@ ahash = { workspace = true }
 indexmap = { workspace = true }
 twox-hash = { workspace = true }
 zstd = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 

@@ -26,6 +26,7 @@ impl TieredShuffleStore {
     }
 }
 
+#[async_trait::async_trait]
 impl ShuffleStore for TieredShuffleStore {
     async fn register_partition_lease(
         &self,

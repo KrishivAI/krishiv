@@ -248,6 +248,7 @@ impl LocalDiskShuffleStore {
     }
 }
 
+#[async_trait::async_trait]
 impl ShuffleStore for LocalDiskShuffleStore {
     async fn register_partition_lease(
         &self,
@@ -405,8 +406,16 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 // Newer writer won — silently discard this temp file.
                 let _ = std::fs::remove_file(&tmp_path);
                 let _ = std::fs::remove_file(&tmp_hash_path);
+                // B4: Report the actual current token as `expected`, not
+                // `lease_token + 1` (which was wrong when tokens advance by more than 1).
+                let current = {
+                    let tokens = lease_tokens
+                        .read()
+                        .map_err(|_| io_err("lease token lock poisoned"))?;
+                    tokens.get(&key).copied().unwrap_or(0)
+                };
                 return Err(ShuffleError::StaleLeaseToken {
-                    expected: lease_token.saturating_add(1),
+                    expected: current,
                     actual: lease_token,
                 });
             }

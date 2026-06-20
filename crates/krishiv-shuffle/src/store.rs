@@ -1,7 +1,6 @@
 use crate::ShuffleResult;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use std::future::Future;
 
 /// Identifies a shuffle partition uniquely within a job.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -30,6 +29,10 @@ pub struct ShuffleStream {
 ///
 /// Implementations must be `Send + Sync` so they can be shared across async
 /// task boundaries inside the executor runtime.
+///
+/// The trait is object-safe via `async_trait` so callers can use
+/// `Arc<dyn ShuffleStore + Send + Sync>`.
+#[async_trait::async_trait]
 pub trait ShuffleStore: Send + Sync {
     /// Register the currently valid assignment lease token for a partition.
     ///
@@ -37,48 +40,39 @@ pub trait ShuffleStore: Send + Sync {
     /// zombie attempt cannot win a race by writing before the replacement
     /// attempt commits data. Subsequent writes for the partition must present
     /// exactly this token until a newer assignment registers a replacement.
-    fn register_partition_lease(
+    async fn register_partition_lease(
         &self,
         id: PartitionId,
         lease_token: u64,
-    ) -> impl Future<Output = ShuffleResult<()>> + Send;
+    ) -> ShuffleResult<()>;
 
     /// Write a partition. `lease_token` must match the current assignment
     /// token for this partition; stale tokens are rejected.
-    fn write_partition(
+    async fn write_partition(
         &self,
         partition: ShufflePartition,
         lease_token: u64,
-    ) -> impl Future<Output = ShuffleResult<()>> + Send;
+    ) -> ShuffleResult<()>;
 
     /// Read a partition. Returns `None` if not yet written.
-    fn read_partition(
-        &self,
-        id: &PartitionId,
-    ) -> impl Future<Output = ShuffleResult<Option<ShufflePartition>>> + Send;
+    async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>>;
 
     /// Stream a partition. Default implementation buffers via read_partition.
-    fn stream_partition(
-        &self,
-        id: &PartitionId,
-    ) -> impl Future<Output = ShuffleResult<Option<ShuffleStream>>> + Send {
+    async fn stream_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShuffleStream>> {
         let id = id.clone();
-        async move {
-            if let Some(partition) = self.read_partition(&id).await? {
-                Ok(Some(ShuffleStream {
-                    id: partition.id,
-                    schema: partition.schema,
-                    batches: Box::pin(futures::stream::iter(partition.batches.into_iter().map(Ok))),
-                }))
-            } else {
-                Ok(None)
-            }
+        if let Some(partition) = self.read_partition(&id).await? {
+            Ok(Some(ShuffleStream {
+                id: partition.id,
+                schema: partition.schema,
+                batches: Box::pin(futures::stream::iter(partition.batches.into_iter().map(Ok))),
+            }))
+        } else {
+            Ok(None)
         }
     }
 
     /// Delete all partitions for a job (called on job completion or cancellation).
-    fn delete_job_partitions(&self, job_id: &str)
-    -> impl Future<Output = ShuffleResult<()>> + Send;
+    async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()>;
 }
 
 /// Compound key used for lease maps: `(job_id, stage_id, partition_index)`.
@@ -95,6 +89,7 @@ pub enum ShuffleBackend {
     Object(std::sync::Arc<crate::ObjectStoreShuffleStore>),
 }
 
+#[async_trait::async_trait]
 impl ShuffleStore for ShuffleBackend {
     async fn register_partition_lease(
         &self,
@@ -140,18 +135,12 @@ impl ShuffleStore for ShuffleBackend {
         }
     }
 
-    fn delete_job_partitions(
-        &self,
-        job_id: &str,
-    ) -> impl Future<Output = ShuffleResult<()>> + Send {
-        let job_id = job_id.to_string();
-        async move {
-            match self {
-                Self::Local(s) => s.delete_job_partitions(&job_id).await,
-                Self::InMemory(s) => s.delete_job_partitions(&job_id).await,
-                Self::Tiered(s) => s.delete_job_partitions(&job_id).await,
-                Self::Object(s) => s.delete_job_partitions(&job_id).await,
-            }
+    async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()> {
+        match self {
+            Self::Local(s) => s.delete_job_partitions(job_id).await,
+            Self::InMemory(s) => s.delete_job_partitions(job_id).await,
+            Self::Tiered(s) => s.delete_job_partitions(job_id).await,
+            Self::Object(s) => s.delete_job_partitions(job_id).await,
         }
     }
 }

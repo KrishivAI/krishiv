@@ -33,45 +33,24 @@ pub struct InMemoryShuffleStore {
 
 /// Stable content hash for partition determinism verification.
 ///
-/// Uses XxHash64 over the actual IPC bytes of every record batch so that a
-/// write that mutates batch data (not just the metadata) is detected. The
-/// hash covers batch count and row count as a fast header check, then mixes
-/// in the first 64 bytes of each batch's Arrow IPC buffer for content
-/// sampling. Full IPC serialisation would be more thorough but is too
-/// expensive to run on every write.
+/// G8: Uses BLAKE3 over the full raw column buffer content of every record
+/// batch. This is consistent with `compute_hash_bytes` in `disk_store.rs`
+/// (which hashes the Parquet bytes) and produces a cryptographically strong
+/// 256-bit hash that covers *all* data rather than sampling the first 64 bytes.
 fn compute_simple_partition_hash(partition: &ShufflePartition) -> [u8; 32] {
-    use std::hash::Hasher as _;
-    use twox_hash::XxHash64;
-
-    let mut h = XxHash64::with_seed(0xcafe_babe_dead_beef);
-    // Mix ID so two partitions with identical data but different IDs don't collide.
-    h.write(partition.id.job_id.as_bytes());
-    h.write(partition.id.stage_id.as_bytes());
-    h.write_u32(partition.id.partition);
-    // Cover batch count and total row count as a fast header.
-    h.write_usize(partition.batches.len());
-    let total_rows: usize = partition.batches.iter().map(|b| b.num_rows()).sum();
-    h.write_usize(total_rows);
-    // Sample actual column data from each batch's first few column buffers.
+    let mut hasher = blake3::Hasher::new();
+    // Mix the partition ID so two partitions with identical data don't collide.
+    hasher.update(partition.id.job_id.as_bytes());
+    hasher.update(partition.id.stage_id.as_bytes());
+    hasher.update(&partition.id.partition.to_le_bytes());
     for batch in &partition.batches {
-        h.write_usize(batch.num_columns());
         for col in batch.columns() {
-            // Hash the first 64 bytes of each array's data buffer.
-            let buf = col.to_data();
-            for raw_buf in buf.buffers() {
-                let sample = &raw_buf.as_slice()[..raw_buf.len().min(64)];
-                h.write(sample);
+            for buf in col.to_data().buffers() {
+                hasher.update(buf.as_slice());
             }
         }
     }
-    let digest = h.finish();
-    let mut out = [0u8; 32];
-    out[0..8].copy_from_slice(&digest.to_be_bytes());
-    // Fill remaining bytes with XOR-rotated variants for better avalanche.
-    out[8..16].copy_from_slice(&digest.rotate_left(17).to_be_bytes());
-    out[16..24].copy_from_slice(&digest.rotate_left(37).to_be_bytes());
-    out[24..32].copy_from_slice(&(!digest).to_be_bytes());
-    out
+    *hasher.finalize().as_bytes()
 }
 
 impl Default for InMemoryShuffleStore {
@@ -150,6 +129,24 @@ impl InMemoryShuffleStore {
             return false;
         };
         !spilled.contains(&key)
+    }
+
+    /// G1: Returns the total in-memory bytes consumed by all in-memory (non-spilled)
+    /// partitions belonging to `job_id`. Used by `SpillableShuffleBackend` to
+    /// release budget when a job's partitions are deleted.
+    pub fn bytes_for_job(&self, job_id: &str) -> usize {
+        let Ok(parts) = shuffle_read_lock(&self.partitions) else {
+            return 0;
+        };
+        let Ok(spilled) = shuffle_read_lock(&self.spilled) else {
+            return 0;
+        };
+        parts
+            .iter()
+            .filter(|((jid, _, _), _)| jid == job_id)
+            .filter(|(key, _)| !spilled.contains(key))
+            .map(|(_, partition)| partition_memory_bytes(partition))
+            .sum()
     }
 
     async fn ensure_memory_capacity_locked(
@@ -251,6 +248,7 @@ impl InMemoryShuffleStore {
     }
 }
 
+#[async_trait::async_trait]
 impl ShuffleStore for InMemoryShuffleStore {
     async fn register_partition_lease(
         &self,

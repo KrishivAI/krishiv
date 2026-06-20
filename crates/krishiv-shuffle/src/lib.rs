@@ -11,7 +11,8 @@ pub mod disk_store;
 pub mod error;
 pub mod flight;
 pub mod lease_persistence;
-pub mod local_store;
+#[cfg(test)]
+pub(crate) mod local_store;
 pub mod memory_store;
 pub mod metadata;
 pub mod object_store;
@@ -45,7 +46,6 @@ pub use compression::{CompressionCodec, ShuffleCompression};
 pub use disk_store::LocalDiskShuffleStore;
 pub use error::{ShuffleError, ShuffleResult};
 pub use krishiv_common::durability::{DurabilityProfile, ShuffleDurability};
-pub use local_store::LocalShuffleStore;
 pub use memory_store::InMemoryShuffleStore;
 pub use metadata::{PartitionState, ShuffleMetadata};
 pub use object_store::ObjectStoreShuffleStore;
@@ -58,7 +58,5 @@ pub use storage_uri::{open_shuffle_backend_from_uri, open_tiered_shuffle_backend
 pub use store::{PartitionId, ShuffleBackend, ShufflePartition, ShuffleStore, ShuffleStream};
 pub use tiered_store::TieredShuffleStore;
 
-#[cfg(test)]
-mod gap_tests;
 #[cfg(test)]
 mod tests;

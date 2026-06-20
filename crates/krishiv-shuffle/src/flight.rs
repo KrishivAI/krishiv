@@ -181,17 +181,29 @@ impl FlightService for ShuffleFlightService {
             ));
         }
         let (job_id, stage_id, partition) = parse_ticket(descriptor.path[0].as_bytes())?;
+        // B6: Make lease_token required — reject absent or unparseable tokens.
         let lease_token: u64 = descriptor
             .path
             .get(1)
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1);
+            .ok_or_else(|| {
+                Status::invalid_argument(
+                    "missing or invalid lease_token in FlightDescriptor.path[1]",
+                )
+            })?;
 
         let id = PartitionId {
             job_id,
             stage_id,
             partition,
         };
+
+        // B6: Register the lease before writing so the two-phase protocol is
+        // honoured on the Flight path, matching the HTTP path.
+        self.store
+            .register_partition_lease(id.clone(), lease_token)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("register_partition_lease: {e}")))?;
 
         // Re-assemble a stream that starts with the first (schema) message.
         let schema_msg = futures::stream::once(async move {

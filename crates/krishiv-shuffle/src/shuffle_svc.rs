@@ -24,7 +24,7 @@ pub async fn run_shuffle_svc_from_env() -> Result<(), Box<dyn std::error::Error 
     let base_dir = std::env::var("KRISHIV_SHUFFLE_DIR")
         .unwrap_or_else(|_| String::from("/tmp/krishiv-shuffle"));
     let addr: SocketAddr = std::env::var("KRISHIV_SHUFFLE_ADDR")
-        .unwrap_or_else(|_| String::from("0.0.0.0:2004"))
+        .unwrap_or_else(|_| String::from("0.0.0.0:7072"))
         .parse()?;
     run_shuffle_svc(&base_dir, addr).await
 }
@@ -86,6 +86,34 @@ pub(crate) async fn read_partition(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let rows: usize = part.batches.iter().map(|b| b.num_rows()).sum();
-    Ok(format!("partition {} rows={rows}\n", id.partition))
+
+    // B1: Serialize batches to Arrow IPC stream bytes and return them with
+    // the correct Content-Type header, instead of a text summary.
+    use arrow::ipc::writer::StreamWriter;
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &part.schema).map_err(|e| {
+            tracing::error!(error = %e, "IPC StreamWriter creation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        for batch in &part.batches {
+            writer.write(batch).map_err(|e| {
+                tracing::error!(error = %e, "IPC batch write failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
+        writer.finish().map_err(|e| {
+            tracing::error!(error = %e, "IPC StreamWriter finish failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/vnd.apache.arrow.stream",
+        )],
+        buf,
+    ))
 }

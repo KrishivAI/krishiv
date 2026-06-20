@@ -82,6 +82,7 @@ impl SpillableShuffleBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl ShuffleStore for SpillableShuffleBackend {
     async fn register_partition_lease(
         &self,
@@ -96,27 +97,27 @@ impl ShuffleStore for SpillableShuffleBackend {
         partition: ShufflePartition,
         lease_token: u64,
     ) -> ShuffleResult<()> {
-        // Reserve budget before writing. If the budget is exceeded (returns
-        // false), the in-memory store's own spill mechanism will handle it —
-        // but we must not silently ignore the rejection.
         let bytes = crate::compression::partition_memory_bytes(&partition);
         let accepted = self.budget.try_reserve(bytes as u64);
         if !accepted {
-            // Budget exceeded — the InMemoryShuffleStore will spill to disk
-            // internally. We don't return an error here because the store's
-            // own spill path handles the overflow. The budget is advisory.
-            tracing::debug!(
-                bytes,
-                used = self.budget.used_bytes(),
-                "shuffle write exceeds memory budget; relying on store spill"
-            );
+            // G7: Budget exceeded — this is a hard limit. Return an error
+            // instead of silently proceeding and hoping the inner store's spill
+            // path handles it. Callers must handle the error and either reduce
+            // their working set or wait for budget to be released.
+            return Err(ShuffleError::MemoryLimitExceeded {
+                max_bytes: self
+                    .budget
+                    .limit()
+                    .map(|l| l as usize)
+                    .unwrap_or(usize::MAX),
+                current_bytes: self.budget.used_bytes() as usize,
+                incoming_bytes: bytes,
+            });
         }
         let result = self.inner.write_partition(partition, lease_token).await;
         if result.is_err() {
-            // Only release if we actually reserved (accepted was true).
-            if accepted {
-                self.budget.release(bytes as u64);
-            }
+            // Roll back the reservation since the write failed.
+            self.budget.release(bytes as u64);
         }
         result
     }
@@ -130,13 +131,17 @@ impl ShuffleStore for SpillableShuffleBackend {
         self.inner.read_partition(id).await
     }
 
-    fn delete_job_partitions(
-        &self,
-        job_id: &str,
-    ) -> impl std::future::Future<Output = ShuffleResult<()>> + Send {
-        let inner = Arc::clone(&self.inner);
-        let job_id = job_id.to_string();
-        async move { inner.delete_job_partitions(&job_id).await }
+    async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()> {
+        // G1: Compute the bytes about to be released BEFORE deletion so we can
+        // credit them back to the shared budget.  Only in-memory (non-spilled)
+        // partitions consume budget; spilled ones already released their budget
+        // when the spill write succeeded.
+        let bytes_to_release = self.inner.bytes_for_job(job_id) as u64;
+        self.inner.delete_job_partitions(job_id).await?;
+        if bytes_to_release > 0 {
+            self.budget.release(bytes_to_release);
+        }
+        Ok(())
     }
 }
 

@@ -152,11 +152,54 @@ impl ObjectStoreShuffleStore {
         id: &PartitionId,
         incoming: u64,
     ) -> ShuffleResult<u64> {
+        // B3: Use DashMap::entry to atomically read-validate-write the in-memory
+        // token under a shard lock, preventing two concurrent writers from both
+        // passing the monotonic check.
+        //
+        // We must release the DashMap shard lock before performing the async
+        // object-store persist, so we compute the new token under the lock and
+        // then persist it after releasing.
         let memory = self.lease_tokens.get(key).map(|entry| *entry);
-        let persisted = self.load_persisted_lease(id).await?;
+
+        // If we have an in-memory token and it is higher than `incoming`, reject
+        // immediately without an object-store read.
+        if let Some(mem_token) = memory
+            && incoming < mem_token
+        {
+            return Err(crate::ShuffleError::StaleLeaseToken {
+                expected: mem_token,
+                actual: incoming,
+            });
+        }
+
+        let persisted = if memory.is_none() {
+            self.load_persisted_lease(id).await?
+        } else {
+            None
+        };
         let current = memory.or(persisted);
         let next = crate::lease_persistence::enforce_monotonic_lease(current, incoming)?;
-        self.lease_tokens.insert(key.clone(), next);
+
+        // Atomic update: use entry() to hold the shard lock for the full
+        // read-modify-write cycle, preventing another concurrent writer from
+        // sneaking in between our validate and our insert.
+        use dashmap::mapref::entry::Entry;
+        match self.lease_tokens.entry(key.clone()) {
+            Entry::Occupied(mut e) => {
+                let current_in_map = *e.get();
+                if incoming < current_in_map {
+                    return Err(crate::ShuffleError::StaleLeaseToken {
+                        expected: current_in_map,
+                        actual: incoming,
+                    });
+                }
+                e.insert(next);
+            }
+            Entry::Vacant(e) => {
+                e.insert(next);
+            }
+        }
+
         self.persist_lease(id, next).await?;
         Ok(next)
     }
@@ -173,6 +216,7 @@ impl ObjectStoreShuffleStore {
     }
 }
 
+#[async_trait::async_trait]
 impl ShuffleStore for ObjectStoreShuffleStore {
     async fn register_partition_lease(
         &self,
@@ -392,11 +436,12 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             });
         }
 
-        let decompressed = self
-            .compression
-            .decompress(&data)
-            .map_err(|e| crate::error::io_err(e.to_string()))?;
-        let cursor = std::io::Cursor::new(decompressed);
+        // B2: The IPC bytes from the object store are NOT outer-compressed —
+        // compression is embedded at the IPC record-batch level. Pass `data`
+        // directly to StreamReader without a double-decompress step.
+        // Convert to Vec<u8> so the owned bytes can be moved into spawn_blocking.
+        let ipc_bytes: Vec<u8> = data.to_vec();
+        let cursor = std::io::Cursor::new(ipc_bytes);
         let reader =
             StreamReader::try_new(cursor, None).map_err(|e| crate::error::io_err(e.to_string()))?;
         let schema = reader.schema();

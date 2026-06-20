@@ -11,9 +11,12 @@ mod shuffle_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
+    use crate::local_store::LocalShuffleStore;
     use crate::{
         CompressionCodec, HashPartitioner, InMemoryShuffleStore, LocalDiskShuffleStore,
-        LocalShuffleStore, PartitionId, PartitionState, ShuffleCompression, ShuffleError,
+        PartitionId, PartitionState, ShuffleCompression, ShuffleError,
+    };
+    use crate::{
         ShuffleMetadata, ShufflePartition, ShufflePath, ShuffleStore, TieredShuffleStore,
         cleanup_orphans, compression::partition_memory_bytes, scan_orphans,
     };

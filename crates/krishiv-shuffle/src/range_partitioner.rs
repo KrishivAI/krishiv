@@ -49,36 +49,79 @@ impl RangeBound {
 
 // ── Sampler ───────────────────────────────────────────────────────────────────
 
-/// Collects a reservoir sample of key values from input batches.
+/// Collects an unbiased reservoir sample of key values from input batches.
+///
+/// Uses Vitter's Algorithm R for reservoir sampling: every row in the input
+/// has an equal probability of appearing in the final sample regardless of
+/// input order, batch size, or total count. This produces unbiased range
+/// boundaries even for skewed distributions.
 ///
 /// Call [`sample`][Self::sample] for each input batch, then
 /// [`build_boundaries`][Self::build_boundaries] once all input is consumed.
-#[derive(Debug, Default)]
+///
+/// G5: Replaced deterministic stride sampling with proper reservoir sampling
+/// so that `build_boundaries` produces unbiased quantile estimates.
+#[derive(Debug)]
 pub struct RangeSampler {
     i32_samples: Vec<i32>,
     i64_samples: Vec<i64>,
     str_samples: Vec<String>,
-    sample_fraction: f64,
+    /// Maximum number of samples to retain (reservoir capacity).
+    reservoir_size: usize,
+    /// Total number of non-null rows seen so far (for Vitter's Algorithm R).
+    rows_seen: usize,
+    /// Deterministic seed for the PRNG used in reservoir sampling.
+    seed: u64,
+}
+
+impl Default for RangeSampler {
+    fn default() -> Self {
+        Self {
+            i32_samples: Vec::new(),
+            i64_samples: Vec::new(),
+            str_samples: Vec::new(),
+            reservoir_size: 10_000,
+            rows_seen: 0,
+            seed: 0,
+        }
+    }
+}
+
+/// Simple deterministic LCG PRNG for reservoir sampling (no external deps).
+/// Returns a value in `[0, n)`.
+fn lcg_rand(state: &mut u64, n: usize) -> usize {
+    // LCG parameters from Knuth.
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    // Use the upper 32 bits for better quality.
+    ((*state >> 33) as usize) % n
 }
 
 impl RangeSampler {
-    /// Create a sampler that retains approximately `fraction` of rows (0.0–1.0).
+    /// Create a sampler with a reservoir of `reservoir_size` samples.
+    ///
+    /// The `sample_fraction` parameter is kept for API compatibility but is
+    /// unused — the reservoir size governs how many samples are retained.
     pub fn new(sample_fraction: f64) -> Self {
+        // Convert fraction to a reservoir size: at 1.0 fraction keep up to
+        // 10_000 samples; at 0.01 keep 100. The actual per-row probability
+        // of inclusion is determined by Algorithm R at `build_boundaries` time.
+        let reservoir_size = ((sample_fraction.clamp(0.01, 1.0) * 10_000.0) as usize).max(1);
         Self {
-            sample_fraction: sample_fraction.clamp(0.01, 1.0),
+            reservoir_size,
             ..Default::default()
         }
     }
 
-    /// Collect key values from `batch` column `key_column`.
+    /// Collect key values from `batch` column `key_column` using reservoir sampling.
     pub fn sample(&mut self, batch: &RecordBatch, key_column: &str) -> ShuffleResult<()> {
         let idx = batch
             .schema()
             .index_of(key_column)
             .map_err(|_e| ShuffleError::InvalidPartitionCount { buckets: 0 })?;
         let col = batch.column(idx);
-        let step = (1.0 / self.sample_fraction).ceil() as usize;
-        let step = step.max(1);
+        let k = self.reservoir_size;
 
         match col.data_type() {
             DataType::Int32 => {
@@ -87,9 +130,20 @@ impl RangeSampler {
                         expected: "Int32 downcast failed".into(),
                     }
                 })?;
-                for row in (0..batch.num_rows()).step_by(step) {
-                    if !arr.is_null(row) {
-                        self.i32_samples.push(arr.value(row));
+                for row in 0..batch.num_rows() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    let v = arr.value(row);
+                    let i = self.rows_seen;
+                    self.rows_seen += 1;
+                    if i < k {
+                        self.i32_samples.push(v);
+                    } else {
+                        let j = lcg_rand(&mut self.seed, i + 1);
+                        if j < k {
+                            self.i32_samples[j] = v;
+                        }
                     }
                 }
             }
@@ -99,9 +153,20 @@ impl RangeSampler {
                         expected: "Int64 downcast failed".into(),
                     }
                 })?;
-                for row in (0..batch.num_rows()).step_by(step) {
-                    if !arr.is_null(row) {
-                        self.i64_samples.push(arr.value(row));
+                for row in 0..batch.num_rows() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    let v = arr.value(row);
+                    let i = self.rows_seen;
+                    self.rows_seen += 1;
+                    if i < k {
+                        self.i64_samples.push(v);
+                    } else {
+                        let j = lcg_rand(&mut self.seed, i + 1);
+                        if j < k {
+                            self.i64_samples[j] = v;
+                        }
                     }
                 }
             }
@@ -111,9 +176,20 @@ impl RangeSampler {
                         expected: "Utf8 downcast failed".into(),
                     }
                 })?;
-                for row in (0..batch.num_rows()).step_by(step) {
-                    if !arr.is_null(row) {
-                        self.str_samples.push(arr.value(row).to_owned());
+                for row in 0..batch.num_rows() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    let v = arr.value(row).to_owned();
+                    let i = self.rows_seen;
+                    self.rows_seen += 1;
+                    if i < k {
+                        self.str_samples.push(v);
+                    } else {
+                        let j = lcg_rand(&mut self.seed, i + 1);
+                        if j < k {
+                            self.str_samples[j] = v;
+                        }
                     }
                 }
             }
@@ -227,6 +303,38 @@ impl RangePartitioner {
         let col = batch.column(col_idx);
         let n = self.buckets as usize;
         let mut bucket_indices: Vec<Vec<u32>> = vec![Vec::new(); n];
+
+        // B5: Validate that the boundary type matches the column type.
+        // If boundaries were built for Int64 but the column is Int32, silently
+        // routing all rows to the last bucket was a data-correctness bug.
+        if let Some(first_bound) = self.boundaries.first() {
+            let col_type = col.data_type();
+            let bound_type_name = match first_bound {
+                RangeBound::Int32(_) => "Int32",
+                RangeBound::Int64(_) => "Int64",
+                RangeBound::Utf8(_) => "Utf8",
+            };
+            let col_type_name = match col_type {
+                DataType::Int32 => "Int32",
+                DataType::Int64 => "Int64",
+                DataType::Utf8 => "Utf8",
+                other => {
+                    return Err(ShuffleError::TypeMismatch {
+                        expected: format!(
+                            "range partitioner: unsupported key type {other}, expected Int32/Int64/Utf8"
+                        ),
+                    });
+                }
+            };
+            if bound_type_name != col_type_name {
+                return Err(ShuffleError::TypeMismatch {
+                    expected: format!(
+                        "range partition boundaries are {bound_type_name} but column '{}' is {col_type_name}",
+                        self.key_column
+                    ),
+                });
+            }
+        }
 
         match col.data_type() {
             DataType::Int32 => {

@@ -102,6 +102,11 @@ impl HashPartitioner {
         self.null_key_count.load(Ordering::Relaxed)
     }
 
+    /// The number of output partitions this partitioner produces.
+    pub fn partition_count(&self) -> u32 {
+        self.buckets
+    }
+
     /// Hash the null sentinel for integer columns and count the null.
     fn null_int_bucket(&self) -> ShuffleBucket {
         self.null_key_count.fetch_add(1, Ordering::Relaxed);
@@ -303,6 +308,14 @@ impl SaltedHashPartitioner {
         if base_buckets == 0 {
             return Err(ShuffleError::InvalidPartitionCount {
                 buckets: base_buckets,
+            });
+        }
+        // B7: Validate that the inner partitioner's bucket count matches base_buckets.
+        // A mismatch means the caller is supplying incorrect metadata; reject it early
+        // before any partitioning is done so rows cannot be silently routed incorrectly.
+        if inner.partition_count() != base_buckets {
+            return Err(ShuffleError::InvalidPartitionCount {
+                buckets: inner.partition_count(),
             });
         }
         salts.sort_by_key(|s| s.partition_id);
