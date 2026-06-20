@@ -328,6 +328,48 @@ the generated native stub no longer collapses the public surface to `Any`.
 ### Next useful command
 `.venv-pytest/bin/python -m pytest -q crates/krishiv-python/python/tests/test_async.py crates/krishiv-python/python/tests/test_dataframe.py::test_collect_async`
 
+## 2026-06-20 — Responsive web/docs mobile pass
+
+Improved the Krishiv website and documentation responsive behavior with the highest priority on docs reading, navigation, and overflow prevention.
+
+### What changed
+- Added a compact sticky mobile docs toolbar with menu, truncated page title, search, and version selector.
+- Added a mobile/tablet docs drawer below 1024px with backdrop close, Escape close, scroll locking, grouped collapsible navigation, search trigger, version selector, and active-page highlighting.
+- Added a mobile docs search overlay and compact in-page table-of-contents disclosure.
+- Tightened responsive CSS for docs typography, code blocks, tables, prev/next cards, safe-area padding, touch targets, reduced motion, and no page-level horizontal overflow.
+- Improved landing-page mobile behavior for navbar, hero, architecture visual, capability strip, developer journey, code tabs, and footer without changing the desktop black/gold direction.
+
+### Validation
+- `pnpm --dir web run typecheck`
+- `pnpm --dir web run build`
+- `pnpm --dir web run lint` exited 0 via the package fallback, but Next.js 16 reported `next lint` as an invalid project directory command.
+- `cargo fmt --check`
+- `cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings` was attempted, but the container linker failed before crate linting because `ld` is unavailable while repo rustflags request mold/lld.
+- Playwright browser installation was attempted for target-width screenshots, but `cdn.playwright.dev` returned `403 Domain forbidden`; no local Chromium/Chrome/Firefox binary was available.
+
+### Next useful command
+`pnpm --dir web run build`
+
+## 2026-06-20 — Landing page high-fidelity dark/gold redesign
+
+Rebuilt the web landing page around the provided black-and-gold reference composition and replaced the religious-inspired logo direction with a geometric infrastructure mark.
+
+### What changed
+- Replaced the homepage with reusable landing components for the hero, runtime architecture diagram, SVG data-flow particles, capability strip, developer journey, code example panel, and ecosystem row.
+- Updated the shared web shell with the new horizontal brand treatment, centered navigation, action icons, sticky translucent header, and mobile menu.
+- Reworked the global web theme to the near-black palette with restrained gold accents, neutral borders, responsive behavior, and reduced-motion support.
+- Added new brand assets in `web/public/brand/` for the logo mark, horizontal logo, and favicon.
+
+### Validation
+- `pnpm --dir web run typecheck`
+- `pnpm --dir web run build`
+- `cargo fmt --check`
+- `cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings` was attempted but the container linker failed before crate linting because `ld` is unavailable while the repo cargo config requests mold/lld linker flags.
+- Playwright screenshot capture was attempted, but browser download failed with a `403 Domain forbidden` response from `cdn.playwright.dev`.
+
+### Next useful command
+`pnpm --dir web run build`
+
 ---
 
 ## 2026-06-19 — Web and docs logo refresh
