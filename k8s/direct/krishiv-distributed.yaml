@@ -1,9 +1,9 @@
 # Krishiv single-node k3s / single-host Kubernetes deployment.
 #
 # Topology:
-#   coordinator (1 pod)   — gRPC :9090, HTTP :18080  NodePort :30080
-#   executor    (2 pods)  — task gRPC :50055, health HTTP :8080
-#   flight-server (1 pod) — Arrow Flight :50051       NodePort :30051
+#   coordinator (1 pod)   — gRPC :2001, HTTP :2002  NodePort :30002
+#   executor    (2 pods)  — task gRPC :2005, health HTTP :2002
+#   flight-server (1 pod) — Arrow Flight :2003       NodePort :30003
 #
 # Usage:
 #   kubectl apply -f k8s/direct/krishiv-distributed.yaml
@@ -85,9 +85,9 @@ spec:
             matchLabels:
               app: krishiv-coordinator
       ports:
-        - port: 9090
+        - port: 2001
           protocol: TCP
-        - port: 18080
+        - port: 2002
           protocol: TCP
     # Allow DNS resolution
     - ports:
@@ -140,9 +140,9 @@ spec:
             - /usr/local/bin/krishiv
             - coordinator
             - --grpc-addr
-            - 0.0.0.0:9090
+            - 0.0.0.0:2001
             - --http-addr
-            - 0.0.0.0:18080
+            - 0.0.0.0:2002
             # dev-local: volatile in-memory metadata, safe for single-node dev/test.
             # For production (single-node-durable) replace with:
             #   --durability-profile single-node-durable
@@ -157,9 +157,9 @@ spec:
             - dev-local
           ports:
             - name: grpc
-              containerPort: 9090
+              containerPort: 2001
             - name: http
-              containerPort: 18080
+              containerPort: 2002
           env:
             - name: KRISHIV_COORDINATOR_BEARER_TOKEN
               valueFrom:
@@ -199,14 +199,14 @@ spec:
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 18080
+              port: 2002
             initialDelaySeconds: 3
             periodSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 18080
+              port: 2002
             initialDelaySeconds: 10
             periodSeconds: 15
             failureThreshold: 3
@@ -229,11 +229,11 @@ spec:
     app: krishiv-coordinator
   ports:
     - name: grpc
-      port: 9090
-      targetPort: 9090
+      port: 2001
+      targetPort: 2001
     - name: http
-      port: 18080
-      targetPort: 18080
+      port: 2002
+      targetPort: 2002
 
 ---
 # NodePort for external access to coordinator HTTP (diagnostics / jobs API)
@@ -248,9 +248,9 @@ spec:
     app: krishiv-coordinator
   ports:
     - name: http
-      port: 18080
-      targetPort: 18080
-      nodePort: 30080
+      port: 2002
+      targetPort: 2002
+      nodePort: 30002
 
 ---
 # ── Executor ──────────────────────────────────────────────────────────────────
@@ -294,13 +294,13 @@ spec:
             - executor
             - --connect
             - --coordinator
-            - http://coordinator.krishiv-system.svc:9090
+            - http://coordinator.krishiv-system.svc:2001
             - --heartbeat-interval-secs
             - "10"
             - --slots
             - "2"
             - --http-addr
-            - 0.0.0.0:8080
+            - 0.0.0.0:2002
             # dev-local profile: ephemeral window state + explicit shuffle dir.
             # For single-node-durable (survives restart):
             #   --durability-profile single-node-durable
@@ -313,11 +313,11 @@ spec:
             - /tmp/krishiv-shuffle
           ports:
             - name: health
-              containerPort: 8080
+              containerPort: 2002
             - name: task-grpc
-              containerPort: 50055
+              containerPort: 2005
             - name: barrier-grpc
-              containerPort: 50056
+              containerPort: 2006
           env:
             - name: KRISHIV_EXECUTOR_ID
               valueFrom:
@@ -349,14 +349,14 @@ spec:
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 8080
+              port: 2002
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8080
+              port: 2002
             initialDelaySeconds: 15
             periodSeconds: 30
             failureThreshold: 3
@@ -368,7 +368,7 @@ spec:
                 command:
                   - /bin/sh
                   - -c
-                  - "curl -sf -X POST http://localhost:8080/internal/drain || sleep 5"
+                  - "curl -sf -X POST http://localhost:2002/internal/drain || sleep 5"
       terminationGracePeriodSeconds: 60
 
 ---
@@ -397,12 +397,12 @@ spec:
             - flight-server
           env:
             - name: KRISHIV_FLIGHT_ADDR
-              value: "0.0.0.0:50051"
+              value: "0.0.0.0:2003"
             - name: KRISHIV_COORDINATOR_HTTP
-              value: "http://coordinator.krishiv-system.svc:18080"
+              value: "http://coordinator.krishiv-system.svc:2002"
           ports:
             - name: flight
-              containerPort: 50051
+              containerPort: 2003
           resources:
             requests:
               cpu: "250m"
@@ -412,13 +412,13 @@ spec:
               memory: "1Gi"
           readinessProbe:
             tcpSocket:
-              port: 50051
+              port: 2003
             initialDelaySeconds: 3
             periodSeconds: 5
             failureThreshold: 3
           livenessProbe:
             tcpSocket:
-              port: 50051
+              port: 2003
             initialDelaySeconds: 10
             periodSeconds: 30
             failureThreshold: 3
@@ -436,6 +436,6 @@ spec:
     app: krishiv-flight
   ports:
     - name: flight
-      port: 50051
-      targetPort: 50051
-      nodePort: 30051
+      port: 2003
+      targetPort: 2003
+      nodePort: 30003

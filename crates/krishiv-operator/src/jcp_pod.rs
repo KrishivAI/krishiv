@@ -3,7 +3,7 @@
 use krishiv_proto::JobId;
 
 /// gRPC port used by JCP pods.
-pub const JCP_GRPC_PORT: u16 = 9091;
+pub const JCP_GRPC_PORT: u16 = 2009;
 
 /// Maximum length of a Kubernetes resource name (RFC 1123 DNS label).
 const K8S_NAME_MAX_LEN: usize = 63;

@@ -7,15 +7,15 @@ metadata:
     app: krishiv-single-node
 spec:
   ports:
-  - port: 18080
+  - port: 2002
     name: http
-    targetPort: 18080
-  - port: 50051
+    targetPort: 2002
+  - port: 2003
     name: flight
-    targetPort: 50051
-  - port: 9090
+    targetPort: 2003
+  - port: 2001
     name: grpc
-    targetPort: 9090
+    targetPort: 2001
   selector:
     app: krishiv-single-node
 ---
@@ -50,9 +50,9 @@ spec:
           # Tail all component logs to keep the pod alive and stream logs to stdout
           tail -f /tmp/krishiv-cluster/*.log
         ports:
-        - containerPort: 18080
+        - containerPort: 2002
           name: http
-        - containerPort: 50051
+        - containerPort: 2003
           name: flight
-        - containerPort: 9090
+        - containerPort: 2001
           name: grpc

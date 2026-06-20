@@ -314,11 +314,11 @@ impl OperatorCliConfig {
             bootstrap_executor_slots: None,
             status_addr: None,
             executor_grpc_addr: None,
-            http_sidecar_addr: "0.0.0.0:8080"
+            http_sidecar_addr: "0.0.0.0:2002"
                 .parse()
                 .expect("default sidecar addr is valid"),
             coordinator_endpoint: std::env::var("KRISHIV_COORDINATOR_ENDPOINT")
-                .unwrap_or_else(|_| String::from("http://krishiv-coordinator:9090")),
+                .unwrap_or_else(|_| String::from("http://krishiv-coordinator:2001")),
             help: false,
         };
         let mut args = args.into_iter();
@@ -464,8 +464,8 @@ impl OperatorCliConfig {
            --bootstrap-executor-slots <N>   Register a bootstrap executor with N slots\n\
            --status-addr <HOST:PORT>        Serve scheduler-backed status API/UI on this address\n\
            --executor-grpc-addr <HOST:PORT> Serve coordinator/executor gRPC on this address\n\
-           --http-sidecar-addr <HOST:PORT>  Coordinator HTTP sidecar address (default: 0.0.0.0:8080)\n\
-           --coordinator-endpoint <URL>     Coordinator gRPC endpoint for executor pods (default: KRISHIV_COORDINATOR_ENDPOINT or http://krishiv-coordinator:9090)\n\
+           --http-sidecar-addr <HOST:PORT>  Coordinator HTTP sidecar address (default: 0.0.0.0:2002)\n\
+           --coordinator-endpoint <URL>     Coordinator gRPC endpoint for executor pods (default: KRISHIV_COORDINATOR_ENDPOINT or http://krishiv-coordinator:2001)\n\
            -h, --help                       Show help\n"
     }
 }

@@ -6,7 +6,7 @@ metadata:
     app: krishiv-coordinator
 spec:
   ports:
-  - port: 50051
+  - port: 2001
     name: grpc
   clusterIP: None
   selector:
@@ -31,9 +31,9 @@ spec:
         image: localhost/krishiv:local
         imagePullPolicy: Never
         command: ["/usr/local/bin/krishiv"]
-        args: ["coordinator", "--grpc-addr", "0.0.0.0:50051", "--durability-profile", "dev-local", "--insecure"]
+        args: ["coordinator", "--grpc-addr", "0.0.0.0:2001", "--durability-profile", "dev-local", "--insecure"]
         ports:
-        - containerPort: 50051
+        - containerPort: 2001
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -60,4 +60,4 @@ spec:
               fieldPath: metadata.name
         command: ["/bin/sh", "-c"]
         args:
-        - "/usr/local/bin/krishiv executor --executor-id $POD_NAME --coordinator http://krishiv-coordinator.default.svc.cluster.local:50051 --connect"
+        - "/usr/local/bin/krishiv executor --executor-id $POD_NAME --coordinator http://krishiv-coordinator.default.svc.cluster.local:2001 --connect"

@@ -886,10 +886,10 @@ pub async fn run_flight_server_with_host(
     Ok(())
 }
 
-/// Run the Arrow Flight SQL server (env `KRISHIV_FLIGHT_ADDR`, default `127.0.0.1:50051`).
+/// Run the Arrow Flight SQL server (env `KRISHIV_FLIGHT_ADDR`, default `127.0.0.1:2003`).
 pub async fn run_flight_server_from_env() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: std::net::SocketAddr = std::env::var("KRISHIV_FLIGHT_ADDR")
-        .unwrap_or_else(|_| String::from("127.0.0.1:50051"))
+        .unwrap_or_else(|_| String::from("127.0.0.1:2003"))
         .parse()?;
     run_flight_server(addr).await
 }

@@ -16,4 +16,4 @@ spec:
               kubernetes.io/metadata.name: krishiv-system
       ports:
         - protocol: TCP
-          port: 9090
+          port: 2001

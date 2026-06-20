@@ -33,12 +33,12 @@ spec:
             - --coordinator-id
             - $(KRISHIV_COORDINATOR_ID)
             - --executor-grpc-addr
-            - 0.0.0.0:9090
+            - 0.0.0.0:2001
           ports:
             - name: grpc
-              containerPort: 9090
+              containerPort: 2001
             - name: http
-              containerPort: 8080
+              containerPort: 2002
           env:
             - name: KRISHIV_COORDINATOR_ID
               valueFrom:

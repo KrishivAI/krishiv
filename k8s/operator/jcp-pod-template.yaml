@@ -23,11 +23,11 @@ spec:
         - --coordinator-id
         - "jcp-{{JOB_ID}}"
         - --grpc-addr
-        - 0.0.0.0:9091
+        - 0.0.0.0:2009
         - --metadata-backend
         - json
         - --metadata-path
         - /var/lib/krishiv/jcp/{{JOB_ID}}/metadata.json
       ports:
         - name: grpc
-          containerPort: 9091
+          containerPort: 2009
