@@ -1,29 +1,63 @@
-import { docsVersions, type DocsVersion } from './versions';
+import { docsVersions } from './versions';
+import { gettingStartedPages } from './docs-content/getting-started';
+import { sqlPages } from './docs-content/sql';
+import { rustPages } from './docs-content/rust';
+import { pythonPages } from './docs-content/python';
+import { connectorsPages } from './docs-content/connectors';
 
-export type DocPage = { slug: string; title: string; description: string; status: string; body: string[] };
+export type DocStatus = 'Available' | 'Experimental' | 'In Progress' | 'Preview';
+
+export type DocPage = {
+  slug: string;
+  title: string;
+  description: string;
+  status: DocStatus;
+  group: string;
+  body: string; // HTML content
+};
+
+// Ordered group list – determines sidebar order.
+export const GROUP_ORDER = [
+  'Getting Started',
+  'Concepts',
+  'SQL Reference',
+  'Rust API',
+  'Python API',
+  'Connectors',
+  'Operations',
+] as const;
+
 export const docPages: DocPage[] = [
- { slug:'', title:'Introduction', description:'Krishiv at a glance.', status:'Available', body:['Krishiv is a Rust-native hybrid compute framework for batch SQL, streaming pipelines, and lakehouse-oriented data work. The source of truth is the Rust workspace and the docs under the repository root.','It uses Apache Arrow RecordBatch as the internal columnar model and DataFusion for SQL parsing, planning, expressions, and local execution.']},
- { slug:'getting-started', title:'Getting Started', description:'Install, build, and run a first query.', status:'Available', body:['Use the Rust workspace commands for engine development and the web app commands for site development. Embedded mode is the safest first runtime because it runs in the caller process.','Recommended validation starts with cargo check --workspace, then focused crate tests.']},
- { slug:'installation', title:'Installation', description:'Build features and local setup.', status:'Available', body:['The facade crate exposes feature presets including minimal, local, embedded, single-node, distributed, k8s, and full. Features select compiled capabilities, not mutually exclusive runtime modes.','Python bindings are built with maturin and optional integration features such as kafka and iceberg.']},
- { slug:'architecture', title:'Architecture', description:'Crates, boundaries, and runtime model.', status:'Available', body:['The user-facing APIs route through session/catalog layers, DataFusion and Krishiv plans, ExecutionRuntime, coordinator, executors, dataflow, shuffle, state, checkpoints, and connectors.','Scheduler, executor, control-plane, state, shuffle, metadata, and connectors remain behind crate APIs.']},
- { slug:'concepts/execution-model', title:'Execution Model', description:'How plans move through Krishiv.', status:'Available', body:['RuntimeMode is the user-visible mode while ExecutionPlacement describes where data-plane work may run. Distributed sessions require an explicit remote Flight endpoint and must not silently fall back to local execution.','Sync runtime methods delegate through a single sync/async seam; async variants are preferred inside Tokio contexts.']},
- { slug:'execution/batch-processing', title:'Batch Processing', description:'DataFusion-backed batch SQL.', status:'Available', body:['Batch SQL is implemented through DataFusion over Arrow RecordBatch data. Examples include registering Arrow or Parquet sources, executing SQL, and collecting RecordBatches.','Parquet connector maturity is Preview for source/sink usage; local write helpers are not advertised as distributed atomic writes.']},
- { slug:'execution/streaming-processing', title:'Streaming Processing', description:'Streaming sessions and windows.', status:'Available', body:['Streaming APIs include stream sessions, in-memory streams, windows, joins, stateful operators, and stream job submission/push/poll patterns in examples.','Connector-level delivery guarantees depend on specific source, sink, and checkpoint combinations.']},
- { slug:'incremental-processing/delta-batch-mode', title:'Delta Batch Mode', description:'Weighted Arrow rows for change processing.', status:'Experimental', body:['DeltaBatch represents inserts, deletes, updates, and explicit weights by carrying an Int64 _weight column alongside Arrow data.','It is implemented and tested, but public copy should call the mode experimental while end-to-end connector certification continues.']},
- { slug:'incremental-processing/ivm', title:'Incremental View Maintenance', description:'IncrementalFlow and view maintenance.', status:'Experimental', body:['IncrementalFlow supports registered sources and views, ticks, snapshots, output watches, partitioning, and checkpoint hooks.','Distributed IVM compute across executors is intentionally not advertised as complete; current notes identify executor-side IVM as deferred work.']},
- { slug:'execution/local-mode', title:'Local Mode', description:'Embedded and single-node development.', status:'Available', body:['Embedded mode runs inside the caller process and is appropriate for tests, examples, and local API use. Single-node mode runs engine pieces on one host and can use durable local profiles.']},
- { slug:'execution/distributed-mode', title:'Distributed Mode', description:'Remote coordinator and executor deployment.', status:'In Progress', body:['Distributed mode uses remote coordinator/executor transport and explicit endpoints. Coordinator and executor gRPC support bearer-token auth for production paths.','Kubernetes manifests and CRDs exist, but operational maturity should be presented conservatively.']},
- { slug:'operations/scheduler', title:'Scheduler', description:'Coordinator, jobs, and tasks.', status:'Available', body:['The scheduler crate owns coordinator, job/task lifecycle, metadata stores, leadership, and gRPC server responsibilities. Job ownership remains fenced to one active coordinator per job.']},
- { slug:'operations/shuffle', title:'Shuffle', description:'Shuffle boundaries and stores.', status:'Preview', body:['The shuffle crate contains in-memory, local disk, object-store, and Flight-oriented shuffle support. Durability is selected through profiles rather than implied globally.']},
- { slug:'operations/checkpointing-state', title:'Checkpointing and State', description:'Durability profiles and state stores.', status:'Preview', body:['The state crate provides in-memory and RocksDB-backed keyed state, TTL, migration, incremental state, and checkpoint/savepoint storage. Checkpoint storage exposes async primitives plus sync compatibility wrappers.']},
- { slug:'sql', title:'SQL API', description:'SQL surface and planning.', status:'Available', body:['SQL uses DataFusion for parsing, planning, expressions, and local execution. Krishiv adds policy hooks, catalog abstractions, and runtime routing around that foundation.']},
- { slug:'rust', title:'Rust API', description:'Session, DataFrame, Stream, IncrementalFlow.', status:'Available', body:['The Rust API crate owns Session, DataFrame, Stream, and public user API surfaces. Examples use Session builders, SQL, stream jobs, and IncrementalFlow.']},
- { slug:'python', title:'Python API', description:'PyO3 bindings and feature-gated integrations.', status:'Available', body:['Python bindings expose Session/DataFrame-style APIs, SQL functions, streaming examples, and thin wrappers over delta/incremental types. Kafka and Iceberg bindings are optional feature-gated integrations.']},
- { slug:'connectors/iceberg', title:'Iceberg', description:'Primary lakehouse target.', status:'Preview', body:['Iceberg is the primary lakehouse platform. New lakehouse correctness and certification work targets Iceberg before Delta Lake or Hudi.']},
- { slug:'connectors/catalogs-polaris-rest', title:'Catalogs and Polaris / REST Catalog', description:'Catalog relationships.', status:'Preview', body:['Code and documentation describe REST, Hive, and Glue Iceberg catalog integration paths. Polaris-compatible REST catalog wording should be kept as REST catalog compatible unless tested against a named service.']},
- { slug:'connectors/s3-adls', title:'S3 / ADLS', description:'Object storage support.', status:'Preview', body:['S3/object-store connector and storage paths are preview maturity and depend on concrete file/table commit protocols. ADLS appears as a storage target in docs and examples, so public wording should stay conservative.']},
- { slug:'connectors/kafka', title:'Kafka', description:'Streaming source and sink maturity.', status:'Preview', body:['Kafka source/sink paths and transactional/checkpoint concepts exist, but certification is pending for broker and object-store failure tests. Do not claim certified exactly-once semantics globally.']},
- { slug:'operations/release-compatibility', title:'Release and Compatibility Policy', description:'How to write compatibility notes.', status:'In Progress', body:['Use release notes for codebase-verified facts only. Mark unknown entries as maintainer placeholders and separate Available, Experimental, In Progress, and Planned functionality.']},
+  ...gettingStartedPages,
+  ...sqlPages,
+  ...rustPages,
+  ...pythonPages,
+  ...connectorsPages,
 ];
-export function getDoc(version: string, slugParts?: string[]){ if(!docsVersions.some(v=>v.slug===version)) return null; const slug=(slugParts??[]).join('/'); return docPages.find(p=>p.slug===slug)||null; }
-export function getAllDocParams(){ return docsVersions.flatMap(v=>docPages.map(p=>({version:v.slug, slug:p.slug?p.slug.split('/'):[]}))); }
+
+export type GroupedPages = { group: string; pages: DocPage[] };
+
+export function getGroupedPages(): GroupedPages[] {
+  const map = new Map<string, DocPage[]>();
+  for (const g of GROUP_ORDER) map.set(g, []);
+  for (const p of docPages) {
+    const g = p.group;
+    if (!map.has(g)) map.set(g, []);
+    map.get(g)!.push(p);
+  }
+  return [...map.entries()]
+    .filter(([, pages]) => pages.length > 0)
+    .map(([group, pages]) => ({ group, pages }));
+}
+
+export function getDoc(version: string, slugParts?: string[]): DocPage | null {
+  if (!docsVersions.some((v) => v.slug === version)) return null;
+  const slug = (slugParts ?? []).join('/');
+  return docPages.find((p) => p.slug === slug) ?? null;
+}
+
+export function getAllDocParams() {
+  return docsVersions.flatMap((v) =>
+    docPages.map((p) => ({ version: v.slug, slug: p.slug ? p.slug.split('/') : [] }))
+  );
+}
