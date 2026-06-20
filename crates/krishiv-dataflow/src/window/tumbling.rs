@@ -13,7 +13,7 @@ use crate::{ExecError, ExecResult};
 // ── TumblingWindowSpec ────────────────────────────────────────────────────────
 
 /// Configuration for a tumbling event-time window operator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TumblingWindowSpec {
     /// Name of the column to key by.
     pub key_column: String,
@@ -26,6 +26,9 @@ pub struct TumblingWindowSpec {
     pub window_size_ms: u64,
     /// Aggregate expressions to apply within each window.
     pub agg_exprs: Vec<AggExpr>,
+    /// Per-aggregate float flag: `true` when the aggregate input column is `Float64`.
+    /// Positions beyond this slice default to `false` (Int64 output).
+    pub agg_is_float: Vec<bool>,
 }
 
 // ── TumblingWindowOperator ────────────────────────────────────────────────────
@@ -68,8 +71,12 @@ pub struct TumblingWindowOperator {
 impl TumblingWindowOperator {
     /// Create a new operator.
     pub fn new(spec: TumblingWindowSpec) -> Self {
-        let output_schema =
-            build_window_output_schema(&spec.key_column, &spec.key_column_type, &spec.agg_exprs);
+        let output_schema = build_window_output_schema(
+            &spec.key_column,
+            &spec.key_column_type,
+            &spec.agg_exprs,
+            &spec.agg_is_float,
+        );
         Self {
             spec,
             accumulators: HashMap::new(),
@@ -270,6 +277,7 @@ impl TumblingWindowOperator {
             window_end_ms,
             &self.spec.agg_exprs,
             state,
+            &self.spec.agg_is_float,
         )
     }
 }
@@ -292,6 +300,7 @@ pub(crate) fn build_window_output_schema(
     key_column: &str,
     key_type: &str,
     agg_exprs: &[AggExpr],
+    agg_is_float: &[bool],
 ) -> Arc<Schema> {
     let key_dtype = key_type_to_arrow_data_type(key_type);
     let mut fields = vec![
@@ -299,9 +308,10 @@ pub(crate) fn build_window_output_schema(
         Field::new("window_start_ms", DataType::Int64, false),
         Field::new("window_end_ms", DataType::Int64, false),
     ];
-    for agg in agg_exprs {
+    for (i, agg) in agg_exprs.iter().enumerate() {
         let dtype = match agg.function {
             AggFunction::Avg => DataType::Float64,
+            _ if agg_is_float.get(i).copied().unwrap_or(false) => DataType::Float64,
             _ => DataType::Int64,
         };
         fields.push(Field::new(&agg.output_column, dtype, false));
@@ -317,6 +327,7 @@ pub(crate) fn build_window_record_batch(
     window_end_ms: i64,
     agg_exprs: &[AggExpr],
     state: &AggState,
+    agg_is_float: &[bool],
 ) -> ExecResult<RecordBatch> {
     let schema = Arc::clone(schema);
     let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = vec![
@@ -325,9 +336,13 @@ pub(crate) fn build_window_record_batch(
         Arc::new(Int64Array::from(vec![window_end_ms])),
     ];
     for (i, agg) in agg_exprs.iter().enumerate() {
+        let is_float = agg_is_float.get(i).copied().unwrap_or(false);
         match agg.function {
             AggFunction::Avg => {
                 columns.push(Arc::new(Float64Array::from(vec![state.finalized_avg(i)])));
+            }
+            _ if is_float => {
+                columns.push(Arc::new(Float64Array::from(vec![state.finalized_float_value(i, agg)])));
             }
             _ => {
                 columns.push(Arc::new(Int64Array::from(vec![

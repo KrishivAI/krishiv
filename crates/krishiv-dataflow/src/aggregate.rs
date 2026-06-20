@@ -129,6 +129,8 @@ pub struct AggState {
     /// Sum for `Avg` (all numeric types promoted to f64).
     pub(crate) avg_sums: Vec<f64>,
     pub(crate) avg_counts: Vec<u64>,
+    /// Float64 accumulator for `Sum|Min|Max` when the input column is Float64.
+    pub(crate) float_values: Vec<f64>,
 }
 
 impl AggState {
@@ -146,11 +148,20 @@ impl AggState {
         let has_value = agg_exprs.iter().map(|_| false).collect();
         let avg_sums = agg_exprs.iter().map(|_| 0.0).collect();
         let avg_counts = agg_exprs.iter().map(|_| 0u64).collect();
+        let float_values = agg_exprs
+            .iter()
+            .map(|expr| match expr.function {
+                AggFunction::Min => f64::INFINITY,
+                AggFunction::Max => f64::NEG_INFINITY,
+                _ => 0.0,
+            })
+            .collect();
         Self {
             values,
             has_value,
             avg_sums,
             avg_counts,
+            float_values,
         }
     }
 
@@ -206,57 +217,71 @@ impl AggState {
                         .index_of(&expr.input_column)
                         .map_err(|_| ExecError::ColumnNotFound(expr.input_column.clone()))?;
                     let col = batch.column(col_idx);
-                    let v = match col.data_type() {
-                        DataType::Int32 => {
-                            let arr =
-                                col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                                    ExecError::UnsupportedType(
-                                        "declared Int32 aggregate input failed downcast".into(),
-                                    )
-                                })?;
-                            arr.value(row) as i64
-                        }
-                        DataType::Int64 => {
-                            let arr =
-                                col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                                    ExecError::UnsupportedType(
-                                        "declared Int64 aggregate input failed downcast".into(),
-                                    )
-                                })?;
-                            arr.value(row)
-                        }
-                        other => {
-                            return Err(ExecError::UnsupportedType(format!(
-                                "unsupported aggregate input type: {other}"
-                            )));
-                        }
-                    };
-                    match expr.function {
-                        AggFunction::Sum => {
-                            self.values[i] = self.values[i].checked_add(v).ok_or_else(|| {
-                                ExecError::InvalidInput(format!(
-                                    "sum overflow on column '{}': i64::MAX reached",
-                                    expr.input_column
-                                ))
-                            })?;
-                            self.has_value[i] = true;
-                        }
-                        AggFunction::Min => {
-                            if !self.has_value[i] || v < self.values[i] {
-                                self.values[i] = v;
+                    match col.data_type() {
+                        DataType::Float64 => {
+                            let v = Self::numeric_value(col, row, &expr.input_column)?;
+                            match expr.function {
+                                AggFunction::Sum => self.float_values[i] += v,
+                                AggFunction::Min => {
+                                    if v < self.float_values[i] {
+                                        self.float_values[i] = v;
+                                    }
+                                }
+                                AggFunction::Max => {
+                                    if v > self.float_values[i] {
+                                        self.float_values[i] = v;
+                                    }
+                                }
+                                _ => {}
                             }
                             self.has_value[i] = true;
                         }
-                        AggFunction::Max => {
-                            if !self.has_value[i] || v > self.values[i] {
-                                self.values[i] = v;
+                        _ => {
+                            let v = match col.data_type() {
+                                DataType::Int32 => {
+                                    let arr = col.as_any().downcast_ref::<Int32Array>()
+                                        .ok_or_else(|| ExecError::UnsupportedType(
+                                            "declared Int32 aggregate input failed downcast".into()))?;
+                                    arr.value(row) as i64
+                                }
+                                DataType::Int64 => {
+                                    let arr = col.as_any().downcast_ref::<Int64Array>()
+                                        .ok_or_else(|| ExecError::UnsupportedType(
+                                            "declared Int64 aggregate input failed downcast".into()))?;
+                                    arr.value(row)
+                                }
+                                other => {
+                                    return Err(ExecError::UnsupportedType(format!(
+                                        "unsupported aggregate input type: {other}"
+                                    )));
+                                }
+                            };
+                            match expr.function {
+                                AggFunction::Sum => {
+                                    self.values[i] = self.values[i].checked_add(v).ok_or_else(|| {
+                                        ExecError::InvalidInput(format!(
+                                            "sum overflow on column '{}': i64::MAX reached",
+                                            expr.input_column
+                                        ))
+                                    })?;
+                                }
+                                AggFunction::Min => {
+                                    if !self.has_value[i] || v < self.values[i] {
+                                        self.values[i] = v;
+                                    }
+                                }
+                                AggFunction::Max => {
+                                    if !self.has_value[i] || v > self.values[i] {
+                                        self.values[i] = v;
+                                    }
+                                }
+                                AggFunction::Count | AggFunction::Avg => {
+                                    return Err(ExecError::InvalidInput(
+                                        "unexpected Count/Avg in Sum/Min/Max branch".into(),
+                                    ));
+                                }
                             }
                             self.has_value[i] = true;
-                        }
-                        AggFunction::Count | AggFunction::Avg => {
-                            return Err(ExecError::InvalidInput(
-                                "unexpected Count/Avg in Sum/Min/Max branch".into(),
-                            ));
                         }
                     }
                 }
@@ -304,6 +329,19 @@ impl AggState {
             self.avg_sums[i] / self.avg_counts[i] as f64
         }
     }
+
+    /// Return the finalized float value for position `i` (Sum/Min/Max on Float64 columns).
+    pub(crate) fn finalized_float_value(&self, i: usize, expr: &AggExpr) -> f64 {
+        match expr.function {
+            AggFunction::Min => {
+                if self.has_value[i] { self.float_values[i] } else { f64::INFINITY }
+            }
+            AggFunction::Max => {
+                if self.has_value[i] { self.float_values[i] } else { f64::NEG_INFINITY }
+            }
+            _ => self.float_values[i],
+        }
+    }
 }
 
 /// Fast per-row aggregate state update using pre-downcasted columns.
@@ -331,33 +369,48 @@ fn update_agg_state_pre(
                         i
                     ))
                 })?;
-                let v = col.int64_value(row)?;
-                match expr.function {
-                    AggFunction::Sum => {
-                        state.values[i] = state.values[i].checked_add(v).ok_or_else(|| {
-                            ExecError::InvalidInput(
-                                "sum overflow in pre-downcast path: i64::MAX reached".into(),
-                            )
-                        })?;
-                        state.has_value[i] = true;
-                    }
-                    AggFunction::Min => {
-                        if !state.has_value[i] || v < state.values[i] {
-                            state.values[i] = v;
+                if matches!(col, PreDowncastCol::Float64(_)) {
+                    let v = col.float64_value(row)?;
+                    match expr.function {
+                        AggFunction::Sum => state.float_values[i] += v,
+                        AggFunction::Min => {
+                            if v < state.float_values[i] { state.float_values[i] = v; }
                         }
-                        state.has_value[i] = true;
-                    }
-                    AggFunction::Max => {
-                        if !state.has_value[i] || v > state.values[i] {
-                            state.values[i] = v;
+                        AggFunction::Max => {
+                            if v > state.float_values[i] { state.float_values[i] = v; }
                         }
-                        state.has_value[i] = true;
+                        _ => {}
                     }
-                    _ => {
-                        return Err(ExecError::Arrow(format!(
-                            "unexpected aggregate function {:?} for numeric column",
-                            expr.function
-                        )));
+                    state.has_value[i] = true;
+                } else {
+                    let v = col.int64_value(row)?;
+                    match expr.function {
+                        AggFunction::Sum => {
+                            state.values[i] = state.values[i].checked_add(v).ok_or_else(|| {
+                                ExecError::InvalidInput(
+                                    "sum overflow in pre-downcast path: i64::MAX reached".into(),
+                                )
+                            })?;
+                            state.has_value[i] = true;
+                        }
+                        AggFunction::Min => {
+                            if !state.has_value[i] || v < state.values[i] {
+                                state.values[i] = v;
+                            }
+                            state.has_value[i] = true;
+                        }
+                        AggFunction::Max => {
+                            if !state.has_value[i] || v > state.values[i] {
+                                state.values[i] = v;
+                            }
+                            state.has_value[i] = true;
+                        }
+                        _ => {
+                            return Err(ExecError::Arrow(format!(
+                                "unexpected aggregate function {:?} for numeric column",
+                                expr.function
+                            )));
+                        }
                     }
                 }
             }
@@ -459,12 +512,23 @@ impl LocalAggregator {
                 .map_err(|_| ExecError::ColumnNotFound(col_name.clone()))?;
             fields.push(f.clone());
         }
-        for agg in &self.agg_exprs {
-            let dtype = match agg.function {
+        // Determine output dtype per aggregate: Float64 if input column is Float64.
+        let agg_out_dtypes: Vec<DataType> = self.agg_exprs.iter().map(|agg| {
+            match agg.function {
                 AggFunction::Avg => DataType::Float64,
-                _ => DataType::Int64,
-            };
-            fields.push(Field::new(&agg.output_column, dtype, true));
+                AggFunction::Count => DataType::Int64,
+                _ => {
+                    // Sum/Min/Max output type follows the input column type.
+                    batch.schema().field_with_name(&agg.input_column)
+                        .ok()
+                        .map(|f| f.data_type().clone())
+                        .filter(|dt| matches!(dt, DataType::Float64))
+                        .unwrap_or(DataType::Int64)
+                }
+            }
+        }).collect();
+        for (agg, dtype) in self.agg_exprs.iter().zip(&agg_out_dtypes) {
+            fields.push(Field::new(&agg.output_column, dtype.clone(), true));
         }
         let out_schema = Arc::new(Schema::new(fields));
 
@@ -549,12 +613,18 @@ impl LocalAggregator {
             }
         }
 
-        for (agg_pos, agg) in self.agg_exprs.iter().enumerate() {
-            match agg.function {
-                AggFunction::Avg => {
+        for (agg_pos, (agg, out_dtype)) in self.agg_exprs.iter().zip(&agg_out_dtypes).enumerate() {
+            match (agg.function, out_dtype) {
+                (AggFunction::Avg, _) | (_, DataType::Float64) => {
                     let arr: Float64Array = sorted_entries
                         .iter()
-                        .map(|(_, state)| state.finalized_avg(agg_pos))
+                        .map(|(_, state)| {
+                            if matches!(agg.function, AggFunction::Avg) {
+                                state.finalized_avg(agg_pos)
+                            } else {
+                                state.finalized_float_value(agg_pos, agg)
+                            }
+                        })
                         .collect();
                     columns.push(Arc::new(arr) as ArrayRef);
                 }

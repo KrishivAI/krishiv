@@ -43,6 +43,8 @@ pub struct CountWindowSpec {
     pub slide: u64,
     /// Aggregates to compute within each window.
     pub agg_exprs: Vec<AggExpr>,
+    /// Per-aggregate float flag: `true` when the aggregate input column is `Float64`.
+    pub agg_is_float: Vec<bool>,
 }
 
 /// Per-row aggregate contribution (a single-row AggState).
@@ -81,8 +83,12 @@ impl CountWindowOperator {
                 "count window slide must be > 0 and ≤ size".into(),
             ));
         }
-        let schema =
-            build_window_output_schema(&spec.key_column, &spec.key_column_type, &spec.agg_exprs);
+        let schema = build_window_output_schema(
+            &spec.key_column,
+            &spec.key_column_type,
+            &spec.agg_exprs,
+            &spec.agg_is_float,
+        );
         Ok(Self {
             spec,
             key_states: HashMap::new(),
@@ -139,6 +145,7 @@ impl CountWindowOperator {
                     window_end as i64,
                     &self.spec.agg_exprs,
                     &merged,
+                    &self.spec.agg_is_float,
                 )?);
                 // Slide: drop the first `slide` rows from the front.
                 for _ in 0..self.spec.slide {
@@ -169,6 +176,7 @@ impl CountWindowOperator {
                 window_end as i64,
                 &self.spec.agg_exprs,
                 &merged,
+                &self.spec.agg_is_float,
             )?);
         }
         self.key_states.clear();
@@ -195,6 +203,7 @@ fn fold_agg_states<'a>(
                     merged.values[i] = merged.values[i]
                         .checked_add(contrib.values[i])
                         .unwrap_or(i64::MAX);
+                    merged.float_values[i] += contrib.float_values[i];
                     if contrib.has_value[i] {
                         merged.has_value[i] = true;
                     }
@@ -204,11 +213,17 @@ fn fold_agg_states<'a>(
                         merged.values[i] = contrib.values[i];
                         merged.has_value[i] = true;
                     }
+                    if contrib.has_value[i] && contrib.float_values[i] < merged.float_values[i] {
+                        merged.float_values[i] = contrib.float_values[i];
+                    }
                 }
                 AggFunction::Max => {
                     if contrib.has_value[i] && contrib.values[i] > merged.values[i] {
                         merged.values[i] = contrib.values[i];
                         merged.has_value[i] = true;
+                    }
+                    if contrib.has_value[i] && contrib.float_values[i] > merged.float_values[i] {
+                        merged.float_values[i] = contrib.float_values[i];
                     }
                 }
                 AggFunction::Avg => {

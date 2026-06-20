@@ -78,6 +78,7 @@ fn build_operator(
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.to_vec(),
+                agg_is_float: vec![false; agg_exprs.len()],
             };
             let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
             let op = StateBackedTumblingWindowOperator::new(
@@ -98,6 +99,7 @@ fn build_operator(
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
                 agg_exprs: agg_exprs.to_vec(),
+                agg_is_float: vec![false; agg_exprs.len()],
             };
             let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
             let op = StateBackedSlidingWindowOperator::new(
@@ -135,6 +137,7 @@ fn build_operator(
                 size,
                 slide,
                 agg_exprs: agg_exprs.to_vec(),
+                agg_is_float: vec![false; agg_exprs.len()],
             };
             let op = CountWindowOperator::new(count_spec)
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;

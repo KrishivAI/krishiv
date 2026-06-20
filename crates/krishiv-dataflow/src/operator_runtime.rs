@@ -88,6 +88,24 @@ pub fn execute_bounded_window(
     }
 
     let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
+
+    // Determine which aggregates take Float64 input so downstream operators
+    // can emit Float64 output arrays (instead of silently truncating to Int64).
+    let agg_is_float: Vec<bool> = input_batches
+        .first()
+        .map(|b| {
+            agg_exprs
+                .iter()
+                .map(|e| {
+                    b.schema()
+                        .field_with_name(&e.input_column)
+                        .map(|f| *f.data_type() == arrow::datatypes::DataType::Float64)
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| vec![false; agg_exprs.len()]);
+
     let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
     let mut multi_watermark =
         MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
@@ -108,6 +126,7 @@ pub fn execute_bounded_window(
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
+                agg_is_float: agg_is_float.clone(),
             };
             TumblingWindowOperator::validate_spec(&tw_spec)
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -138,6 +157,7 @@ pub fn execute_bounded_window(
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
                 agg_exprs,
+                agg_is_float: agg_is_float.clone(),
             };
             let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
             let mut op =
@@ -192,6 +212,7 @@ pub fn execute_bounded_window(
                 size,
                 slide,
                 agg_exprs: agg_exprs.clone(),
+                agg_is_float: agg_is_float.clone(),
             };
             let mut op = CountWindowOperator::new(count_spec)
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -313,6 +334,7 @@ pub fn execute_streaming_window(
     }
 
     let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
+    let agg_is_float = vec![false; agg_exprs.len()];
 
     // Clone the shared spec fields once; only the arm matching `window_kind`
     // runs, so these are moved (not re-cloned) into whichever operator spec
@@ -329,6 +351,7 @@ pub fn execute_streaming_window(
                 event_time_column,
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
+                agg_is_float: agg_is_float.clone(),
             };
             TumblingWindowOperator::validate_spec(&tw_spec)
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -347,6 +370,7 @@ pub fn execute_streaming_window(
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
                 agg_exprs,
+                agg_is_float: agg_is_float.clone(),
             };
             let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
             let op =
@@ -377,6 +401,7 @@ pub fn execute_streaming_window(
                 size,
                 slide,
                 agg_exprs,
+                agg_is_float,
             };
             let op = CountWindowOperator::new(count_spec)
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;

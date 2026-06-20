@@ -1,5 +1,64 @@
 # Krishiv Implementation Status
 
+## 2026-06-20 — Enterprise examples 01-10 running in embedded mode + Float64 aggregate gap fix
+
+All 10 enterprise Rust examples now run successfully in embedded/in-process mode
+(no external services required). Two engine gaps were discovered and fixed.
+
+### Gap 1 — Float64 windowed aggregation
+
+`AggState::update()` and `update_agg_state_pre()` only handled `Int32`/`Int64`
+inputs for Sum/Min/Max; `Float64` raised `unsupported aggregate input type`.
+
+**Fix** (spans 5 files):
+- `crates/krishiv-dataflow/src/aggregate.rs` — added `float_values: Vec<f64>` to
+  `AggState`; `update()` and `update_agg_state_pre()` now branch on Float64;
+  added `finalized_float_value()`; `LocalAggregator::aggregate()` emits
+  `Float64Array` when appropriate.
+- `window/tumbling.rs` — added `agg_is_float: Vec<bool>` to `TumblingWindowSpec`;
+  `build_window_output_schema` and `build_window_record_batch` emit `Float64`
+  fields/arrays for float aggregates.
+- `window/sliding.rs` — same `agg_is_float` propagation.
+- `window/count.rs` — same; `fold_agg_states` merges `float_values`.
+- `window/state_persistence.rs` — persist/restore `float_values` field.
+- `operator_runtime.rs` — `execute_bounded_window` auto-detects Float64 from first
+  batch schema and populates `agg_is_float`; streaming path defaults to false.
+- `continuous.rs` — creation sites updated with `agg_is_float: vec![]`.
+- `window/session.rs` — `AggState` struct literal updated with `float_values: vec![]`.
+
+### Gap 2 — DataFusion Utf8View vs Utf8 downcast
+
+DataFusion 53.1.0 returns all string columns as `Utf8View` (not `Utf8`). Direct
+`downcast_ref::<StringArray>()` returns `None` for SQL query results.
+
+**Fix**: use `arrow::compute::cast(col, &DataType::Utf8)` before downcasting in
+enterprise examples ent_06 and ent_07.
+
+### Example run summary
+
+| Example | Status | Notes |
+|---------|--------|-------|
+| ent_01 Kafka → Parquet (at-least-once) | ✓ | rolling-files pattern |
+| ent_02 Kafka → Parquet (exactly-once 2PC) | ✓ | |
+| ent_03 CDC Debezium → Delta | ✓ | |
+| ent_04 Kafka → tumbling window (Float64 sum) | ✓ | required Float64 gap fix |
+| ent_05 Kinesis → Parquet (checkpointed) | ✓ | |
+| ent_06 Parquet → Elasticsearch (_bulk) | ✓ | required Utf8View fix |
+| ent_07 Parquet → Cassandra (CQL) | ✓ | required Utf8View fix |
+| ent_08 Multi-source join | ✓ | |
+| ent_09 CEP fraud detection | ✓ | |
+| ent_10 S3 ETL pipeline | ✓ | LocalFileSystem embedded mode |
+
+### Validation
+- `cargo check --workspace` — clean
+- `cargo test --workspace` — all pass
+- All 10 enterprise examples executed end-to-end with `cargo run --bin <name>`
+
+### Next useful task
+- Add streaming window Float64 support (currently `execute_streaming_window` sets
+  `agg_is_float: vec![false; n]` regardless of input schema — needs peeking at
+  first stream batch or a schema parameter on `WindowExecutionSpec`)
+
 ## 2026-06-19 — Python async API and stub cleanup
 
 Fixed the Python user API issues identified in the Rust/Python API review:

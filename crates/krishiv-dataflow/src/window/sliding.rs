@@ -30,6 +30,8 @@ pub struct SlidingWindowSpec {
     pub slide_ms: u64,
     /// Aggregate expressions to apply within each window.
     pub agg_exprs: Vec<AggExpr>,
+    /// Per-aggregate float flag: `true` when the aggregate input column is `Float64`.
+    pub agg_is_float: Vec<bool>,
 }
 
 /// Sliding event-time window operator (R5.2).
@@ -80,8 +82,12 @@ impl SlidingWindowOperator {
                 spec.window_size_ms, spec.slide_ms,
             )));
         }
-        let output_schema =
-            build_window_output_schema(&spec.key_column, &spec.key_column_type, &spec.agg_exprs);
+        let output_schema = build_window_output_schema(
+            &spec.key_column,
+            &spec.key_column_type,
+            &spec.agg_exprs,
+            &spec.agg_is_float,
+        );
         Ok(Self {
             spec,
             accumulators: HashMap::new(),
@@ -270,6 +276,7 @@ impl SlidingWindowOperator {
             window_end_ms,
             &self.spec.agg_exprs,
             state,
+            &self.spec.agg_is_float,
         )
     }
 }

@@ -47,6 +47,7 @@ pub fn persist_window_accumulators(
             "has_value": agg.has_value,
             "avg_sums": agg.avg_sums,
             "avg_counts": agg.avg_counts,
+            "float_values": agg.float_values,
         });
         let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
             message: e.to_string(),
@@ -124,6 +125,10 @@ pub fn restore_window_accumulators(
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
             .unwrap_or_default();
+        let float_values: Vec<f64> = parsed["float_values"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+            .unwrap_or_default();
 
         if let Some((key, win_start)) = parse_window_state_key(&key_bytes, key_prefix) {
             restored.insert(
@@ -133,6 +138,7 @@ pub fn restore_window_accumulators(
                     has_value,
                     avg_sums,
                     avg_counts,
+                    float_values,
                 },
             );
         }

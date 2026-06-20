@@ -219,6 +219,7 @@ impl SessionWindowOperator {
                             has_value,
                             avg_sums,
                             avg_counts,
+                            float_values: vec![],
                         },
                     },
                 );
