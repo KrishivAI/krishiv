@@ -1061,6 +1061,7 @@ pub(crate) fn parse_job_kind(value: &str) -> SchedulerResult<JobKind> {
 
 pub(crate) fn parse_job_state(value: &str) -> SchedulerResult<JobState> {
     match value {
+        "queued" => Ok(JobState::Queued),
         "accepted" => Ok(JobState::Accepted),
         "planning" => Ok(JobState::Planning),
         "running" => Ok(JobState::Running),

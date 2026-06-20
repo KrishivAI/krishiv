@@ -269,16 +269,16 @@ impl TumblingWindowOperator {
         state: &AggState,
     ) -> ExecResult<RecordBatch> {
         let window_end_ms = window_start_ms + self.spec.window_size_ms as i64;
-        build_window_record_batch(
-            &self.output_schema,
-            &self.spec.key_column_type,
+        build_window_record_batch(WindowRecordBatchInput {
+            schema: &self.output_schema,
+            key_type: &self.spec.key_column_type,
             key_value,
             window_start_ms,
             window_end_ms,
-            &self.spec.agg_exprs,
+            agg_exprs: &self.spec.agg_exprs,
             state,
-            &self.spec.agg_is_float,
-        )
+            agg_is_float: &self.spec.agg_is_float,
+        })
     }
 }
 
@@ -319,16 +319,30 @@ pub(crate) fn build_window_output_schema(
     Arc::new(Schema::new(fields))
 }
 
+pub(crate) struct WindowRecordBatchInput<'a> {
+    pub(crate) schema: &'a Arc<Schema>,
+    pub(crate) key_type: &'a str,
+    pub(crate) key_value: &'a str,
+    pub(crate) window_start_ms: i64,
+    pub(crate) window_end_ms: i64,
+    pub(crate) agg_exprs: &'a [AggExpr],
+    pub(crate) state: &'a AggState,
+    pub(crate) agg_is_float: &'a [bool],
+}
+
 pub(crate) fn build_window_record_batch(
-    schema: &Arc<Schema>,
-    key_type: &str,
-    key_value: &str,
-    window_start_ms: i64,
-    window_end_ms: i64,
-    agg_exprs: &[AggExpr],
-    state: &AggState,
-    agg_is_float: &[bool],
+    input: WindowRecordBatchInput<'_>,
 ) -> ExecResult<RecordBatch> {
+    let WindowRecordBatchInput {
+        schema,
+        key_type,
+        key_value,
+        window_start_ms,
+        window_end_ms,
+        agg_exprs,
+        state,
+        agg_is_float,
+    } = input;
     let schema = Arc::clone(schema);
     let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = vec![
         key_value_to_typed_array(key_type, key_value),
@@ -342,7 +356,9 @@ pub(crate) fn build_window_record_batch(
                 columns.push(Arc::new(Float64Array::from(vec![state.finalized_avg(i)])));
             }
             _ if is_float => {
-                columns.push(Arc::new(Float64Array::from(vec![state.finalized_float_value(i, agg)])));
+                columns.push(Arc::new(Float64Array::from(vec![
+                    state.finalized_float_value(i, agg),
+                ])));
             }
             _ => {
                 columns.push(Arc::new(Int64Array::from(vec![

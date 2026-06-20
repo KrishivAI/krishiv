@@ -1,6 +1,4 @@
 //! Controller runtime.
-
-use crate::jcp_pod;
 use futures::StreamExt;
 use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState,
@@ -372,8 +370,7 @@ pub async fn reconcile_dynamic_object_with_runtime(
                 if resource.spec.dedicated_coordinator {
                     tracing::info!(
                         job_id = %job_id,
-                        jcp_pod = %jcp_pod::jcp_pod_name(job_id),
-                        "dedicated JCP orchestration enabled (see k8s/manifests/jcp-pod-template.yaml)"
+                        "dedicated in-process JCP bookkeeping enabled"
                     );
                 }
             }

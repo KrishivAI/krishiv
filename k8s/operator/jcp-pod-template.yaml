@@ -1,5 +1,8 @@
-# Per-job Job Coordinator Pod (JCP) — created by krishiv-operator when
-# KrishivJob.spec.dedicatedCoordinator is true (WS-7.3).
+# Reference-only per-job Job Coordinator Pod (JCP) shape.
+#
+# The current operator uses scheduler in-process JobCoordinator ownership for
+# `KrishivJob.spec.dedicatedCoordinator`; it does not create this pod. Keep this
+# template out of kustomization until an external JCP controller is implemented.
 apiVersion: v1
 kind: Pod
 metadata:

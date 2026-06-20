@@ -45,6 +45,7 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
     let http_addr = config.http_addr;
     let task_grpc_addr = config.task_grpc_addr;
     let barrier_grpc_addr = config.barrier_grpc_addr;
+    let shuffle_flight_addr = config.shuffle_flight_addr;
     let durability_profile = config.durability_profile;
 
     // Apply profile-driven backend defaults when explicit flags were not given.
@@ -90,6 +91,7 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
                 heartbeat_interval_secs,
                 task_grpc_addr,
                 barrier_grpc_addr,
+                shuffle_flight_addr,
                 shuffle_dir,
                 shuffle_uri,
                 state_dir,
@@ -316,12 +318,29 @@ fn apply_successful_reregister_lease(
     shared_lease.set(response.lease_generation());
 }
 
+fn advertised_endpoint(bound_addr: SocketAddr, configured_host: &str) -> String {
+    let advertised_host = if bound_addr.ip().is_unspecified() {
+        configured_host.to_owned()
+    } else {
+        bound_addr.ip().to_string()
+    };
+    format!("{advertised_host}:{}", bound_addr.port())
+}
+
+fn advertised_http_endpoint(bound_addr: SocketAddr, configured_host: &str) -> String {
+    format!(
+        "http://{}",
+        advertised_endpoint(bound_addr, configured_host)
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn heartbeat_loop(
     runtime: &mut ExecutorRuntime,
     heartbeat_interval_secs: u64,
     task_grpc_addr: Option<SocketAddr>,
     barrier_grpc_addr: Option<SocketAddr>,
+    shuffle_flight_addr: SocketAddr,
     shuffle_dir: Option<std::path::PathBuf>,
     shuffle_uri: Option<String>,
     state_dir: Option<std::path::PathBuf>,
@@ -345,14 +364,7 @@ async fn heartbeat_loop(
     };
     if let Some(listener) = &task_listener {
         let bound_addr = listener.local_addr().unwrap();
-        // When bound to 0.0.0.0, use the configured host (HOSTNAME / KRISHIV_HOST)
-        // so the coordinator can reach us via a routable address.
-        let advertised_host = if bound_addr.ip().is_unspecified() {
-            runtime.config().host().to_owned()
-        } else {
-            bound_addr.ip().to_string()
-        };
-        let endpoint = format!("http://{}:{}", advertised_host, bound_addr.port());
+        let endpoint = advertised_http_endpoint(bound_addr, runtime.config().host());
         runtime.set_advertised_endpoints(Some(endpoint.clone()), None);
         println!("Krishiv executor task gRPC listening on {bound_addr} (advertised {endpoint})");
         readiness.mark_task_grpc_ready();
@@ -368,12 +380,7 @@ async fn heartbeat_loop(
     };
     if let Some(listener) = &barrier_listener {
         let bound_addr = listener.local_addr().unwrap();
-        let advertised_host = if bound_addr.ip().is_unspecified() {
-            runtime.config().host().to_owned()
-        } else {
-            bound_addr.ip().to_string()
-        };
-        let endpoint = format!("http://{}:{}", advertised_host, bound_addr.port());
+        let endpoint = advertised_http_endpoint(bound_addr, runtime.config().host());
         runtime.set_advertised_endpoints(None, Some(endpoint.clone()));
         println!("Krishiv executor barrier gRPC listening on {bound_addr} (advertised {endpoint})");
         readiness.mark_barrier_grpc_ready();
@@ -492,15 +499,14 @@ async fn heartbeat_loop(
         };
         match backend.as_ref() {
             ShuffleBackend::Local(disk) => {
-                let bind: SocketAddr = "0.0.0.0:0"
-                    .parse()
-                    .map_err(|e| format!("failed to parse shuffle bind address: {e}"))?;
                 let (local_addr, _server_handle) =
-                    krishiv_shuffle::flight::serve(bind, Arc::clone(disk))
+                    krishiv_shuffle::flight::serve(shuffle_flight_addr, Arc::clone(disk))
                         .await
                         .map_err(|e| format!("shuffle flight server: {e}"))?;
-                let endpoint = local_addr.to_string();
-                println!("Krishiv executor shuffle flight listening on {endpoint}");
+                let endpoint = advertised_endpoint(local_addr, runtime.config().host());
+                println!(
+                    "Krishiv executor shuffle flight listening on {local_addr} (advertised {endpoint})"
+                );
                 let local_dir = shuffle_dir.clone().unwrap_or_else(|| {
                     std::path::PathBuf::from(if uri.starts_with("file://") {
                         uri.strip_prefix("file://").unwrap_or(&uri)
@@ -534,15 +540,14 @@ async fn heartbeat_loop(
             LocalDiskShuffleStore::new(dir)
                 .map_err(|e| format!("local shuffle store at {}: {e}", dir.display()))?,
         );
-        // Start the shuffle Flight server on a kernel-chosen port and advertise it.
-        let bind: SocketAddr = "0.0.0.0:0"
-            .parse()
-            .map_err(|e| format!("failed to parse shuffle bind address: {e}"))?;
-        let (local_addr, _server_handle) = krishiv_shuffle::flight::serve(bind, Arc::clone(&disk))
-            .await
-            .map_err(|e| format!("shuffle flight server: {e}"))?;
-        let endpoint = local_addr.to_string();
-        println!("Krishiv executor shuffle flight listening on {endpoint}");
+        let (local_addr, _server_handle) =
+            krishiv_shuffle::flight::serve(shuffle_flight_addr, Arc::clone(&disk))
+                .await
+                .map_err(|e| format!("shuffle flight server: {e}"))?;
+        let endpoint = advertised_endpoint(local_addr, runtime.config().host());
+        println!(
+            "Krishiv executor shuffle flight listening on {local_addr} (advertised {endpoint})"
+        );
         runner_builder = runner_builder.with_shuffle(ShuffleContext {
             store: Arc::new(krishiv_shuffle::ShuffleBackend::Local(disk)),
             local_dir: dir.clone(),
@@ -808,6 +813,8 @@ struct ExecutorCliConfig {
     task_grpc_addr: Option<SocketAddr>,
     /// BarrierService gRPC listen address.
     barrier_grpc_addr: Option<SocketAddr>,
+    /// Shuffle Flight listen address used when local-disk shuffle is enabled.
+    shuffle_flight_addr: SocketAddr,
     /// Local on-disk shuffle store directory; if set, the shuffle Flight
     /// server is started and the runner is wired for `shuffle-write:` fragments.
     shuffle_dir: Option<std::path::PathBuf>,
@@ -869,6 +876,15 @@ impl ExecutorCliConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .or_else(|| "0.0.0.0:2006".parse().ok()),
+            shuffle_flight_addr: env::var("KRISHIV_SHUFFLE_FLIGHT_ADDR")
+                .or_else(|_| env::var("KRISHIV_SHUFFLE_ADDR"))
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| {
+                    "0.0.0.0:2004"
+                        .parse()
+                        .expect("valid default shuffle Flight address")
+                }),
             shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR")
                 .ok()
                 .map(std::path::PathBuf::from),
@@ -932,6 +948,12 @@ impl ExecutorCliConfig {
                             format!("invalid socket address for --barrier-grpc-addr: {value}")
                         })?);
                     }
+                }
+                "--shuffle-flight-addr" => {
+                    let value = next_arg(&mut args, "--shuffle-flight-addr")?;
+                    config.shuffle_flight_addr = value.parse().map_err(|_| {
+                        format!("invalid socket address for --shuffle-flight-addr: {value}")
+                    })?;
                 }
                 "--heartbeat-interval-secs" => {
                     let value = next_arg(&mut args, "--heartbeat-interval-secs")?;
@@ -1081,6 +1103,7 @@ impl ExecutorCliConfig {
            --heartbeat-interval-secs <N> Heartbeat interval for --connect, defaults to KRISHIV_HEARTBEAT_INTERVAL_SECS or 10\n\
            --task-grpc-addr <ADDR>      Task gRPC server address (default: KRISHIV_TASK_GRPC_ADDR or 0.0.0.0:2005; use 'off' to disable)\n\
            --barrier-grpc-addr <ADDR>   Barrier gRPC server address (default: KRISHIV_BARRIER_GRPC_ADDR or 0.0.0.0:2006; use 'off' to disable)\n\
+           --shuffle-flight-addr <ADDR> Shuffle Flight server address (default: KRISHIV_SHUFFLE_FLIGHT_ADDR, KRISHIV_SHUFFLE_ADDR, or 0.0.0.0:2004)\n\
            --shuffle-dir <DIR>          On-disk shuffle store directory (also KRISHIV_SHUFFLE_DIR)\n\
            --shuffle-uri <URI>          Shuffle storage URI: file://path, s3://bucket/prefix (KRISHIV_SHUFFLE_URI)\n\
            --checkpoint-uri <URI>       Checkpoint storage URI: file://path, s3://bucket/prefix, memory:// (default: KRISHIV_CHECKPOINT_STORAGE, else selected by durability profile)\n\
@@ -1362,6 +1385,7 @@ mod tests {
         assert_eq!(config.coordinator_endpoint, "http://127.0.0.1:2001");
         assert_eq!(config.mode, ExecutorMode::DryRun);
         assert_eq!(config.heartbeat_interval_secs, 10);
+        assert_eq!(config.shuffle_flight_addr, "0.0.0.0:2004".parse().unwrap());
         assert!(!config.help);
     }
 
@@ -1496,6 +1520,30 @@ mod tests {
             ExecutorCliConfig::parse([String::from("--barrier-grpc-addr"), String::from("off")])
                 .unwrap();
         assert!(config.barrier_grpc_addr.is_none());
+    }
+
+    #[test]
+    fn parses_shuffle_flight_addr() {
+        let config = ExecutorCliConfig::parse([
+            String::from("--shuffle-flight-addr"),
+            String::from("0.0.0.0:2104"),
+        ])
+        .unwrap();
+        assert_eq!(config.shuffle_flight_addr, "0.0.0.0:2104".parse().unwrap());
+    }
+
+    #[test]
+    fn advertised_endpoint_rewrites_unspecified_host() {
+        let endpoint = super::advertised_endpoint("0.0.0.0:2004".parse().unwrap(), "10.2.3.4");
+
+        assert_eq!(endpoint, "10.2.3.4:2004");
+    }
+
+    #[test]
+    fn advertised_endpoint_keeps_specific_bound_host() {
+        let endpoint = super::advertised_endpoint("127.0.0.1:2004".parse().unwrap(), "10.2.3.4");
+
+        assert_eq!(endpoint, "127.0.0.1:2004");
     }
 
     #[test]

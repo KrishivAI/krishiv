@@ -239,15 +239,23 @@ impl AggState {
                         _ => {
                             let v = match col.data_type() {
                                 DataType::Int32 => {
-                                    let arr = col.as_any().downcast_ref::<Int32Array>()
-                                        .ok_or_else(|| ExecError::UnsupportedType(
-                                            "declared Int32 aggregate input failed downcast".into()))?;
+                                    let arr =
+                                        col.as_any().downcast_ref::<Int32Array>().ok_or_else(
+                                            || {
+                                                ExecError::UnsupportedType(
+                                            "declared Int32 aggregate input failed downcast".into())
+                                            },
+                                        )?;
                                     arr.value(row) as i64
                                 }
                                 DataType::Int64 => {
-                                    let arr = col.as_any().downcast_ref::<Int64Array>()
-                                        .ok_or_else(|| ExecError::UnsupportedType(
-                                            "declared Int64 aggregate input failed downcast".into()))?;
+                                    let arr =
+                                        col.as_any().downcast_ref::<Int64Array>().ok_or_else(
+                                            || {
+                                                ExecError::UnsupportedType(
+                                            "declared Int64 aggregate input failed downcast".into())
+                                            },
+                                        )?;
                                     arr.value(row)
                                 }
                                 other => {
@@ -258,12 +266,13 @@ impl AggState {
                             };
                             match expr.function {
                                 AggFunction::Sum => {
-                                    self.values[i] = self.values[i].checked_add(v).ok_or_else(|| {
-                                        ExecError::InvalidInput(format!(
-                                            "sum overflow on column '{}': i64::MAX reached",
-                                            expr.input_column
-                                        ))
-                                    })?;
+                                    self.values[i] =
+                                        self.values[i].checked_add(v).ok_or_else(|| {
+                                            ExecError::InvalidInput(format!(
+                                                "sum overflow on column '{}': i64::MAX reached",
+                                                expr.input_column
+                                            ))
+                                        })?;
                                 }
                                 AggFunction::Min => {
                                     if !self.has_value[i] || v < self.values[i] {
@@ -334,10 +343,18 @@ impl AggState {
     pub(crate) fn finalized_float_value(&self, i: usize, expr: &AggExpr) -> f64 {
         match expr.function {
             AggFunction::Min => {
-                if self.has_value[i] { self.float_values[i] } else { f64::INFINITY }
+                if self.has_value[i] {
+                    self.float_values[i]
+                } else {
+                    f64::INFINITY
+                }
             }
             AggFunction::Max => {
-                if self.has_value[i] { self.float_values[i] } else { f64::NEG_INFINITY }
+                if self.has_value[i] {
+                    self.float_values[i]
+                } else {
+                    f64::NEG_INFINITY
+                }
             }
             _ => self.float_values[i],
         }
@@ -374,10 +391,14 @@ fn update_agg_state_pre(
                     match expr.function {
                         AggFunction::Sum => state.float_values[i] += v,
                         AggFunction::Min => {
-                            if v < state.float_values[i] { state.float_values[i] = v; }
+                            if v < state.float_values[i] {
+                                state.float_values[i] = v;
+                            }
                         }
                         AggFunction::Max => {
-                            if v > state.float_values[i] { state.float_values[i] = v; }
+                            if v > state.float_values[i] {
+                                state.float_values[i] = v;
+                            }
                         }
                         _ => {}
                     }
@@ -513,20 +534,26 @@ impl LocalAggregator {
             fields.push(f.clone());
         }
         // Determine output dtype per aggregate: Float64 if input column is Float64.
-        let agg_out_dtypes: Vec<DataType> = self.agg_exprs.iter().map(|agg| {
-            match agg.function {
-                AggFunction::Avg => DataType::Float64,
-                AggFunction::Count => DataType::Int64,
-                _ => {
-                    // Sum/Min/Max output type follows the input column type.
-                    batch.schema().field_with_name(&agg.input_column)
-                        .ok()
-                        .map(|f| f.data_type().clone())
-                        .filter(|dt| matches!(dt, DataType::Float64))
-                        .unwrap_or(DataType::Int64)
+        let agg_out_dtypes: Vec<DataType> = self
+            .agg_exprs
+            .iter()
+            .map(|agg| {
+                match agg.function {
+                    AggFunction::Avg => DataType::Float64,
+                    AggFunction::Count => DataType::Int64,
+                    _ => {
+                        // Sum/Min/Max output type follows the input column type.
+                        batch
+                            .schema()
+                            .field_with_name(&agg.input_column)
+                            .ok()
+                            .map(|f| f.data_type().clone())
+                            .filter(|dt| matches!(dt, DataType::Float64))
+                            .unwrap_or(DataType::Int64)
+                    }
                 }
-            }
-        }).collect();
+            })
+            .collect();
         for (agg, dtype) in self.agg_exprs.iter().zip(&agg_out_dtypes) {
             fields.push(Field::new(&agg.output_column, dtype.clone(), true));
         }

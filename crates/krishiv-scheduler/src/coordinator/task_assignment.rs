@@ -124,16 +124,15 @@ impl Coordinator {
     /// `Assigned` so `launch_assigned_tasks` can launch them.
     pub fn assign_pending_tasks(&mut self, job_id: &JobId) -> SchedulerResult<usize> {
         self.ensure_active()?;
-        // Collect executor ids first to avoid a simultaneous immutable + mutable borrow.
-        let mut executor_ids: Vec<ExecutorId> = self
-            .executors
-            .schedulable_executors()
-            .into_iter()
-            .map(|d| d.executor_id().clone())
-            .collect();
-        executor_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        if executor_ids.is_empty() {
+        let executors = self.executors.schedulable_executor_placements();
+        if executors.is_empty() {
             return Err(SchedulerError::NoExecutors);
+        }
+        {
+            let job = self.find_job(job_id)?;
+            if job.state() == JobState::Queued {
+                return Ok(0);
+            }
         }
         let mut job = self.find_job_mut(job_id)?;
         let pending_task_ids: Vec<TaskId> = job
@@ -144,10 +143,22 @@ impl Coordinator {
             .map(|t| t.task_id().clone())
             .collect();
         let count = pending_task_ids.len();
-        for (idx, task_id) in pending_task_ids.into_iter().enumerate() {
-            let executor_id = executor_ids[idx % executor_ids.len()].clone();
-            let assignment = TaskAssignment::new(task_id, executor_id);
-            job.apply_assignments(vec![assignment]);
+        let assignments =
+            SlotAwareScheduler::place_task_ids_with_load(&pending_task_ids, &executors)?;
+        for task_id in pending_task_ids {
+            if let Some(assignment) = assignments
+                .iter()
+                .find(|assignment| assignment.task_id() == &task_id)
+            {
+                job.apply_assignments(vec![assignment.clone()]);
+            }
+        }
+        drop(job);
+        if count > 0 {
+            self.persist_job_record(
+                job_id,
+                krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile),
+            )?;
         }
         Ok(count)
     }
@@ -431,6 +442,12 @@ impl Coordinator {
             self.job_task_input_partitions.insert(job_id.clone(), parts);
         }
         let assignments = assignment_result?;
+        if !assignments.is_empty() {
+            self.persist_job_record(
+                job_id,
+                krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile),
+            )?;
+        }
         // GAP-OB-01: Increment tasks_assigned counter.
         TASKS_ASSIGNED_TOTAL.fetch_add(assignments.len() as u64, AtomicOrdering::Relaxed);
         Ok(assignments)
@@ -624,7 +641,13 @@ impl Coordinator {
         job_id: &JobId,
     ) -> SchedulerResult<Vec<TaskStatusResponse>> {
         let assignments = self.launch_assigned_task_assignments(job_id)?;
-        let targets = self.resolve_assignment_targets(assignments)?;
+        let targets = match self.resolve_assignment_targets(assignments) {
+            Ok(targets) => targets,
+            Err(error) => {
+                self.clear_launch_in_flight_for_job(job_id);
+                return Err(error);
+            }
+        };
         // GAP-4: Clone the channel map BEFORE the await point. Because
         // `deliver_assignment_targets_with_channels` is a static method that owns
         // `channels`, `self` is not borrowed across the network I/O yield points.
@@ -721,46 +744,75 @@ impl Coordinator {
     }
 
     pub(crate) fn clear_launch_in_flight_for_job(&mut self, job_id: &JobId) {
-        let Some(mut job) = self
-            .job_coordinators
-            .get(job_id)
-            .map(|jc| jc.write_record())
-        else {
-            return;
-        };
-        for stage in &mut job.stages {
-            for task in stage.tasks_mut() {
-                if task.state() == TaskState::Assigned {
-                    task.clear_launch_in_flight();
+        let changed = {
+            let Some(mut job) = self
+                .job_coordinators
+                .get(job_id)
+                .map(|jc| jc.write_record())
+            else {
+                return;
+            };
+            let mut changed = false;
+            for stage in &mut job.stages {
+                for task in stage.tasks_mut() {
+                    if task.state() == TaskState::Assigned && task.launch_in_flight() {
+                        task.clear_launch_in_flight();
+                        changed = true;
+                    }
                 }
+                stage.refresh_state();
             }
-            stage.refresh_state();
+            job.refresh_state();
+            changed
+        };
+        if changed
+            && let Err(error) = self.persist_job_record(
+                job_id,
+                krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile),
+            )
+        {
+            tracing::warn!(job_id = %job_id, error = %error, "failed to persist cleared launch state");
         }
-        job.refresh_state();
     }
 
     fn clear_launch_in_flight_for_task(&mut self, job_id: &JobId, task_id: &TaskId) {
-        let Some(mut job) = self
-            .job_coordinators
-            .get(job_id)
-            .map(|jc| jc.write_record())
-        else {
-            return;
-        };
-        for stage in &mut job.stages {
+        let changed = {
+            let Some(mut job) = self
+                .job_coordinators
+                .get(job_id)
+                .map(|jc| jc.write_record())
+            else {
+                return;
+            };
             let mut changed = false;
-            for task in stage.tasks_mut() {
-                if task.task_id() == task_id && task.state() == TaskState::Assigned {
-                    task.clear_launch_in_flight();
-                    changed = true;
-                    break;
+            for stage in &mut job.stages {
+                let mut stage_changed = false;
+                for task in stage.tasks_mut() {
+                    if task.task_id() == task_id
+                        && task.state() == TaskState::Assigned
+                        && task.launch_in_flight()
+                    {
+                        task.clear_launch_in_flight();
+                        changed = true;
+                        stage_changed = true;
+                        break;
+                    }
+                }
+                if stage_changed {
+                    stage.refresh_state();
                 }
             }
-            if changed {
-                stage.refresh_state();
-            }
+            job.refresh_state();
+            changed
+        };
+        if changed
+            && let Err(error) = self.persist_job_record(
+                job_id,
+                krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile),
+            )
+        {
+            tracing::warn!(job_id = %job_id, task_id = %task_id, error = %error, "failed to persist cleared task launch state");
         }
-        job.refresh_state();
     }
 
     pub(crate) fn apply_assignment_dispatch_responses(

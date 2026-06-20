@@ -24,6 +24,13 @@ impl Coordinator {
                 Arc::new(JobCoordinator::new(job_id, record.clone())),
             );
         }
+        let normalized = self.normalize_recovered_launch_state();
+        if normalized > 0 {
+            tracing::warn!(
+                task_count = normalized,
+                "recovered assigned tasks had in-flight launches; clearing launch guards for retry"
+            );
+        }
         // RC1: Rebuild streaming_task_index so heartbeats arriving during the
         // recovery window are not silently dropped.  Without this, every call to
         // apply_streaming_task_state returns early because the index is empty.
@@ -55,13 +62,17 @@ impl Coordinator {
                     && j.spec.checkpoint_storage_path().is_some()
             })
             .filter_map(|j| {
-                let task_count: usize = j.spec.stages().iter().map(|s| s.tasks().len()).sum();
-                Some((
-                    j.job_id().clone(),
-                    j.spec.checkpoint_interval_ms()?,
-                    j.spec.checkpoint_storage_path()?.to_owned(),
-                    task_count,
-                ))
+                if j.state() == JobState::Queued {
+                    None
+                } else {
+                    let task_count: usize = j.spec.stages().iter().map(|s| s.tasks().len()).sum();
+                    Some((
+                        j.job_id().clone(),
+                        j.spec.checkpoint_interval_ms()?,
+                        j.spec.checkpoint_storage_path()?.to_owned(),
+                        task_count,
+                    ))
+                }
             })
             .collect();
         for (job_id, interval_ms, storage_path, task_count) in streaming_checkpoint_jobs {
@@ -146,6 +157,39 @@ impl Coordinator {
             );
         }
         Ok(())
+    }
+
+    fn normalize_recovered_launch_state(&mut self) -> usize {
+        let mut normalized = 0usize;
+        for coordinator in self.job_coordinators.values() {
+            let mut record = coordinator.write_record();
+            if record.state() == JobState::Queued {
+                record.mark_queued();
+                continue;
+            }
+            if record.state().is_terminal() {
+                continue;
+            }
+            let mut job_changed = false;
+            for stage in &mut record.stages {
+                let mut stage_changed = false;
+                for task in stage.tasks_mut() {
+                    if task.state() == TaskState::Assigned && task.launch_in_flight() {
+                        task.clear_launch_in_flight();
+                        normalized = normalized.saturating_add(1);
+                        stage_changed = true;
+                        job_changed = true;
+                    }
+                }
+                if stage_changed {
+                    stage.refresh_state();
+                }
+            }
+            if job_changed {
+                record.refresh_state();
+            }
+        }
+        normalized
     }
 
     /// Audit shuffle availability across all non-terminal jobs.

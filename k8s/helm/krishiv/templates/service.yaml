@@ -16,6 +16,16 @@ spec:
       port: {{ .Values.coordinator.port }}
       targetPort: grpc
       protocol: TCP
+    - name: http
+      port: {{ .Values.coordinator.httpPort }}
+      targetPort: http
+      protocol: TCP
+    {{- if .Values.coordinator.flight.enabled }}
+    - name: flight
+      port: {{ .Values.coordinator.flight.port }}
+      targetPort: flight
+      protocol: TCP
+    {{- end }}
   type: ClusterIP
 ---
 # Executor gRPC service — used by the coordinator to push task assignments.
@@ -34,6 +44,18 @@ spec:
     - name: grpc
       port: {{ .Values.executor.port }}
       targetPort: grpc
+      protocol: TCP
+    - name: barrier
+      port: {{ .Values.executor.barrierPort }}
+      targetPort: barrier
+      protocol: TCP
+    - name: shuffle-flight
+      port: {{ .Values.executor.shuffleFlightPort }}
+      targetPort: shuffle-flight
+      protocol: TCP
+    - name: http
+      port: {{ .Values.executor.httpPort }}
+      targetPort: http
       protocol: TCP
   type: ClusterIP
   # Use headless service so each executor pod is individually addressable.

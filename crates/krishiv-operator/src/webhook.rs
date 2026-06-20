@@ -170,7 +170,7 @@ mod tests {
                         "apiVersion": "{API_GROUP}/{API_VERSION}",
                         "kind": "{KIND}",
                         "metadata": {{ "name": "{name}" }},
-                        "spec": {{ "image": "krishiv:latest", "tasks": 2 }}
+                        "spec": {{ "mode": "batch", "image": "krishiv:latest", "tasks": 2 }}
                     }}
                 }}
             }}"#
@@ -197,7 +197,7 @@ mod tests {
                         "apiVersion": "{API_GROUP}/{API_VERSION}",
                         "kind": "{KIND}",
                         "metadata": {{ "name": "" }},
-                        "spec": {{ "image": "krishiv:latest", "tasks": 1 }}
+                        "spec": {{ "mode": "batch", "image": "krishiv:latest", "tasks": 1 }}
                     }}
                 }}
             }}"#
@@ -225,7 +225,7 @@ mod tests {
                         "apiVersion": "{API_GROUP}/{API_VERSION}",
                         "kind": "{KIND}",
                         "metadata": {{ "name": "valid-name" }},
-                        "spec": {{ "image": "krishiv:latest", "tasks": 0 }}
+                        "spec": {{ "mode": "batch", "image": "krishiv:latest", "tasks": 0 }}
                     }}
                 }}
             }}"#

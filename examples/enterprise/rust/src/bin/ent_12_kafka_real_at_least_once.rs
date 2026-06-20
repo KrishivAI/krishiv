@@ -1,13 +1,13 @@
-//! Enterprise 12 · Kafka → Parquet (at-least-once, real broker) — stress test
+//! Enterprise 12 · Kafka → Parquet (at-least-once, real broker)
 //!
-//! Produces configurable batches to a real Kafka broker, then consumes them
-//! with the `KafkaSink`/`KafkaSource` connector API (JSON row-per-message)
-//! and verifies exactly the right number of rows land in Parquet.
+//! Demonstrates the `KafkaSink` / `KafkaSource` connector API against a live
+//! Kafka broker. Each `write_batch` on `KafkaSink` waits for broker delivery
+//! acknowledgement before returning — giving at-least-once per batch.
 //!
-//! Demonstrates:
-//!   - Real `KafkaSource` + `KafkaSink` connector API
-//!   - `PostWriteOffsetCommitProtocol` at-least-once delivery
-//!   - End-to-end row-count correctness check
+//! Pipeline:
+//!   KafkaSink  → produces each row as a JSON message, waits for ack
+//!   KafkaSource → consumes JSON messages, one RecordBatch per poll
+//!   ParquetSink → accumulates all batches into one output file
 //!
 //! Run:
 //!   cargo run --bin ent_12_kafka_real_at_least_once
@@ -22,7 +22,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use krishiv_connectors::kafka::{KafkaConfig, KafkaSink, KafkaSource};
 use krishiv_connectors::parquet::ParquetSink;
-use krishiv_connectors::{CheckpointSource, ConnectorConfig, PostWriteOffsetCommitProtocol, Sink, Source};
+use krishiv_connectors::{ConnectorConfig, Sink, Source};
 use tempfile::tempdir;
 
 const TOPIC: &str = "orders-at-least-once";
@@ -30,7 +30,7 @@ const BROKERS: &str = "localhost:9092";
 
 fn make_batch(schema: Arc<Schema>, start_id: i64, count: usize) -> Result<RecordBatch> {
     let ids: Vec<i64>    = (start_id..start_id + count as i64).collect();
-    let customers        = vec!["alice", "bob", "carol", "dave"];
+    let customers        = ["alice", "bob", "carol", "dave"];
     let custs: Vec<&str> = ids.iter().map(|i| customers[(i % 4) as usize]).collect();
     let amounts: Vec<f64>= ids.iter().map(|i| 10.0 + (i % 100) as f64).collect();
     Ok(RecordBatch::try_new(schema, vec![
@@ -43,9 +43,9 @@ fn make_batch(schema: Arc<Schema>, start_id: i64, count: usize) -> Result<Record
 #[tokio::main]
 async fn main() -> Result<()> {
     let total_rows: usize = std::env::var("LOAD_ROWS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(5_000);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2_000);
     let batch_size: usize = std::env::var("BATCH_SIZE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(200);
 
     println!("=== Enterprise 12: Kafka at-least-once (real broker) ===");
     println!("  broker     : {BROKERS}");
@@ -61,12 +61,13 @@ async fn main() -> Result<()> {
     ]));
 
     // ── Phase 1: Produce ──────────────────────────────────────────────────
-    println!("▶ Phase 1 — Produce via KafkaSink");
+    println!("▶ Phase 1 — Produce via KafkaSink (at-least-once, JSON row per message)");
     let sink_cfg = KafkaConfig::from_config(
         &ConnectorConfig::new("kafka-sink", "kafka")
             .with_property("bootstrap.servers", BROKERS)
             .with_property("topic", TOPIC)
-            .with_property("group.id", "krishiv-ent12-sink"),
+            .with_property("group.id", "krishiv-ent12-sink")
+            .with_property("message.timeout.ms", "30000"),
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut sink = KafkaSink::new(sink_cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -77,8 +78,12 @@ async fn main() -> Result<()> {
         let rows  = batch_size.min(total_rows - b * batch_size);
         let batch = make_batch(schema.clone(), (b * batch_size) as i64, rows)?;
         sink.write_batch(batch).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        if b % 5 == 0 {
+            eprint!("\r  produced {}/{} rows   ", (b + 1) * batch_size, total_rows);
+        }
     }
     sink.flush().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!();
 
     let prod_secs = t0.elapsed().as_secs_f64();
     println!("  ✓ {total_rows} rows in {prod_secs:.2}s  ({:.0} rows/s)",
@@ -86,88 +91,79 @@ async fn main() -> Result<()> {
     println!();
 
     // ── Phase 2: Consume + Parquet ─────────────────────────────────────────
-    println!("▶ Phase 2 — Consume via KafkaSource → ParquetSink (at-least-once)");
+    println!("▶ Phase 2 — Consume via KafkaSource → ParquetSink");
     let run_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let src_cfg = KafkaConfig::from_config(
         &ConnectorConfig::new("kafka-source", "kafka")
             .with_property("bootstrap.servers", BROKERS)
             .with_property("topic", TOPIC)
-            .with_property("group.id", format!("krishiv-ent12-{run_id}")),
+            .with_property("group.id", format!("krishiv-ent12-{run_id}"))
+            .with_property("session.timeout.ms", "30000")
+            .with_property("heartbeat.interval.ms", "3000"),
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut source = KafkaSource::new(src_cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let dir = tempdir()?;
-    let mut file_idx = 0usize;
-    let mut written_rows = 0usize;
-    let mut written_paths = Vec::new();
+    let out_path = dir.path().join("output.parquet");
+    let mut parquet = ParquetSink::create(&out_path).context("create ParquetSink")?;
 
-    // Wait for initial rebalance.
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    // Allow time for initial group rebalance.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     let t1 = Instant::now();
-    let idle_timeout = std::time::Duration::from_millis(5000);
+    let idle_timeout = std::time::Duration::from_millis(8000);
+    let mut consumed_rows = 0usize;
     loop {
-        let batch = match tokio::time::timeout(idle_timeout, source.read_batch()).await {
-            Err(_) => break, // idle timeout — consumed everything available
-            Ok(r)  => r.map_err(|e| anyhow::anyhow!("{e}"))?,
+        let result = tokio::time::timeout(idle_timeout, source.read_batch()).await;
+        let batch = match result {
+            Err(_) => break, // idle — done
+            Ok(Ok(Some(b))) => b,
+            Ok(Ok(None)) => continue,
+            Ok(Err(e)) => {
+                eprintln!("  warn: {e} (retrying)");
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                continue;
+            }
         };
-        let Some(batch) = batch else { continue };
-        if batch.num_rows() == 0 { continue }
+        if batch.num_rows() == 0 { continue; }
 
-        let offsets = source.checkpoint_offset()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        consumed_rows += batch.num_rows();
+        parquet.write_batch(batch).await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let path = dir.path().join(format!("part_{file_idx:04}.parquet"));
-        let mut parquet = ParquetSink::create(&path).context("create ParquetSink")?;
-        let mut committer = krishiv_connectors::kafka::InMemoryKafkaOffsetCommitter::new();
-        PostWriteOffsetCommitProtocol::write_flush_commit(
-            &mut parquet,
-            &mut committer,
-            batch.clone(),
-            // Use a per-partition offset for the committer.
-            krishiv_connectors::kafka::KafkaOffset {
-                topic: TOPIC.to_string(),
-                partition: 0,
-                offset: offsets.offsets.first().map(|o| o.offset).unwrap_or(0),
-            },
-        ).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        written_rows += batch.num_rows();
-        written_paths.push(path);
-        file_idx += 1;
-
-        if written_rows % 1000 == 0 {
-            eprint!("\r  consumed {written_rows}/{total_rows} rows   ");
+        if consumed_rows % (batch_size * 10).max(100) == 0 {
+            eprint!("\r  consumed {consumed_rows}/{total_rows} rows   ");
         }
-
-        if written_rows >= total_rows { break; }
+        if consumed_rows >= total_rows { break; }
     }
     eprintln!();
+    parquet.flush().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let cons_secs = t1.elapsed().as_secs_f64();
-    println!("  ✓ {written_rows} rows → {file_idx} Parquet files in {cons_secs:.2}s  ({:.0} rows/s)",
-        written_rows as f64 / cons_secs);
+    println!("  ✓ {consumed_rows} rows → output.parquet in {cons_secs:.2}s  ({:.0} rows/s)",
+        consumed_rows as f64 / cons_secs);
     println!();
 
     // ── Verify via SQL ─────────────────────────────────────────────────────
     let session = krishiv::Session::builder().build()?;
-    let mut all: Vec<RecordBatch> = Vec::new();
-    for p in &written_paths {
-        for b in session.read_parquet(p)?.collect()?.into_batches() {
-            all.push(b);
-        }
-    }
-    session.register_record_batches("orders", all)?;
-    let df = session.sql("SELECT COUNT(*) AS rows, ROUND(SUM(amount),2) AS revenue FROM orders")?;
-    println!("--- Verification ---");
+    let all_batches = session.read_parquet(&out_path)?.collect()?.into_batches();
+    session.register_record_batches("orders", all_batches)?;
+    // KafkaSink serialises rows as JSON; KafkaSource reads all fields back as
+    // Utf8 strings (no schema preservation). Cast numeric columns explicitly.
+    let df = session.sql(
+        "SELECT customer, COUNT(*) AS orders, \
+                ROUND(SUM(CAST(amount AS DOUBLE)), 2) AS revenue \
+         FROM orders GROUP BY customer ORDER BY revenue DESC"
+    )?;
+
+    println!("--- Verification: revenue per customer ---");
     println!("{}", df.collect()?.pretty()?);
 
-    if written_rows == total_rows {
-        println!("✓ row count correct: {written_rows} == {total_rows}");
+    if consumed_rows == total_rows {
+        println!("✓ row count correct: {consumed_rows} == {total_rows}");
     } else {
-        println!("⚠ row count mismatch: got {written_rows}, expected {total_rows}");
+        println!("⚠ row count mismatch: got {consumed_rows}, expected {total_rows}");
     }
 
     Ok(())

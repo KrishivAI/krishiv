@@ -1,9 +1,9 @@
-# Krishiv single-node k3s / single-host Kubernetes deployment.
+# Krishiv single-node k3s / single-host distributed developer deployment.
 #
 # Topology:
-#   coordinator (1 pod)   — gRPC :2001, HTTP :2002  NodePort :30002
-#   executor    (2 pods)  — task gRPC :2005, health HTTP :2002
-#   flight-server (1 pod) — Arrow Flight :2003       NodePort :30003
+#   clusterd   (1 pod)  — gRPC :2001, HTTP :2002, Flight SQL :2003
+#   executor   (2 pods) — task gRPC :2005, barrier gRPC :2006,
+#                         shuffle Flight :2004, health HTTP :2002
 #
 # Usage:
 #   kubectl apply -f k8s/direct/krishiv-distributed.yaml
@@ -15,7 +15,8 @@
 #     (optional key `tokens` may hold comma/newline separated rotation tokens;
 #      coordinator pods reload the mounted Secret every 30 seconds)
 #   - Secret krishiv-system/krishiv-executor-task-auth with key `token` must exist
-#   - For multi-node: replace hostPath /tmp with a PVC or object-store data path
+#   - For production distributed-durable: build with `full`/`k8s` features and
+#     provide etcd plus object-store shuffle/checkpoint URIs.
 
 ---
 # ── Namespace ──────────────────────────────────────────────────────────────────
@@ -67,7 +68,7 @@ subjects:
     namespace: krishiv-system
 
 ---
-# ── NetworkPolicy: executor can only reach coordinator ────────────────────────
+# ── NetworkPolicy: executor egress for coordinator + peer shuffle ─────────────
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -89,15 +90,25 @@ spec:
           protocol: TCP
         - port: 2002
           protocol: TCP
+        - port: 2003
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: krishiv-executor
+      ports:
+        - port: 2004
+          protocol: TCP
     # Allow DNS resolution
     - ports:
         - port: 53
           protocol: UDP
 
 ---
-# ── Coordinator persistent storage (R1) ───────────────────────────────────────
-# emptyDir would lose all job state on pod restart. Use a PVC instead so that
-# the coordinator can recover in-flight jobs after a restart.
+# ── Coordinator local storage ─────────────────────────────────────────────────
+# Reserved for developer/local-durable overrides. The default clusterd command
+# below runs with dev-local durability; production recovery requires etcd and
+# object-store checkpoint/shuffle URIs.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -110,17 +121,17 @@ spec:
       storage: 1Gi
 
 ---
-# ── Coordinator ────────────────────────────────────────────────────────────────
-# For HA: set replicas: 3, --metadata-backend etcd, and set env var
-# KRISHIV_ETCD_ENDPOINTS. The etcd leader election and metadata backends are
-# already implemented (feature = "etcd") — only config changes are needed.
+# ── Cluster control plane ─────────────────────────────────────────────────────
+# This manifest intentionally uses dev-local durability for single-host k3s.
+# For HA, run multiple `clusterd` replicas with distributed-durable, etcd
+# metadata/leader election, and shared object-store checkpoint/shuffle URIs.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: coordinator
   namespace: krishiv-system
 spec:
-  replicas: 1  # Increase to 3+ for HA with etcd leader election
+  replicas: 1
   selector:
     matchLabels:
       app: krishiv-coordinator
@@ -138,21 +149,13 @@ spec:
           imagePullPolicy: Never
           command:
             - /usr/local/bin/krishiv
-            - coordinator
+            - clusterd
             - --grpc-addr
             - 0.0.0.0:2001
             - --http-addr
             - 0.0.0.0:2002
-            # dev-local: volatile in-memory metadata, safe for single-node dev/test.
-            # For production (single-node-durable) replace with:
-            #   --durability-profile single-node-durable
-            #   --metadata-backend redb  (requires --features redb build)
-            #   --metadata-path /data/coordinator-meta.redb
-            # For HA (distributed-durable) replace with:
-            #   --durability-profile distributed-durable
-            #   --metadata-backend etcd
-            #   --leader-backend etcd
-            #   --etcd-endpoints http://etcd:2379
+            - --flight-addr
+            - 0.0.0.0:2003
             - --durability-profile
             - dev-local
           ports:
@@ -160,6 +163,8 @@ spec:
               containerPort: 2001
             - name: http
               containerPort: 2002
+            - name: flight
+              containerPort: 2003
           env:
             - name: KRISHIV_COORDINATOR_BEARER_TOKEN
               valueFrom:
@@ -198,7 +203,7 @@ spec:
               memory: "1Gi"
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /healthz
               port: 2002
             initialDelaySeconds: 3
             periodSeconds: 5
@@ -234,6 +239,9 @@ spec:
     - name: http
       port: 2002
       targetPort: 2002
+    - name: flight
+      port: 2003
+      targetPort: 2003
 
 ---
 # NodePort for external access to coordinator HTTP (diagnostics / jobs API)
@@ -253,11 +261,28 @@ spec:
       nodePort: 30002
 
 ---
+# NodePort for external access to co-located Flight SQL
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator-flight-ext
+  namespace: krishiv-system
+spec:
+  type: NodePort
+  selector:
+    app: krishiv-coordinator
+  ports:
+    - name: flight
+      port: 2003
+      targetPort: 2003
+      nodePort: 30003
+
+---
 # ── Executor ──────────────────────────────────────────────────────────────────
 # Each pod advertises its real pod IP (via POD_IP downward API) so the
 # coordinator can call back on the task gRPC service.
-# Data is delivered via InlineIpc in the task assignment — no shared filesystem
-# or hostPath mount is required.
+# Shuffle partitions use executor-local disk plus peer shuffle Flight on :2004.
+# No hostPath mount is required for this single-host developer manifest.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -301,6 +326,10 @@ spec:
             - "2"
             - --http-addr
             - 0.0.0.0:2002
+            - --task-grpc-addr
+            - 0.0.0.0:2005
+            - --barrier-grpc-addr
+            - 0.0.0.0:2006
             # dev-local profile: ephemeral window state + explicit shuffle dir.
             # For single-node-durable (survives restart):
             #   --durability-profile single-node-durable
@@ -311,9 +340,13 @@ spec:
             # so multi-stage queries don't exhaust executor pod memory.
             - --shuffle-dir
             - /tmp/krishiv-shuffle
+            - --shuffle-flight-addr
+            - 0.0.0.0:2004
           ports:
             - name: health
               containerPort: 2002
+            - name: shuffle-flight
+              containerPort: 2004
             - name: task-grpc
               containerPort: 2005
             - name: barrier-grpc
@@ -360,82 +393,13 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 30
             failureThreshold: 3
-          # Graceful shutdown: ask the executor to stop accepting new tasks and
-          # drain in-flight work before SIGTERM is sent (C5).
+          # Give Kubernetes time to remove this pod from Services before the
+          # executor handles SIGTERM by deregistering from the coordinator.
           lifecycle:
             preStop:
               exec:
                 command:
                   - /bin/sh
                   - -c
-                  - "curl -sf -X POST http://localhost:2002/internal/drain || sleep 5"
+                  - "sleep 5"
       terminationGracePeriodSeconds: 60
-
----
-# ── Flight Server ─────────────────────────────────────────────────────────────
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: flight-server
-  namespace: krishiv-system
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: krishiv-flight
-  template:
-    metadata:
-      labels:
-        app: krishiv-flight
-    spec:
-      containers:
-        - name: flight
-          image: localhost/krishiv:local
-          imagePullPolicy: Never
-          command:
-            - /usr/local/bin/krishiv
-            - flight-server
-          env:
-            - name: KRISHIV_FLIGHT_ADDR
-              value: "0.0.0.0:2003"
-            - name: KRISHIV_COORDINATOR_HTTP
-              value: "http://coordinator.krishiv-system.svc:2002"
-          ports:
-            - name: flight
-              containerPort: 2003
-          resources:
-            requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
-              cpu: "2"
-              memory: "1Gi"
-          readinessProbe:
-            tcpSocket:
-              port: 2003
-            initialDelaySeconds: 3
-            periodSeconds: 5
-            failureThreshold: 3
-          livenessProbe:
-            tcpSocket:
-              port: 2003
-            initialDelaySeconds: 10
-            periodSeconds: 30
-            failureThreshold: 3
-
----
-# NodePort for external access to Flight SQL
-apiVersion: v1
-kind: Service
-metadata:
-  name: flight-server
-  namespace: krishiv-system
-spec:
-  type: NodePort
-  selector:
-    app: krishiv-flight
-  ports:
-    - name: flight
-      port: 2003
-      targetPort: 2003
-      nodePort: 30003

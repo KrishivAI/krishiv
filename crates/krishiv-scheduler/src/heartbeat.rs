@@ -4,6 +4,7 @@ use krishiv_proto::{
     ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, LeaseGeneration, TaskId,
 };
 
+use crate::job::ExecutorPlacement;
 use crate::{CoordinatorConfig, SchedulerError, SchedulerResult};
 
 /// Memory and task load snapshot from an executor heartbeat.
@@ -198,6 +199,43 @@ impl ExecutorRegistry {
             })
             .map(|executor| executor.descriptor())
             .collect()
+    }
+
+    pub(crate) fn schedulable_executor_placements(&self) -> Vec<ExecutorPlacement> {
+        let mut placements: Vec<_> = self
+            .executors
+            .values()
+            .filter(|executor| self.is_schedulable(executor))
+            .map(|executor| {
+                let active_tasks = executor
+                    .health_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.active_task_count)
+                    .map(|count| count as usize)
+                    .unwrap_or_else(|| executor.running_tasks.len());
+                ExecutorPlacement::new(
+                    executor.executor_id().clone(),
+                    executor.descriptor().slots(),
+                    active_tasks,
+                )
+            })
+            .collect();
+        placements.sort_by(|a, b| a.executor_id.as_str().cmp(b.executor_id.as_str()));
+        placements
+    }
+
+    fn is_schedulable(&self, executor: &ExecutorRecord) -> bool {
+        if !executor.state().can_accept_work() || executor.descriptor().slots() == 0 {
+            return false;
+        }
+        if let Some(threshold) = self.memory_threshold_bytes
+            && let Some(snapshot) = &executor.health_snapshot
+            && let Some(used) = snapshot.memory_used_bytes
+            && used >= threshold
+        {
+            return false;
+        }
+        true
     }
 
     /// Sum of available memory across schedulable executors that report

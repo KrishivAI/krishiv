@@ -5,7 +5,7 @@ mod scheduler;
 mod snapshot;
 
 pub use record::{JobRecord, StageRecord, TaskRecord};
-pub(crate) use scheduler::validate_job;
+pub(crate) use scheduler::{ExecutorPlacement, validate_job};
 pub use scheduler::{
     NamespaceQuotaSnapshot, ResourceUsage, SlotAwareScheduler, StaticScheduler, SubmitOutcome,
     job_spec_from_logical_plan, job_spec_from_physical_plan,

@@ -35,3 +35,15 @@ krishiv-plan = { path = "../../../crates/krishiv-plan" }
 
 # Direct rdkafka access for high-load Kafka examples (ent_11+)
 rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
+
+# ent_13: PostgreSQL sink
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+
+# ent_14 / ent_17: HTTP client for ClickHouse + Flink REST API
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# ent_16: checkpoint serialisation
+serde = { version = "1", features = ["derive"] }
+
+# timing / metrics
+instant = "0.1"

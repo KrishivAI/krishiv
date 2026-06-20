@@ -97,6 +97,13 @@ Distributed:
 - Uses remote coordinator/executor transport.
 - Requires an explicit Flight coordinator URL; local fallback is rejected at
   session build/runtime construction.
+- Run `krishiv clusterd` for distributed control-plane deployments. It
+  co-locates coordinator gRPC, HTTP status/jobs API, and optional Flight SQL.
+  The standalone `flight-server` command is for embedded/local use and is not a
+  replacement for a distributed coordinator.
+- Executors must advertise routable task, barrier, and shuffle endpoints. In
+  Kubernetes this means binding task/barrier/shuffle services on stable ports
+  and advertising the pod IP, not `0.0.0.0`.
 - Production coordinator and executor task-control gRPC require bearer-token
   auth via `KRISHIV_COORDINATOR_BEARER_TOKEN` and
   `KRISHIV_EXECUTOR_TASK_BEARER_TOKEN`; anonymous gRPC is for dev-local only.

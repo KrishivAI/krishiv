@@ -8,7 +8,16 @@ image:
 
 coordinator:
   replicas: 1
+  command: "clusterd"
   port: 7070
+  httpPort: 7072
+  durabilityProfile: "dev-local"
+  metadataBackend: ""
+  leaderBackend: "single"
+  etcdEndpoints: ""
+  flight:
+    enabled: true
+    port: 7073
   resources:
     requests:
       cpu: "500m"
@@ -26,6 +35,14 @@ coordinator:
 executor:
   replicas: 3
   port: 7071
+  barrierPort: 7072
+  shuffleFlightPort: 7074
+  httpPort: 8080
+  durabilityProfile: "dev-local"
+  shuffleDir: "/tmp/krishiv-shuffle"
+  shuffleUri: ""
+  stateDir: ""
+  checkpointUri: ""
   resources:
     requests:
       cpu: "1"

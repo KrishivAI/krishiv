@@ -545,11 +545,15 @@ impl Coordinator {
 
 impl Coordinator {
     fn assign_pending_tasks_for_schedulable_jobs(&mut self) {
+        if let Err(error) = self.admit_queued_jobs() {
+            tracing::warn!(error = %error, "failed to admit queued jobs");
+        }
         let job_ids: Vec<JobId> = self
             .job_coordinators
             .iter()
             .filter_map(|(job_id, job_coordinator)| {
-                if job_coordinator.read_record().state().is_terminal() {
+                let state = job_coordinator.read_record().state();
+                if state.is_terminal() || state == JobState::Queued {
                     None
                 } else {
                     Some(job_id.clone())

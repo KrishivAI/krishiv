@@ -1,5 +1,182 @@
 # Krishiv Implementation Status
 
+## 2026-06-20 — Distributed deployment wiring fixes
+
+Fixed the distributed-mode deployment gaps found in the executor/coordinator
+review.
+
+### Completed
+
+- Direct Kubernetes manifest now runs `krishiv clusterd` as the distributed
+  control plane, exposes co-located Flight SQL, and removes the disconnected
+  standalone `flight-server` deployment.
+- Executors now have a fixed configurable shuffle Flight bind address
+  (`--shuffle-flight-addr` / `KRISHIV_SHUFFLE_FLIGHT_ADDR`) and advertise
+  routable pod-host endpoints instead of `0.0.0.0`.
+- Helm chart now exposes coordinator HTTP/Flight ports and executor
+  task/barrier/shuffle/health ports, with a durable distributed values override
+  for etcd plus object-store shuffle/checkpoint storage.
+- Operator manifests now route `krishiv-coordinator` Service traffic to the
+  operator pod that actually embeds the coordinator sidecars; stale external
+  JCP-pod claims were downgraded to reference-only documentation.
+- etcd metadata now persists continuous-job snapshots and bounded job history,
+  so distributed coordinator recovery covers more than active job/executor
+  records.
+
+### Validation
+
+```bash
+cargo fmt --check                                                        # pass
+cargo test -p krishiv-executor --lib                                    # pass
+cargo test -p krishiv-scheduler --lib --features etcd                   # pass
+cargo test -p krishiv-operator --lib                                    # pass
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings  # pass
+git diff --check                                                        # pass
+```
+
+### Blockers
+
+- `helm` is not installed in this environment, so Helm rendering was not
+  validated here.
+- `cargo test -p krishiv-shuffle --lib` compiles but has sandbox-dependent
+  filesystem/localhost failures (`Operation not permitted` on temp-dir
+  permission/attribute behavior); the required clippy gate passes.
+
+### Next useful command
+
+```bash
+helm template krishiv ./k8s/helm/krishiv -f k8s/helm/krishiv/values-distributed-durable.yaml
+```
+
+---
+
+## 2026-06-20 — Scheduler/executor architecture fixes
+
+Fixed the control-plane issues found in the scheduler/executor review.
+
+### Completed
+
+- Assignment target resolution errors now clear and persist `launch_in_flight`
+  state instead of silently dropping launches.
+- Task placement now uses heartbeat-reported live executor load before falling
+  back to static slots.
+- Admission-queued jobs are represented durably with `JobState::Queued`, remain
+  visible in status APIs, do not reserve namespace quota, and are admitted later
+  when capacity is available.
+- Recovered jobs clear persisted in-flight launch guards so dispatch is
+  retryable after coordinator restart.
+- Coordinator and executor `/readyz` endpoints now require actual scheduling /
+  executor readiness instead of process liveness alone.
+- Dataflow window output builder now uses a parameter struct to satisfy clippy's
+  type/argument quality gate.
+
+### Validation
+
+```bash
+cargo test -p krishiv-scheduler --lib
+cargo test -p krishiv-executor --lib
+cargo fmt --check
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings
+```
+
+### Blockers
+
+None from this session.
+
+### Next useful command
+
+```bash
+cargo test --workspace
+```
+
+---
+
+## 2026-06-20 — Enterprise examples 21-24: Delta batch → Kafka sink (all passing)
+
+Four new examples covering Delta Lake as a source with Kafka as the sink.
+
+### Example run summary
+
+| Example | Status | Notes |
+|---------|--------|-------|
+| ent_21 Delta batch → Kafka | ✓ | 3 Delta versions → 15K rows as Arrow IPC via Kafka |
+| ent_22 Delta CDC diff → Kafka | ✓ | Time-travel V0→V1 diff; 20 INSERTs, 80 UPDATEs, 20 DELETEs published as JSON |
+| ent_23 Delta SQL agg → Kafka | ✓ | 100K raw → GROUP BY (cat, month) → 60 compact rows; revenue matches $50M |
+| ent_24 Kafka→Delta→Kafka pipeline | ✓ | 50K rows: source Kafka → Delta staging → SQL → enriched output Kafka |
+
+### Key patterns
+
+- **Delta write**: `write_delta(path, batches, DeltaWriteMode::Append, false)`
+- **Delta time-travel**: `DeltaTableHandle::open(path, Some(version))` → `.scan_batches()`
+- **CDC diff**: compare `HashMap<order_id, Row>` for V0 vs V1 → classify as INSERT/UPDATE/DELETE
+- **Aggregate to Kafka**: SQL `GROUP BY` via embedded `Session`, then JSON-per-row to Kafka
+- **Full pipeline**: rdkafka consume → `write_delta` batch → `Session::sql` → JSON produce
+
+### Validation
+```bash
+cargo run --bin ent_21_delta_batch_to_kafka       # ✓ 15000 rows
+cargo run --bin ent_22_delta_cdc_to_kafka         # ✓ 120 CDC events (20+80+20)
+cargo run --bin ent_23_delta_agg_to_kafka         # ✓ $50M revenue matches
+cargo run --bin ent_24_kafka_to_delta_to_kafka    # ✓ $12.9M revenue matches
+```
+
+---
+
+## 2026-06-20 — Enterprise examples 13-20: Kafka sinks + benchmarks (all passing)
+
+Implemented and validated 8 new enterprise Rust examples covering real-service sinks,
+watermark correctness, crash+resume, throughput benchmarks, backpressure, and consumer
+group scale-out.
+
+### Example run summary
+
+| Example | Status | Throughput / Notes |
+|---------|--------|--------------------|
+| ent_13 Kafka → PostgreSQL | ✓ | 24 K rows/s · unnest bulk insert · offset table |
+| ent_14 Kafka → ClickHouse | ✓ | 87 K rows/s · JSONEachRow HTTP · 500 K rows |
+| ent_15 Watermark late-data | ✓ | 50 late events dropped, 500 on-time processed |
+| ent_16 Crash+resume checkpoint | ✓ | 10 K rows, seek via `assign()` after crash |
+| ent_17 Benchmark vs Flink | ✓ | Kafka 868 K rows/s produce; Krishiv 257 K rows/s e2e (5 M rows + windowing) |
+| ent_18 Kafka → InfluxDB | ✓ | 9.5 K rows/s · line protocol · 20 K sensor readings |
+| ent_19 Backpressure slow sink | ✓ | 6.8 K rows/s vs 20 K produce; bounded memory |
+| ent_20 Consumer group scale-out | ✓ | 100 K rows, 2 consumers, 0 duplicates, 14 K rows/s |
+
+### Key bugs fixed during this session
+
+1. **PostgreSQL reserved word** — `offset`/`partition` columns renamed to `next_offset`/`part_id`.
+2. **PostgreSQL ROUND return type** — `::float8` cast added after `ROUND(SUM(...)::numeric)`.
+3. **Stale topic data (all examples)** — AdminClient `delete_topics` + `create_topics` at startup.
+4. **Crash+resume duplicate reads** — `consumer.subscribe` + `seek_partitions` buffers pre-seek
+   messages; fixed by using `consumer.assign(tpl)` directly.
+5. **InfluxDB Flux count** — `|> group()` before `|> count()` collapses per-device series
+   into one total; CSV parser filters lines starting with `,` that are not headers.
+
+### Infrastructure used
+
+- **Kafka 3.9 KRaft**: `docker run --network=host apache/kafka:3.9.0`
+- **PostgreSQL 16**: `docker run -p 5432:5432 -e POSTGRES_PASSWORD=pass postgres:16-alpine`
+- **ClickHouse**: `docker run -p 8123:8123 clickhouse/clickhouse-server`
+- **InfluxDB v2**: `docker run -p 8086:8086 influxdb:2` (org=krishiv, bucket=sensors, token=krishiv-token-123)
+
+### Validation
+
+```bash
+cargo run --bin ent_13_kafka_to_postgres     # ✓ 50000 == 50000
+cargo run --bin ent_14_kafka_to_clickhouse   # ✓ 500000 == 500000
+cargo run --bin ent_15_watermark_late_data   # ✓ PASS
+cargo run --bin ent_16_crash_resume_checkpoint # ✓ PASS
+cargo run --bin ent_17_benchmark_vs_flink    # ✓ 5M rows benchmarked
+cargo run --bin ent_18_kafka_to_influxdb     # ✓ 20000 == 20000
+cargo run --bin ent_19_backpressure_slow_sink # ✓ PASS
+cargo run --bin ent_20_consumer_group_scaleout # ✓ PASS
+```
+
+### Next useful task
+Run `cargo run --bin ent_12_kafka_real_at_least_once` to verify the at-least-once
+connector example still passes after the topic cleanup changes.
+
+---
+
 ## 2026-06-20 — Enterprise examples 01-10 running in embedded mode + Float64 aggregate gap fix
 
 All 10 enterprise Rust examples now run successfully in embedded/in-process mode
@@ -54,10 +231,61 @@ enterprise examples ent_06 and ent_07.
 - `cargo test --workspace` — all pass
 - All 10 enterprise examples executed end-to-end with `cargo run --bin <name>`
 
+## 2026-06-20 — Real Kafka high-load examples (ent_11, ent_12)
+
+Two new enterprise examples added and validated against a live Apache Kafka 3.9
+broker (KRaft mode, no Zookeeper, `--network=host` Docker).
+
+### ent_11 — Kafka high-load pipeline (Arrow IPC)
+
+1 million rows produced at **646 K rows/s** (26 MB/s) as 100 Arrow IPC + lz4
+messages (10 K rows each). Consumed and window-aggregated at **983 K rows/s**
+end-to-end in **5.6 s** (180 K rows/s e2e). 400 window rows emitted (8
+customers × 50 tumbling 10s windows).
+
+Key implementation details:
+- `FutureProducer` with 64-message pipeline; `Producer` trait import for `flush(Timeout::After(…))`
+- `FutureRecord<str, Vec<u8>>` (not `[u8]`) for type inference
+- Per-run timestamped consumer group ID avoids re-reading prior offsets
+- 500 ms sleep + retry-on-transport-error handles initial group rebalance
+
+### ent_12 — KafkaSink / KafkaSource connector API (at-least-once)
+
+Demonstrates the `KafkaSink` / `KafkaSource` connector API. 2 000 rows produced
+as JSON messages (one per row, waiting for broker ack) and consumed back into a
+single Parquet file. Row count verified via SQL (CAST required for numeric
+columns — connector reads all JSON fields back as `Utf8`).
+
+Key notes:
+- `KafkaSink.write_batch` serialises each row as JSON and blocks on ack → ~120 rows/s
+  (correctness-first design; use ent_11 pattern for throughput)
+- `KafkaSource.payload_to_batch` returns all columns as `Utf8` — must CAST numerics in SQL
+- Transport glitches during group rebalance handled with warn + 300 ms retry loop
+
+### Kafka Docker setup
+
+```bash
+docker run -d --name krishiv-kafka --network=host \
+  -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
+  -e KAFKA_LISTENERS=PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093 \
+  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  -e KAFKA_NUM_PARTITIONS=4 \
+  apache/kafka:3.9.0
+docker exec krishiv-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --topic orders-load-test --partitions 4
+```
+
+Also requires mold linker (avoids ld SIGBUS on large link units):
+`.cargo/config.toml` in `examples/enterprise/rust/` with `rustflags = ["-C", "link-arg=-fuse-ld=mold"]`
+
 ### Next useful task
-- Add streaming window Float64 support (currently `execute_streaming_window` sets
-  `agg_is_float: vec![false; n]` regardless of input schema — needs peeking at
-  first stream batch or a schema parameter on `WindowExecutionSpec`)
+- Add streaming window Float64 support (`execute_streaming_window` still uses
+  `agg_is_float: vec![false; n]` — needs schema peeking or a spec parameter)
+- ent_13: multi-partition consumer group with 2+ consumers reading in parallel
 
 ## 2026-06-19 — Python async API and stub cleanup
 
@@ -732,3 +960,42 @@ Full workspace test suite deferred due to concurrent build lock contention; indi
 ```bash
 cargo test -p krishiv-scheduler --lib
 ```
+
+---
+
+## 2026-06-20 — Cloudflare Pages migration
+
+Converted krishiv.ai from Cloudflare Workers to Cloudflare Pages.
+All pages are static — Pages is the simpler, limit-free option.
+
+### What changed
+- `web/next.config.mjs` — added `output: 'export'`, removed OpenNext
+  `serverExternalPackages`.
+- `web/package.json` — removed `@opennextjs/cloudflare` dependency,
+  updated `deploy`/`preview` scripts to `next build && wrangler pages deploy out`.
+- `.github/workflows/deploy-web.yml` — switched from OpenNext build+deploy
+  to `pnpm build` + `wrangler pages deploy out --project-name krishiv-web`.
+- Removed `web/wrangler.jsonc` and `web/open-next.config.ts` (Workers-only).
+- Removed `.open-next/` and `.wrangler/` build artifacts.
+
+### Why
+- Error 1102 ("Worker exceeded resource limits") on cold start — the 3.1 MB
+  `handler.mjs` bundled the full Next.js server runtime, exceeding the free
+  plan's 10 ms CPU limit.
+- All 93 pages are statically generated (○ or SSG). No SSR, ISR, middleware,
+  API routes, or dynamic server features.
+- Pages serves static files directly from CDN — no Worker script, no CPU
+  limits, no bundle size concerns.
+
+### Validation
+- `pnpm build` — success, 93 pages generated.
+- Static output in `out/` is 11 MB (HTML + JS + CSS).
+
+### Deployment
+First deploy requires creating the Pages project:
+```bash
+cd web
+CLOUDFLARE_API_TOKEN=<token> pnpm wrangler pages project create krishiv-web --production-branch main
+CLOUDFLARE_API_TOKEN=<token> pnpm wrangler pages deploy out --project-name krishiv-web
+```
+After that, GitHub Actions handles deploys on push to `main`.

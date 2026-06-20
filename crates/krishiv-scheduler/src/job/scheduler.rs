@@ -2,8 +2,8 @@ use krishiv_plan::{
     ExecutionKind as PlanExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanNode,
 };
 use krishiv_proto::{
-    ExecutorDescriptor, JobId, JobKind, JobSpec, StageId, StageSpec, TaskAssignment, TaskId,
-    TaskSpec,
+    ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec, StageId, StageSpec, TaskAssignment,
+    TaskId, TaskSpec,
 };
 
 use crate::{SchedulerError, SchedulerResult};
@@ -116,20 +116,71 @@ impl StaticScheduler {
 #[derive(Debug, Clone, Default)]
 pub struct SlotAwareScheduler;
 
+/// Scheduler input for one executor with live load included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutorPlacement {
+    pub(crate) executor_id: ExecutorId,
+    slots: usize,
+    active_tasks: usize,
+}
+
+impl ExecutorPlacement {
+    pub(crate) fn new(executor_id: ExecutorId, slots: usize, active_tasks: usize) -> Self {
+        Self {
+            executor_id,
+            slots,
+            active_tasks,
+        }
+    }
+
+    fn free_slots(&self) -> usize {
+        self.slots.saturating_sub(self.active_tasks)
+    }
+}
+
 impl SlotAwareScheduler {
     pub fn place(
         spec: &JobSpec,
         executors: &[&ExecutorDescriptor],
     ) -> SchedulerResult<Vec<TaskAssignment>> {
+        let executors: Vec<_> = executors
+            .iter()
+            .map(|executor| {
+                ExecutorPlacement::new(executor.executor_id().clone(), executor.slots(), 0)
+            })
+            .collect();
+        Self::place_with_load(spec, &executors)
+    }
+
+    pub(crate) fn place_with_load(
+        spec: &JobSpec,
+        executors: &[ExecutorPlacement],
+    ) -> SchedulerResult<Vec<TaskAssignment>> {
+        let task_ids: Vec<_> = spec
+            .stages()
+            .iter()
+            .flat_map(StageSpec::tasks)
+            .map(|task| task.task_id().clone())
+            .collect();
+        Self::place_task_ids_with_load(&task_ids, executors)
+    }
+
+    pub(crate) fn place_task_ids_with_load(
+        task_ids: &[TaskId],
+        executors: &[ExecutorPlacement],
+    ) -> SchedulerResult<Vec<TaskAssignment>> {
         if executors.is_empty() {
             return Err(SchedulerError::NoExecutors);
         }
 
-        let mut slot_budget: Vec<usize> = executors.iter().map(|e| e.slots()).collect();
-        let mut assignments = Vec::with_capacity(spec.task_count());
-        for task in spec.stages().iter().flat_map(StageSpec::tasks) {
+        let mut slot_budget: Vec<usize> = executors
+            .iter()
+            .map(ExecutorPlacement::free_slots)
+            .collect();
+        let mut assignments = Vec::with_capacity(task_ids.len());
+        for task_id in task_ids {
             if slot_budget.iter().all(|s| *s == 0) {
-                slot_budget = executors.iter().map(|e| e.slots()).collect();
+                slot_budget = executors.iter().map(|e| e.slots).collect();
             }
             let (idx, _) = slot_budget
                 .iter()
@@ -138,8 +189,8 @@ impl SlotAwareScheduler {
                 .ok_or(SchedulerError::NoExecutors)?;
             slot_budget[idx] = slot_budget[idx].saturating_sub(1);
             assignments.push(TaskAssignment::new(
-                task.task_id().clone(),
-                executors[idx].executor_id().clone(),
+                task_id.clone(),
+                executors[idx].executor_id.clone(),
             ));
         }
         Ok(assignments)

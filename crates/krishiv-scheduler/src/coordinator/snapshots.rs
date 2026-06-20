@@ -92,7 +92,7 @@ impl Coordinator {
             ..Default::default()
         };
         for job in self.job_coordinators.values().map(|jc| jc.read_record()) {
-            if job.state().is_terminal() {
+            if job.state().is_terminal() || job.state() == JobState::Queued {
                 continue;
             }
             if job.spec.namespace_id() != namespace_id {

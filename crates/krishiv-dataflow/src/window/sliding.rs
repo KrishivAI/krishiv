@@ -8,7 +8,9 @@ use krishiv_state::{Namespace, StateBackend, StateResult};
 
 use crate::aggregate::{AggExpr, AggState};
 use crate::join::extract_agg_key;
-use crate::window::tumbling::{build_window_output_schema, build_window_record_batch};
+use crate::window::tumbling::{
+    WindowRecordBatchInput, build_window_output_schema, build_window_record_batch,
+};
 use crate::{ExecError, ExecResult};
 
 /// Configuration for a sliding event-time window operator (R5.2).
@@ -268,16 +270,16 @@ impl SlidingWindowOperator {
         state: &AggState,
     ) -> ExecResult<RecordBatch> {
         let window_end_ms = window_start_ms + self.spec.window_size_ms as i64;
-        build_window_record_batch(
-            &self.output_schema,
-            &self.spec.key_column_type,
+        build_window_record_batch(WindowRecordBatchInput {
+            schema: &self.output_schema,
+            key_type: &self.spec.key_column_type,
             key_value,
             window_start_ms,
             window_end_ms,
-            &self.spec.agg_exprs,
+            agg_exprs: &self.spec.agg_exprs,
             state,
-            &self.spec.agg_is_float,
-        )
+            agg_is_float: &self.spec.agg_is_float,
+        })
     }
 }
 

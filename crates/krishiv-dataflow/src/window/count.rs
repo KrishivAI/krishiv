@@ -27,7 +27,9 @@ use arrow::record_batch::RecordBatch;
 
 use crate::aggregate::{AggExpr, AggFunction, AggState};
 use crate::join::extract_agg_key;
-use crate::window::tumbling::{build_window_output_schema, build_window_record_batch};
+use crate::window::tumbling::{
+    WindowRecordBatchInput, build_window_output_schema, build_window_record_batch,
+};
 use crate::{ExecError, ExecResult};
 
 /// Specification for a count-based window operator.
@@ -137,16 +139,16 @@ impl CountWindowOperator {
                         .map(|c| &c.agg),
                     &self.spec.agg_exprs,
                 );
-                output.push(build_window_record_batch(
-                    &self.output_schema,
-                    &self.spec.key_column_type,
-                    &key_str,
-                    window_start as i64,
-                    window_end as i64,
-                    &self.spec.agg_exprs,
-                    &merged,
-                    &self.spec.agg_is_float,
-                )?);
+                output.push(build_window_record_batch(WindowRecordBatchInput {
+                    schema: &self.output_schema,
+                    key_type: &self.spec.key_column_type,
+                    key_value: &key_str,
+                    window_start_ms: window_start as i64,
+                    window_end_ms: window_end as i64,
+                    agg_exprs: &self.spec.agg_exprs,
+                    state: &merged,
+                    agg_is_float: &self.spec.agg_is_float,
+                })?);
                 // Slide: drop the first `slide` rows from the front.
                 for _ in 0..self.spec.slide {
                     state.buf.pop_front();
@@ -168,16 +170,16 @@ impl CountWindowOperator {
             let window_start = state.window_start_row;
             let window_end = window_start + state.buf.len() as u64;
             let merged = fold_agg_states(state.buf.iter().map(|c| &c.agg), &self.spec.agg_exprs);
-            output.push(build_window_record_batch(
-                &self.output_schema,
-                &self.spec.key_column_type,
-                key_str,
-                window_start as i64,
-                window_end as i64,
-                &self.spec.agg_exprs,
-                &merged,
-                &self.spec.agg_is_float,
-            )?);
+            output.push(build_window_record_batch(WindowRecordBatchInput {
+                schema: &self.output_schema,
+                key_type: &self.spec.key_column_type,
+                key_value: key_str,
+                window_start_ms: window_start as i64,
+                window_end_ms: window_end as i64,
+                agg_exprs: &self.spec.agg_exprs,
+                state: &merged,
+                agg_is_float: &self.spec.agg_is_float,
+            })?);
         }
         self.key_states.clear();
         Ok(output)

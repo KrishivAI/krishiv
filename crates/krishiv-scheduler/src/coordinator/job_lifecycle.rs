@@ -20,54 +20,10 @@ impl Coordinator {
             });
         }
 
-        // Admission control: compute live quota snapshot then ask the queue manager.
-        let quota = self.namespace_quota_snapshot(spec.namespace_id());
-        let mut outcome = self.queue_manager.admit(&spec, &quota);
-
-        // Memory-estimate admission: when the job declares a memory ask and the
-        // cluster reports memory capacity via heartbeats, queue the job if its
-        // ask exceeds what is currently available across schedulable executors.
-        // Unknown capacity (no executor reports a memory limit) skips the check
-        // so clusters without memory reporting are unaffected.
-        if matches!(outcome, SubmitOutcome::Accepted)
-            && let Some(ask) = spec.memory_limit_bytes()
-            && ask > 0
-            && self.executors.cluster_available_memory_bytes().is_none()
-        {
-            tracing::debug!(
-                job_id = %spec.job_id(),
-                memory_ask = ask,
-                "job declares a memory ask but no executor has reported memory \
-                 capacity; skipping admission check"
-            );
-        }
-        if matches!(outcome, SubmitOutcome::Accepted)
-            && let Some(ask) = spec.memory_limit_bytes()
-            && ask > 0
-            && let Some(available) = self.executors.cluster_available_memory_bytes()
-            && ask > available
-        {
-            tracing::warn!(
-                job_id = %spec.job_id(),
-                memory_ask = ask,
-                cluster_available = available,
-                "job memory ask exceeds available cluster memory; queueing"
-            );
-            outcome = SubmitOutcome::Queued { position: 0 };
-        }
-
-        if let SubmitOutcome::Queued { .. } = &outcome {
-            if krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile) {
-                return Err(SchedulerError::InvalidJob {
-                    message: format!(
-                        "job {} was queued by admission control but durable profiles require \
-                         immediate admission; increase quota or reduce concurrent load",
-                        spec.job_id()
-                    ),
-                });
-            }
-            return Ok(outcome);
-        }
+        // Admission control: queued jobs are persisted as visible job records
+        // and admitted by later executor-heartbeat / scheduling ticks.
+        let outcome = self.evaluate_admission(&spec);
+        let is_queued = matches!(outcome, SubmitOutcome::Queued { .. });
 
         // Prepare (but don't yet commit) a CheckpointCoordinator for streaming jobs.
         // A7: We previously inserted the coordinator into `checkpoint_coordinators`
@@ -75,7 +31,8 @@ impl Coordinator {
         // leaked.  Now we open storage here, hand the constructed `CheckpointCoordinator`
         // over only after the job record is durably saved AND inserted in memory.
         let mut pending_checkpoint: Option<CheckpointCoordinator> = None;
-        if spec.kind() == JobKind::Streaming
+        if !is_queued
+            && spec.kind() == JobKind::Streaming
             && let (Some(interval_ms), Some(storage_path)) = (
                 spec.checkpoint_interval_ms(),
                 spec.checkpoint_storage_path(),
@@ -97,7 +54,7 @@ impl Coordinator {
         // (assign_pending_tasks_for_schedulable_jobs) will assign them as soon
         // as executors register or become healthy. This prevents submission
         // failures during rolling executor restarts.
-        let executors = self.executors.schedulable_executors();
+        let executors = self.executors.schedulable_executor_placements();
         let job_id = spec.job_id().clone();
         let _job_name = spec.name().to_owned();
         let _namespace = spec
@@ -105,8 +62,10 @@ impl Coordinator {
             .map(|s| s.to_owned())
             .unwrap_or_default();
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
-        if !executors.is_empty() {
-            let assignments = SlotAwareScheduler::place(&record.spec, &executors)?;
+        if is_queued {
+            record.mark_queued();
+        } else if !executors.is_empty() {
+            let assignments = SlotAwareScheduler::place_with_load(&record.spec, &executors)?;
             record.apply_assignments(assignments);
         }
         // If no executors: all tasks remain Pending; assign_pending_tasks will
@@ -146,7 +105,147 @@ impl Coordinator {
         // GAP-OB-01: Increment jobs_submitted counter.
         JOBS_SUBMITTED_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         krishiv_metrics::global_metrics().inc_tasks_submitted();
-        Ok(SubmitOutcome::Accepted)
+        Ok(outcome)
+    }
+
+    pub(crate) fn evaluate_admission(&self, spec: &JobSpec) -> SubmitOutcome {
+        let quota = self.namespace_quota_snapshot(spec.namespace_id());
+        let mut outcome = self.queue_manager.admit(spec, &quota);
+
+        // Memory-estimate admission: when the job declares a memory ask and the
+        // cluster reports memory capacity via heartbeats, queue the job if its
+        // ask exceeds what is currently available across schedulable executors.
+        // Unknown capacity skips the check so clusters without memory reporting
+        // are unaffected.
+        if matches!(outcome, SubmitOutcome::Accepted)
+            && let Some(ask) = spec.memory_limit_bytes()
+            && ask > 0
+            && self.executors.cluster_available_memory_bytes().is_none()
+        {
+            tracing::debug!(
+                job_id = %spec.job_id(),
+                memory_ask = ask,
+                "job declares a memory ask but no executor has reported memory \
+                 capacity; skipping admission check"
+            );
+        }
+        if matches!(outcome, SubmitOutcome::Accepted)
+            && let Some(ask) = spec.memory_limit_bytes()
+            && ask > 0
+            && let Some(available) = self.executors.cluster_available_memory_bytes()
+            && ask > available
+        {
+            tracing::warn!(
+                job_id = %spec.job_id(),
+                memory_ask = ask,
+                cluster_available = available,
+                "job memory ask exceeds available cluster memory; queueing"
+            );
+            outcome = SubmitOutcome::Queued { position: 0 };
+        }
+
+        outcome
+    }
+
+    pub(crate) fn admit_queued_jobs(&mut self) -> SchedulerResult<usize> {
+        self.ensure_active()?;
+        let mut queued: Vec<(u8, JobId)> = self
+            .job_coordinators
+            .iter()
+            .filter_map(|(job_id, coordinator)| {
+                let record = coordinator.read_record();
+                (record.state() == JobState::Queued)
+                    .then_some((record.spec.priority(), job_id.clone()))
+            })
+            .collect();
+        queued.sort_by_key(|(priority, _)| std::cmp::Reverse(*priority));
+
+        let mut admitted = 0usize;
+        for (_, job_id) in queued {
+            let spec = {
+                let Some(coordinator) = self.job_coordinators.get(&job_id) else {
+                    continue;
+                };
+                let record = coordinator.read_record();
+                if record.state() != JobState::Queued {
+                    continue;
+                }
+                record.spec.clone()
+            };
+            if !matches!(self.evaluate_admission(&spec), SubmitOutcome::Accepted) {
+                continue;
+            }
+
+            {
+                let mut record = self.find_job_mut(&job_id)?;
+                record.mark_admitted();
+            }
+            self.ensure_checkpoint_coordinator_for_job(&job_id)?;
+            self.persist_job_record(&job_id, true)?;
+            admitted = admitted.saturating_add(1);
+            tracing::info!(job_id = %job_id, "queued job admitted");
+        }
+
+        if admitted > 0 {
+            self.notify.notify_waiters();
+        }
+        Ok(admitted)
+    }
+
+    pub(crate) fn ensure_checkpoint_coordinator_for_job(
+        &mut self,
+        job_id: &JobId,
+    ) -> SchedulerResult<()> {
+        if self.checkpoint_coordinators.contains_key(job_id) {
+            return Ok(());
+        }
+        let (kind, interval_ms, storage_path, task_count) = {
+            let record = self.find_job(job_id)?;
+            (
+                record.spec.kind(),
+                record.spec.checkpoint_interval_ms(),
+                record.spec.checkpoint_storage_path().map(str::to_owned),
+                record.spec.task_count(),
+            )
+        };
+        if kind != JobKind::Streaming {
+            return Ok(());
+        }
+        let (Some(interval_ms), Some(storage_path)) = (interval_ms, storage_path) else {
+            return Ok(());
+        };
+        let storage = Self::open_checkpoint_storage(&storage_path)?;
+        self.checkpoint_coordinators.insert(
+            job_id.clone(),
+            CheckpointCoordinator::new(
+                job_id.clone(),
+                self.coordinator_id().as_str().to_owned(),
+                storage,
+                interval_ms,
+                task_count,
+            ),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn persist_job_record(&self, job_id: &JobId, sync: bool) -> SchedulerResult<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let record = self
+            .job_coordinators
+            .get(job_id)
+            .map(|coordinator| coordinator.read_record())
+            .ok_or_else(|| SchedulerError::UnknownJob {
+                job_id: job_id.clone(),
+            })?;
+        if sync {
+            let mut guard = store.inner();
+            guard.save_job(&record)?;
+        } else {
+            store.save_job(&record);
+        }
+        Ok(())
     }
 
     /// Cancel a job and mark non-terminal stages/tasks cancelled.

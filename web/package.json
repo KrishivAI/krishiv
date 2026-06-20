@@ -6,11 +6,10 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "preview": "opennextjs-cloudflare build && wrangler dev",
-    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "preview": "next build && wrangler pages dev out",
+    "deploy": "next build && wrangler pages deploy out",
     "lint": "next lint || tsc --noEmit",
-    "typecheck": "tsc --noEmit",
-    "cf:build": "opennextjs-cloudflare build"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@types/mdx": "latest",
@@ -23,7 +22,6 @@
     "zod": "latest"
   },
   "devDependencies": {
-    "@opennextjs/cloudflare": "^1.19.11",
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",

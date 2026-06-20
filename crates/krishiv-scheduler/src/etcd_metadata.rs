@@ -10,6 +10,8 @@
 //! |--------|---------|
 //! | `/krishiv/jobs/<job_id>` | JSON-encoded `PersistedJobRecord` |
 //! | `/krishiv/executors/<executor_id>` | JSON-encoded `PersistedExecutorDescriptor` |
+//! | `/krishiv/continuous/<job_id>` | Binary `ContinuousSnapshot` payload |
+//! | `/krishiv/history/<job_id>` | JSON-encoded terminal `JobHistoryRecord` |
 //!
 //! Events are not persisted — they are audit-only and kept in-memory.
 //!
@@ -23,13 +25,15 @@
 use etcd_client::{Client, GetOptions};
 
 use crate::store::{
-    ContinuousSnapshot, EventLogEvent, MetadataStore, PersistedExecutorDescriptor,
-    PersistedJobRecord,
+    ContinuousSnapshot, EventLogEvent, JobHistoryRecord, MAX_JOB_HISTORY, MetadataStore,
+    PersistedExecutorDescriptor, PersistedJobRecord,
 };
 use crate::{JobRecord, SchedulerError, SchedulerResult};
 
 const JOB_KEY_PREFIX: &str = "/krishiv/jobs/";
 const EXECUTOR_KEY_PREFIX: &str = "/krishiv/executors/";
+const CONTINUOUS_KEY_PREFIX: &str = "/krishiv/continuous/";
+const HISTORY_KEY_PREFIX: &str = "/krishiv/history/";
 
 /// Durable metadata store backed by per-record etcd keys.
 ///
@@ -56,6 +60,8 @@ pub struct EtcdMetadataStore {
     startup_jobs: Vec<JobRecord>,
     /// Startup-time snapshot loaded from etcd.  Read-only after construction.
     startup_executors: Vec<krishiv_proto::ExecutorDescriptor>,
+    continuous_snapshots: std::collections::HashMap<String, ContinuousSnapshot>,
+    history: Vec<JobHistoryRecord>,
 }
 
 impl EtcdMetadataStore {
@@ -84,11 +90,25 @@ impl EtcdMetadataStore {
             message: format!("etcd executors load failed: {e}"),
         })?;
 
+        let continuous_snapshots = load_continuous_snapshots(&mut client).await.map_err(|e| {
+            SchedulerError::Transport {
+                message: format!("etcd continuous snapshots load failed: {e}"),
+            }
+        })?;
+
+        let history = load_json_prefix::<JobHistoryRecord>(&mut client, HISTORY_KEY_PREFIX)
+            .await
+            .map_err(|e| SchedulerError::Transport {
+                message: format!("etcd job history load failed: {e}"),
+            })?;
+
         Ok(Self {
             client: std::sync::Mutex::new(client),
             events: Vec::new(),
             startup_jobs: jobs,
             startup_executors: executor_descriptors,
+            continuous_snapshots,
+            history: truncate_history(sort_history(history)),
         })
     }
 
@@ -174,43 +194,67 @@ impl MetadataStore for EtcdMetadataStore {
     fn save_continuous_snapshot(
         &mut self,
         job_id: &str,
-        _snapshot: ContinuousSnapshot,
+        snapshot: ContinuousSnapshot,
     ) -> SchedulerResult<()> {
-        // Continuous window snapshots may exceed per-record etcd size limits for
-        // large key cardinalities. Operators using the etcd backend should persist
-        // continuous job state to an external object store and restore manually.
-        tracing::warn!(
-            job_id = %job_id,
-            "EtcdMetadataStore: continuous snapshot persistence is not supported; \
-             window state will not survive coordinator restart on this backend"
-        );
+        let key = continuous_key(job_id);
+        let bytes = snapshot.encode()?;
+        self.put_key(key, bytes)?;
+        self.continuous_snapshots
+            .insert(job_id.to_owned(), snapshot);
         Ok(())
     }
 
-    fn load_continuous_snapshot(&self, _job_id: &str) -> Option<ContinuousSnapshot> {
-        None
+    fn load_continuous_snapshot(&self, job_id: &str) -> Option<ContinuousSnapshot> {
+        self.continuous_snapshots.get(job_id).cloned()
     }
 
-    fn remove_continuous_snapshot(&mut self, _job_id: &str) -> SchedulerResult<()> {
+    fn remove_continuous_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
+        self.delete_key(continuous_key(job_id))?;
+        self.continuous_snapshots.remove(job_id);
         Ok(())
     }
 
-    fn save_job_history(&mut self, record: crate::store::JobHistoryRecord) -> SchedulerResult<()> {
-        tracing::warn!(
-            job_id = %record.job_id,
-            "EtcdMetadataStore: job history persistence is not supported; \
-             history will not survive coordinator restart on this backend"
-        );
+    fn save_job_history(&mut self, record: JobHistoryRecord) -> SchedulerResult<()> {
+        let bytes = serde_json::to_vec(&record).map_err(|e| SchedulerError::Transport {
+            message: format!("etcd job history encode failed for {}: {e}", record.job_id),
+        })?;
+        self.put_key(history_key(&record.job_id), bytes)?;
+        self.history.retain(|r| r.job_id != record.job_id);
+        self.history.insert(0, record);
+        self.history = sort_history(std::mem::take(&mut self.history));
+        while self.history.len() > MAX_JOB_HISTORY {
+            if let Some(evicted) = self.history.pop() {
+                self.delete_key(history_key(&evicted.job_id))?;
+            }
+        }
         Ok(())
     }
 
-    fn list_job_history(&self) -> Vec<crate::store::JobHistoryRecord> {
-        Vec::new()
+    fn list_job_history(&self) -> Vec<JobHistoryRecord> {
+        self.history.clone()
     }
 
-    fn get_job_history(&self, _job_id: &str) -> Option<crate::store::JobHistoryRecord> {
-        None
+    fn get_job_history(&self, job_id: &str) -> Option<JobHistoryRecord> {
+        self.history.iter().find(|r| r.job_id == job_id).cloned()
     }
+}
+
+fn continuous_key(job_id: &str) -> String {
+    format!("{CONTINUOUS_KEY_PREFIX}{job_id}")
+}
+
+fn history_key(job_id: &str) -> String {
+    format!("{HISTORY_KEY_PREFIX}{job_id}")
+}
+
+fn sort_history(mut history: Vec<JobHistoryRecord>) -> Vec<JobHistoryRecord> {
+    history.sort_by_key(|record| std::cmp::Reverse(record.completed_at_ms));
+    history
+}
+
+fn truncate_history(mut history: Vec<JobHistoryRecord>) -> Vec<JobHistoryRecord> {
+    history.truncate(MAX_JOB_HISTORY);
+    history
 }
 
 /// Load all values under `prefix` from etcd, deserializing each as `P` then
@@ -245,11 +289,54 @@ where
     Ok(results)
 }
 
+async fn load_json_prefix<T>(client: &mut Client, prefix: &str) -> Result<Vec<T>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let resp = client
+        .get(prefix, Some(GetOptions::new().with_prefix()))
+        .await
+        .map_err(|e| format!("etcd get prefix {prefix} failed: {e}"))?;
+
+    let mut results = Vec::with_capacity(resp.kvs().len());
+    for kv in resp.kvs() {
+        let record: T = serde_json::from_slice(kv.value()).map_err(|e| {
+            format!(
+                "etcd decode failed for key {}: {e}",
+                kv.key_str().unwrap_or("?")
+            )
+        })?;
+        results.push(record);
+    }
+    Ok(results)
+}
+
+async fn load_continuous_snapshots(
+    client: &mut Client,
+) -> Result<std::collections::HashMap<String, ContinuousSnapshot>, String> {
+    let resp = client
+        .get(CONTINUOUS_KEY_PREFIX, Some(GetOptions::new().with_prefix()))
+        .await
+        .map_err(|e| format!("etcd get prefix {CONTINUOUS_KEY_PREFIX} failed: {e}"))?;
+
+    let mut snapshots = std::collections::HashMap::with_capacity(resp.kvs().len());
+    for kv in resp.kvs() {
+        let key = kv.key_str().unwrap_or("?");
+        let job_id = key
+            .strip_prefix(CONTINUOUS_KEY_PREFIX)
+            .ok_or_else(|| format!("etcd continuous snapshot key has wrong prefix: {key}"))?;
+        let snapshot = ContinuousSnapshot::decode(kv.value())
+            .map_err(|e| format!("etcd continuous snapshot decode failed for {key}: {e}"))?;
+        snapshots.insert(job_id.to_owned(), snapshot);
+    }
+    Ok(snapshots)
+}
+
 #[cfg(feature = "etcd")]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{EventLogEvent, PersistedExecutorDescriptor, PersistedJobRecord};
+    use crate::store::{JobHistoryRecord, PersistedExecutorDescriptor, PersistedJobRecord};
     use krishiv_proto::{ExecutorDescriptor, ExecutorId, JobId};
 
     #[test]
@@ -264,6 +351,42 @@ mod tests {
         let executor_id = "exec-0";
         let key = format!("{EXECUTOR_KEY_PREFIX}{executor_id}");
         assert_eq!(key, "/krishiv/executors/exec-0");
+    }
+
+    #[test]
+    fn continuous_and_history_keys_have_correct_prefixes() {
+        assert_eq!(
+            continuous_key("job-stream-1"),
+            "/krishiv/continuous/job-stream-1"
+        );
+        assert_eq!(history_key("job-batch-1"), "/krishiv/history/job-batch-1");
+    }
+
+    #[test]
+    fn history_sorting_is_most_recent_first_and_bounded() {
+        let mut records = Vec::new();
+        for i in 0..(MAX_JOB_HISTORY + 2) {
+            records.push(JobHistoryRecord {
+                job_id: format!("job-{i}"),
+                job_kind: "batch".into(),
+                final_state: "succeeded".into(),
+                completed_at_ms: i as u64,
+                stage_count: 1,
+                task_count: 1,
+                succeeded_task_count: 1,
+                failed_task_count: 0,
+                cpu_nanos: 0,
+                memory_peak_task_bytes: 0,
+                namespace_id: None,
+                priority: 0,
+            });
+        }
+
+        let sorted = truncate_history(sort_history(records));
+
+        assert_eq!(sorted.len(), MAX_JOB_HISTORY);
+        assert_eq!(sorted[0].completed_at_ms, (MAX_JOB_HISTORY + 1) as u64);
+        assert_eq!(sorted[MAX_JOB_HISTORY - 1].completed_at_ms, 2);
     }
 
     #[test]

@@ -44,6 +44,8 @@ impl fmt::Display for JobKind {
 /// Distributed job lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
+    /// Job is visible to the coordinator but waiting for admission capacity.
+    Queued,
     /// Job was accepted by the active coordinator.
     Accepted,
     /// Job is being converted into stages and tasks.
@@ -68,6 +70,7 @@ impl JobState {
 impl fmt::Display for JobState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Queued => f.write_str("queued"),
             Self::Accepted => f.write_str("accepted"),
             Self::Planning => f.write_str("planning"),
             Self::Running => f.write_str("running"),

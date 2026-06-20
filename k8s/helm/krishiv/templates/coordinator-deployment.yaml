@@ -27,13 +27,41 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/krishiv"]
           args:
-            - "coordinator"
+            - {{ .Values.coordinator.command | quote }}
             - "--grpc-addr"
             - "0.0.0.0:{{ .Values.coordinator.port }}"
+            - "--http-addr"
+            - "0.0.0.0:{{ .Values.coordinator.httpPort }}"
+            {{- if .Values.coordinator.flight.enabled }}
+            - "--flight-addr"
+            - "0.0.0.0:{{ .Values.coordinator.flight.port }}"
+            {{- end }}
+            - "--durability-profile"
+            - {{ .Values.coordinator.durabilityProfile | quote }}
+            {{- if .Values.coordinator.metadataBackend }}
+            - "--metadata-backend"
+            - {{ .Values.coordinator.metadataBackend | quote }}
+            {{- end }}
+            {{- if .Values.coordinator.leaderBackend }}
+            - "--leader-backend"
+            - {{ .Values.coordinator.leaderBackend | quote }}
+            {{- end }}
+            {{- if .Values.coordinator.etcdEndpoints }}
+            - "--etcd-endpoints"
+            - {{ .Values.coordinator.etcdEndpoints | quote }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.coordinator.port }}
               protocol: TCP
+            - name: http
+              containerPort: {{ .Values.coordinator.httpPort }}
+              protocol: TCP
+            {{- if .Values.coordinator.flight.enabled }}
+            - name: flight
+              containerPort: {{ .Values.coordinator.flight.port }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: KRISHIV_SERVICE_NAME
               value: {{ .Values.observability.serviceName | quote }}
@@ -78,13 +106,15 @@ spec:
           resources:
             {{- toYaml .Values.coordinator.resources | nindent 12 }}
           readinessProbe:
-            tcpSocket:
-              port: {{ .Values.coordinator.port }}
+            httpGet:
+              path: /healthz
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            tcpSocket:
-              port: {{ .Values.coordinator.port }}
+            httpGet:
+              path: /healthz
+              port: http
             initialDelaySeconds: 15
             periodSeconds: 30
       volumes:

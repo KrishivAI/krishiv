@@ -1,0 +1,26 @@
+# Production distributed-durable override.
+#
+# Usage:
+#   helm install krishiv ./k8s/helm/krishiv \
+#     -f k8s/helm/krishiv/values-distributed-durable.yaml
+#
+# Replace the etcd and S3-compatible URIs with endpoints reachable from every
+# coordinator and executor pod. The image must be built with distributed/k8s
+# capabilities, including `etcd`, `flight-sql`, `shuffle`, and RocksDB state.
+
+coordinator:
+  replicas: 3
+  command: "clusterd"
+  durabilityProfile: "distributed-durable"
+  metadataBackend: "etcd"
+  leaderBackend: "etcd"
+  etcdEndpoints: "http://etcd:2379"
+  flight:
+    enabled: true
+
+executor:
+  durabilityProfile: "distributed-durable"
+  shuffleDir: "/var/lib/krishiv/shuffle"
+  shuffleUri: "s3://krishiv-prod/shuffle"
+  stateDir: "/var/lib/krishiv/state"
+  checkpointUri: "s3://krishiv-prod/checkpoints"

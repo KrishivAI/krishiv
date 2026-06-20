@@ -158,8 +158,8 @@ pub struct KrishivJobSpec {
     /// Optional labels propagated to future runtime objects.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
-    /// When true, the operator runs a per-job orchestration loop (JCP) in addition
-    /// to the cluster control plane tick loops (ADR-DIST-01).
+    /// When true, the operator records that the scheduler's in-process per-job
+    /// coordinator should be treated as dedicated for this job.
     #[serde(default, rename = "dedicatedCoordinator")]
     pub dedicated_coordinator: bool,
 }
@@ -189,6 +189,8 @@ impl KrishivJobSpec {
 /// Observed `KrishivJob` phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KrishivJobPhase {
+    /// Job is waiting for scheduler admission capacity.
+    Queued,
     /// Resource was accepted by the controller.
     Accepted,
     /// Resource is being planned.
@@ -206,6 +208,7 @@ pub enum KrishivJobPhase {
 impl From<JobState> for KrishivJobPhase {
     fn from(value: JobState) -> Self {
         match value {
+            JobState::Queued => Self::Queued,
             JobState::Accepted => Self::Accepted,
             JobState::Planning => Self::Planning,
             JobState::Running => Self::Running,

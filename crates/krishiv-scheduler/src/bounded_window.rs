@@ -160,7 +160,7 @@ pub async fn execute_bounded_window_coordinated(
                     message: format!("bounded window job {job_id} finished in state {state:?}"),
                 });
             }
-            JobState::Accepted | JobState::Planning | JobState::Running => {
+            JobState::Queued | JobState::Accepted | JobState::Planning | JobState::Running => {
                 let state_changed = notify.notified();
                 let recheck = {
                     let coord = coordinator.read().await;
@@ -168,7 +168,7 @@ pub async fn execute_bounded_window_coordinated(
                 };
                 if matches!(
                     recheck,
-                    JobState::Accepted | JobState::Planning | JobState::Running
+                    JobState::Queued | JobState::Accepted | JobState::Planning | JobState::Running
                 ) {
                     tokio::select! {
                         _ = state_changed => {}

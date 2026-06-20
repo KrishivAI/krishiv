@@ -293,6 +293,140 @@ fn memory_admission_accepts_job_within_cluster_capacity() {
     assert_eq!(outcome, SubmitOutcome::Accepted);
 }
 
+#[test]
+fn slot_aware_scheduler_prefers_executor_with_live_free_slots() {
+    let job_id = JobId::try_new("job-live-placement").unwrap();
+    let task_id = TaskId::try_new("task-live-placement").unwrap();
+    let spec = JobSpec::new(job_id, "live-placement", JobKind::Batch).with_stage(
+        StageSpec::new(StageId::try_new("stage-live-placement").unwrap(), "stage")
+            .with_task(TaskSpec::new(task_id, "sql: SELECT 1")),
+    );
+    let busy = crate::job::ExecutorPlacement::new(
+        ExecutorId::try_new("exec-busy").unwrap(),
+        4,
+        4,
+    );
+    let idle = crate::job::ExecutorPlacement::new(
+        ExecutorId::try_new("exec-idle").unwrap(),
+        4,
+        0,
+    );
+
+    let assignments = crate::job::SlotAwareScheduler::place_with_load(&spec, &[busy, idle])
+        .expect("placement must succeed");
+
+    assert_eq!(
+        assignments[0].executor_id(),
+        &ExecutorId::try_new("exec-idle").unwrap()
+    );
+}
+
+#[test]
+fn submit_placement_uses_heartbeat_active_task_count() {
+    let exec_busy = ExecutorId::try_new("exec-submit-busy").unwrap();
+    let exec_idle = ExecutorId::try_new("exec-submit-idle").unwrap();
+    let job_id = JobId::try_new("job-submit-live-placement").unwrap();
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-submit-live-placement").unwrap());
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_busy.clone(), "busy", 4))
+        .unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_idle.clone(), "idle", 4))
+        .unwrap();
+    coordinator
+        .executor_heartbeat(
+            ExecutorHeartbeat::new(exec_busy, ExecutorState::Healthy).with_active_task_count(4),
+        )
+        .unwrap();
+    coordinator
+        .executor_heartbeat(
+            ExecutorHeartbeat::new(exec_idle.clone(), ExecutorState::Healthy)
+                .with_active_task_count(0),
+        )
+        .unwrap();
+
+    coordinator
+        .submit_job(single_task_job(job_id.clone()))
+        .expect("submit must succeed");
+
+    let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+    let assigned = detail.stages()[0].tasks()[0].assigned_executor().unwrap();
+    assert_eq!(assigned, &exec_idle);
+}
+
+#[tokio::test]
+async fn launch_target_resolution_error_clears_in_flight_guard() {
+    allow_anonymous_for_tests();
+
+    let exec_id = ExecutorId::try_new("exec-no-task-endpoint").unwrap();
+    let job_id = JobId::try_new("job-resolve-clears-launch").unwrap();
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-resolve-clears-launch").unwrap());
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id, "host-no-endpoint", 1))
+        .unwrap();
+    coordinator
+        .submit_job(single_task_job(job_id.clone()))
+        .unwrap();
+
+    let shared = SharedCoordinator::new(coordinator);
+    let launched = shared.drive_pending_task_launches().await.unwrap();
+    assert_eq!(launched, 0);
+
+    let retry_assignments = {
+        let mut coord = shared.write().await;
+        coord.launch_assigned_task_assignments(&job_id).unwrap()
+    };
+    assert_eq!(
+        retry_assignments.len(),
+        1,
+        "resolution failure must clear launch_in_flight so the task can retry"
+    );
+}
+
+#[test]
+fn recovery_clears_persisted_in_flight_launch_guards() {
+    allow_anonymous_for_tests();
+
+    let exec_id = ExecutorId::try_new("exec-recover-inflight").unwrap();
+    let job_id = JobId::try_new("job-recover-inflight").unwrap();
+    let mut coordinator =
+        Coordinator::active(CoordinatorId::try_new("coord-recover-inflight").unwrap());
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_id.clone(), "host-recover", 1))
+        .unwrap();
+    coordinator
+        .submit_job(single_task_job(job_id.clone()))
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut store = crate::store::InMemoryMetadataStore::default();
+    coordinator.persist_jobs_to_store(&mut store).unwrap();
+    store
+        .save_executor(&ExecutorDescriptor::new(exec_id, "host-recover", 1))
+        .unwrap();
+
+    let mut restarted =
+        Coordinator::active(CoordinatorId::try_new("coord-recover-inflight-2").unwrap());
+    restarted.recover_from_store(&store).unwrap();
+
+    assert_eq!(
+        restarted
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap()
+            .len(),
+        1,
+        "recovered in-flight assignment must be retryable"
+    );
+}
+
 // --- Phase 2.6: post-restart shuffle availability audit ---
 
 /// Build a two-stage shuffle job, succeed the producer with remote shuffle

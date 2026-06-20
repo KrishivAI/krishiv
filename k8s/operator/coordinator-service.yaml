@@ -5,13 +5,13 @@ metadata:
   namespace: krishiv-system
   labels:
     app.kubernetes.io/name: krishiv
-    app.kubernetes.io/component: coordinator
+    app.kubernetes.io/component: operator
     app.kubernetes.io/part-of: krishiv
 spec:
   type: ClusterIP
   selector:
     app.kubernetes.io/name: krishiv
-    app.kubernetes.io/component: coordinator
+    app.kubernetes.io/component: operator
   ports:
     - name: http
       port: 2002

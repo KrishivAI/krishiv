@@ -8,7 +8,7 @@ use krishiv_proto::{
     ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorTaskAssignment,
     HeartbeatHotKeyReport, InitiateCheckpointCommand, InitiateCheckpointRequest, JobId, JobKind,
     JobSpec, JobState, LeaseGeneration, StageId, StageState, StreamingProgressReport,
-    StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState,
+    StreamingTaskState, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState,
     TaskStatusResponse, TaskStatusUpdate, wire,
 };
 use krishiv_state::checkpoint::{
@@ -279,7 +279,7 @@ impl SinkFinalizeWork {
                         );
                     }
                 }
-                JobState::Accepted | JobState::Planning | JobState::Running => {}
+                JobState::Queued | JobState::Accepted | JobState::Planning | JobState::Running => {}
             }
         }
         all_ok
@@ -663,17 +663,24 @@ impl SharedCoordinator {
             let mut coord = self.write().await;
             for job_id in batch {
                 match coord.launch_assigned_task_assignments(job_id) {
-                    Ok(assignments) => {
-                        let targets = coord
-                            .resolve_assignment_targets(assignments)
-                            .unwrap_or_default();
-                        if !targets.is_empty() {
-                            launches.push(JobLaunch {
-                                job_id: job_id.clone(),
-                                targets,
-                            });
+                    Ok(assignments) => match coord.resolve_assignment_targets(assignments) {
+                        Ok(targets) => {
+                            if !targets.is_empty() {
+                                launches.push(JobLaunch {
+                                    job_id: job_id.clone(),
+                                    targets,
+                                });
+                            }
                         }
-                    }
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = %job_id,
+                                error = %error,
+                                "failed to resolve assignment targets; clearing in-flight launch state"
+                            );
+                            coord.clear_launch_in_flight_for_job(job_id);
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(
                             job_id = %job_id,

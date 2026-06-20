@@ -75,6 +75,24 @@ impl JobRecord {
         }
     }
 
+    pub(crate) fn mark_queued(&mut self) {
+        self.state = JobState::Queued;
+        for stage in &mut self.stages {
+            stage.state = StageState::Pending;
+            for task in stage.tasks_mut() {
+                task.state = TaskState::Pending;
+                task.assigned_executor = None;
+                task.clear_launch_in_flight();
+            }
+        }
+    }
+
+    pub(crate) fn mark_admitted(&mut self) {
+        if self.state == JobState::Queued {
+            self.state = JobState::Accepted;
+        }
+    }
+
     /// Accumulated resource consumption reported by completed tasks.
     pub fn resource_usage(&self) -> &ResourceUsage {
         &self.resource_usage
@@ -101,6 +119,9 @@ impl JobRecord {
     }
 
     pub(crate) fn apply_assignments(&mut self, assignments: Vec<TaskAssignment>) {
+        if self.state == JobState::Queued {
+            return;
+        }
         self.state = JobState::Running;
         let _job_id_str = self.job_id().to_string();
         for stage in &mut self.stages {
@@ -132,6 +153,9 @@ impl JobRecord {
         skew_partition_override: Option<u32>,
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         let mut assignments = Vec::new();
+        if self.state == JobState::Queued {
+            return Ok(assignments);
+        }
         self.state = JobState::Running;
 
         // Build a HashSet once for O(1) upstream-ready checks instead of

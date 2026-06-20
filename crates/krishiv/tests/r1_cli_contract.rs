@@ -78,8 +78,8 @@ fn write_people_parquet(path: &std::path::Path) {
         ],
     )
     .unwrap_or_else(|error| panic!("unexpected record batch error: {error}"));
-    let file = File::create(path)
-        .unwrap_or_else(|error| panic!("unexpected parquet file error: {error}"));
+    let file =
+        File::create(path).unwrap_or_else(|error| panic!("unexpected parquet file error: {error}"));
     let mut writer = ArrowWriter::try_new(file, schema, None)
         .unwrap_or_else(|error| panic!("unexpected parquet writer error: {error}"));
     writer

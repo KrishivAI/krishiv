@@ -148,14 +148,15 @@ fn coordinator_with_blocking_queue_manager_returns_queued() {
         .register_executor(ExecutorDescriptor::new(executor_id, "host-1", 2))
         .unwrap();
 
-    // Job is queued, not accepted — coordinator has no JobRecord yet.
+    // Job is queued, visible, and not assigned until the queue manager admits it.
     let outcome = coordinator.submit_job(demo_job()).unwrap();
     assert_eq!(outcome, SubmitOutcome::Queued { position: 0 });
-    assert!(
-        coordinator
-            .job_snapshot(&demo_job().job_id().clone())
-            .is_err(),
-        "queued job must not appear in job list"
-    );
-}
+    let snapshot = coordinator.job_snapshot(&demo_job().job_id().clone()).unwrap();
+    assert_eq!(snapshot.state(), JobState::Queued);
+    assert_eq!(snapshot.assigned_task_count(), 0);
 
+    coordinator.coordinator_tick().unwrap();
+    let snapshot = coordinator.job_snapshot(&demo_job().job_id().clone()).unwrap();
+    assert_eq!(snapshot.state(), JobState::Queued);
+    assert_eq!(snapshot.assigned_task_count(), 0);
+}
