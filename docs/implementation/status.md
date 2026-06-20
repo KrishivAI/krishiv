@@ -1,5 +1,27 @@
 # Krishiv Implementation Status
 
+## 2026-06-20 — Landing page high-fidelity dark/gold redesign
+
+Rebuilt the web landing page around the provided black-and-gold reference composition and replaced the religious-inspired logo direction with a geometric infrastructure mark.
+
+### What changed
+- Replaced the homepage with reusable landing components for the hero, runtime architecture diagram, SVG data-flow particles, capability strip, developer journey, code example panel, and ecosystem row.
+- Updated the shared web shell with the new horizontal brand treatment, centered navigation, action icons, sticky translucent header, and mobile menu.
+- Reworked the global web theme to the near-black palette with restrained gold accents, neutral borders, responsive behavior, and reduced-motion support.
+- Added new brand assets in `web/public/brand/` for the logo mark, horizontal logo, and favicon.
+
+### Validation
+- `pnpm --dir web run typecheck`
+- `pnpm --dir web run build`
+- `cargo fmt --check`
+- `cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings` was attempted but the container linker failed before crate linting because `ld` is unavailable while the repo cargo config requests mold/lld linker flags.
+- Playwright screenshot capture was attempted, but browser download failed with a `403 Domain forbidden` response from `cdn.playwright.dev`.
+
+### Next useful command
+`pnpm --dir web run build`
+
+---
+
 ## 2026-06-19 — Web and docs logo refresh
 
 Redesigned the Krishiv SVG asset set to better match the dark web theme and
