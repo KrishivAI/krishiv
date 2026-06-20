@@ -1,5 +1,16 @@
 #![deny(unsafe_code)]
 
+mod cli;
+mod cluster_cmd;
+mod daemon_cmd;
+mod local_cluster;
+mod pipeline_cmd;
+mod process_util;
+mod query_cli;
+mod remote_client;
+mod stream_cmd;
+mod table_cmd;
+
 use std::env;
 use std::process;
 
@@ -24,11 +35,11 @@ fn main() {
     });
 
     let args: Vec<String> = env::args().skip(1).collect();
-    if let Some(code) = krishiv::daemon_cmd::try_run_daemon(&args) {
+    if let Some(code) = daemon_cmd::try_run_daemon(&args) {
         process::exit(code);
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let response = krishiv::cli::dispatch(&arg_refs);
+    let response = cli::dispatch(&arg_refs);
 
     if !response.stdout.is_empty() {
         print!("{}", response.stdout);

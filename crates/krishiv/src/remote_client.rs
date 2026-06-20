@@ -101,26 +101,6 @@ impl RemoteCoordinatorClient {
         Ok(())
     }
 
-    /// Trigger a named savepoint for the given job on the remote coordinator.
-    pub async fn trigger_savepoint_with_label(
-        &mut self,
-        job_id: &str,
-        label: &str,
-    ) -> Result<u64, RemoteClientError> {
-        let req = krishiv_proto::wire::v1::TriggerSavepointRequest {
-            job_id: job_id.to_owned(),
-            label: label.to_owned(),
-            stop: false,
-        };
-        let request = self.request(req)?;
-        let resp = self
-            .client()?
-            .trigger_savepoint(request)
-            .await
-            .map_err(RemoteClientError::from)?;
-        Ok(resp.into_inner().epoch)
-    }
-
     /// Request a restore from a specific checkpoint epoch on the remote coordinator.
     pub async fn restore(
         &mut self,

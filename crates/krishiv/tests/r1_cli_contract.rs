@@ -1,12 +1,24 @@
 #![forbid(unsafe_code)]
 
 use std::fs::File;
+use std::process::Command;
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};
-use krishiv::cli::dispatch;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
+
+fn run(args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_krishiv"))
+        .args(args)
+        .output()
+        .expect("failed to run krishiv binary");
+    (
+        out.status.code().unwrap_or(1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
 
 #[test]
 fn parquet_projection_filter_aggregate_limit_matches_golden_output() {
@@ -15,7 +27,7 @@ fn parquet_projection_filter_aggregate_limit_matches_golden_output() {
     write_people_parquet(&parquet_path);
     let parquet_arg = format!("people={}", parquet_path.display());
 
-    let response = dispatch(&[
+    let (code, stdout, stderr) = run(&[
         "sql",
         "--parquet",
         &parquet_arg,
@@ -23,26 +35,25 @@ fn parquet_projection_filter_aggregate_limit_matches_golden_output() {
         "select city, count(*) as count from people where id > 1 group by city order by city limit 2",
     ]);
 
-    assert_eq!(response.exit_code, 0, "{}", response.stderr);
+    assert_eq!(code, 0, "{stderr}");
     assert_eq!(
-        normalize(&response.stdout),
+        normalize(&stdout),
         include_str!("../../../tests/golden/r1-sql-parquet-aggregate.txt")
     );
 }
 
 #[test]
 fn invalid_sql_returns_error() {
-    let response = dispatch(&["sql", "--query", "select from"]);
-
-    assert_eq!(response.exit_code, 1);
-    assert!(response.stderr.contains("DataFusion error"));
+    let (code, _stdout, stderr) = run(&["sql", "--query", "select from"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("DataFusion error"));
 }
 
 #[test]
 fn missing_parquet_file_returns_error() {
     let temp = tempdir().unwrap_or_else(|error| panic!("unexpected tempdir error: {error}"));
     let parquet_arg = format!("people={}", temp.path().join("missing.parquet").display());
-    let response = dispatch(&[
+    let (code, _stdout, stderr) = run(&[
         "sql",
         "--parquet",
         &parquet_arg,
@@ -50,8 +61,8 @@ fn missing_parquet_file_returns_error() {
         "select * from people",
     ]);
 
-    assert_eq!(response.exit_code, 1);
-    assert!(response.stderr.contains("DataFusion error"));
+    assert_eq!(code, 1);
+    assert!(stderr.contains("DataFusion error"));
 }
 
 fn write_people_parquet(path: &std::path::Path) {
@@ -67,8 +78,8 @@ fn write_people_parquet(path: &std::path::Path) {
         ],
     )
     .unwrap_or_else(|error| panic!("unexpected record batch error: {error}"));
-    let file =
-        File::create(path).unwrap_or_else(|error| panic!("unexpected parquet file error: {error}"));
+    let file = File::create(path)
+        .unwrap_or_else(|error| panic!("unexpected parquet file error: {error}"));
     let mut writer = ArrowWriter::try_new(file, schema, None)
         .unwrap_or_else(|error| panic!("unexpected parquet writer error: {error}"));
     writer

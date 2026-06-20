@@ -110,29 +110,6 @@ pub use relation::{EmitMode, Relation, WindowSpec};
 pub use session_ext::SessionExt;
 pub use stream_handle::StreamHandle;
 
-// ── Prelude ───────────────────────────────────────────────────────────────────
-
-#[doc(hidden)]
-pub mod cli;
-#[doc(hidden)]
-pub mod daemon_cmd;
-#[doc(hidden)]
-pub mod process_util;
-#[doc(hidden)]
-pub mod remote_client;
-
-#[doc(hidden)]
-pub mod cluster_cmd;
-pub mod local_cluster;
-#[doc(hidden)]
-pub mod pipeline_cmd;
-#[doc(hidden)]
-pub mod query_cli;
-#[doc(hidden)]
-pub mod stream_cmd;
-#[doc(hidden)]
-pub mod table_cmd;
-
 /// Distributed control-plane and data-plane building blocks for advanced embedding.
 ///
 /// Most applications use [`Session`] only; operators and custom tooling can use these

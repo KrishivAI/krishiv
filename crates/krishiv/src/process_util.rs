@@ -3,7 +3,6 @@
 //! Process helpers for spawning Krishiv daemons from the unified binary.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Path to the current `krishiv` executable (falls back to `krishiv` on `PATH`).
@@ -51,13 +50,4 @@ pub fn spawn_krishiv_daemon_with_env(
         .spawn()
         .map_err(|e| format!("failed to spawn krishiv {subcommand}: {e}"))?;
     Ok(child.id())
-}
-
-/// Resolve data directory for cluster commands.
-pub fn cluster_data_dir(default: &str, override_path: Option<&Path>) -> PathBuf {
-    override_path.map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(
-            std::env::var("KRISHIV_CLUSTER_DATA_DIR").unwrap_or_else(|_| default.to_string()),
-        )
-    })
 }
