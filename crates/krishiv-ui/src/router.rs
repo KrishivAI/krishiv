@@ -158,17 +158,13 @@ pub fn embedded_router(state: UiState) -> Router {
         .route("/ui/assets/krishiv-sql.js", get(sql_js))
         .route("/api/v1/openapi.json", get(openapi_json));
 
+    // NOTE: API routes (/api/v1/jobs, /api/v1/executors, etc.) are served by
+    // the coordinator's own HTTP router. This embedded router only provides
+    // UI pages and static assets to avoid duplicate-route panics when merged
+    // via `extra_http_factory`.
     let protected = Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui") }))
-        .route("/api/v1/jobs", get(api_jobs))
-        .route("/api/v1/jobs/{job_id}", get(api_job_detail))
-        .route(
-            "/api/v1/jobs/{job_id}/checkpoints",
-            get(api_job_checkpoints),
-        )
         .route("/api/v1/jobs/{job_id}/diagnose", get(api_job_diagnose))
-        .route("/api/v1/executors", get(api_executors))
-        .route("/api/v1/executors/{executor_id}", get(api_executor_detail))
         .route("/api/v1/queues", get(api_queues))
         .route("/api/v1/sql", post(api_sql_execute))
         .route("/api/v1/history", get(api_history))
