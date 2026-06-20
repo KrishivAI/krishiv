@@ -705,7 +705,8 @@ pub fn parse_coordinator_daemon_config(
             .unwrap_or_else(|| "0.0.0.0:2001".parse().unwrap()),
         http_addr: env::var("KRISHIV_HTTP_ADDR")
             .ok()
-            .and_then(|value| value.parse().ok()),
+            .and_then(|value| value.parse().ok())
+            .or_else(|| Some("0.0.0.0:2002".parse().unwrap())),
         shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR").ok().map(PathBuf::from),
         durability_profile: env::var("KRISHIV_DURABILITY_PROFILE")
             .ok()
@@ -990,7 +991,7 @@ pub fn coordinator_daemon_help() -> &'static str {
      Options:\n\
        --coordinator-id <ID>     Coordinator id (KRISHIV_COORDINATOR_ID, default coord-local)\n\
        --grpc-addr <HOST:PORT>     gRPC listen address (KRISHIV_GRPC_ADDR, default 0.0.0.0:2001)\n\
-       --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics /federation (optional)\n\
+       --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics /federation (default 0.0.0.0:2002)\n\
        --shuffle-dir <PATH>        Local shuffle store directory (optional)\n\
        --durability-profile <NAME> dev-local | single-node-durable | distributed-durable\n\
        --metadata-backend <TYPE>   memory | rocksdb | etcd\n\
