@@ -1,5 +1,57 @@
 # Krishiv Implementation Status
 
+## 2026-06-21 — Checkpoint single-owner ack path + gRPC channel pool
+
+Closed C1 residuals 1 and 2 from 2026-06-20 and fixed the #43/#44 gRPC
+channel-pool double-connect race.
+
+### Completed
+
+- **C1 residual 1 — outer→inner periodic sync clobber** (`coordinator_sharded.rs`,
+  `coordinator/mod.rs`): new `sync_checkpoint_to_inner_monotonic` replaces the
+  full-replace call in `advance_heartbeat_tick` and `submit_job`. It is
+  membership-aware (adds new jobs, drops evicted ones) but forward-merges per
+  job by `(epoch, state_rank)`, so a fixed-cadence tick can no longer clobber
+  an inner coordinator a concurrent ack advanced to `Committing` mid-finalize.
+  The full-replace `sync_checkpoint_to_inner` is retained only on restore/savepoint
+  paths where a deliberate backward epoch move is required.
+
+- **C1 residual 2 — split-quorum on mixed ack transports** (`barrier_dispatch.rs`):
+  `drive_barrier_dispatches` now routes each barrier ack through
+  `checkpoint_inner.handle_ack` (the same 3-phase async quorum accumulator the
+  `checkpoint_ack` gRPC handler uses) via a new `barrier_ack_to_checkpoint_ack`
+  conversion helper. Previously the barrier path acked the outer `Coordinator`
+  while the RPC path acked the inner lock; an epoch whose tasks acked over
+  different transports reached quorum in neither copy and timed out. Both
+  transports now share one accumulator — an epoch commits exactly once regardless
+  of how each task's ack arrives.
+
+- **#43/#44 — gRPC channel double-connect** (`coordinator/mod.rs`,
+  `coordinator/task_assignment.rs`): `executor_channels` type changed to
+  `Arc<DashMap<String, Arc<tokio::sync::OnceCell<Channel>>>>`. The map shard lock
+  is held only to get-or-insert an empty per-endpoint `OnceCell`; the
+  TCP+TLS connect runs through `OnceCell::get_or_try_init` on the owned cell
+  with no map lock held. Concurrent callers for the same endpoint now establish
+  exactly one connection; a failed init leaves the cell empty so the next caller
+  retries; connects for different endpoints never contend.
+
+### Validation
+
+```
+cargo check -p krishiv-scheduler        # clean
+cargo clippy --package krishiv-scheduler -- -D warnings  # clean
+cargo fmt --check                       # clean
+cargo test -p krishiv-scheduler --lib   # 337 passed, 0 failed
+```
+
+### Next useful task
+
+Full A1/A2 god-object decomposition: make `ExecutorInner` and `CheckpointInner`
+sole sources of truth, delete `sync_executor_to_inner` / `sync_checkpoint_to_inner`
+/ `merge_checkpoint_coordinator`, remove duplicate fields from outer `Coordinator`.
+Gate on a distributed integration test that asserts single-epoch-commit under
+both ack transports.
+
 ## 2026-06-20 — Component review fixes (C1/C2/C3/P2/P3/G1) + Coordinator decomposition decision
 
 Applied the actionable findings from a core-component review (coordinator,

@@ -140,7 +140,14 @@ pub struct Coordinator {
     pub(crate) streaming_job_task_index: HashMap<JobId, Vec<TaskId>>,
     /// Sharded gRPC channel cache keyed by executor endpoint string.
     /// DashMap avoids a full TCP+TLS handshake per task push.
-    pub(crate) executor_channels: Arc<DashMap<String, tonic::transport::Channel>>,
+    ///
+    /// Each entry is an `Arc<OnceCell<Channel>>` so that, under concurrent
+    /// callers for the same endpoint, exactly one TCP+TLS connection is
+    /// established and every other caller awaits and reuses it (#43/#44). The
+    /// map lock is held only long enough to get-or-insert the (empty) cell; the
+    /// connect runs through `OnceCell::get_or_try_init` with no map lock held.
+    pub(crate) executor_channels:
+        Arc<DashMap<String, Arc<tokio::sync::OnceCell<tonic::transport::Channel>>>>,
     pub(crate) checkpoint_notify_sent: indexmap::IndexSet<(JobId, ExecutorId, u64)>,
     /// (job_id, executor_id, epoch) triples for which a checkpoint-complete
     /// notification (transactional-sink commit signal) was already delivered.
@@ -392,22 +399,19 @@ impl SharedCoordinator {
 
     /// Submit a job through the shared coordinator and refresh sharded checkpoint state.
     pub async fn submit_job(&self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
-        let (outcome, checkpoint_coordinators, checkpoint_notify_sent, barrier_dispatch_sent) = {
+        let (outcome, checkpoint_coordinators) = {
             let mut coord = self.inner.write().await;
             let outcome = coord.submit_job(spec)?;
-            (
-                outcome,
-                coord.checkpoint_coordinators.clone(),
-                coord.checkpoint_notify_sent.clone(),
-                coord.barrier_dispatch_sent.clone(),
-            )
+            (outcome, coord.checkpoint_coordinators.clone())
         };
 
+        // Add the newly submitted job's checkpoint coordinator to the inner lock
+        // without clobbering any *other* job's in-flight epoch the inner may be
+        // mid-committing (C1 residual 1). A new job has no inner entry yet, so
+        // the monotonic merge simply inserts it.
         let mut checkpoint_inner = self.checkpoint_inner.write().await;
-        crate::coordinator_sharded::sync_checkpoint_to_inner(
+        crate::coordinator_sharded::sync_checkpoint_to_inner_monotonic(
             &checkpoint_coordinators,
-            &checkpoint_notify_sent,
-            &barrier_dispatch_sent,
             &mut checkpoint_inner,
         );
 
@@ -447,10 +451,14 @@ impl SharedCoordinator {
                 coord.recovering,
                 &mut exec_inner,
             );
-            crate::coordinator_sharded::sync_checkpoint_to_inner(
+            // C1 residual 1: the periodic tick fires on a fixed cadence and must
+            // not clobber an inner checkpoint coordinator that a concurrent ack
+            // has already advanced further (mid-`Committing`). Use the
+            // membership-aware monotonic merge instead of a full replace; the
+            // restore/savepoint paths keep the full-replace semantics where a
+            // deliberate backward epoch move is required.
+            crate::coordinator_sharded::sync_checkpoint_to_inner_monotonic(
                 &coord.checkpoint_coordinators,
-                &coord.checkpoint_notify_sent,
-                &coord.barrier_dispatch_sent,
                 &mut ckpt_inner,
             );
             lost

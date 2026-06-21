@@ -230,6 +230,49 @@ pub(crate) fn sync_checkpoint_to_inner(
     inner.barrier_sent.clone_from(src_barrier);
 }
 
+/// Membership-aware, monotonic outer→inner checkpoint sync (C1 residual 1).
+///
+/// Used by the *periodic* sync path (`advance_heartbeat_tick`), which fires on a
+/// fixed cadence regardless of checkpoint progress and must NOT clobber an inner
+/// coordinator that a concurrent ack has already advanced further (e.g. mid
+/// `Committing`, in the window between a gRPC/barrier ack's storage I/O and its
+/// finalize). Unlike the full-replace [`sync_checkpoint_to_inner`] (which the
+/// restore path needs because restore deliberately lowers the epoch), this:
+///
+///   * adds jobs the outer has but the inner lacks (job submit while the inner
+///     is the live quorum owner),
+///   * removes jobs the outer no longer has (job evict/cancel),
+///   * for jobs in both, overwrites the inner entry *only* when the outer copy
+///     is at least as advanced by `(epoch, state_rank)` — never regressing an
+///     in-flight inner epoch.
+///
+/// `notify_sent` / `barrier_sent` are intentionally NOT replaced here: in the
+/// single-owner ack model the inner lock is authoritative for per-epoch
+/// delivery tracking, and a full replace would resurrect entries the inner
+/// cleared on quorum. Membership eviction is handled below.
+pub(crate) fn sync_checkpoint_to_inner_monotonic(
+    src_coordinators: &HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
+    inner: &mut CheckpointInner,
+) {
+    // Drop jobs the outer no longer tracks (cancel/evict). Reference only
+    // `src_coordinators` in every closure so the borrows stay disjoint.
+    inner
+        .coordinators
+        .retain(|job_id, _| src_coordinators.contains_key(job_id));
+    inner
+        .notify_sent
+        .retain(|(jid, _, _)| src_coordinators.contains_key(jid));
+    inner
+        .barrier_sent
+        .retain(|(jid, _)| src_coordinators.contains_key(jid));
+
+    // Forward-merge each outer job into the inner without regressing in-flight
+    // inner epochs.
+    for (job_id, src) in src_coordinators {
+        merge_checkpoint_coordinator(&mut inner.coordinators, job_id, src.clone());
+    }
+}
+
 /// Lexicographic checkpoint progress key: `(current_epoch, state_rank)`.
 ///
 /// `state_rank` orders the per-epoch lifecycle so a forward-merge never

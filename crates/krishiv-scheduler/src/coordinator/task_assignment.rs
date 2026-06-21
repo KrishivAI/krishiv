@@ -1,5 +1,12 @@
 use super::*;
 
+/// Shared per-endpoint gRPC channel cache.
+///
+/// Each value is an `Arc<OnceCell<Channel>>` so concurrent callers for the same
+/// endpoint coalesce onto a single connect (#43/#44).
+pub(crate) type ExecutorChannelMap =
+    Arc<DashMap<String, Arc<tokio::sync::OnceCell<tonic::transport::Channel>>>>;
+
 /// Env var for overriding the max concurrent task-assignment gRPC calls.
 ///
 /// Default: 128. Raise for large clusters (> 100 executors) where the default
@@ -501,7 +508,7 @@ impl Coordinator {
     }
 
     pub(crate) async fn deliver_assignment_targets_with_channels(
-        channels: Arc<DashMap<String, tonic::transport::Channel>>,
+        channels: ExecutorChannelMap,
         targets: Vec<(String, ExecutorTaskAssignment)>,
     ) -> SchedulerResult<Vec<(ExecutorTaskAssignment, TaskStatusResponse)>> {
         // Inbox-backed in-process targets do not have a gRPC endpoint: they are
@@ -535,7 +542,7 @@ impl Coordinator {
     }
 
     async fn deliver_assignment_target_with_retries(
-        channels: &Arc<DashMap<String, tonic::transport::Channel>>,
+        channels: &ExecutorChannelMap,
         endpoint: String,
         assignment: ExecutorTaskAssignment,
     ) -> SchedulerResult<(ExecutorTaskAssignment, TaskStatusResponse)> {
@@ -857,48 +864,48 @@ impl Coordinator {
     ///
     /// On a cache hit, clones the existing `Channel` (pointer-only cost).
     /// On a miss, establishes a new TCP+TLS connection and stores it for reuse.
+    ///
+    /// #43/#44: concurrent callers for the *same* endpoint must not each open a
+    /// connection.  The map lock is taken only to get-or-insert a per-endpoint
+    /// `Arc<OnceCell>` (no I/O under the lock).  `get_or_try_init` on the owned
+    /// cell then guarantees exactly one task runs the connect while the rest
+    /// await its result.  Because the connect runs on the owned cell and not
+    /// under the map lock, a slow handshake never blocks lookups for other
+    /// endpoints (M6); a failed init leaves the cell empty so the next caller
+    /// retries the connect.
     pub(crate) async fn get_or_connect_channel_on_map(
-        channels: &Arc<DashMap<String, tonic::transport::Channel>>,
+        channels: &ExecutorChannelMap,
         endpoint: &str,
     ) -> SchedulerResult<tonic::transport::Channel> {
-        // Fast path: check the sharded cache (per-shard lock, dropped
-        // immediately) so lookups for different endpoints never contend.
-        if let Some(ch) = channels.get(endpoint) {
-            return Ok(ch.clone());
-        }
+        // Get-or-insert the per-endpoint cell, holding the shard lock only long
+        // enough to clone the Arc out.
+        let cell = channels
+            .entry(endpoint.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone();
 
-        // Slow path: connect outside any lock so a single slow handshake
-        // cannot block lookups for other endpoints (M6).
-        let parsed =
-            tonic::transport::Endpoint::from_shared(endpoint.to_string()).map_err(|e| {
-                SchedulerError::InvalidJob {
-                    message: e.to_string(),
-                }
-            })?;
-        let ch = parsed
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
-            .http2_keep_alive_interval(std::time::Duration::from_secs(15))
-            .keep_alive_timeout(std::time::Duration::from_secs(20))
-            .keep_alive_while_idle(true)
-            .connect()
-            .await
-            .map_err(|e| SchedulerError::ExecutorUnavailable {
-                endpoint: endpoint.to_string(),
-                reason: e.to_string(),
-            })?;
-
-        // Only one shard is locked during the insert.  If another task
-        // raced and already installed a channel, prefer the existing one.
-        let endpoint_owned = endpoint.to_owned();
-        let entry = channels.entry(endpoint_owned);
-        match entry {
-            dashmap::mapref::entry::Entry::Occupied(existing) => Ok(existing.get().clone()),
-            dashmap::mapref::entry::Entry::Vacant(slot) => {
-                slot.insert(ch.clone());
-                Ok(ch)
-            }
-        }
+        // Connect (if needed) on the owned cell with no map lock held.
+        let channel = cell
+            .get_or_try_init(|| async {
+                let parsed = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+                    .map_err(|e| SchedulerError::InvalidJob {
+                        message: e.to_string(),
+                    })?;
+                parsed
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                    .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+                    .keep_alive_timeout(std::time::Duration::from_secs(20))
+                    .keep_alive_while_idle(true)
+                    .connect()
+                    .await
+                    .map_err(|e| SchedulerError::ExecutorUnavailable {
+                        endpoint: endpoint.to_string(),
+                        reason: e.to_string(),
+                    })
+            })
+            .await?;
+        Ok(channel.clone())
     }
 }
 

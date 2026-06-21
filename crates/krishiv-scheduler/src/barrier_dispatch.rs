@@ -284,11 +284,44 @@ pub async fn dispatch_barrier_plan(
     Ok(acks)
 }
 
+/// Build a [`CheckpointAckRequest`] from one barrier ack so the barrier transport
+/// and the `checkpoint_ack` RPC produce identical acks for the same task/epoch.
+fn barrier_ack_to_checkpoint_ack(
+    job_id: &JobId,
+    epoch: u64,
+    fencing_token: FencingToken,
+    task_id: &TaskId,
+    ack: &krishiv_proto::wire::v1::BarrierAck,
+) -> CheckpointAckRequest {
+    let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
+    CheckpointAckRequest {
+        job_id: job_id.clone(),
+        operator_id: krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
+            .expect("task_id is non-empty, so operator_id is non-empty"),
+        task_id: task_id.clone(),
+        epoch,
+        fencing_token,
+        source_offsets: Vec::new(),
+        snapshot_path,
+    }
+}
+
 /// Run pending barrier dispatches against a shared coordinator (background loop).
+///
+/// C1 residual 2 (split-quorum): barrier acks are routed through
+/// `checkpoint_inner.handle_ack` — the *same* quorum accumulator the
+/// `checkpoint_ack` gRPC handler uses. Before this fix the barrier path acked
+/// the outer `Coordinator` while the RPC path acked the inner lock, so when a
+/// single epoch's tasks acked over different transports neither copy reached
+/// quorum alone and the epoch timed out and retried. With both transports
+/// feeding `checkpoint_inner`, an epoch commits exactly once regardless of how
+/// each task's ack arrives.
 pub async fn drive_barrier_dispatches(
     shared: &crate::SharedCoordinator,
     timeout: Duration,
 ) -> SchedulerResult<()> {
+    use crate::checkpoint::CheckpointCoordinator;
+
     let plans = {
         let coord = shared.read().await;
         coord.pending_barrier_dispatch_plans()
@@ -297,25 +330,8 @@ pub async fn drive_barrier_dispatches(
         let job_id = plan.job_id.clone();
         let epoch = plan.epoch;
         let fencing = plan.fencing_token;
-        match dispatch_barrier_plan(&plan, timeout).await {
-            Ok(acks) => {
-                // Phase 1: apply barrier acks in-memory under the write lock.
-                // The sync `handle_checkpoint_ack` is called here, but we must
-                // NOT do FS I/O under the lock. The post-commit work
-                // (savepoint preservation) is deferred and executed outside.
-                let post_commit_jobs: Vec<(JobId, u64)> = {
-                    let mut coord = shared.write().await;
-                    coord.mark_barrier_dispatched(&job_id, epoch);
-                    coord.apply_barrier_acks_deferred(&job_id, epoch, fencing, &acks)
-                };
-                // Phase 2: execute deferred post-commit FS I/O (savepoint
-                // preservation, stop-with-savepoint) outside the coordinator
-                // write lock so heartbeats/submissions are not blocked.
-                for (pc_job_id, pc_epoch) in post_commit_jobs {
-                    let mut coord = shared.write().await;
-                    coord.on_checkpoint_epoch_committed(&pc_job_id, pc_epoch);
-                }
-            }
+        let acks = match dispatch_barrier_plan(&plan, timeout).await {
+            Ok(acks) => acks,
             Err(e) => {
                 tracing::warn!(
                     job_id = %job_id,
@@ -323,6 +339,93 @@ pub async fn drive_barrier_dispatches(
                     error = %e,
                     "barrier dispatch failed; heartbeat checkpoint fallback remains"
                 );
+                continue;
+            }
+        };
+
+        // Mark dispatched on the outer coordinator (delivery dedup tracking).
+        shared.write().await.mark_barrier_dispatched(&job_id, epoch);
+
+        for (task_id, ack) in &acks {
+            let request = barrier_ack_to_checkpoint_ack(&job_id, epoch, fencing, task_id, ack);
+
+            // Phase 1: in-memory ack processing under the dedicated checkpoint
+            // inner lock — the single quorum owner shared with the gRPC path.
+            let (response, pending) = {
+                let mut inner = shared.checkpoint_inner.write().await;
+                inner.handle_ack(request).await
+            };
+            if !matches!(response, CheckpointAckResponse::Accepted) {
+                tracing::warn!(
+                    job_id = %job_id,
+                    task_id = %task_id,
+                    epoch,
+                    ?response,
+                    "barrier ack rejected during fanout"
+                );
+                continue;
+            }
+
+            let Some(commit) = pending else {
+                // Ack accepted, quorum not yet reached — keep collecting.
+                continue;
+            };
+
+            // Phase 2: async storage I/O with no coordinator lock held.
+            if let Err(e) = CheckpointCoordinator::commit_storage(commit).await {
+                let aborted = {
+                    let mut inner = shared.checkpoint_inner.write().await;
+                    if let Some(coord) = inner.coordinators.get_mut(&job_id) {
+                        coord.abort_epoch(&format!("checkpoint storage write failed: {e}"));
+                    }
+                    inner.coordinators.get(&job_id).cloned()
+                };
+                krishiv_metrics::global_metrics().inc_checkpoint_failed(job_id.as_str());
+                // Lock order: checkpoint_inner released above, take outer now.
+                let mut coord = shared.write().await;
+                if let Some(aborted) = aborted {
+                    crate::coordinator_sharded::merge_checkpoint_coordinator(
+                        &mut coord.checkpoint_coordinators,
+                        &job_id,
+                        aborted,
+                    );
+                }
+                tracing::warn!(
+                    job_id = %job_id,
+                    epoch,
+                    error = %e,
+                    "barrier-path checkpoint commit failed; epoch aborted"
+                );
+                continue;
+            }
+
+            // Phase 3: finalize under checkpoint_inner, snapshot the committed
+            // coordinator, release, then monotonically merge into the outer copy
+            // and run post-commit FS work (savepoint preserve, stop-after).
+            let (finalize_result, committed) = {
+                let mut inner = shared.checkpoint_inner.write().await;
+                let result = inner.finalize_ack(&job_id, epoch);
+                (result, inner.coordinators.get(&job_id).cloned())
+            };
+            {
+                let mut coord = shared.write().await;
+                if let Some(committed) = committed {
+                    crate::coordinator_sharded::merge_checkpoint_coordinator(
+                        &mut coord.checkpoint_coordinators,
+                        &job_id,
+                        committed,
+                    );
+                }
+                if let Err(error) = finalize_result {
+                    tracing::error!(
+                        job_id = %job_id,
+                        epoch,
+                        error = %error,
+                        "barrier-path checkpoint finalize failed"
+                    );
+                    continue;
+                }
+                coord.on_checkpoint_epoch_committed(&job_id, epoch);
             }
         }
     }
