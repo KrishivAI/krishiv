@@ -689,6 +689,8 @@ krishiv_scheduler_tasks_assigned_total {tasks}
     );
     body.push_str(&scheduler_body);
     body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
+    body.push('\n');
+    body.push_str(&krishiv_metrics::system::system_metrics().render_prometheus());
     body
 }
 

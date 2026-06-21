@@ -58,6 +58,7 @@ pub fn cluster_help() -> String {
          Usage:\n\
            krishiv cluster start [--data-dir <DIR>] [--executors <N>] [--http-addr <HOST:PORT>]\n\
            krishiv cluster stop [--data-dir <DIR>]\n\
+           krishiv cluster restart [--data-dir <DIR>] [--executors <N>] [--http-addr <HOST:PORT>]\n\
            krishiv cluster status [--data-dir <DIR>]\n\
            krishiv cluster verify-network [--data-dir <DIR>]\n\
          \n\
@@ -71,6 +72,7 @@ pub fn run_cluster(args: &[&str]) -> CliResponse {
         [] | ["--help"] | ["-h"] => CliResponse::ok(format!("{}\n", cluster_help())),
         ["start", rest @ ..] => cluster_start(rest),
         ["stop", rest @ ..] => cluster_stop(rest),
+        ["restart", rest @ ..] => cluster_restart(rest),
         ["status", rest @ ..] => cluster_status(rest),
         ["verify-network", rest @ ..] => cluster_verify_network(rest),
         [unknown, ..] => CliResponse::err(
@@ -251,6 +253,28 @@ fn cluster_stop(args: &[&str]) -> CliResponse {
             warnings.join("\n  - "),
         ))
     }
+}
+
+fn cluster_restart(args: &[&str]) -> CliResponse {
+    // Stop existing cluster (best-effort — may not be running).
+    let (data_dir, _) = match parse_data_dir(args) {
+        Ok(v) => v,
+        Err(e) => return CliResponse::err(e, 2),
+    };
+    if let Ok(cfg) = ClusterConfig::load(&data_dir) {
+        if let Some(pid) = cfg.clusterd_pid {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+        for pid in &cfg.executor_pids {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+        let _ = fs::remove_file(ClusterConfig::path(&data_dir));
+        // Brief pause so ports are released before re-binding.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Start fresh cluster with the same arguments.
+    cluster_start(args)
 }
 
 fn cluster_status(args: &[&str]) -> CliResponse {

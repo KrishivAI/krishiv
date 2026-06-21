@@ -22,9 +22,13 @@ fn prune_sent_set(set: &mut indexmap::IndexSet<(JobId, ExecutorId, u64)>) {
 impl Coordinator {
     /// Route a checkpoint ack to the correct per-job coordinator.
     pub fn handle_checkpoint_ack(&mut self, ack: CheckpointAckRequest) -> CheckpointAckResponse {
+        let commit_start = std::time::Instant::now();
         let (res, post_commit) = self.handle_checkpoint_ack_deferred(ack);
         if let Some((job_id, epoch)) = post_commit {
             self.on_checkpoint_epoch_committed(&job_id, epoch);
+            let elapsed_secs = commit_start.elapsed().as_secs_f64();
+            krishiv_metrics::global_metrics()
+                .observe_checkpoint_commit_duration("post_commit", elapsed_secs);
         }
         res
     }

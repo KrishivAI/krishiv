@@ -274,19 +274,25 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                 // Lock order: acquire checkpoint_inner, mutate, extract a clone
                 // of the coordinators map, RELEASE checkpoint_inner, then
                 // acquire coordinator.write() to sync. Never hold both.
-                let coordinators_snapshot = {
+                let aborted = {
                     let mut inner = self.coordinator.checkpoint_inner.write().await;
                     if let Some(coord) = inner.coordinators.get_mut(&job_id) {
                         coord.abort_epoch(&format!("checkpoint storage write failed: {e}"));
                     }
-                    inner.coordinators.clone()
+                    inner.coordinators.get(&job_id).cloned()
                 };
                 krishiv_metrics::global_metrics().inc_checkpoint_failed(job_id.as_str());
-                // Sync inner → outer coordinator after abort (checkpoint_inner released).
+                // Sync inner → outer for THIS job only, via a monotonic merge:
+                // never clobber other jobs' in-flight epochs, and never roll this
+                // job back past a newer epoch the outer copy already advanced to (C1).
                 let mut coordinator = self.coordinator.write().await;
-                coordinator
-                    .checkpoint_coordinators
-                    .clone_from(&coordinators_snapshot);
+                if let Some(aborted) = aborted {
+                    crate::coordinator_sharded::merge_checkpoint_coordinator(
+                        &mut coordinator.checkpoint_coordinators,
+                        &job_id,
+                        aborted,
+                    );
+                }
                 return Err(tonic::Status::internal(format!(
                     "checkpoint commit failed: {e}"
                 )));
@@ -296,18 +302,25 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             // to the outer coordinator. The two locks are never held
             // simultaneously — extract the clone under checkpoint_inner,
             // release it, then take coordinator.write().
-            let (finalize_result, coordinators_snapshot) = {
+            let (finalize_result, committed) = {
                 let mut inner = self.coordinator.checkpoint_inner.write().await;
                 let result = inner.finalize_ack(&job_id, ack_epoch);
-                // Clone the coordinators map for syncing to the outer
+                // Snapshot only THIS job's coordinator for syncing to the outer
                 // coordinator after releasing checkpoint_inner.
-                (result, inner.coordinators.clone())
+                (result, inner.coordinators.get(&job_id).cloned())
             };
             {
                 let mut coordinator = self.coordinator.write().await;
-                coordinator
-                    .checkpoint_coordinators
-                    .clone_from(&coordinators_snapshot);
+                // Monotonic single-job merge (C1): a late finalize must not
+                // clobber other jobs, nor roll this job back past a newer epoch
+                // the outer copy already advanced to.
+                if let Some(committed) = committed {
+                    crate::coordinator_sharded::merge_checkpoint_coordinator(
+                        &mut coordinator.checkpoint_coordinators,
+                        &job_id,
+                        committed,
+                    );
+                }
                 finalize_result.map_err(|error| {
                     tonic::Status::internal(format!("checkpoint finalize failed: {error}"))
                 })?;

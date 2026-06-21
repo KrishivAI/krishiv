@@ -71,6 +71,15 @@ impl Coordinator {
         let streaming_progress: Vec<StreamingProgressReport> =
             heartbeat.streaming_progress().to_vec();
         self.executors.heartbeat(heartbeat)?;
+
+        // Wire executor slot usage to the global metrics gauge so the
+        // Prometheus krishiv_executor_slots_used metric reflects live state.
+        if let Ok(exec_rec) = self.executors.find_executor(&executor_id) {
+            let slots_used = exec_rec.running_tasks().len() as u64;
+            krishiv_metrics::global_metrics()
+                .set_executor_slots_used(executor_id.as_str(), slots_used);
+        }
+
         self.assign_pending_tasks_for_schedulable_jobs();
         for state in &streaming_states {
             self.apply_streaming_task_state(state);

@@ -400,6 +400,8 @@ impl Coordinator {
         );
         self.ensure_active()?;
 
+        let assignment_start = std::time::Instant::now();
+
         // PRR Parallel Execution - Circuit Breaker (IMM-1):
         // Filter out executors that have crossed the failure threshold before
         // even attempting to launch tasks to them.
@@ -450,6 +452,9 @@ impl Coordinator {
         }
         // GAP-OB-01: Increment tasks_assigned counter.
         TASKS_ASSIGNED_TOTAL.fetch_add(assignments.len() as u64, AtomicOrdering::Relaxed);
+        // Record task assignment latency for the avg-assignment-duration metric.
+        let elapsed_ms = assignment_start.elapsed().as_millis() as u64;
+        crate::metrics::record_task_assignment_duration_ms(elapsed_ms);
         Ok(assignments)
     }
 

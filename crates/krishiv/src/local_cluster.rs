@@ -116,6 +116,7 @@ pub fn local_help() -> String {
          Usage:\n\
            krishiv local start [--data-dir <DIR>] [--http-addr <HOST:PORT>]\n\
            krishiv local stop [--data-dir <DIR>]\n\
+           krishiv local restart [--data-dir <DIR>] [--http-addr <HOST:PORT>]\n\
            krishiv local status [--data-dir <DIR>]\n\
          \n\
          After start, use:\n\
@@ -133,6 +134,7 @@ pub fn run_local(args: &[&str]) -> CliResponse {
         [] | ["--help"] | ["-h"] => CliResponse::ok(format!("{}\n", local_help())),
         ["start", rest @ ..] => run_local_start(rest),
         ["stop", rest @ ..] => run_local_stop(rest),
+        ["restart", rest @ ..] => run_local_restart(rest),
         ["status", rest @ ..] => run_local_status(rest),
         [unknown, ..] => CliResponse::err(
             format!("unknown local subcommand: {unknown}\n\n{}", local_help()),
@@ -370,6 +372,34 @@ fn run_local_stop(args: &[&str]) -> CliResponse {
         );
     }
     CliResponse::ok("Stopped local Krishiv cluster.\n".to_string())
+}
+
+fn run_local_restart(args: &[&str]) -> CliResponse {
+    // Stop existing cluster (best-effort — may not be running).
+    let data_dir = match parse_data_dir(args) {
+        Ok(d) => d,
+        Err(e) => return CliResponse::err(format!("{e}\n"), 2),
+    };
+    if let Ok(config) = LocalClusterConfig::load(&data_dir) {
+        if let Some(pid) = config.flight_pid {
+            kill_pid_or_group(pid);
+        }
+        if let Some(pid) = config.ui_pid {
+            kill_pid_or_group(pid);
+        }
+        if let Some(pid) = config.executor_pid {
+            kill_pid_or_group(pid);
+        }
+        if let Some(pid) = config.coordinator_pid {
+            kill_pid_or_group(pid);
+        }
+        let _ = fs::remove_file(LocalClusterConfig::path(&data_dir));
+        // Brief pause so ports are released before re-binding.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Start fresh cluster with the same arguments.
+    run_local_start(args)
 }
 
 fn run_local_status(args: &[&str]) -> CliResponse {

@@ -70,6 +70,19 @@ impl Coordinator {
                 .saturating_add(job.shuffle_partitions_available_count());
         }
 
+        // Wire running task count and job queue depth to the global metrics gauge
+        // so the Prometheus/UI gauges reflect live cluster state.
+        let gm = krishiv_metrics::global_metrics();
+        gm.set_tasks_running(running_task_count as u64);
+
+        // Count queued (not yet admitted) jobs for the job_queue_depth gauge.
+        let queued_count = self
+            .job_coordinators
+            .values()
+            .filter(|jc| jc.read_record().state() == JobState::Queued)
+            .count() as u64;
+        gm.set_job_queue_depth(queued_count);
+
         StabilityMetrics {
             heartbeat_ages: self.executors.heartbeat_ages(),
             failed_assignments,

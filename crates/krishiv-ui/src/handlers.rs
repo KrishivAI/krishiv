@@ -27,6 +27,8 @@ pub(crate) async fn metrics(State(state): State<UiState>) -> impl IntoResponse {
         let mut body = format_stability_metrics(&coordinator.stability_metrics());
         body.push('\n');
         body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
+        body.push('\n');
+        body.push_str(&krishiv_metrics::system::system_metrics().render_prometheus());
         cache.0 = body.clone();
         cache.1 = now;
         body
@@ -207,6 +209,16 @@ pub(crate) async fn ui_metrics(State(state): State<UiState>) -> Result<Html<Stri
         watermark_entry_count: gm.watermark_entry_count(),
         state_key_entry_count: gm.state_key_entry_count(),
     };
+    let sm = krishiv_metrics::system::system_metrics();
+    let system = SystemMetricsView {
+        process_memory_bytes: sm.process_memory_bytes(),
+        process_cpu_usage_x100: sm.process_cpu_usage_x100(),
+        process_virtual_memory_bytes: sm.process_virtual_memory_bytes(),
+        process_thread_count: sm.process_thread_count(),
+        system_total_memory_bytes: sm.system_total_memory_bytes(),
+        system_available_memory_bytes: sm.system_available_memory_bytes(),
+        system_cpu_usage_x100: sm.system_cpu_usage_x100(),
+    };
     let template = MetricsTemplate {
         scheduler,
         stability,
@@ -214,6 +226,7 @@ pub(crate) async fn ui_metrics(State(state): State<UiState>) -> Result<Html<Stri
         executors_count: snapshot.executors.len(),
         avg_duration_ms: avg,
         global,
+        system,
         bearer_token: ui_auth_token(&state),
     };
     Ok(Html(template.render()?))

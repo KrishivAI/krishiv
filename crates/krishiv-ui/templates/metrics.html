@@ -131,6 +131,44 @@
     </div>
   </div>
 
+  <div class="panel">
+    <div class="panel-header">
+      <h2>System Resources</h2>
+    </div>
+    <div class="panel-body">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Process Memory (RSS)</div>
+          <div class="stat-value gold">{{ (system.process_memory_bytes / 1048576) }} MB</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Process CPU</div>
+          <div class="stat-value">{{ system.process_cpu_usage_x100 / 100 }}%</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Virtual Memory</div>
+          <div class="stat-value">{{ (system.process_virtual_memory_bytes / 1048576) }} MB</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Threads</div>
+          <div class="stat-value">{{ system.process_thread_count }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">System Total Memory</div>
+          <div class="stat-value">{{ (system.system_total_memory_bytes / 1048576) }} MB</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">System Available Memory</div>
+          <div class="stat-value success">{{ (system.system_available_memory_bytes / 1048576) }} MB</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">System CPU Usage</div>
+          <div class="stat-value">{{ system.system_cpu_usage_x100 / 100 }}%</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <span class="refresh-note" hidden>refreshing</span>
 </div>
 {% endblock %}

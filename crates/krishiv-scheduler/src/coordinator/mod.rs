@@ -853,6 +853,28 @@ impl SharedCoordinator {
             ));
         }
 
+        // System metrics refresh loop — updates process and system gauges
+        // (RSS, CPU, memory, threads) every 10 seconds for the Prometheus
+        // and UI metrics endpoints.
+        {
+            let mut rx = shutdown_rx.clone();
+            let span = tracing::info_span!("coordinator.system_metrics_loop");
+            join_handles.push(tokio::spawn(
+                async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {}
+                            _ = rx.changed() => { if *rx.borrow() { return; } }
+                        }
+                        krishiv_metrics::system::system_metrics().refresh();
+                    }
+                }
+                .instrument(span),
+            ));
+        }
+
         OrchestratorHandles {
             join_handles,
             shutdown_tx,

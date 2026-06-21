@@ -1,5 +1,80 @@
 # Krishiv Implementation Status
 
+## 2026-06-20 — Component review fixes (C1/C2/C3/P2/P3/G1) + Coordinator decomposition decision
+
+Applied the actionable findings from a core-component review (coordinator,
+executor, dataflow, shuffle, state).
+
+### Completed
+
+- **C2 (correctness)** — `krishiv-dataflow/operator_runtime.rs`:
+  `execute_streaming_window` hardcoded `agg_is_float = false`, silently
+  truncating streaming windowed `Float64` `SUM/MIN/MAX/AVG` to `Int64`. It now
+  defers operator construction into the stream and probes the first batch's
+  schema (mirroring `execute_bounded_window`). Regression test
+  `streaming_window_preserves_float64_sum`.
+- **C3 (robustness)** — `krishiv-executor/runner/executor_task_runner.rs`:
+  `restore_job_from_checkpoint` used `.lock().unwrap()` on the checkpoint-runner
+  mutex (panic on poison); now `unwrap_or_else(|p| p.into_inner())` like the rest
+  of the file.
+- **P2 (perf)** — same file: `initiate_checkpoint_for_job` now fans out the
+  per-task snapshot+ack work concurrently via `FuturesUnordered` instead of
+  awaiting each sequentially (distinct task ids → distinct `checkpoint_runners`
+  entries, so it is safe).
+- **G1 (correctness)** — `krishiv-shuffle/tiered_store.rs`: `write_partition`
+  now uses `tokio::join!` so a local-tier failure no longer drops the in-flight
+  remote write; both tiers are always driven to completion (fail-closed).
+- **P3 (perf)** — `krishiv-state/ttl.rs`: hoisted `now_ms()` out of the
+  `snapshot()` per-entry loop.
+- **C1 (correctness)** — checkpoint dual-state hardening. The gRPC
+  `checkpoint_ack` path previously deep-cloned the *entire* inner
+  `checkpoint_coordinators` map into the outer `Coordinator`, which could
+  clobber other jobs' in-flight epochs and roll the acked job back past a newer
+  epoch the barrier path had already initiated. It now syncs only the acked
+  job, via a new monotonic `merge_checkpoint_coordinator` helper
+  (`coordinator_sharded.rs`) that never regresses `(epoch, state_rank)`. Unit
+  tests in `coordinator_sharded::merge_tests`.
+
+### Architectural decision (A1/A2) — deferred deliberately
+
+The 35-field `Coordinator` god-object behind one `RwLock`, and the dual
+source-of-truth "sync dance" between the outer `Coordinator` and the sharded
+`ExecutorInner`/`CheckpointInner` locks, remain the root architectural issues.
+The correct end-state is a single source of truth (inner locks authoritative;
+outer split into `JobRegistry` / `StreamingCoordinator` / `AdaptiveCoordinator`,
+each independently locked). This is **not** being big-banged in this session:
+rewriting the distributed checkpoint protocol without the ability to run the
+distributed/integration suite here would be reckless. Instead C1 takes the safe
+incremental step (monotonic inner→outer merge). Two residual hazards are known
+and remain only fully closed by the consolidation:
+
+1. The outer→inner full-replace (`sync_checkpoint_to_inner`) can momentarily
+   clobber an inner coordinator that is mid-`Committing` in the window between a
+   gRPC ack's storage I/O and its finalize. Bounded (epoch retries); left as a
+   full replace because *restore* legitimately moves an epoch backward.
+2. Split-quorum: a single epoch's acks can arrive via both the barrier path
+   (outer) and the `checkpoint_ack` RPC (inner); if different tasks ack via
+   different transports neither copy reaches quorum alone and the epoch times
+   out and retries (safe, but degraded).
+
+### Validation
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings
+cargo test -p krishiv-dataflow --lib
+cargo test -p krishiv-executor --lib
+cargo test -p krishiv-shuffle --lib
+cargo test -p krishiv-state --lib
+cargo test -p krishiv-scheduler --lib
+```
+
+### Next useful task
+
+Single-source-of-truth consolidation of checkpoint/executor state (close C1
+residuals 1–2 and remove the sync dance), gated on an integration test that
+asserts exactly one commit per epoch under both ack transports.
+
 ## 2026-06-20 — Shuffle service deferred fixes
 
 Applied the 6 remaining architectural fixes to `krishiv-shuffle`.

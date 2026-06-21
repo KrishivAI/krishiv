@@ -179,6 +179,7 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         let count_offset = out.len();
         out.extend_from_slice(&0u64.to_le_bytes()); // placeholder; patched after filtering
         let mut written = 0u64;
+        let now_ms = self.now_ms();
         for (op_id, state_name, key, ttl_encoded_value) in &entries {
             // Strip the 8-byte TTL prefix if present; skip expired / corrupt entries.
             if ttl_encoded_value.len() < 8 {
@@ -191,7 +192,6 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
                         message: "ttl expiry prefix is not 8 bytes in snapshot".into(),
                     }
                 })?);
-            let now_ms = self.now_ms();
             if now_ms >= expires_at_ms {
                 // Skip already-expired entries — they're invisible on read anyway.
                 continue;

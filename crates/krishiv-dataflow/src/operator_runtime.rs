@@ -258,50 +258,181 @@ impl StreamingWindowOp {
     }
 }
 
-/// Drive a state-backed window operator over an input stream, advancing the
-/// watermark per batch and yielding window outputs as they're produced,
-/// followed by a final flush of any remaining windows once the input ends.
+/// Build a state-backed streaming window operator for `spec`.
 ///
-/// Shared by all `WindowKind` arms of `execute_streaming_window` so the
-/// watermark-tracking and yield/error-propagation logic is implemented once.
-fn stream_window_operator(
+/// Constructed lazily (once the first input batch's schema is known) so that
+/// `agg_is_float` can reflect the real aggregate input types — mirroring the
+/// schema probe in [`execute_bounded_window`]. Previously the streaming path
+/// hardcoded `agg_is_float = false`, silently truncating `Float64`
+/// `SUM`/`MIN`/`MAX`/`AVG` results to `Int64`.
+fn build_streaming_window_op(
+    spec: &WindowExecutionSpec,
+    state_dir: Option<&std::path::Path>,
+    agg_exprs: &[AggExpr],
+    agg_is_float: &[bool],
+) -> ExecResult<StreamingWindowOp> {
+    let key_column = spec.key_column.clone();
+    let key_column_type = spec.key_column_type.clone();
+    let event_time_column = spec.event_time_column.clone();
+    let agg_exprs = agg_exprs.to_vec();
+    let agg_is_float = agg_is_float.to_vec();
+
+    let op = match spec.window_kind {
+        WindowKind::Tumbling => {
+            let tw_spec = TumblingWindowSpec {
+                key_column,
+                key_column_type,
+                event_time_column,
+                window_size_ms: spec.window_size_ms,
+                agg_exprs,
+                agg_is_float,
+            };
+            TumblingWindowOperator::validate_spec(&tw_spec)
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
+            StreamingWindowOp::Tumbling(
+                StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
+                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?,
+            )
+        }
+        WindowKind::Sliding => {
+            let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);
+            let sw_spec = SlidingWindowSpec {
+                key_column,
+                key_column_type,
+                event_time_column,
+                window_size_ms: spec.window_size_ms,
+                slide_ms,
+                agg_exprs,
+                agg_is_float,
+            };
+            let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
+            StreamingWindowOp::Sliding(
+                StateBackedSlidingWindowOperator::new(sw_spec, state, "window-exec", "sliding")
+                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?,
+            )
+        }
+        WindowKind::Session => {
+            let session_gap_ms = spec.session_gap_ms.unwrap_or(spec.window_size_ms);
+            let sess_spec = SessionWindowSpec {
+                key_column,
+                key_column_type,
+                event_time_column,
+                session_gap_ms,
+                agg_exprs,
+            };
+            let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
+            StreamingWindowOp::Session(
+                StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
+                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?,
+            )
+        }
+        WindowKind::Count { size, slide } => {
+            use crate::window::{CountWindowOperator, CountWindowSpec};
+            let count_spec = CountWindowSpec {
+                key_column,
+                key_column_type,
+                size,
+                slide,
+                agg_exprs,
+                agg_is_float,
+            };
+            StreamingWindowOp::Count(
+                CountWindowOperator::new(count_spec)
+                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?,
+            )
+        }
+    };
+    Ok(op)
+}
+
+pub fn execute_streaming_window(
     mut input: Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>,
     spec: WindowExecutionSpec,
-    mut op: StreamingWindowOp,
-) -> Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>> {
+    state_dir: Option<&std::path::Path>,
+) -> ExecResult<Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>> {
+    if spec.agg_exprs.is_empty() {
+        return Err(ExecError::InvalidWindowConfig(
+            "window execution requires at least one aggregate".into(),
+        ));
+    }
+
+    let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
+    // Own the state dir so the returned `'static` stream can open its state
+    // backend lazily, after the first batch reveals the aggregate input types.
+    let state_dir = state_dir.map(|p| p.to_path_buf());
+
     let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
     let mut multi_watermark =
         MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
 
     let stream = async_stream::stream! {
-        while let Some(batch_res) = input.next().await {
-            match batch_res {
-                Ok(batch) => {
-                    multi_watermark.apply_idle_source_policy();
-                    let wm = match advance_effective_watermark(
-                        &batch,
-                        &spec.event_time_column,
-                        spec.source_id_column.as_deref(),
-                        &spec.source_watermark_lags,
-                        &mut single_watermark,
-                        &mut multi_watermark,
-                    ) {
-                        Ok(wm) => wm,
-                        Err(e) => {
-                            yield Err(e);
-                            continue;
-                        }
-                    };
-                    match op.process_batch(&batch, wm) {
-                        Ok(output_batches) => {
-                            for out_batch in output_batches {
-                                yield Ok(out_batch);
-                            }
-                        }
-                        Err(e) => {
-                            yield Err(e);
-                            return;
-                        }
+        // Peek the first batch so the operator is built with correct Float64
+        // awareness (mirrors `execute_bounded_window`). The first batch is then
+        // processed normally via `pending_first` — it is not dropped.
+        let first_batch = match input.next().await {
+            None => return,
+            Some(Err(e)) => {
+                yield Err(e);
+                return;
+            }
+            Some(Ok(batch)) => batch,
+        };
+        let agg_is_float: Vec<bool> = agg_exprs
+            .iter()
+            .map(|e| {
+                first_batch
+                    .schema()
+                    .field_with_name(&e.input_column)
+                    .map(|f| *f.data_type() == arrow::datatypes::DataType::Float64)
+                    .unwrap_or(false)
+            })
+            .collect();
+        let mut op = match build_streaming_window_op(
+            &spec,
+            state_dir.as_deref(),
+            &agg_exprs,
+            &agg_is_float,
+        ) {
+            Ok(op) => op,
+            Err(e) => {
+                yield Err(e);
+                return;
+            }
+        };
+
+        let mut pending_first = Some(first_batch);
+        loop {
+            let batch = match pending_first.take() {
+                Some(batch) => batch,
+                None => match input.next().await {
+                    Some(Ok(batch)) => batch,
+                    Some(Err(e)) => {
+                        yield Err(e);
+                        return;
+                    }
+                    None => break,
+                },
+            };
+            multi_watermark.apply_idle_source_policy();
+            let wm = match advance_effective_watermark(
+                &batch,
+                &spec.event_time_column,
+                spec.source_id_column.as_deref(),
+                &spec.source_watermark_lags,
+                &mut single_watermark,
+                &mut multi_watermark,
+            ) {
+                Ok(wm) => wm,
+                Err(e) => {
+                    yield Err(e);
+                    continue;
+                }
+            };
+            match op.process_batch(&batch, wm) {
+                Ok(output_batches) => {
+                    for out_batch in output_batches {
+                        yield Ok(out_batch);
                     }
                 }
                 Err(e) => {
@@ -319,97 +450,7 @@ fn stream_window_operator(
             Err(e) => yield Err(e),
         }
     };
-    Box::pin(stream)
-}
-
-pub fn execute_streaming_window(
-    input: Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>,
-    spec: WindowExecutionSpec,
-    state_dir: Option<&std::path::Path>,
-) -> ExecResult<Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>> {
-    if spec.agg_exprs.is_empty() {
-        return Err(ExecError::InvalidWindowConfig(
-            "window execution requires at least one aggregate".into(),
-        ));
-    }
-
-    let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
-    let agg_is_float = vec![false; agg_exprs.len()];
-
-    // Clone the shared spec fields once; only the arm matching `window_kind`
-    // runs, so these are moved (not re-cloned) into whichever operator spec
-    // gets constructed below.
-    let key_column = spec.key_column.clone();
-    let key_column_type = spec.key_column_type.clone();
-    let event_time_column = spec.event_time_column.clone();
-
-    let op = match spec.window_kind {
-        WindowKind::Tumbling => {
-            let tw_spec = TumblingWindowSpec {
-                key_column,
-                key_column_type,
-                event_time_column,
-                window_size_ms: spec.window_size_ms,
-                agg_exprs: agg_exprs.clone(),
-                agg_is_float: agg_is_float.clone(),
-            };
-            TumblingWindowOperator::validate_spec(&tw_spec)
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
-            let op =
-                StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
-                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            StreamingWindowOp::Tumbling(op)
-        }
-        WindowKind::Sliding => {
-            let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);
-            let sw_spec = SlidingWindowSpec {
-                key_column,
-                key_column_type,
-                event_time_column,
-                window_size_ms: spec.window_size_ms,
-                slide_ms,
-                agg_exprs,
-                agg_is_float: agg_is_float.clone(),
-            };
-            let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
-            let op =
-                StateBackedSlidingWindowOperator::new(sw_spec, state, "window-exec", "sliding")
-                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            StreamingWindowOp::Sliding(op)
-        }
-        WindowKind::Session => {
-            let session_gap_ms = spec.session_gap_ms.unwrap_or(spec.window_size_ms);
-            let sess_spec = SessionWindowSpec {
-                key_column,
-                key_column_type,
-                event_time_column,
-                session_gap_ms,
-                agg_exprs,
-            };
-            let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
-            let op =
-                StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
-                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            StreamingWindowOp::Session(op)
-        }
-        WindowKind::Count { size, slide } => {
-            use crate::window::{CountWindowOperator, CountWindowSpec};
-            let count_spec = CountWindowSpec {
-                key_column,
-                key_column_type,
-                size,
-                slide,
-                agg_exprs,
-                agg_is_float,
-            };
-            let op = CountWindowOperator::new(count_spec)
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            StreamingWindowOp::Count(op)
-        }
-    };
-
-    Ok(stream_window_operator(input, spec, op))
+    Ok(Box::pin(stream))
 }
 
 /// Parameters for converting a legacy local window spec into a `WindowExecutionSpec`.

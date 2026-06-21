@@ -5,6 +5,7 @@
 
 pub mod grpc;
 pub mod observability_report;
+pub mod system;
 
 mod counters;
 mod init;

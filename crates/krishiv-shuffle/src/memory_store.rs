@@ -1,8 +1,6 @@
 use crate::{
     LocalDiskShuffleStore, PartitionId, ShuffleError, ShufflePartition, ShuffleResult,
-    ShuffleStore,
-    compression::partition_memory_bytes,
-    store::PartitionKey,
+    ShuffleStore, compression::partition_memory_bytes, store::PartitionKey,
 };
 use ahash::{AHashMap, AHashSet};
 use indexmap::IndexSet;
@@ -131,13 +129,13 @@ impl ShuffleStore for InMemoryShuffleStore {
     ) -> ShuffleResult<()> {
         let key = (id.job_id, id.stage_id, id.partition);
         let mut st = self.state.lock().map_err(|_| ShuffleError::LockPoisoned)?;
-        if let Some(&expected) = st.lease_tokens.get(&key) {
-            if lease_token < expected {
-                return Err(ShuffleError::StaleLeaseToken {
-                    expected,
-                    actual: lease_token,
-                });
-            }
+        if let Some(&expected) = st.lease_tokens.get(&key)
+            && lease_token < expected
+        {
+            return Err(ShuffleError::StaleLeaseToken {
+                expected,
+                actual: lease_token,
+            });
         }
         st.lease_tokens.insert(key, lease_token);
         Ok(())
@@ -159,38 +157,41 @@ impl ShuffleStore for InMemoryShuffleStore {
         // Initial token validation — synchronous, no I/O.
         {
             let st = self.state.lock().map_err(|_| ShuffleError::LockPoisoned)?;
-            if let Some(&expected) = st.lease_tokens.get(&key) {
-                if lease_token < expected {
-                    return Err(ShuffleError::StaleLeaseToken {
-                        expected,
-                        actual: lease_token,
-                    });
-                }
+            if let Some(&expected) = st.lease_tokens.get(&key)
+                && lease_token < expected
+            {
+                return Err(ShuffleError::StaleLeaseToken {
+                    expected,
+                    actual: lease_token,
+                });
             }
         } // guard dropped before any .await
 
         // Direct-to-disk: single partition exceeds the total memory cap.
-        if let (Some(max_bytes), Some(spill)) = (self.max_bytes, self.spill_store.as_ref()) {
-            if new_size > max_bytes {
-                spill.write_partition(partition, lease_token).await?;
-                let mut st = self.state.lock().map_err(|_| ShuffleError::LockPoisoned)?;
-                if let Some(&expected) = st.lease_tokens.get(&key) {
-                    if lease_token < expected {
-                        return Err(ShuffleError::StaleLeaseToken {
-                            expected,
-                            actual: lease_token,
-                        });
-                    }
-                }
-                let old =
-                    st.partitions.remove(&key).map(|p| partition_memory_bytes(&p)).unwrap_or(0);
-                st.lease_tokens.insert(key.clone(), lease_token);
-                st.spill_order.swap_remove(&key);
-                st.spilled.insert(key.clone());
-                st.bytes_used = st.bytes_used.saturating_sub(old);
-                st.content_hashes.remove(&key);
-                return Ok(());
+        if let (Some(max_bytes), Some(spill)) = (self.max_bytes, self.spill_store.as_ref())
+            && new_size > max_bytes
+        {
+            spill.write_partition(partition, lease_token).await?;
+            let mut st = self.state.lock().map_err(|_| ShuffleError::LockPoisoned)?;
+            if let Some(&expected) = st.lease_tokens.get(&key)
+                && lease_token < expected
+            {
+                return Err(ShuffleError::StaleLeaseToken {
+                    expected,
+                    actual: lease_token,
+                });
             }
+            let old = st
+                .partitions
+                .remove(&key)
+                .map(|p| partition_memory_bytes(&p))
+                .unwrap_or(0);
+            st.lease_tokens.insert(key.clone(), lease_token);
+            st.spill_order.swap_remove(&key);
+            st.spilled.insert(key.clone());
+            st.bytes_used = st.bytes_used.saturating_sub(old);
+            st.content_hashes.remove(&key);
+            return Ok(());
         }
 
         // Evict LRU victims until there is room for the incoming partition.
@@ -199,7 +200,11 @@ impl ShuffleStore for InMemoryShuffleStore {
                 // Determine capacity and pick a victim in one lock acquisition.
                 let (have_room, victim) = {
                     let st = self.state.lock().map_err(|_| ShuffleError::LockPoisoned)?;
-                    let old = st.partitions.get(&key).map(partition_memory_bytes).unwrap_or(0);
+                    let old = st
+                        .partitions
+                        .get(&key)
+                        .map(partition_memory_bytes)
+                        .unwrap_or(0);
                     let projected = st.bytes_used.saturating_sub(old).saturating_add(new_size);
                     if projected <= max_bytes {
                         (true, None)
@@ -220,7 +225,11 @@ impl ShuffleStore for InMemoryShuffleStore {
                 let Some(victim_key) = victim else {
                     // No evictable partition — return hard limit error.
                     let st = self.state.lock().map_err(|_| ShuffleError::LockPoisoned)?;
-                    let old = st.partitions.get(&key).map(partition_memory_bytes).unwrap_or(0);
+                    let old = st
+                        .partitions
+                        .get(&key)
+                        .map(partition_memory_bytes)
+                        .unwrap_or(0);
                     return Err(ShuffleError::MemoryLimitExceeded {
                         max_bytes,
                         current_bytes: st.bytes_used.saturating_sub(old),
@@ -255,7 +264,9 @@ impl ShuffleStore for InMemoryShuffleStore {
                         incoming_bytes: new_size,
                     });
                 };
-                spill.write_partition(victim_partition, victim_token).await?;
+                spill
+                    .write_partition(victim_partition, victim_token)
+                    .await?;
 
                 // Update accounting — skip if victim was overwritten during spill.
                 {
@@ -279,21 +290,28 @@ impl ShuffleStore for InMemoryShuffleStore {
         {
             let mut st = self.state.lock().map_err(|_| ShuffleError::LockPoisoned)?;
             // Re-validate: token may have been superseded while we were spilling.
-            if let Some(&expected) = st.lease_tokens.get(&key) {
-                if lease_token < expected {
-                    return Err(ShuffleError::StaleLeaseToken {
-                        expected,
-                        actual: lease_token,
-                    });
-                }
+            if let Some(&expected) = st.lease_tokens.get(&key)
+                && lease_token < expected
+            {
+                return Err(ShuffleError::StaleLeaseToken {
+                    expected,
+                    actual: lease_token,
+                });
             }
-            let old_size = st.partitions.get(&key).map(partition_memory_bytes).unwrap_or(0);
+            let old_size = st
+                .partitions
+                .get(&key)
+                .map(partition_memory_bytes)
+                .unwrap_or(0);
             st.partitions.insert(key.clone(), partition);
             st.lease_tokens.insert(key.clone(), lease_token);
             st.spill_order.swap_remove(&key);
             st.spill_order.insert(key.clone());
             st.spilled.remove(&key);
-            st.bytes_used = st.bytes_used.saturating_sub(old_size).saturating_add(new_size);
+            st.bytes_used = st
+                .bytes_used
+                .saturating_sub(old_size)
+                .saturating_add(new_size);
             st.content_hashes.insert(key, computed_hash);
         }
 

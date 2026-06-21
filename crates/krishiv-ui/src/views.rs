@@ -342,6 +342,17 @@ pub struct GlobalMetricsView {
     pub state_key_entry_count: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SystemMetricsView {
+    pub process_memory_bytes: u64,
+    pub process_cpu_usage_x100: u64,
+    pub process_virtual_memory_bytes: u64,
+    pub process_thread_count: u64,
+    pub system_total_memory_bytes: u64,
+    pub system_available_memory_bytes: u64,
+    pub system_cpu_usage_x100: u64,
+}
+
 #[derive(Template)]
 #[template(path = "metrics.html")]
 pub(crate) struct MetricsTemplate {
@@ -351,6 +362,7 @@ pub(crate) struct MetricsTemplate {
     pub(crate) executors_count: usize,
     pub(crate) avg_duration_ms: u64,
     pub(crate) global: GlobalMetricsView,
+    pub(crate) system: SystemMetricsView,
     pub(crate) bearer_token: Option<String>,
 }
 

@@ -14,7 +14,7 @@ use indexmap::IndexSet;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::checkpoint::{CheckpointCoordinator, PendingCommit};
+use crate::checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState, PendingCommit};
 use crate::heartbeat::ExecutorRegistry;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CoordinatorState, ExecutorId, JobId,
@@ -207,6 +207,18 @@ pub(crate) fn sync_executor_to_inner(
 // ── Checkpoint sync helpers (G3) ───────────────────────────────────────────
 
 /// Synchronise checkpoint state FROM the Coordinator fields INTO the inner lock.
+///
+/// This is the outer→inner direction and is intentionally a *full replace*: the
+/// outer `Coordinator` is authoritative for membership (job submit/evict) and
+/// for deliberate backward moves (checkpoint/savepoint restore lowers the
+/// epoch). The inner→outer direction instead uses [`merge_checkpoint_coordinator`]
+/// so a late gRPC ack can never roll the outer copy backwards.
+///
+/// NOTE (C1): a full replace here can still momentarily clobber an inner
+/// coordinator that is mid-commit (`Committing`) in the narrow window between
+/// the gRPC ack's storage I/O and its finalize. That is bounded — at worst the
+/// epoch retries — and is fully resolved only by collapsing the two copies into
+/// a single source of truth (see `docs/implementation/status.md`).
 pub(crate) fn sync_checkpoint_to_inner(
     src_coordinators: &HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
     src_notify: &IndexSet<(krishiv_proto::JobId, ExecutorId, u64)>,
@@ -216,4 +228,190 @@ pub(crate) fn sync_checkpoint_to_inner(
     inner.coordinators.clone_from(src_coordinators);
     inner.notify_sent.clone_from(src_notify);
     inner.barrier_sent.clone_from(src_barrier);
+}
+
+/// Lexicographic checkpoint progress key: `(current_epoch, state_rank)`.
+///
+/// `state_rank` orders the per-epoch lifecycle so a forward-merge never
+/// regresses a coordinator: pre-quorum (`AwaitingAcks`) < `Committing` <
+/// terminal. `Failed` and `Committed` share the top rank — both are terminal
+/// for the epoch, so a same-epoch tie keeps the destination (the copy that
+/// reached a terminal state first wins; we never flip a committed epoch to
+/// failed or vice versa).
+fn checkpoint_progress(coord: &CheckpointCoordinator) -> (u64, u8) {
+    let rank = match coord.coordinator_state() {
+        CheckpointCoordinatorState::Idle => 0,
+        CheckpointCoordinatorState::AwaitingAcks { .. } => 1,
+        CheckpointCoordinatorState::Committing { .. } => 2,
+        CheckpointCoordinatorState::Failed { .. }
+        | CheckpointCoordinatorState::Committed { .. } => 3,
+    };
+    (coord.current_epoch(), rank)
+}
+
+/// Forward-merge one job's checkpoint coordinator from one dual-state copy into
+/// the other (C1, inner→outer direction).
+///
+/// Applies `src` only when it is strictly more advanced than the existing `dst`
+/// entry (by `(epoch, state_rank)`), or when `dst` has no entry. This keeps the
+/// inner→outer sync from (a) clobbering *other* jobs' in-flight epochs — it
+/// touches only `job_id` — and (b) rolling *this* job back past a newer epoch
+/// the outer copy already advanced to (e.g. a late `finalize_ack` for epoch N
+/// arriving after the barrier path already initiated epoch N+1).
+pub(crate) fn merge_checkpoint_coordinator(
+    dst: &mut HashMap<JobId, CheckpointCoordinator>,
+    job_id: &JobId,
+    src: CheckpointCoordinator,
+) {
+    match dst.get(job_id) {
+        Some(existing) if checkpoint_progress(existing) >= checkpoint_progress(&src) => {
+            // dst is at least as advanced — keep it (never regress).
+        }
+        _ => {
+            dst.insert(job_id.clone(), src);
+        }
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn coord(job: &JobId, epoch: u64, state: CheckpointCoordinatorState) -> CheckpointCoordinator {
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
+            Arc::new(krishiv_state::checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap());
+        let mut c = CheckpointCoordinator::new_for_test(job.clone(), storage, 1_000, 1);
+        c.current_epoch = epoch;
+        c.state = state;
+        c
+    }
+
+    #[test]
+    fn merge_inserts_when_absent_then_applies_when_ahead() {
+        let job = JobId::try_new("m1").unwrap();
+        let mut dst = HashMap::new();
+        merge_checkpoint_coordinator(
+            &mut dst,
+            &job,
+            coord(&job, 1, CheckpointCoordinatorState::Committed { epoch: 1 }),
+        );
+        assert_eq!(dst[&job].current_epoch(), 1);
+        merge_checkpoint_coordinator(
+            &mut dst,
+            &job,
+            coord(&job, 2, CheckpointCoordinatorState::Committed { epoch: 2 }),
+        );
+        assert_eq!(dst[&job].current_epoch(), 2);
+    }
+
+    #[test]
+    fn merge_does_not_regress_to_older_epoch() {
+        // A late finalize for epoch 5 must not clobber an outer copy that
+        // already advanced to epoch 6.
+        let job = JobId::try_new("m2").unwrap();
+        let mut dst = HashMap::new();
+        dst.insert(
+            job.clone(),
+            coord(
+                &job,
+                6,
+                CheckpointCoordinatorState::AwaitingAcks {
+                    epoch: 6,
+                    initiated_at_ms: 0,
+                },
+            ),
+        );
+        merge_checkpoint_coordinator(
+            &mut dst,
+            &job,
+            coord(&job, 5, CheckpointCoordinatorState::Committed { epoch: 5 }),
+        );
+        assert_eq!(dst[&job].current_epoch(), 6);
+        assert!(matches!(
+            dst[&job].coordinator_state(),
+            CheckpointCoordinatorState::AwaitingAcks { epoch: 6, .. }
+        ));
+    }
+
+    #[test]
+    fn merge_applies_commit_over_awaiting_same_epoch() {
+        let job = JobId::try_new("m3").unwrap();
+        let mut dst = HashMap::new();
+        dst.insert(
+            job.clone(),
+            coord(
+                &job,
+                3,
+                CheckpointCoordinatorState::AwaitingAcks {
+                    epoch: 3,
+                    initiated_at_ms: 0,
+                },
+            ),
+        );
+        merge_checkpoint_coordinator(
+            &mut dst,
+            &job,
+            coord(&job, 3, CheckpointCoordinatorState::Committed { epoch: 3 }),
+        );
+        assert!(matches!(
+            dst[&job].coordinator_state(),
+            CheckpointCoordinatorState::Committed { epoch: 3 }
+        ));
+    }
+
+    #[test]
+    fn merge_does_not_regress_committing_to_awaiting_same_epoch() {
+        // R1 protection: an outer AwaitingAcks{N} must not clobber a more
+        // advanced Committing{N} that another path is mid-finalizing.
+        let job = JobId::try_new("m4").unwrap();
+        let mut dst = HashMap::new();
+        dst.insert(
+            job.clone(),
+            coord(&job, 4, CheckpointCoordinatorState::Committing { epoch: 4 }),
+        );
+        merge_checkpoint_coordinator(
+            &mut dst,
+            &job,
+            coord(
+                &job,
+                4,
+                CheckpointCoordinatorState::AwaitingAcks {
+                    epoch: 4,
+                    initiated_at_ms: 0,
+                },
+            ),
+        );
+        assert!(matches!(
+            dst[&job].coordinator_state(),
+            CheckpointCoordinatorState::Committing { epoch: 4 }
+        ));
+    }
+
+    #[test]
+    fn merge_keeps_committed_on_terminal_tie() {
+        // A committed epoch must never be flipped to Failed by the other copy.
+        let job = JobId::try_new("m5").unwrap();
+        let mut dst = HashMap::new();
+        dst.insert(
+            job.clone(),
+            coord(&job, 2, CheckpointCoordinatorState::Committed { epoch: 2 }),
+        );
+        merge_checkpoint_coordinator(
+            &mut dst,
+            &job,
+            coord(
+                &job,
+                2,
+                CheckpointCoordinatorState::Failed {
+                    epoch: 2,
+                    reason: "storage".into(),
+                },
+            ),
+        );
+        assert!(matches!(
+            dst[&job].coordinator_state(),
+            CheckpointCoordinatorState::Committed { epoch: 2 }
+        ));
+    }
 }

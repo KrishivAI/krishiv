@@ -124,6 +124,7 @@ regex = "1"
 sqlparser = "0.62.0"
 url = "2"
 wiremock = "0.6"
+sysinfo = "0.35"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

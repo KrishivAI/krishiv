@@ -936,6 +936,13 @@ impl ExecutorTaskRunner {
         // generic backend would persist vacuous state for them.
         let state = self.checkpoint_state_for_job(req.job_id.as_str(), fallback_state);
 
+        // Fan out concurrently: each attempt has a distinct task_id (and thus a
+        // distinct `checkpoint_runners` entry / TaskRunner mutex), so the
+        // per-task snapshot I/O + ack RPCs are independent. Driving them in
+        // parallel keeps barrier latency from scaling linearly with the number
+        // of this executor's tasks for the job.
+        use futures::stream::{FuturesUnordered, StreamExt as _};
+        let mut acks = FuturesUnordered::new();
         for attempt in attempts {
             let task_id = attempt.task_id().clone();
             let stage_id = attempt.stage_id().clone();
@@ -953,19 +960,27 @@ impl ExecutorTaskRunner {
                 OutputContract::new(OutputContractKind::InlineRecordBatches, "checkpoint"),
             );
 
-            let s_clone = Arc::clone(&storage);
-            let coord_clone = coordinator.clone();
-            if let Err(error) = self
-                .initiate_checkpoint_and_deliver_ack(
-                    &assignment,
-                    req.clone(),
-                    state.clone(),
-                    s_clone,
-                    coord_clone,
-                )
-                .await
-            {
-                tracing::warn!(task_id = %assignment.task_id(), error = %error, "checkpoint acknowledgement failed");
+            let req = req.clone();
+            let state = state.clone();
+            let storage = Arc::clone(&storage);
+            let coordinator = coordinator.clone();
+            acks.push(async move {
+                let task_id = assignment.task_id().clone();
+                let result = self
+                    .initiate_checkpoint_and_deliver_ack(
+                        &assignment,
+                        req,
+                        state,
+                        storage,
+                        coordinator,
+                    )
+                    .await;
+                (task_id, result)
+            });
+        }
+        while let Some((task_id, result)) = acks.next().await {
+            if let Err(error) = result {
+                tracing::warn!(task_id = %task_id, error = %error, "checkpoint acknowledgement failed");
             }
         }
         Ok(())
@@ -1164,7 +1179,7 @@ impl ExecutorTaskRunner {
                     .entry(task_id.clone())
                     .or_insert_with(|| Arc::new(Mutex::new(TaskRunner::new(task_id))))
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|p| p.into_inner())
                     .apply_restored_epoch(cmd.epoch);
             }
         }

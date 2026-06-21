@@ -24,6 +24,7 @@ tracing-opentelemetry = { workspace = true }
 tonic.workspace = true
 dashmap = { workspace = true }
 serde = { workspace = true }
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
