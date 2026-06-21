@@ -17,10 +17,10 @@ impl Coordinator {
         if let Some(ref store) = self.store {
             store.save_executor(&descriptor);
         }
-        let res = self.executors.register(descriptor.clone());
+        let res = self.exec.executors.register(descriptor.clone());
         if res.is_ok() {
             self.assign_pending_tasks_for_schedulable_jobs();
-            self.notify.notify_waiters();
+            self.exec.notify.notify_waiters();
         }
         res
     }
@@ -32,11 +32,11 @@ impl Coordinator {
         lease_generation: LeaseGeneration,
     ) -> SchedulerResult<LeaseGeneration> {
         self.ensure_active()?;
-        let res = self.executors.deregister(executor_id, lease_generation);
+        let res = self.exec.executors.deregister(executor_id, lease_generation);
         if res.is_ok() {
             // Evict the executor's gRPC channel so stale TCP connections
             // do not leak (Phase 1.3).
-            if let Ok(record) = self.executors.find_executor(executor_id)
+            if let Ok(record) = self.exec.executors.find_executor(executor_id)
                 && let Some(endpoint) = record.descriptor().task_endpoint()
             {
                 self.executor_channels.remove(endpoint);
@@ -46,7 +46,7 @@ impl Coordinator {
             if let Some(ref store) = self.store {
                 store.remove_executor(executor_id);
             }
-            self.notify.notify_waiters();
+            self.exec.notify.notify_waiters();
         }
         res
     }
@@ -70,11 +70,11 @@ impl Coordinator {
         let hot_key_reports = heartbeat.hot_key_reports().to_vec();
         let streaming_progress: Vec<StreamingProgressReport> =
             heartbeat.streaming_progress().to_vec();
-        self.executors.heartbeat(heartbeat)?;
+        self.exec.executors.heartbeat(heartbeat)?;
 
         // Wire executor slot usage to the global metrics gauge so the
         // Prometheus krishiv_executor_slots_used metric reflects live state.
-        if let Ok(exec_rec) = self.executors.find_executor(&executor_id) {
+        if let Ok(exec_rec) = self.exec.executors.find_executor(&executor_id) {
             let slots_used = exec_rec.running_tasks().len() as u64;
             krishiv_metrics::global_metrics()
                 .set_executor_slots_used(executor_id.as_str(), slots_used);
@@ -102,12 +102,13 @@ impl Coordinator {
         let checkpoint_complete_commands =
             self.pending_checkpoint_complete_for_executor(&executor_id);
         let lease_generation = self
+            .exec
             .executors
             .find_executor(&executor_id)
             .map(|e| e.lease_generation())
             .unwrap_or(fallback_lease);
 
-        self.notify.notify_waiters();
+        self.exec.notify.notify_waiters();
 
         Ok(ExecutorHeartbeatEffects {
             source_throttles,
@@ -200,7 +201,7 @@ impl Coordinator {
                     .map(|jc| jc.read_record().spec.kind() == JobKind::Streaming)
                     .unwrap_or(false);
                 if !is_streaming {
-                    let buckets = self.executors.list().len().max(2) as u32;
+                    let buckets = self.exec.executors.list().len().max(2) as u32;
                     self.skew_repartition_overrides
                         .insert(job_id.clone(), buckets);
                 } else {
@@ -239,7 +240,7 @@ impl Coordinator {
     pub fn mark_executor_lost(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
         self.ensure_active()?;
         self.prune_executor_channel(executor_id);
-        self.executors.mark_lost(executor_id)?;
+        self.exec.executors.mark_lost(executor_id)?;
         self.handle_executor_loss_for_checkpoints(executor_id);
         self.reset_running_tasks_for_lost_executor(executor_id);
         krishiv_metrics::global_metrics().inc_executor_lost();
@@ -264,21 +265,22 @@ impl Coordinator {
     /// task→executor assignments still identify the affected jobs.
     pub(crate) fn handle_executor_loss_for_checkpoints(&mut self, lost_id: &ExecutorId) {
         let affected_jobs: Vec<JobId> = self
-            .checkpoint_coordinators
+            .ckpt
+            .coordinators
             .keys()
             .filter(|job_id| self.executor_has_running_task_in_job(lost_id, job_id))
             .cloned()
             .collect();
 
         for job_id in affected_jobs {
-            let Some(coord) = self.checkpoint_coordinators.get_mut(&job_id) else {
+            let Some(coord) = self.ckpt.coordinators.get_mut(&job_id) else {
                 continue;
             };
             if let CheckpointCoordinatorState::AwaitingAcks { epoch, .. } = coord.state {
                 coord.abort_epoch(&format!("executor {lost_id} lost during epoch {epoch}"));
-                self.checkpoint_notify_sent
+                self.ckpt.notify_sent
                     .retain(|(jid, _, e)| jid != &job_id || *e != epoch);
-                self.barrier_dispatch_sent
+                self.ckpt.barrier_sent
                     .retain(|(jid, e)| jid != &job_id || *e != epoch);
                 tracing::warn!(
                     job_id = %job_id,
@@ -288,7 +290,7 @@ impl Coordinator {
                 );
             }
 
-            let Some(coord) = self.checkpoint_coordinators.get(&job_id) else {
+            let Some(coord) = self.ckpt.coordinators.get(&job_id) else {
                 continue;
             };
             // The rollback target is the last DURABLY committed epoch from
@@ -340,7 +342,7 @@ impl Coordinator {
     }
 
     fn prune_executor_channel(&mut self, executor_id: &ExecutorId) {
-        if let Ok(record) = self.executors.find_executor(executor_id)
+        if let Ok(record) = self.exec.executors.find_executor(executor_id)
             && let Some(endpoint) = record.descriptor().task_endpoint()
         {
             self.executor_channels.remove(endpoint);
@@ -359,12 +361,12 @@ impl Coordinator {
     pub fn advance_heartbeat_clock(&mut self, ticks: u64) -> SchedulerResult<Vec<ExecutorId>> {
         self.ensure_active()?;
         // Advance the restart tick counter.
-        self.ticks_since_restart = self.ticks_since_restart.saturating_add(ticks);
+        self.exec.ticks_since_restart = self.exec.ticks_since_restart.saturating_add(ticks);
 
-        let in_grace_period = self.recovering
-            && self.ticks_since_restart <= self.config.streaming_reattach_grace_ticks();
+        let in_grace_period = self.exec.recovering
+            && self.exec.ticks_since_restart <= self.config.streaming_reattach_grace_ticks();
 
-        let lost = self.executors.advance_clock(ticks);
+        let lost = self.exec.executors.advance_clock(ticks);
         let mut evicted: Vec<ExecutorId> = Vec::new();
         for lost_id in &lost {
             // During the re-attach grace period, skip evicting executors that own
@@ -380,7 +382,7 @@ impl Coordinator {
 
         // Drive per-job checkpoint interval timers (SCH-3: quorum = running tasks).
         let elapsed_ms = ticks.saturating_mul(self.config.tick_period_ms());
-        let job_ids: Vec<JobId> = self.checkpoint_coordinators.keys().cloned().collect();
+        let job_ids: Vec<JobId> = self.ckpt.coordinators.keys().cloned().collect();
         for job_id in &job_ids {
             let running = self.running_task_count_for_job(job_id);
 
@@ -391,7 +393,7 @@ impl Coordinator {
             // aborted epoch so they don't accumulate forever and block future
             // checkpoint rounds.
             let pre_tick_awaiting: Option<u64> =
-                self.checkpoint_coordinators.get(job_id).and_then(|c| {
+                self.ckpt.coordinators.get(job_id).and_then(|c| {
                     if let CheckpointCoordinatorState::AwaitingAcks { epoch, .. } = &c.state {
                         Some(*epoch)
                     } else {
@@ -399,7 +401,7 @@ impl Coordinator {
                     }
                 });
 
-            if let Some(coord) = self.checkpoint_coordinators.get_mut(job_id) {
+            if let Some(coord) = self.ckpt.coordinators.get_mut(job_id) {
                 coord.set_expected_task_count(running);
                 coord.try_tick(elapsed_ms, self.config.checkpoint_ack_timeout_ms());
             }
@@ -415,18 +417,19 @@ impl Coordinator {
             //     unique so the entry is harmless for correctness but wastes memory.
             if let Some(aborted_epoch) = pre_tick_awaiting {
                 let was_aborted = self
-                    .checkpoint_coordinators
+                    .ckpt
+                    .coordinators
                     .get(job_id)
                     .is_some_and(|c| matches!(c.state, CheckpointCoordinatorState::Failed { .. }));
                 if was_aborted {
-                    self.checkpoint_notify_sent
+                    self.ckpt.notify_sent
                         .retain(|(jid, _, e)| jid != job_id || *e != aborted_epoch);
-                    self.barrier_dispatch_sent
+                    self.ckpt.barrier_sent
                         .retain(|(jid, e)| jid != job_id || *e != aborted_epoch);
                     // A stop-with-savepoint waiting on the aborted epoch can
                     // never fire; drop it so the operator can retry the stop.
-                    if self.pending_stop_after_savepoint.get(job_id) == Some(&aborted_epoch) {
-                        self.pending_stop_after_savepoint.remove(job_id);
+                    if self.ckpt.pending_stop_after_savepoint.get(job_id) == Some(&aborted_epoch) {
+                        self.ckpt.pending_stop_after_savepoint.remove(job_id);
                         tracing::warn!(
                             job_id = %job_id,
                             epoch = aborted_epoch,

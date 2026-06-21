@@ -34,24 +34,10 @@ mod scheduler_tests {
     }
 
     fn in_process_bridge_for(coordinator: Coordinator) -> InProcessCoordinatorBridge {
-        let executor_inner = Arc::new(tokio::sync::RwLock::new(
-            crate::coordinator_sharded::ExecutorInner {
-                executors: coordinator.executors().clone(),
-                state: coordinator.state(),
-                ticks_since_restart: coordinator.ticks_since_restart(),
-                recovering: coordinator.recovering(),
-                notify: coordinator.notify().clone(),
-            },
-        ));
-        let (checkpoint_coordinators, checkpoint_notify_sent, barrier_dispatch_sent) =
-            coordinator.checkpoint_inner_parts();
-        let checkpoint_inner = Arc::new(tokio::sync::RwLock::new(
-            crate::coordinator_sharded::CheckpointInner::from_parts(
-                checkpoint_coordinators,
-                checkpoint_notify_sent,
-                barrier_dispatch_sent,
-            ),
-        ));
+        // Both exec and ckpt are now embedded in Coordinator; clone them directly
+        // to seed the sharded inner locks.
+        let executor_inner = Arc::new(tokio::sync::RwLock::new(coordinator.exec.clone()));
+        let checkpoint_inner = Arc::new(tokio::sync::RwLock::new(coordinator.ckpt.clone()));
         InProcessCoordinatorBridge::new(
             Arc::new(Mutex::new(coordinator)),
             executor_inner,

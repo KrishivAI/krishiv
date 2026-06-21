@@ -62,13 +62,13 @@ impl Coordinator {
     /// Collect executors/tasks that should receive a barrier for in-flight checkpoint epochs.
     pub fn pending_barrier_dispatch_plans(&self) -> Vec<BarrierDispatchPlan> {
         let mut plans = Vec::new();
-        for (job_id, coord) in &self.checkpoint_coordinators {
+        for (job_id, coord) in &self.ckpt.coordinators {
             let epoch = match &coord.state {
                 crate::checkpoint::CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
                 _ => continue,
             };
             let key = (job_id.clone(), epoch);
-            if self.barrier_dispatch_sent.contains(&key) {
+            if self.ckpt.barrier_sent.contains(&key) {
                 continue;
             }
             let mut targets = Vec::new();
@@ -83,7 +83,7 @@ impl Coordinator {
                     let Some(executor_id) = task.assigned_executor() else {
                         continue;
                     };
-                    let Ok(record) = self.executors.find_executor(executor_id) else {
+                    let Ok(record) = self.exec.executors.find_executor(executor_id) else {
                         continue;
                     };
                     let Some(endpoint) = barrier_endpoint_for_record(record) else {
@@ -111,7 +111,7 @@ impl Coordinator {
 
     /// Mark `(job_id, epoch)` as dispatched so we do not re-send barriers.
     pub fn mark_barrier_dispatched(&mut self, job_id: &JobId, epoch: u64) {
-        self.barrier_dispatch_sent.insert((job_id.clone(), epoch));
+        self.ckpt.barrier_sent.insert((job_id.clone(), epoch));
     }
 
     /// Apply barrier acks as checkpoint acks (one per task).
@@ -385,7 +385,7 @@ pub async fn drive_barrier_dispatches(
                 let mut coord = shared.write().await;
                 if let Some(aborted) = aborted {
                     crate::coordinator_sharded::merge_checkpoint_coordinator(
-                        &mut coord.checkpoint_coordinators,
+                        &mut coord.ckpt.coordinators,
                         &job_id,
                         aborted,
                     );
@@ -411,7 +411,7 @@ pub async fn drive_barrier_dispatches(
                 let mut coord = shared.write().await;
                 if let Some(committed) = committed {
                     crate::coordinator_sharded::merge_checkpoint_coordinator(
-                        &mut coord.checkpoint_coordinators,
+                        &mut coord.ckpt.coordinators,
                         &job_id,
                         committed,
                     );

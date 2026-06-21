@@ -77,13 +77,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         {
             let coordinator = self.coordinator.read().await;
             let mut executor_inner = self.coordinator.executor_inner.write().await;
-            crate::coordinator_sharded::sync_executor_to_inner(
-                &coordinator.executors,
-                coordinator.state,
-                coordinator.executors.current_tick,
-                coordinator.recovering,
-                &mut executor_inner,
-            );
+            executor_inner.clone_from(&coordinator.exec);
         }
 
         Ok(tonic::Response::new(response))
@@ -288,7 +282,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                 let mut coordinator = self.coordinator.write().await;
                 if let Some(aborted) = aborted {
                     crate::coordinator_sharded::merge_checkpoint_coordinator(
-                        &mut coordinator.checkpoint_coordinators,
+                        &mut coordinator.ckpt.coordinators,
                         &job_id,
                         aborted,
                     );
@@ -316,7 +310,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                 // the outer copy already advanced to.
                 if let Some(committed) = committed {
                     crate::coordinator_sharded::merge_checkpoint_coordinator(
-                        &mut coordinator.checkpoint_coordinators,
+                        &mut coordinator.ckpt.coordinators,
                         &job_id,
                         committed,
                     );

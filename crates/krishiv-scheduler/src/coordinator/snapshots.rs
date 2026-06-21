@@ -31,7 +31,7 @@ impl Coordinator {
 
     /// Snapshot all known executors.
     pub fn executor_snapshots(&self) -> Vec<ExecutorRecord> {
-        self.executors.list()
+        self.exec.executors.list()
     }
 
     /// Basic scheduler/executor stability metrics.
@@ -84,7 +84,7 @@ impl Coordinator {
         gm.set_job_queue_depth(queued_count);
 
         StabilityMetrics {
-            heartbeat_ages: self.executors.heartbeat_ages(),
+            heartbeat_ages: self.exec.executors.heartbeat_ages(),
             failed_assignments,
             retry_count,
             running_task_count,

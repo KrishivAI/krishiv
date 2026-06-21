@@ -51,7 +51,7 @@ impl Coordinator {
         // Before this fix, recover_from_store iterated an empty in-memory map
         // because checkpoint coordinators are only inserted in submit_job.  After
         // a coordinator restart the map is empty so no checkpointing resumes.
-        self.checkpoint_coordinators.clear();
+        self.ckpt.coordinators.clear();
         let streaming_checkpoint_jobs: Vec<(JobId, u64, String, usize)> = self
             .job_coordinators
             .values()
@@ -106,7 +106,7 @@ impl Coordinator {
                         // Do not insert a checkpoint coordinator for a failed job.
                         continue;
                     }
-                    self.checkpoint_coordinators.insert(job_id, coord);
+                    self.ckpt.coordinators.insert(job_id, coord);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -130,7 +130,7 @@ impl Coordinator {
         // Registered state; they will be evicted by the heartbeat timeout if
         // they never reconnect.
         for descriptor in store.executors() {
-            if let Err(e) = self.executors.register(descriptor.clone()) {
+            if let Err(e) = self.exec.executors.register(descriptor.clone()) {
                 tracing::warn!(
                     executor_id = %descriptor.executor_id(),
                     error = %e,
@@ -141,8 +141,8 @@ impl Coordinator {
         }
 
         // Start the re-attach grace period.
-        self.ticks_since_restart = 0;
-        self.recovering = true;
+        self.exec.ticks_since_restart = 0;
+        self.exec.recovering = true;
 
         // Phase 2.6: post-restart shuffle availability audit. Shuffle outputs
         // whose producing executor is not present in the restored registry can
@@ -208,6 +208,7 @@ impl Coordinator {
     #[tracing::instrument(skip(self), name = "audit_shuffle_availability")]
     pub fn audit_shuffle_availability(&mut self) -> usize {
         let known_executors: std::collections::HashSet<ExecutorId> = self
+            .exec
             .executors
             .list()
             .iter()
@@ -286,7 +287,7 @@ impl Coordinator {
             }
         }
         if jobs_affected > 0 {
-            self.notify.notify_waiters();
+            self.exec.notify.notify_waiters();
         }
         jobs_affected
     }

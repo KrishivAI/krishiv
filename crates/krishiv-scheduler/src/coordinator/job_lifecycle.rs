@@ -54,7 +54,7 @@ impl Coordinator {
         // (assign_pending_tasks_for_schedulable_jobs) will assign them as soon
         // as executors register or become healthy. This prevents submission
         // failures during rolling executor restarts.
-        let executors = self.executors.schedulable_executor_placements();
+        let executors = self.exec.executors.schedulable_executor_placements();
         let job_id = spec.job_id().clone();
         let _job_name = spec.name().to_owned();
         let _namespace = spec
@@ -97,7 +97,7 @@ impl Coordinator {
         );
 
         if let Some(ckpt_coord) = pending_checkpoint {
-            self.checkpoint_coordinators
+            self.ckpt.coordinators
                 .insert(inserted_job_id.clone(), ckpt_coord);
         }
         // P1.1: Index streaming tasks for O(1) heartbeat lookup.
@@ -120,7 +120,7 @@ impl Coordinator {
         if matches!(outcome, SubmitOutcome::Accepted)
             && let Some(ask) = spec.memory_limit_bytes()
             && ask > 0
-            && self.executors.cluster_available_memory_bytes().is_none()
+            && self.exec.executors.cluster_available_memory_bytes().is_none()
         {
             tracing::debug!(
                 job_id = %spec.job_id(),
@@ -132,7 +132,7 @@ impl Coordinator {
         if matches!(outcome, SubmitOutcome::Accepted)
             && let Some(ask) = spec.memory_limit_bytes()
             && ask > 0
-            && let Some(available) = self.executors.cluster_available_memory_bytes()
+            && let Some(available) = self.exec.executors.cluster_available_memory_bytes()
             && ask > available
         {
             tracing::warn!(
@@ -187,7 +187,7 @@ impl Coordinator {
         }
 
         if admitted > 0 {
-            self.notify.notify_waiters();
+            self.exec.notify.notify_waiters();
         }
         Ok(admitted)
     }
@@ -196,7 +196,7 @@ impl Coordinator {
         &mut self,
         job_id: &JobId,
     ) -> SchedulerResult<()> {
-        if self.checkpoint_coordinators.contains_key(job_id) {
+        if self.ckpt.coordinators.contains_key(job_id) {
             return Ok(());
         }
         let (kind, interval_ms, storage_path, task_count) = {
@@ -215,7 +215,7 @@ impl Coordinator {
             return Ok(());
         };
         let storage = Self::open_checkpoint_storage(&storage_path)?;
-        self.checkpoint_coordinators.insert(
+        self.ckpt.coordinators.insert(
             job_id.clone(),
             CheckpointCoordinator::new(
                 job_id.clone(),
@@ -281,7 +281,7 @@ impl Coordinator {
             }
             self.gc_ready_jobs.push_back(job_id.clone());
         }
-        self.checkpoint_coordinators.remove(job_id);
+        self.ckpt.coordinators.remove(job_id);
         self.job_inline_results.remove(job_id);
         self.job_input_partitions.remove(job_id);
         self.job_task_input_partitions.remove(job_id);
@@ -306,7 +306,7 @@ impl Coordinator {
              caller must call take_pending_sink_finalize() after every apply_task_update"
         );
         self.ensure_active()?;
-        self.executors
+        self.exec.executors
             .validate_lease(update.executor_id(), update.lease_generation())?;
 
         tracing::debug!(
@@ -378,6 +378,7 @@ impl Coordinator {
 
             let threshold = self.config.circuit_breaker_failure_threshold();
             let exceeded = self
+                .exec
                 .executors
                 .record_task_failure(&executor_id_for_circuit, threshold);
             if exceeded {
@@ -419,11 +420,11 @@ impl Coordinator {
                 );
                 // Fire notify AFTER clearing completes so the task-launch loop
                 // sees the updated (cleared) assignments.
-                self.notify.notify_waiters();
+                self.exec.notify.notify_waiters();
             }
         } else if terminal_state == TaskState::Succeeded {
             krishiv_metrics::global_metrics().inc_tasks_succeeded();
-            self.executors.reset_task_failures(&executor_id_for_circuit);
+            self.exec.executors.reset_task_failures(&executor_id_for_circuit);
         }
 
         // Re-queue the producing stage when the consumer reports missing partitions.
@@ -442,7 +443,7 @@ impl Coordinator {
                 false
             };
             if producers_affected {
-                self.notify.notify_waiters();
+                self.exec.notify.notify_waiters();
             }
         }
 
@@ -556,7 +557,7 @@ impl Coordinator {
                 self.gc_ready_jobs.pop_front();
             }
             self.gc_ready_jobs.push_back(job_id.clone());
-            self.checkpoint_coordinators.remove(&job_id);
+            self.ckpt.coordinators.remove(&job_id);
             // Free inline input data (InlineIpc partitions for batch-sql and
             // bounded-window jobs) — executors have already consumed this by the
             // time the job reaches a terminal state.
@@ -708,7 +709,7 @@ impl Coordinator {
         self.job_task_input_partitions.remove(job_id);
         self.continuous_input_cycles.remove(job_id);
         self.batch_sql_job_tables.remove(job_id);
-        self.checkpoint_coordinators.remove(job_id);
+        self.ckpt.coordinators.remove(job_id);
         self.gc_ready_jobs.retain(|id| id != job_id);
         self.streaming_task_index
             .retain(|_, (jid, _)| jid != job_id);
@@ -721,12 +722,12 @@ impl Coordinator {
         self.streaming_advisory_partitions.remove(job_id);
         self.aqe_coalesce_hints.retain(|(jid, _), _| jid != job_id);
         // Recovery control-plane state for the completed job.
-        self.restore_directives.remove(job_id);
-        self.pending_stop_after_savepoint.remove(job_id);
-        self.restore_notify_sent.retain(|(jid, _, _)| jid != job_id);
-        self.checkpoint_complete_sent
+        self.ckpt.restore_directives.remove(job_id);
+        self.ckpt.pending_stop_after_savepoint.remove(job_id);
+        self.ckpt.restore_notify_sent.retain(|(jid, _, _)| jid != job_id);
+        self.ckpt.checkpoint_complete_sent
             .retain(|(jid, _, _)| jid != job_id);
-        self.checkpoint_notify_sent
+        self.ckpt.notify_sent
             .retain(|(jid, _, _)| jid != job_id);
     }
 

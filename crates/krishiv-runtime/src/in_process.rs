@@ -143,21 +143,11 @@ impl InProcessStreamingRuntime {
             let coord = coordinator.lock().map_err(|_| RuntimeError::InvalidState {
                 message: "coordinator lock poisoned during bridge inner-state extraction".into(),
             })?;
-            let (checkpoint_coordinators, checkpoint_notify_sent, barrier_dispatch_sent) =
-                coord.checkpoint_inner_parts();
+            // Both exec and ckpt are now embedded in Coordinator; snapshot them
+            // to seed the sharded inner locks.
             (
-                Arc::new(RwLock::new(ExecutorInner {
-                    executors: coord.executors().clone(),
-                    state: coord.state(),
-                    ticks_since_restart: coord.ticks_since_restart(),
-                    recovering: coord.recovering(),
-                    notify: coord.notify().clone(),
-                })),
-                Arc::new(RwLock::new(CheckpointInner::from_parts(
-                    checkpoint_coordinators,
-                    checkpoint_notify_sent,
-                    barrier_dispatch_sent,
-                ))),
+                Arc::new(RwLock::new(coord.exec_inner_snapshot())),
+                Arc::new(RwLock::new(coord.checkpoint_inner_snapshot())),
             )
         };
         let inbox = ExecutorAssignmentInbox::new();

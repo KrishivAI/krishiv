@@ -603,7 +603,7 @@ async fn api_executor_reset(
     coordinator
         .write()
         .await
-        .executors
+        .exec.executors
         .reset_task_failures(&executor_id);
     (
         axum::http::StatusCode::OK,
@@ -1625,6 +1625,7 @@ mod parse_tests {
             coordinator
                 .write()
                 .await
+                .exec
                 .executors
                 .record_task_failure(&exec_id, threshold);
         }

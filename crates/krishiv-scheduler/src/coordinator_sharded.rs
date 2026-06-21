@@ -1,14 +1,18 @@
-//! Inner locks (ExecutorInner, CheckpointInner) are the long-term primary source
-//! of truth for executor registry and checkpoint coordinator state.
+//! `ExecutorInner` and `CheckpointInner` are the single source of truth for
+//! executor-registry and checkpoint-coordinator state respectively.
 //!
-//! The outer Coordinator maintains a snapshot for synchronous tick paths
-//! (advance_heartbeat_tick). The sync dance copies state in both directions:
-//!   outer → inner: after sync tick mutations
-//!   inner → outer: after gRPC/in-process handler mutations
+//! `Coordinator` now embeds these structs directly as `exec: ExecutorInner`
+//! and `ckpt: CheckpointInner`.  `SharedCoordinator` clones them into dedicated
+//! `RwLock`s (`executor_inner`, `checkpoint_inner`) so hot-path callers
+//! (heartbeat processing, checkpoint acks) can bypass the full coordinator lock.
 //!
-//! Full elimination of the sync dance requires making all outer Coordinator
-//! methods that access executor/checkpoint state read from the inner locks
-//! directly — deferred to avoid a larger refactor.
+//! Sync direction: after any mutation that modifies `Coordinator.exec` or
+//! `Coordinator.ckpt`, callers call
+//!   `executor_inner.clone_from(&coord.exec)`, or
+//!   `coord.checkpoint_sync_snapshot().apply_to_monotonic(&mut ckpt_inner)`
+//! to keep the sharded lock copies up to date.  Inner→outer syncing is done
+//! only by the gRPC barrier/ack paths which monotonically merge a committed
+//! epoch back into `coord.ckpt.coordinators` via `merge_checkpoint_coordinator`.
 
 use indexmap::IndexSet;
 use std::collections::{HashMap, HashSet};
@@ -87,6 +91,7 @@ impl ExecutorInner {
         self.notify.notify_waiters();
         Ok(lease_generation)
     }
+
 }
 
 /// Checkpoint-facing state guarded by a dedicated `RwLock`.
@@ -362,7 +367,7 @@ impl CheckpointSyncSnapshot {
             .retain(|(jid, _)| self.coordinators.contains_key(jid));
         // Forward-merge each outer job without regressing in-flight inner epochs.
         for (job_id, src) in &self.coordinators {
-            merge_checkpoint_coordinator(&mut inner.coordinators, &job_id, src.clone());
+            merge_checkpoint_coordinator(&mut inner.coordinators, job_id, src.clone());
         }
         // The 4 delivery-tracking fields have no monotonic invariant — full replace.
         inner.checkpoint_complete_sent = self.checkpoint_complete_sent;
@@ -372,102 +377,15 @@ impl CheckpointSyncSnapshot {
     }
 }
 
-// The sync helper functions below are transitional. Hot paths should prefer
-// the bypass fast-path methods on SharedCoordinator that operate directly on
-// the inner locks. The long-term goal is for ExecutorInner/CheckpointInner
-// (plus Notify) to be the sole source of truth.
-
-// ── Executor sync helpers (G3) ──────────────────────────────────────────────
-
-/// Synchronise executor state FROM the Coordinator fields INTO the inner lock.
-/// Call after any coordinator mutation that modifies the executor registry
-/// (register, deregister, advance_heartbeat_clock) so the inner lock's hot-path
-/// readers see consistent state.
-pub(crate) fn sync_executor_to_inner(
-    src_executors: &ExecutorRegistry,
-    src_state: CoordinatorState,
-    src_ticks: u64,
-    src_recovering: bool,
-    inner: &mut ExecutorInner,
-) {
-    inner.executors.clone_from(src_executors);
-    inner.state = src_state;
-    inner.ticks_since_restart = src_ticks;
-    inner.recovering = src_recovering;
-}
-
 // ── Checkpoint sync helpers (G3) ───────────────────────────────────────────
-
-/// Synchronise checkpoint state FROM the Coordinator fields INTO the inner lock.
-///
-/// This is the outer→inner direction and is intentionally a *full replace*: the
-/// outer `Coordinator` is authoritative for membership (job submit/evict) and
-/// for deliberate backward moves (checkpoint/savepoint restore lowers the
-/// epoch). The inner→outer direction instead uses [`merge_checkpoint_coordinator`]
-/// so a late gRPC ack can never roll the outer copy backwards.
-///
-/// NOTE (C1): a full replace here can still momentarily clobber an inner
-/// coordinator that is mid-commit (`Committing`) in the narrow window between
-/// the gRPC ack's storage I/O and its finalize. That is bounded — at worst the
-/// epoch retries — and is fully resolved only by collapsing the two copies into
-/// a single source of truth (see `docs/implementation/status.md`).
-/// Full-replace sync — retained for the restore path where a deliberate backward
-/// epoch move is required. Use [`CheckpointSyncSnapshot::apply_to`] instead when
-/// building from a `Coordinator` snapshot (it covers all 7 fields).
-#[allow(dead_code)]
-pub(crate) fn sync_checkpoint_to_inner(
-    src_coordinators: &HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
-    src_notify: &IndexSet<(krishiv_proto::JobId, ExecutorId, u64)>,
-    src_barrier: &HashSet<(krishiv_proto::JobId, u64)>,
-    inner: &mut CheckpointInner,
-) {
-    inner.coordinators.clone_from(src_coordinators);
-    inner.notify_sent.clone_from(src_notify);
-    inner.barrier_sent.clone_from(src_barrier);
-}
-
-/// Membership-aware, monotonic outer→inner checkpoint sync (C1 residual 1).
-///
-/// Used by the *periodic* sync path (`advance_heartbeat_tick`), which fires on a
-/// fixed cadence regardless of checkpoint progress and must NOT clobber an inner
-/// coordinator that a concurrent ack has already advanced further (e.g. mid
-/// `Committing`, in the window between a gRPC/barrier ack's storage I/O and its
-/// finalize). Unlike the full-replace [`sync_checkpoint_to_inner`] (which the
-/// restore path needs because restore deliberately lowers the epoch), this:
-///
-///   * adds jobs the outer has but the inner lacks (job submit while the inner
-///     is the live quorum owner),
-///   * removes jobs the outer no longer has (job evict/cancel),
-///   * for jobs in both, overwrites the inner entry *only* when the outer copy
-///     is at least as advanced by `(epoch, state_rank)` — never regressing an
-///     in-flight inner epoch.
-///
-/// `notify_sent` / `barrier_sent` are intentionally NOT replaced here: in the
-/// single-owner ack model the inner lock is authoritative for per-epoch
-/// delivery tracking, and a full replace would resurrect entries the inner
-/// cleared on quorum. Membership eviction is handled below.
-pub(crate) fn sync_checkpoint_to_inner_monotonic(
-    src_coordinators: &HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
-    inner: &mut CheckpointInner,
-) {
-    // Drop jobs the outer no longer tracks (cancel/evict). Reference only
-    // `src_coordinators` in every closure so the borrows stay disjoint.
-    inner
-        .coordinators
-        .retain(|job_id, _| src_coordinators.contains_key(job_id));
-    inner
-        .notify_sent
-        .retain(|(jid, _, _)| src_coordinators.contains_key(jid));
-    inner
-        .barrier_sent
-        .retain(|(jid, _)| src_coordinators.contains_key(jid));
-
-    // Forward-merge each outer job into the inner without regressing in-flight
-    // inner epochs.
-    for (job_id, src) in src_coordinators {
-        merge_checkpoint_coordinator(&mut inner.coordinators, job_id, src.clone());
-    }
-}
+//
+// The legacy free-function sync helpers (sync_executor_to_inner,
+// sync_checkpoint_to_inner, sync_checkpoint_to_inner_monotonic) have been
+// removed now that Coordinator embeds exec:ExecutorInner and ckpt:CheckpointInner
+// directly. Callers now do `executor_inner.clone_from(&coord.exec)` or
+// `coord.checkpoint_sync_snapshot().apply_to_monotonic(&mut ckpt_inner)`.
+// The merge helper and CheckpointSyncSnapshot are still used by grpc.rs and
+// barrier_dispatch.rs for the monotonic merge protocol (C1).
 
 /// Lexicographic checkpoint progress key: `(current_epoch, state_rank)`.
 ///

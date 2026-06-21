@@ -131,7 +131,7 @@ impl Coordinator {
     /// `Assigned` so `launch_assigned_tasks` can launch them.
     pub fn assign_pending_tasks(&mut self, job_id: &JobId) -> SchedulerResult<usize> {
         self.ensure_active()?;
-        let executors = self.executors.schedulable_executor_placements();
+        let executors = self.exec.executors.schedulable_executor_placements();
         if executors.is_empty() {
             return Err(SchedulerError::NoExecutors);
         }
@@ -324,7 +324,7 @@ impl Coordinator {
 
         self.job_input_partitions.insert(job_id.clone(), partitions);
         self.continuous_input_cycles.insert(job_id.clone());
-        self.notify.notify_waiters();
+        self.exec.notify.notify_waiters();
         Ok(())
     }
 
@@ -414,12 +414,12 @@ impl Coordinator {
         // even attempting to launch tasks to them.
         let failure_threshold = self.config.circuit_breaker_failure_threshold();
         let bad_executors: std::collections::HashSet<_> = self
-            .executors
+            .exec.executors
             .executors_over_failure_threshold(failure_threshold)
             .into_iter()
             .collect();
 
-        let mut executor_leases = self.executors.assignment_leases();
+        let mut executor_leases = self.exec.executors.assignment_leases();
         if !bad_executors.is_empty() {
             executor_leases.retain(|(eid, _)| !bad_executors.contains(eid));
             tracing::warn!(
@@ -482,7 +482,7 @@ impl Coordinator {
         let mut targets = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let endpoint = self
-                .executors
+                .exec.executors
                 .find_executor(assignment.executor_id())?
                 .descriptor()
                 .task_endpoint()
@@ -694,7 +694,7 @@ impl Coordinator {
                 for task in stage.tasks() {
                     if task.state() == TaskState::Running
                         && let Some(executor_id) = task.assigned_executor()
-                        && let Ok(record) = self.executors.find_executor(executor_id)
+                        && let Ok(record) = self.exec.executors.find_executor(executor_id)
                         && let Some(endpoint) = record.descriptor().task_endpoint()
                     {
                         let attempt_id = AttemptId::try_new(task.attempt()).map_err(|e| {

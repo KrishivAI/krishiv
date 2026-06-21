@@ -108,23 +108,17 @@ pub struct Coordinator {
     pub(crate) config: CoordinatorConfig,
     /// Active durability profile for fail-closed admission and restore paths.
     pub(crate) durability_profile: DurabilityProfile,
-    pub(crate) executors: ExecutorRegistry,
+    /// Executor-registry state (owned; mirrored into SharedCoordinator::executor_inner).
+    pub(crate) exec: crate::coordinator_sharded::ExecutorInner,
     pub(crate) store: Option<NonBlockingStoreHandle>,
-    /// Per-job checkpoint coordinators for streaming jobs with checkpoint config.
-    pub(crate) checkpoint_coordinators: HashMap<JobId, CheckpointCoordinator>,
+    /// Checkpoint coordinator state (owned; mirrored into SharedCoordinator::checkpoint_inner).
+    pub(crate) ckpt: crate::coordinator_sharded::CheckpointInner,
     /// Controls admission of new jobs.  Defaults to `InMemoryQueueManager`
     /// (always admits).  R7.1 will add quota-aware implementations.
     pub(crate) queue_manager: Arc<dyn QueueManager>,
     /// Jobs that have just reached a terminal state and need shuffle GC.
     /// Drained by the coordinator binary's tick loop.
     pub(crate) gc_ready_jobs: VecDeque<JobId>,
-    /// Number of heartbeat ticks since the last coordinator restart.
-    /// Used to implement `streaming_reattach_grace_ticks`: for this many ticks
-    /// after `recover_from_store` is called, streaming-job executors are not
-    /// evicted for missing heartbeats.
-    pub(crate) ticks_since_restart: u64,
-    /// Set to true after `recover_from_store` has been called at least once.
-    pub(crate) recovering: bool,
     /// Append-only log of adaptive decisions (hot-key split, repartition,
     /// throttle, slow-sink).  Keyed by job id.  R7.2 Group H.
     /// Uses VecDeque for O(1) front-pop when evicting oldest entries.
@@ -148,21 +142,6 @@ pub struct Coordinator {
     /// connect runs through `OnceCell::get_or_try_init` with no map lock held.
     pub(crate) executor_channels:
         Arc<DashMap<String, Arc<tokio::sync::OnceCell<tonic::transport::Channel>>>>,
-    pub(crate) checkpoint_notify_sent: indexmap::IndexSet<(JobId, ExecutorId, u64)>,
-    /// (job_id, executor_id, epoch) triples for which a checkpoint-complete
-    /// notification (transactional-sink commit signal) was already delivered.
-    pub(crate) checkpoint_complete_sent: indexmap::IndexSet<(JobId, ExecutorId, u64)>,
-    /// Active restore directives per job: every executor with tasks in the job
-    /// must reload state/offsets from the directive's epoch (global rollback).
-    pub(crate) restore_directives: HashMap<JobId, RestoreDirective>,
-    /// (job_id, executor_id, epoch) triples for which a restore directive was
-    /// already delivered.
-    pub(crate) restore_notify_sent: indexmap::IndexSet<(JobId, ExecutorId, u64)>,
-    /// Jobs that must be cancelled once their savepoint epoch commits
-    /// (stop-with-savepoint protocol).  Maps job → savepoint epoch.
-    pub(crate) pending_stop_after_savepoint: HashMap<JobId, u64>,
-    /// (job_id, epoch) pairs for which a gRPC barrier round-trip was dispatched.
-    pub(crate) barrier_dispatch_sent: HashSet<(JobId, u64)>,
     /// Inline Arrow IPC result batches keyed by job id (terminal SQL/window collect).
     pub(crate) job_inline_results: HashMap<JobId, Vec<Vec<u8>>>,
     /// Parquet tables registered for coordinated `batch-sql` jobs.
@@ -197,9 +176,6 @@ pub struct Coordinator {
     /// assigns for the next streaming cycle. Entries are removed with
     /// `evict_completed_job`.
     pub(crate) streaming_advisory_partitions: HashMap<JobId, u32>,
-
-    /// Notify channel for waking daemon tick and other waiters on state change.
-    pub(crate) notify: Arc<Notify>,
 
     /// Per-job coordinators. Each owns its JobRecord and per-job launch decisions.
     pub(crate) job_coordinators: HashMap<JobId, Arc<crate::job_coordinator::JobCoordinator>>,
@@ -299,7 +275,7 @@ impl fmt::Debug for Coordinator {
             .field("coordinator_id", &self.coordinator_id)
             .field("state", &self.state)
             .field("config", &self.config)
-            .field("executors", &self.executors)
+            .field("executors", &self.exec.executors)
             .field("job_coordinators_len", &self.job_coordinators.len())
             .field("store", &self.store.as_ref().map(|_| "<store>"))
             .field("streaming_task_index_len", &self.streaming_task_index.len())
@@ -351,19 +327,10 @@ pub struct SharedCoordinator {
 impl SharedCoordinator {
     /// Create a shared coordinator handle.
     pub fn new(coordinator: Coordinator) -> Self {
-        use crate::coordinator_sharded::{CheckpointInner, ExecutorInner};
-        let executor_inner = ExecutorInner {
-            executors: coordinator.executors.clone(),
-            state: coordinator.state,
-            ticks_since_restart: coordinator.ticks_since_restart,
-            recovering: coordinator.recovering,
-            notify: coordinator.notify.clone(),
-        };
-        let checkpoint_inner = CheckpointInner::from_parts(
-            coordinator.checkpoint_coordinators.clone(),
-            coordinator.checkpoint_notify_sent.clone(),
-            coordinator.barrier_dispatch_sent.clone(),
-        );
+        // Clone the embedded inner state into the sharded locks so the fast
+        // paths can read executor / checkpoint state without the full write lock.
+        let executor_inner = coordinator.exec.clone();
+        let checkpoint_inner = coordinator.ckpt.clone();
         let durability_profile = coordinator.durability_profile;
         Self {
             inner: Arc::new(RwLock::new(coordinator)),
@@ -408,8 +375,8 @@ impl SharedCoordinator {
         // Add the newly submitted job's checkpoint coordinator to the inner lock
         // without clobbering any *other* job's in-flight epoch (C1 residual 1).
         // apply_to_monotonic also propagates the 4 delivery-tracking fields.
-        let mut checkpoint_inner = self.checkpoint_inner.write().await;
-        snapshot.apply_to_monotonic(&mut checkpoint_inner);
+        let mut ckpt_inner = self.checkpoint_inner.write().await;
+        snapshot.apply_to_monotonic(&mut ckpt_inner);
 
         Ok(outcome)
     }
@@ -440,13 +407,7 @@ impl SharedCoordinator {
             // must see the updated executor registry and checkpoint state.
             let mut exec_inner = self.executor_inner.write().await;
             let mut ckpt_inner = self.checkpoint_inner.write().await;
-            crate::coordinator_sharded::sync_executor_to_inner(
-                &coord.executors,
-                coord.state,
-                coord.executors.current_tick,
-                coord.recovering,
-                &mut exec_inner,
-            );
+            exec_inner.clone_from(&coord.exec);
             // C1 residual 1: periodic tick must not clobber an inner checkpoint
             // coordinator a concurrent ack already advanced further. Use
             // apply_to_monotonic (monotonic for coordinators, full replace for
@@ -589,7 +550,7 @@ impl SharedCoordinator {
     /// Wait for any coordinator state change notification (executor, checkpoint, etc.).
     /// Used by the daemon tick to react promptly instead of pure periodic polling.
     pub async fn wait_for_change(&self) {
-        let notify = { self.inner.read().await.notify.clone() };
+        let notify = { self.inner.read().await.exec.notify.clone() };
         notify.notified().await;
     }
 
@@ -739,7 +700,7 @@ impl SharedCoordinator {
                         );
 
                         if newly_launched > 0 {
-                            coord.notify.notify_waiters();
+                            coord.exec.notify.notify_waiters();
                         }
                     }
                     Err(error) => {
@@ -806,7 +767,7 @@ impl SharedCoordinator {
             let span = tracing::info_span!("coordinator.task_launch_loop");
             join_handles.push(tokio::spawn(
                 async move {
-                    let notify = coord.inner.read().await.notify.clone();
+                    let notify = coord.inner.read().await.exec.notify.clone();
                     let mut interval =
                         tokio::time::interval(std::time::Duration::from_millis(500));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -939,32 +900,35 @@ impl Coordinator {
         config: CoordinatorConfig,
         state: CoordinatorState,
     ) -> Self {
+        use crate::coordinator_sharded::{CheckpointInner, ExecutorInner};
+        let notify = Arc::new(Notify::new());
+        let exec = ExecutorInner {
+            executors: ExecutorRegistry::new(
+                config.heartbeat_timeout_ticks(),
+                config.memory_threshold_bytes(),
+            ),
+            state,
+            ticks_since_restart: u64::MAX,
+            recovering: false,
+            notify: notify.clone(),
+        };
+        let mut ckpt = CheckpointInner::new();
+        ckpt.notify = notify.clone();
         Self {
             coordinator_id,
             state,
             config,
             durability_profile: DurabilityProfile::DevLocal,
-            executors: ExecutorRegistry::new(
-                config.heartbeat_timeout_ticks(),
-                config.memory_threshold_bytes(),
-            ),
+            exec,
             store: None,
-            checkpoint_coordinators: HashMap::new(),
+            ckpt,
             queue_manager: Arc::new(InMemoryQueueManager),
             gc_ready_jobs: VecDeque::new(),
-            ticks_since_restart: u64::MAX,
-            recovering: false,
             adaptive_decision_log: HashMap::new(),
             adaptive_override: AdaptiveOverrideConfig::default(),
             streaming_task_index: HashMap::new(),
             streaming_job_task_index: HashMap::new(),
             executor_channels: Arc::new(DashMap::new()),
-            checkpoint_notify_sent: indexmap::IndexSet::new(),
-            checkpoint_complete_sent: indexmap::IndexSet::new(),
-            restore_directives: HashMap::new(),
-            restore_notify_sent: indexmap::IndexSet::new(),
-            pending_stop_after_savepoint: HashMap::new(),
-            barrier_dispatch_sent: HashSet::new(),
             job_inline_results: HashMap::new(),
             batch_sql_job_tables: HashMap::new(),
             job_input_partitions: HashMap::new(),
@@ -973,7 +937,6 @@ impl Coordinator {
             skew_repartition_overrides: HashMap::new(),
             pending_source_throttles: HashMap::new(),
             streaming_advisory_partitions: HashMap::new(),
-            notify: Arc::new(Notify::new()),
             job_coordinators: HashMap::new(),
             aqe_coalesce_hints: HashMap::new(),
             pending_sink_finalize: Vec::new(),
@@ -1114,32 +1077,44 @@ impl Coordinator {
 
     /// Executor registry (used to populate sharded inner locks).
     pub fn executors(&self) -> &ExecutorRegistry {
-        &self.executors
+        &self.exec.executors
     }
 
     /// Heartbeat ticks since coordinator restart.
     pub fn ticks_since_restart(&self) -> u64 {
-        self.executors.current_tick
+        self.exec.executors.current_tick
     }
 
     /// Whether the coordinator is in recovery mode.
     pub fn recovering(&self) -> bool {
-        self.recovering
+        self.exec.recovering
     }
 
     /// Notify handle for wake-on-state-change.
     pub fn notify(&self) -> &Arc<Notify> {
-        &self.notify
+        &self.exec.notify
+    }
+
+    /// Executor-facing inner state snapshot (for constructing sharded inner locks).
+    pub fn exec_inner_snapshot(&self) -> crate::coordinator_sharded::ExecutorInner {
+        self.exec.clone()
+    }
+
+    /// Checkpoint-control inner state snapshot (for constructing sharded inner locks).
+    pub fn checkpoint_inner_snapshot(&self) -> crate::coordinator_sharded::CheckpointInner {
+        self.ckpt.clone()
     }
 
     /// Promote a standby coordinator to active leader.
     pub fn promote_to_active(&mut self) {
         self.state = CoordinatorState::Active;
+        self.exec.state = CoordinatorState::Active;
     }
 
     /// Demote to standby when leadership is lost.
     pub fn demote_to_standby(&mut self) {
         self.state = CoordinatorState::Standby;
+        self.exec.state = CoordinatorState::Standby;
     }
 
     /// Coordinator config.
@@ -1201,7 +1176,7 @@ impl Coordinator {
                     {
                         let executor_endpoint = task
                             .assigned_executor()
-                            .and_then(|eid| self.executors.find_executor(eid).ok())
+                            .and_then(|eid| self.exec.executors.find_executor(eid).ok())
                             .and_then(|rec| rec.descriptor().task_endpoint().map(str::to_owned));
                         work.push(StallCancelWork {
                             job_id: record.job_id().clone(),

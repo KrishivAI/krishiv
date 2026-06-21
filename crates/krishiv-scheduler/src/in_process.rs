@@ -140,9 +140,9 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
                 .handle_heartbeat(registry_heartbeat)
                 .map_err(status_from_scheduler_error)?;
             let mut coord = lock_coord(&self.coordinator)?;
-            coord.executors.clone_from(&inner.executors);
-            coord.state = inner.state;
-            coord.recovering = inner.recovering;
+            coord.exec.executors.clone_from(&inner.executors);
+            coord.exec.state = inner.state;
+            coord.exec.recovering = inner.recovering;
             lg
         };
 
