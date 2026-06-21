@@ -135,14 +135,21 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         }
 
         let lease_generation = {
-            let mut inner = self.executor_inner.write().await;
-            let lg = inner
-                .handle_heartbeat(registry_heartbeat)
-                .map_err(status_from_scheduler_error)?;
+            // Snapshot executor state while holding the async write guard, then
+            // drop it before acquiring the sync Mutex — holding both simultaneously
+            // risks deadlock (async T1 blocks on Mutex while sync T2 blocks on RwLock).
+            let (lg, snap) = {
+                let mut inner = self.executor_inner.write().await;
+                let lg = inner
+                    .handle_heartbeat(registry_heartbeat)
+                    .map_err(status_from_scheduler_error)?;
+                (lg, (inner.executors.clone(), inner.state, inner.recovering))
+                // async write guard drops here
+            };
             let mut coord = lock_coord(&self.coordinator)?;
-            coord.exec.executors.clone_from(&inner.executors);
-            coord.exec.state = inner.state;
-            coord.exec.recovering = inner.recovering;
+            coord.exec.executors = snap.0;
+            coord.exec.state = snap.1;
+            coord.exec.recovering = snap.2;
             lg
         };
 
@@ -284,17 +291,24 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         }
 
         // Phase 3: finalize and sync inner → outer coordinator.
-        {
+        // Clone inner state while holding the async lock, then drop the guard
+        // before acquiring the sync Mutex (prevents L1 deadlock: T1 holds async
+        // write guard and blocks on Mutex; T2 holds Mutex and waits for RwLock).
+        let (inner_snap, finalize_result) = {
             let mut inner = self.checkpoint_inner.write().await;
-            let finalize_result = if require_finalize {
+            let result = if require_finalize {
                 inner.finalize_ack(&job_id, ack_epoch)
             } else {
                 Ok(())
             };
+            (inner.clone(), result)
+            // async write guard drops here
+        };
+        {
             // Sync inner → outer coordinator to avoid dual-state drift (G3).
             // All 7 checkpoint-control fields are mirrored back.
             let mut coord = lock_coord(&self.coordinator)?;
-            coord.apply_checkpoint_inner_sync(&inner);
+            coord.apply_checkpoint_inner_sync(&inner_snap);
             if require_finalize {
                 finalize_result.map_err(|e| {
                     tonic::Status::internal(format!("checkpoint finalize failed: {e}"))

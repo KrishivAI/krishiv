@@ -403,11 +403,10 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         match restore_result {
             Ok(_meta) => {
                 // Full replace: restore deliberately lowers the epoch, so the
-                // monotonic merge is wrong here. The 7-field snapshot ensures
-                // restore_directives and related fields also propagate to inner.
-                coordinator
-                    .checkpoint_sync_snapshot()
-                    .apply_to(&mut checkpoint_inner);
+                // monotonic merge is wrong here. replace_data_from copies all 7
+                // data fields from coord.ckpt into the shard lock, preserving
+                // the shard's own notify handle.
+                checkpoint_inner.replace_data_from(&coordinator.ckpt);
                 Ok(tonic::Response::new(RestoreJobResponse {
                     accepted: true,
                     message: format!(

@@ -85,13 +85,11 @@ cargo fmt --check                       # clean
 cargo test -p krishiv-scheduler --lib   # 343 passed, 0 failed (337 + 6 new)
 ```
 
-### What's still deferred (A1/A2)
+### Status (A1/A2)
 
-Full sync-dance elimination — deleting the 6 true-duplicate fields (`executors`,
-`checkpoint_coordinators`, `ticks_since_restart`, `recovering`, etc.) from the
-outer `Coordinator` — requires changing the signature of ~40 methods that call
-`self.executors.*` / `self.checkpoint_coordinators.*` directly. Safe only with a
-workspace-wide caller migration. Documented as next major milestone.
+**Completed 2026-06-21** — see entry above. The 6 duplicate fields are gone;
+`exec: ExecutorInner` and `ckpt: CheckpointInner` are embedded directly in
+`Coordinator`. Sync dance reduced to `clone_from` / `apply_monotonic_from`.
 
 ## 2026-06-21 — Checkpoint single-owner ack path + gRPC channel pool
 
@@ -137,13 +135,11 @@ cargo fmt --check                       # clean
 cargo test -p krishiv-scheduler --lib   # 337 passed, 0 failed
 ```
 
-### Next useful task
+### Status
 
-Full A1/A2 god-object decomposition: make `ExecutorInner` and `CheckpointInner`
-sole sources of truth, delete `sync_executor_to_inner` / `sync_checkpoint_to_inner`
-/ `merge_checkpoint_coordinator`, remove duplicate fields from outer `Coordinator`.
-Gate on a distributed integration test that asserts single-epoch-commit under
-both ack transports.
+A1/A2 embedding completed 2026-06-21. `CheckpointSyncSnapshot` deleted;
+`apply_monotonic_from` / `replace_data_from` methods on `CheckpointInner`
+replace it. L1 lock-ordering fix applied in `in_process.rs`.
 
 ## 2026-06-20 — Component review fixes (C1/C2/C3/P2/P3/G1) + Coordinator decomposition decision
 
@@ -180,27 +176,17 @@ executor, dataflow, shuffle, state).
   (`coordinator_sharded.rs`) that never regresses `(epoch, state_rank)`. Unit
   tests in `coordinator_sharded::merge_tests`.
 
-### Architectural decision (A1/A2) — deferred deliberately
+### Architectural decision (A1/A2) — completed 2026-06-21
 
-The 35-field `Coordinator` god-object behind one `RwLock`, and the dual
-source-of-truth "sync dance" between the outer `Coordinator` and the sharded
-`ExecutorInner`/`CheckpointInner` locks, remain the root architectural issues.
-The correct end-state is a single source of truth (inner locks authoritative;
-outer split into `JobRegistry` / `StreamingCoordinator` / `AdaptiveCoordinator`,
-each independently locked). This is **not** being big-banged in this session:
-rewriting the distributed checkpoint protocol without the ability to run the
-distributed/integration suite here would be reckless. Instead C1 takes the safe
-incremental step (monotonic inner→outer merge). Two residual hazards are known
-and remain only fully closed by the consolidation:
+The 35-field `Coordinator` god-object has been decomposed: `exec: ExecutorInner`
+and `ckpt: CheckpointInner` are now embedded directly in `Coordinator`, and all
+duplicate fields removed. The two residual hazards from this entry have been
+closed:
 
-1. The outer→inner full-replace (`sync_checkpoint_to_inner`) can momentarily
-   clobber an inner coordinator that is mid-`Committing` in the window between a
-   gRPC ack's storage I/O and its finalize. Bounded (epoch retries); left as a
-   full replace because *restore* legitimately moves an epoch backward.
-2. Split-quorum: a single epoch's acks can arrive via both the barrier path
-   (outer) and the `checkpoint_ack` RPC (inner); if different tasks ack via
-   different transports neither copy reaches quorum alone and the epoch times
-   out and retries (safe, but degraded).
+1. Outer→inner clobber during `Committing`: resolved via `apply_monotonic_from`
+   (monotonic per-job forward merge, never regresses in-flight epochs).
+2. Split-quorum (barrier vs RPC ack paths): resolved by routing all barrier acks
+   through `checkpoint_inner.handle_ack` (same 3-phase accumulator).
 
 ### Validation
 

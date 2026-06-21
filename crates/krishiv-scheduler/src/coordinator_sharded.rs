@@ -6,13 +6,13 @@
 //! `RwLock`s (`executor_inner`, `checkpoint_inner`) so hot-path callers
 //! (heartbeat processing, checkpoint acks) can bypass the full coordinator lock.
 //!
-//! Sync direction: after any mutation that modifies `Coordinator.exec` or
-//! `Coordinator.ckpt`, callers call
-//!   `executor_inner.clone_from(&coord.exec)`, or
-//!   `coord.checkpoint_sync_snapshot().apply_to_monotonic(&mut ckpt_inner)`
-//! to keep the sharded lock copies up to date.  Inner→outer syncing is done
-//! only by the gRPC barrier/ack paths which monotonically merge a committed
-//! epoch back into `coord.ckpt.coordinators` via `merge_checkpoint_coordinator`.
+//! Sync direction (outer→inner): after mutating `Coordinator.exec` or `.ckpt`,
+//! callers use `executor_inner.clone_from(&coord.exec)` (executor registry),
+//! `ckpt_inner.apply_monotonic_from(&coord.ckpt)` (periodic/submit paths), or
+//! `ckpt_inner.replace_data_from(&coord.ckpt)` (restore path, full replace).
+//! Inner→outer syncing uses `Coordinator::apply_checkpoint_inner_sync`, called
+//! from the in-process ack path. The gRPC ack path uses `merge_checkpoint_coordinator`
+//! for per-job monotonic merges without touching other jobs.
 
 use indexmap::IndexSet;
 use std::collections::{HashMap, HashSet};
@@ -305,6 +305,46 @@ impl CheckpointInner {
         out
     }
 
+    /// Full replace of all 7 data fields from `src`, preserving `self.notify`.
+    ///
+    /// Use on the restore path where a deliberate backward epoch move is correct.
+    pub fn replace_data_from(&mut self, src: &CheckpointInner) {
+        self.coordinators.clone_from(&src.coordinators);
+        self.notify_sent.clone_from(&src.notify_sent);
+        self.barrier_sent.clone_from(&src.barrier_sent);
+        self.checkpoint_complete_sent
+            .clone_from(&src.checkpoint_complete_sent);
+        self.restore_directives.clone_from(&src.restore_directives);
+        self.restore_notify_sent.clone_from(&src.restore_notify_sent);
+        self.pending_stop_after_savepoint
+            .clone_from(&src.pending_stop_after_savepoint);
+    }
+
+    /// Monotonic merge from `src` into `self`.
+    ///
+    /// - Drops jobs absent in `src` (cancel/evict propagates).
+    /// - Forward-merges per-job coordinators without regressing in-flight epochs (C1).
+    /// - Full-replaces the 4 delivery-tracking fields (no monotonic invariant there).
+    ///
+    /// Use on the periodic tick and submit_job paths.
+    pub fn apply_monotonic_from(&mut self, src: &CheckpointInner) {
+        self.coordinators
+            .retain(|job_id, _| src.coordinators.contains_key(job_id));
+        self.notify_sent
+            .retain(|(jid, _, _)| src.coordinators.contains_key(jid));
+        self.barrier_sent
+            .retain(|(jid, _)| src.coordinators.contains_key(jid));
+        for (job_id, src_coord) in &src.coordinators {
+            merge_checkpoint_coordinator(&mut self.coordinators, job_id, src_coord.clone());
+        }
+        self.checkpoint_complete_sent
+            .clone_from(&src.checkpoint_complete_sent);
+        self.restore_directives.clone_from(&src.restore_directives);
+        self.restore_notify_sent.clone_from(&src.restore_notify_sent);
+        self.pending_stop_after_savepoint
+            .clone_from(&src.pending_stop_after_savepoint);
+    }
+
     /// Remove all checkpoint-control state for a completed/cancelled job.
     pub fn clear_job(&mut self, job_id: &JobId) {
         self.coordinators.remove(job_id);
@@ -318,73 +358,12 @@ impl CheckpointInner {
     }
 }
 
-/// Full snapshot of all 7 checkpoint-control fields for outer→inner syncs.
-///
-/// Use `apply_to` for deliberate full-replaces (restore path).
-/// Use `apply_to_monotonic` for periodic syncs that must not clobber
-/// in-flight inner epochs (submit_job, advance_heartbeat_tick — C1 residual 1).
-#[derive(Clone, Debug)]
-pub struct CheckpointSyncSnapshot {
-    pub coordinators: HashMap<JobId, CheckpointCoordinator>,
-    pub notify_sent: IndexSet<(JobId, ExecutorId, u64)>,
-    pub barrier_sent: HashSet<(JobId, u64)>,
-    pub checkpoint_complete_sent: IndexSet<(JobId, ExecutorId, u64)>,
-    pub restore_directives: HashMap<JobId, RestoreDirective>,
-    pub restore_notify_sent: IndexSet<(JobId, ExecutorId, u64)>,
-    pub pending_stop_after_savepoint: HashMap<JobId, u64>,
-}
-
-impl CheckpointSyncSnapshot {
-    /// Full replace — use only when a deliberate backward epoch move is correct
-    /// (restore path).
-    pub fn apply_to(self, inner: &mut CheckpointInner) {
-        inner.coordinators = self.coordinators;
-        inner.notify_sent = self.notify_sent;
-        inner.barrier_sent = self.barrier_sent;
-        inner.checkpoint_complete_sent = self.checkpoint_complete_sent;
-        inner.restore_directives = self.restore_directives;
-        inner.restore_notify_sent = self.restore_notify_sent;
-        inner.pending_stop_after_savepoint = self.pending_stop_after_savepoint;
-    }
-
-    /// Monotonic merge for coordinators (never regresses in-flight epochs),
-    /// full replace for the 4 delivery-tracking fields.
-    ///
-    /// Used by the periodic tick and job-submit paths (C1 residual 1 fix):
-    /// membership changes propagate, but a concurrent checkpoint ack that
-    /// already advanced an inner coordinator to `Committing` is never clobbered.
-    pub fn apply_to_monotonic(self, inner: &mut CheckpointInner) {
-        // Drop jobs no longer in the outer copy (cancel/evict).
-        inner
-            .coordinators
-            .retain(|job_id, _| self.coordinators.contains_key(job_id));
-        inner
-            .notify_sent
-            .retain(|(jid, _, _)| self.coordinators.contains_key(jid));
-        inner
-            .barrier_sent
-            .retain(|(jid, _)| self.coordinators.contains_key(jid));
-        // Forward-merge each outer job without regressing in-flight inner epochs.
-        for (job_id, src) in &self.coordinators {
-            merge_checkpoint_coordinator(&mut inner.coordinators, job_id, src.clone());
-        }
-        // The 4 delivery-tracking fields have no monotonic invariant — full replace.
-        inner.checkpoint_complete_sent = self.checkpoint_complete_sent;
-        inner.restore_directives = self.restore_directives;
-        inner.restore_notify_sent = self.restore_notify_sent;
-        inner.pending_stop_after_savepoint = self.pending_stop_after_savepoint;
-    }
-}
-
 // ── Checkpoint sync helpers (G3) ───────────────────────────────────────────
 //
-// The legacy free-function sync helpers (sync_executor_to_inner,
-// sync_checkpoint_to_inner, sync_checkpoint_to_inner_monotonic) have been
-// removed now that Coordinator embeds exec:ExecutorInner and ckpt:CheckpointInner
-// directly. Callers now do `executor_inner.clone_from(&coord.exec)` or
-// `coord.checkpoint_sync_snapshot().apply_to_monotonic(&mut ckpt_inner)`.
-// The merge helper and CheckpointSyncSnapshot are still used by grpc.rs and
-// barrier_dispatch.rs for the monotonic merge protocol (C1).
+// Outer→inner sync uses CheckpointInner::replace_data_from (full replace,
+// restore path) or CheckpointInner::apply_monotonic_from (periodic/submit paths).
+// Inner→outer sync uses Coordinator::apply_checkpoint_inner_sync.
+// Per-job monotonic merges use merge_checkpoint_coordinator (gRPC ack path).
 
 /// Lexicographic checkpoint progress key: `(current_epoch, state_rank)`.
 ///
@@ -709,18 +688,18 @@ mod checkpoint_inner_tests {
     }
 
     #[test]
-    fn snapshot_apply_to_monotonic_does_not_clobber_advanced_inner() {
+    fn apply_monotonic_from_does_not_clobber_advanced_inner() {
         let j = job("ci-snap");
-        let e = exec("ci-exec6");
         // Inner is mid-Committing on epoch 3.
         let mut inner = CheckpointInner::new();
         inner.coordinators.insert(
             j.clone(),
             coord(&j, 3, CheckpointCoordinatorState::Committing { epoch: 3 }),
         );
-        // Outer snapshot has the same job at AwaitingAcks epoch 3 (stale copy).
-        let mut outer_coords = HashMap::new();
-        outer_coords.insert(
+        // Outer has the same job at AwaitingAcks epoch 3 (stale copy) plus a
+        // restore directive that must propagate.
+        let mut outer = CheckpointInner::new();
+        outer.coordinators.insert(
             j.clone(),
             coord(
                 &j,
@@ -731,32 +710,22 @@ mod checkpoint_inner_tests {
                 },
             ),
         );
-        let mut restore = HashMap::new();
-        restore.insert(
+        outer.restore_directives.insert(
             j.clone(),
             RestoreDirective {
                 epoch: 3,
                 fencing_token: 1,
             },
         );
-        let snapshot = CheckpointSyncSnapshot {
-            coordinators: outer_coords,
-            notify_sent: IndexSet::new(),
-            barrier_sent: HashSet::new(),
-            checkpoint_complete_sent: IndexSet::new(),
-            restore_directives: restore.clone(),
-            restore_notify_sent: IndexSet::new(),
-            pending_stop_after_savepoint: HashMap::new(),
-        };
-        snapshot.apply_to_monotonic(&mut inner);
+
+        inner.apply_monotonic_from(&outer);
 
         // The Committing epoch must NOT have been clobbered by AwaitingAcks.
         assert!(matches!(
             inner.coordinators[&j].coordinator_state(),
             CheckpointCoordinatorState::Committing { epoch: 3 }
         ));
-        // The delivery-tracking fields ARE replaced.
+        // Delivery-tracking fields ARE replaced from outer.
         assert!(inner.restore_directives.contains_key(&j));
-        drop(e); // suppress unused warning
     }
 }

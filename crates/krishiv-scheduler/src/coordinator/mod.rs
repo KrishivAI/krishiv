@@ -366,17 +366,17 @@ impl SharedCoordinator {
 
     /// Submit a job through the shared coordinator and refresh sharded checkpoint state.
     pub async fn submit_job(&self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
-        let (outcome, snapshot) = {
+        let outcome = {
             let mut coord = self.inner.write().await;
-            let outcome = coord.submit_job(spec)?;
-            (outcome, coord.checkpoint_sync_snapshot())
+            coord.submit_job(spec)?
         };
 
         // Add the newly submitted job's checkpoint coordinator to the inner lock
         // without clobbering any *other* job's in-flight epoch (C1 residual 1).
-        // apply_to_monotonic also propagates the 4 delivery-tracking fields.
+        // apply_monotonic_from also propagates the 4 delivery-tracking fields.
+        let coord = self.inner.read().await;
         let mut ckpt_inner = self.checkpoint_inner.write().await;
-        snapshot.apply_to_monotonic(&mut ckpt_inner);
+        ckpt_inner.apply_monotonic_from(&coord.ckpt);
 
         Ok(outcome)
     }
@@ -409,12 +409,10 @@ impl SharedCoordinator {
             let mut ckpt_inner = self.checkpoint_inner.write().await;
             exec_inner.clone_from(&coord.exec);
             // C1 residual 1: periodic tick must not clobber an inner checkpoint
-            // coordinator a concurrent ack already advanced further. Use
-            // apply_to_monotonic (monotonic for coordinators, full replace for
-            // the 4 delivery-tracking fields).
-            coord
-                .checkpoint_sync_snapshot()
-                .apply_to_monotonic(&mut ckpt_inner);
+            // coordinator a concurrent ack already advanced further.
+            // apply_monotonic_from: monotonic for coordinators, full replace for
+            // the 4 delivery-tracking fields.
+            ckpt_inner.apply_monotonic_from(&coord.ckpt);
             lost
         };
 

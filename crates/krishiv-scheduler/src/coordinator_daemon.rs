@@ -164,7 +164,8 @@ pub fn build_shared_coordinator_sync(
 ) -> Result<SharedCoordinator, Box<dyn Error>> {
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
         .map_err(|error| format!("invalid coordinator id: {error}"))?;
-    // `mut` is required so the `recover_from_store` arms can take `&mut self`.
+    // `mut` is used by `recover_from_store` in durable backend arms; suppressed
+    // for feature configs where only the in-memory arm is reachable.
     #[allow(unused_mut)]
     let mut coord = Coordinator::active(coordinator_id);
     let coordinator = match (config.metadata_backend.as_deref(), &config.metadata_path) {

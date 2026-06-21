@@ -801,24 +801,6 @@ impl Coordinator {
         self.ckpt.coordinators.get(job_id)
     }
 
-    /// Full snapshot of all 7 checkpoint-control fields for outer→inner syncs.
-    ///
-    /// Use the returned snapshot's `apply_to` (restore path) or `apply_to_monotonic`
-    /// (periodic tick / submit_job — C1 residual 1 fix) to push state to CheckpointInner.
-    pub(crate) fn checkpoint_sync_snapshot(
-        &self,
-    ) -> crate::coordinator_sharded::CheckpointSyncSnapshot {
-        crate::coordinator_sharded::CheckpointSyncSnapshot {
-            coordinators: self.ckpt.coordinators.clone(),
-            notify_sent: self.ckpt.notify_sent.clone(),
-            barrier_sent: self.ckpt.barrier_sent.clone(),
-            checkpoint_complete_sent: self.ckpt.checkpoint_complete_sent.clone(),
-            restore_directives: self.ckpt.restore_directives.clone(),
-            restore_notify_sent: self.ckpt.restore_notify_sent.clone(),
-            pending_stop_after_savepoint: self.ckpt.pending_stop_after_savepoint.clone(),
-        }
-    }
-
     /// Mirror all checkpoint-control state FROM a `CheckpointInner` back into
     /// the embedded `self.ckpt` (inner→outer full replace, in-process ack path).
     ///

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::delta_batch::{DeltaBatch, WEIGHT_COLUMN};
@@ -137,6 +138,13 @@ impl AggState {
     }
 }
 
+/// `group_key → per-aggregation running state`.
+/// Keys are `Vec<Option<String>>` where `None` represents a SQL null group member.
+type GroupStateMap = AHashMap<Vec<Option<String>>, Vec<AggState>>;
+
+/// Before/after snapshot map used within a single `apply` tick.
+type TouchedMap = AHashMap<Vec<Option<String>>, (Option<Vec<AggState>>, ())>;
+
 // ── IncrementalAggOp ──────────────────────────────────────────────────────────
 
 /// Stateful incremental aggregate operator.
@@ -145,7 +153,7 @@ pub struct IncrementalAggOp {
     aggregations: Vec<Aggregation>,
     output_schema: SchemaRef,
     /// state[group_key] → per-aggregation running state (one entry per aggregation)
-    state: AHashMap<Vec<String>, Vec<AggState>>,
+    state: GroupStateMap,
 }
 
 impl IncrementalAggOp {
@@ -198,7 +206,7 @@ impl IncrementalAggOp {
             group_by,
             aggregations,
             output_schema,
-            state: AHashMap::new(),
+            state: GroupStateMap::default(),
         })
     }
 
@@ -232,12 +240,12 @@ impl IncrementalAggOp {
             .collect::<DeltaResult<Vec<_>>>()?;
 
         // Track which groups were touched, and their before/after states.
-        let mut touched: AHashMap<Vec<String>, (Option<Vec<AggState>>, ())> = AHashMap::new();
+        let mut touched: TouchedMap = AHashMap::new();
 
         for row in 0..data.num_rows() {
-            let group_key: Vec<String> = group_col_indices
+            let group_key: Vec<Option<String>> = group_col_indices
                 .iter()
-                .map(|&idx| scalar_to_string(data.column(idx), row))
+                .map(|&idx| scalar_to_group_key(data.column(idx), row))
                 .collect();
 
             // Record state before this row's delta
@@ -286,7 +294,7 @@ impl IncrementalAggOp {
         }
 
         // Build output: retraction of old agg + insertion of new agg for each touched group
-        let mut out_group_rows: Vec<Vec<String>> = Vec::new();
+        let mut out_group_rows: Vec<Vec<Option<String>>> = Vec::new();
         let mut out_weights: Vec<i64> = Vec::new();
         let mut agg_values: Vec<Vec<Option<f64>>> = Vec::new();
 
@@ -340,7 +348,7 @@ fn compute_agg_values(states: &[AggState], aggregations: &[Aggregation]) -> Vec<
 }
 
 fn build_output_batch(
-    group_rows: &[Vec<String>],
+    group_rows: &[Vec<Option<String>>],
     weights: &[i64],
     agg_values: &[Vec<Option<f64>>],
     group_by: &[String],
@@ -349,11 +357,22 @@ fn build_output_batch(
 ) -> DeltaResult<DeltaBatch> {
     let n_group = group_by.len();
 
-    // Build group-by columns (all as StringArray for now; TODO: typed)
+    // Build group-by columns with their native types.
+    // Group keys are stored as Option<String> (None = SQL null); cast to the
+    // output schema's declared type so downstream operators see correct types.
     let mut cols: Vec<Arc<dyn Array>> = Vec::new();
     for gi in 0..n_group {
-        let vals: Vec<Option<&str>> = group_rows.iter().map(|r| Some(r[gi].as_str())).collect();
-        cols.push(Arc::new(StringArray::from(vals)) as Arc<dyn Array>);
+        let vals: Vec<Option<&str>> = group_rows
+            .iter()
+            .map(|r| r[gi].as_deref())
+            .collect();
+        let string_col: Arc<dyn Array> = Arc::new(StringArray::from(vals));
+        let target = output_schema.field(gi).data_type();
+        if target == &DataType::Utf8 || target == &DataType::LargeUtf8 {
+            cols.push(string_col);
+        } else {
+            cols.push(compute::cast(&string_col, target)?);
+        }
     }
 
     // Build aggregate columns — Count is Int64, all others are Float64.
@@ -385,42 +404,46 @@ fn build_output_batch(
     DeltaBatch::from_weighted(inner)
 }
 
+/// Stringify a scalar for use as a group-key hash component.
+/// Returns None for SQL nulls (they hash together as a single null group).
+fn scalar_to_group_key(arr: &dyn Array, row: usize) -> Option<String> {
+    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
+    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+        return if a.is_null(row) { None } else { Some(a.value(row).to_string()) };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
+        return if a.is_null(row) { None } else { Some(a.value(row).to_string()) };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+        return if a.is_null(row) { None } else { Some(a.value(row).to_string()) };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
+        return if a.is_null(row) { None } else { Some(a.value(row).to_string()) };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        return if a.is_null(row) { None } else { Some(a.value(row).to_string()) };
+    }
+    None
+}
+
+/// Stringify a scalar for use as an aggregate input value.
+/// Returns "NULL" for SQL nulls (parsed as 0 by numeric aggregations).
 fn scalar_to_string(arr: &dyn Array, row: usize) -> String {
     use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
+        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
+        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
+        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
+        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
     }
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
+        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
     }
     "NULL".to_string()
 }
@@ -512,7 +535,9 @@ mod tests {
         op.apply(d1).unwrap();
         // Count for c1 should be 2
         assert_eq!(
-            op.state.get(&vec!["c1".to_string()]).map(|s| s[0].count),
+            op.state
+                .get(&vec![Some("c1".to_string())])
+                .map(|s| s[0].count),
             Some(2)
         );
     }

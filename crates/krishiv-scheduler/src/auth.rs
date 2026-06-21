@@ -528,7 +528,7 @@ pub struct JwtAuthProvider {
 struct JwtClaims {
     sub: String,
     #[serde(default)]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Reserved for future RBAC enforcement — deserialized but not yet consumed.
     krishiv_role: Option<String>,
 }
 
