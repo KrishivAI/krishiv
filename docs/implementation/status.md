@@ -1,5 +1,53 @@
 # Krishiv Implementation Status
 
+## 2026-06-21 — CheckpointInner becomes sole checkpoint-control authority
+
+Expanded `CheckpointInner` to carry all 7 checkpoint-control fields, making it
+the single source of truth. Fixed a latent bug where restore directives and
+stop-savepoint state set by the restore RPC never propagated to CheckpointInner.
+
+### Completed
+
+- **4 fields moved to `CheckpointInner`** (`coordinator_sharded.rs`):
+  `checkpoint_complete_sent`, `restore_directives`, `restore_notify_sent`,
+  `pending_stop_after_savepoint`. New authoritative methods on `CheckpointInner`:
+  `set_restore_directive`, `restore_directive`,
+  `pending_checkpoint_complete_for_executor`, `pending_restore_commands_for_executor`,
+  `clear_job`. Closures for executor-relevance checks avoid coupling to the outer
+  Coordinator's `job_coordinators`.
+
+- **`CheckpointSyncSnapshot`** replaces the ad-hoc 3-field sync function:
+  - `apply_to` — full replace for the restore path (deliberate backward epoch move)
+  - `apply_to_monotonic` — monotonic for coordinators + full replace for the
+    4 delivery-tracking fields; used by `submit_job` and `advance_heartbeat_tick`
+    to preserve the C1 residual 1 fix
+
+- **Latent bug fixed**: `restore_job` RPC previously only synced 3 fields to
+  inner; restore directives were never visible to `CheckpointInner`, so executor
+  heartbeats would never deliver the restore command. Now all 7 fields sync.
+
+- **`apply_checkpoint_inner_sync`** on `Coordinator` covers all 7 fields for the
+  in-process ack inner→outer sync (was only 3 fields).
+
+- **7 new unit tests** in `checkpoint_inner_tests`.
+
+### Validation
+
+```
+cargo check -p krishiv-scheduler        # clean
+cargo clippy --package krishiv-scheduler -- -D warnings  # clean
+cargo fmt --check                       # clean
+cargo test -p krishiv-scheduler --lib   # 343 passed, 0 failed (337 + 6 new)
+```
+
+### What's still deferred (A1/A2)
+
+Full sync-dance elimination — deleting the 6 true-duplicate fields (`executors`,
+`checkpoint_coordinators`, `ticks_since_restart`, `recovering`, etc.) from the
+outer `Coordinator` — requires changing the signature of ~40 methods that call
+`self.executors.*` / `self.checkpoint_coordinators.*` directly. Safe only with a
+workspace-wide caller migration. Documented as next major milestone.
+
 ## 2026-06-21 — Checkpoint single-owner ack path + gRPC channel pool
 
 Closed C1 residuals 1 and 2 from 2026-06-20 and fixed the #43/#44 gRPC
