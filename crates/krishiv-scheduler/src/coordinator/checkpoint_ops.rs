@@ -808,6 +808,43 @@ impl Coordinator {
         )
     }
 
+    /// Full snapshot of all 7 checkpoint-control fields for outer→inner syncs.
+    ///
+    /// Use the returned snapshot's `apply_to` (restore path) or `apply_to_monotonic`
+    /// (periodic tick / submit_job — C1 residual 1 fix) to push state to CheckpointInner.
+    pub(crate) fn checkpoint_sync_snapshot(
+        &self,
+    ) -> crate::coordinator_sharded::CheckpointSyncSnapshot {
+        crate::coordinator_sharded::CheckpointSyncSnapshot {
+            coordinators: self.checkpoint_coordinators.clone(),
+            notify_sent: self.checkpoint_notify_sent.clone(),
+            barrier_sent: self.barrier_dispatch_sent.clone(),
+            checkpoint_complete_sent: self.checkpoint_complete_sent.clone(),
+            restore_directives: self.restore_directives.clone(),
+            restore_notify_sent: self.restore_notify_sent.clone(),
+            pending_stop_after_savepoint: self.pending_stop_after_savepoint.clone(),
+        }
+    }
+
+    /// Mirror all checkpoint-control state FROM a `CheckpointInner` back into
+    /// the outer `Coordinator` (inner→outer full replace, in-process ack path).
+    pub(crate) fn apply_checkpoint_inner_sync(
+        &mut self,
+        inner: &crate::coordinator_sharded::CheckpointInner,
+    ) {
+        self.checkpoint_coordinators.clone_from(&inner.coordinators);
+        self.checkpoint_notify_sent.clone_from(&inner.notify_sent);
+        self.barrier_dispatch_sent.clone_from(&inner.barrier_sent);
+        self.checkpoint_complete_sent
+            .clone_from(&inner.checkpoint_complete_sent);
+        self.restore_directives
+            .clone_from(&inner.restore_directives);
+        self.restore_notify_sent
+            .clone_from(&inner.restore_notify_sent);
+        self.pending_stop_after_savepoint
+            .clone_from(&inner.pending_stop_after_savepoint);
+    }
+
     /// Mutable access to the checkpoint coordinator for a specific job.
     pub fn checkpoint_coordinator_mut(
         &mut self,

@@ -399,21 +399,17 @@ impl SharedCoordinator {
 
     /// Submit a job through the shared coordinator and refresh sharded checkpoint state.
     pub async fn submit_job(&self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
-        let (outcome, checkpoint_coordinators) = {
+        let (outcome, snapshot) = {
             let mut coord = self.inner.write().await;
             let outcome = coord.submit_job(spec)?;
-            (outcome, coord.checkpoint_coordinators.clone())
+            (outcome, coord.checkpoint_sync_snapshot())
         };
 
         // Add the newly submitted job's checkpoint coordinator to the inner lock
-        // without clobbering any *other* job's in-flight epoch the inner may be
-        // mid-committing (C1 residual 1). A new job has no inner entry yet, so
-        // the monotonic merge simply inserts it.
+        // without clobbering any *other* job's in-flight epoch (C1 residual 1).
+        // apply_to_monotonic also propagates the 4 delivery-tracking fields.
         let mut checkpoint_inner = self.checkpoint_inner.write().await;
-        crate::coordinator_sharded::sync_checkpoint_to_inner_monotonic(
-            &checkpoint_coordinators,
-            &mut checkpoint_inner,
-        );
+        snapshot.apply_to_monotonic(&mut checkpoint_inner);
 
         Ok(outcome)
     }
@@ -451,16 +447,13 @@ impl SharedCoordinator {
                 coord.recovering,
                 &mut exec_inner,
             );
-            // C1 residual 1: the periodic tick fires on a fixed cadence and must
-            // not clobber an inner checkpoint coordinator that a concurrent ack
-            // has already advanced further (mid-`Committing`). Use the
-            // membership-aware monotonic merge instead of a full replace; the
-            // restore/savepoint paths keep the full-replace semantics where a
-            // deliberate backward epoch move is required.
-            crate::coordinator_sharded::sync_checkpoint_to_inner_monotonic(
-                &coord.checkpoint_coordinators,
-                &mut ckpt_inner,
-            );
+            // C1 residual 1: periodic tick must not clobber an inner checkpoint
+            // coordinator a concurrent ack already advanced further. Use
+            // apply_to_monotonic (monotonic for coordinators, full replace for
+            // the 4 delivery-tracking fields).
+            coord
+                .checkpoint_sync_snapshot()
+                .apply_to_monotonic(&mut ckpt_inner);
             lost
         };
 

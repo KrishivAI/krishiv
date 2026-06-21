@@ -292,12 +292,9 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
                 Ok(())
             };
             // Sync inner → outer coordinator to avoid dual-state drift (G3).
+            // All 7 checkpoint-control fields are mirrored back.
             let mut coord = lock_coord(&self.coordinator)?;
-            coord
-                .checkpoint_coordinators
-                .clone_from(&inner.coordinators);
-            coord.checkpoint_notify_sent.clone_from(&inner.notify_sent);
-            coord.barrier_dispatch_sent.clone_from(&inner.barrier_sent);
+            coord.apply_checkpoint_inner_sync(&inner);
             if require_finalize {
                 finalize_result.map_err(|e| {
                     tonic::Status::internal(format!("checkpoint finalize failed: {e}"))

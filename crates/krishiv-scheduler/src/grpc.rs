@@ -408,12 +408,12 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         };
         match restore_result {
             Ok(_meta) => {
-                crate::coordinator_sharded::sync_checkpoint_to_inner(
-                    &coordinator.checkpoint_coordinators,
-                    &coordinator.checkpoint_notify_sent,
-                    &coordinator.barrier_dispatch_sent,
-                    &mut checkpoint_inner,
-                );
+                // Full replace: restore deliberately lowers the epoch, so the
+                // monotonic merge is wrong here. The 7-field snapshot ensures
+                // restore_directives and related fields also propagate to inner.
+                coordinator
+                    .checkpoint_sync_snapshot()
+                    .apply_to(&mut checkpoint_inner);
                 Ok(tonic::Response::new(RestoreJobResponse {
                     accepted: true,
                     message: format!(

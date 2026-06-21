@@ -15,11 +15,24 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState, PendingCommit};
+use crate::coordinator::RestoreDirective;
 use crate::heartbeat::ExecutorRegistry;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CoordinatorState, ExecutorId, JobId,
 };
 use tokio::sync::Notify;
+
+/// Maximum entries in a checkpoint sent-tracking set before old entries are evicted.
+const MAX_CHECKPOINT_NOTIFY_ENTRIES: usize = 10_000;
+
+fn prune_sent_set(set: &mut IndexSet<(JobId, ExecutorId, u64)>) {
+    while set.len() > MAX_CHECKPOINT_NOTIFY_ENTRIES {
+        let Some(oldest) = set.get_index(0).cloned() else {
+            break;
+        };
+        set.shift_remove(&oldest);
+    }
+}
 
 /// Executor-facing state guarded by a dedicated `RwLock`.
 #[derive(Clone, Debug)]
@@ -77,11 +90,25 @@ impl ExecutorInner {
 }
 
 /// Checkpoint-facing state guarded by a dedicated `RwLock`.
+///
+/// This is the authoritative source for checkpoint-control state. All checkpoint
+/// ack processing, restore directives, and completion notifications are managed here.
 #[derive(Clone, Debug, Default)]
 pub struct CheckpointInner {
     pub coordinators: HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
     pub notify_sent: IndexSet<(krishiv_proto::JobId, ExecutorId, u64)>,
     pub barrier_sent: HashSet<(krishiv_proto::JobId, u64)>,
+    /// (job_id, executor_id, epoch) triples for which a checkpoint-complete
+    /// notification (transactional-sink commit signal) was already delivered.
+    pub checkpoint_complete_sent: IndexSet<(krishiv_proto::JobId, ExecutorId, u64)>,
+    /// Active restore directives per job: every executor with tasks in the job
+    /// must reload state/offsets from the directive's epoch (global rollback).
+    pub restore_directives: HashMap<krishiv_proto::JobId, RestoreDirective>,
+    /// (job_id, executor_id, epoch) triples for which a restore directive was
+    /// already delivered.
+    pub restore_notify_sent: IndexSet<(krishiv_proto::JobId, ExecutorId, u64)>,
+    /// Jobs that must be cancelled once their savepoint epoch commits.
+    pub pending_stop_after_savepoint: HashMap<krishiv_proto::JobId, u64>,
     /// Notify for checkpoint-related state changes (acks, epoch advances).
     pub notify: Arc<Notify>,
 }
@@ -100,6 +127,10 @@ impl CheckpointInner {
             coordinators,
             notify_sent,
             barrier_sent,
+            checkpoint_complete_sent: IndexSet::new(),
+            restore_directives: HashMap::new(),
+            restore_notify_sent: IndexSet::new(),
+            pending_stop_after_savepoint: HashMap::new(),
             notify: Arc::new(Notify::new()),
         }
     }
@@ -178,6 +209,167 @@ impl CheckpointInner {
         self.barrier_sent
             .retain(|(jid, e)| jid != job_id || *e != epoch);
     }
+
+    /// Record a restore directive for a job and reset delivery tracking.
+    pub fn set_restore_directive(&mut self, job_id: &JobId, directive: RestoreDirective) {
+        self.restore_directives.insert(job_id.clone(), directive);
+        self.restore_notify_sent.retain(|(jid, _, _)| jid != job_id);
+        // Re-deliver completion signal: an executor that restored may hold
+        // prepared transactions that must be committed.
+        self.checkpoint_complete_sent
+            .retain(|(jid, _, _)| jid != job_id);
+        self.notify.notify_waiters();
+    }
+
+    /// Active restore directive for a job, if any.
+    pub fn restore_directive(&self, job_id: &JobId) -> Option<RestoreDirective> {
+        self.restore_directives.get(job_id).copied()
+    }
+
+    /// Checkpoint-complete notifications to deliver to `executor_id`.
+    ///
+    /// `is_running` reports whether `executor_id` owns a running task in the job
+    /// (supplied by the caller from `job_coordinators`).
+    pub fn pending_checkpoint_complete_for_executor(
+        &mut self,
+        executor_id: &ExecutorId,
+        mut is_running: impl FnMut(&JobId) -> bool,
+    ) -> Vec<krishiv_proto::CheckpointCompleteCommand> {
+        let mut out = Vec::new();
+        for (job_id, coord) in &self.coordinators {
+            let Some(epoch) = coord.committed_epoch() else {
+                continue;
+            };
+            if epoch == 0 || !is_running(job_id) {
+                continue;
+            }
+            let key = (job_id.clone(), executor_id.clone(), epoch);
+            if self.checkpoint_complete_sent.contains(&key) {
+                continue;
+            }
+            out.push(krishiv_proto::CheckpointCompleteCommand {
+                job_id: job_id.clone(),
+                epoch,
+                fencing_token: coord.fencing_token(),
+            });
+            self.checkpoint_complete_sent.insert(key);
+            prune_sent_set(&mut self.checkpoint_complete_sent);
+        }
+        out
+    }
+
+    /// Restore directives to deliver to `executor_id`.
+    ///
+    /// `is_active` reports whether `executor_id` owns a running or assigned task
+    /// in the job (supplied by the caller from `job_coordinators`).
+    pub fn pending_restore_commands_for_executor(
+        &mut self,
+        executor_id: &ExecutorId,
+        mut is_active: impl FnMut(&JobId) -> bool,
+    ) -> Vec<krishiv_proto::RestoreFromCheckpointCommand> {
+        let mut out = Vec::new();
+        let directives: Vec<(JobId, RestoreDirective)> = self
+            .restore_directives
+            .iter()
+            .map(|(job_id, directive)| (job_id.clone(), *directive))
+            .collect();
+        for (job_id, directive) in directives {
+            if !is_active(&job_id) {
+                continue;
+            }
+            let key = (job_id.clone(), executor_id.clone(), directive.epoch);
+            if self.restore_notify_sent.contains(&key) {
+                continue;
+            }
+            let Ok(fencing_token) = krishiv_proto::FencingToken::try_new(directive.fencing_token)
+            else {
+                tracing::error!(
+                    job_id = %job_id,
+                    epoch = directive.epoch,
+                    "restore directive carries a zero fencing token; dropping"
+                );
+                continue;
+            };
+            out.push(krishiv_proto::RestoreFromCheckpointCommand {
+                job_id: job_id.clone(),
+                epoch: directive.epoch,
+                fencing_token,
+            });
+            self.restore_notify_sent.insert(key);
+            prune_sent_set(&mut self.restore_notify_sent);
+        }
+        out
+    }
+
+    /// Remove all checkpoint-control state for a completed/cancelled job.
+    pub fn clear_job(&mut self, job_id: &JobId) {
+        self.coordinators.remove(job_id);
+        self.restore_directives.remove(job_id);
+        self.pending_stop_after_savepoint.remove(job_id);
+        self.restore_notify_sent.retain(|(jid, _, _)| jid != job_id);
+        self.checkpoint_complete_sent
+            .retain(|(jid, _, _)| jid != job_id);
+        self.notify_sent.retain(|(jid, _, _)| jid != job_id);
+        self.barrier_sent.retain(|(jid, _)| jid != job_id);
+    }
+}
+
+/// Full snapshot of all 7 checkpoint-control fields for outer→inner syncs.
+///
+/// Use `apply_to` for deliberate full-replaces (restore path).
+/// Use `apply_to_monotonic` for periodic syncs that must not clobber
+/// in-flight inner epochs (submit_job, advance_heartbeat_tick — C1 residual 1).
+#[derive(Clone, Debug)]
+pub struct CheckpointSyncSnapshot {
+    pub coordinators: HashMap<JobId, CheckpointCoordinator>,
+    pub notify_sent: IndexSet<(JobId, ExecutorId, u64)>,
+    pub barrier_sent: HashSet<(JobId, u64)>,
+    pub checkpoint_complete_sent: IndexSet<(JobId, ExecutorId, u64)>,
+    pub restore_directives: HashMap<JobId, RestoreDirective>,
+    pub restore_notify_sent: IndexSet<(JobId, ExecutorId, u64)>,
+    pub pending_stop_after_savepoint: HashMap<JobId, u64>,
+}
+
+impl CheckpointSyncSnapshot {
+    /// Full replace — use only when a deliberate backward epoch move is correct
+    /// (restore path).
+    pub fn apply_to(self, inner: &mut CheckpointInner) {
+        inner.coordinators = self.coordinators;
+        inner.notify_sent = self.notify_sent;
+        inner.barrier_sent = self.barrier_sent;
+        inner.checkpoint_complete_sent = self.checkpoint_complete_sent;
+        inner.restore_directives = self.restore_directives;
+        inner.restore_notify_sent = self.restore_notify_sent;
+        inner.pending_stop_after_savepoint = self.pending_stop_after_savepoint;
+    }
+
+    /// Monotonic merge for coordinators (never regresses in-flight epochs),
+    /// full replace for the 4 delivery-tracking fields.
+    ///
+    /// Used by the periodic tick and job-submit paths (C1 residual 1 fix):
+    /// membership changes propagate, but a concurrent checkpoint ack that
+    /// already advanced an inner coordinator to `Committing` is never clobbered.
+    pub fn apply_to_monotonic(self, inner: &mut CheckpointInner) {
+        // Drop jobs no longer in the outer copy (cancel/evict).
+        inner
+            .coordinators
+            .retain(|job_id, _| self.coordinators.contains_key(job_id));
+        inner
+            .notify_sent
+            .retain(|(jid, _, _)| self.coordinators.contains_key(jid));
+        inner
+            .barrier_sent
+            .retain(|(jid, _)| self.coordinators.contains_key(jid));
+        // Forward-merge each outer job without regressing in-flight inner epochs.
+        for (job_id, src) in &self.coordinators {
+            merge_checkpoint_coordinator(&mut inner.coordinators, &job_id, src.clone());
+        }
+        // The 4 delivery-tracking fields have no monotonic invariant — full replace.
+        inner.checkpoint_complete_sent = self.checkpoint_complete_sent;
+        inner.restore_directives = self.restore_directives;
+        inner.restore_notify_sent = self.restore_notify_sent;
+        inner.pending_stop_after_savepoint = self.pending_stop_after_savepoint;
+    }
 }
 
 // The sync helper functions below are transitional. Hot paths should prefer
@@ -219,6 +411,10 @@ pub(crate) fn sync_executor_to_inner(
 /// the gRPC ack's storage I/O and its finalize. That is bounded — at worst the
 /// epoch retries — and is fully resolved only by collapsing the two copies into
 /// a single source of truth (see `docs/implementation/status.md`).
+/// Full-replace sync — retained for the restore path where a deliberate backward
+/// epoch move is required. Use [`CheckpointSyncSnapshot::apply_to`] instead when
+/// building from a `Coordinator` snapshot (it covers all 7 fields).
+#[allow(dead_code)]
 pub(crate) fn sync_checkpoint_to_inner(
     src_coordinators: &HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
     src_notify: &IndexSet<(krishiv_proto::JobId, ExecutorId, u64)>,
@@ -456,5 +652,194 @@ mod merge_tests {
             dst[&job].coordinator_state(),
             CheckpointCoordinatorState::Committed { epoch: 2 }
         ));
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_inner_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn coord(job: &JobId, epoch: u64, state: CheckpointCoordinatorState) -> CheckpointCoordinator {
+        let storage: Arc<dyn krishiv_state::checkpoint::CheckpointStorage> =
+            Arc::new(krishiv_state::checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap());
+        let mut c = CheckpointCoordinator::new_for_test(job.clone(), storage, 1_000, 1);
+        c.current_epoch = epoch;
+        c.state = state;
+        c
+    }
+
+    fn job(id: &str) -> JobId {
+        JobId::try_new(id).unwrap()
+    }
+
+    fn exec(id: &str) -> ExecutorId {
+        ExecutorId::try_new(id).unwrap()
+    }
+
+    #[test]
+    fn set_restore_directive_records_and_resets_tracking() {
+        let j = job("ci-restore");
+        let e = exec("ci-exec");
+        let mut inner = CheckpointInner::new();
+        inner.restore_notify_sent.insert((j.clone(), e.clone(), 1));
+        inner
+            .checkpoint_complete_sent
+            .insert((j.clone(), e.clone(), 1));
+
+        inner.set_restore_directive(
+            &j,
+            RestoreDirective {
+                epoch: 7,
+                fencing_token: 3,
+            },
+        );
+
+        assert_eq!(inner.restore_directive(&j).map(|d| d.epoch), Some(7));
+        assert!(inner.restore_notify_sent.is_empty());
+        assert!(inner.checkpoint_complete_sent.is_empty());
+    }
+
+    #[test]
+    fn pending_restore_commands_dedupes_and_respects_relevance() {
+        let j = job("ci-restore2");
+        let e = exec("ci-exec2");
+        let mut inner = CheckpointInner::new();
+        inner.set_restore_directive(
+            &j,
+            RestoreDirective {
+                epoch: 5,
+                fencing_token: 2,
+            },
+        );
+
+        let none = inner.pending_restore_commands_for_executor(&e, |_| false);
+        assert!(none.is_empty());
+
+        let first = inner.pending_restore_commands_for_executor(&e, |_| true);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].epoch, 5);
+        let second = inner.pending_restore_commands_for_executor(&e, |_| true);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn pending_restore_commands_drops_zero_fencing_token() {
+        let j = job("ci-restore3");
+        let e = exec("ci-exec3");
+        let mut inner = CheckpointInner::new();
+        inner.restore_directives.insert(
+            j.clone(),
+            RestoreDirective {
+                epoch: 5,
+                fencing_token: 0,
+            },
+        );
+        let cmds = inner.pending_restore_commands_for_executor(&e, |_| true);
+        assert!(cmds.is_empty(), "zero fencing token must be dropped");
+    }
+
+    #[test]
+    fn pending_checkpoint_complete_dedupes_committed_epoch() {
+        let j = job("ci-complete");
+        let e = exec("ci-exec4");
+        let mut inner = CheckpointInner::new();
+        inner.coordinators.insert(
+            j.clone(),
+            coord(&j, 4, CheckpointCoordinatorState::Committed { epoch: 4 }),
+        );
+
+        let first = inner.pending_checkpoint_complete_for_executor(&e, |_| true);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].epoch, 4);
+        let second = inner.pending_checkpoint_complete_for_executor(&e, |_| true);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn clear_job_removes_all_control_state() {
+        let j = job("ci-clear");
+        let e = exec("ci-exec5");
+        let mut inner = CheckpointInner::new();
+        inner.coordinators.insert(
+            j.clone(),
+            coord(&j, 1, CheckpointCoordinatorState::Committed { epoch: 1 }),
+        );
+        inner.restore_directives.insert(
+            j.clone(),
+            RestoreDirective {
+                epoch: 1,
+                fencing_token: 1,
+            },
+        );
+        inner.pending_stop_after_savepoint.insert(j.clone(), 1);
+        inner.restore_notify_sent.insert((j.clone(), e.clone(), 1));
+        inner
+            .checkpoint_complete_sent
+            .insert((j.clone(), e.clone(), 1));
+        inner.notify_sent.insert((j.clone(), e.clone(), 1));
+        inner.barrier_sent.insert((j.clone(), 1));
+
+        inner.clear_job(&j);
+
+        assert!(inner.coordinators.is_empty());
+        assert!(inner.restore_directives.is_empty());
+        assert!(inner.pending_stop_after_savepoint.is_empty());
+        assert!(inner.restore_notify_sent.is_empty());
+        assert!(inner.checkpoint_complete_sent.is_empty());
+        assert!(inner.notify_sent.is_empty());
+        assert!(inner.barrier_sent.is_empty());
+    }
+
+    #[test]
+    fn snapshot_apply_to_monotonic_does_not_clobber_advanced_inner() {
+        let j = job("ci-snap");
+        let e = exec("ci-exec6");
+        // Inner is mid-Committing on epoch 3.
+        let mut inner = CheckpointInner::new();
+        inner.coordinators.insert(
+            j.clone(),
+            coord(&j, 3, CheckpointCoordinatorState::Committing { epoch: 3 }),
+        );
+        // Outer snapshot has the same job at AwaitingAcks epoch 3 (stale copy).
+        let mut outer_coords = HashMap::new();
+        outer_coords.insert(
+            j.clone(),
+            coord(
+                &j,
+                3,
+                CheckpointCoordinatorState::AwaitingAcks {
+                    epoch: 3,
+                    initiated_at_ms: 0,
+                },
+            ),
+        );
+        let mut restore = HashMap::new();
+        restore.insert(
+            j.clone(),
+            RestoreDirective {
+                epoch: 3,
+                fencing_token: 1,
+            },
+        );
+        let snapshot = CheckpointSyncSnapshot {
+            coordinators: outer_coords,
+            notify_sent: IndexSet::new(),
+            barrier_sent: HashSet::new(),
+            checkpoint_complete_sent: IndexSet::new(),
+            restore_directives: restore.clone(),
+            restore_notify_sent: IndexSet::new(),
+            pending_stop_after_savepoint: HashMap::new(),
+        };
+        snapshot.apply_to_monotonic(&mut inner);
+
+        // The Committing epoch must NOT have been clobbered by AwaitingAcks.
+        assert!(matches!(
+            inner.coordinators[&j].coordinator_state(),
+            CheckpointCoordinatorState::Committing { epoch: 3 }
+        ));
+        // The delivery-tracking fields ARE replaced.
+        assert!(inner.restore_directives.contains_key(&j));
+        drop(e); // suppress unused warning
     }
 }
