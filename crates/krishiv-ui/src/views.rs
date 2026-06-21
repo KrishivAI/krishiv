@@ -122,6 +122,10 @@ pub struct JobSummaryView {
     pub namespace_id: Option<String>,
     /// Accumulated resource consumption from completed tasks.
     pub resource_usage: ResourceUsageView,
+    /// Total shuffle bytes written across all stages.
+    pub shuffle_bytes_written: u64,
+    /// Total shuffle partitions currently marked Available.
+    pub shuffle_partitions_available: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -213,6 +217,18 @@ pub struct ExecutorView {
     pub memory_limit_bytes: Option<u64>,
     /// Active task count as reported by the last heartbeat, if any.
     pub active_task_count: Option<u32>,
+    /// Consecutive task failure count (circuit-breaker input).
+    pub consecutive_task_failures: u32,
+    /// Task assignment endpoint display (empty string when not available).
+    pub task_endpoint_display: String,
+    /// Barrier service endpoint display (empty string when not available).
+    pub barrier_endpoint_display: String,
+    /// Memory utilization percentage (0-100), or None if not available.
+    pub memory_used_pct: Option<u64>,
+    /// Heartbeat age in scheduler ticks.
+    pub heartbeat_age_ticks: u64,
+    /// Slots in use (running task count).
+    pub slots_used: usize,
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {

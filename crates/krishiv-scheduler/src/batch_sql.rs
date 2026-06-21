@@ -59,7 +59,7 @@ pub async fn execute_batch_sql_coordinated(
 
     let notify = {
         let coord = coordinator.read().await;
-        coord.notify.clone()
+        coord.notify().clone()
     };
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
@@ -133,7 +133,7 @@ pub async fn execute_batch_sql_sink_coordinated(
 
     let notify = {
         let coord = coordinator.read().await;
-        coord.notify.clone()
+        coord.notify().clone()
     };
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);

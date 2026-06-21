@@ -347,7 +347,7 @@ fn checkpoint_coordinator_rejects_non_quorum_ack_as_stale_epoch() {
     coordinator.submit_job(spec).unwrap();
 
     // Store the notify count before the ack.
-    let notify_count_before = coordinator.checkpoint_notify_sent.len();
+    let notify_count_before = coordinator.ckpt.notify_sent.len();
 
     // Initiate an epoch — expected_task_count = 2.
     {
@@ -371,7 +371,7 @@ fn checkpoint_coordinator_rejects_non_quorum_ack_as_stale_epoch() {
 
     // Notify entries must NOT have been cleared by a non-quorum ack.
     assert_eq!(
-        coordinator.checkpoint_notify_sent.len(),
+        coordinator.ckpt.notify_sent.len(),
         notify_count_before,
         "non-quorum ack must not clear checkpoint_notify_sent"
     );
@@ -612,7 +612,7 @@ fn circuit_breaker_clears_assignments_synchronously() {
     let threshold = coordinator.config.circuit_breaker_failure_threshold();
     let mut exceeded = false;
     for _ in 0..threshold {
-        exceeded = coordinator.executors.record_task_failure(&exec_id, threshold);
+        exceeded = coordinator.exec.executors.record_task_failure(&exec_id, threshold);
     }
     assert!(exceeded, "circuit breaker must trip after threshold failures");
 

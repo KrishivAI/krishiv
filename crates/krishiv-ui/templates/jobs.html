@@ -52,7 +52,8 @@
               <th>Succeeded</th>
               <th>Failed</th>
               <th>Priority</th>
-              <th>CPU (ns)</th>
+              <th>Memory</th>
+              <th>Shuffle</th>
             </tr>
           </thead>
           <tbody>
@@ -89,7 +90,23 @@
               <td class="td-mono">{{ job.succeeded_task_count }}</td>
               <td class="td-mono">{% if job.failed_task_count > 0 %}<strong style="color: var(--error);">{{ job.failed_task_count }}</strong>{% else %}{{ job.failed_task_count }}{% endif %}</td>
               <td><span class="tag">{{ job.priority }}</span></td>
-              <td class="td-mono">{{ job.resource_usage.cpu_nanos }}</td>
+              <td class="td-mono">
+                {% if job.resource_usage.memory_total_bytes > 0 %}
+                  {{ job.resource_usage.memory_total_bytes / 1048576 }} MB
+                {% else %}
+                  &mdash;
+                {% endif %}
+              </td>
+              <td class="td-mono">
+                {% if job.shuffle_bytes_written > 0 %}
+                  {{ job.shuffle_bytes_written / 1048576 }} MB
+                  {% if job.shuffle_partitions_available > 0 %}
+                    <span style="color: var(--text-soft);">({{ job.shuffle_partitions_available }} parts)</span>
+                  {% endif %}
+                {% else %}
+                  &mdash;
+                {% endif %}
+              </td>
             </tr>
             {% endfor %}
           </tbody>
@@ -125,6 +142,7 @@
               <th>Running Tasks</th>
               <th>Heartbeat</th>
               <th>Memory</th>
+              <th>Failures</th>
             </tr>
           </thead>
           <tbody>
@@ -147,6 +165,7 @@
               <td class="td-mono">{{ executor.running_tasks.len() }}</td>
               <td class="td-mono">{{ executor.last_heartbeat_tick }}</td>
               <td class="td-mono">{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB{% else %}&mdash;{% endif %}</td>
+              <td class="td-mono">{% if executor.consecutive_task_failures > 0 %}<strong style="color: var(--error);">{{ executor.consecutive_task_failures }}</strong>{% else %}0{% endif %}</td>
             </tr>
             {% endfor %}
           </tbody>

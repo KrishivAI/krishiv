@@ -1,5 +1,50 @@
 # Krishiv Implementation Status
 
+## 2026-06-21 — Eliminate sync-dance: Coordinator embeds ExecutorInner/CheckpointInner
+
+Removed 6 duplicate fields from `Coordinator` by making it embed `exec:
+ExecutorInner` and `ckpt: CheckpointInner` directly. All `self.executors`,
+`self.checkpoint_coordinators`, `self.checkpoint_notify_sent`,
+`self.barrier_dispatch_sent`, `self.ticks_since_restart`, and `self.recovering`
+accesses throughout the codebase were migrated to `self.exec.*` / `self.ckpt.*`.
+
+### Completed
+
+- **6 fields removed from `Coordinator`** (`coordinator/mod.rs`): executor
+  registry, checkpoint coordinators, 2 tracking sets, 2 tick/recovery flags.
+  Replaced by embedded `exec: ExecutorInner` and `ckpt: CheckpointInner`.
+
+- **41 `Coordinator` methods updated** across `executor_ops.rs`,
+  `checkpoint_ops.rs`, `job_lifecycle.rs`, `recovery.rs`, `snapshots.rs`,
+  `task_assignment.rs`, `observability.rs`, `barrier_dispatch.rs`.
+
+- **All external callers updated**: `grpc.rs`, `barrier_dispatch.rs`,
+  `batch_sql.rs`, `bounded_window.rs`, `coordinator_daemon.rs`,
+  `in_process.rs`, and all `.rs.inc` test section files.
+
+- **Dead sync helpers removed** from `coordinator_sharded.rs`:
+  `sync_executor_to_inner`, `sync_checkpoint_to_inner`,
+  `sync_checkpoint_to_inner_monotonic`, `sync_from_coordinator`.
+  Also removed `checkpoint_inner_parts` type alias.
+
+- **`SharedCoordinator::new`** now seeds the sharded locks by cloning
+  `coordinator.exec` and `coordinator.ckpt` directly — no separate manual
+  field enumeration.
+
+### Validation
+
+```
+cargo check -p krishiv-scheduler        # clean
+cargo test -p krishiv-scheduler --lib   # 343 passed, 0 failed
+```
+
+### Next milestone
+
+Update the module doc comment to reflect that `Coordinator.exec` and
+`Coordinator.ckpt` ARE the inner locks (owned copies), not snapshots.
+The "sync dance" for the sharded locks is now `clone_from`, not a
+field-by-field copy.
+
 ## 2026-06-21 — CheckpointInner becomes sole checkpoint-control authority
 
 Expanded `CheckpointInner` to carry all 7 checkpoint-control fields, making it

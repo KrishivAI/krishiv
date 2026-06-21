@@ -32,7 +32,10 @@ impl Coordinator {
         lease_generation: LeaseGeneration,
     ) -> SchedulerResult<LeaseGeneration> {
         self.ensure_active()?;
-        let res = self.exec.executors.deregister(executor_id, lease_generation);
+        let res = self
+            .exec
+            .executors
+            .deregister(executor_id, lease_generation);
         if res.is_ok() {
             // Evict the executor's gRPC channel so stale TCP connections
             // do not leak (Phase 1.3).
@@ -278,9 +281,11 @@ impl Coordinator {
             };
             if let CheckpointCoordinatorState::AwaitingAcks { epoch, .. } = coord.state {
                 coord.abort_epoch(&format!("executor {lost_id} lost during epoch {epoch}"));
-                self.ckpt.notify_sent
+                self.ckpt
+                    .notify_sent
                     .retain(|(jid, _, e)| jid != &job_id || *e != epoch);
-                self.ckpt.barrier_sent
+                self.ckpt
+                    .barrier_sent
                     .retain(|(jid, e)| jid != &job_id || *e != epoch);
                 tracing::warn!(
                     job_id = %job_id,
@@ -392,14 +397,13 @@ impl Coordinator {
             // checkpoint_notify_sent and barrier_dispatch_sent entries for the
             // aborted epoch so they don't accumulate forever and block future
             // checkpoint rounds.
-            let pre_tick_awaiting: Option<u64> =
-                self.ckpt.coordinators.get(job_id).and_then(|c| {
-                    if let CheckpointCoordinatorState::AwaitingAcks { epoch, .. } = &c.state {
-                        Some(*epoch)
-                    } else {
-                        None
-                    }
-                });
+            let pre_tick_awaiting: Option<u64> = self.ckpt.coordinators.get(job_id).and_then(|c| {
+                if let CheckpointCoordinatorState::AwaitingAcks { epoch, .. } = &c.state {
+                    Some(*epoch)
+                } else {
+                    None
+                }
+            });
 
             if let Some(coord) = self.ckpt.coordinators.get_mut(job_id) {
                 coord.set_expected_task_count(running);
@@ -416,15 +420,16 @@ impl Coordinator {
             //   - barrier_dispatch_sent retains (job_id, epoch); again the epoch is
             //     unique so the entry is harmless for correctness but wastes memory.
             if let Some(aborted_epoch) = pre_tick_awaiting {
-                let was_aborted = self
-                    .ckpt
-                    .coordinators
-                    .get(job_id)
-                    .is_some_and(|c| matches!(c.state, CheckpointCoordinatorState::Failed { .. }));
+                let was_aborted =
+                    self.ckpt.coordinators.get(job_id).is_some_and(|c| {
+                        matches!(c.state, CheckpointCoordinatorState::Failed { .. })
+                    });
                 if was_aborted {
-                    self.ckpt.notify_sent
+                    self.ckpt
+                        .notify_sent
                         .retain(|(jid, _, e)| jid != job_id || *e != aborted_epoch);
-                    self.ckpt.barrier_sent
+                    self.ckpt
+                        .barrier_sent
                         .retain(|(jid, e)| jid != job_id || *e != aborted_epoch);
                     // A stop-with-savepoint waiting on the aborted epoch can
                     // never fire; drop it so the operator can retry the stop.

@@ -72,6 +72,14 @@
                     N/A
                 {% endmatch %}
               </dd>
+              <dt>Failures</dt>
+              <dd>
+                {% if ex.consecutive_task_failures > 0 %}
+                  <span class="badge badge-error">{{ ex.consecutive_task_failures }}</span>
+                {% else %}
+                  <span class="badge badge-success">0</span>
+                {% endif %}
+              </dd>
             </dl>
           </div>
         </div>

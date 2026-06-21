@@ -126,7 +126,7 @@ pub async fn execute_bounded_window_coordinated(
 
     let notify = {
         let coord = coordinator.read().await;
-        coord.notify.clone()
+        coord.notify().clone()
     };
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);

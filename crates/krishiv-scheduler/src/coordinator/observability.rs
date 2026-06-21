@@ -58,7 +58,8 @@ pub fn build_observability_report(
     }
 
     let checkpoint = coordinator
-        .checkpoint_coordinators
+        .ckpt
+        .coordinators
         .get(job_id)
         .map(|coord| ReportCheckpoint {
             latest_epoch: coord.current_epoch(),
@@ -82,6 +83,7 @@ pub fn build_observability_report(
             slots: record.descriptor().slots(),
             active_tasks: record.running_tasks().len(),
             heartbeat_age_ticks: coordinator
+                .exec
                 .ticks_since_restart
                 .saturating_sub(record.last_heartbeat_tick()),
             task_endpoint: record.descriptor().task_endpoint().map(str::to_owned),

@@ -97,7 +97,8 @@ impl Coordinator {
         );
 
         if let Some(ckpt_coord) = pending_checkpoint {
-            self.ckpt.coordinators
+            self.ckpt
+                .coordinators
                 .insert(inserted_job_id.clone(), ckpt_coord);
         }
         // P1.1: Index streaming tasks for O(1) heartbeat lookup.
@@ -120,7 +121,11 @@ impl Coordinator {
         if matches!(outcome, SubmitOutcome::Accepted)
             && let Some(ask) = spec.memory_limit_bytes()
             && ask > 0
-            && self.exec.executors.cluster_available_memory_bytes().is_none()
+            && self
+                .exec
+                .executors
+                .cluster_available_memory_bytes()
+                .is_none()
         {
             tracing::debug!(
                 job_id = %spec.job_id(),
@@ -306,7 +311,8 @@ impl Coordinator {
              caller must call take_pending_sink_finalize() after every apply_task_update"
         );
         self.ensure_active()?;
-        self.exec.executors
+        self.exec
+            .executors
             .validate_lease(update.executor_id(), update.lease_generation())?;
 
         tracing::debug!(
@@ -424,7 +430,9 @@ impl Coordinator {
             }
         } else if terminal_state == TaskState::Succeeded {
             krishiv_metrics::global_metrics().inc_tasks_succeeded();
-            self.exec.executors.reset_task_failures(&executor_id_for_circuit);
+            self.exec
+                .executors
+                .reset_task_failures(&executor_id_for_circuit);
         }
 
         // Re-queue the producing stage when the consumer reports missing partitions.
@@ -724,11 +732,13 @@ impl Coordinator {
         // Recovery control-plane state for the completed job.
         self.ckpt.restore_directives.remove(job_id);
         self.ckpt.pending_stop_after_savepoint.remove(job_id);
-        self.ckpt.restore_notify_sent.retain(|(jid, _, _)| jid != job_id);
-        self.ckpt.checkpoint_complete_sent
+        self.ckpt
+            .restore_notify_sent
             .retain(|(jid, _, _)| jid != job_id);
-        self.ckpt.notify_sent
+        self.ckpt
+            .checkpoint_complete_sent
             .retain(|(jid, _, _)| jid != job_id);
+        self.ckpt.notify_sent.retain(|(jid, _, _)| jid != job_id);
     }
 
     /// Convert and submit a Krishiv logical DAG through the R2 scheduler.

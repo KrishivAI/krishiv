@@ -25,6 +25,10 @@ pub struct JobSnapshot {
     pub(crate) namespace_id: Option<String>,
     /// Accumulated resource consumption from completed tasks.
     pub(crate) resource_usage: ResourceUsage,
+    /// Total shuffle bytes written across all stages.
+    pub(crate) shuffle_bytes_written: u64,
+    /// Total shuffle partitions currently marked Available.
+    pub(crate) shuffle_partitions_available: usize,
 }
 
 impl JobSnapshot {
@@ -87,6 +91,16 @@ impl JobSnapshot {
     pub fn resource_usage(&self) -> &ResourceUsage {
         &self.resource_usage
     }
+
+    /// Total shuffle bytes written across all stages.
+    pub fn shuffle_bytes_written(&self) -> u64 {
+        self.shuffle_bytes_written
+    }
+
+    /// Total shuffle partitions currently marked Available.
+    pub fn shuffle_partitions_available(&self) -> usize {
+        self.shuffle_partitions_available
+    }
 }
 
 /// Detailed job status for CLI/UI use in later R2 slices.
@@ -116,6 +130,10 @@ pub struct StageSnapshot {
     pub(crate) retry_count: u32,
     pub(crate) task_count: usize,
     pub(crate) tasks: Vec<TaskSnapshot>,
+    /// Shuffle bytes written by completed tasks in this stage.
+    pub(crate) shuffle_bytes_written: u64,
+    /// Shuffle partitions currently available for this stage.
+    pub(crate) shuffle_partitions_available: usize,
 }
 
 impl StageSnapshot {
@@ -142,6 +160,16 @@ impl StageSnapshot {
     /// Task summaries.
     pub fn tasks(&self) -> &[TaskSnapshot] {
         &self.tasks
+    }
+
+    /// Shuffle bytes written by completed tasks in this stage.
+    pub fn shuffle_bytes_written(&self) -> u64 {
+        self.shuffle_bytes_written
+    }
+
+    /// Shuffle partitions currently available for this stage.
+    pub fn shuffle_partitions_available(&self) -> usize {
+        self.shuffle_partitions_available
     }
 }
 

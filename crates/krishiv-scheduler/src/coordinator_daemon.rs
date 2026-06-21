@@ -603,7 +603,8 @@ async fn api_executor_reset(
     coordinator
         .write()
         .await
-        .exec.executors
+        .exec
+        .executors
         .reset_task_failures(&executor_id);
     (
         axum::http::StatusCode::OK,

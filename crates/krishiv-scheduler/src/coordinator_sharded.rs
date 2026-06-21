@@ -91,7 +91,6 @@ impl ExecutorInner {
         self.notify.notify_waiters();
         Ok(lease_generation)
     }
-
 }
 
 /// Checkpoint-facing state guarded by a dedicated `RwLock`.

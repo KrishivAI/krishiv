@@ -1282,7 +1282,7 @@ fn duplicate_failed_task_status_does_not_replay_circuit_breaker_side_effects() {
 
     assert!(
         coordinator
-            .executors
+            .exec.executors
             .executors_over_failure_threshold(failure_threshold)
             .is_empty(),
         "duplicate failed task reports must not advance executor circuit-breaker counters"

@@ -295,6 +295,7 @@ impl ExecutorRuntime {
             .as_ref()
             .map(|map| map.iter().map(|entry| entry.value().clone()).collect())
             .unwrap_or_default();
+        let active_count = attempts.len() as u32;
 
         // Drain streaming progress snapshots (GAP-OB-04). Runner tasks write
         // into the buffer via ProgressBufferCallback; we drain here so each
@@ -310,13 +311,25 @@ impl ExecutorRuntime {
                 Vec::new()
             };
 
-        ExecutorHeartbeatRequest::new(
+        let mut req = ExecutorHeartbeatRequest::new(
             self.config.executor_id.clone(),
             self.config.lease_generation,
             ExecutorState::Healthy,
         )
         .with_running_attempts(attempts)
         .with_streaming_progress(progress)
+        .with_active_task_count(active_count);
+
+        let rss = read_proc_rss_bytes();
+        let total = read_proc_mem_total_bytes();
+        if let Some(bytes) = rss {
+            req = req.with_memory_used_bytes(bytes);
+        }
+        if let Some(bytes) = total {
+            req = req.with_memory_limit_bytes(bytes);
+        }
+
+        req
     }
 
     /// Send a heartbeat through a tonic-shaped coordinator service.
@@ -652,4 +665,30 @@ pub async fn serve_executor_task_grpc_with_listener_and_continuous(
         ))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await
+}
+
+/// Read process RSS (resident set size) in bytes from `/proc/self/status`.
+/// Returns `None` if the file cannot be read or parsed (e.g. non-Linux).
+fn read_proc_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.trim().strip_suffix(" kB")?.trim().parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Read total system memory in bytes from `/proc/meminfo`.
+/// Returns `None` if the file cannot be read or parsed.
+fn read_proc_mem_total_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.trim().strip_suffix(" kB")?.trim().parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
 }

@@ -460,6 +460,8 @@ impl JobRecord {
             priority: self.spec.priority(),
             namespace_id: self.spec.namespace_id().map(str::to_owned),
             resource_usage: self.resource_usage.clone(),
+            shuffle_bytes_written: self.shuffle_bytes_written(),
+            shuffle_partitions_available: self.shuffle_partitions_available_count(),
         }
     }
 
@@ -853,12 +855,28 @@ impl StageRecord {
     }
 
     pub(crate) fn snapshot(&self) -> StageSnapshot {
+        let shuffle_bytes_written: u64 = self
+            .tasks
+            .iter()
+            .filter_map(|t| t.output_metadata.as_ref())
+            .flat_map(|m| m.shuffle_partitions())
+            .map(|p| p.size_bytes)
+            .sum();
+        let shuffle_partitions_available: usize = self
+            .tasks
+            .iter()
+            .filter(|t| t.state == TaskState::Succeeded)
+            .filter_map(|t| t.output_metadata.as_ref())
+            .map(|m| m.shuffle_partitions().len())
+            .sum();
         StageSnapshot {
             stage_id: self.spec.stage_id().clone(),
             state: self.state,
             retry_count: self.retry_count,
             task_count: self.tasks.len(),
             tasks: self.tasks.iter().map(TaskRecord::snapshot).collect(),
+            shuffle_bytes_written,
+            shuffle_partitions_available,
         }
     }
 }

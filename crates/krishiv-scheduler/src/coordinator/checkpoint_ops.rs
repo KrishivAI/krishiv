@@ -273,7 +273,8 @@ impl Coordinator {
         label: Option<String>,
     ) -> SchedulerResult<u64> {
         let epoch = self.savepoint_job(job_id, label)?;
-        self.ckpt.pending_stop_after_savepoint
+        self.ckpt
+            .pending_stop_after_savepoint
             .insert(job_id.clone(), epoch);
         Ok(epoch)
     }
@@ -294,7 +295,8 @@ impl Coordinator {
         let storage = Self::open_checkpoint_storage(storage_path)?;
         let current_token = leader_fencing_token
             .or_else(|| {
-                self.ckpt.coordinators
+                self.ckpt
+                    .coordinators
                     .get(job_id)
                     .map(|coord| coord.fencing_token().as_u64())
             })
@@ -431,7 +433,8 @@ impl Coordinator {
         // an older in-memory token would reject valid older checkpoints or
         // activate future work under the wrong owner generation.
         let token = leader_fencing_token.or_else(|| {
-            self.ckpt.coordinators
+            self.ckpt
+                .coordinators
                 .get(job_id)
                 .map(|coord| coord.fencing_token().as_u64())
         });
@@ -584,8 +587,7 @@ impl Coordinator {
             epoch: restored_epoch,
             fencing_token: coord.fencing_token().as_u64(),
         };
-        self.ckpt.notify_sent
-            .retain(|(jid, _, _)| jid != job_id);
+        self.ckpt.notify_sent.retain(|(jid, _, _)| jid != job_id);
         self.ckpt.barrier_sent.retain(|(jid, _)| jid != job_id);
         // Every executor with tasks in this job must reload state and source
         // offsets from the restored epoch.
@@ -728,12 +730,17 @@ impl Coordinator {
     /// Record a restore directive for a job and reset its delivery tracking so
     /// every executor with tasks in the job receives it.
     pub(crate) fn set_restore_directive(&mut self, job_id: &JobId, directive: RestoreDirective) {
-        self.ckpt.restore_directives.insert(job_id.clone(), directive);
-        self.ckpt.restore_notify_sent.retain(|(jid, _, _)| jid != job_id);
+        self.ckpt
+            .restore_directives
+            .insert(job_id.clone(), directive);
+        self.ckpt
+            .restore_notify_sent
+            .retain(|(jid, _, _)| jid != job_id);
         // Re-deliver the completion signal for epochs at or before the restore
         // point: an executor that restored may hold prepared transactions for
         // the restored epoch that must be committed (recover-and-commit).
-        self.ckpt.checkpoint_complete_sent
+        self.ckpt
+            .checkpoint_complete_sent
             .retain(|(jid, _, _)| jid != job_id);
         self.exec.notify.notify_waiters();
     }
@@ -762,16 +769,16 @@ impl Coordinator {
         drop(self.find_job(job_id)?);
 
         let running = self.running_task_count_for_job(job_id);
-        let coord = self
-            .ckpt
-            .coordinators
-            .get_mut(job_id)
-            .ok_or_else(|| SchedulerError::InvalidJob {
-                message: format!(
-                    "no checkpoint coordinator for job {job_id}; \
+        let coord =
+            self.ckpt
+                .coordinators
+                .get_mut(job_id)
+                .ok_or_else(|| SchedulerError::InvalidJob {
+                    message: format!(
+                        "no checkpoint coordinator for job {job_id}; \
                      job must be streaming with checkpoint_interval_ms set"
-                ),
-            })?;
+                    ),
+                })?;
         coord.set_expected_task_count(running);
 
         let epoch = coord
@@ -826,13 +833,17 @@ impl Coordinator {
         self.ckpt.coordinators.clone_from(&inner.coordinators);
         self.ckpt.notify_sent.clone_from(&inner.notify_sent);
         self.ckpt.barrier_sent.clone_from(&inner.barrier_sent);
-        self.ckpt.checkpoint_complete_sent
+        self.ckpt
+            .checkpoint_complete_sent
             .clone_from(&inner.checkpoint_complete_sent);
-        self.ckpt.restore_directives
+        self.ckpt
+            .restore_directives
             .clone_from(&inner.restore_directives);
-        self.ckpt.restore_notify_sent
+        self.ckpt
+            .restore_notify_sent
             .clone_from(&inner.restore_notify_sent);
-        self.ckpt.pending_stop_after_savepoint
+        self.ckpt
+            .pending_stop_after_savepoint
             .clone_from(&inner.pending_stop_after_savepoint);
         self.ckpt.notify = notify;
     }
@@ -973,7 +984,8 @@ impl Coordinator {
     }
 
     pub(crate) fn clear_checkpoint_notify_for_epoch(&mut self, job_id: &JobId, epoch: u64) {
-        self.ckpt.notify_sent
+        self.ckpt
+            .notify_sent
             .retain(|(jid, _, ep)| jid != job_id || ep != &epoch);
     }
 }

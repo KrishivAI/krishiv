@@ -261,7 +261,7 @@ fn checkpoint_abort_cleans_up_stale_tracking_entries() {
 
     // Transition the task to Running so the checkpoint quorum == 1.
     let lease = coordinator
-        .executors
+        .exec.executors
         .find_executor(&exec_id)
         .unwrap()
         .lease_generation();
@@ -286,33 +286,33 @@ fn checkpoint_abort_cleans_up_stale_tracking_entries() {
     // Manually initiate an epoch so the checkpoint coordinator is in
     // AwaitingAcks state, then inject stale tracking entries.
     coordinator
-        .checkpoint_coordinators
+        .ckpt.coordinators
         .get_mut(&job_id)
         .unwrap()
         .initiate()
         .unwrap();
     let epoch = 1u64;
     coordinator
-        .checkpoint_notify_sent
+        .ckpt.notify_sent
         .insert((job_id.clone(), exec_id.clone(), epoch));
     coordinator
-        .barrier_dispatch_sent
+        .ckpt.barrier_sent
         .insert((job_id.clone(), epoch));
 
-    assert_eq!(coordinator.checkpoint_notify_sent.len(), 1);
-    assert_eq!(coordinator.barrier_dispatch_sent.len(), 1);
+    assert_eq!(coordinator.ckpt.notify_sent.len(), 1);
+    assert_eq!(coordinator.ckpt.barrier_sent.len(), 1);
 
     // A single tick of 1_000 ms is well above the 100 ms ack timeout, so
     // advance_heartbeat_clock must abort the epoch and clean up the stale entries.
     coordinator.advance_heartbeat_clock(1).unwrap();
 
     assert_eq!(
-        coordinator.checkpoint_notify_sent.len(),
+        coordinator.ckpt.notify_sent.len(),
         0,
         "checkpoint_notify_sent must be cleared after epoch abort (GAP-5)"
     );
     assert_eq!(
-        coordinator.barrier_dispatch_sent.len(),
+        coordinator.ckpt.barrier_sent.len(),
         0,
         "barrier_dispatch_sent must be cleared after epoch abort (GAP-5)"
     );
@@ -360,10 +360,10 @@ fn circuit_breaker_actually_clears_assignments_from_bad_executor() {
     // Drive the failure counter directly (this is what apply_task_update does internally)
     // until the executor is marked bad.
     for _ in 0..6 {
-        coordinator.executors.record_task_failure(&exec_id, 5);
+        coordinator.exec.executors.record_task_failure(&exec_id, 5);
     }
 
-    let bad = coordinator.executors.executors_over_failure_threshold(5);
+    let bad = coordinator.exec.executors.executors_over_failure_threshold(5);
     assert!(
         bad.contains(&exec_id),
         "executor must be in bad set after repeated failures"
@@ -381,10 +381,10 @@ fn assignment_flood_protection_basic() {
         .unwrap();
 
     for _ in 0..10 {
-        let _ = coordinator.executors.record_task_failure(&exec_id, 5);
+        let _ = coordinator.exec.executors.record_task_failure(&exec_id, 5);
     }
 
-    let broken = coordinator.executors.executors_over_failure_threshold(5);
+    let broken = coordinator.exec.executors.executors_over_failure_threshold(5);
 
     assert!(
         !broken.is_empty(),

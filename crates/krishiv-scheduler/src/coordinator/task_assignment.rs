@@ -414,7 +414,8 @@ impl Coordinator {
         // even attempting to launch tasks to them.
         let failure_threshold = self.config.circuit_breaker_failure_threshold();
         let bad_executors: std::collections::HashSet<_> = self
-            .exec.executors
+            .exec
+            .executors
             .executors_over_failure_threshold(failure_threshold)
             .into_iter()
             .collect();
@@ -482,7 +483,8 @@ impl Coordinator {
         let mut targets = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let endpoint = self
-                .exec.executors
+                .exec
+                .executors
                 .find_executor(assignment.executor_id())?
                 .descriptor()
                 .task_endpoint()

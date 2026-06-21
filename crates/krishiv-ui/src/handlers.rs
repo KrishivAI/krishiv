@@ -26,9 +26,13 @@ pub(crate) async fn metrics(State(state): State<UiState>) -> impl IntoResponse {
     let body = if now.duration_since(cache.1).as_secs() >= 1 || cache.0.is_empty() {
         let mut body = format_stability_metrics(&coordinator.stability_metrics());
         body.push('\n');
+        body.push_str(&krishiv_scheduler::metrics::render_prometheus_metrics());
+        body.push('\n');
         body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
         body.push('\n');
-        body.push_str(&krishiv_metrics::system::system_metrics().render_prometheus());
+        let sm = krishiv_metrics::system::system_metrics();
+        sm.refresh();
+        body.push_str(&sm.render_prometheus());
         cache.0 = body.clone();
         cache.1 = now;
         body
@@ -62,15 +66,15 @@ krishiv_failed_assignments_total {failed}
 # HELP krishiv_max_executor_heartbeat_age_ticks Max executor heartbeat age in scheduler ticks
 # TYPE krishiv_max_executor_heartbeat_age_ticks gauge
 krishiv_max_executor_heartbeat_age_ticks {hb_age}
-# HELP krishiv_shuffle_bytes_written_total Total bytes written to shuffle store
-# TYPE krishiv_shuffle_bytes_written_total counter
-krishiv_shuffle_bytes_written_total {shuffle_bytes}
+# HELP krishiv_shuffle_partitions_available Total shuffle partitions available across all active stages
+# TYPE krishiv_shuffle_partitions_available gauge
+krishiv_shuffle_partitions_available {shuffle_parts}
 ",
         running = m.running_task_count(),
         retries = m.retry_count(),
         failed = m.failed_assignments(),
         hb_age = max_heartbeat_age,
-        shuffle_bytes = m.shuffle_bytes_written,
+        shuffle_parts = m.shuffle_partitions_available,
     )
 }
 
@@ -171,11 +175,12 @@ pub(crate) async fn ui_submit(State(state): State<UiState>) -> Result<Html<Strin
 pub(crate) async fn ui_health(State(state): State<UiState>) -> Result<Html<String>, UiError> {
     let coordinator = state.coordinator.read().await;
     let bearer_token = ui_auth_token(&state);
+    let tick = coordinator.executors().current_tick();
     let template = HealthTemplate {
         executors: coordinator
             .executor_snapshots()
             .iter()
-            .map(ExecutorView::from_record)
+            .map(|r| ExecutorView::from_record(r, tick))
             .collect(),
         jobs: coordinator
             .job_snapshots()
@@ -495,13 +500,14 @@ pub(crate) async fn api_executor_detail_inner(
     executor_id: &str,
 ) -> UiResult<ExecutorView> {
     let coordinator = state.coordinator.read().await;
+    let tick = coordinator.executors().current_tick();
     let executors = coordinator.executor_snapshots();
     let eid = krishiv_proto::ExecutorId::try_new(executor_id.to_owned())
         .map_err(|e| UiError::Id(e.to_string()))?;
     executors
         .iter()
         .find(|e| e.executor_id() == &eid)
-        .map(ExecutorView::from_record)
+        .map(|r| ExecutorView::from_record(r, tick))
         .ok_or_else(|| {
             UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownExecutor {
                 executor_id: eid.clone(),
@@ -556,6 +562,7 @@ async fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
 }
 
 fn status_snapshot_inner(coordinator: &krishiv_scheduler::Coordinator) -> StatusView {
+    let tick = coordinator.executors().current_tick();
     StatusView {
         jobs: coordinator
             .job_snapshots()
@@ -565,7 +572,7 @@ fn status_snapshot_inner(coordinator: &krishiv_scheduler::Coordinator) -> Status
         executors: coordinator
             .executor_snapshots()
             .iter()
-            .map(ExecutorView::from_record)
+            .map(|r| ExecutorView::from_record(r, tick))
             .collect(),
     }
 }
@@ -736,6 +743,8 @@ impl JobSummaryView {
             priority: snapshot.priority(),
             namespace_id: snapshot.namespace_id().map(str::to_owned),
             resource_usage: ResourceUsageView::from_usage(snapshot.resource_usage()),
+            shuffle_bytes_written: snapshot.shuffle_bytes_written(),
+            shuffle_partitions_available: snapshot.shuffle_partitions_available(),
         }
     }
 }
@@ -797,8 +806,18 @@ impl JobDetailView {
 }
 
 impl ExecutorView {
-    fn from_record(record: &ExecutorRecord) -> Self {
+    fn from_record(record: &ExecutorRecord, current_tick: u64) -> Self {
         let health = record.health_snapshot();
+        let memory_used_pct = health.and_then(|h| {
+            let used = h.memory_used_bytes?;
+            let limit = h.memory_limit_bytes?;
+            if limit > 0 {
+                Some(used * 100 / limit)
+            } else {
+                None
+            }
+        });
+        let heartbeat_age_ticks = current_tick.saturating_sub(record.last_heartbeat_tick());
         Self {
             executor_id: record.executor_id().to_string(),
             state: record.state().to_string(),
@@ -814,6 +833,16 @@ impl ExecutorView {
             memory_used_bytes: health.and_then(|h| h.memory_used_bytes),
             memory_limit_bytes: health.and_then(|h| h.memory_limit_bytes),
             active_task_count: health.and_then(|h| h.active_task_count),
+            consecutive_task_failures: record.consecutive_task_failures(),
+            task_endpoint_display: record.descriptor().task_endpoint().unwrap_or("").to_owned(),
+            barrier_endpoint_display: record
+                .descriptor()
+                .barrier_endpoint()
+                .unwrap_or("")
+                .to_owned(),
+            memory_used_pct,
+            heartbeat_age_ticks,
+            slots_used: record.running_tasks().len(),
         }
     }
 }

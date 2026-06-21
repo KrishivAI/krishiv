@@ -368,6 +368,11 @@ impl ExecutorRecord {
         self.health_snapshot.as_ref()
     }
 
+    /// Consecutive task failure count (circuit-breaker input).
+    pub fn consecutive_task_failures(&self) -> u32 {
+        self.consecutive_task_failures
+    }
+
     /// Increment failure counter (called on task failure reports from this executor).
     /// Returns true if the executor has now exceeded the given threshold (circuit break candidate).
     pub fn record_task_failure(&mut self, threshold: u32) -> bool {

@@ -100,7 +100,7 @@ fn advance_heartbeat_clock_drives_checkpoint_coordinator() {
     // D3: checkpoint epochs require Running tasks (not just Assigned),
     // so transition the task to Running before ticking.
     let lease = coordinator
-        .executors
+        .exec.executors
         .find_executor(&executor_id)
         .unwrap()
         .lease_generation();

@@ -37,31 +37,91 @@
     </div>
     <div class="info-item">
       <span class="label">Slots</span>
-      <span class="value">{{ executor.slots }}</span>
+      <span class="value">
+        {{ executor.slots_used }} / {{ executor.slots }}
+        {% if executor.slots > 0 %}
+          {% set pct = executor.slots_used * 100 / executor.slots %}
+          <span style="display:inline-block; width:80px; height:8px; background:var(--border); border-radius:4px; margin-left:6px; vertical-align:middle;">
+            <span style="display:block; height:100%; width:{% if pct > 100 %}100{% else %}{{ pct }}{% endif %}%; background:{% if pct >= 90 %}var(--error){% elif pct >= 70 %}var(--warn){% else %}var(--success){% endif %}; border-radius:4px;"></span>
+          </span>
+        {% endif %}
+      </span>
     </div>
     <div class="info-item">
-      <span class="label">Running Tasks</span>
-      <span class="value">{{ executor.running_tasks.len() }}</span>
-    </div>
-    <div class="info-item">
-      <span class="label">Heartbeat Tick</span>
-      <span class="value">{{ executor.last_heartbeat_tick }}</span>
+      <span class="label">Heartbeat</span>
+      <span class="value">
+        {% if executor.heartbeat_age_ticks <= 3 %}
+          <span class="badge badge-success">{{ executor.heartbeat_age_ticks }} ticks</span>
+        {% elif executor.heartbeat_age_ticks <= 10 %}
+          <span class="badge badge-neutral">{{ executor.heartbeat_age_ticks }} ticks</span>
+        {% else %}
+          <span class="badge badge-error">{{ executor.heartbeat_age_ticks }} ticks</span>
+        {% endif %}
+      </span>
     </div>
     <div class="info-item">
       <span class="label">Lease Generation</span>
       <span class="value">{{ executor.lease_generation }}</span>
     </div>
     <div class="info-item">
-      <span class="label">Memory Used</span>
-      <span class="value">{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB{% else %}&mdash;{% endif %}</span>
+      <span class="label">Memory</span>
+      <span class="value">
+        {% if executor.memory_used_bytes.is_some() %}
+          {% set used_mb = executor.memory_used_bytes.unwrap() / 1048576 %}
+          {% if executor.memory_limit_bytes.is_some() %}
+            {% set limit_mb = executor.memory_limit_bytes.unwrap() / 1048576 %}
+            {{ used_mb }} / {{ limit_mb }} MB
+            {% if limit_mb > 0 %}
+              {% set mem_pct = used_mb * 100 / limit_mb %}
+              <span style="display:inline-block; width:80px; height:8px; background:var(--border); border-radius:4px; margin-left:6px; vertical-align:middle;">
+                <span style="display:block; height:100%; width:{% if mem_pct > 100 %}100{% else %}{{ mem_pct }}{% endif %}%; background:{% if mem_pct >= 90 %}var(--error){% elif mem_pct >= 70 %}var(--warn){% else %}var(--success){% endif %}; border-radius:4px;"></span>
+              </span>
+            {% endif %}
+          {% else %}
+            {{ used_mb }} MB
+          {% endif %}
+        {% else %}
+          &mdash;
+        {% endif %}
+      </span>
     </div>
     <div class="info-item">
-      <span class="label">Memory Limit</span>
-      <span class="value">{% if executor.memory_limit_bytes.is_some() %}{{ executor.memory_limit_bytes.unwrap() / 1048576 }} MB{% else %}&mdash;{% endif %}</span>
+      <span class="label">Memory Utilization</span>
+      <span class="value">
+        {% if executor.memory_used_pct.is_some() %}
+          {% if executor.memory_used_pct.unwrap() >= 90 %}
+            <strong style="color: var(--error);">{{ executor.memory_used_pct.unwrap() }}%</strong>
+          {% elif executor.memory_used_pct.unwrap() >= 70 %}
+            <strong style="color: var(--warn);">{{ executor.memory_used_pct.unwrap() }}%</strong>
+          {% else %}
+            <span style="color: var(--success);">{{ executor.memory_used_pct.unwrap() }}%</span>
+          {% endif %}
+        {% else %}
+          &mdash;
+        {% endif %}
+      </span>
     </div>
     <div class="info-item">
       <span class="label">Active Task Count</span>
       <span class="value">{% if executor.active_task_count.is_some() %}{{ executor.active_task_count.unwrap() }}{% else %}&mdash;{% endif %}</span>
+    </div>
+    <div class="info-item">
+      <span class="label">Consecutive Task Failures</span>
+      <span class="value">
+        {% if executor.consecutive_task_failures > 0 %}
+          <span class="badge badge-error">{{ executor.consecutive_task_failures }}</span>
+        {% else %}
+          <span class="badge badge-success">0</span>
+        {% endif %}
+      </span>
+    </div>
+    <div class="info-item">
+      <span class="label">Task Endpoint</span>
+      <span class="value td-mono">{% if executor.task_endpoint_display.is_empty() %}&mdash;{% else %}{{ executor.task_endpoint_display }}{% endif %}</span>
+    </div>
+    <div class="info-item">
+      <span class="label">Barrier Endpoint</span>
+      <span class="value td-mono">{% if executor.barrier_endpoint_display.is_empty() %}&mdash;{% else %}{{ executor.barrier_endpoint_display }}{% endif %}</span>
     </div>
   </div>
 
