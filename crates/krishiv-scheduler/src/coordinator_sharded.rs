@@ -315,7 +315,8 @@ impl CheckpointInner {
         self.checkpoint_complete_sent
             .clone_from(&src.checkpoint_complete_sent);
         self.restore_directives.clone_from(&src.restore_directives);
-        self.restore_notify_sent.clone_from(&src.restore_notify_sent);
+        self.restore_notify_sent
+            .clone_from(&src.restore_notify_sent);
         self.pending_stop_after_savepoint
             .clone_from(&src.pending_stop_after_savepoint);
     }
@@ -340,7 +341,8 @@ impl CheckpointInner {
         self.checkpoint_complete_sent
             .clone_from(&src.checkpoint_complete_sent);
         self.restore_directives.clone_from(&src.restore_directives);
-        self.restore_notify_sent.clone_from(&src.restore_notify_sent);
+        self.restore_notify_sent
+            .clone_from(&src.restore_notify_sent);
         self.pending_stop_after_savepoint
             .clone_from(&src.pending_stop_after_savepoint);
     }

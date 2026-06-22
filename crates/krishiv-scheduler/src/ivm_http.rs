@@ -22,9 +22,14 @@ use axum::extract::{FromRef, Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use krishiv_ivm::{
-    DeltaBatch, IncrementalViewSpec, deserialize_delta_batch, serialize_delta_batch,
+    DeltaBatch, IncrementalFlow, IncrementalViewSpec, coalesce_pending, deserialize_delta_batch,
+    encode_ivm_step_fragment, serialize_delta_batch,
 };
+use krishiv_proto::{JobId, JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec};
 
 use crate::SharedCoordinator;
 use crate::ivm::SharedIvmJobRegistry;
@@ -325,18 +330,22 @@ pub async fn api_ivm_step(
         .get(&job_id)
         .ok_or_else(|| ivm_not_found(&job_id))?;
 
-    // Log executor availability for observability. IVM computation always runs
-    // centrally on the coordinator (distributed ingestion, centralized compute).
-    // Executor-side dispatch via delta:step: fragments is a future optimization.
     let executor_count = coordinator.read().await.executor_snapshots().len();
+    // Distributed dispatch is available for Single (unpartitioned) IVM jobs only.
     if executor_count > 0 {
-        tracing::debug!(
-            job_id = %job_id,
-            executors = executor_count,
-            "IVM step: executors registered; computing centrally on coordinator"
-        );
+        if let crate::ivm::IvmJob::Single(ref inner_flow) = flow {
+            tracing::debug!(
+                job_id = %job_id,
+                executors = executor_count,
+                "IVM step: dispatching delta:step: task to executor"
+            );
+            let resp =
+                submit_distributed_ivm_step(&coordinator, inner_flow, &job_id).await?;
+            return Ok(Json(resp));
+        }
     }
 
+    // Central path (no executors): run the IVM tick on the coordinator directly.
     let summary = flow.step_datafusion().await.map_err(|e| {
         tracing::error!("IVM step error for job {job_id}: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -347,6 +356,132 @@ pub async fn api_ivm_step(
         total_output_rows: summary.total_output_rows,
         tick,
     }))
+}
+
+/// Dispatch one IVM tick as a `delta:step:` batch job to a registered executor.
+///
+/// Drains pending deltas from `flow`, builds the fragment body, submits a batch
+/// job to the coordinator (which assigns it to an executor), waits for
+/// completion, then advances the coordinator-side tick counter.
+///
+/// **Limitation**: the coordinator's `IncrementalFlow` view baselines and source
+/// snapshots are NOT updated after distributed execution — only the executor's
+/// per-job `IvmJobState` sees the updated state. The coordinator's flow is used
+/// solely as a pending-delta buffer and tick counter in distributed mode.
+async fn submit_distributed_ivm_step(
+    coordinator: &SharedCoordinator,
+    flow: &std::sync::Arc<IncrementalFlow>,
+    ivm_job_id: &str,
+) -> Result<StepResponse, StatusCode> {
+    let map_err = |msg: String| -> StatusCode {
+        tracing::error!("IVM distributed step error: {msg}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+
+    // Drain pending and coalesce per-source batches.
+    let raw = flow.take_pending().map_err(|e| map_err(e.to_string()))?;
+    let coalesced: HashMap<_, _> =
+        coalesce_pending(raw).map_err(|e| map_err(e.to_string()))?;
+
+    // If pending is empty, just advance the tick and return (nothing to compute).
+    if coalesced.is_empty() {
+        flow.step_with(|_| Ok(HashMap::new()))
+            .map_err(|e| map_err(e.to_string()))?;
+        let tick = flow.tick().unwrap_or(0);
+        return Ok(StepResponse {
+            active_views: 0,
+            total_output_rows: 0,
+            tick,
+        });
+    }
+
+    let specs = flow.view_specs().map_err(|e| map_err(e.to_string()))?;
+    let fragment = encode_ivm_step_fragment(ivm_job_id, &coalesced, &specs)
+        .map_err(|e| map_err(e.to_string()))?;
+
+    // Build and submit the batch job.
+    let sched_job_id = JobId::try_new(format!(
+        "ivm-step-{}",
+        krishiv_common::async_util::unix_now_ms()
+    ))
+    .map_err(|e| map_err(e.to_string()))?;
+    let task = TaskSpec::new(
+        TaskId::try_new("task-ivm").map_err(|e| map_err(e.to_string()))?,
+        fragment,
+    );
+    let stage = StageSpec::new(
+        StageId::try_new("stage-ivm").map_err(|e| map_err(e.to_string()))?,
+        "ivm-step",
+    )
+    .with_task(task);
+    let spec =
+        JobSpec::new(sched_job_id.clone(), "ivm-step", JobKind::Batch).with_stage(stage);
+
+    let notify = {
+        let mut coord = coordinator.write().await;
+        coord
+            .submit_job(spec)
+            .map_err(|e| map_err(e.to_string()))?;
+        coord.notify().clone()
+    };
+
+    // Poll until the job reaches a terminal state (timeout: 5 min).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let succeeded = loop {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::error!("IVM distributed step timed out after 300s");
+            break false;
+        }
+        let state = {
+            let coord = coordinator.read().await;
+            coord
+                .job_snapshot(&sched_job_id)
+                .map(|s| s.state())
+                .unwrap_or(JobState::Failed)
+        };
+        match state {
+            JobState::Succeeded => break true,
+            JobState::Failed | JobState::Cancelled => break false,
+            _ => {
+                let state_changed = notify.notified();
+                let recheck = {
+                    let coord = coordinator.read().await;
+                    coord
+                        .job_snapshot(&sched_job_id)
+                        .map(|s| s.state())
+                        .unwrap_or(JobState::Failed)
+                };
+                if matches!(
+                    recheck,
+                    JobState::Queued
+                        | JobState::Accepted
+                        | JobState::Planning
+                        | JobState::Running
+                ) {
+                    tokio::select! {
+                        _ = state_changed => {}
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    }
+                }
+            }
+        }
+    };
+
+    if !succeeded {
+        return Err(map_err(format!(
+            "ivm-step job {sched_job_id} did not succeed"
+        )));
+    }
+
+    // Advance the coordinator-side tick (pending already drained).
+    let _ = flow.step_with(|_| Ok(HashMap::new()));
+    let tick = flow.tick().unwrap_or(0);
+
+    Ok(StepResponse {
+        active_views: 0,
+        total_output_rows: 0,
+        tick,
+    })
 }
 
 // ── GET /api/v1/ivm/jobs/{job_id}/views/{view_name}/snap ─────────────────────

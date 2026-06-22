@@ -55,7 +55,7 @@
             {% endif %}
             <span class="dag-stage-name">{{ stage.stage_id }}</span>
           </div>
-          <div class="dag-stage-info">{{ stage.task_count }} tasks &middot; {{ stage.retry_count }} retries</div>
+          <div class="dag-stage-info">{{ stage.task_count }} tasks &middot; {{ stage.retry_count }} retries{% if stage.shuffle_bytes_written > 0 %} &middot; {{ stage.shuffle_bytes_written / 1048576 }} MB shuffle{% endif %}</div>
         </div>
         {% if !loop.last %}<div class="dag-arrow">&rarr;</div>{% endif %}
         {% endfor %}
@@ -76,6 +76,7 @@
               <th>State</th>
               <th>Retries</th>
               <th>Tasks</th>
+              <th>Shuffle</th>
             </tr>
           </thead>
           <tbody>
@@ -95,6 +96,16 @@
               </td>
               <td class="td-mono">{{ stage.retry_count }}</td>
               <td class="td-mono">{{ stage.task_count }}</td>
+              <td class="td-mono">
+                {% if stage.shuffle_bytes_written > 0 %}
+                  {{ stage.shuffle_bytes_written / 1048576 }} MB
+                  {% if stage.shuffle_partitions_available > 0 %}
+                    <span style="color: var(--text-soft);">({{ stage.shuffle_partitions_available }} parts)</span>
+                  {% endif %}
+                {% else %}
+                  &mdash;
+                {% endif %}
+              </td>
             </tr>
             {% endfor %}
           </tbody>

@@ -1,5 +1,73 @@
 # Krishiv Implementation Status
 
+## 2026-06-21 — Comprehensive UI metrics overhaul (Phases 1-7)
+
+Enhanced the Web UI and executor heartbeats to surface rich metrics across all
+pages. All changes pass `cargo fmt --check` and `cargo clippy --workspace -D warnings`.
+
+### Completed
+
+- **Phase 1 — Prometheus `/metrics`**: Added `render_prometheus_metrics()` call so
+  scheduler counters (`jobs_submitted_total`, `tasks_assigned_total`, etc.) are now
+  exposed. Removed duplicate `shuffle_bytes_written` from stability metrics. Added
+  `shuffle_partitions_available`. Wired `system_metrics().refresh()` in handler.
+
+- **Phase 2 — Executor detail page**: Added `heartbeat_age_ticks`, `slots_used`,
+  `memory_used_pct` fields to `ExecutorView`. Added visual bars for slots and memory
+  usage (color-coded green/yellow/red). Added heartbeat age indicator.
+
+- **Phase 3 — Jobs table**: Added `shuffle_bytes_written` and
+  `shuffle_partitions_available` to `JobSnapshot` and `JobSummaryView`. Replaced
+  CPU (ns) column with Memory and Shuffle columns in jobs.html.
+
+- **Phase 4 — Job detail page**: Added per-stage `shuffle_bytes_written` and
+  `shuffle_partitions_available` to `StageSnapshot` and `StageView`. Added Shuffle
+  column to stages table and inline shuffle info in DAG view.
+
+- **Phase 5 — Overview cluster metrics**: Added `cluster_total_slots`,
+  `cluster_used_slots`, `cluster_memory_total_mb`, `cluster_memory_used_mb`,
+  `healthy_executor_count` to `StatusView` and `JobsTemplate`. Overview page now
+  shows slots usage, cluster memory, and healthy executor count.
+
+- **Phase 6 — CPU/network in heartbeats**: Added `available_cpu_cores()` and
+  `read_proc_net_bytes()` to executor transport. Wired `cpu_cores_used`,
+  `network_bytes_sent`, `network_bytes_recv` through `ExecutorHeartbeatRequest` →
+  `ExecutorHeartbeat` → `ExecutorHealthSnapshot` → `ExecutorView`. Added CPU and
+  network display to executor detail and health pages.
+
+- **Phase 7 — Validation**: `cargo fmt --check` clean. `cargo clippy --workspace
+  --exclude krishiv-python --exclude krishiv-chaos -- -D warnings` clean. Docker
+  build + k3s deploy in progress.
+
+### Files modified
+
+- `krishiv-ui/src/handlers.rs`: `ExecutorView::from_record`, `JobSummaryView`,
+  `JobDetailView`, `StatusView`, `status_snapshot_inner`, Prometheus handler
+- `krishiv-ui/src/views.rs`: `ExecutorView`, `JobSummaryView`, `StageView`,
+  `JobsTemplate`, `ExecutorsResponse`, `ExecutorDetailResponse` (removed `Eq` where
+  `f64` fields added)
+- `krishiv-ui/templates/executor.html`: Full rewrite with bars and new metrics
+- `krishiv-ui/templates/jobs.html`: Added cluster stat cards, Memory/Shuffle columns
+- `krishiv-ui/templates/job.html`: Added per-stage shuffle column and DAG info
+- `krishiv-ui/templates/health.html`: Added CPU cores to executor cards
+- `krishiv-executor/src/transport.rs`: Added `available_cpu_cores()`,
+  `read_proc_net_bytes()`, wired into heartbeat_request
+- `krishiv-scheduler/src/heartbeat.rs`: Added CPU/network fields to
+  `ExecutorHealthSnapshot`; removed `Eq` (f64)
+- `krishiv-scheduler/src/job/snapshot.rs`: Added shuffle fields to `JobSnapshot`
+  and `StageSnapshot`
+- `krishiv-scheduler/src/job/record.rs`: Populated shuffle fields in `snapshot()`
+  and `StageRecord::snapshot()`
+- `krishiv-scheduler/src/coordinator/heartbeat_mapping.rs`: Mapped CPU/network from
+  request to heartbeat
+- `krishiv-proto/src/executor.rs`: Added `cpu_cores_used`, `network_bytes_sent/recv`
+  fields, builders, and accessors to `ExecutorHeartbeat`
+
+### Next
+
+- Wait for Docker build to complete, then `kubectl rollout restart` to deploy.
+- Verify UI at `http://13.140.186.28:30002/ui` shows new metrics.
+
 ## 2026-06-21 — Eliminate sync-dance: Coordinator embeds ExecutorInner/CheckpointInner
 
 Removed 6 duplicate fields from `Coordinator` by making it embed `exec:
@@ -38,12 +106,13 @@ cargo check -p krishiv-scheduler        # clean
 cargo test -p krishiv-scheduler --lib   # 343 passed, 0 failed
 ```
 
-### Next milestone
+### L2 — dual-state accepted as design
 
-Update the module doc comment to reflect that `Coordinator.exec` and
-`Coordinator.ckpt` ARE the inner locks (owned copies), not snapshots.
-The "sync dance" for the sharded locks is now `clone_from`, not a
-field-by-field copy.
+The `SharedCoordinator` still holds separate `RwLock<ExecutorInner>` and
+`RwLock<CheckpointInner>` as hot-path copies of `coord.exec` and `coord.ckpt`.
+This is intentional: heartbeat and checkpoint-ack hot paths must not contend
+on the full coordinator lock. The sync is now correct (`clone_from` /
+`apply_monotonic_from` / `replace_data_from`). No further action needed.
 
 ## 2026-06-21 — CheckpointInner becomes sole checkpoint-control authority
 

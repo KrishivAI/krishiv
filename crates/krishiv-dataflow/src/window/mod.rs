@@ -266,24 +266,30 @@ impl MultiSourceWatermarkState {
         self.source_watermarks.len()
     }
 
-    /// E3.6 — Per-source watermark lag relative to the effective watermark.
+    /// E3.6 — Per-source watermark lag relative to the most-advanced source.
     ///
     /// Returns a map of `source_id → lag_ms` where `lag_ms` is:
-    /// `effective_watermark_ms - source_watermark_ms`.
+    /// `max_source_watermark_ms - source_watermark_ms`.
     ///
-    /// A positive value means the source is behind the effective watermark.
-    /// A value of 0 means the source is at (or ahead of) the effective watermark.
+    /// A positive value means the source is behind the fastest source.
+    /// A value of 0 means the source is at (or ahead of) all others.
     /// Sources with watermark `i64::MIN` (never emitted) are reported with
     /// `lag_ms = i64::MAX` to indicate they've not contributed any data yet.
     pub fn per_source_lag_ms(&self) -> HashMap<String, i64> {
-        let effective = self.effective_watermark_ms();
+        let max_wm = self
+            .source_watermarks
+            .values()
+            .copied()
+            .filter(|&w| w != i64::MIN)
+            .max()
+            .unwrap_or(i64::MIN);
         self.source_watermarks
             .iter()
             .map(|(id, &wm)| {
                 let lag = if wm == i64::MIN {
                     i64::MAX
                 } else {
-                    effective.saturating_sub(wm).max(0)
+                    max_wm.saturating_sub(wm).max(0)
                 };
                 (id.clone(), lag)
             })

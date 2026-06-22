@@ -596,6 +596,12 @@ pub struct ExecutorHeartbeat {
     memory_used_bytes: Option<u64>,
     memory_limit_bytes: Option<u64>,
     active_task_count: Option<u32>,
+    /// Available CPU cores reported by the executor.
+    cpu_cores_used: Option<f64>,
+    /// Cumulative network bytes sent, as reported by the executor.
+    network_bytes_sent: Option<u64>,
+    /// Cumulative network bytes received, as reported by the executor.
+    network_bytes_recv: Option<u64>,
     /// Per-task streaming state for the re-attach protocol.
     /// Empty for batch tasks and executors that have no streaming tasks.
     streaming_task_states: Vec<StreamingTaskState>,
@@ -623,6 +629,9 @@ impl ExecutorHeartbeat {
             memory_used_bytes: None,
             memory_limit_bytes: None,
             active_task_count: None,
+            cpu_cores_used: None,
+            network_bytes_sent: None,
+            network_bytes_recv: None,
             streaming_task_states: Vec::new(),
             hot_key_reports: Vec::new(),
             llm_quota_reports: Vec::new(),
@@ -665,6 +674,27 @@ impl ExecutorHeartbeat {
         self
     }
 
+    /// Attach available CPU cores.
+    #[must_use]
+    pub fn with_cpu_cores_used(mut self, cores: f64) -> Self {
+        self.cpu_cores_used = Some(cores);
+        self
+    }
+
+    /// Attach cumulative network bytes sent.
+    #[must_use]
+    pub fn with_network_bytes_sent(mut self, bytes: u64) -> Self {
+        self.network_bytes_sent = Some(bytes);
+        self
+    }
+
+    /// Attach cumulative network bytes received.
+    #[must_use]
+    pub fn with_network_bytes_recv(mut self, bytes: u64) -> Self {
+        self.network_bytes_recv = Some(bytes);
+        self
+    }
+
     /// Executor id.
     pub fn executor_id(&self) -> &ExecutorId {
         &self.executor_id
@@ -698,6 +728,21 @@ impl ExecutorHeartbeat {
     /// Active task count reported by executor.
     pub fn active_task_count(&self) -> Option<u32> {
         self.active_task_count
+    }
+
+    /// Available CPU cores reported by executor.
+    pub fn cpu_cores_used(&self) -> Option<f64> {
+        self.cpu_cores_used
+    }
+
+    /// Cumulative network bytes sent.
+    pub fn network_bytes_sent(&self) -> Option<u64> {
+        self.network_bytes_sent
+    }
+
+    /// Cumulative network bytes received.
+    pub fn network_bytes_recv(&self) -> Option<u64> {
+        self.network_bytes_recv
     }
 
     /// Attach streaming task states for the re-attach protocol.

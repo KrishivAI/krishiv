@@ -189,7 +189,7 @@ impl RateLimiter {
         }
         self.last_refill_ms = Some(now_ms);
 
-        if self.tokens >= n as f64 {
+        if self.tokens >= n as f64 || self.rows_per_second == 0 {
             self.tokens -= n as f64;
             None
         } else {

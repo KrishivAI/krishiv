@@ -58,6 +58,8 @@
               </dd>
               <dt>Slots</dt>
               <dd>{{ ex.slots }}</dd>
+              <dt>CPU Cores</dt>
+              <dd>{% if ex.cpu_cores.is_some() %}{{ ex.cpu_cores.unwrap() }}{% else %}N/A{% endif %}</dd>
               <dt>Memory</dt>
               <dd>
                 {% match ex.memory_used_bytes %}

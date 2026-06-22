@@ -69,7 +69,10 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
             .map_err(|e| format!("failed to bind HTTP addr {addr}: {e}"))?;
         println!(
             "Krishiv executor HTTP listening on {}",
-            listener.local_addr().unwrap()
+            listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| addr.to_string())
         );
         let http_executor_id = runtime.config().executor_id().as_str().to_owned();
         let http_slots = slots;
@@ -363,7 +366,9 @@ async fn heartbeat_loop(
         None
     };
     if let Some(listener) = &task_listener {
-        let bound_addr = listener.local_addr().unwrap();
+        let bound_addr = listener
+            .local_addr()
+            .map_err(|e| format!("failed to resolve task gRPC listener address: {e}"))?;
         let endpoint = advertised_http_endpoint(bound_addr, runtime.config().host());
         runtime.set_advertised_endpoints(Some(endpoint.clone()), None);
         println!("Krishiv executor task gRPC listening on {bound_addr} (advertised {endpoint})");
@@ -379,7 +384,9 @@ async fn heartbeat_loop(
         None
     };
     if let Some(listener) = &barrier_listener {
-        let bound_addr = listener.local_addr().unwrap();
+        let bound_addr = listener
+            .local_addr()
+            .map_err(|e| format!("failed to resolve barrier gRPC listener address: {e}"))?;
         let endpoint = advertised_http_endpoint(bound_addr, runtime.config().host());
         runtime.set_advertised_endpoints(None, Some(endpoint.clone()));
         println!("Krishiv executor barrier gRPC listening on {bound_addr} (advertised {endpoint})");

@@ -410,10 +410,11 @@ pub(crate) async fn read_shuffle_flight_partitions(
             |(table_name, flight_endpoint, job_id, upstream_stage_id, partition_id)| async move {
                 // Acquire a concurrency permit before touching the network.
                 // The permit is released when it drops at the end of this block.
-                let _permit = SHUFFLE_FETCH_SEMAPHORE
-                    .acquire()
-                    .await
-                    .expect("shuffle fetch semaphore closed");
+                let _permit = SHUFFLE_FETCH_SEMAPHORE.acquire().await.map_err(|_| {
+                    ExecutorError::LocalExecution {
+                        message: "shuffle fetch semaphore closed".to_string(),
+                    }
+                })?;
                 let batches = FlightShuffleClient::fetch_with_retry(
                     &flight_endpoint,
                     job_id.as_str(),

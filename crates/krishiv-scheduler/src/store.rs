@@ -306,7 +306,7 @@ impl InMemoryMetadataStore {
             self.events_byte_size = self
                 .events_byte_size
                 .saturating_sub(EVENT_BASE_BYTES + oldest.approx_heap_bytes());
-            self.evicted_event_count = self.evicted_event_count.wrapping_add(1);
+            self.evicted_event_count = self.evicted_event_count.saturating_add(1);
         }
     }
 }

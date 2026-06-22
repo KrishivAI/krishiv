@@ -1011,7 +1011,7 @@ fn scalar_to_string(arr: &dyn arrow::array::Array, row: usize) -> String {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn coalesce_pending(
+pub fn coalesce_pending(
     raw: HashMap<String, Vec<DeltaBatch>>,
 ) -> IvmResult<HashMap<String, DeltaBatch>> {
     raw.into_iter()

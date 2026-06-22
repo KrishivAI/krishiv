@@ -237,14 +237,7 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         let req = request.into_inner();
         let job_id = req.job_id.as_str();
 
-        // Take pending input batches for this job.
-        let input_batches = self
-            .continuous_inputs
-            .remove(job_id)
-            .map(|(_, v)| v)
-            .unwrap_or_default();
-
-        // If no loop executor exists yet, there's nothing to drain.
+        // Check executor FIRST to avoid losing input batches on early return.
         let executor_entry = match self.loop_executors.get(job_id) {
             Some(e) => e,
             None => {
@@ -259,6 +252,13 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         };
         let executor_arc = executor_entry.value().clone();
         drop(executor_entry);
+
+        // Now safe to consume pending input batches.
+        let input_batches = self
+            .continuous_inputs
+            .remove(job_id)
+            .map(|(_, v)| v)
+            .unwrap_or_default();
 
         let output_batches = {
             let mut exec = executor_arc

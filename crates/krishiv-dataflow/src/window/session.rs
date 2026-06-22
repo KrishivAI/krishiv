@@ -275,6 +275,9 @@ impl SessionWindowOperator {
                 && event_time_ms >= existing.last_event_time_ms.saturating_add(gap)
                 && let Some(s) = self.sessions.remove(&key)
             {
+                if let Some(budget) = &self.memory_budget {
+                    budget.release(128);
+                }
                 output.push(self.build_output_batch(
                     &key,
                     s.session_start_ms,

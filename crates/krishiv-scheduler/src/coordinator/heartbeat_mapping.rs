@@ -27,6 +27,15 @@ pub fn executor_heartbeat_from_request(request: &ExecutorHeartbeatRequest) -> Ex
     if let Some(count) = request.active_task_count() {
         heartbeat = heartbeat.with_active_task_count(count);
     }
+    if let Some(cores) = request.cpu_cores_used() {
+        heartbeat = heartbeat.with_cpu_cores_used(cores);
+    }
+    if let Some(bytes) = request.network_bytes_sent() {
+        heartbeat = heartbeat.with_network_bytes_sent(bytes);
+    }
+    if let Some(bytes) = request.network_bytes_recv() {
+        heartbeat = heartbeat.with_network_bytes_recv(bytes);
+    }
     if !request.streaming_task_states().is_empty() {
         heartbeat = heartbeat.with_streaming_task_states(request.streaming_task_states().to_vec());
     }

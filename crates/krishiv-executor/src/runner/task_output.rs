@@ -211,6 +211,23 @@ impl ExecutorTaskOutput {
         }
     }
 
+    pub(crate) fn ivm_step(active_views: usize, total_output_rows: usize) -> Self {
+        Self {
+            kind: ExecutorTaskOutputKind::IvmStep,
+            row_count: total_output_rows,
+            batch_count: active_views,
+            column_count: 0,
+            shuffle_partitions: Vec::new(),
+            runtime_stats: None,
+            record_batches: Vec::new(),
+            watermark_ms: None,
+            hot_key_reports: Vec::new(),
+            sink_staged_files: Vec::new(),
+            advisory_buckets: None,
+            backpressure: krishiv_common::BackpressureSignal::None,
+        }
+    }
+
     /// Batches produced by this task (streaming window or SQL).
     pub fn record_batches(&self) -> &[RecordBatch] {
         &self.record_batches
@@ -309,10 +326,19 @@ impl ExecutorTaskOutput {
         if let Some(stats) = &self.runtime_stats {
             meta = meta.with_runtime_stats(stats.clone());
         }
-        if !self.record_batches.is_empty()
-            && let Ok(ipc) = encode_record_batches_ipc(&self.record_batches)
-        {
-            meta = meta.with_inline_record_batch_ipc(ipc);
+        if !self.record_batches.is_empty() {
+            match encode_record_batches_ipc(&self.record_batches) {
+                Ok(ipc) => {
+                    meta = meta.with_inline_record_batch_ipc(ipc);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        batch_count = self.record_batches.len(),
+                        "failed to encode inline record batches for task output"
+                    );
+                }
+            }
         }
         // GAP-2: Propagate watermark so the coordinator can track global low-watermark
         // across all executor tasks for downstream stage scheduling.
@@ -347,6 +373,8 @@ pub enum ExecutorTaskOutputKind {
     ShuffleWrite,
     /// Streaming window aggregation output (tumbling, sliding, or session).
     StreamingWindow,
+    /// One bounded IVM tick completed (DeltaBatch model).
+    IvmStep,
 }
 
 impl ExecutorTaskOutputKind {
@@ -357,6 +385,7 @@ impl ExecutorTaskOutputKind {
             Self::Cancelled => "cancelled",
             Self::ShuffleWrite => "shuffle_write",
             Self::StreamingWindow => "streaming_window",
+            Self::IvmStep => "ivm_step",
         }
     }
 }

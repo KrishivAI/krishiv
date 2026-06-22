@@ -362,10 +362,7 @@ fn build_output_batch(
     // output schema's declared type so downstream operators see correct types.
     let mut cols: Vec<Arc<dyn Array>> = Vec::new();
     for gi in 0..n_group {
-        let vals: Vec<Option<&str>> = group_rows
-            .iter()
-            .map(|r| r[gi].as_deref())
-            .collect();
+        let vals: Vec<Option<&str>> = group_rows.iter().map(|r| r[gi].as_deref()).collect();
         let string_col: Arc<dyn Array> = Arc::new(StringArray::from(vals));
         let target = output_schema.field(gi).data_type();
         if target == &DataType::Utf8 || target == &DataType::LargeUtf8 {
@@ -409,19 +406,39 @@ fn build_output_batch(
 fn scalar_to_group_key(arr: &dyn Array, row: usize) -> Option<String> {
     use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return if a.is_null(row) { None } else { Some(a.value(row).to_string()) };
+        return if a.is_null(row) {
+            None
+        } else {
+            Some(a.value(row).to_string())
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return if a.is_null(row) { None } else { Some(a.value(row).to_string()) };
+        return if a.is_null(row) {
+            None
+        } else {
+            Some(a.value(row).to_string())
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return if a.is_null(row) { None } else { Some(a.value(row).to_string()) };
+        return if a.is_null(row) {
+            None
+        } else {
+            Some(a.value(row).to_string())
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        return if a.is_null(row) { None } else { Some(a.value(row).to_string()) };
+        return if a.is_null(row) {
+            None
+        } else {
+            Some(a.value(row).to_string())
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) { None } else { Some(a.value(row).to_string()) };
+        return if a.is_null(row) {
+            None
+        } else {
+            Some(a.value(row).to_string())
+        };
     }
     None
 }
@@ -431,19 +448,39 @@ fn scalar_to_group_key(arr: &dyn Array, row: usize) -> Option<String> {
 fn scalar_to_string(arr: &dyn Array, row: usize) -> String {
     use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) { "NULL".into() } else { a.value(row).to_string() };
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
     }
     "NULL".to_string()
 }

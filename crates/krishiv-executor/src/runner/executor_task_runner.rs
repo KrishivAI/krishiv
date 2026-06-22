@@ -567,21 +567,16 @@ impl ExecutorTaskRunner {
                 )
                 .await
                 {
-                    Ok(Ok(_summary)) => {
-                        // The scheduler never dispatches delta:step: fragments today — IVM
-                        // runs centrally on the coordinator (see ivm_http.rs:api_ivm_step).
-                        // If this branch is reached it means a fragment was accidentally
-                        // wired up; fail loudly instead of silently returning empty output.
-                        tracing::error!(
-                            "delta:step fragment reached executor — IVM must run centrally \
-                             on the coordinator; this is a scheduler wiring bug"
+                    Ok(Ok(summary)) => {
+                        tracing::debug!(
+                            active_views = summary.active_views,
+                            total_output_rows = summary.total_output_rows,
+                            "IVM delta:step tick completed on executor"
                         );
-                        Err(ExecutorError::InvalidAssignment {
-                            message: "delta:step fragments are not dispatched by the scheduler; \
-                                      IVM runs centrally on the coordinator \
-                                      (see ivm_http.rs:api_ivm_step)"
-                                .into(),
-                        })
+                        Ok(crate::runner::task_output::ExecutorTaskOutput::ivm_step(
+                            summary.active_views,
+                            summary.total_output_rows,
+                        ))
                     }
                     Ok(Err(e)) => Err(ExecutorError::InvalidAssignment {
                         message: format!("IVM step failed: {e}"),

@@ -123,6 +123,18 @@
       <span class="label">Barrier Endpoint</span>
       <span class="value td-mono">{% if executor.barrier_endpoint_display.is_empty() %}&mdash;{% else %}{{ executor.barrier_endpoint_display }}{% endif %}</span>
     </div>
+    <div class="info-item">
+      <span class="label">CPU Cores</span>
+      <span class="value">{% if executor.cpu_cores.is_some() %}{{ executor.cpu_cores.unwrap() }}{% else %}&mdash;{% endif %}</span>
+    </div>
+    <div class="info-item">
+      <span class="label">Network Sent</span>
+      <span class="value td-mono">{% if executor.network_bytes_sent.is_some() %}{{ executor.network_bytes_sent.unwrap() / 1048576 }} MB{% else %}&mdash;{% endif %}</span>
+    </div>
+    <div class="info-item">
+      <span class="label">Network Received</span>
+      <span class="value td-mono">{% if executor.network_bytes_recv.is_some() %}{{ executor.network_bytes_recv.unwrap() / 1048576 }} MB{% else %}&mdash;{% endif %}</span>
+    </div>
   </div>
 
   <div class="panel">

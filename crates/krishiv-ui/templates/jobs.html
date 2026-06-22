@@ -12,7 +12,15 @@
     </div>
     <div class="stat-card">
       <div class="stat-label">Executors</div>
-      <div class="stat-value">{{ executors.len() }}</div>
+      <div class="stat-value">{{ healthy_executor_count }} / {{ executors.len() }} healthy</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Slots</div>
+      <div class="stat-value">{{ cluster_used_slots }} / {{ cluster_total_slots }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Cluster Memory</div>
+      <div class="stat-value">{{ cluster_memory_used_mb }} / {{ cluster_memory_total_mb }} MB</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Running Tasks</div>

@@ -8,7 +8,7 @@ use crate::job::ExecutorPlacement;
 use crate::{CoordinatorConfig, SchedulerError, SchedulerResult};
 
 /// Memory and task load snapshot from an executor heartbeat.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorHealthSnapshot {
     /// Memory used, as reported by the executor.
     pub memory_used_bytes: Option<u64>,
@@ -16,6 +16,12 @@ pub struct ExecutorHealthSnapshot {
     pub memory_limit_bytes: Option<u64>,
     /// Active task count, as reported by the executor.
     pub active_task_count: Option<u32>,
+    /// Available CPU cores, as reported by the executor.
+    pub cpu_cores_used: Option<f64>,
+    /// Cumulative network bytes sent, as reported by the executor.
+    pub network_bytes_sent: Option<u64>,
+    /// Cumulative network bytes received, as reported by the executor.
+    pub network_bytes_recv: Option<u64>,
 }
 
 /// Executor registry backed by `HashMap` for O(1) lookup on the hot heartbeat path.
@@ -91,6 +97,9 @@ impl ExecutorRegistry {
             memory_used_bytes: heartbeat.memory_used_bytes(),
             memory_limit_bytes: heartbeat.memory_limit_bytes(),
             active_task_count: heartbeat.active_task_count(),
+            cpu_cores_used: heartbeat.cpu_cores_used(),
+            network_bytes_sent: heartbeat.network_bytes_sent(),
+            network_bytes_recv: heartbeat.network_bytes_recv(),
         });
         Ok(())
     }
@@ -303,7 +312,7 @@ pub(crate) fn validate_executor_lease(
 }
 
 /// Executor registry record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorRecord {
     pub(crate) descriptor: ExecutorDescriptor,
     pub(crate) lease_generation: LeaseGeneration,
@@ -376,6 +385,9 @@ impl ExecutorRecord {
     /// Increment failure counter (called on task failure reports from this executor).
     /// Returns true if the executor has now exceeded the given threshold (circuit break candidate).
     pub fn record_task_failure(&mut self, threshold: u32) -> bool {
+        if threshold == 0 {
+            return false;
+        }
         self.consecutive_task_failures = self.consecutive_task_failures.saturating_add(1);
         self.consecutive_task_failures >= threshold
     }
@@ -406,6 +418,9 @@ impl ExecutorRegistry {
 
     /// Return list of executors that currently exceed the failure threshold.
     pub fn executors_over_failure_threshold(&self, threshold: u32) -> Vec<ExecutorId> {
+        if threshold == 0 {
+            return Vec::new();
+        }
         self.executors
             .values()
             .filter(|e| e.consecutive_task_failures >= threshold)

@@ -24,7 +24,7 @@ pub struct JobDetailResponse {
     pub job: JobDetailView,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExecutorsResponse {
     /// Executor summaries.
     pub executors: Vec<ExecutorView>,
@@ -148,6 +148,10 @@ pub struct StageView {
     pub task_count: usize,
     /// Task details.
     pub tasks: Vec<TaskView>,
+    /// Shuffle bytes written by completed tasks in this stage.
+    pub shuffle_bytes_written: u64,
+    /// Shuffle partitions currently available for this stage.
+    pub shuffle_partitions_available: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -195,7 +199,7 @@ pub struct TaskView {
     pub last_source_offset_display: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExecutorView {
     /// Executor id.
     pub executor_id: String,
@@ -229,6 +233,12 @@ pub struct ExecutorView {
     pub heartbeat_age_ticks: u64,
     /// Slots in use (running task count).
     pub slots_used: usize,
+    /// Available CPU cores as reported by the executor.
+    pub cpu_cores: Option<f64>,
+    /// Cumulative network bytes sent as reported by the executor.
+    pub network_bytes_sent: Option<u64>,
+    /// Cumulative network bytes received as reported by the executor.
+    pub network_bytes_recv: Option<u64>,
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
@@ -236,7 +246,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Response for `GET /api/v1/executors/{executor_id}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExecutorDetailResponse {
     pub executor: ExecutorView,
 }
@@ -256,6 +266,11 @@ pub(crate) struct JobsTemplate {
     pub(crate) jobs: Vec<JobSummaryView>,
     pub(crate) executors: Vec<ExecutorView>,
     pub(crate) bearer_token: Option<String>,
+    pub(crate) cluster_total_slots: usize,
+    pub(crate) cluster_used_slots: usize,
+    pub(crate) cluster_memory_total_mb: u64,
+    pub(crate) cluster_memory_used_mb: u64,
+    pub(crate) healthy_executor_count: usize,
 }
 
 impl JobsTemplate {
@@ -449,12 +464,12 @@ pub(crate) struct HistoryTemplate {
 impl HistoryTemplate {
     /// True when more archived records exist beyond this page.
     fn has_more(&self) -> bool {
-        self.offset + self.records.len() < self.total
+        self.offset.saturating_add(self.records.len()) < self.total
     }
 
     /// Offset for the next page link.
     fn next_offset(&self) -> usize {
-        self.offset + self.limit
+        self.offset.saturating_add(self.limit)
     }
 }
 

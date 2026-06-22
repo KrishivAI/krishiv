@@ -329,6 +329,16 @@ impl ExecutorRuntime {
             req = req.with_memory_limit_bytes(bytes);
         }
 
+        // CPU core count available to this executor (cgroup-aware).
+        req = req.with_cpu_cores_used(available_cpu_cores() as f64);
+
+        // Cumulative network bytes (sent, recv) across all interfaces.
+        if let Some((sent, recv)) = read_proc_net_bytes() {
+            req = req
+                .with_network_bytes_sent(sent)
+                .with_network_bytes_recv(recv);
+        }
+
         req
     }
 
@@ -691,4 +701,35 @@ fn read_proc_mem_total_bytes() -> Option<u64> {
         }
     }
     None
+}
+
+/// Read the number of available CPU cores.
+fn available_cpu_cores() -> u32 {
+    // available_parallelism respects cgroup CPU limits in recent kernels
+    // (Linux 5.13+) and container CPU pinning. Falls back to 1 on error.
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
+/// Read total network bytes sent and received from `/proc/net/dev`.
+/// Returns `(sent, recv)` or `None` on non-Linux or parse failure.
+fn read_proc_net_bytes() -> Option<(u64, u64)> {
+    let dev = std::fs::read_to_string("/proc/net/dev").ok()?;
+    let mut total_sent: u64 = 0;
+    let mut total_recv: u64 = 0;
+    // Lines after the header look like:
+    //   "  eth0: 1234  ...  5678 ..."
+    // Fields: recv_bytes (col 1), sent_bytes (col 9)
+    for line in dev.lines().skip(2) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 10 {
+            continue;
+        }
+        let recv: u64 = parts[1].parse().ok()?;
+        let sent: u64 = parts[9].parse().ok()?;
+        total_recv = total_recv.saturating_add(recv);
+        total_sent = total_sent.saturating_add(sent);
+    }
+    Some((total_sent, total_recv))
 }

@@ -270,7 +270,7 @@ fn compute_watermark_ms(batches: &[RecordBatch], event_time_col: &str, lag_ms: u
             max_ts = Some(max_ts.unwrap_or(i64::MIN).max(ts));
         }
     }
-    max_ts.map(|ts| ts - lag_ms as i64)
+    max_ts.map(|ts| ts.saturating_sub(i64::try_from(lag_ms).unwrap_or(i64::MAX)))
 }
 
 fn tables_to_batch_sql(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> {

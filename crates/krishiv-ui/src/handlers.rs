@@ -322,6 +322,11 @@ pub(crate) async fn ui_jobs(
         jobs,
         executors: snapshot.executors,
         bearer_token: ui_auth_token(&state),
+        cluster_total_slots: snapshot.cluster_total_slots,
+        cluster_used_slots: snapshot.cluster_used_slots,
+        cluster_memory_total_mb: snapshot.cluster_memory_total_mb,
+        cluster_memory_used_mb: snapshot.cluster_memory_used_mb,
+        healthy_executor_count: snapshot.healthy_executor_count,
     };
     Ok(Html(template.render()?))
 }
@@ -563,17 +568,41 @@ async fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
 
 fn status_snapshot_inner(coordinator: &krishiv_scheduler::Coordinator) -> StatusView {
     let tick = coordinator.executors().current_tick();
+    let executors: Vec<ExecutorView> = coordinator
+        .executor_snapshots()
+        .iter()
+        .map(|r| ExecutorView::from_record(r, tick))
+        .collect();
+
+    let cluster_total_slots: usize = executors.iter().map(|e| e.slots).sum();
+    let cluster_used_slots: usize = executors.iter().map(|e| e.slots_used).sum();
+    let cluster_memory_total_mb: u64 = executors
+        .iter()
+        .filter_map(|e| e.memory_limit_bytes)
+        .map(|b| b / 1048576)
+        .sum();
+    let cluster_memory_used_mb: u64 = executors
+        .iter()
+        .filter_map(|e| e.memory_used_bytes)
+        .map(|b| b / 1048576)
+        .sum();
+    let healthy_executor_count = executors
+        .iter()
+        .filter(|e| e.state == "healthy" || e.state == "active")
+        .count();
+
     StatusView {
         jobs: coordinator
             .job_snapshots()
             .iter()
             .map(JobSummaryView::from_snapshot)
             .collect(),
-        executors: coordinator
-            .executor_snapshots()
-            .iter()
-            .map(|r| ExecutorView::from_record(r, tick))
-            .collect(),
+        executors,
+        cluster_total_slots,
+        cluster_used_slots,
+        cluster_memory_total_mb,
+        cluster_memory_used_mb,
+        healthy_executor_count,
     }
 }
 
@@ -722,10 +751,20 @@ async fn job_detail(state: &UiState, job_id: &str) -> UiResult<JobDetailView> {
     Ok(JobDetailView::from_snapshot(&detail))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct StatusView {
     jobs: Vec<JobSummaryView>,
     executors: Vec<ExecutorView>,
+    /// Total slots across all executors.
+    cluster_total_slots: usize,
+    /// Total slots in use across all executors.
+    cluster_used_slots: usize,
+    /// Total memory (MB) across all executors.
+    cluster_memory_total_mb: u64,
+    /// Used memory (MB) across all executors.
+    cluster_memory_used_mb: u64,
+    /// Number of healthy executors.
+    healthy_executor_count: usize,
 }
 
 impl JobSummaryView {
@@ -799,6 +838,8 @@ impl JobDetailView {
                             }
                         })
                         .collect(),
+                    shuffle_bytes_written: stage.shuffle_bytes_written(),
+                    shuffle_partitions_available: stage.shuffle_partitions_available(),
                 })
                 .collect(),
         }
@@ -812,7 +853,7 @@ impl ExecutorView {
             let used = h.memory_used_bytes?;
             let limit = h.memory_limit_bytes?;
             if limit > 0 {
-                Some(used * 100 / limit)
+                Some(((used as f64) * 100.0 / limit as f64) as u64)
             } else {
                 None
             }
@@ -843,6 +884,9 @@ impl ExecutorView {
             memory_used_pct,
             heartbeat_age_ticks,
             slots_used: record.running_tasks().len(),
+            cpu_cores: health.and_then(|h| h.cpu_cores_used),
+            network_bytes_sent: health.and_then(|h| h.network_bytes_sent),
+            network_bytes_recv: health.and_then(|h| h.network_bytes_recv),
         }
     }
 }

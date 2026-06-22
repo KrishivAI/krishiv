@@ -141,7 +141,13 @@ async fn poll_batch_sql_job(
         if let Some(ms) = backoff_ms {
             // Apply ±25 % jitter; minimum 10 ms.
             let jitter_pct = (seed.wrapping_add(ms) % 51) as i64 - 25; // [-25, 25]
-            let jittered = ((ms as i64) + (ms as i64) * jitter_pct / 100).max(10) as u64;
+            let delta = ms / 100 * jitter_pct.unsigned_abs() as u64;
+            let jittered = if jitter_pct >= 0 {
+                ms.saturating_add(delta)
+            } else {
+                ms.saturating_sub(delta)
+            }
+            .max(10);
             tokio::time::sleep(std::time::Duration::from_millis(jittered)).await;
         }
         if tokio::time::Instant::now() >= deadline {
