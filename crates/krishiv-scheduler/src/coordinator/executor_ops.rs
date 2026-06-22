@@ -113,12 +113,29 @@ impl Coordinator {
 
         self.exec.notify.notify_waiters();
 
+        // F5: update per-executor per-job watermarks from streaming progress reports,
+        // then compute the global minimum watermark per job.
+        if !streaming_progress.is_empty() {
+            let entry = self
+                .executor_job_watermarks
+                .entry(executor_id.clone())
+                .or_default();
+            for report in &streaming_progress {
+                entry
+                    .entry(report.job_id.clone())
+                    .and_modify(|wm| *wm = (*wm).max(report.watermark_ms))
+                    .or_insert(report.watermark_ms);
+            }
+        }
+        let global_watermarks = self.compute_global_watermarks();
+
         Ok(ExecutorHeartbeatEffects {
             source_throttles,
             checkpoint_commands,
             checkpoint_complete_commands,
             restore_commands,
             lease_generation,
+            global_watermarks,
         })
     }
 
@@ -246,6 +263,7 @@ impl Coordinator {
         self.exec.executors.mark_lost(executor_id)?;
         self.handle_executor_loss_for_checkpoints(executor_id);
         self.reset_running_tasks_for_lost_executor(executor_id);
+        self.executor_job_watermarks.remove(executor_id);
         krishiv_metrics::global_metrics().inc_executor_lost();
         Ok(())
     }
@@ -597,5 +615,25 @@ impl Coordinator {
                 }
             }
         }
+    }
+
+    /// Compute the global minimum watermark per job from all executor per-job watermarks.
+    ///
+    /// Returns the minimum watermark across all executors for each job that has
+    /// at least one reported watermark entry.
+    fn compute_global_watermarks(&self) -> std::collections::HashMap<JobId, i64> {
+        if self.executor_job_watermarks.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let mut global: std::collections::HashMap<JobId, i64> = std::collections::HashMap::new();
+        for job_wm_map in self.executor_job_watermarks.values() {
+            for (job_id, &wm) in job_wm_map {
+                global
+                    .entry(job_id.clone())
+                    .and_modify(|m| *m = (*m).min(wm))
+                    .or_insert(wm);
+            }
+        }
+        global
     }
 }

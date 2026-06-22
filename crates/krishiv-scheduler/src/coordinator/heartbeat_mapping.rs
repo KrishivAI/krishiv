@@ -74,5 +74,8 @@ pub fn executor_heartbeat_response_from_effects(
     if !effects.restore_commands.is_empty() {
         resp = resp.with_restore_commands(effects.restore_commands);
     }
+    if !effects.global_watermarks.is_empty() {
+        resp = resp.with_global_watermarks(effects.global_watermarks);
+    }
     resp
 }

@@ -248,11 +248,16 @@ impl PyIvmJob {
     }
 
     /// Advance one tick. Returns a :class:`StepSummary`.
-    pub fn step(&self) -> PyResult<PyStepSummary> {
-        crate::RUNTIME
-            .block_on(self.inner.step())
-            .map(PyStepSummary::from)
-            .map_err(rt_err)
+    ///
+    /// The GIL is released while waiting for the async tick to complete so that
+    /// other Python threads (e.g. feed producers) can run concurrently.
+    pub fn step(&self, py: Python<'_>) -> PyResult<PyStepSummary> {
+        py.detach(|| {
+            crate::RUNTIME
+                .block_on(self.inner.step())
+                .map(PyStepSummary::from)
+                .map_err(rt_err)
+        })
     }
 
     /// Read the current materialized snapshot of a view, or ``None``.

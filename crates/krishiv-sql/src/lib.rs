@@ -20,6 +20,7 @@ use catalog::{InMemoryCatalog, datafusion_bridge::DataFusionCatalogBridge};
 use datafusion::dataframe::DataFrame as DataFusionDataFrame;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, parser::Parser};
+use object_store::aws::AmazonS3Builder;
 
 use krishiv_plan::optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
@@ -1298,6 +1299,23 @@ impl SqlEngine {
         }
 
         let path = path.as_ref().to_string_lossy().into_owned();
+
+        // Register an S3 ObjectStore when the path is an s3:// URL so DataFusion
+        // can read remote Parquet files transparently.
+        if path.starts_with("s3://") {
+            let url = url::Url::parse(&path)
+                .map_err(|e| SqlError::DataFusion { message: format!("invalid s3 url {path}: {e}") })?;
+            let bucket = url.host_str().unwrap_or_default();
+            let store_url = url::Url::parse(&format!("s3://{bucket}"))
+                .map_err(|e| SqlError::DataFusion { message: format!("invalid s3 bucket url: {e}") })?;
+            let store = AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|e| SqlError::DataFusion { message: format!("s3 store init: {e}") })?;
+            self.context
+                .register_object_store(&store_url, Arc::new(store));
+        }
+
         if self
             .context
             .table_exist(table_name)

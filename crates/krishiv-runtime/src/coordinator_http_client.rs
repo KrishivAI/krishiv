@@ -141,7 +141,7 @@ async fn poll_batch_sql_job(
         if let Some(ms) = backoff_ms {
             // Apply ±25 % jitter; minimum 10 ms.
             let jitter_pct = (seed.wrapping_add(ms) % 51) as i64 - 25; // [-25, 25]
-            let delta = ms / 100 * jitter_pct.unsigned_abs() as u64;
+            let delta = ms / 100 * jitter_pct.unsigned_abs();
             let jittered = if jitter_pct >= 0 {
                 ms.saturating_add(delta)
             } else {

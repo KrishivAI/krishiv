@@ -127,7 +127,12 @@ impl Drop for MetricsHandle {
 /// Returns a [`MetricsError`] if the OTLP exporter pipeline fails to build (only
 /// possible when `config.otlp_endpoint` is `Some`).
 pub fn init(config: MetricsConfig) -> Result<MetricsHandle, MetricsError> {
-    let filter_str = config.log_filter.as_deref().unwrap_or("info").to_string();
+    let filter_str = config
+        .log_filter
+        .as_deref()
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("RUST_LOG").ok())
+        .unwrap_or_else(|| "info".to_string());
     let filter = tracing_subscriber::EnvFilter::new(&filter_str);
     let deployment_target = config.resolved_deployment_target();
 

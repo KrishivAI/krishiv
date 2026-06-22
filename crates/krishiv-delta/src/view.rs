@@ -73,8 +73,29 @@ impl IncrementalView {
                 .lock()
                 .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
             let current = snap.take();
-            let updated = crate::operators::stream::apply_delta(current, &output)?;
+            let updated = match crate::operators::stream::apply_delta(current, &output) {
+                Ok(rb) => rb,
+                Err(e) => {
+                    tracing::warn!(
+                        view = %self.spec.name,
+                        error = %e,
+                        output_rows = output.num_rows(),
+                        "apply_delta failed in publish_output — snapshot not updated"
+                    );
+                    return Err(e);
+                }
+            };
+            tracing::debug!(
+                view = %self.spec.name,
+                rows = updated.num_rows(),
+                "snapshot updated"
+            );
             *snap = Some(updated);
+        } else {
+            tracing::debug!(
+                view = %self.spec.name,
+                "publish_output: not materialized, snapshot skipped"
+            );
         }
         let _ = self.sender.send(Some(output));
         Ok(())

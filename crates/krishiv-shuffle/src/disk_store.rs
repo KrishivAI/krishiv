@@ -326,8 +326,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
             let tmp_suffix = TMP_CTR.fetch_add(1, Ordering::Relaxed);
 
             if let Some(parent) = final_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| wrap_io_err(e, final_path.parent().unwrap()))?;
+                std::fs::create_dir_all(parent).map_err(|e| wrap_io_err(e, parent))?;
             }
 
             // Phase 1 (continued): Write to a temp file alongside the final path.

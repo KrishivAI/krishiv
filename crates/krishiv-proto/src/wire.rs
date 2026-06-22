@@ -355,6 +355,11 @@ pub fn executor_heartbeat_response_to_wire(
             .collect(),
         trace_parent,
         trace_state,
+        global_watermarks: value
+            .global_watermarks()
+            .iter()
+            .map(|(k, &v)| (k.as_str().to_owned(), v))
+            .collect(),
     }
 }
 
@@ -448,6 +453,20 @@ pub fn executor_heartbeat_response_from_wire(
     }
     if let Some(ctx) = trace_context_from_wire(value.trace_parent, value.trace_state) {
         response = response.with_trace_context(ctx);
+    }
+    if !value.global_watermarks.is_empty() {
+        let watermarks: std::collections::HashMap<_, _> = value
+            .global_watermarks
+            .into_iter()
+            .filter_map(|(k, v)| match JobId::try_new(k.clone()) {
+                Ok(id) => Some((id, v)),
+                Err(e) => {
+                    tracing::warn!(key = %k, error = %e, "global_watermarks: skipping malformed JobId");
+                    None
+                }
+            })
+            .collect();
+        response = response.with_global_watermarks(watermarks);
     }
     Ok(response)
 }

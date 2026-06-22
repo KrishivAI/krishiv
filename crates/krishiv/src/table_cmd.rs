@@ -50,14 +50,6 @@ fn run_table_read(args: &[&str]) -> CliResponse {
         Ok(c) => c,
         Err(e) => return CliResponse::err(format!("{e}\n\n{}", table_help()), 2),
     };
-    if matches!(&cmd.format, TableFormat::Delta | TableFormat::Hudi) {
-        let fmt_str = match &cmd.format {
-            TableFormat::Delta => "Delta",
-            TableFormat::Hudi => "Hudi",
-            _ => "",
-        };
-        eprintln!("[alpha] Reading local {fmt_str} table — remote/S3 paths are not yet supported.");
-    }
     let session = match SessionBuilder::new().build() {
         Ok(s) => s,
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),

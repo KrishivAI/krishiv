@@ -550,7 +550,7 @@ fn kafka_offsets_for_events(events: &[CdcEvent]) -> BTreeMap<String, i64> {
     let mut offsets = BTreeMap::new();
     for event in events {
         let key = format!("{}-{}", event.table, event.partition_id);
-        let next_offset = event.offset + 1;
+        let next_offset = event.offset.saturating_add(1);
         // H5: take the max offset per partition so non-ascending event order
         // (e.g. from merged multi-table batches) never commits a stale offset.
         offsets

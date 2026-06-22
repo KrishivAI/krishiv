@@ -172,6 +172,10 @@ message ExecutorHeartbeatResponse {
   repeated CheckpointCompleteCommand completed_checkpoints = 10;
   // Restore directives driving executor-side state/offset reload.
   repeated RestoreFromCheckpointCommand restore_checkpoints = 11;
+  // Global minimum event-time watermark per job (ms since epoch).
+  // Computed from all executors running each job; executor uses this to
+  // advance downstream aggregation windows.
+  map<string, int64> global_watermarks = 12;
 }
 
 message ShuffleWriteConfigWire {

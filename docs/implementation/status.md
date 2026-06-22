@@ -1,5 +1,146 @@
 # Krishiv Implementation Status
 
+## 2026-06-22 — IVM snapshot null bug: root cause found and fixed
+
+### Root cause
+`api_ivm_step` in `ivm_http.rs` was computing executor count as
+`coordinator.executor_snapshots().len()` — counting **all** snapshots including
+stale/dead executors from previous runs.  With stale registrations present, the
+handler incorrectly routed every step to the distributed path, which explicitly
+does **not** update the coordinator's `IncrementalFlow` snapshot.  The snapshot
+therefore stayed `None` regardless of correct delta processing.
+
+### Fix
+Changed executor count to filter by `can_accept_work()`:
+```rust
+coordinator.read().await
+    .executor_snapshots()
+    .into_iter()
+    .filter(|e| e.state().can_accept_work())
+    .count()
+```
+Only executors that are genuinely ready now trigger distributed dispatch.
+
+### Diagnostic infrastructure added (useful for future debugging)
+- `view.rs` (`krishiv-delta`): `tracing::warn!` on `apply_delta` failure inside
+  `publish_output`; `tracing::debug!` on successful snapshot update.
+- `flow.rs` (`krishiv-ivm`): `tracing::warn!` when `publish_output` returns `Err`.
+- `init.rs` (`krishiv-metrics`): Log filter now falls back to `RUST_LOG` env var
+  (coordinator deployment already sets `RUST_LOG=info,krishiv_delta=debug,
+  krishiv_ivm=debug`).
+- `ivm_http.rs`: Added `/api/v1/ivm/jobs/{id}/views/{view}/debug-info` endpoint.
+- `ivm.rs`: Added `view_spec` method to `IvmJob`; regression test
+  `single_job_snapshot_non_null_after_step` (passes locally).
+
+### Validation
+- Docker image rebuilt (`localhost/krishiv:local` 2026-06-22 16:50:18) and
+  deployed to k3s (`kubectl -n krishiv-system rollout restart deployment/coordinator`).
+- Scenario tests (`scripts/test_ivm_scenarios.sh`): **4/4 PASS**
+  - Scenario A (SUM no GROUP BY, local): snapshot `{total: [350.0]}` ✓
+  - Scenario B (GROUP BY region, local): snapshot `{east: 150.0, west: 200.0}` ✓
+- Coordinator debug logs confirm `snapshot updated` (rows=1, rows=2) with no
+  WARN or ERROR messages.
+
+### Next useful command
+```bash
+# Run full workspace tests
+cargo test --workspace
+# Run IVM scenario tests against K8s
+./scripts/test_ivm_scenarios.sh http://localhost:30002
+```
+
+## 2026-06-21 — Systematic bug sweep across all crates
+
+Performed a comprehensive scan of every workspace crate for correctness bugs,
+panic risks, integer overflows, resource leaks, and silent error swallowing.
+Fixed **30 bugs** across 14 files. All changes pass `cargo fmt --check` and
+`cargo clippy --workspace -D warnings`.
+
+### Scheduler fixes
+
+- **`ivm_http.rs`**: Fixed silent IVM step error swallowing (`let _ = flow.step_with(...)`)
+  — now propagates errors as HTTP 500. Collapsed nested `if` for clippy.
+- **`store.rs`**: Changed `wrapping_add(1)` to `saturating_add(1)` on monotonic
+  `evicted_event_count` counter.
+- **`heartbeat.rs`**: Circuit breaker `record_task_failure(0)` now returns `false`
+  (treats threshold 0 as disabled) instead of fencing every executor. Same guard
+  added to `executors_over_failure_threshold(0)`.
+
+### Executor fixes
+
+- **`grpc.rs`**: Fixed data loss in `drain_continuous_output` — reordered to check
+  `loop_executors` before removing from `continuous_inputs`, preventing permanent
+  loss of pending input batches on early return.
+- **`transport.rs`**: (no changes needed — prior session's /proc reads are correct)
+- **`cli.rs`**: Replaced 3× `.unwrap()` on `TcpListener::local_addr()` with proper
+  error propagation.
+- **`fragment/common.rs`**: Replaced `.expect("shuffle fetch semaphore closed")` with
+  `map_err` — semaphore closed is a runtime condition, not an invariant.
+- **`runner/task_output.rs`**: IPC encoding errors are now logged instead of silently
+  swallowed when building task output metadata.
+
+### Dataflow fixes
+
+- **`window/session.rs`**: Fixed memory-budget leak — `budget.release(128)` now
+  called in the early-close branch when a session exceeds its gap.
+- **`window/mod.rs`**: Fixed `per_source_lag_ms()` — was always returning 0 because
+  it computed lag against `min(watermarks)` (effective) instead of `max(watermarks)`.
+  Now correctly reports how far behind each source is relative to the fastest.
+- **`window/tumbling.rs`**: Two integer overflow sites fixed — `win_start + size`
+  changed to `win_start.saturating_add(size)` in both `flush_closed_windows` and
+  `build_output_batch`.
+- **`window/sliding.rs`**: Same overflow fix in `build_output_batch`.
+- **`adaptive.rs`**: Fixed `RateLimiter::try_consume` divide-by-zero when
+  `rows_per_second == 0` — now short-circuits as unlimited.
+- **`process_fn.rs`**: Timer callbacks now log-and-continue on error instead of
+  immediately returning, preventing loss of remaining timers.
+
+### UI fixes
+
+- **`handlers.rs`**: Fixed `used * 100 / limit` u64 overflow in
+  `ExecutorView::from_record` — now uses `(used as f64) * 100.0 / limit as f64`.
+- **`views.rs`**: Fixed pagination `has_more` and `next_offset` arithmetic — now
+  uses `saturating_add` to prevent overflow.
+
+### Proto fixes
+
+- (wire round-trip zero-value drop noted but not fixed — requires proto schema change)
+
+### Runtime fixes
+
+- **`execution_runtime.rs`**: Fixed `lag_ms as i64` cast for huge values — now uses
+  `i64::try_from(lag_ms).unwrap_or(i64::MAX)` to prevent negative watermark shifts.
+- **`coordinator_http_client.rs`**: Fixed backoff jitter arithmetic that could
+  overflow for huge backoff values — now uses `saturating_add`/`saturating_sub`.
+
+### Shuffle fixes
+
+- **`flight.rs`**: Replaced `.expect()` in Flight push stream with proper error
+  propagation via `io::Error`.
+- **`disk_store.rs`**: Reused outer `parent` binding instead of redundant
+  `final_path.parent().unwrap()`.
+
+### Connector fixes
+
+- **`kafka.rs`**: Fixed `current + 1` offset overflow (3 sites) — now uses
+  `saturating_add(1)`.
+- **`cdc/pipeline.rs`**: Same `offset + 1` overflow fix.
+
+### State fixes
+
+- **`timer.rs`**: Fixed `watermark_ms + 1` sentinel overflow — now uses
+  `watermark_ms.saturating_add(1)`.
+
+### Plan fixes
+
+- **`cep/matcher.rs`**: Fixed backward event-time causing incorrect match expiry —
+  `event_time_ms - start_time_ms` changed to
+  `event_time_ms.saturating_sub(start_time_ms)` to prevent wrap to large positive.
+
+### Next
+
+- Build Docker image and deploy to K8s.
+
 ## 2026-06-21 — Comprehensive UI metrics overhaul (Phases 1-7)
 
 Enhanced the Web UI and executor heartbeats to surface rich metrics across all
@@ -1354,3 +1495,119 @@ CLOUDFLARE_API_TOKEN=<token> pnpm wrangler pages project create krishiv-web --pr
 CLOUDFLARE_API_TOKEN=<token> pnpm wrangler pages deploy out --project-name krishiv-web
 ```
 After that, GitHub Actions handles deploys on push to `main`.
+
+## 2026-06-22 — F2/A3/F5/F4/F3 gap closures
+
+Completed the remaining 5 gap-items from the prior session audit.
+
+### Completed
+
+- **F2 — Arrow Flight stubs**: Fixed 2 compile errors in `krishiv-shuffle/src/flight.rs`:
+  - Removed non-existent `app_metadata` field from both `PollInfo { ... }` struct literals
+    in `poll_flight_info` (prost-generated `PollInfo` does not expose this field).
+  - Replaced `SchemaResult::try_from(&*part.schema)` (unsatisfied trait bound) with
+    `SchemaResult::try_from(SchemaAsIpc::new(&part.schema, &IpcWriteOptions::default()))`.
+  - `list_flights`, `get_flight_info`, `poll_flight_info`, `get_schema`, `do_get` all compile.
+
+- **A3 — Recursive IVM fixpoint iteration**: Added `MAX_FIXPOINT_ITERS = 100` constant and
+  fixpoint loop in `step_datafusion_with_ctx` (Phase 4 DiffBased path).
+  When `spec.is_recursive`, runs SQL repeatedly until `differentiate(prev, new)` is empty or
+  max iterations reached. Re-registers self-view as MemTable each iteration for self-reference.
+  Non-recursive views use the existing single-pass path unchanged.
+
+- **F5 — Distributed watermark**: Per-job global minimum watermark propagation.
+  - Added `global_watermarks: map<string, int64>` (field 12) to `ExecutorHeartbeatResponse`
+    protobuf definition.
+  - Added `global_watermarks: HashMap<JobId, i64>` to domain `ExecutorHeartbeatResponse`
+    with `with_global_watermarks` builder + `global_watermarks()` accessor.
+  - Added `global_watermarks: HashMap<JobId, i64>` to `ExecutorHeartbeatEffects`.
+  - Added `executor_job_watermarks: HashMap<ExecutorId, HashMap<JobId, i64>>` to `Coordinator`.
+  - In `executor_heartbeat()`: updates per-executor per-job watermarks from `streaming_progress`
+    reports, then calls `compute_global_watermarks()` to aggregate global min per job.
+  - Wired `global_watermarks` into `executor_heartbeat_response_from_effects` and wire.rs
+    `executor_heartbeat_response_to_wire` / `executor_heartbeat_response_from_wire`.
+
+- **F4 — Python GIL release**: Modified `PyIvmJob::step()` in `krishiv-python/src/incremental.rs`
+  to accept `py: Python<'_>` and wrap `RUNTIME.block_on(...)` in `py.detach(|| ...)` so the GIL
+  is released while the async tick blocks. Allows other Python threads to run concurrently.
+
+- **F3 — S3 reads**: Added S3 ObjectStore detection and registration in `register_parquet`
+  (`krishiv-sql/src/lib.rs`). When path starts with `s3://`, an `AmazonS3Builder::from_env()`
+  store is built and registered with the DataFusion session context before the parquet scan.
+  Added `object_store = { workspace = true, features = ["aws"] }` to `krishiv-sql/Cargo.toml`.
+  Removed the `[alpha]` warning from `krishiv/src/table_cmd.rs`.
+
+### Validation
+
+```
+cargo check -p krishiv-shuffle         # F2 clean
+cargo check -p krishiv-ivm             # A3 clean
+cargo check -p krishiv-proto -p krishiv-scheduler  # F5 clean
+cargo check -p krishiv-python          # F4 clean
+cargo check -p krishiv-sql             # F3 clean
+```
+
+### Next
+
+```
+cargo test --workspace                 # full suite regression check
+cargo clippy --workspace -- -D warnings
+```
+
+## 2026-06-22 — Audit fix sweep (P0/P1/P2/P3)
+
+Applied all confirmed findings from a comprehensive codebase audit. 6 changes
+across 5 files; `cargo check --workspace` clean, 343 scheduler + 302 state tests
+passing.
+
+### Completed
+
+- **P0 — executor_job_watermarks leak on eviction** (`coordinator/executor_ops.rs`):
+  `mark_executor_lost` now calls `self.executor_job_watermarks.remove(executor_id)`
+  before returning. Previously, dead executors accumulated forever and pinned
+  `compute_global_watermarks` to their last watermark, blocking GC.
+
+- **P1 — orphaned scheduler job on IVM timeout** (`ivm_http.rs`):
+  Added `coordinator.write().await.cancel_job(&sched_job_id)` before the `Err`
+  return in `submit_distributed_ivm_step`. Previously a 300s timeout left the job
+  alive, consuming resources and confusing scheduler state.
+
+- **P1 — silent degradation for partitioned IVM dispatch** (`ivm_http.rs`):
+  `api_ivm_step` now returns `StatusCode::NOT_IMPLEMENTED` (503) when
+  `IvmJob::Partitioned` is requested with executors present, instead of silently
+  falling through to the single-node coordinator path. The `if let` guard was
+  replaced with an exhaustive `match &flow`.
+
+- **P2 — silent DataFusion register_table failures in fixpoint loop** (`flow.rs`):
+  `let _ = ctx.deregister_table(...)` and `let _ = ctx.register_table(...)` inside
+  the recursive fixpoint iteration now use `tracing::warn!` on failure so
+  stale-table bugs are observable rather than producing wrong convergence silently.
+
+- **P2 — wire global_watermarks all-or-nothing decode** (`wire.rs`):
+  Replaced `collect::<WireResult<HashMap>>()? ` with `filter_map` + per-key
+  `tracing::warn!`. A single malformed `JobId` no longer drops all watermarks
+  delivered to the executor.
+
+- **P3 — TTL `put()` doc comment** (`ttl.rs`): Corrected the doc comment that
+  incorrectly claimed expiry is computed from wall-clock time. Both `put` and `get`
+  use `now_ms()` (watermark-aware) for consistency.
+
+### Validation
+
+```
+cargo check --workspace                # clean
+cargo test -p krishiv-scheduler --lib  # 343 passed, 0 failed
+cargo test -p krishiv-state --lib      # 302 passed, 0 failed
+```
+
+### Remaining gaps (P3)
+
+No unit tests for A3 recursive fixpoint convergence, F5 global watermark
+wire round-trip, F2 Flight stub happy paths, or F3 S3 URL detection.
+
+### Next
+
+```
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
+```

@@ -68,7 +68,7 @@ impl SequentialPatternMatcher {
         state.last_event_ms = event_time_ms;
 
         if let Some(ref partial) = state.partial
-            && event_time_ms - partial.start_time_ms
+            && event_time_ms.saturating_sub(partial.start_time_ms)
                 > i64::try_from(self.pattern.window_ms).unwrap_or(i64::MAX)
         {
             state.partial = None;

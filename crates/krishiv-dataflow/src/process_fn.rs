@@ -258,7 +258,10 @@ impl ProcessFunctionExecutor {
                     output: &mut output,
                     timers_to_register: &mut timers_to_register,
                 };
-                self.func.on_timer(&key, fire_time, &mut ctx)?;
+                if let Err(e) = self.func.on_timer(&key, fire_time, &mut ctx) {
+                    tracing::error!(key = %key, fire_time = fire_time, error = %e,
+                        "event timer callback failed — continuing with remaining timers");
+                }
             }
         }
 
@@ -282,7 +285,10 @@ impl ProcessFunctionExecutor {
                     output: &mut output,
                     timers_to_register: &mut timers_to_register,
                 };
-                self.func.on_timer(&key, fire_time, &mut ctx)?;
+                if let Err(e) = self.func.on_timer(&key, fire_time, &mut ctx) {
+                    tracing::error!(key = %key, fire_time = fire_time, error = %e,
+                        "processing-time timer callback failed — continuing with remaining timers");
+                }
             }
         }
 

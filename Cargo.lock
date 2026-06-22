@@ -5736,6 +5736,7 @@ dependencies = [
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-plan",
+ "object_store 0.13.2",
  "regex",
  "reqwest 0.13.4",
  "serde",

@@ -925,7 +925,7 @@ impl RdkafkaKafkaSource {
             .map(|(&partition, &offset)| KafkaOffset {
                 topic: self.topic.clone(),
                 partition,
-                offset: offset + 1, // Kafka convention: committed offset = next to read
+                offset: offset.saturating_add(1), // Kafka convention: committed offset = next to read
             })
     }
 
@@ -953,7 +953,7 @@ impl RdkafkaKafkaSource {
             .map(|(&partition, &offset)| KafkaOffset {
                 topic: self.topic.clone(),
                 partition,
-                offset: offset + 1,
+                offset: offset.saturating_add(1),
             })
             .collect()
     }
@@ -1113,7 +1113,7 @@ impl Source for RdkafkaKafkaSource {
                         partition,
                         std::time::Duration::from_millis(50),
                     ) {
-                        let lag = high.saturating_sub(current + 1);
+                        let lag = high.saturating_sub(current.saturating_add(1));
                         let source_id = format!("{topic}:{partition}");
                         krishiv_metrics::global_metrics()
                             .set_source_offset_lag(&group_id, &source_id, lag);

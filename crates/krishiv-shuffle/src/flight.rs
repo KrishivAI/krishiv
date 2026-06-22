@@ -24,8 +24,8 @@ use arrow_flight::FlightData;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightDescriptor, FlightInfo, HandshakeRequest,
-    HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+    Action, ActionType, Criteria, Empty, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
 };
 use futures::{StreamExt, TryStreamExt};
 use tokio::net::TcpListener;
@@ -35,6 +35,21 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{PartitionId, ShuffleStore, error::MAX_SHUFFLE_TICKET_LEN};
+
+/// Extract the ticket bytes from a `FlightDescriptor`.
+///
+/// Prefers `path[0]` (string ticket); falls back to the raw `cmd` bytes.
+fn descriptor_ticket_bytes(d: &FlightDescriptor) -> Result<&[u8], Status> {
+    if let Some(path) = d.path.first() {
+        return Ok(path.as_bytes());
+    }
+    if !d.cmd.is_empty() {
+        return Ok(&d.cmd);
+    }
+    Err(Status::invalid_argument(
+        "FlightDescriptor must have path[0] or cmd set to '<job>/<stage>/<partition>'",
+    ))
+}
 
 fn parse_ticket(ticket_bytes: &[u8]) -> Result<(String, String, u32), Status> {
     if ticket_bytes.len() > MAX_SHUFFLE_TICKET_LEN {
@@ -100,28 +115,111 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
         &self,
         _request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        Err(Status::unimplemented("list_flights"))
+        // Shuffle partitions are accessed by known ticket, not discovered.
+        // Return an empty stream — clients always know their partition IDs.
+        let (tx, rx) = mpsc::channel::<Result<FlightInfo, Status>>(1);
+        drop(tx);
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::ListFlightsStream
+        ))
     }
 
     async fn get_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("get_flight_info"))
+        let descriptor = request.into_inner();
+        let ticket_bytes = descriptor_ticket_bytes(&descriptor)?;
+        let (job_id, stage_id, partition) = parse_ticket(ticket_bytes)?;
+        let id = PartitionId {
+            job_id,
+            stage_id,
+            partition,
+        };
+        let part = self
+            .store
+            .read_partition(&id)
+            .await
+            .map_err(|e| Status::internal(format!("read_partition: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("partition not found: {id:?}")))?;
+
+        let ticket_str = format!("{}/{}/{}", id.job_id, id.stage_id, id.partition);
+        let ticket = Ticket {
+            ticket: ticket_str.into(),
+        };
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let total_records: i64 = part.batches.iter().map(|b| b.num_rows() as i64).sum();
+        let info = FlightInfo::new()
+            .try_with_schema(&part.schema)
+            .map_err(|e| Status::internal(format!("schema encode: {e}")))?
+            .with_descriptor(descriptor)
+            .with_endpoint(endpoint)
+            .with_total_records(total_records)
+            .with_total_bytes(-1);
+        Ok(Response::new(info))
     }
 
     async fn poll_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
-        Err(Status::unimplemented("poll_flight_info"))
+        // Shuffle partitions are write-once: once available, they are complete.
+        let descriptor = request.into_inner();
+        let ticket_bytes = descriptor_ticket_bytes(&descriptor)?;
+        let (job_id, stage_id, partition) = parse_ticket(ticket_bytes)?;
+        let id = PartitionId {
+            job_id,
+            stage_id,
+            partition,
+        };
+        let exists = self
+            .store
+            .read_partition(&id)
+            .await
+            .map_err(|e| Status::internal(format!("read_partition: {e}")))?
+            .is_some();
+        if !exists {
+            // Not yet written — tell the client to poll again later.
+            return Ok(Response::new(PollInfo {
+                info: None,
+                flight_descriptor: Some(descriptor),
+                progress: Some(0.0),
+                expiration_time: None,
+            }));
+        }
+        // Partition is ready — return full info.
+        let inner_req = Request::new(descriptor.clone());
+        let flight_info = self.get_flight_info(inner_req).await?.into_inner();
+        Ok(Response::new(PollInfo {
+            info: Some(flight_info),
+            flight_descriptor: None,
+            progress: Some(1.0),
+            expiration_time: None,
+        }))
     }
 
     async fn get_schema(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        Err(Status::unimplemented("get_schema"))
+        let descriptor = request.into_inner();
+        let ticket_bytes = descriptor_ticket_bytes(&descriptor)?;
+        let (job_id, stage_id, partition) = parse_ticket(ticket_bytes)?;
+        let id = PartitionId {
+            job_id,
+            stage_id,
+            partition,
+        };
+        let part = self
+            .store
+            .read_partition(&id)
+            .await
+            .map_err(|e| Status::internal(format!("read_partition: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("partition not found: {id:?}")))?;
+        let schema_result =
+            SchemaResult::try_from(SchemaAsIpc::new(&part.schema, &IpcWriteOptions::default()))
+                .map_err(|e| Status::internal(format!("schema encode: {e}")))?;
+        Ok(Response::new(schema_result))
     }
 
     async fn do_get(
@@ -527,16 +625,16 @@ impl FlightShuffleClient {
             .with_options(IpcWriteOptions::default())
             .build(batch_stream);
 
-        // G6: Stream encoder output directly to avoid buffering all FlightData in memory.
-        // Arrow IPC encoding of valid in-memory RecordBatches must not fail; any error
-        // indicates a bug (unsupported type) that would have failed earlier at batch creation.
-        let flight_stream = encoder.map(|item| {
-            item.expect("Arrow IPC encoding of a valid in-memory RecordBatch must not fail")
-        });
+        // Collect encoder output first to propagate encoding errors before streaming.
+        let flight_data: Vec<FlightData> = encoder
+            .try_collect()
+            .await
+            .map_err(|e| io::Error::other(format!("Arrow IPC encoding error: {e}")))?;
+        let flight_stream = futures::stream::iter(flight_data);
         client
             .do_put(Request::new(flight_stream))
             .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            .map_err(|e: tonic::Status| io::Error::other(e.to_string()))?;
 
         Ok(())
     }

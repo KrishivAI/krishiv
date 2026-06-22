@@ -269,7 +269,7 @@ impl SlidingWindowOperator {
         window_start_ms: i64,
         state: &AggState,
     ) -> ExecResult<RecordBatch> {
-        let window_end_ms = window_start_ms + self.spec.window_size_ms as i64;
+        let window_end_ms = window_start_ms.saturating_add(self.spec.window_size_ms as i64);
         build_window_record_batch(WindowRecordBatchInput {
             schema: &self.output_schema,
             key_type: &self.spec.key_column_type,

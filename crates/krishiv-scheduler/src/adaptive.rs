@@ -86,4 +86,6 @@ pub struct ExecutorHeartbeatEffects {
     /// Restore directives driving executor-side state/offset reload.
     pub restore_commands: Vec<krishiv_proto::RestoreFromCheckpointCommand>,
     pub lease_generation: LeaseGeneration,
+    /// Global minimum event-time watermark per job (ms since epoch).
+    pub global_watermarks: std::collections::HashMap<krishiv_proto::JobId, i64>,
 }

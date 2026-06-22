@@ -330,18 +330,31 @@ pub async fn api_ivm_step(
         .get(&job_id)
         .ok_or_else(|| ivm_not_found(&job_id))?;
 
-    let executor_count = coordinator.read().await.executor_snapshots().len();
-    // Distributed dispatch is available for Single (unpartitioned) IVM jobs only.
+    let executor_count = coordinator
+        .read()
+        .await
+        .executor_snapshots()
+        .into_iter()
+        .filter(|e| e.state().can_accept_work())
+        .count();
     if executor_count > 0 {
-        if let crate::ivm::IvmJob::Single(ref inner_flow) = flow {
-            tracing::debug!(
-                job_id = %job_id,
-                executors = executor_count,
-                "IVM step: dispatching delta:step: task to executor"
-            );
-            let resp =
-                submit_distributed_ivm_step(&coordinator, inner_flow, &job_id).await?;
-            return Ok(Json(resp));
+        match &flow {
+            crate::ivm::IvmJob::Single(inner_flow) => {
+                tracing::debug!(
+                    job_id = %job_id,
+                    executors = executor_count,
+                    "IVM step: dispatching delta:step: task to executor"
+                );
+                let resp = submit_distributed_ivm_step(&coordinator, inner_flow, &job_id).await?;
+                return Ok(Json(resp));
+            }
+            crate::ivm::IvmJob::Partitioned(_) => {
+                tracing::error!(
+                    job_id = %job_id,
+                    "IVM distributed dispatch is not supported for partitioned jobs"
+                );
+                return Err(StatusCode::NOT_IMPLEMENTED);
+            }
         }
     }
 
@@ -380,8 +393,7 @@ async fn submit_distributed_ivm_step(
 
     // Drain pending and coalesce per-source batches.
     let raw = flow.take_pending().map_err(|e| map_err(e.to_string()))?;
-    let coalesced: HashMap<_, _> =
-        coalesce_pending(raw).map_err(|e| map_err(e.to_string()))?;
+    let coalesced: HashMap<_, _> = coalesce_pending(raw).map_err(|e| map_err(e.to_string()))?;
 
     // If pending is empty, just advance the tick and return (nothing to compute).
     if coalesced.is_empty() {
@@ -414,14 +426,11 @@ async fn submit_distributed_ivm_step(
         "ivm-step",
     )
     .with_task(task);
-    let spec =
-        JobSpec::new(sched_job_id.clone(), "ivm-step", JobKind::Batch).with_stage(stage);
+    let spec = JobSpec::new(sched_job_id.clone(), "ivm-step", JobKind::Batch).with_stage(stage);
 
     let notify = {
         let mut coord = coordinator.write().await;
-        coord
-            .submit_job(spec)
-            .map_err(|e| map_err(e.to_string()))?;
+        coord.submit_job(spec).map_err(|e| map_err(e.to_string()))?;
         coord.notify().clone()
     };
 
@@ -453,10 +462,7 @@ async fn submit_distributed_ivm_step(
                 };
                 if matches!(
                     recheck,
-                    JobState::Queued
-                        | JobState::Accepted
-                        | JobState::Planning
-                        | JobState::Running
+                    JobState::Queued | JobState::Accepted | JobState::Planning | JobState::Running
                 ) {
                     tokio::select! {
                         _ = state_changed => {}
@@ -468,6 +474,7 @@ async fn submit_distributed_ivm_step(
     };
 
     if !succeeded {
+        let _ = coordinator.write().await.cancel_job(&sched_job_id);
         return Err(map_err(format!(
             "ivm-step job {sched_job_id} did not succeed"
         )));
@@ -500,7 +507,7 @@ pub async fn api_ivm_snapshot(
     let flow = registry
         .get(&job_id)
         .ok_or_else(|| ivm_not_found(&job_id))?;
-    let rb_opt = flow.source_snapshot(&view_name).map_err(ivm_err)?;
+    let rb_opt = flow.snapshot(&view_name).map_err(ivm_err)?;
     match rb_opt {
         None => Ok(Json(SnapshotResponse {
             snapshot_ipc_b64: None,
@@ -551,6 +558,45 @@ pub async fn api_ivm_view_output(
             }))
         }
     }
+}
+
+// ── GET /api/v1/ivm/jobs/{job_id}/views/{view_name}/debug-info ──────────────
+
+#[derive(Debug, Serialize)]
+pub struct ViewDebugInfo {
+    pub is_materialized: bool,
+    pub has_snapshot: bool,
+    pub snapshot_num_rows: usize,
+    pub has_last_output: bool,
+    pub last_output_num_rows: usize,
+}
+
+pub async fn api_ivm_view_debug_info(
+    State(registry): State<SharedIvmJobRegistry>,
+    Path((job_id, view_name)): Path<(String, String)>,
+) -> Result<Json<ViewDebugInfo>, StatusCode> {
+    let job = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+    // is_materialized from spec
+    let is_materialized = job
+        .view_spec(&view_name)
+        .map_err(ivm_err)?
+        .ok_or_else(|| ivm_err(format!("view {view_name} not found")))?
+        .is_materialized;
+    let snapshot = job.snapshot(&view_name).map_err(ivm_err)?;
+    let has_snapshot = snapshot.is_some();
+    let snapshot_num_rows = snapshot.map(|s| s.num_rows()).unwrap_or(0);
+    let last_output = job.view_output_peek(&view_name).map_err(ivm_err)?;
+    let has_last_output = last_output.is_some();
+    let last_output_num_rows = last_output.map(|d| d.num_rows()).unwrap_or(0);
+    Ok(Json(ViewDebugInfo {
+        is_materialized,
+        has_snapshot,
+        snapshot_num_rows,
+        has_last_output,
+        last_output_num_rows,
+    }))
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/checkpoint ────────────────────────────────
@@ -805,6 +851,10 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
         .route(
             "/api/v1/ivm/jobs/{job_id}/views/{view_name}/output",
             get(api_ivm_view_output),
+        )
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/views/{view_name}/debug-info",
+            get(api_ivm_view_debug_info),
         )
         .route(
             "/api/v1/ivm/jobs/{job_id}/checkpoint",

@@ -47,6 +47,9 @@ use crate::plan::{ViewPlan, ViewPlanKind};
 /// When the cap is reached the oldest entries are evicted to bound memory.
 const DEDUP_SEEN_CAPACITY: usize = 10_000_000;
 
+/// Maximum iterations for recursive view fixpoint computation.
+const MAX_FIXPOINT_ITERS: usize = 100;
+
 // ── StepSummary ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone)]
@@ -593,20 +596,77 @@ impl IncrementalFlow {
                         let _ = ctx.register_table(up_name.as_str(), Arc::new(table));
                     }
                 }
-                let new_full = match execute_view_sql(ctx, spec).await {
-                    Ok(rb) => rb,
-                    Err(_) => {
-                        let empty_cols: Vec<_> = spec
+
+                macro_rules! make_empty_batch {
+                    ($spec:expr) => {{
+                        let empty_cols: Vec<_> = $spec
                             .output_schema
                             .fields()
                             .iter()
                             .map(|f| arrow::array::new_empty_array(f.data_type()))
                             .collect();
-                        RecordBatch::try_new(spec.output_schema.clone(), empty_cols)
+                        RecordBatch::try_new($spec.output_schema.clone(), empty_cols)
                             .map_err(|e| IvmError::execution(e.to_string()))?
+                    }};
+                }
+
+                if spec.is_recursive {
+                    // Fixpoint iteration: re-run SQL until output stabilises.
+                    let mut iter = 0usize;
+                    loop {
+                        let new_full = match execute_view_sql(ctx, spec).await {
+                            Ok(rb) => rb,
+                            Err(_) => make_empty_batch!(spec),
+                        };
+                        let prev = view_full_outputs.get(view_name).map(|b| b as &RecordBatch);
+                        let converged = differentiate(&spec.output_schema, prev, &new_full)
+                            .map(|d| d.is_empty())
+                            .unwrap_or(true);
+                        let hit_limit = iter >= MAX_FIXPOINT_ITERS;
+                        if hit_limit {
+                            tracing::warn!(
+                                view = %view_name,
+                                "recursive view reached MAX_FIXPOINT_ITERS without convergence"
+                            );
+                        }
+                        view_full_outputs.insert(view_name.clone(), new_full.clone());
+                        if converged || hit_limit {
+                            break;
+                        }
+                        // Register updated self-view for the next iteration.
+                        if new_full.num_rows() > 0 {
+                            let _ = ctx.deregister_table(view_name.as_str());
+                            match MemTable::try_new(new_full.schema(), vec![vec![new_full]]) {
+                                Ok(tbl) => {
+                                    if let Err(e) =
+                                        ctx.register_table(view_name.as_str(), Arc::new(tbl))
+                                    {
+                                        tracing::warn!(
+                                            view = %view_name,
+                                            error = %e,
+                                            "fixpoint: failed to register updated view; \
+                                             next iteration will use stale data"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        view = %view_name,
+                                        error = %e,
+                                        "fixpoint: failed to build MemTable for updated view"
+                                    );
+                                }
+                            }
+                        }
+                        iter += 1;
                     }
-                };
-                view_full_outputs.insert(view_name.clone(), new_full);
+                } else {
+                    let new_full = match execute_view_sql(ctx, spec).await {
+                        Ok(rb) => rb,
+                        Err(_) => make_empty_batch!(spec),
+                    };
+                    view_full_outputs.insert(view_name.clone(), new_full);
+                }
             }
         }
 
@@ -736,7 +796,14 @@ impl IncrementalFlow {
 
             // Propagate this view's output delta to downstream views.
             available_deltas.insert(view_name.clone(), output_delta.clone());
-            let _ = view.publish_output(output_delta);
+            if let Err(e) = view.publish_output(output_delta) {
+                tracing::warn!(
+                    view = %view_name,
+                    error = %e,
+                    is_materialized = view.spec.is_materialized,
+                    "publish_output failed"
+                );
+            }
         }
 
         // Gap 6: GC join traces for sources with watermark trackers.
@@ -782,6 +849,15 @@ impl IncrementalFlow {
         let inner = self.inner.lock().map_err(lock_err)?;
         let view = inner.view_registry.get(name).map_err(delta_err)?;
         view.snapshot().map_err(delta_err)
+    }
+
+    pub fn view_spec(&self, name: &str) -> IvmResult<Option<IncrementalViewSpec>> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner
+            .view_registry
+            .get(name)
+            .ok()
+            .map(|v| v.spec.clone()))
     }
 
     pub fn source_snapshot(&self, name: &str) -> IvmResult<Option<RecordBatch>> {
@@ -1310,6 +1386,69 @@ mod integration_tests {
 
         let snap = flow.source_snapshot("src").unwrap().unwrap();
         assert_eq!(snap.num_rows(), 1, "update replaces row 1 with row 2");
+    }
+
+    // ── materialized view snapshot ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn materialized_view_snapshot_sum_no_group_by() {
+        use arrow::array::Float64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use krishiv_delta::DeltaBatch;
+
+        let flow = IncrementalFlow::new();
+
+        // Register materialized view: SUM with no GROUP BY.
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "total",
+            DataType::Float64,
+            true,
+        )]));
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "total_sales".into(),
+            body_sql: "SELECT SUM(amount) AS total FROM sales".into(),
+            output_schema,
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+
+        // Feed three rows: amount=[100, 200, 50].
+        let sales_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Float64,
+            false,
+        )]));
+        let sales_batch = RecordBatch::try_new(
+            sales_schema,
+            vec![Arc::new(Float64Array::from(vec![100.0_f64, 200.0, 50.0]))],
+        )
+        .unwrap();
+        flow.feed("sales", DeltaBatch::from_inserts(sales_batch).unwrap())
+            .unwrap();
+
+        let summary = flow.step_datafusion().await.unwrap();
+        assert_eq!(summary.active_views, 1, "view should be active");
+        assert_eq!(summary.total_output_rows, 1, "one aggregate row expected");
+
+        // Snapshot should be Some after step with is_materialized=true.
+        let snap = flow
+            .snapshot("total_sales")
+            .expect("snapshot call failed")
+            .expect("snapshot is None — materialized view must have a snapshot");
+        assert_eq!(snap.num_rows(), 1, "snapshot should have 1 row");
+        let totals = snap
+            .column_by_name("total")
+            .expect("missing 'total' column")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("total is not Float64");
+        assert!(
+            (totals.value(0) - 350.0).abs() < 1e-9,
+            "expected total=350.0, got {}",
+            totals.value(0)
+        );
     }
 
     // ── 3c: serialization versioning ──────────────────────────────────────────

@@ -194,6 +194,10 @@ pub struct Coordinator {
     /// `tokio::task::spawn_blocking`, so the write lock is not held during I/O.
     /// Callers in sync contexts use `block_in_place` to drain.
     pub(crate) pending_sink_finalize: Vec<SinkFinalizeWork>,
+
+    /// Per-executor, per-job event-time watermarks (ms since epoch) from streaming progress reports.
+    /// Used to compute the global minimum watermark per job (F5: distributed watermark).
+    pub(crate) executor_job_watermarks: HashMap<ExecutorId, HashMap<JobId, i64>>,
 }
 
 /// Describes a stalled task that must be cancelled and reset.
@@ -938,6 +942,7 @@ impl Coordinator {
             job_coordinators: HashMap::new(),
             aqe_coalesce_hints: HashMap::new(),
             pending_sink_finalize: Vec::new(),
+            executor_job_watermarks: HashMap::new(),
         }
     }
 

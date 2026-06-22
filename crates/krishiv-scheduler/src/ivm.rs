@@ -103,6 +103,14 @@ impl IvmJob {
         }
     }
 
+    /// Return the spec for a named view (`None` if not registered).
+    pub fn view_spec(&self, view: &str) -> IvmResult<Option<IncrementalViewSpec>> {
+        match self {
+            IvmJob::Single(f) => f.view_spec(view),
+            IvmJob::Partitioned(p) => p.view_spec(view),
+        }
+    }
+
     /// Enable delta-checkpoint accumulation (every shard when partitioned).
     pub fn enable_delta_checkpoints(&self) -> IvmResult<()> {
         match self {
@@ -605,6 +613,65 @@ mod tests {
     }
 
     /// Vector-view fan-out: one task per shard (partitioned) vs. one (single).
+    /// Regression: Single-job registry must expose a non-null snapshot after step
+    /// when `is_materialized = true`.
+    #[tokio::test]
+    async fn single_job_snapshot_non_null_after_step() {
+        use arrow::array::Float64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use krishiv_ivm::DeltaBatch;
+
+        let sales_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Float64,
+            false,
+        )]));
+        let view_schema = Arc::new(Schema::new(vec![Field::new(
+            "total",
+            DataType::Float64,
+            true,
+        )]));
+        let spec = IncrementalViewSpec {
+            name: "total_sales".into(),
+            body_sql: "SELECT SUM(amount) AS total FROM sales".into(),
+            output_schema: view_schema,
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        };
+
+        // Use default_shards=1 so no auto-partition (stays Single).
+        let reg = IvmJobRegistry::with_default_shards(1);
+        reg.create("job-a".into()).unwrap();
+        reg.register_view("job-a", spec).unwrap();
+
+        let sales_batch = RecordBatch::try_new(
+            sales_schema,
+            vec![Arc::new(Float64Array::from(vec![100.0_f64, 200.0, 50.0]))],
+        )
+        .unwrap();
+        let job = reg.get("job-a").unwrap();
+        job.feed("sales", DeltaBatch::from_inserts(sales_batch).unwrap())
+            .unwrap();
+        let summary = job.step_datafusion().await.unwrap();
+        assert_eq!(summary.active_views, 1, "expected 1 active view");
+        assert_eq!(summary.total_output_rows, 1, "expected 1 output row");
+
+        let snap = job
+            .snapshot("total_sales")
+            .expect("snapshot() failed")
+            .expect("snapshot is None for materialized view after step");
+        assert_eq!(snap.num_rows(), 1);
+        let total = snap
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert!((total - 350.0).abs() < 1e-9, "expected 350.0, got {total}");
+    }
+
     #[tokio::test]
     async fn spawn_vector_views_fans_out_per_shard() {
         use krishiv_ivm::{InMemoryVectorSink, VectorViewSpec};

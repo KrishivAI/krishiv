@@ -111,14 +111,13 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
 
     /// Store `value` under `key` in `namespace` with a TTL expiry.
     ///
-    /// **Note:** The expiry deadline is computed from wall-clock time
-    /// (`unix_now_ms()`), even when a watermark has been set via
-    /// [`set_watermark`](Self::set_watermark).  The watermark only affects
-    /// read-time expiry checks and `purge_expired`, not the initial write.
+    /// The expiry deadline is computed via [`now_ms`](Self::now_ms): when a
+    /// watermark has been set via [`set_watermark`](Self::set_watermark) it
+    /// returns the event-time watermark; otherwise it falls back to wall-clock
+    /// time.  Both `put` and `get` use `now_ms` for consistency — keys do not
+    /// appear immediately expired when the event-time watermark lags wall clock.
     fn put(&mut self, namespace: &Namespace, key: Vec<u8>, value: Vec<u8>) -> StateResult<()> {
-        // Use watermark-aware now_ms() so that writes and reads agree on the
-        // effective clock, preventing keys from appearing immediately expired
-        // when the event-time watermark lags wall-clock time.
+        // now_ms() is watermark-aware; see set_watermark / now_ms for details.
         let expires_at_ms = self
             .now_ms()
             .checked_add(self.config.ttl_ms as i64)

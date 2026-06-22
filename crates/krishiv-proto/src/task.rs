@@ -707,6 +707,10 @@ pub struct ExecutorHeartbeatResponse {
     restore_commands: Vec<RestoreFromCheckpointCommand>,
     /// W3C trace context for distributed tracing (R8 wiring).
     trace_context: Option<TraceContext>,
+    /// Global minimum event-time watermark per job (ms since epoch).
+    /// Aggregated from all executors running the job; executor uses this to
+    /// advance downstream window aggregation.
+    global_watermarks: std::collections::HashMap<crate::ids::JobId, i64>,
 }
 
 impl ExecutorHeartbeatResponse {
@@ -723,6 +727,7 @@ impl ExecutorHeartbeatResponse {
             checkpoint_complete_commands: Vec::new(),
             restore_commands: Vec::new(),
             trace_context: None,
+            global_watermarks: std::collections::HashMap::new(),
         }
     }
 
@@ -831,6 +836,21 @@ impl ExecutorHeartbeatResponse {
     /// W3C trace context, if provided by the coordinator.
     pub fn trace_context(&self) -> Option<&TraceContext> {
         self.trace_context.as_ref()
+    }
+
+    /// Attach global minimum event-time watermarks per job.
+    #[must_use]
+    pub fn with_global_watermarks(
+        mut self,
+        watermarks: std::collections::HashMap<crate::ids::JobId, i64>,
+    ) -> Self {
+        self.global_watermarks = watermarks;
+        self
+    }
+
+    /// Global minimum watermarks per job (ms since epoch).
+    pub fn global_watermarks(&self) -> &std::collections::HashMap<crate::ids::JobId, i64> {
+        &self.global_watermarks
     }
 }
 

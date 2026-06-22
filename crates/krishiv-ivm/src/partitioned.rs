@@ -206,6 +206,18 @@ impl PartitionedIncrementalFlow {
         self.concat_per_shard(|s| s.snapshot(view))
     }
 
+    pub fn view_spec(
+        &self,
+        view: &str,
+    ) -> IvmResult<Option<IncrementalViewSpec>> {
+        // All shards carry the same spec; read from shard 0.
+        self.shards
+            .first()
+            .map(|s| s.view_spec(view))
+            .transpose()
+            .map(|o| o.flatten())
+    }
+
     /// Read a source/view snapshot from the per-source map (the surface the
     /// coordinator's `/snap` endpoint reads), concatenating per-shard partials.
     pub fn source_snapshot(&self, name: &str) -> IvmResult<Option<RecordBatch>> {

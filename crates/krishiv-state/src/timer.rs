@@ -105,7 +105,7 @@ impl TimerService for InMemoryTimerService {
         // BTreeMap::split_off returns [sentinel, ∞); self keeps [−∞, sentinel).
         // After the split: self.timers has fired timers, `pending` has the rest.
         let sentinel = TimerKey {
-            deadline_ms: watermark_ms + 1,
+            deadline_ms: watermark_ms.saturating_add(1),
             namespace: Namespace::new("", ""),
             key: vec![],
         };
