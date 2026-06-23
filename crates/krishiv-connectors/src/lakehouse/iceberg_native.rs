@@ -182,9 +182,9 @@ pub mod native {
                         "overwrite_commit: failed to create replacement table; \
                          attempting to restore original table"
                     );
-                    if old_metadata_location.is_some() {
+                    if let Some(ref loc) = old_metadata_location {
                         let _ = self.catalog.drop_table(&self.ident).await;
-                        let _ = self.catalog.load_table(&self.ident).await;
+                        let _ = self.catalog.register_table(&self.ident, loc.clone()).await;
                     }
                     return Err(LakehouseError::Iceberg(e.to_string()));
                 }

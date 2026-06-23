@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 tracing = { workspace = true }
 twox-hash = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

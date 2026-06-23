@@ -219,14 +219,9 @@ impl SavepointCoordinator {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Generate a simple unique savepoint ID without a UUID crate dependency.
-/// Format: `sp-<process_id>-<epoch_secs>-<nanos>`.
+/// Generate a unique savepoint ID via UUID v4.
 fn new_savepoint_id() -> String {
-    let pid = std::process::id();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("sp-{pid}-{}-{}", now.as_secs(), now.subsec_nanos())
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]

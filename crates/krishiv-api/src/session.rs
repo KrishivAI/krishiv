@@ -1117,6 +1117,24 @@ impl Session {
     pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         let query = query.as_ref().to_owned();
 
+        // Enforce table-access policy on every SQL entry point.
+        if let Some(policy) = &self.policy {
+            match krishiv_sql::referenced_table_names(&query) {
+                Ok(tables) => {
+                    for table in &tables {
+                        if !policy.check_table_access(table) {
+                            return Err(KrishivError::AccessDenied {
+                                reason: format!("access denied to table: {table}"),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, query = %query, "failed to extract table references for policy check");
+                }
+            }
+        }
+
         // Intercept START / REFRESH PIPELINE — the SqlEngine handles CREATE/DROP
         // SOURCE/SINK, but execution needs the api pipeline layer.
         use krishiv_sql::pipeline_ddl::PipelineStatement;
@@ -1456,13 +1474,26 @@ impl Session {
     /// session mode. Returns a DataFrame with pre-collected results so that
     /// `.collect()` returns immediately without remote routing.
     pub async fn execute_local_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
-        let sql_df =
-            self.sql_engine
-                .sql(query.as_ref())
-                .await
-                .map_err(|e| KrishivError::Runtime {
-                    message: e.to_string(),
-                })?;
+        let query = query.as_ref();
+        // Enforce table-access policy.
+        if let Some(policy) = &self.policy
+            && let Ok(tables) = krishiv_sql::referenced_table_names(query)
+        {
+            for table in &tables {
+                if !policy.check_table_access(table) {
+                    return Err(KrishivError::AccessDenied {
+                        reason: format!("access denied to table: {table}"),
+                    });
+                }
+            }
+        }
+        let sql_df = self
+            .sql_engine
+            .sql(query)
+            .await
+            .map_err(|e| KrishivError::Runtime {
+                message: e.to_string(),
+            })?;
         let batches = sql_df.collect().await.map_err(|e| KrishivError::Runtime {
             message: e.to_string(),
         })?;

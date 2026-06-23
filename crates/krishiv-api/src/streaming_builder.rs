@@ -92,6 +92,8 @@ pub struct StreamingQuery {
     state_rx: tokio::sync::watch::Receiver<StreamingQueryState>,
     cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
     last_progress: Arc<Mutex<Option<StreamingQueryProgress>>>,
+    /// Aborted on drop so the micro-batch task does not outlive the handle.
+    _task: tokio::task::JoinHandle<()>,
 }
 
 impl StreamingQuery {
@@ -101,6 +103,7 @@ impl StreamingQuery {
         state_rx: tokio::sync::watch::Receiver<StreamingQueryState>,
         cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
         last_progress: Arc<Mutex<Option<StreamingQueryProgress>>>,
+        task: tokio::task::JoinHandle<()>,
     ) -> Self {
         Self {
             id,
@@ -108,9 +111,18 @@ impl StreamingQuery {
             state_rx,
             cancel_tx,
             last_progress,
+            _task: task,
         }
     }
+}
 
+impl Drop for StreamingQuery {
+    fn drop(&mut self) {
+        self._task.abort();
+    }
+}
+
+impl StreamingQuery {
     /// The query's unique identifier.
     pub fn id(&self) -> &QueryId {
         &self.id
@@ -303,7 +315,7 @@ impl DataStreamWriter {
 
         let cancel_rx_task = cancel_rx;
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = run_streaming_task(
                 base_stream,
                 trigger,
@@ -325,6 +337,7 @@ impl DataStreamWriter {
             state_rx,
             cancel_tx,
             last_progress,
+            task,
         ))
     }
 }

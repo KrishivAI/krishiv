@@ -67,6 +67,9 @@ impl crate::sink::Sink for ElasticsearchSinkWrapper {
         self.0.write_batch(&batch).await
     }
 
+    /// Each `write_batch` call performs a self-contained bulk index request
+    /// (synchronous/blocking I/O). `flush` is a no-op — there is no internal
+    /// buffering to drain.
     async fn flush(&mut self) -> crate::error::ConnectorResult<()> {
         Ok(())
     }

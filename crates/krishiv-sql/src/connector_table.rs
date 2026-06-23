@@ -3,6 +3,7 @@
 
 use std::any::Any;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use arrow::datatypes::SchemaRef;
@@ -17,6 +18,35 @@ use datafusion::physical_plan::ExecutionPlan;
 use krishiv_connectors::{ConnectorConfig, ConnectorError, ConnectorRegistry, default_registry};
 
 use crate::kafka_table::{KafkaPartitionStream, kafka_auto_commit_interval_ms, project_batch};
+
+/// Reject paths that escape the warehouse root via traversal or absolutes.
+fn validate_path_under_warehouse(location: &str) -> DataFusionResult<()> {
+    let warehouse = std::env::var("KRISHIV_WAREHOUSE_ROOT").unwrap_or_else(|_| ".".to_string());
+    let base = PathBuf::from(&warehouse).canonicalize().map_err(|e| {
+        DataFusionError::External(Box::new(ConnectorError::Unsupported {
+            message: format!("warehouse root '{warehouse}' not accessible: {e}"),
+        }))
+    })?;
+    let candidate = PathBuf::from(location);
+    let resolved = if candidate.is_relative() {
+        base.join(&candidate)
+    } else {
+        candidate
+    };
+    let canonical = resolved.canonicalize().map_err(|e| {
+        DataFusionError::External(Box::new(ConnectorError::Unsupported {
+            message: format!("path '{location}' not accessible: {e}"),
+        }))
+    })?;
+    if !canonical.starts_with(&base) {
+        return Err(DataFusionError::External(Box::new(
+            ConnectorError::Unsupported {
+                message: format!("path '{location}' escapes warehouse root '{warehouse}'"),
+            },
+        )));
+    }
+    Ok(())
+}
 
 /// Shared registry instance for SQL DDL table factories.
 pub fn shared_connector_registry() -> Arc<ConnectorRegistry> {
@@ -47,10 +77,18 @@ pub fn register_connector_table_factories(
 }
 
 /// Build a [`ConnectorConfig`] from a `CREATE EXTERNAL TABLE` command.
-pub fn connector_config_from_ddl(kind: &str, cmd: &CreateExternalTable) -> ConnectorConfig {
+pub fn connector_config_from_ddl(
+    kind: &str,
+    cmd: &CreateExternalTable,
+) -> DataFusionResult<ConnectorConfig> {
     let name = cmd.name.table().to_string();
-    match kind {
-        "parquet" => ConnectorConfig::new(name, kind).with_property("path", cmd.location.clone()),
+    Ok(match kind {
+        "parquet" => {
+            if !cmd.location.is_empty() {
+                validate_path_under_warehouse(&cmd.location)?;
+            }
+            ConnectorConfig::new(name, kind).with_property("path", cmd.location.clone())
+        }
         "s3" => {
             let mut cfg = ConnectorConfig::new(cmd.name.table(), kind)
                 .with_property("object_path", cmd.location.clone());
@@ -85,7 +123,7 @@ pub fn connector_config_from_ddl(kind: &str, cmd: &CreateExternalTable) -> Conne
             cfg
         }
         _ => ConnectorConfig::new(name, kind).with_property("path", cmd.location.clone()),
-    }
+    })
 }
 
 fn connector_error(err: ConnectorError) -> DataFusionError {
@@ -132,7 +170,7 @@ impl TableProviderFactory for ConnectorTableFactory {
         _state: &dyn datafusion::catalog::Session,
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
-        let config = connector_config_from_ddl(self.connector_kind, cmd);
+        let config = connector_config_from_ddl(self.connector_kind, cmd)?;
         self.registry
             .validate_source(&config)
             .map_err(connector_error)?;

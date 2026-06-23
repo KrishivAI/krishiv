@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use arrow::record_batch::RecordBatch;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ExecResult;
@@ -95,9 +96,13 @@ struct BroadcastSnapshot {
     keyed_state: HashMap<String, Vec<u8>>,
     broadcast_state: HashMap<String, Vec<u8>>,
     current_watermark_ms: i64,
+    access_order: Vec<String>,
 }
 
 // ── BroadcastProcessExecutor ──────────────────────────────────────────────────
+
+/// Default cap on the number of distinct per-key states retained in memory.
+const DEFAULT_BROADCAST_MAX_KEYS: usize = 100_000;
 
 /// Executor for a [`BroadcastProcessFunction`].
 pub struct BroadcastProcessExecutor {
@@ -108,6 +113,8 @@ pub struct BroadcastProcessExecutor {
     /// Shared broadcast state, keyed by descriptor name.
     broadcast_state: HashMap<String, Vec<u8>>,
     current_watermark_ms: i64,
+    max_keys: usize,
+    access_order: IndexMap<String, ()>,
 }
 
 impl BroadcastProcessExecutor {
@@ -119,6 +126,8 @@ impl BroadcastProcessExecutor {
             keyed_state: HashMap::new(),
             broadcast_state: HashMap::new(),
             current_watermark_ms: i64::MIN,
+            max_keys: DEFAULT_BROADCAST_MAX_KEYS,
+            access_order: IndexMap::new(),
         }
     }
 
@@ -140,6 +149,8 @@ impl BroadcastProcessExecutor {
         for row in 0..batch.num_rows() {
             let key = crate::join::extract_agg_key(batch, key_idx, row)?;
             let key_str = key.to_string();
+            self.touch_key(&key_str);
+            self.maybe_evict();
             let key_state = self.keyed_state.entry(key_str.clone()).or_default();
 
             let mut ctx = BroadcastContext {
@@ -153,6 +164,19 @@ impl BroadcastProcessExecutor {
         }
 
         Ok(output)
+    }
+
+    fn touch_key(&mut self, key: &str) {
+        self.access_order.shift_remove(key);
+        self.access_order.insert(key.to_owned(), ());
+    }
+
+    fn maybe_evict(&mut self) {
+        if self.access_order.len() > self.max_keys
+            && let Some((oldest, _)) = self.access_order.shift_remove_index(0)
+        {
+            self.keyed_state.remove(&oldest);
+        }
     }
 
     /// Process a batch from the broadcast stream.
@@ -196,10 +220,16 @@ impl BroadcastProcessExecutor {
 
     /// Serialize state to a snapshot blob.
     pub fn snapshot(&self) -> ExecResult<Vec<u8>> {
+        let access_order: Vec<String> = self
+            .access_order
+            .iter()
+            .map(|(k, _): (&String, &())| k.clone())
+            .collect();
         let snap = BroadcastSnapshot {
             keyed_state: self.keyed_state.clone(),
             broadcast_state: self.broadcast_state.clone(),
             current_watermark_ms: self.current_watermark_ms,
+            access_order,
         };
         serde_json::to_vec(&snap).map_err(|e| crate::ExecError::InvalidInput(e.to_string()))
     }
@@ -214,6 +244,10 @@ impl BroadcastProcessExecutor {
         }
         for (k, v) in snap.broadcast_state {
             self.broadcast_state.insert(k, v);
+        }
+        for key in &snap.access_order {
+            self.access_order.shift_remove(key);
+            self.access_order.insert(key.clone(), ());
         }
         self.current_watermark_ms = self.current_watermark_ms.max(snap.current_watermark_ms);
         Ok(())

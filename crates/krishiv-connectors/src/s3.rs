@@ -186,7 +186,7 @@ impl Source for S3Source {
         let stream = self.ensure_stream().await?;
         match stream.next().await {
             Some(Ok(batch)) => {
-                self.cursor += 1;
+                self.cursor = self.cursor.saturating_add(1);
                 Ok(Some(batch))
             }
             Some(Err(e)) => Err(ConnectorError::Parquet(format!(

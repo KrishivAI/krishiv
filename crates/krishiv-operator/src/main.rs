@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // A2/E3: do NOT eagerly start orchestration loops while still Standby.
     // Demote first so the lease loop can promote us atomically once acquired.
     runtime.coordinator().write().await.demote_to_standby();
-    spawn_coordinator_leader_election(
+    let _leader_election_task = spawn_coordinator_leader_election(
         runtime.coordinator(),
         client.clone(),
         controller_config.namespace().map(str::to_string),
@@ -218,7 +218,7 @@ fn spawn_coordinator_leader_election(
     client: kube::Client,
     namespace: Option<String>,
     coordinator_id: String,
-) {
+) -> tokio::task::JoinHandle<()> {
     let ns = namespace.unwrap_or_else(|| "krishiv-system".to_string());
     // Holder identity must be unique per pod so that two operator replicas do
     // not share the same identity and inadvertently both believe they hold the
@@ -266,7 +266,7 @@ fn spawn_coordinator_leader_election(
             }
             // When !acquired && !was_leader we were already standby — no action needed.
         }
-    });
+    })
 }
 
 #[cfg(not(feature = "k8s"))]

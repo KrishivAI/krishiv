@@ -654,8 +654,8 @@ Execution statistics:
     /// stream submission through one typed handle.
     pub fn submit_async(self) -> crate::query::QueryHandle {
         let id = crate::query::QueryId::next();
-        let (handle, driver) = crate::query::QueryHandle::new(id);
-        tokio::spawn(async move {
+        let (mut handle, driver) = crate::query::QueryHandle::new(id);
+        let task = tokio::spawn(async move {
             driver.set_running();
             if driver.is_cancelled() {
                 return;
@@ -669,6 +669,7 @@ Execution statistics:
                 Err(e) => driver.set_failed(e.to_string()),
             }
         });
+        handle._task = Some(task);
         handle
     }
 

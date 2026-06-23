@@ -34,7 +34,9 @@ use arrow::array::{BinaryBuilder, Int64Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
-use pulsar::{Consumer, DeserializeMessage, Payload, Pulsar, SubType, TokioExecutor};
+use pulsar::{
+    Consumer, DeserializeMessage, Message, MessageId, Payload, Pulsar, SubType, TokioExecutor,
+};
 
 use crate::capabilities::ConnectorCapabilities;
 use crate::error::{ConnectorError, ConnectorResult};
@@ -124,6 +126,10 @@ pub struct PulsarSource {
     consumer: Consumer<RawBytes, TokioExecutor>,
     schema: SchemaRef,
     batch_size: usize,
+    /// Messages read but not yet acknowledged.  The consumer holds them in
+    /// unacked state until `ack_all_pending()` is called, providing
+    /// at-least-once delivery semantics.
+    pending_messages: VecDeque<(String, Option<String>, i64, Vec<u8>, MessageId)>,
 }
 
 impl PulsarSource {
@@ -147,6 +153,7 @@ impl PulsarSource {
             consumer,
             schema: pulsar_arrow_schema(),
             batch_size: config.batch_size,
+            pending_messages: VecDeque::new(),
         })
     }
 
@@ -160,12 +167,11 @@ impl PulsarSource {
     ///
     /// Returns `Ok(None)` when no message is ready immediately.
     ///
-    /// Messages are NOT acked here. The caller is responsible for calling
-    /// `ack_all_pending()` after confirming downstream durability. This
-    /// prevents data loss: if the process crashes after ack but before the
-    /// write is committed, messages are lost permanently. By deferring the
-    /// ack, un-acked messages are redelivered from the subscription on
-    /// restart (at-least-once semantics).
+    /// Messages are NOT acked here. Call [`ack_all_pending`][Self::ack_all_pending]
+    /// after confirming downstream durability. This prevents data loss: if the
+    /// process crashes after ack but before the write is committed, messages are
+    /// lost permanently. By deferring the ack, un-acked messages are redelivered
+    /// from the subscription on restart (at-least-once semantics).
     pub async fn next_batch(
         &mut self,
         max_messages: usize,
@@ -180,14 +186,24 @@ impl PulsarSource {
             match self.consumer.try_next().await {
                 Ok(Some(msg)) => {
                     topic_col.append_value(&msg.topic);
-                    match &msg.payload.metadata.partition_key {
+                    let partition_key = msg.payload.metadata.partition_key.clone();
+                    match &partition_key {
                         Some(k) => key_col.append_value(k),
                         None => key_col.append_null(),
                     }
-                    ts_col.append_value(msg.payload.metadata.publish_time as i64);
-                    data_col.append_value(&msg.payload.data);
+                    let publish_time = msg.payload.metadata.publish_time as i64;
+                    ts_col.append_value(publish_time);
+                    let payload_data = msg.payload.data.clone();
+                    data_col.append_value(&payload_data);
                     count += 1;
-                    // Do NOT ack here. Defer until downstream durability is confirmed.
+                    // Record the message for deferred ack.
+                    self.pending_messages.push_back((
+                        msg.topic.clone(),
+                        partition_key,
+                        publish_time,
+                        payload_data,
+                        msg.message_id.clone(),
+                    ));
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -214,6 +230,26 @@ impl PulsarSource {
         Ok(Some(batch))
     }
 
+    /// Acknowledge all messages that have been read but not yet committed.
+    ///
+    /// Must be called **only after** the downstream sink has durably persisted
+    /// the data. Calling before durability creates a gap where acknowledged
+    /// messages are lost on crash.
+    pub async fn ack_all_pending(&mut self) -> ConnectorResult<()> {
+        while let Some((_topic, _key, _ts, _data, msg_id)) = self.pending_messages.pop_front() {
+            self.consumer
+                .ack(&msg_id)
+                .await
+                .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        Ok(())
+    }
+
+    /// Return the number of unacknowledged messages pending in the buffer.
+    pub fn pending_count(&self) -> usize {
+        self.pending_messages.len()
+    }
+
     /// Connector capabilities: unbounded streaming source.
     pub fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities::default().with_unbounded()
@@ -232,9 +268,10 @@ impl Source for PulsarSource {
     }
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
-        // Pulsar consumer position is broker-managed via subscription.
-        // Offsets are implicitly committed on ack; no client-side cursor needed.
-        None
+        // Return the latest pending message ID as the current position.
+        self.pending_messages
+            .back()
+            .map(|(_t, _k, _ts, _d, msg_id)| Box::new(msg_id.clone()) as Box<dyn Any + Send>)
     }
 }
 

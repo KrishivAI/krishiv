@@ -124,6 +124,10 @@ impl ElasticsearchSink {
     ///
     /// Each row is converted to a JSON document.  The `_id` field is set from
     /// `config.id_column` when configured, otherwise Elasticsearch auto-IDs.
+    ///
+    /// **This method performs synchronous blocking I/O** (HTTP request to the
+    /// Elasticsearch cluster). There is no separate `flush()` — each call to
+    /// `write_batch` is a self-contained bulk index operation.
     pub async fn write_batch(&self, batch: &RecordBatch) -> ConnectorResult<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -248,7 +252,13 @@ fn arrow_scalar_to_json(col: &dyn Array, row: usize) -> JsonValue {
                 if v.is_nan() || v.is_infinite() {
                     JsonValue::Null
                 } else {
-                    JsonValue::Number(serde_json::Number::from_f64(v as f64).unwrap_or(0.into()))
+                    match serde_json::Number::from_f64(v as f64) {
+                        Some(n) => JsonValue::Number(n),
+                        None => {
+                            tracing::warn!(value = %v, "unrepresentable float32 value for JSON; mapping to null");
+                            JsonValue::Null
+                        }
+                    }
                 }
             })
             .unwrap_or(JsonValue::Null),
@@ -260,7 +270,13 @@ fn arrow_scalar_to_json(col: &dyn Array, row: usize) -> JsonValue {
                 if v.is_nan() || v.is_infinite() {
                     JsonValue::Null
                 } else {
-                    JsonValue::Number(serde_json::Number::from_f64(v).unwrap_or(0.into()))
+                    match serde_json::Number::from_f64(v) {
+                        Some(n) => JsonValue::Number(n),
+                        None => {
+                            tracing::warn!(value = %v, "unrepresentable float64 value for JSON; mapping to null");
+                            JsonValue::Null
+                        }
+                    }
                 }
             })
             .unwrap_or(JsonValue::Null),

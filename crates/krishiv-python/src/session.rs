@@ -132,20 +132,19 @@ fn build_session_with_opts(
 // Uses crate::RUNTIME as the Tokio fallback rather than krishiv_common's FALLBACK_RUNTIME
 // because the python crate owns its own runtime handle for PyO3 thread safety.
 //
-// Implementation note (O6/S6): `block_in_place` parks the current tokio worker
-// thread for the duration of the call. For the common case (GIL released via
-// `py.detach()` before calling this), the thread park is acceptable because
-// PyO3 ensures no other Python threads are competing for this runtime thread.
-// A `spawn` + channel approach would free the thread but requires `Send + 'static`
-// bounds incompatible with the borrowed PyO3 contexts used by callers here.
+// Implementation note: `block_in_place` panics when called from a `spawn_blocking`
+// worker (e.g. when a Python callback invoked from `spawn_blocking` calls into
+// a Krishiv API that ultimately calls `block_on_async`). Instead of trying to
+// detect the spawn_blocking context, we always delegate to `crate::RUNTIME.block_on`,
+// which blocks the calling OS thread but is correct in all contexts.
+//
+// Tradeoff: slightly less efficient than cooperative parking of a tokio worker
+// via `block_in_place`, but avoids hard aborts in the spawn_blocking edge case.
 pub(crate) fn block_on_async<F, T>(future: F) -> Result<T, krishiv_api::KrishivError>
 where
     F: std::future::Future<Output = Result<T, krishiv_api::KrishivError>>,
 {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-        Err(_) => crate::RUNTIME.block_on(future),
-    }
+    crate::RUNTIME.block_on(future)
 }
 
 /// A Krishiv query session.

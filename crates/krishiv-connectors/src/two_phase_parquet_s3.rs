@@ -11,17 +11,13 @@ fn io_err(context: &str, e: std::io::Error) -> ConnectorError {
 }
 
 fn publish_staged_file(staging_path: &Path, final_path: &Path) -> ConnectorResult<()> {
-    match std::fs::hard_link(staging_path, final_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && final_path.exists() => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && final_path.exists() => {}
-        Err(error) => return Err(io_err("publish staged parquet without replacement", error)),
-    }
-
-    match std::fs::remove_file(staging_path) {
+    // Use `rename` instead of `hard_link` to avoid cross-filesystem failures.
+    // `rename` is atomic on the same filesystem; cross-fs moves require explicit
+    // copy+delete which is not appropriate for a two-phase commit protocol.
+    match std::fs::rename(staging_path, final_path) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io_err("remove published staging file", error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && final_path.exists() => Ok(()),
+        Err(error) => Err(io_err("publish staged parquet without replacement", error)),
     }
 }
 

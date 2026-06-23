@@ -174,7 +174,9 @@ impl StateBackend for RocksDbStateBackend {
 
     fn delete(&mut self, namespace: &Namespace, key: &[u8]) -> StateResult<()> {
         let rk = Self::rocksdb_key(namespace, key);
-        self.db.delete(rk).map_err(db_err)
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db.delete_opt(rk, &write_opts).map_err(db_err)
     }
 
     fn clear_namespace(&mut self, namespace: &Namespace) -> StateResult<()> {

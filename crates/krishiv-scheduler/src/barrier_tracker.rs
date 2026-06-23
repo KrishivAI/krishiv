@@ -54,6 +54,10 @@ impl CheckpointBarrierTracker {
         self.expected_tasks.is_subset(&self.received_acks)
     }
 
+    pub fn completed_count(&self) -> usize {
+        self.received_acks.len()
+    }
+
     pub fn timed_out(&self) -> bool {
         self.started_at.elapsed() > self.timeout
     }

@@ -91,20 +91,26 @@ pub fn execute_bounded_window(
 
     // Determine which aggregates take Float64 input so downstream operators
     // can emit Float64 output arrays (instead of silently truncating to Int64).
-    let agg_is_float: Vec<bool> = input_batches
-        .first()
-        .map(|b| {
-            agg_exprs
-                .iter()
-                .map(|e| {
-                    b.schema()
-                        .field_with_name(&e.input_column)
-                        .map(|f| *f.data_type() == arrow::datatypes::DataType::Float64)
-                        .unwrap_or(false)
-                })
-                .collect()
-        })
-        .unwrap_or_else(|| vec![false; agg_exprs.len()]);
+    let agg_is_float: Vec<bool> = match input_batches.first() {
+        Some(b) => agg_exprs
+            .iter()
+            .map(|e| {
+                if e.input_column.is_empty() {
+                    return Ok(false);
+                }
+                b.schema()
+                    .field_with_name(&e.input_column)
+                    .map(|f| *f.data_type() == arrow::datatypes::DataType::Float64)
+                    .map_err(|_| {
+                        ExecError::InvalidWindowConfig(format!(
+                            "aggregate input column '{}' not found in batch schema",
+                            e.input_column
+                        ))
+                    })
+            })
+            .collect::<ExecResult<Vec<_>>>()?,
+        None => vec![false; agg_exprs.len()],
+    };
 
     let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
     let mut multi_watermark =
@@ -380,16 +386,31 @@ pub fn execute_streaming_window(
             }
             Some(Ok(batch)) => batch,
         };
-        let agg_is_float: Vec<bool> = agg_exprs
+        let agg_is_float: Vec<bool> = match agg_exprs
             .iter()
             .map(|e| {
+                if e.input_column.is_empty() {
+                    return Ok(false);
+                }
                 first_batch
                     .schema()
                     .field_with_name(&e.input_column)
                     .map(|f| *f.data_type() == arrow::datatypes::DataType::Float64)
-                    .unwrap_or(false)
+                    .map_err(|_| {
+                        ExecError::InvalidWindowConfig(format!(
+                            "aggregate input column '{}' not found in batch schema",
+                            e.input_column
+                        ))
+                    })
             })
-            .collect();
+            .collect::<ExecResult<Vec<_>>>()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                yield Err(e);
+                return;
+            }
+        };
         let mut op = match build_streaming_window_op(
             &spec,
             state_dir.as_deref(),

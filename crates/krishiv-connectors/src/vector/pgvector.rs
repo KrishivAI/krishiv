@@ -54,10 +54,12 @@ mod imp {
         }
 
         async fn ensure_table(&self) -> VectorSinkResult<()> {
+            // Table name is validated at connect time; double-quote it so
+            // case-sensitive names are preserved and injection is impossible.
             let sql = format!(
                 r#"
                 CREATE EXTENSION IF NOT EXISTS vector;
-                CREATE TABLE IF NOT EXISTS {} (
+                CREATE TABLE IF NOT EXISTS "{}" (
                     id TEXT PRIMARY KEY,
                     vector vector({}),
                     payload JSONB NOT NULL DEFAULT '{{}}'::jsonb,
@@ -92,7 +94,7 @@ mod imp {
                     .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
                 let sql = format!(
                     r#"
-                    INSERT INTO {} (id, vector, payload, epoch)
+                    INSERT INTO "{}" (id, vector, payload, epoch)
                     VALUES ($1, $2::vector, $3::jsonb, $4)
                     ON CONFLICT (id) DO UPDATE
                     SET vector = EXCLUDED.vector,
@@ -115,7 +117,7 @@ mod imp {
 
         async fn delete_by_ids(&self, ids: &[String]) -> VectorSinkResult<()> {
             for id in ids {
-                let sql = format!("DELETE FROM {} WHERE id = $1", self.table_name);
+                let sql = format!(r#"DELETE FROM "{}" WHERE id = $1"#, self.table_name);
                 sqlx::query(&sql)
                     .bind(id)
                     .execute(&self.pool)
@@ -134,7 +136,7 @@ mod imp {
             let sql = format!(
                 r#"
                 SELECT payload, 1 - (vector <=> $1::vector) AS score
-                FROM {}
+                FROM "{}"
                 ORDER BY vector <=> $1::vector
                 LIMIT $2
                 "#,

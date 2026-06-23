@@ -216,6 +216,10 @@ message ExecutorTaskAssignment {
   // W3C traceparent header for distributed tracing.
   string trace_parent = 20;
   string trace_state = 21;
+  // Presence flags for optional scalar fields (avoids zero-value ambiguity).
+  bool has_task_timeout_secs = 22;
+  bool has_cpu_limit_nanos = 23;
+  bool has_memory_limit_bytes = 24;
 }
 
 message InputPartition {

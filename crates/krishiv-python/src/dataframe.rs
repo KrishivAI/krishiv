@@ -770,6 +770,11 @@ impl PyDataFrameStream {
         slf
     }
 
+    /// NOTE: this method blocks a runtime worker per call via
+    /// `block_on_async`. For high-throughput streams consider using
+    /// `tokio::select!` with a timeout on the underlying stream future
+    /// so that `__anext__` does not stall the event loop indefinitely
+    /// when the stream has no data ready.
     fn __anext__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let stream = self.stream.clone();
         let next_item = py

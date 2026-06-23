@@ -158,7 +158,7 @@ impl Source for ParquetSource {
         let reader = self.ensure_reader()?;
         match reader.next() {
             Some(Ok(batch)) => {
-                self.cursor += 1;
+                self.cursor = self.cursor.saturating_add(1);
                 Ok(Some(batch))
             }
             Some(Err(e)) => Err(ConnectorError::Parquet(format!(

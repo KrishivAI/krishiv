@@ -481,7 +481,10 @@ async fn submit_distributed_ivm_step(
     }
 
     // Advance the coordinator-side tick (pending already drained).
-    let _ = flow.step_with(|_| Ok(HashMap::new()));
+    flow.step_with(|_| Ok(HashMap::new())).map_err(|e| {
+        tracing::warn!(error = %e, "IVM distributed step tick failed");
+        map_err(e.to_string())
+    })?;
     let tick = flow.tick().unwrap_or(0);
 
     Ok(StepResponse {

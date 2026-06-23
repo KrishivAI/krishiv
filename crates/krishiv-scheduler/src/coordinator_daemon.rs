@@ -344,7 +344,8 @@ pub async fn spawn_coordinator_sidecars(
     config: &CoordinatorDaemonConfig,
     extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
     extra_sidecars: Vec<CoordinatorSidecarFn>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Vec<tokio::task::JoinHandle<()>>, Box<dyn Error>> {
+    let mut handles = Vec::new();
     if let Some(shuffle_dir) = &config.shuffle_dir {
         let store: Arc<LocalDiskShuffleStore> =
             Arc::new(LocalDiskShuffleStore::new(shuffle_dir).map_err(|e| {
@@ -356,7 +357,7 @@ pub async fn spawn_coordinator_sidecars(
         let gc_coordinator = coordinator.clone();
         let orphan_store = Arc::clone(&store);
         let orphan_shuffle_dir = shuffle_dir.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(5));
             let mut orphan_tick_count: u64 = 0;
             loop {
@@ -390,7 +391,7 @@ pub async fn spawn_coordinator_sidecars(
                     });
                 }
             }
-        });
+        }));
     }
 
     if let Some(http_addr) = config.http_addr {
@@ -398,7 +399,7 @@ pub async fn spawn_coordinator_sidecars(
         let http_listener = TcpListener::bind(http_addr).await?;
         tracing::info!(addr = %http_listener.local_addr()?, "Krishiv coordinator HTTP listening");
         let http_config = config.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             let router = coordinator_http_router(http_coordinator.clone(), &http_config);
             let router = if let Some(factory) = extra_http_factory {
                 router.merge(factory(http_coordinator))
@@ -406,20 +407,20 @@ pub async fn spawn_coordinator_sidecars(
                 router
             };
             let _ = axum::serve(http_listener, router).await;
-        });
+        }));
     }
 
     // Spawn any additional co-located services (e.g., Flight SQL server).
     for sidecar_fn in extra_sidecars {
         let coordinator_clone = coordinator.clone();
-        tokio::spawn(sidecar_fn(coordinator_clone));
+        handles.push(tokio::spawn(sidecar_fn(coordinator_clone)));
     }
 
     // Orchestration loops (heartbeat, task launch, barrier dispatch) are now spawned
     // by run_standalone_coordinator / run_cluster_control_plane via
     // spawn_orchestration_loops(). No separate coordinator_tick loop here.
 
-    Ok(())
+    Ok(handles)
 }
 
 pub fn coordinator_http_router(
@@ -1043,7 +1044,9 @@ pub async fn run_standalone_coordinator(
         // current leader token (C8).
         coordinator.sync_checkpoint_fencing_tokens(token).await;
     }
-    spawn_coordinator_sidecars(&coordinator, &config, extra_http_factory, extra_sidecars).await?;
+    let _sidecar_handles =
+        spawn_coordinator_sidecars(&coordinator, &config, extra_http_factory, extra_sidecars)
+            .await?;
     // Standalone must spawn orchestration loops for task dispatch and heartbeat management.
     let _handles = coordinator.spawn_orchestration_loops();
     let listener = TcpListener::bind(config.grpc_addr).await?;
@@ -1126,7 +1129,8 @@ pub async fn run_clusterd_daemon(
         shared.clone(),
         leader,
     ));
-    spawn_coordinator_sidecars(&shared, &config, extra_http_factory, extra_sidecars).await?;
+    let _sidecar_handles =
+        spawn_coordinator_sidecars(&shared, &config, extra_http_factory, extra_sidecars).await?;
     let listener = TcpListener::bind(config.grpc_addr).await?;
     tracing::info!(coordinator_id = %config.coordinator_id, addr = %listener.local_addr()?, leader_backend = %config.leader_backend, "Krishiv clusterd (CCP) gRPC listening");
     run_cluster_control_plane(ccp, listener).await

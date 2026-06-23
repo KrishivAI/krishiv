@@ -232,7 +232,7 @@ impl StreamingDataFrame {
         let df_stream = self.df.execute_stream_async().await?;
         let side_output_name = side_output.name.clone();
         let router = SideOutputRouter::new(side_output, event_time_column);
-        let (main_input, side_input) =
+        let (main_input, side_input, _router_task) =
             spawn_side_output_router(df_stream, router, self.watermark_lag_ms);
         let main = execute_window_pipeline(main_input, window_spec.as_ref())?;
         let side_stream =
@@ -521,11 +521,11 @@ fn spawn_side_output_router(
     mut input: KrishivStream,
     router: SideOutputRouter,
     watermark_lag_ms: u64,
-) -> (ExecStream, ExecStream) {
+) -> (ExecStream, ExecStream, tokio::task::JoinHandle<()>) {
     let (main_tx, main_rx) = mpsc::channel(SIDE_OUTPUT_CHANNEL_CAPACITY);
     let (side_tx, side_rx) = mpsc::channel(SIDE_OUTPUT_CHANNEL_CAPACITY);
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut watermark = WatermarkState::new(watermark_lag_ms);
         let mut main_open = true;
         let mut side_open = true;
@@ -569,7 +569,11 @@ fn spawn_side_output_router(
         }
     });
 
-    (receiver_exec_stream(main_rx), receiver_exec_stream(side_rx))
+    (
+        receiver_exec_stream(main_rx),
+        receiver_exec_stream(side_rx),
+        handle,
+    )
 }
 
 async fn wait_for_both_receivers_closed(

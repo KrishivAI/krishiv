@@ -259,6 +259,7 @@ mod tests {
                 input_column: String::new(),
                 output_column: "cnt".into(),
             }],
+            agg_is_float: vec![false],
         }
     }
 

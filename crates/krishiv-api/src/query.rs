@@ -83,8 +83,8 @@ pub struct QueryProgress {
 /// Shared state between [`QueryHandle`] and the executor task.
 #[derive(Debug, Clone)]
 pub(crate) struct QueryState {
-    status: QueryStatus,
-    progress: QueryProgress,
+    pub(crate) status: QueryStatus,
+    pub(crate) progress: QueryProgress,
 }
 
 /// Handle returned by [`DataFrame::submit_async`].
@@ -95,9 +95,12 @@ pub(crate) struct QueryState {
 /// - cancel the query,
 /// - `await` completion and collect the result.
 pub struct QueryHandle {
-    id: QueryId,
-    state_rx: watch::Receiver<QueryState>,
-    cancel_tx: Arc<watch::Sender<bool>>,
+    pub(crate) id: QueryId,
+    pub(crate) state_rx: watch::Receiver<QueryState>,
+    pub(crate) cancel_tx: Arc<watch::Sender<bool>>,
+    /// Background task handle; set after construction when the driver task is
+    /// spawned by `DataFrame::submit_async`. `None` only in tests.
+    pub(crate) _task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Driver held by the executor task — not part of the public API.
@@ -107,7 +110,9 @@ pub(crate) struct QueryDriver {
 }
 
 impl QueryHandle {
-    /// Create a linked `(handle, driver)` pair.
+    /// Create a linked `(handle, driver)` pair.  The caller (typically
+    /// `DataFrame::submit_async`) spawns the background task and sets
+    /// `handle._task` afterwards.
     pub(crate) fn new(id: QueryId) -> (Self, QueryDriver) {
         let (state_tx, state_rx) = watch::channel(QueryState {
             status: QueryStatus::Pending,
@@ -118,6 +123,7 @@ impl QueryHandle {
             id,
             state_rx,
             cancel_tx: Arc::new(cancel_tx),
+            _task: None,
         };
         let driver = QueryDriver {
             state_tx,

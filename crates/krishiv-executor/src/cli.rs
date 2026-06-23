@@ -917,7 +917,7 @@ impl ExecutorCliConfig {
                 .unwrap_or_else(|| {
                     "0.0.0.0:2004"
                         .parse()
-                        .expect("valid default shuffle Flight address")
+                        .unwrap_or(std::net::SocketAddr::from(([0, 0, 0, 0], 2004)))
                 }),
             shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR")
                 .ok()

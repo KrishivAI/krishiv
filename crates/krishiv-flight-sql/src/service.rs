@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -40,6 +41,11 @@ const FLIGHT_MAX_CONCURRENT_QUERIES_ENV: &str = "KRISHIV_FLIGHT_MAX_CONCURRENT_Q
 /// Default cap on simultaneous Flight SQL query executions.
 const DEFAULT_FLIGHT_MAX_CONCURRENT_QUERIES: usize = 256;
 
+/// Maximum number of active transactions before rejecting new `BeginTransaction` requests.
+const MAX_TRANSACTIONS: usize = 10_000;
+/// Transaction entries older than this are evicted on each `BeginTransaction` sweep.
+const TRANSACTION_TTL: Duration = Duration::from_secs(300);
+
 /// Per-subject LRU cache mapping handle → bound parameter record batches.
 type PreparedStatementCache =
     Arc<tokio::sync::Mutex<HashMap<String, lru::LruCache<String, String>>>>;
@@ -56,8 +62,10 @@ pub struct KrishivFlightSqlService {
     prepared_statements: PreparedStatementCache,
     /// Per-subject LRU caches of handle → bound parameter record batches (set via DoPut).
     bound_params: BoundParamCache,
-    /// Active Flight SQL transaction ids issued by `BeginTransaction`. Maps txn_id -> subject.
-    transactions: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    /// Active Flight SQL transaction ids issued by `BeginTransaction`.
+    /// Maps txn_id -> (subject, created_at).  Entries older than `TRANSACTION_TTL`
+    /// are swept on each new transaction request.  Capped at `MAX_TRANSACTIONS`.
+    transactions: Arc<tokio::sync::Mutex<HashMap<String, (String, Instant)>>>,
     /// Semaphore that caps the number of queries executing concurrently through
     /// the Flight ingress. `None` means no cap.
     inflight_queries: Option<Arc<tokio::sync::Semaphore>>,
@@ -218,7 +226,15 @@ impl KrishivFlightSqlService {
             .map_err(|_| Status::invalid_argument("invalid transaction id encoding"))?;
         let transactions = self.transactions.lock().await;
         match transactions.get(id) {
-            Some(owner) if subject.is_none_or(|s| s == owner) => Ok(()),
+            Some((owner, created)) if subject.is_none_or(|s| s == owner) => {
+                if created.elapsed() >= TRANSACTION_TTL {
+                    Err(Status::invalid_argument(format!(
+                        "transaction id {id} has expired"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
             Some(_) => Err(Status::permission_denied(format!(
                 "transaction id {id} does not belong to this subject"
             ))),
@@ -584,10 +600,17 @@ impl FlightSqlService for KrishivFlightSqlService {
         let subject = self.authenticate_request(&request)?;
         let subject_key = subject.unwrap_or_else(|| "__anon__".to_owned());
         let transaction_id = Uuid::new_v4().to_string();
-        self.transactions
-            .lock()
-            .await
-            .insert(transaction_id.clone(), subject_key);
+        let now = Instant::now();
+        let mut txns = self.transactions.lock().await;
+        // Sweep expired entries and enforce cap before inserting.
+        txns.retain(|_id, (_owner, created)| now.duration_since(*created) < TRANSACTION_TTL);
+        if txns.len() >= MAX_TRANSACTIONS {
+            return Err(Status::resource_exhausted(format!(
+                "transaction limit reached ({MAX_TRANSACTIONS}); retry after existing transactions expire"
+            )));
+        }
+        txns.insert(transaction_id.clone(), (subject_key, now));
+        drop(txns);
         Ok(ActionBeginTransactionResult {
             transaction_id: transaction_id.into_bytes().into(),
         })
@@ -610,7 +633,7 @@ impl FlightSqlService for KrishivFlightSqlService {
                         "unknown transaction id: {transaction_id}"
                     )));
                 }
-                Some(owner) if owner != subject_key => {
+                Some((owner, _created)) if owner != subject_key => {
                     return Err(Status::permission_denied(format!(
                         "transaction id {transaction_id} does not belong to this subject"
                     )));

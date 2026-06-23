@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use indexmap::IndexMap;
 
 use crate::{ExecError, ExecResult};
 
@@ -59,6 +60,9 @@ impl VersionedTableState {
     }
 }
 
+/// Default cap on the number of distinct per-key states retained in memory.
+const DEFAULT_TEMPORAL_JOIN_MAX_KEYS: usize = 100_000;
+
 /// Temporal join operator: joins stream events against versioned table state
 /// using as-of semantics per join key.
 pub struct TemporalJoinOperator {
@@ -66,6 +70,8 @@ pub struct TemporalJoinOperator {
     /// Per-key versioned table state.
     keyed_state: HashMap<String, VersionedTableState>,
     lookback_ms: i64,
+    max_keys: usize,
+    access_order: IndexMap<String, ()>,
 }
 
 impl TemporalJoinOperator {
@@ -74,6 +80,8 @@ impl TemporalJoinOperator {
             spec,
             keyed_state: HashMap::new(),
             lookback_ms,
+            max_keys: DEFAULT_TEMPORAL_JOIN_MAX_KEYS,
+            access_order: IndexMap::new(),
         }
     }
 
@@ -92,10 +100,25 @@ impl TemporalJoinOperator {
         version_ms: i64,
         batch: RecordBatch,
     ) {
+        self.touch_key(&encoded_key);
         self.keyed_state
             .entry(encoded_key)
             .or_insert_with(|| VersionedTableState::new(self.lookback_ms))
             .upsert_version(version_ms, batch);
+        self.maybe_evict();
+    }
+
+    fn touch_key(&mut self, key: &str) {
+        self.access_order.shift_remove(key);
+        self.access_order.insert(key.to_owned(), ());
+    }
+
+    fn maybe_evict(&mut self) {
+        if self.access_order.len() > self.max_keys
+            && let Some((oldest, _)) = self.access_order.shift_remove_index(0)
+        {
+            self.keyed_state.remove(&oldest);
+        }
     }
 
     /// Join a stream batch against all registered table state using as-of semantics.

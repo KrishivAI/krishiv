@@ -23,6 +23,12 @@ struct EtcdLeaseState {
 /// Leader election backed by an etcd v3 lease on a single coordination key.
 ///
 /// When `client` is `None`, runs in **simulation mode** (unit tests, no etcd process).
+///
+/// `state` is a `std::sync::Mutex` (not `tokio::sync::Mutex`) by design:
+/// every access is a single field read/write with sub-microsecond hold time,
+/// so a contending task cannot block a Tokio worker in practice. Marking this
+/// for awareness during future method additions: any new method that holds the
+/// `state` lock across an `.await` point must switch to `tokio::sync::Mutex`.
 pub struct EtcdLeaseElection {
     lease_key: String,
     holder_identity: String,

@@ -21,9 +21,7 @@ impl SourceDriver for PulsarSourceDriver {
         ConnectorDescriptor::new(
             ConnectorKind::Pulsar,
             ConnectorRole::Source,
-            ConnectorCapabilities::new()
-                .with_unbounded()
-                .with_checkpoint(),
+            ConnectorCapabilities::new().with_unbounded(),
         )
     }
 

@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
+use indexmap::IndexMap;
 
 /// Interval join bounds relative to the opposite stream's event time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +103,9 @@ impl IntervalJoinBuffers {
     }
 }
 
+/// Default cap on the number of distinct per-key states retained in memory.
+const DEFAULT_INTERVAL_JOIN_MAX_KEYS: usize = 100_000;
+
 /// Per-key interval join operator.
 ///
 /// Each join key maintains independent left/right buffers, so events from
@@ -110,6 +114,8 @@ impl IntervalJoinBuffers {
 pub struct PerKeyIntervalJoin {
     spec: IntervalJoinSpec,
     states: HashMap<String, IntervalJoinBuffers>,
+    max_keys: usize,
+    access_order: IndexMap<String, ()>,
 }
 
 impl PerKeyIntervalJoin {
@@ -117,6 +123,21 @@ impl PerKeyIntervalJoin {
         Self {
             spec,
             states: HashMap::new(),
+            max_keys: DEFAULT_INTERVAL_JOIN_MAX_KEYS,
+            access_order: IndexMap::new(),
+        }
+    }
+
+    fn touch_key(&mut self, key: &str) {
+        self.access_order.shift_remove(key);
+        self.access_order.insert(key.to_owned(), ());
+    }
+
+    fn maybe_evict(&mut self) {
+        if self.access_order.len() > self.max_keys
+            && let Some((oldest, _)) = self.access_order.shift_remove_index(0)
+        {
+            self.states.remove(&oldest);
         }
     }
 
@@ -131,6 +152,8 @@ impl PerKeyIntervalJoin {
         batch: RecordBatch,
     ) -> Vec<(Arc<RecordBatch>, Arc<RecordBatch>)> {
         let max_buf = self.spec.max_buffer_per_side;
+        self.touch_key(key);
+        self.maybe_evict();
         let state = self
             .states
             .entry(key.to_owned())
@@ -156,6 +179,8 @@ impl PerKeyIntervalJoin {
         batch: RecordBatch,
     ) -> Vec<(Arc<RecordBatch>, Arc<RecordBatch>)> {
         let max_buf = self.spec.max_buffer_per_side;
+        self.touch_key(key);
+        self.maybe_evict();
         let state = self
             .states
             .entry(key.to_owned())
@@ -181,6 +206,8 @@ impl PerKeyIntervalJoin {
             state.evict_before(watermark_ms, bound);
             !state.is_empty()
         });
+        self.access_order
+            .retain(|key, _| self.states.contains_key(key));
     }
 
     /// Number of active keys with buffered events.

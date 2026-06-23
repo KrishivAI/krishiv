@@ -373,8 +373,18 @@ impl SharedCoordinator {
             Ok(t) => t,
             Err(_) => return,
         };
+        // Update the outer (canonical) copy.
         let mut coord = self.inner.write().await;
         for c in coord.ckpt.coordinators.values_mut() {
+            c.fencing_token = new_token;
+        }
+        // Drop the outer lock before acquiring inner — the gRPC checkpoint_ack
+        // handler and drive_barrier_dispatches read from the inner lock's
+        // coordinators, so every ack would be rejected as StaleFencingToken
+        // until the next epoch advances if we don't propagate here.
+        drop(coord);
+        let mut ckpt_inner = self.checkpoint_inner.write().await;
+        for c in ckpt_inner.coordinators.values_mut() {
             c.fencing_token = new_token;
         }
     }
@@ -702,7 +712,15 @@ impl SharedCoordinator {
         let delivery_results = futures::future::join_all(delivery_futures)
             .await
             .into_iter()
-            .filter_map(|r| r.ok());
+            .filter_map(|r| match r {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    if e.is_panic() {
+                        tracing::error!("assignment delivery task panicked");
+                    }
+                    None
+                }
+            });
 
         // Phase 3: apply all results under a single write lock.
         let mut launched = 0usize;

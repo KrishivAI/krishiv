@@ -30,6 +30,9 @@ pub(crate) fn kafka_auto_commit_interval_ms() -> Option<u64> {
 pub(crate) struct KafkaPartitionStream {
     schema: SchemaRef,
     source: Arc<tokio::sync::Mutex<KafkaSource>>,
+    /// Handle to the spawned Kafka consumer task; stored so it can be aborted
+    /// if the stream is dropped before the consumer loop exits.
+    consumer_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl KafkaPartitionStream {
@@ -37,6 +40,7 @@ impl KafkaPartitionStream {
         Self {
             schema,
             source: Arc::new(tokio::sync::Mutex::new(source)),
+            consumer_task: std::sync::Mutex::new(None),
         }
     }
 }
@@ -62,7 +66,7 @@ impl PartitionStream for KafkaPartitionStream {
         // for an unbounded topic — we keep looping rather than ending the stream.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, DataFusionError>>(64);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 // Check cancellation before doing any I/O: if the DataFusion
                 // executor dropped the stream, stop immediately rather than
@@ -105,6 +109,7 @@ impl PartitionStream for KafkaPartitionStream {
                 }
             }
         });
+        *self.consumer_task.lock().unwrap_or_else(|p| p.into_inner()) = Some(task);
 
         let recv_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Box::pin(RecordBatchStreamAdapter::new(

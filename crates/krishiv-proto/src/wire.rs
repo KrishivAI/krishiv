@@ -634,11 +634,14 @@ pub fn executor_task_assignment_to_wire(
         plan_fragment: Some(plan_fragment_to_wire(value.plan_fragment())),
         output_contract: Some(output_contract_to_wire(value.output_contract())),
         task_timeout_secs: value.task_timeout_secs().unwrap_or(0),
+        has_task_timeout_secs: value.task_timeout_secs().is_some(),
         key_group_range_start: value.key_group_range().start(),
         key_group_range_end: value.key_group_range().end(),
         has_key_group_range: true,
         cpu_limit_nanos: value.cpu_limit_nanos().unwrap_or(0),
+        has_cpu_limit_nanos: value.cpu_limit_nanos().is_some(),
         memory_limit_bytes: value.memory_limit_bytes().unwrap_or(0),
+        has_memory_limit_bytes: value.memory_limit_bytes().is_some(),
         shuffle_write: value.shuffle_write().map(shuffle_write_config_to_wire),
         shuffle_read: value.shuffle_read().map(shuffle_read_config_to_wire),
         requires_reattach: value.requires_reattach(),
@@ -679,7 +682,7 @@ pub fn executor_task_assignment_from_wire(
     )
     .with_version(version)
     .with_input_partitions(input_partitions);
-    if value.task_timeout_secs > 0 {
+    if value.has_task_timeout_secs {
         assignment = assignment.with_task_timeout_secs(value.task_timeout_secs);
     }
     if value.has_key_group_range {
@@ -688,10 +691,10 @@ pub fn executor_task_assignment_from_wire(
                 .map_err(WireError::from_id)?,
         );
     }
-    if value.cpu_limit_nanos > 0 {
+    if value.has_cpu_limit_nanos {
         assignment = assignment.with_cpu_limit_nanos(value.cpu_limit_nanos);
     }
-    if value.memory_limit_bytes > 0 {
+    if value.has_memory_limit_bytes {
         assignment = assignment.with_memory_limit_bytes(value.memory_limit_bytes);
     }
     if let Some(sw) = value.shuffle_write {

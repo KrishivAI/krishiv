@@ -15,9 +15,10 @@
 //! - The executor is single-threaded (no `Arc<Mutex<…>>`); async variants can
 //!   wrap it in a task.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arrow::record_batch::RecordBatch;
+use indexmap::IndexMap;
 
 use crate::ExecError;
 use serde::{Deserialize, Serialize};
@@ -141,9 +142,13 @@ struct ExecutorSnapshot {
     /// Pending timers.
     timers: Vec<TimerEntry>,
     current_watermark_ms: i64,
+    access_order: Vec<String>,
 }
 
 // ── ProcessFunctionExecutor ───────────────────────────────────────────────────
+
+/// Default cap on the number of distinct per-key states retained in memory.
+const DEFAULT_PROCESS_FN_MAX_KEYS: usize = 100_000;
 
 /// Runtime wrapper for a [`ProcessFunction`].
 ///
@@ -154,10 +159,12 @@ pub struct ProcessFunctionExecutor {
     /// Per-key state: `key_str → Vec<u8>`.
     state: HashMap<String, Vec<u8>>,
     /// Event-time timer map: `fire_time_ms → Set<key_str>`.
-    event_timers: BTreeMap<i64, Vec<String>>,
+    event_timers: BTreeMap<i64, HashSet<String>>,
     /// Processing-time timer map: `fire_time_ms → Set<key_str>`.
-    processing_timers: BTreeMap<i64, Vec<String>>,
+    processing_timers: BTreeMap<i64, HashSet<String>>,
     current_watermark_ms: i64,
+    max_keys: usize,
+    access_order: IndexMap<String, ()>,
 }
 
 impl ProcessFunctionExecutor {
@@ -169,6 +176,8 @@ impl ProcessFunctionExecutor {
             event_timers: BTreeMap::new(),
             processing_timers: BTreeMap::new(),
             current_watermark_ms: i64::MIN,
+            max_keys: DEFAULT_PROCESS_FN_MAX_KEYS,
+            access_order: IndexMap::new(),
         }
     }
 
@@ -201,6 +210,8 @@ impl ProcessFunctionExecutor {
         for row in 0..batch.num_rows() {
             let key = crate::join::extract_agg_key(batch, key_idx, row)?;
             let key_str = key.to_string();
+            self.touch_key(&key_str);
+            self.maybe_evict();
             let key_state = self.state.entry(key_str.clone()).or_default();
 
             let mut ctx = ProcessContext {
@@ -250,6 +261,8 @@ impl ProcessFunctionExecutor {
                 continue;
             };
             for key in keys {
+                self.touch_key(&key);
+                self.maybe_evict();
                 let key_state = self.state.entry(key.clone()).or_default();
                 let mut ctx = ProcessContext {
                     watermark_ms,
@@ -277,6 +290,8 @@ impl ProcessFunctionExecutor {
                 continue;
             };
             for key in keys {
+                self.touch_key(&key);
+                self.maybe_evict();
                 let key_state = self.state.entry(key.clone()).or_default();
                 let mut ctx = ProcessContext {
                     watermark_ms,
@@ -302,19 +317,16 @@ impl ProcessFunctionExecutor {
         for entry in timers {
             match entry.kind {
                 TimerKind::EventTime => {
-                    let bucket = self.event_timers.entry(entry.fire_time_ms).or_default();
-                    if !bucket.contains(&entry.key) {
-                        bucket.push(entry.key);
-                    }
+                    self.event_timers
+                        .entry(entry.fire_time_ms)
+                        .or_default()
+                        .insert(entry.key);
                 }
                 TimerKind::ProcessingTime => {
-                    let bucket = self
-                        .processing_timers
+                    self.processing_timers
                         .entry(entry.fire_time_ms)
-                        .or_default();
-                    if !bucket.contains(&entry.key) {
-                        bucket.push(entry.key);
-                    }
+                        .or_default()
+                        .insert(entry.key);
                 }
             }
         }
@@ -323,6 +335,19 @@ impl ProcessFunctionExecutor {
     /// Return the current watermark.
     pub fn watermark_ms(&self) -> i64 {
         self.current_watermark_ms
+    }
+
+    fn touch_key(&mut self, key: &str) {
+        self.access_order.shift_remove(key);
+        self.access_order.insert(key.to_owned(), ());
+    }
+
+    fn maybe_evict(&mut self) {
+        if self.access_order.len() > self.max_keys
+            && let Some((oldest, _)) = self.access_order.shift_remove_index(0)
+        {
+            self.state.remove(&oldest);
+        }
     }
 
     /// Return a reference to the per-key state map.
@@ -362,10 +387,17 @@ impl ProcessFunctionExecutor {
             }
         }
 
+        let access_order: Vec<String> = self
+            .access_order
+            .iter()
+            .map(|(k, _): (&String, &())| k.clone())
+            .collect();
+
         let snap = ExecutorSnapshot {
             state: self.state.clone(),
             timers,
             current_watermark_ms: self.current_watermark_ms,
+            access_order,
         };
         serde_json::to_vec(&snap)
             .map_err(|e| ExecError::InvalidInput(format!("snapshot serialization failed: {e}")))
@@ -384,6 +416,12 @@ impl ProcessFunctionExecutor {
         // Merge state (later calls override earlier ones for the same key).
         for (k, v) in snap.state {
             self.state.insert(k, v);
+        }
+
+        // Merge access order idempotently.
+        for key in &snap.access_order {
+            self.access_order.shift_remove(key);
+            self.access_order.insert(key.clone(), ());
         }
 
         // Advance watermark monotonically.

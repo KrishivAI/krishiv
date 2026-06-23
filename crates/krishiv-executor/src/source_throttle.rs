@@ -62,7 +62,7 @@ impl TokenBucket {
 
     fn try_consume(&mut self, requested: u64) -> u64 {
         if self.rate == 0 {
-            return requested;
+            return 0;
         }
         self.refill();
         let available = self.tokens.floor() as u64;
@@ -158,11 +158,11 @@ mod tests {
     }
 
     #[test]
-    fn token_bucket_empty_grants_all() {
+    fn token_bucket_empty_pauses_source() {
         let mut tb = TokenBucket::clear();
         assert!(!tb.is_active());
         let granted = tb.try_consume(10_000);
-        assert_eq!(granted, 10_000);
+        assert_eq!(granted, 0);
     }
 
     #[test]

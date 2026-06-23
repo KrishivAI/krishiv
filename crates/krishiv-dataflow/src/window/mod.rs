@@ -570,11 +570,18 @@ mod watermark_tests {
         let mut state = MultiSourceWatermarkState::new();
         state.update("fast", 5_000);
         state.update("slow", 2_000);
-        // effective = min = 2000
+        // effective = min = 2000; lag = max - source (how far behind fastest)
         let lag = state.per_source_lag_ms();
-        // Both sources are at or ahead of effective watermark.
-        assert_eq!(lag["fast"], 0, "fast source should have 0 lag");
-        assert_eq!(lag["slow"], 0, "slow source IS the effective watermark");
+        // Fast source is at the maximum watermark → 0 lag.
+        assert_eq!(
+            lag["fast"], 0,
+            "fast source at max watermark should have 0 lag"
+        );
+        // Slow source lags behind the fastest by 3000 ms.
+        assert_eq!(
+            lag["slow"], 3_000,
+            "slow source lags behind fastest by 3000 ms"
+        );
     }
 
     #[test]

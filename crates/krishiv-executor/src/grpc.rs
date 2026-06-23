@@ -286,9 +286,19 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
     }
 }
 
+/// Maximum IPC payload size accepted from the wire (256 MiB).
+const MAX_IPC_BYTES: usize = 256 * 1024 * 1024;
+
 fn decode_ipc_batches(ipc_bytes: &[u8]) -> Result<Vec<RecordBatch>, tonic::Status> {
     if ipc_bytes.is_empty() {
         return Ok(vec![]);
+    }
+    if ipc_bytes.len() > MAX_IPC_BYTES {
+        return Err(tonic::Status::resource_exhausted(format!(
+            "IPC payload {} bytes exceeds max {} bytes",
+            ipc_bytes.len(),
+            MAX_IPC_BYTES
+        )));
     }
     use arrow::ipc::reader::StreamReader;
     let reader = StreamReader::try_new(std::io::Cursor::new(ipc_bytes), None)

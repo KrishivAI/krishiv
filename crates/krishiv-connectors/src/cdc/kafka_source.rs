@@ -131,6 +131,13 @@ pub struct RdkafkaCdcEventSource {
     consumer: std::sync::Arc<rdkafka::consumer::StreamConsumer>,
     /// Maximum number of milliseconds to wait for a single message poll.
     poll_timeout_ms: u64,
+    /// Per-partition offsets of tombstone (null-payload) messages that were
+    /// stored via `store_offset` but skipped in the event list.  These must
+    /// be merged into the Iceberg snapshot's kafka offset summary so the
+    /// offsets are not lost on crash — `commit_consumer_state` commits them
+    /// to the broker, but the snapshot summary provides a second durable
+    /// record.
+    tombstone_offsets: std::collections::HashMap<i32, i64>,
 }
 
 #[cfg(feature = "kafka")]
@@ -176,6 +183,7 @@ impl RdkafkaCdcEventSource {
         Ok(Self {
             consumer: std::sync::Arc::new(consumer),
             poll_timeout_ms: 100,
+            tombstone_offsets: std::collections::HashMap::new(),
         })
     }
 
@@ -189,11 +197,27 @@ impl RdkafkaCdcEventSource {
     /// Commit consumer group offsets for the currently assigned partitions.
     ///
     /// Called internally after a successful downstream sink commit.
-    fn commit_offsets_inner(&self) -> Result<(), ConnectorError> {
+    fn commit_offsets_inner(&mut self) -> Result<(), ConnectorError> {
         use rdkafka::consumer::Consumer;
-        self.consumer
+        let result = self
+            .consumer
             .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
-            .map_err(|e| ConnectorError::Cdc(format!("rdkafka offset commit failed: {e}")))
+            .map_err(|e| ConnectorError::Cdc(format!("rdkafka offset commit failed: {e}")));
+        if result.is_ok() {
+            // Tombstone offsets were committed to the broker; clear the tracking
+            // map so the next poll cycle starts fresh.
+            self.tombstone_offsets.clear();
+        }
+        result
+    }
+
+    /// Per-partition tombstone offsets accumulated since the last commit.
+    ///
+    /// Callers should merge these into the Iceberg snapshot's kafka offset
+    /// summary to prevent offset loss on crash for partitions that only
+    /// received tombstone messages.
+    pub fn tombstone_partition_offsets(&self) -> &std::collections::HashMap<i32, i64> {
+        &self.tombstone_offsets
     }
 }
 
@@ -255,7 +279,7 @@ impl CdcEventSource for RdkafkaCdcEventSource {
                             tracing::warn!(
                                 partition = msg.partition(),
                                 offset = msg.offset(),
-                                "skipping tombstone message (null payload); offset committed"
+                                "skipping tombstone message (null payload); offset stored for checkpoint"
                             );
                             use rdkafka::consumer::Consumer;
                             let _ = self.consumer.store_offset(
@@ -263,6 +287,11 @@ impl CdcEventSource for RdkafkaCdcEventSource {
                                 msg.partition(),
                                 msg.offset(),
                             );
+                            // Track the tombstone offset so the Iceberg snapshot
+                            // checkpoint summary can include it — prevention of
+                            // offset loss on crash for tombstone-only partitions.
+                            self.tombstone_offsets
+                                .insert(msg.partition(), msg.offset().saturating_add(1));
                             continue;
                         }
                     };

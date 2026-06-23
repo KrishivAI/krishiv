@@ -470,7 +470,15 @@ fn batch_to_py_dict(
         let col = batch.column(idx);
         let py_list = match field.data_type() {
             DataType::Int8 => {
-                let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
+                let arr = col.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                    krishiv_plan::udf::UdfError::InvalidArgument {
+                        message: format!(
+                            "column '{}' declared Int8 but downcast failed (got {})",
+                            field.name(),
+                            col.data_type()
+                        ),
+                    }
+                })?;
                 PyList::new(py, arr.iter().map(|v| v.map(|x| x as i64)))
                     .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: e.to_string(),
@@ -478,7 +486,15 @@ fn batch_to_py_dict(
                     .into_any()
             }
             DataType::Int16 => {
-                let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
+                let arr = col.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                    krishiv_plan::udf::UdfError::InvalidArgument {
+                        message: format!(
+                            "column '{}' declared Int16 but downcast failed (got {})",
+                            field.name(),
+                            col.data_type()
+                        ),
+                    }
+                })?;
                 PyList::new(py, arr.iter().map(|v| v.map(|x| x as i64)))
                     .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: e.to_string(),
@@ -486,7 +502,15 @@ fn batch_to_py_dict(
                     .into_any()
             }
             DataType::Int32 => {
-                let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
+                let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    krishiv_plan::udf::UdfError::InvalidArgument {
+                        message: format!(
+                            "column '{}' declared Int32 but downcast failed (got {})",
+                            field.name(),
+                            col.data_type()
+                        ),
+                    }
+                })?;
                 PyList::new(py, arr.iter().map(|v| v.map(|x| x as i64)))
                     .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: e.to_string(),
@@ -494,7 +518,15 @@ fn batch_to_py_dict(
                     .into_any()
             }
             DataType::Int64 => {
-                let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    krishiv_plan::udf::UdfError::InvalidArgument {
+                        message: format!(
+                            "column '{}' declared Int64 but downcast failed (got {})",
+                            field.name(),
+                            col.data_type()
+                        ),
+                    }
+                })?;
                 PyList::new(py, arr.iter())
                     .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: e.to_string(),
@@ -502,7 +534,15 @@ fn batch_to_py_dict(
                     .into_any()
             }
             DataType::Float32 => {
-                let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
+                let arr = col.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
+                    krishiv_plan::udf::UdfError::InvalidArgument {
+                        message: format!(
+                            "column '{}' declared Float32 but downcast failed (got {})",
+                            field.name(),
+                            col.data_type()
+                        ),
+                    }
+                })?;
                 PyList::new(py, arr.iter().map(|v| v.map(|x| x as f64)))
                     .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: e.to_string(),
@@ -510,7 +550,15 @@ fn batch_to_py_dict(
                     .into_any()
             }
             DataType::Float64 => {
-                let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    krishiv_plan::udf::UdfError::InvalidArgument {
+                        message: format!(
+                            "column '{}' declared Float64 but downcast failed (got {})",
+                            field.name(),
+                            col.data_type()
+                        ),
+                    }
+                })?;
                 PyList::new(py, arr.iter())
                     .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: e.to_string(),
@@ -518,7 +566,15 @@ fn batch_to_py_dict(
                     .into_any()
             }
             DataType::Boolean => {
-                let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+                let arr = col.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                    krishiv_plan::udf::UdfError::InvalidArgument {
+                        message: format!(
+                            "column '{}' declared Boolean but downcast failed (got {})",
+                            field.name(),
+                            col.data_type()
+                        ),
+                    }
+                })?;
                 PyList::new(py, arr.iter())
                     .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: e.to_string(),
@@ -526,7 +582,15 @@ fn batch_to_py_dict(
                     .into_any()
             }
             DataType::Utf8 => {
-                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                    krishiv_plan::udf::UdfError::InvalidArgument {
+                        message: format!(
+                            "column '{}' declared Utf8 but downcast failed (got {})",
+                            field.name(),
+                            col.data_type()
+                        ),
+                    }
+                })?;
                 PyList::new(py, arr.iter())
                     .map_err(|e| krishiv_plan::udf::UdfError::Execution {
                         message: e.to_string(),

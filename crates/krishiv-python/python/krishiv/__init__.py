@@ -79,35 +79,49 @@ async def connect_async(url: str) -> Session:
     return Session.connect(url)
 
 
+_native_session_sql_async = Session.sql_async
+
+
 async def _session_sql_async(self, query: str):
-    """Plan SQL from async code and return a lazy DataFrame."""
-    return self.sql(query)
+    """Plan SQL from async code (runs on a thread pool)."""
+    loop = _asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _native_session_sql_async, self, query)
+
+
+_native_dataframe_collect_async = DataFrame.collect_async
 
 
 async def _dataframe_collect_async(self):
-    """Collect a DataFrame from async code."""
-    return self.collect()
+    """Collect a DataFrame from async code (runs on a thread pool)."""
+    loop = _asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _native_dataframe_collect_async, self)
 
 
 _native_dataframe_execute_stream_async = DataFrame.execute_stream_async
 
 
 async def _dataframe_execute_stream_async(self):
-    """Execute a DataFrame as a stream from async code."""
-    return _native_dataframe_execute_stream_async(self)
+    """Execute a DataFrame as a stream from async code (runs on a thread pool)."""
+    loop = _asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _native_dataframe_execute_stream_async, self)
 
 
 _native_streaming_dataframe_execute_stream_async = StreamingDataFrame.execute_stream_async
 
 
 async def _streaming_dataframe_execute_stream_async(self):
-    """Execute a streaming DataFrame from async code."""
-    return _native_streaming_dataframe_execute_stream_async(self)
+    """Execute a streaming DataFrame from async code (runs on a thread pool)."""
+    loop = _asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _native_streaming_dataframe_execute_stream_async, self)
+
+
+_native_query_handle_collect = QueryHandle.collect
 
 
 async def _query_handle_collect_async(self):
-    """Await a submitted query handle."""
-    return self.collect()
+    """Await a submitted query handle (runs on a thread pool)."""
+    loop = _asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _native_query_handle_collect, self)
 
 
 Session.sql_async = _session_sql_async

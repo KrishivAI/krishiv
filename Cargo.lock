@@ -5401,6 +5401,7 @@ dependencies = [
  "async-stream",
  "dashmap",
  "futures",
+ "indexmap 2.14.0",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-metrics",
@@ -5780,6 +5781,7 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
+ "uuid",
 ]
 
 [[package]]

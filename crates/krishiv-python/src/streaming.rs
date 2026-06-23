@@ -91,17 +91,28 @@ impl PyStreamingQuery {
 impl PyStreamingQuery {
     /// The query's unique ID string.
     fn id(&self) -> String {
-        self.inner.lock().unwrap().id().to_string()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .id()
+            .to_string()
     }
 
     /// The query name if one was set.
     fn name(&self) -> Option<String> {
-        self.inner.lock().unwrap().name().map(str::to_string)
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .name()
+            .map(str::to_string)
     }
 
     /// ``True`` if the query is still running.
     fn is_active(&self) -> bool {
-        self.inner.lock().unwrap().is_active()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_active()
     }
 
     /// Request the query to stop.
@@ -109,7 +120,7 @@ impl PyStreamingQuery {
     /// Returns immediately; the background task may finish the current
     /// micro-batch before it actually stops.
     fn stop(&self) {
-        self.inner.lock().unwrap().stop();
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).stop();
     }
 
     /// Block until the query terminates.
@@ -126,7 +137,7 @@ impl PyStreamingQuery {
                     timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
                 loop {
                     {
-                        let guard = q.lock().unwrap();
+                        let guard = q.lock().unwrap_or_else(|p| p.into_inner());
                         if !guard.is_active() {
                             return Ok(());
                         }
@@ -149,7 +160,7 @@ impl PyStreamingQuery {
     fn last_progress(&self) -> Option<PyStreamingQueryProgress> {
         self.inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .last_progress()
             .map(|p| PyStreamingQueryProgress {
                 epoch: p.epoch,
@@ -160,7 +171,7 @@ impl PyStreamingQuery {
     }
 
     fn __repr__(&self) -> String {
-        let q = self.inner.lock().unwrap();
+        let q = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         format!(
             "StreamingQuery(id={}, name={:?}, active={})",
             q.id(),
@@ -379,21 +390,27 @@ impl PyRemoteStreamingJob {
     }
 
     /// Push a list of :class:`Batch` objects as input to the streaming job.
-    pub fn push(&self, batches: Vec<PyRef<'_, PyBatch>>) -> PyResult<()> {
+    pub fn push(&self, py: Python<'_>, batches: Vec<PyRef<'_, PyBatch>>) -> PyResult<()> {
         let rbs: Vec<_> = batches.iter().map(|b| b.record_batch().clone()).collect();
-        RUNTIME
-            .block_on(self.inner.push(&rbs))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        let inner = self.inner.clone();
+        py.detach(move || {
+            RUNTIME
+                .block_on(inner.push(&rbs))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
     }
 
     /// Drain accumulated output batches from the job.
     ///
     /// Returns a list of :class:`Batch` objects.
-    pub fn drain(&self) -> PyResult<Vec<PyBatch>> {
-        RUNTIME
-            .block_on(self.inner.drain())
-            .map(|rbs| rbs.into_iter().map(PyBatch::from_record_batch).collect())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    pub fn drain(&self, py: Python<'_>) -> PyResult<Vec<PyBatch>> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            RUNTIME
+                .block_on(inner.drain())
+                .map(|rbs| rbs.into_iter().map(PyBatch::from_record_batch).collect())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
     }
 
     pub fn __repr__(&self) -> String {

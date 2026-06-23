@@ -10,6 +10,7 @@ description.workspace = true
 arrow = { workspace = true }
 ahash = { workspace = true }
 dashmap = { workspace = true }
+indexmap = { workspace = true }
 smallvec = "1"
 thiserror = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }

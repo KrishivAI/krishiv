@@ -235,15 +235,22 @@ pub mod testing {
         }
 
         pub fn get(&self, id: &str) -> Option<Vec<f32>> {
-            self.store.lock().unwrap().get(id).cloned()
+            self.store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(id)
+                .cloned()
         }
 
         pub fn len(&self) -> usize {
-            self.store.lock().unwrap().len()
+            self.store.lock().unwrap_or_else(|p| p.into_inner()).len()
         }
 
         pub fn is_empty(&self) -> bool {
-            self.store.lock().unwrap().is_empty()
+            self.store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
         }
     }
 
@@ -254,7 +261,7 @@ pub mod testing {
             vectors: &'a [Vec<f32>],
         ) -> VectorFuture<'a> {
             Box::pin(async move {
-                let mut store = self.store.lock().unwrap();
+                let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
                 for (id, vec) in ids.iter().zip(vectors.iter()) {
                     store.insert(id.clone(), vec.clone());
                 }
@@ -264,7 +271,7 @@ pub mod testing {
 
         fn delete_batch<'a>(&'a self, ids: &'a [String]) -> VectorFuture<'a> {
             Box::pin(async move {
-                let mut store = self.store.lock().unwrap();
+                let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
                 for id in ids {
                     store.remove(id);
                 }

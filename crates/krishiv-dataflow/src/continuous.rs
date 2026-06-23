@@ -69,6 +69,7 @@ fn build_operator(
     spec: &WindowExecutionSpec,
     agg_exprs: &[AggExpr],
     state_dir: Option<&std::path::Path>,
+    agg_is_float: &[bool],
 ) -> ExecResult<WindowOperatorState> {
     match spec.window_kind {
         WindowKind::Tumbling => {
@@ -78,7 +79,7 @@ fn build_operator(
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.to_vec(),
-                agg_is_float: vec![false; agg_exprs.len()],
+                agg_is_float: agg_is_float.to_vec(),
             };
             let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
             let op = StateBackedTumblingWindowOperator::new(
@@ -99,7 +100,7 @@ fn build_operator(
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
                 agg_exprs: agg_exprs.to_vec(),
-                agg_is_float: vec![false; agg_exprs.len()],
+                agg_is_float: agg_is_float.to_vec(),
             };
             let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
             let op = StateBackedSlidingWindowOperator::new(
@@ -119,7 +120,7 @@ fn build_operator(
                 event_time_column: spec.event_time_column.clone(),
                 session_gap_ms: gap_ms,
                 agg_exprs: agg_exprs.to_vec(),
-                agg_is_float: vec![false; agg_exprs.len()],
+                agg_is_float: agg_is_float.to_vec(),
             };
             let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
             let op = StateBackedSessionWindowOperator::new(
@@ -138,7 +139,7 @@ fn build_operator(
                 size,
                 slide,
                 agg_exprs: agg_exprs.to_vec(),
-                agg_is_float: vec![false; agg_exprs.len()],
+                agg_is_float: agg_is_float.to_vec(),
             };
             let op = CountWindowOperator::new(count_spec)
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -228,8 +229,11 @@ pub use krishiv_common::StreamQualityHook;
 
 /// Retains window operator state between continuous streaming drain cycles.
 pub struct ContinuousWindowExecutor {
+    spec: WindowExecutionSpec,
+    agg_exprs: Vec<AggExpr>,
+    state_dir: Option<std::path::PathBuf>,
     watermark: WatermarkTracker,
-    operator: WindowOperatorState,
+    operator: Option<WindowOperatorState>,
     /// Optional data-quality gate applied to each emitted output batch.
     quality_hook: Option<Box<dyn StreamQualityHook>>,
     /// Most recently computed event-time watermark in milliseconds.
@@ -265,7 +269,10 @@ impl ContinuousWindowExecutor {
         let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
         Ok(Self {
             watermark: WatermarkTracker::new(&spec),
-            operator: build_operator(&spec, &agg_exprs, state_dir)?,
+            spec,
+            agg_exprs,
+            state_dir: state_dir.map(|p| p.to_path_buf()),
+            operator: None,
             quality_hook: None,
             last_watermark_ms: i64::MIN,
             rejected_rows_total: 0,
@@ -307,6 +314,33 @@ impl ContinuousWindowExecutor {
     /// expiry.  Within the batch loop, `set_watermark` is called again after each
     /// watermark advance so that lazy read-time expiry also reflects event time.
     pub fn drain(&mut self, input_batches: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
+        // Lazy-init: build the window operator from the first batch's schema so
+        // that `agg_is_float` reflects the actual aggregate input types instead
+        // of hardcoding `false` (which silently truncates Float64 to Int64).
+        if self.operator.is_none() && !input_batches.is_empty() {
+            let agg_is_float: Vec<bool> = self
+                .agg_exprs
+                .iter()
+                .map(|e| {
+                    input_batches[0]
+                        .schema()
+                        .field_with_name(&e.input_column)
+                        .map(|f| *f.data_type() == arrow::datatypes::DataType::Float64)
+                        .unwrap_or(false)
+                })
+                .collect();
+            self.operator = Some(build_operator(
+                &self.spec,
+                &self.agg_exprs,
+                self.state_dir.as_deref(),
+                &agg_is_float,
+            )?);
+        }
+
+        let Some(op) = &mut self.operator else {
+            return Ok(Vec::new());
+        };
+
         // C2: Apply idle-source policy before processing so idle sources don't
         // freeze all windows when they stop emitting data.
         self.watermark.apply_idle_source_policy();
@@ -316,11 +350,11 @@ impl ContinuousWindowExecutor {
         // On the very first drain cycle last_watermark_ms == i64::MIN and the
         // backend falls back to wall-clock time (no-op for non-TTL operators).
         if self.last_watermark_ms != i64::MIN {
-            self.operator.set_watermark(self.last_watermark_ms);
+            op.set_watermark(self.last_watermark_ms);
         }
 
         // Eagerly evict stale TTL entries before processing new data.
-        self.operator.purge_expired()?;
+        op.purge_expired()?;
 
         if input_batches.is_empty() {
             return Ok(Vec::new());
@@ -343,9 +377,9 @@ impl ContinuousWindowExecutor {
             }
             // Keep the TTL backend's event-time reference current as the
             // watermark advances within this drain cycle.
-            self.operator.set_watermark(wm);
+            op.set_watermark(wm);
             self.last_watermark_ms = wm;
-            raw.extend(self.operator.process_batch(batch, wm)?);
+            raw.extend(op.process_batch(batch, wm)?);
         }
         if raw.is_empty() {
             return Ok(raw);
@@ -394,15 +428,36 @@ impl ContinuousWindowExecutor {
             return self.drain(input_batches);
         }
 
-        // Eagerly purge TTL-expired entries BEFORE taking the snapshot so that
-        // the snapshot captures post-purge state. If we took the snapshot first
-        // and purge_expired ran inside drain(), a rollback would restore pre-purge
-        // state while the state backend retained its post-purge writes — leaving
-        // the in-memory and backend views inconsistent.
-        if self.last_watermark_ms != i64::MIN {
-            self.operator.set_watermark(self.last_watermark_ms);
+        // Lazy-init operator from first batch's schema (Float64 awareness).
+        if self.operator.is_none() {
+            let agg_is_float: Vec<bool> = self
+                .agg_exprs
+                .iter()
+                .map(|e| {
+                    input_batches[0]
+                        .schema()
+                        .field_with_name(&e.input_column)
+                        .map(|f| *f.data_type() == arrow::datatypes::DataType::Float64)
+                        .unwrap_or(false)
+                })
+                .collect();
+            self.operator = Some(build_operator(
+                &self.spec,
+                &self.agg_exprs,
+                self.state_dir.as_deref(),
+                &agg_is_float,
+            )?);
         }
-        self.operator.purge_expired()?;
+
+        // Eagerly purge TTL-expired entries BEFORE taking the snapshot so that
+        // the snapshot captures post-purge state.
+        {
+            let op = self.operator.as_mut().unwrap();
+            if self.last_watermark_ms != i64::MIN {
+                op.set_watermark(self.last_watermark_ms);
+            }
+            op.purge_expired()?;
+        }
 
         let state_snapshot = self.snapshot()?;
         let watermark_snapshot = self.watermark.clone();
@@ -411,14 +466,27 @@ impl ContinuousWindowExecutor {
         match self.drain(input_batches) {
             Ok(output) => Ok(output),
             Err(process_error) => {
-                self.operator
-                    .load_snapshot_bytes(&state_snapshot)
+                // Rollback restores the in-memory operator state from the
+                // pre-drain snapshot. However, RocksDB-backed operators may
+                // have written partial state to the persistent backend during
+                // `drain` (e.g. via `process_batch` window aggregations).
+                // `load_snapshot_bytes` only restores the in-memory view —
+                // it does NOT revert RocksDB entries. A `checkpoint()`
+                // immediately after rollback syncs the restored in-memory
+                // state back to the persistent backend, overwriting any
+                // partial writes from the failed drain cycle. Without it,
+                // the in-memory view may diverge from persisted state on
+                // crash, causing duplicate or inconsistent window results
+                // after recovery.
+                let op = self.operator.as_mut().unwrap();
+                op.load_snapshot_bytes(&state_snapshot)
                     .map_err(|restore_error| {
                         ExecError::InvalidWindowConfig(format!(
                             "continuous drain failed ({process_error}); rollback failed: \
                              {restore_error}"
                         ))
                     })?;
+                let _ = op.checkpoint();
                 self.watermark = watermark_snapshot;
                 self.last_watermark_ms = last_watermark_snapshot;
                 Err(process_error)
@@ -438,7 +506,10 @@ impl ContinuousWindowExecutor {
     /// (the runtime drain loop) should invoke this periodically so that open
     /// windows survive executor restarts.
     pub fn checkpoint(&mut self) -> ExecResult<()> {
-        self.operator.checkpoint()
+        match &mut self.operator {
+            Some(op) => op.checkpoint(),
+            None => Ok(()),
+        }
     }
 
     /// C9: Serialize the current window state to bytes for cross-session
@@ -449,10 +520,14 @@ impl ContinuousWindowExecutor {
     /// stored externally (file, etcd, object store) and later restored via
     /// [`restore_from_snapshot`] on a new executor.
     pub fn snapshot(&mut self) -> ExecResult<Vec<u8>> {
-        self.operator.checkpoint()?;
-        self.operator
-            .snapshot_state_bytes()
-            .map_err(|e| ExecError::InvalidWindowConfig(format!("snapshot failed: {e}")))
+        match &mut self.operator {
+            Some(op) => {
+                op.checkpoint()?;
+                op.snapshot_state_bytes()
+                    .map_err(|e| ExecError::InvalidWindowConfig(format!("snapshot failed: {e}")))
+            }
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Most recently observed watermark, used to restore `last_watermark_ms`
@@ -468,9 +543,16 @@ impl ContinuousWindowExecutor {
     /// the first batch). Call this immediately after [`new`] and before any
     /// [`drain`] calls when resuming an executor from a checkpoint.
     pub fn restore_from_snapshot(&mut self, bytes: &[u8]) -> ExecResult<()> {
-        self.operator
-            .load_snapshot_bytes(bytes)
-            .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?;
+        match &mut self.operator {
+            Some(op) => op
+                .load_snapshot_bytes(bytes)
+                .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?,
+            None => {
+                return Err(ExecError::InvalidWindowConfig(
+                    "cannot restore snapshot before operator is initialized".into(),
+                ));
+            }
+        }
         self.last_watermark_ms = i64::MIN;
         Ok(())
     }
@@ -483,9 +565,14 @@ impl ContinuousWindowExecutor {
     /// same-key entries (per-task snapshots of the same epoch are disjoint by
     /// key group after a rescaled restore, and identical for duplicated keys).
     pub fn merge_snapshot(&mut self, bytes: &[u8]) -> ExecResult<()> {
-        self.operator
-            .merge_snapshot_bytes(bytes)
-            .map_err(|e| ExecError::InvalidWindowConfig(format!("merge restore failed: {e}")))
+        match &mut self.operator {
+            Some(op) => op
+                .merge_snapshot_bytes(bytes)
+                .map_err(|e| ExecError::InvalidWindowConfig(format!("merge restore failed: {e}"))),
+            None => Err(ExecError::InvalidWindowConfig(
+                "cannot merge snapshot before operator is initialized".into(),
+            )),
+        }
     }
 }
 

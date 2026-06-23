@@ -648,7 +648,7 @@ impl Source for InMemoryKafkaSource {
                 .ok_or_else(|| ConnectorError::Offset {
                     message: "in-memory Kafka offset overflow".into(),
                 })?;
-        self.cursor += 1;
+        self.cursor = self.cursor.saturating_add(1);
         self.next_offset = next_offset;
         Ok(Some(batch))
     }

@@ -231,20 +231,34 @@ impl PyIvmJob {
     /// Build the delta with :meth:`DeltaBatch.from_inserts`,
     /// :meth:`DeltaBatch.from_deletes`, or :meth:`DeltaBatch.from_cdc`.
     /// Buffered until the next :meth:`step`.
-    pub fn feed(&self, source: String, delta: PyRef<'_, PyDeltaBatch>) -> PyResult<()> {
+    pub fn feed(
+        &self,
+        py: Python<'_>,
+        source: String,
+        delta: PyRef<'_, PyDeltaBatch>,
+    ) -> PyResult<()> {
         let delta = delta.inner.clone();
-        crate::RUNTIME
-            .block_on(async { self.inner.feed(&source, &delta).await })
-            .map_err(rt_err)
+        py.detach(move || {
+            crate::RUNTIME
+                .block_on(async { self.inner.feed(&source, &delta).await })
+                .map_err(rt_err)
+        })
     }
 
     /// Feed a full streaming snapshot; differentiated against the previous
     /// snapshot for this source.
-    pub fn feed_snapshot(&self, source: String, batches: Vec<PyRef<'_, PyBatch>>) -> PyResult<()> {
+    pub fn feed_snapshot(
+        &self,
+        py: Python<'_>,
+        source: String,
+        batches: Vec<PyRef<'_, PyBatch>>,
+    ) -> PyResult<()> {
         let rbs: Vec<_> = batches.iter().map(|b| b.record_batch().clone()).collect();
-        crate::RUNTIME
-            .block_on(async { self.inner.feed_snapshot(&source, &rbs).await })
-            .map_err(rt_err)
+        py.detach(move || {
+            crate::RUNTIME
+                .block_on(async { self.inner.feed_snapshot(&source, &rbs).await })
+                .map_err(rt_err)
+        })
     }
 
     /// Advance one tick. Returns a :class:`StepSummary`.
@@ -261,11 +275,13 @@ impl PyIvmJob {
     }
 
     /// Read the current materialized snapshot of a view, or ``None``.
-    pub fn snapshot(&self, view: String) -> PyResult<Option<PyBatch>> {
-        crate::RUNTIME
-            .block_on(async { self.inner.snapshot(&view).await })
-            .map(|opt| opt.map(PyBatch::from_record_batch))
-            .map_err(rt_err)
+    pub fn snapshot(&self, py: Python<'_>, view: String) -> PyResult<Option<PyBatch>> {
+        py.detach(move || {
+            crate::RUNTIME
+                .block_on(async { self.inner.snapshot(&view).await })
+                .map(|opt| opt.map(PyBatch::from_record_batch))
+                .map_err(rt_err)
+        })
     }
 
     /// Enable delta-checkpoint accumulation (embedded only; remote always on).
@@ -279,31 +295,39 @@ impl PyIvmJob {
     }
 
     /// Serialize a full checkpoint to bytes.
-    pub fn checkpoint(&self) -> PyResult<Vec<u8>> {
-        crate::RUNTIME
-            .block_on(self.inner.checkpoint())
-            .map_err(rt_err)
+    pub fn checkpoint(&self, py: Python<'_>) -> PyResult<Vec<u8>> {
+        py.detach(|| {
+            crate::RUNTIME
+                .block_on(self.inner.checkpoint())
+                .map_err(rt_err)
+        })
     }
 
     /// Restore from a full checkpoint.
-    pub fn restore(&self, bytes: Vec<u8>) -> PyResult<()> {
-        crate::RUNTIME
-            .block_on(async { self.inner.restore(&bytes).await })
-            .map_err(rt_err)
+    pub fn restore(&self, py: Python<'_>, bytes: Vec<u8>) -> PyResult<()> {
+        py.detach(move || {
+            crate::RUNTIME
+                .block_on(async { self.inner.restore(&bytes).await })
+                .map_err(rt_err)
+        })
     }
 
     /// Serialize only the deltas accumulated since the last call.
-    pub fn checkpoint_delta(&self) -> PyResult<Vec<u8>> {
-        crate::RUNTIME
-            .block_on(self.inner.checkpoint_delta())
-            .map_err(rt_err)
+    pub fn checkpoint_delta(&self, py: Python<'_>) -> PyResult<Vec<u8>> {
+        py.detach(|| {
+            crate::RUNTIME
+                .block_on(self.inner.checkpoint_delta())
+                .map_err(rt_err)
+        })
     }
 
     /// Apply delta-checkpoint bytes on top of restored state.
-    pub fn restore_delta(&self, bytes: Vec<u8>) -> PyResult<()> {
-        crate::RUNTIME
-            .block_on(async { self.inner.restore_delta(&bytes).await })
-            .map_err(rt_err)
+    pub fn restore_delta(&self, py: Python<'_>, bytes: Vec<u8>) -> PyResult<()> {
+        py.detach(move || {
+            crate::RUNTIME
+                .block_on(async { self.inner.restore_delta(&bytes).await })
+                .map_err(rt_err)
+        })
     }
 
     pub fn __repr__(&self) -> String {

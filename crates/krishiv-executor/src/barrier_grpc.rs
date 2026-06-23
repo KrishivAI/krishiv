@@ -1,5 +1,6 @@
 //! Executor-side `BarrierService` gRPC server.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use krishiv_proto::wire::v1::{
@@ -32,6 +33,8 @@ pub struct ExecutorBarrierService {
     pub state_backend_kind: String,
     /// How long to wait for a checkpoint to complete before returning deadline_exceeded.
     pub checkpoint_timeout_secs: u64,
+    /// Background barrier-stream processing tasks; aborted when the service is dropped.
+    background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl ExecutorBarrierService {
@@ -47,6 +50,7 @@ impl ExecutorBarrierService {
             checkpoint_uri: None,
             state_backend_kind: String::new(),
             checkpoint_timeout_secs: 120,
+            background_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -152,7 +156,8 @@ impl BarrierService for ExecutorBarrierService {
         let task_id = self.task_id.clone();
         let state_backend_kind = self.state_backend_kind.clone();
         let checkpoint_timeout_secs = self.checkpoint_timeout_secs;
-        tokio::spawn(async move {
+        let bg = self.background_tasks.clone();
+        let handle = tokio::spawn(async move {
             while let Ok(Some(barrier)) = inbound.message().await {
                 // Register the waiter BEFORE enqueueing the barrier.  The
                 // runner slot loop can complete the checkpoint as soon as the
@@ -202,6 +207,11 @@ impl BarrierService for ExecutorBarrierService {
                 }
             }
         });
+        {
+            let mut tasks = bg.lock().unwrap_or_else(|p| p.into_inner());
+            tasks.retain(|h| !h.is_finished());
+            tasks.push(handle);
+        }
         Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 }

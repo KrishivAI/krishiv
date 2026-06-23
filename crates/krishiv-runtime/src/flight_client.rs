@@ -1139,7 +1139,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn do_action_rejects_response_exceeding_size_cap() {
+    async fn do_action_rejects_response_exceeding_size_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
         use arrow_flight::flight_service_server::FlightServiceServer;
         use tonic::transport::Server;
 
@@ -1148,7 +1149,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
-        let addr: std::net::SocketAddr = listener.local_addr().expect("local_addr");
+        let addr: std::net::SocketAddr = listener
+            .local_addr()
+            .map_err(|e| format!("local_addr: {e}"))?;
         let incoming = tonic::transport::server::TcpIncoming::from(listener);
 
         // 40 chunks * 2 MiB = 80 MiB, over the 64 MiB cap while each chunk
@@ -1166,7 +1169,7 @@ mod tests {
         });
 
         let url = format!("http://{addr}");
-        let pool = FlightClientPool::new(url).expect("pool");
+        let pool = FlightClientPool::new(url).map_err(|e| format!("pool: {e}"))?;
         let action =
             crate::flight_action::KrishivFlightAction::Explain(crate::flight_action::ExplainBody {
                 sql: "SELECT 1".into(),

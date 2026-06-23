@@ -264,6 +264,8 @@ pub async fn dispatch_barrier_plan(
         });
     }
 
+    let total_targets = plan.targets.len();
+    let mut failure_count = 0usize;
     while let Some(result) = futures.next().await {
         match result {
             Ok(ack) => {
@@ -273,6 +275,22 @@ pub async fn dispatch_barrier_plan(
                 tracker.record_ack(&ack);
             }
             Err(e) => {
+                failure_count = failure_count.saturating_add(1);
+                // Early-abort: if remaining live targets can never reach quorum,
+                // stop waiting for the full timeout.
+                let completed = tracker.completed_count();
+                let remaining_live = total_targets.saturating_sub(failure_count);
+                if completed + remaining_live < total_targets {
+                    tracing::error!(
+                        job_id = %plan.job_id,
+                        epoch = plan.epoch,
+                        total = total_targets,
+                        completed,
+                        failures = failure_count,
+                        "barrier quorum mathematically impossible; aborting early"
+                    );
+                    break;
+                }
                 // Log the connection error but continue processing remaining
                 // executor acks. Only fail after the loop if quorum is unachievable.
                 tracing::warn!(

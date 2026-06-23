@@ -401,8 +401,15 @@ pub(crate) fn merge_checkpoint_coordinator(
     src: CheckpointCoordinator,
 ) {
     match dst.get(job_id) {
-        Some(existing) if checkpoint_progress(existing) >= checkpoint_progress(&src) => {
-            // dst is at least as advanced — keep it (never regress).
+        Some(existing) if checkpoint_progress(existing) > checkpoint_progress(&src) => {
+            // dst is strictly more advanced — keep it (never regress).
+        }
+        Some(existing) if checkpoint_progress(existing) == checkpoint_progress(&src) => {
+            // Same (epoch, state_rank). If src carries a newer fencing token
+            // (e.g. after a leader election), take it; otherwise keep dst.
+            if src.fencing_token.as_u64() > existing.fencing_token.as_u64() {
+                dst.insert(job_id.clone(), src);
+            }
         }
         _ => {
             dst.insert(job_id.clone(), src);

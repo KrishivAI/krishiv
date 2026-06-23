@@ -67,7 +67,9 @@ impl AuthProvider for StaticApiKeyAuthProviderWithRole {
 /// Convention:
 /// - Subjects with the `reader:` prefix → `Role::Reader`
 /// - Subjects with the `writer:` prefix → `Role::Writer`
-/// - All other subjects (including bare coordinator tokens) → `Role::Admin`
+/// - Subjects with the `admin:` prefix → `Role::Admin`
+/// - All other subjects (including bare coordinator tokens) → `Role::Reader`
+///   (default least privilege; never escalate unprefixed subjects)
 ///
 /// JWT providers should encode the role in a `krishiv_role` claim and return
 /// a subject of the form `<role>:<original-sub>` after claim extraction.
@@ -168,9 +170,13 @@ where
     if tokens.is_empty() {
         return None;
     }
-    let entries = tokens
-        .into_iter()
-        .map(|token| (token, COORDINATOR_AUTH_SUBJECT.to_owned(), Role::Admin));
+    let entries = tokens.into_iter().map(|token| {
+        (
+            token,
+            format!("admin:{COORDINATOR_AUTH_SUBJECT}"),
+            Role::Admin,
+        )
+    });
     Some(Arc::new(StaticApiKeyAuthProviderWithRole::new(entries)))
 }
 
@@ -361,9 +367,12 @@ fn configured_grpc_auth_reload_interval() -> Option<Duration> {
 }
 
 /// Spawn a best-effort periodic coordinator auth reload task when configured.
+///
+/// The returned handle is already captured by callers (e.g., `_auth_reload_task`) so the
+/// task is properly tracked for the lifetime of the process.
 pub fn spawn_grpc_auth_reload_task_from_env() -> Option<tokio::task::JoinHandle<()>> {
     let interval = configured_grpc_auth_reload_interval()?;
-    Some(tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -374,7 +383,8 @@ pub fn spawn_grpc_auth_reload_task_from_env() -> Option<tokio::task::JoinHandle<
                 tracing::warn!("coordinator gRPC auth reload skipped; no valid token set");
             }
         }
-    }))
+    });
+    Some(handle)
 }
 
 /// Return `true` when at least one coordinator server bearer token is configured.
@@ -613,7 +623,11 @@ impl JwtAuthProvider {
     pub async fn from_jwks_uri(
         uri: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let body = reqwest::Client::new().get(uri).send().await?.text().await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("failed to build JWKS HTTP client: {e}"))?;
+        let body = client.get(uri).send().await?.text().await?;
         Self::from_jwks_json(&body)
     }
 
@@ -635,6 +649,11 @@ impl JwtAuthProvider {
         let mut validation = jsonwebtoken::Validation::default();
         if let Ok(aud) = std::env::var(OIDC_AUDIENCE_ENV) {
             validation.set_audience(&[aud]);
+        } else if krishiv_common::is_production_mode() {
+            return Err(format!(
+                "{OIDC_AUDIENCE_ENV} must be set when JWT auth is active in production mode"
+            )
+            .into());
         } else {
             validation.validate_aud = false;
         }
@@ -694,7 +713,7 @@ mod tests {
 
         let subject = provider.authenticate("coord-secret").unwrap();
 
-        assert_eq!(subject, COORDINATOR_AUTH_SUBJECT);
+        assert_eq!(subject, format!("admin:{COORDINATOR_AUTH_SUBJECT}"));
         assert!(provider.authenticate("wrong-secret").is_none());
     }
 
@@ -711,8 +730,8 @@ mod tests {
         let active = provider.authenticate("active-token").unwrap();
         let old = provider.authenticate("old-token").unwrap();
 
-        assert_eq!(active, COORDINATOR_AUTH_SUBJECT);
-        assert_eq!(old, COORDINATOR_AUTH_SUBJECT);
+        assert_eq!(active, format!("admin:{COORDINATOR_AUTH_SUBJECT}"));
+        assert_eq!(old, format!("admin:{COORDINATOR_AUTH_SUBJECT}"));
         assert!(provider.authenticate("wrong-token").is_none());
     }
 

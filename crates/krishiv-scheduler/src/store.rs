@@ -1164,6 +1164,9 @@ pub struct NonBlockingStoreHandle {
     tx: Option<tokio::sync::mpsc::Sender<StoreCommand>>,
     /// When true, never drop writes on channel backpressure — fall back to sync write.
     fail_closed_writes: bool,
+    /// Handle to the background store drain task.  When all clones are dropped the
+    /// handle is dropped (the task auto-terminates on channel close).
+    _bg_task: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for NonBlockingStoreHandle {
@@ -1189,12 +1192,14 @@ impl NonBlockingStoreHandle {
             std::sync::Arc::new(std::sync::Mutex::new(store));
 
         // Only spawn the background task when a Tokio runtime is available.
+        let bg_task: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         let tx = if tokio::runtime::Handle::try_current().is_ok() {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StoreCommand>(STORE_CHANNEL_CAPACITY);
             let bg_store = std::sync::Arc::clone(&inner);
             let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
                         StoreCommand::AppendEvent(event) => {
@@ -1270,6 +1275,7 @@ impl NonBlockingStoreHandle {
                     }
                 }
             });
+            *bg_task.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
             Some(tx)
         } else {
             None
@@ -1279,6 +1285,7 @@ impl NonBlockingStoreHandle {
             inner,
             tx,
             fail_closed_writes: false,
+            _bg_task: bg_task,
         }
     }
 

@@ -291,7 +291,10 @@ pub async fn run_kubernetes_controller_runtime_with_client(
                             "skipping reconcile because coordinator is inactive (standby mode)"
                         );
                     } else {
-                        return Err(e);
+                        tracing::error!(
+                            error = %e,
+                            "reconcile failed; continuing controller loop for other jobs"
+                        );
                     }
                 }
             }

@@ -260,27 +260,47 @@ impl LakehouseTable for IcebergFsTable {
         if batches.is_empty() {
             return Ok(());
         }
-        let mut layers = self.state.lock().await;
-        let next_id = layers.last().map(|l| l.snapshot_id + 1).unwrap_or(1);
+        let (next_id, current_layers) = {
+            let layers = self.state.lock().await;
+            let next_id = layers.last().map(|l| l.snapshot_id + 1).unwrap_or(1);
+            (next_id, layers.clone())
+        };
         let file_name = format!("snap-{next_id:05}.parquet");
         let path = self.root.join("data").join(&file_name);
         let tmp_path = self.root.join("data").join(format!(".{file_name}.tmp"));
-        Self::write_parquet_file(&tmp_path, &batches)?;
-        fs::rename(&tmp_path, &path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-        #[cfg(unix)]
-        {
-            if let Ok(dir) = File::open(self.root.join("data")) {
-                let _ = dir.sync_all();
+        let root = self.root.clone();
+
+        // Perform blocking I/O off the async runtime.
+        tokio::task::spawn_blocking(move || {
+            Self::write_parquet_file(&tmp_path, &batches)?;
+            fs::rename(&tmp_path, &path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            #[cfg(unix)]
+            {
+                if let Ok(dir) = File::open(root.join("data")) {
+                    let _ = dir.sync_all();
+                }
             }
-        }
+            Ok::<_, LakehouseError>(())
+        })
+        .await
+        .map_err(|e| LakehouseError::Io(format!("spawn_blocking panicked: {e}")))??;
 
         let new_layer = FsLayer {
             snapshot_id: next_id,
-            path: path.clone(),
+            path: self.root.join("data").join(&file_name),
         };
-        let mut next_layers = layers.clone();
+        let mut next_layers = current_layers;
         next_layers.push(new_layer);
-        Self::persist_metadata(&next_layers, &self.root)?;
+
+        // Persist metadata on a blocking thread — it writes to disk.
+        let root = self.root.clone();
+        let layers_for_persist = next_layers.clone();
+        tokio::task::spawn_blocking(move || Self::persist_metadata(&layers_for_persist, &root))
+            .await
+            .map_err(|e| LakehouseError::Io(format!("spawn_blocking panicked: {e}")))??;
+
+        // Update in-memory state after all I/O has succeeded.
+        let mut layers = self.state.lock().await;
         *layers = next_layers;
         Ok(())
     }
