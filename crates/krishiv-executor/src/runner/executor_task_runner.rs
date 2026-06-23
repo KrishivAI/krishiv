@@ -591,7 +591,6 @@ impl ExecutorTaskRunner {
         let output = match execute_result {
             Ok(output) => output,
             Err(error) => {
-                self.clear_running_attempt(&assignment);
                 let error_text = error.to_string();
                 let message =
                     format_failure_message(assignment.plan_fragment().description(), &error_text);
@@ -612,6 +611,11 @@ impl ExecutorTaskRunner {
                     failed.disposition(),
                     TaskState::Failed,
                 )?;
+                // Clear the running attempt AFTER the terminal status is reported
+                // to the coordinator, matching the success path ordering. This
+                // ensures the task remains visible to checkpoint fanout until its
+                // terminal status is durably reported.
+                self.clear_running_attempt(&assignment);
                 return Err(tonic::Status::internal(error_text));
             }
         };
@@ -973,10 +977,18 @@ impl ExecutorTaskRunner {
                 (task_id, result)
             });
         }
+        let mut failed_tasks: Vec<String> = Vec::new();
         while let Some((task_id, result)) = acks.next().await {
             if let Err(error) = result {
                 tracing::warn!(task_id = %task_id, error = %error, "checkpoint acknowledgement failed");
+                failed_tasks.push(task_id.to_string());
             }
+        }
+        if !failed_tasks.is_empty() {
+            return Err(tonic::Status::internal(format!(
+                "checkpoint acks failed for tasks: {}",
+                failed_tasks.join(", ")
+            )));
         }
         Ok(())
     }
@@ -1238,8 +1250,15 @@ impl ExecutorTaskRunner {
                 // No checkpoint received yet; no prior leader exists.
                 FencingToken::initial()
             } else {
-                FencingToken::try_new(raw_token)
-                    .expect("cached fencing token must be non-zero after first checkpoint")
+                // Defensively handle unexpected fencing token values rather than
+                // panicking (M4). If the token is invalid, fall back to initial.
+                FencingToken::try_new(raw_token).unwrap_or_else(|_| {
+                    tracing::warn!(
+                        raw_token,
+                        "cached fencing token rejected by validation; falling back to initial"
+                    );
+                    FencingToken::initial()
+                })
             };
             let req = InitiateCheckpointRequest {
                 job_id,

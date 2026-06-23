@@ -325,6 +325,7 @@ mod sliding_state_tests {
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
             }],
+            agg_is_float: vec![false],
         };
         let mut op = SlidingWindowOperator::new(spec).unwrap();
         let schema = Arc::new(Schema::new(vec![
@@ -359,6 +360,7 @@ mod sliding_state_tests {
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
             }],
+            agg_is_float: vec![false],
         })
         .unwrap();
         restored.restore_from_state(&backend, &ns).expect("restore");
@@ -443,6 +445,7 @@ mod sliding_state_tests {
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
             }],
+            agg_is_float: vec![false],
         };
         assert!(matches!(
             SlidingWindowOperator::new(base.clone()),

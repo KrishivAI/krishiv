@@ -432,6 +432,7 @@ mod state_tests {
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
             }],
+            agg_is_float: vec![false],
         };
         let mut op = TumblingWindowOperator::new(spec);
         let schema = Arc::new(Schema::new(vec![
@@ -465,6 +466,7 @@ mod state_tests {
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
             }],
+            agg_is_float: vec![false],
         });
         restored.restore_from_state(&backend, &ns).expect("restore");
         assert_eq!(restored.open_window_count(), 1);
@@ -486,6 +488,7 @@ mod state_tests {
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
             }],
+            agg_is_float: vec![false],
         };
         assert!(matches!(
             TumblingWindowOperator::validate_spec(&base),
@@ -571,6 +574,7 @@ mod aggregation_proptests {
                     output_column: "sum_v".into(),
                 },
             ],
+            agg_is_float: vec![false, false],
         }
     }
 

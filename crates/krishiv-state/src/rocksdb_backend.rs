@@ -1,4 +1,4 @@
-use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch};
+use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch, WriteOptions};
 
 use crate::backend::StateBackend;
 use crate::error::{StateError, StateResult};
@@ -167,7 +167,9 @@ impl StateBackend for RocksDbStateBackend {
 
     fn put(&mut self, namespace: &Namespace, key: Vec<u8>, value: Vec<u8>) -> StateResult<()> {
         let rk = Self::rocksdb_key(namespace, &key);
-        self.db.put(rk, value).map_err(db_err)
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db.put_opt(rk, value, &write_opts).map_err(db_err)
     }
 
     fn delete(&mut self, namespace: &Namespace, key: &[u8]) -> StateResult<()> {
@@ -188,7 +190,9 @@ impl StateBackend for RocksDbStateBackend {
             }
             batch.delete(&*k);
         }
-        self.db.write(batch).map_err(db_err)
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db.write_opt(batch, &write_opts).map_err(db_err)
     }
 
     fn list_namespaces(&self) -> StateResult<Vec<Namespace>> {
@@ -271,7 +275,9 @@ impl StateBackend for RocksDbStateBackend {
             let rk = Self::rocksdb_key(&ns, &key);
             batch.put(rk, value);
         }
-        self.db.write(batch).map_err(db_err)
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db.write_opt(batch, &write_opts).map_err(db_err)
     }
 
     fn put_batch(&mut self, entries: &[(&str, &str, &[u8], &[u8])]) -> StateResult<()> {
@@ -281,7 +287,9 @@ impl StateBackend for RocksDbStateBackend {
             let rk = Self::rocksdb_key(&ns, key);
             batch.put(rk, *value);
         }
-        self.db.write(batch).map_err(db_err)
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db.write_opt(batch, &write_opts).map_err(db_err)
     }
 
     fn delete_batch(&mut self, entries: &[(&Namespace, &[u8])]) -> StateResult<()> {
@@ -290,7 +298,9 @@ impl StateBackend for RocksDbStateBackend {
             let rk = Self::rocksdb_key(ns, key);
             batch.delete(rk);
         }
-        self.db.write(batch).map_err(db_err)
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db.write_opt(batch, &write_opts).map_err(db_err)
     }
 }
 

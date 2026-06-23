@@ -238,11 +238,15 @@ impl ExecutorRuntime {
         task_endpoint: Option<String>,
         barrier_endpoint: Option<String>,
     ) {
-        if let Some(ep) = task_endpoint {
-            self.config = self.config.clone().with_task_endpoint(ep);
+        if let Some(ep) = task_endpoint
+            && !ep.trim().is_empty()
+        {
+            self.config.task_endpoint = Some(ep);
         }
-        if let Some(ep) = barrier_endpoint {
-            self.config = self.config.clone().with_barrier_endpoint(ep);
+        if let Some(ep) = barrier_endpoint
+            && !ep.trim().is_empty()
+        {
+            self.config.barrier_endpoint = Some(ep);
         }
     }
 

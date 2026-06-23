@@ -29,6 +29,9 @@ pub struct SessionWindowSpec {
     pub session_gap_ms: u64,
     /// Aggregate expressions to apply within each session.
     pub agg_exprs: Vec<AggExpr>,
+    /// Per-aggregate float flag: `true` when the aggregate input column is
+    /// `Float64`.  Positions beyond this slice default to `false` (Int64 output).
+    pub agg_is_float: Vec<bool>,
 }
 
 pub(crate) struct SessionState {
@@ -67,9 +70,10 @@ fn build_session_output_schema(spec: &SessionWindowSpec) -> Arc<Schema> {
         Field::new("session_start_ms", DataType::Int64, false),
         Field::new("session_end_ms", DataType::Int64, false),
     ];
-    for agg in &spec.agg_exprs {
+    for (i, agg) in spec.agg_exprs.iter().enumerate() {
         let dtype = match agg.function {
             AggFunction::Avg => DataType::Float64,
+            _ if spec.agg_is_float.get(i).copied().unwrap_or(false) => DataType::Float64,
             _ => DataType::Int64,
         };
         fields.push(Field::new(&agg.output_column, dtype, false));
@@ -133,6 +137,7 @@ impl SessionWindowOperator {
                 "has_value": session.agg.has_value,
                 "avg_sums": session.agg.avg_sums,
                 "avg_counts": session.agg.avg_counts,
+                "float_values": session.agg.float_values,
             });
             let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
                 message: e.to_string(),
@@ -208,6 +213,10 @@ impl SessionWindowOperator {
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
                 .unwrap_or_default();
+            let float_values: Vec<f64> = parsed["float_values"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+                .unwrap_or_default();
             if let Some(key) = parse_session_state_key(&key_bytes) {
                 restored.insert(
                     key,
@@ -219,7 +228,7 @@ impl SessionWindowOperator {
                             has_value,
                             avg_sums,
                             avg_counts,
-                            float_values: vec![],
+                            float_values,
                         },
                     },
                 );
@@ -364,9 +373,15 @@ impl SessionWindowOperator {
             Arc::new(Int64Array::from(vec![session_end_ms])),
         ];
         for (i, agg) in self.spec.agg_exprs.iter().enumerate() {
+            let is_float = self.spec.agg_is_float.get(i).copied().unwrap_or(false);
             match agg.function {
                 AggFunction::Avg => {
                     columns.push(Arc::new(Float64Array::from(vec![state.finalized_avg(i)])));
+                }
+                _ if is_float => {
+                    columns.push(Arc::new(Float64Array::from(vec![
+                        state.finalized_float_value(i, agg),
+                    ])));
                 }
                 _ => {
                     columns.push(Arc::new(Int64Array::from(vec![
@@ -457,6 +472,7 @@ mod session_state_tests {
                 output_column: "cnt".into(),
                 function: AggFunction::Count,
             }],
+            agg_is_float: vec![false],
         };
         let mut op = SessionWindowOperator::new(spec);
         let schema = Arc::new(Schema::new(vec![
@@ -490,6 +506,7 @@ mod session_state_tests {
                 output_column: "cnt".into(),
                 function: AggFunction::Count,
             }],
+            agg_is_float: vec![false],
         });
         restored.restore_from_state(&backend, &ns).expect("restore");
         assert_eq!(restored.open_session_count(), 1);
@@ -542,6 +559,7 @@ mod session_state_tests {
                 output_column: "cnt".into(),
                 function: AggFunction::Count,
             }],
+            agg_is_float: vec![false],
         };
         let mut op = SessionWindowOperator::new(spec);
         let schema = Arc::new(Schema::new(vec![
@@ -597,6 +615,7 @@ mod session_state_tests {
                 output_column: "cnt".into(),
                 function: AggFunction::Count,
             }],
+            agg_is_float: vec![false],
         };
         let mut op = SessionWindowOperator::new(spec);
 

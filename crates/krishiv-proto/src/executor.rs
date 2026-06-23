@@ -26,6 +26,17 @@ impl ExecutorDescriptor {
         }
     }
 
+    /// Validate the descriptor. Returns an error if required fields are empty.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.host.trim().is_empty() {
+            return Err("executor host must not be empty".into());
+        }
+        if self.slots == 0 {
+            return Err("executor slots must be greater than zero".into());
+        }
+        Ok(())
+    }
+
     /// Attach the executor-owned task assignment endpoint.
     #[must_use]
     pub fn with_task_endpoint(mut self, endpoint: impl Into<String>) -> Self {
@@ -423,6 +434,19 @@ impl Ord for HeartbeatHotKeyReport {
     }
 }
 
+impl HeartbeatHotKeyReport {
+    /// Validate the report. Returns an error if required fields are empty.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.key.trim().is_empty() {
+            return Err("hot key must not be empty".into());
+        }
+        if self.source_id.trim().is_empty() {
+            return Err("hot key source_id must not be empty".into());
+        }
+        Ok(())
+    }
+}
+
 /// Per-model LLM API usage reported by an executor (R17).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmQuotaReport {
@@ -448,6 +472,16 @@ pub struct HeartbeatThrottleCommand {
     pub source_id: String,
     /// Maximum rows per second (`None` clears the throttle / unlimited).
     pub rows_per_second: Option<u64>,
+}
+
+impl HeartbeatThrottleCommand {
+    /// Validate the throttle command. Returns an error if required fields are empty.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.source_id.trim().is_empty() {
+            return Err("throttle command source_id must not be empty".into());
+        }
+        Ok(())
+    }
 }
 
 // ── Distributed tracing carrier ──────────────────────────────────────────────

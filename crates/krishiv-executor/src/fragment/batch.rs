@@ -743,7 +743,7 @@ async fn execute_memory_kafka_to_parquet(
                 )))
             })
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .kafka_source_offsets = vec![offset];
     }
 
@@ -927,7 +927,7 @@ async fn execute_broker_kafka_two_phase(
                 )))
             })
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .kafka_source_offsets = offsets.offsets;
     }
 

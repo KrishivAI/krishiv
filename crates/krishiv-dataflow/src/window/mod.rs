@@ -464,6 +464,7 @@ mod watermark_tests {
                 input_column: String::new(),
                 output_column: "count".into(),
             }],
+            agg_is_float: vec![false],
         };
         let mut op = TumblingWindowOperator::new(spec);
 
@@ -514,6 +515,7 @@ mod watermark_tests {
                 input_column: String::new(),
                 output_column: "count".into(),
             }],
+            agg_is_float: vec![false],
         };
         let mut op = TumblingWindowOperator::new(spec);
         let b = arrow::record_batch::RecordBatch::try_new(

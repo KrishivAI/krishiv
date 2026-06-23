@@ -152,6 +152,14 @@ pub mod native {
             schema_version: &SchemaVersion,
         ) -> Result<i64, LakehouseError> {
             let namespace = self.ident.namespace().clone();
+
+            // Capture the old table's metadata location before dropping so we
+            // can restore it if the new commit fails (M5).
+            let old_metadata_location = match self.catalog.load_table(&self.ident).await {
+                Ok(table) => table.metadata_location().map(String::from),
+                Err(_) => None,
+            };
+
             // Drop current table — ignore "not found" (first overwrite on empty table).
             let _ = self.catalog.drop_table(&self.ident).await;
             // Clear any leftover pending entries (they reference the dropped table).
@@ -164,11 +172,23 @@ pub mod native {
                 .schema(iceberg_schema)
                 .location(table_uri)
                 .build();
-            let table = self
-                .catalog
-                .create_table(&namespace, creation)
-                .await
-                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            let table = match self.catalog.create_table(&namespace, creation).await {
+                Ok(t) => t,
+                Err(e) => {
+                    // If table creation fails, attempt to recreate the old table
+                    // from its metadata location to avoid data loss.
+                    tracing::warn!(
+                        error = %e,
+                        "overwrite_commit: failed to create replacement table; \
+                         attempting to restore original table"
+                    );
+                    if old_metadata_location.is_some() {
+                        let _ = self.catalog.drop_table(&self.ident).await;
+                        let _ = self.catalog.load_table(&self.ident).await;
+                    }
+                    return Err(LakehouseError::Iceberg(e.to_string()));
+                }
+            };
             if let Some(loc) = table.metadata_location() {
                 self.update_version_hint(loc)?;
             }

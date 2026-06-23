@@ -63,6 +63,17 @@ impl HeavyHittersTracker {
         // O(1) lookup via index map.
         if let Some(&pos) = self.index.get(&key) {
             self.counters[pos].1 += 1;
+            // If this key was the current minimum, re-find the minimum
+            // since its count has increased above the true minimum.
+            if pos == self.min_pos {
+                self.min_pos = self
+                    .counters
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, count, _))| *count)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+            }
             return;
         }
 
@@ -189,7 +200,14 @@ impl RateLimiter {
         }
         self.last_refill_ms = Some(now_ms);
 
-        if self.tokens >= n as f64 || self.rows_per_second == 0 {
+        // M8: rows_per_second == 0 means "block all rows" (source paused),
+        // not "unlimited". Return a very large wait to effectively pause the source.
+        if self.rows_per_second == 0 {
+            self.tokens = 0.0;
+            return Some(u64::MAX);
+        }
+
+        if self.tokens >= n as f64 {
             self.tokens -= n as f64;
             None
         } else {

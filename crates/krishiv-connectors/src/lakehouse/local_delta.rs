@@ -79,10 +79,25 @@ fn active_data_file_paths(root: &Path, max_version: Option<u64>) -> LakehouseRes
 }
 
 fn list_data_files(root: &Path, max_version: Option<u64>) -> LakehouseResult<Vec<PathBuf>> {
-    Ok(active_data_file_paths(root, max_version)?
+    let root_canonical = root
+        .canonicalize()
+        .map_err(|e| LakehouseError::Io(format!("cannot canonicalize table root: {e}")))?;
+    active_data_file_paths(root, max_version)?
         .into_iter()
-        .map(|rel| root.join(rel))
-        .collect())
+        .map(|rel| {
+            let path = root.join(&rel);
+            let canonical = path
+                .canonicalize()
+                .map_err(|e| LakehouseError::Io(format!("cannot resolve data file path: {e}")))?;
+            if !canonical.starts_with(&root_canonical) {
+                return Err(LakehouseError::Io(format!(
+                    "path traversal detected: {} escapes table root",
+                    rel
+                )));
+            }
+            Ok(canonical)
+        })
+        .collect()
 }
 
 pub fn read_table(path: &str, version: Option<u64>) -> LakehouseResult<Vec<RecordBatch>> {

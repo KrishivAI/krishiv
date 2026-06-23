@@ -607,7 +607,13 @@ impl Coordinator {
                 };
                 if let Some(store) = &self.store {
                     let mut guard = store.inner();
-                    let _ = guard.save_job_history(history);
+                    if let Err(e) = guard.save_job_history(history) {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            error = %e,
+                            "failed to persist job history record"
+                        );
+                    }
                 }
             }
         }
@@ -665,7 +671,15 @@ impl Coordinator {
             };
             if let Some(event) = event {
                 let mut guard = store.inner();
-                let _ = guard.append_event(event);
+                if let Err(e) = guard.append_event(event) {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        stage_id = %stage_id,
+                        task_id = %task_id,
+                        error = %e,
+                        "failed to persist task-level event log entry"
+                    );
+                }
             }
         }
         // P1.1: Remove streaming task index entries when job reaches a terminal state.
@@ -739,6 +753,11 @@ impl Coordinator {
             .checkpoint_complete_sent
             .retain(|(jid, _, _)| jid != job_id);
         self.ckpt.notify_sent.retain(|(jid, _, _)| jid != job_id);
+        // M6: Evict stale per-executor per-job watermark entries to prevent
+        // unbounded memory growth on long-lived coordinators.
+        for watermarks in self.executor_job_watermarks.values_mut() {
+            watermarks.remove(job_id);
+        }
     }
 
     /// Convert and submit a Krishiv logical DAG through the R2 scheduler.

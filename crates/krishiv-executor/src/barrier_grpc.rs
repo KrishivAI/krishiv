@@ -154,10 +154,15 @@ impl BarrierService for ExecutorBarrierService {
         let checkpoint_timeout_secs = self.checkpoint_timeout_secs;
         tokio::spawn(async move {
             while let Ok(Some(barrier)) = inbound.message().await {
-                injector.enqueue(barrier.clone());
+                // Register the waiter BEFORE enqueueing the barrier.  The
+                // runner slot loop can complete the checkpoint as soon as the
+                // barrier is visible in the injector; if register_wait runs
+                // after enqueue the completion arrives before the waiter is
+                // registered and is silently dropped → phantom 120 s timeout.
                 let ack_task_id = task_id_from_checkpoint_id(&barrier.checkpoint_id)
                     .unwrap_or_else(|| task_id.clone());
                 let completion_rx = ack_registry.register_wait(&barrier.job_id, barrier.epoch);
+                injector.enqueue(barrier.clone());
                 let ack = match tokio::time::timeout(
                     Duration::from_secs(checkpoint_timeout_secs),
                     completion_rx,

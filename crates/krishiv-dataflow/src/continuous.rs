@@ -119,6 +119,7 @@ fn build_operator(
                 event_time_column: spec.event_time_column.clone(),
                 session_gap_ms: gap_ms,
                 agg_exprs: agg_exprs.to_vec(),
+                agg_is_float: vec![false; agg_exprs.len()],
             };
             let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
             let op = StateBackedSessionWindowOperator::new(

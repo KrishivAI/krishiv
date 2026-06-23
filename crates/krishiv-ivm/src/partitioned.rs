@@ -206,10 +206,7 @@ impl PartitionedIncrementalFlow {
         self.concat_per_shard(|s| s.snapshot(view))
     }
 
-    pub fn view_spec(
-        &self,
-        view: &str,
-    ) -> IvmResult<Option<IncrementalViewSpec>> {
+    pub fn view_spec(&self, view: &str) -> IvmResult<Option<IncrementalViewSpec>> {
         // All shards carry the same spec; read from shard 0.
         self.shards
             .first()

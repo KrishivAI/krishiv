@@ -35,7 +35,7 @@ use crate::error::{ConnectorError, ConnectorResult};
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Configuration for the Elasticsearch / OpenSearch sink.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ElasticsearchConfig {
     /// Cluster URL (e.g. `"http://localhost:9200"`).
     pub url: String,
@@ -46,6 +46,20 @@ pub struct ElasticsearchConfig {
     /// Name of an Arrow `Utf8` column to use as the `_id` field.
     /// When `None`, Elasticsearch auto-generates IDs.
     pub id_column: Option<String>,
+}
+
+impl std::fmt::Debug for ElasticsearchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElasticsearchConfig")
+            .field("url", &self.url)
+            .field("index", &self.index)
+            .field(
+                "credentials",
+                &self.credentials.as_ref().map(|(u, _)| (u, "****")),
+            )
+            .field("id_column", &self.id_column)
+            .finish()
+    }
 }
 
 impl ElasticsearchConfig {
@@ -92,6 +106,11 @@ impl ElasticsearchSink {
             transport_builder =
                 transport_builder.auth(Credentials::Basic(user.clone(), pass.clone()));
         }
+        // L4.1: Set request and connect timeouts to prevent indefinite hangs
+        // on stalled Elasticsearch connections.
+        transport_builder = transport_builder
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5));
 
         let transport = transport_builder
             .build()

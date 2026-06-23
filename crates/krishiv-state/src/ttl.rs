@@ -182,7 +182,15 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         for (op_id, state_name, key, ttl_encoded_value) in &entries {
             // Strip the 8-byte TTL prefix if present; skip expired / corrupt entries.
             if ttl_encoded_value.len() < 8 {
-                // Skip corrupt entries silently in snapshot — they're already invisible on read.
+                // M7: Log corrupt entries so operators can detect silent data loss
+                // instead of silently dropping them.
+                tracing::warn!(
+                    op_id = %op_id,
+                    state_name = %state_name,
+                    key_len = key.len(),
+                    value_len = ttl_encoded_value.len(),
+                    "skipping corrupt TTL entry in snapshot (value too short for 8-byte prefix)"
+                );
                 continue;
             }
             let expires_at_ms =

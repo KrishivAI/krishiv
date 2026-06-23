@@ -478,18 +478,12 @@ impl CdcToLakehousePipeline {
                 .await
                 .map_err(|e| ConnectorError::Cdc(format!("iceberg prepare failed: {e}")))?;
 
-            // Commit source offsets BEFORE the Iceberg commit to minimize the
-            // duplicate-window on crash. Ordering:
-            //   1. prepare (done above)
-            //   2. commit offsets (below) — if this fails, Iceberg never commits → retry
-            //   3. commit Iceberg (below) — if this fails, offsets are past the data
-            //      → data loss for this batch, but no duplicates
-            // This trades a tiny data-loss risk for eliminating the larger
-            // duplicate-risk that the reverse order would create. The embedded
-            // offsets in the Iceberg snapshot summary (krishiv.kafka.committed_offsets)
-            // provide an escape hatch for manual recovery.
-            source.commit_offsets()?;
-
+            // Commit Iceberg FIRST, then commit source offsets.
+            // If Iceberg commit fails, offsets are NOT advanced → on retry the
+            // same batch is re-read (duplicates are safe because the pipeline
+            // declares primary_key_columns for upsert semantics).
+            // If offsets were committed first and Iceberg then failed, the batch
+            // would be permanently lost (offsets past data → data loss).
             let snapshot_id = match iceberg.commit(staged.clone(), offsets).await {
                 Ok(snapshot_id) => snapshot_id,
                 Err(e) => {
@@ -497,6 +491,8 @@ impl CdcToLakehousePipeline {
                     return Err(ConnectorError::Cdc(format!("iceberg commit failed: {e}")));
                 }
             };
+            // Iceberg committed successfully — now safe to advance source offsets.
+            source.commit_offsets()?;
             committed_snapshots.push(snapshot_id);
             if max_commits.is_some_and(|max| committed_snapshots.len() >= max) {
                 break;

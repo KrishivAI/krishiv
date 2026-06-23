@@ -215,12 +215,17 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         // Decode Arrow IPC bytes into RecordBatches.
         let batches = decode_ipc_batches(&req.ipc_bytes)?;
 
-        // Append to the per-job input buffer; drain_continuous_output will
-        // process them through the window executor.
-        self.continuous_inputs
-            .entry(job_id)
-            .or_default()
-            .extend(batches);
+        // Enforce per-job capacity to prevent unbounded memory growth (M1).
+        const MAX_PENDING_BATCHES: usize = 64;
+        let mut entry = self.continuous_inputs.entry(job_id).or_default();
+        if entry.len() + batches.len() > MAX_PENDING_BATCHES {
+            return Err(tonic::Status::resource_exhausted(format!(
+                "continuous input buffer for job {} exceeded capacity ({MAX_PENDING_BATCHES}); \
+                 slow down the producer or increase the drain rate",
+                entry.len() + batches.len(),
+            )));
+        }
+        entry.extend(batches);
 
         Ok(tonic::Response::new(TaskStatusResponse::new(
             TransportDisposition::Accepted,

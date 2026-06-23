@@ -76,8 +76,23 @@ fn subject_to_role(subject: &str) -> Role {
         Role::Reader
     } else if subject.starts_with("writer:") {
         Role::Writer
-    } else {
+    } else if subject.starts_with("admin:") {
         Role::Admin
+    } else {
+        // Default to least privilege — never escalate unknown or unprefixed
+        // subjects to Admin.  The `krishiv_role` claim (see `JwtAuthProvider`)
+        // is the authoritative source for JWT-based RBAC.
+        Role::Reader
+    }
+}
+
+/// Auth provider that rejects every token.  Installed when token sources are
+/// configured but all tokens are empty/revoked (fail-closed revocation).
+struct RejectAllAuthProvider;
+
+impl AuthProvider for RejectAllAuthProvider {
+    fn authenticate(&self, _api_key: &str) -> Option<String> {
+        None
     }
 }
 
@@ -216,10 +231,24 @@ fn read_optional_token_file(path: &str) -> std::io::Result<Option<String>> {
 
 /// Read all configured coordinator bearer tokens from process environment and files.
 pub fn try_configured_coordinator_bearer_tokens() -> std::io::Result<Vec<String>> {
+    let (tokens, _any_source) = try_configured_coordinator_bearer_tokens_with_flag()?;
+    Ok(tokens)
+}
+
+/// Like [`try_configured_coordinator_bearer_tokens`] but also reports whether
+/// any token source (env var or file path) was configured.  When the flag is
+/// `true` but the token list is empty, the caller should install a reject-all
+/// provider (fail-closed revocation).
+fn try_configured_coordinator_bearer_tokens_with_flag() -> std::io::Result<(Vec<String>, bool)> {
     let primary = env_value(COORDINATOR_BEARER_TOKEN_ENV);
     let extra = env_value(COORDINATOR_BEARER_TOKENS_ENV);
     let primary_file_path = env_value(COORDINATOR_BEARER_TOKEN_FILE_ENV);
     let extra_file_path = env_value(COORDINATOR_BEARER_TOKENS_FILE_ENV);
+
+    let any_source = primary.is_some()
+        || extra.is_some()
+        || primary_file_path.is_some()
+        || extra_file_path.is_some();
 
     let primary_file = primary_file_path
         .as_deref()
@@ -231,11 +260,14 @@ pub fn try_configured_coordinator_bearer_tokens() -> std::io::Result<Vec<String>
         .transpose()?
         .flatten();
 
-    Ok(coordinator_bearer_tokens_from_all_values(
-        primary.as_deref(),
-        extra.as_deref(),
-        primary_file.as_deref(),
-        extra_file.as_deref(),
+    Ok((
+        coordinator_bearer_tokens_from_all_values(
+            primary.as_deref(),
+            extra.as_deref(),
+            primary_file.as_deref(),
+            extra_file.as_deref(),
+        ),
+        any_source,
     ))
 }
 
@@ -262,9 +294,16 @@ pub fn configured_coordinator_bearer_token() -> Option<String> {
 }
 
 /// Install or reload coordinator gRPC auth from configured bearer tokens.
+///
+/// When any token source is configured (env var or file path is set) but the
+/// resolved token set is empty (e.g. all tokens revoked), a reject-all provider
+/// is installed so no bearer token is accepted.  Only when NO token source is
+/// configured at all is the existing provider left in place (for transient IO
+/// errors during reload).
 pub fn configure_grpc_auth_provider_from_env() -> bool {
-    let tokens = match try_configured_coordinator_bearer_tokens() {
-        Ok(tokens) => tokens,
+    let (tokens, any_source_configured) = match try_configured_coordinator_bearer_tokens_with_flag()
+    {
+        Ok(result) => result,
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -273,7 +312,16 @@ pub fn configure_grpc_auth_provider_from_env() -> bool {
             return false;
         }
     };
+    if tokens.is_empty() && any_source_configured {
+        // Token sources are configured but all tokens are empty/revoked.
+        // Install a reject-all provider so the old revoked tokens are no longer
+        // accepted. This is the fail-closed path for token revocation.
+        set_grpc_auth_provider(Arc::new(RejectAllAuthProvider));
+        tracing::info!("installed reject-all auth provider — all bearer tokens are revoked");
+        return true;
+    }
     let Some(provider) = static_grpc_auth_provider_from_bearer_tokens(tokens) else {
+        // No token source configured at all — leave existing provider in place.
         return false;
     };
     set_grpc_auth_provider(provider);
@@ -352,8 +400,25 @@ pub enum GrpcAuthSetupError {
 }
 
 /// Allow anonymous gRPC access when no auth provider is configured.
+///
+/// Anonymous access is forbidden when:
+/// - `KRISHIV_PRODUCTION=1` is set, OR
+/// - The durability profile is anything other than `dev-local` (i.e.
+///   `KRISHIV_DURABILITY_PROFILE` is `single-node-durable` or
+///   `distributed-durable`).
+///
+/// This ensures that real clusters never silently accept unauthenticated
+/// control-plane RPCs.  Set `KRISHIV_PRODUCTION=0` AND keep the default
+/// `dev-local` profile to allow anonymous access for local development.
 pub fn set_allow_anonymous() -> Result<(), GrpcAuthSetupError> {
-    set_allow_anonymous_when(!krishiv_common::is_production_mode())
+    if krishiv_common::is_production_mode() {
+        return Err(GrpcAuthSetupError::AnonymousForbiddenInProduction);
+    }
+    let profile = krishiv_common::resolve_durability_profile();
+    if krishiv_common::requires_http_auth(profile) {
+        return Err(GrpcAuthSetupError::AnonymousForbiddenInProduction);
+    }
+    set_allow_anonymous_when(true)
 }
 
 fn set_allow_anonymous_when(allowed: bool) -> Result<(), GrpcAuthSetupError> {
@@ -527,9 +592,10 @@ pub struct JwtAuthProvider {
 #[derive(serde::Deserialize)]
 struct JwtClaims {
     sub: String,
+    /// Optional RBAC role claim. When present the subject is prefixed with
+    /// `<role>:` so that `subject_to_role` maps it correctly. When absent the
+    /// subject is returned as-is (unprefixed subjects get `Role::Reader`).
     #[serde(default)]
-    #[allow(dead_code)]
-    // Reserved for future RBAC enforcement — deserialized but not yet consumed.
     krishiv_role: Option<String>,
 }
 
@@ -583,7 +649,16 @@ impl AuthProvider for JwtAuthProvider {
             if let Ok(token_data) =
                 jsonwebtoken::decode::<JwtClaims>(api_key, key, &self.validation)
             {
-                return Some(token_data.claims.sub);
+                let claims = token_data.claims;
+                // Prefix the subject with the role claim so subject_to_role
+                // maps it correctly. If no role claim is present the subject
+                // is returned bare → default Reader (least privilege).
+                return Some(match claims.krishiv_role.as_deref() {
+                    Some("admin") => format!("admin:{}", claims.sub),
+                    Some("writer") => format!("writer:{}", claims.sub),
+                    Some("reader") | Some(_) => format!("reader:{}", claims.sub),
+                    None => claims.sub,
+                });
             }
         }
         None

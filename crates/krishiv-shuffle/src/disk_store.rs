@@ -231,8 +231,21 @@ impl LocalDiskShuffleStore {
         let current = memory.or(persisted);
         let next = crate::lease_persistence::enforce_monotonic_lease(current, incoming)?;
 
-        // Update in-memory map.
-        shuffle_write_lock(&self.lease_tokens)?.insert(key.clone(), next);
+        // Re-acquire the write lock and verify the in-memory token hasn't been
+        // updated by a concurrent task while we were reading from disk.
+        {
+            let mut tokens = shuffle_write_lock(&self.lease_tokens)
+                .map_err(|e| io_err(format!("lease token lock poisoned: {e}")))?;
+            if let Some(&current_in_mem) = tokens.get(&key)
+                && current_in_mem > next
+            {
+                return Err(crate::ShuffleError::StaleLeaseToken {
+                    expected: current_in_mem,
+                    actual: next,
+                });
+            }
+            tokens.insert(key.clone(), next);
+        }
 
         // Phase 2: persist the new lease token in spawn_blocking.
         // Skip the FS write if the token is unchanged.
@@ -378,18 +391,25 @@ impl ShuffleStore for LocalDiskShuffleStore {
             };
 
             if commit {
-                std::fs::rename(&tmp_path, &final_path).map_err(|e| {
-                    io_err(format!(
-                        "failed to rename temp partition '{}' → '{}': {e}",
-                        tmp_path.display(),
-                        final_path.display()
-                    ))
-                })?;
+                // Rename the sidecar (hash) file first, then the primary data file.
+                // This ensures that a crash at any point leaves a consistent state:
+                // - Crash before any rename: both files are still temp (safe)
+                // - Crash after hash rename only: hash exists without data (tolerated)
+                // - Crash after both renames: fully committed
+                // The old order (data then hash) could leave a committed data file
+                // without its hash sidecar, causing hash-mismatch on recovery.
                 std::fs::rename(&tmp_hash_path, &final_hash_path).map_err(|e| {
                     io_err(format!(
                         "failed to rename temp partition hash '{}' → '{}': {e}",
                         tmp_hash_path.display(),
                         final_hash_path.display()
+                    ))
+                })?;
+                std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+                    io_err(format!(
+                        "failed to rename temp partition '{}' → '{}': {e}",
+                        tmp_path.display(),
+                        final_path.display()
                     ))
                 })?;
                 // S4: Fsync the parent directory so the rename is durable.

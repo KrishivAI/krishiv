@@ -246,24 +246,19 @@ pub fn executor_heartbeat_request_from_wire(
         .with_version(version)
         .with_running_attempts(running_attempts);
 
-    if value.memory_used_bytes > 0 {
-        req = req.with_memory_used_bytes(value.memory_used_bytes);
-    }
-    if value.memory_limit_bytes > 0 {
-        req = req.with_memory_limit_bytes(value.memory_limit_bytes);
-    }
-    if value.active_task_count > 0 {
-        req = req.with_active_task_count(value.active_task_count);
-    }
-    if value.cpu_cores_used > 0.0 {
-        req = req.with_cpu_cores_used(value.cpu_cores_used);
-    }
-    if value.network_bytes_sent > 0 {
-        req = req.with_network_bytes_sent(value.network_bytes_sent);
-    }
-    if value.network_bytes_recv > 0 {
-        req = req.with_network_bytes_recv(value.network_bytes_recv);
-    }
+    // Always send all resource fields so the coordinator always has the latest
+    // values. Previously these were guarded by `> 0` checks which caused a
+    // round-trip asymmetry: legitimate zero values (e.g. executor reporting
+    // zero memory usage) were serialized as 0, then deserialized back as None
+    // because the > 0 guard discarded them. The coordinator could never observe
+    // a zero report vs. no report at all.
+    req = req
+        .with_memory_used_bytes(value.memory_used_bytes)
+        .with_memory_limit_bytes(value.memory_limit_bytes)
+        .with_active_task_count(value.active_task_count)
+        .with_cpu_cores_used(value.cpu_cores_used)
+        .with_network_bytes_sent(value.network_bytes_sent)
+        .with_network_bytes_recv(value.network_bytes_recv);
     if !value.llm_quota_reports.is_empty() {
         req = req.with_llm_quota_reports(
             value

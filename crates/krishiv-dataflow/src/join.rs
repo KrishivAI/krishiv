@@ -118,6 +118,8 @@ pub fn extract_agg_key(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecR
 // ── CompositeKey ────────────────────────────────────────────────────────────
 
 /// Composite multi-key for use with join operators.
+/// Placeholder for future multi-key join support.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompositeKey(Vec<AggKey>);
 

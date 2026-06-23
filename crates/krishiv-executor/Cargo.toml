@@ -16,6 +16,7 @@ base64 = { workspace = true }
 constant_time_eq = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+indexmap = { workspace = true }
 twox-hash = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-ivm = { path = "../krishiv-ivm" }

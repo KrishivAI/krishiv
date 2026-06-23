@@ -58,6 +58,16 @@ impl CassandraConfig {
     }
 }
 
+impl std::fmt::Debug for CassandraConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CassandraConfig")
+            .field("node", &self.node)
+            .field("keyspace", &self.keyspace)
+            .field("table", &self.table)
+            .finish()
+    }
+}
+
 // ── Sink ──────────────────────────────────────────────────────────────────────
 
 /// Writes Arrow [`RecordBatch`] values to Cassandra / ScyllaDB.
@@ -74,6 +84,7 @@ impl CassandraSink {
     pub async fn connect(config: CassandraConfig) -> ConnectorResult<Self> {
         let session = SessionBuilder::new()
             .known_node(&config.node)
+            .request_timeout(std::time::Duration::from_secs(30))
             .build()
             .await
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;

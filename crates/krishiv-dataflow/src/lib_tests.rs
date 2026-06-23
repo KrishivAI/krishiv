@@ -312,6 +312,7 @@ fn count_window_spec() -> TumblingWindowSpec {
             input_column: String::new(),
             output_column: "count".into(),
         }],
+        agg_is_float: vec![false],
     }
 }
 
@@ -407,6 +408,7 @@ fn window_sum_aggregation() {
             input_column: "val".into(),
             output_column: "sum_val".into(),
         }],
+        agg_is_float: vec![false],
     };
     let mut op = TumblingWindowOperator::new(spec);
     let batch = make_stream_batch(vec!["x", "x", "x"], vec![0, 100, 200], vec![10, 20, 30]);
@@ -433,6 +435,7 @@ fn window_avg_aggregation() {
             input_column: "val".into(),
             output_column: "avg_val".into(),
         }],
+        agg_is_float: vec![false],
     };
     let mut op = TumblingWindowOperator::new(spec);
     let batch = make_stream_batch(vec!["x", "x", "x"], vec![0, 100, 200], vec![10, 20, 30]);
@@ -572,6 +575,7 @@ fn sliding_spec() -> SlidingWindowSpec {
             input_column: "val".into(),
             output_column: "cnt".into(),
         }],
+        agg_is_float: vec![false],
     }
 }
 
@@ -658,6 +662,7 @@ fn sliding_window_avg_aggregation() {
             input_column: "val".into(),
             output_column: "avg_val".into(),
         }],
+        agg_is_float: vec![false],
     };
     let mut op = SlidingWindowOperator::new(spec).unwrap();
     let batch = make_stream_batch_i64(vec!["a", "a"], vec![100, 200], vec![10, 30]);
@@ -685,6 +690,7 @@ fn session_spec() -> SessionWindowSpec {
             input_column: "val".into(),
             output_column: "cnt".into(),
         }],
+        agg_is_float: vec![false],
     }
 }
 
@@ -737,6 +743,7 @@ fn session_window_avg_aggregation() {
             input_column: "val".into(),
             output_column: "avg_val".into(),
         }],
+        agg_is_float: vec![false],
     };
     let mut op = SessionWindowOperator::new(spec);
     let b1 = make_stream_batch_i64(vec!["a", "a"], vec![100, 200], vec![10, 30]);
@@ -938,6 +945,7 @@ fn sliding_window_zero_slide_returns_error() {
         window_size_ms: 1000,
         slide_ms: 0, // invalid — would cause infinite loop
         agg_exprs: vec![],
+        agg_is_float: vec![],
     };
     let result = SlidingWindowOperator::new(bad_spec);
     assert!(

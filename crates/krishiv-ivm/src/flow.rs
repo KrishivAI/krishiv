@@ -853,11 +853,7 @@ impl IncrementalFlow {
 
     pub fn view_spec(&self, name: &str) -> IvmResult<Option<IncrementalViewSpec>> {
         let inner = self.inner.lock().map_err(lock_err)?;
-        Ok(inner
-            .view_registry
-            .get(name)
-            .ok()
-            .map(|v| v.spec.clone()))
+        Ok(inner.view_registry.get(name).ok().map(|v| v.spec.clone()))
     }
 
     pub fn source_snapshot(&self, name: &str) -> IvmResult<Option<RecordBatch>> {

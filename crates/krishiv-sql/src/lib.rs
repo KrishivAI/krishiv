@@ -1303,15 +1303,20 @@ impl SqlEngine {
         // Register an S3 ObjectStore when the path is an s3:// URL so DataFusion
         // can read remote Parquet files transparently.
         if path.starts_with("s3://") {
-            let url = url::Url::parse(&path)
-                .map_err(|e| SqlError::DataFusion { message: format!("invalid s3 url {path}: {e}") })?;
+            let url = url::Url::parse(&path).map_err(|e| SqlError::DataFusion {
+                message: format!("invalid s3 url {path}: {e}"),
+            })?;
             let bucket = url.host_str().unwrap_or_default();
-            let store_url = url::Url::parse(&format!("s3://{bucket}"))
-                .map_err(|e| SqlError::DataFusion { message: format!("invalid s3 bucket url: {e}") })?;
+            let store_url =
+                url::Url::parse(&format!("s3://{bucket}")).map_err(|e| SqlError::DataFusion {
+                    message: format!("invalid s3 bucket url: {e}"),
+                })?;
             let store = AmazonS3Builder::from_env()
                 .with_bucket_name(bucket)
                 .build()
-                .map_err(|e| SqlError::DataFusion { message: format!("s3 store init: {e}") })?;
+                .map_err(|e| SqlError::DataFusion {
+                    message: format!("s3 store init: {e}"),
+                })?;
             self.context
                 .register_object_store(&store_url, Arc::new(store));
         }

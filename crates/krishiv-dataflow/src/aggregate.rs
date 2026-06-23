@@ -452,6 +452,10 @@ fn update_agg_state_pre(
 /// Local pre-aggregation operator.
 ///
 /// Groups a `RecordBatch` by `group_by` columns and computes aggregates.
+/// Local in-memory group-by aggregator for testing and single-batch use.
+/// Not yet wired into the production window operators (which use streaming
+/// incremental aggregation via `AggState`).
+#[allow(dead_code)]
 pub struct LocalAggregator {
     group_by: Vec<String>,
     agg_exprs: Vec<AggExpr>,

@@ -27,6 +27,7 @@
 //! ```
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{BinaryBuilder, Int64Builder, StringBuilder};
@@ -158,6 +159,13 @@ impl PulsarSource {
     /// single [`RecordBatch`].
     ///
     /// Returns `Ok(None)` when no message is ready immediately.
+    ///
+    /// Messages are NOT acked here. The caller is responsible for calling
+    /// `ack_all_pending()` after confirming downstream durability. This
+    /// prevents data loss: if the process crashes after ack but before the
+    /// write is committed, messages are lost permanently. By deferring the
+    /// ack, un-acked messages are redelivered from the subscription on
+    /// restart (at-least-once semantics).
     pub async fn next_batch(
         &mut self,
         max_messages: usize,
@@ -179,12 +187,7 @@ impl PulsarSource {
                     ts_col.append_value(msg.payload.metadata.publish_time as i64);
                     data_col.append_value(&msg.payload.data);
                     count += 1;
-                    // Ack the message so the subscription cursor advances.
-                    // Without this, on restart every un-acked message is
-                    // re-delivered from subscription start.
-                    if let Err(e) = self.consumer.ack(&msg).await {
-                        tracing::warn!(error = %e, "pulsar ack failed; will retry on next batch");
-                    }
+                    // Do NOT ack here. Defer until downstream durability is confirmed.
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -221,9 +224,7 @@ impl PulsarSource {
 
 impl Source for PulsarSource {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new()
-            .with_unbounded()
-            .with_checkpoint()
+        ConnectorCapabilities::new().with_unbounded()
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {

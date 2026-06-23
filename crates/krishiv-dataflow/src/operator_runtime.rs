@@ -185,6 +185,7 @@ pub fn execute_bounded_window(
                 event_time_column,
                 session_gap_ms: gap_ms,
                 agg_exprs,
+                agg_is_float,
             };
             let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
             let mut op =
@@ -320,6 +321,7 @@ fn build_streaming_window_op(
                 event_time_column,
                 session_gap_ms,
                 agg_exprs,
+                agg_is_float: agg_is_float.clone(),
             };
             let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
             StreamingWindowOp::Session(

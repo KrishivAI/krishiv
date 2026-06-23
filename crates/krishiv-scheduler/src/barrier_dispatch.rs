@@ -127,7 +127,11 @@ impl Coordinator {
             let request = CheckpointAckRequest {
                 job_id: job_id.clone(),
                 operator_id: krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
-                    .expect("task_id is non-empty, so operator_id is non-empty"),
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id");
+                        krishiv_proto::OperatorId::try_new("op-unknown".to_string())
+                            .expect("static operator_id is valid")
+                    }),
                 task_id: task_id.clone(),
                 epoch,
                 fencing_token,
@@ -174,7 +178,11 @@ impl Coordinator {
             let request = CheckpointAckRequest {
                 job_id: job_id.clone(),
                 operator_id: krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
-                    .expect("task_id is non-empty, so operator_id is non-empty"),
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id");
+                        krishiv_proto::OperatorId::try_new("op-unknown".to_string())
+                            .expect("static operator_id is valid")
+                    }),
                 task_id: task_id.clone(),
                 epoch,
                 fencing_token,
@@ -257,12 +265,23 @@ pub async fn dispatch_barrier_plan(
     }
 
     while let Some(result) = futures.next().await {
-        let ack = result?;
-        if !tracker.record_ack(&ack) {
-            return Err(format!(
-                "unexpected ack for job {} epoch {}",
-                ack.job_id, ack.epoch
-            ));
+        match result {
+            Ok(ack) => {
+                // Duplicate acks (same task_id already received) are expected in
+                // at-least-once delivery — just skip them. Wrong epoch/job acks
+                // should not abort the entire barrier round.
+                tracker.record_ack(&ack);
+            }
+            Err(e) => {
+                // Log the connection error but continue processing remaining
+                // executor acks. Only fail after the loop if quorum is unachievable.
+                tracing::warn!(
+                    job_id = %plan.job_id,
+                    epoch = plan.epoch,
+                    error = %e,
+                    "barrier ack from executor failed; continuing with remaining acks"
+                );
+            }
         }
     }
 
@@ -297,7 +316,11 @@ fn barrier_ack_to_checkpoint_ack(
     CheckpointAckRequest {
         job_id: job_id.clone(),
         operator_id: krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
-            .expect("task_id is non-empty, so operator_id is non-empty"),
+            .unwrap_or_else(|e| {
+                tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id");
+                krishiv_proto::OperatorId::try_new("op-unknown".to_string())
+                    .expect("static operator_id is valid")
+            }),
         task_id: task_id.clone(),
         epoch,
         fencing_token,

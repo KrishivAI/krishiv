@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
+use indexmap::IndexSet;
 use tokio::sync::Notify;
 
 use crate::{ExecutorError, ExecutorResult};
@@ -27,10 +28,10 @@ const MAX_SEEN_ENTRIES: usize = 10_000;
 
 /// Tracks (job_id, task_id, attempt_id) tuples already received to prevent
 /// duplicate execution from at-least-once delivery retries.
-/// Bounded to MAX_SEEN_ENTRIES; oldest entries evicted when full.
+/// Bounded to MAX_SEEN_ENTRIES; oldest entries evicted by insertion order (FIFO).
 #[derive(Debug, Clone)]
 struct SeenSet {
-    entries: BTreeSet<(
+    entries: IndexSet<(
         krishiv_proto::JobId,
         krishiv_proto::TaskId,
         krishiv_proto::AttemptId,
@@ -41,7 +42,7 @@ struct SeenSet {
 impl SeenSet {
     fn new(max_entries: usize) -> Self {
         Self {
-            entries: BTreeSet::new(),
+            entries: IndexSet::new(),
             max_entries,
         }
     }
@@ -56,9 +57,9 @@ impl SeenSet {
     ) -> bool {
         if self.entries.len() >= self.max_entries
             && !self.entries.contains(&key)
-            && let Some(oldest) = self.entries.iter().next().cloned()
+            && let Some(oldest) = self.entries.get_index(0).cloned()
         {
-            self.entries.remove(&oldest);
+            self.entries.shift_remove(&oldest);
         }
         self.entries.insert(key)
     }
@@ -71,7 +72,7 @@ impl SeenSet {
             krishiv_proto::AttemptId,
         ),
     ) -> bool {
-        self.entries.remove(key)
+        self.entries.shift_remove(key)
     }
 }
 

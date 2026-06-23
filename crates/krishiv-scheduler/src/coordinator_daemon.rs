@@ -1039,6 +1039,9 @@ pub async fn run_standalone_coordinator(
         let leader = SingleNodeLeader::new();
         let token = leader.bump_fencing_token();
         coordinator.sync_leader_fencing_token(token);
+        // Override per-job checkpoint coordinator fencing tokens with the
+        // current leader token (C8).
+        coordinator.sync_checkpoint_fencing_tokens(token).await;
     }
     spawn_coordinator_sidecars(&coordinator, &config, extra_http_factory, extra_sidecars).await?;
     // Standalone must spawn orchestration loops for task dispatch and heartbeat management.

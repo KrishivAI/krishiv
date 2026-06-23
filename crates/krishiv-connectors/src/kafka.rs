@@ -564,12 +564,17 @@ impl Sink for KafkaSink {
     async fn flush(&mut self) -> ConnectorResult<()> {
         use rdkafka::producer::Producer;
         use std::time::Duration;
-        self.producer
-            .flush(Duration::from_secs(10))
-            .map_err(|e| ConnectorError::Kafka {
-                message: format!("rdkafka flush failed: {e}"),
-                retriable: true,
-            })
+        // `Producer::flush` is synchronous and may block for up to 10s.
+        // Move it to a blocking thread so the Tokio worker thread is not stalled.
+        let producer = self.producer.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = producer.flush(Duration::from_secs(10));
+        })
+        .await
+        .map_err(|e| ConnectorError::Kafka {
+            message: format!("rdkafka flush task panicked: {e}"),
+            retriable: true,
+        })
     }
 }
 

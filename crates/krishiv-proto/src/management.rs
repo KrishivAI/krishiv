@@ -2,6 +2,18 @@
 
 use crate::ids::JobId;
 
+/// Errors from request validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationError(pub String);
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "validation error: {}", self.0)
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
 /// Domain types for the coordinator management service (GAP-RT-04).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggerSavepointRequest {
@@ -29,6 +41,15 @@ pub struct RestoreJobRequest {
     /// the coordinator copies it back into the active checkpoint chain before
     /// activating the restore.
     pub from_savepoint: bool,
+}
+
+impl RestoreJobRequest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.storage_path.trim().is_empty() {
+            return Err(ValidationError("storage_path must not be empty".into()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,10 +81,31 @@ pub struct InspectStateRequest {
     pub operator_id: String,
 }
 
+impl InspectStateRequest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.operator_id.trim().is_empty() {
+            return Err(ValidationError("operator_id must not be empty".into()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateSnapshotInfo {
     pub task_id: String,
     pub snapshot_path: String,
+}
+
+impl StateSnapshotInfo {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.task_id.trim().is_empty() {
+            return Err(ValidationError("task_id must not be empty".into()));
+        }
+        if self.snapshot_path.trim().is_empty() {
+            return Err(ValidationError("snapshot_path must not be empty".into()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

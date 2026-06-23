@@ -358,6 +358,27 @@ impl SharedCoordinator {
             .store(token, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Override per-job checkpoint coordinator fencing tokens with the current
+    /// leader token.
+    ///
+    /// After recovery from checkpoint storage, each `CheckpointCoordinator`
+    /// restores its fencing token from the last committed checkpoint metadata —
+    /// a value written by the *previous* coordinator instance.  When a new
+    /// leader instance starts (standalone restart or cluster leader election),
+    /// it holds a different fencing token.  Calling this method ensures that
+    /// subsequent `trigger_checkpoint_for_job` calls use the current leader
+    /// token, preventing executors from rejecting checkpoint acks as stale (C8).
+    pub async fn sync_checkpoint_fencing_tokens(&self, token: u64) {
+        let new_token = match krishiv_proto::FencingToken::try_new(token) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let mut coord = self.inner.write().await;
+        for c in coord.ckpt.coordinators.values_mut() {
+            c.fencing_token = new_token;
+        }
+    }
+
     /// Borrow the coordinator for read-only status snapshots.
     pub async fn read(&self) -> RwLockReadGuard<'_, Coordinator> {
         self.inner.read().await

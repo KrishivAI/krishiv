@@ -362,6 +362,13 @@ impl Coordinator {
         storage_path: &str,
         leader_fencing_token: Option<u64>,
     ) -> SchedulerResult<CheckpointMetadata> {
+        tracing::info!(
+            job_id = %job_id,
+            epoch,
+            storage_path,
+            leader_fencing_token = leader_fencing_token.unwrap_or(0),
+            "restoring job from checkpoint"
+        );
         let metadata =
             self.validate_restore_metadata(job_id, epoch, storage_path, leader_fencing_token)?;
         // Parallelism check: read-only restores reject mismatched task counts;

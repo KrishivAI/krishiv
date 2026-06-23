@@ -62,10 +62,13 @@ impl TaskRunner {
     ) -> ExecutorResult<CheckpointAckRequest> {
         // Stale epoch: return an ack that signals the stale condition via epoch.
         if req.epoch <= self.last_acked_epoch {
+            let operator_id = krishiv_proto::OperatorId::try_new(self.operator_id.clone())
+                .map_err(|_| ExecutorError::LocalExecution {
+                    message: format!("operator_id is empty for task {}", self.task_id),
+                })?;
             return Ok(CheckpointAckRequest {
                 job_id: req.job_id,
-                operator_id: krishiv_proto::OperatorId::try_new(self.operator_id.clone())
-                    .expect("operator_id is always non-empty"),
+                operator_id,
                 task_id: self.task_id.clone(),
                 epoch: self.last_acked_epoch, // signal: stale
                 fencing_token: req.fencing_token,
@@ -141,22 +144,35 @@ impl TaskRunner {
         let source_offsets: Vec<CheckpointSourceOffset> = self
             .kafka_source_offsets
             .iter()
-            .map(|ko| CheckpointSourceOffset {
-                partition_id: krishiv_proto::PartitionId::try_new(format!(
-                    "kafka-{}-{}",
-                    ko.topic, ko.partition
-                ))
-                .expect("topic and partition are non-empty, so partition_id is non-empty"),
-                offset: ko.offset,
+            .map(|ko| {
+                Ok(CheckpointSourceOffset {
+                    partition_id: krishiv_proto::PartitionId::try_new(format!(
+                        "kafka-{}-{}",
+                        ko.topic, ko.partition
+                    ))
+                    .map_err(|_| ExecutorError::LocalExecution {
+                        message: format!(
+                            "partition_id is empty for topic={} partition={}",
+                            ko.topic, ko.partition
+                        ),
+                    })?,
+                    offset: ko.offset,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ExecutorError>>()?;
 
         self.last_acked_epoch = req.epoch;
 
+        let operator_id =
+            krishiv_proto::OperatorId::try_new(self.operator_id.clone()).map_err(|_| {
+                ExecutorError::LocalExecution {
+                    message: format!("operator_id is empty for task {}", self.task_id),
+                }
+            })?;
+
         Ok(CheckpointAckRequest {
             job_id: req.job_id,
-            operator_id: krishiv_proto::OperatorId::try_new(self.operator_id.clone())
-                .expect("operator_id is always non-empty"),
+            operator_id,
             task_id: self.task_id.clone(),
             epoch: req.epoch,
             fencing_token: req.fencing_token,

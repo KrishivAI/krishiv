@@ -1,6 +1,6 @@
 //! Shared watermark computation utilities.
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 
 use crate::{ExecError, ExecResult};
@@ -18,6 +18,9 @@ pub fn max_event_time_ms(batch: &RecordBatch, column: &str) -> ExecResult<i64> {
         .ok_or_else(|| ExecError::UnsupportedType(format!("{column} must be Int64")))?;
     let mut max = i64::MIN;
     for row in 0..arr.len() {
+        if arr.is_null(row) {
+            continue;
+        }
         let v = arr.value(row);
         if v > max {
             max = v;
@@ -54,6 +57,9 @@ pub fn max_event_time_ms_for_source(
         .ok_or_else(|| ExecError::UnsupportedType(format!("{source_col} must be Utf8")))?;
     let mut max = i64::MIN;
     for row in 0..batch.num_rows() {
+        if times.is_null(row) {
+            continue;
+        }
         if sources.value(row) == source_id {
             let v = times.value(row);
             if v > max {

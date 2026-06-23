@@ -5440,6 +5440,7 @@ dependencies = [
  "constant_time_eq 0.3.1",
  "dashmap",
  "futures",
+ "indexmap 2.14.0",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-dataflow",

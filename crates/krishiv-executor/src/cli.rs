@@ -3,7 +3,7 @@
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::grpc_client::SharedLeaseGeneration;
@@ -592,6 +592,8 @@ async fn heartbeat_loop(
     // of the advertised slot count.
     let shutdown = Arc::new(AtomicBool::new(false));
     let effective_slots = slots.max(1);
+    let active_slots = Arc::new(AtomicUsize::new(effective_slots));
+    let drain_notify = Arc::new(tokio::sync::Notify::new());
     let storage_for_tasks = Arc::clone(&checkpoint_storage);
     let backend_for_tasks = state_backend.clone();
     // Share a single wakeup notifier across all slots so any push wakes exactly
@@ -604,10 +606,15 @@ async fn heartbeat_loop(
         let backend = backend_for_tasks.clone();
         let shutdown_flag = Arc::clone(&shutdown);
         let wakeup = Arc::clone(&slot_wakeup);
+        let active = Arc::clone(&active_slots);
+        let notify = Arc::clone(&drain_notify);
         tokio::spawn(async move {
             loop {
                 if shutdown_flag.load(Ordering::Acquire) {
                     tracing::info!(slot = slot_idx, "runner shutting down");
+                    if active.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        notify.notify_one();
+                    }
                     break;
                 }
 
@@ -645,6 +652,7 @@ async fn heartbeat_loop(
     }
 
     let mut sigterm = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
+    let mut sigint = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
 
     let base_backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
@@ -786,13 +794,32 @@ async fn heartbeat_loop(
                 }
             }
             _ = sigterm.recv() => {
-                println!("SIGTERM received — deregistering and shutting down");
+                println!("SIGTERM received — shutting down gracefully");
                 shutdown.store(true, Ordering::Release);
                 readiness.mark_registered(false);
                 readiness.mark_heartbeat_ok(false);
-                // Give in-flight tasks a brief window to observe the shutdown
-                // flag before we tear down the gRPC channel.
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Wait for all runner slots to finish in-flight work, with a
+                // timeout to avoid hanging indefinitely.
+                let drain_timeout = Duration::from_secs(30);
+                let _ = tokio::time::timeout(drain_timeout, async {
+                    while active_slots.load(Ordering::Acquire) > 0 {
+                        drain_notify.notified().await;
+                    }
+                }).await;
+                let _ = runtime.deregister_with_grpc_endpoint().await;
+                return Ok(());
+            }
+            _ = sigint.recv() => {
+                println!("SIGINT received — shutting down gracefully");
+                shutdown.store(true, Ordering::Release);
+                readiness.mark_registered(false);
+                readiness.mark_heartbeat_ok(false);
+                let drain_timeout = Duration::from_secs(30);
+                let _ = tokio::time::timeout(drain_timeout, async {
+                    while active_slots.load(Ordering::Acquire) > 0 {
+                        drain_notify.notified().await;
+                    }
+                }).await;
                 let _ = runtime.deregister_with_grpc_endpoint().await;
                 return Ok(());
             }
