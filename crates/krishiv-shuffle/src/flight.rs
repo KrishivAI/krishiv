@@ -550,9 +550,35 @@ impl FlightShuffleClient {
         let endpoint: String = endpoint.into();
         let max_attempts = policy.max_attempts.max(1);
         let mut attempt = 1u32;
+        // T19: classify the endpoint as local (loopback) or remote so
+        // the `local_blocks_fetched` / `remote_blocks_fetched` counters
+        // are accurate.
+        let is_local = endpoint.starts_with("http://localhost")
+            || endpoint.starts_with("http://127.0.0.1")
+            || endpoint.starts_with("http://[::1]")
+            || !endpoint.contains("://");
+        let fetch_started = std::time::Instant::now();
         loop {
             match Self::fetch(endpoint.clone(), job_id, stage_id, partition_id).await {
-                Ok(batches) => return Ok(batches),
+                Ok(batches) => {
+                    let read_elapsed_us = fetch_started.elapsed().as_micros() as u64;
+                    let bytes_read: u64 = batches
+                        .iter()
+                        .map(|b| b.get_array_memory_size() as u64)
+                        .sum();
+                    let rows_read: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+                    krishiv_metrics::global_metrics().add_shuffle_read_bytes(bytes_read);
+                    krishiv_metrics::global_metrics().add_shuffle_read_records(rows_read);
+                    krishiv_metrics::global_metrics().add_shuffle_read_time_us(read_elapsed_us);
+                    krishiv_metrics::global_metrics()
+                        .add_shuffle_fetch_wait_time_us(read_elapsed_us);
+                    if is_local {
+                        krishiv_metrics::global_metrics().add_shuffle_local_blocks_fetched(1);
+                    } else {
+                        krishiv_metrics::global_metrics().add_shuffle_remote_blocks_fetched(1);
+                    }
+                    return Ok(batches);
+                }
                 Err(error) if attempt < max_attempts && is_retryable_fetch_error(&error) => {
                     let delay = policy.delay_after_attempt(attempt);
                     tracing::warn!(

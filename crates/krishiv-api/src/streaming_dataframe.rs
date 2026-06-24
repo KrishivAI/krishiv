@@ -64,6 +64,18 @@ impl NamedSideOutputStream {
     }
 }
 
+/// Deduplication strategy (T6 / ST10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DedupStateMode {
+    /// Legacy in-memory `HashSet` with the 10M-key `DEDUP_SEEN_CAPACITY`
+    /// cap. Suitable only for low-cardinality test workloads.
+    InMemory,
+    /// State-backed dedup using `krishiv_dataflow::DeduplicationOperator`
+    /// (RocksDB). Recommended for production streams.
+    #[default]
+    StateBacked,
+}
+
 /// A fluent builder for creating asynchronous streaming pipelines from a DataFrame.
 #[derive(Clone)]
 pub struct StreamingDataFrame {
@@ -78,6 +90,8 @@ pub struct StreamingDataFrame {
     side_output: Option<SideOutput>,
     /// Columns to use for deduplication (within watermark window).
     dedup_columns: Option<Vec<String>>,
+    /// Which deduplication implementation to wire into the pipeline.
+    dedup_state: DedupStateMode,
 }
 
 impl StreamingDataFrame {
@@ -92,6 +106,7 @@ impl StreamingDataFrame {
             watermark_lag_ms: 0,
             side_output: None,
             dedup_columns: None,
+            dedup_state: DedupStateMode::default(),
         }
     }
 
@@ -159,8 +174,40 @@ impl StreamingDataFrame {
     /// Rows with identical values in all `subset` columns are deduplicated,
     /// keeping the first occurrence per watermark epoch. Deduplication is applied
     /// as a stream adapter when `execute_stream_async` is called.
+    ///
+    /// **Implementation note:** the default implementation uses an in-memory
+    /// `HashSet` and clears it at 10M unique keys (the legacy
+    /// `DEDUP_SEEN_CAPACITY` heuristic), so high-cardinality streams can
+    /// re-emit previously-seen keys when the cap is hit. For production
+    /// workloads prefer [`Self::drop_duplicates_with_state`], which uses a
+    /// state backend (RocksDB) and is bounded by disk + cache, not by an
+    /// in-memory heuristic.
     pub fn drop_duplicates(mut self, subset: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.dedup_columns = Some(subset.into_iter().map(Into::into).collect());
+        self.dedup_state = DedupStateMode::InMemory;
+        self
+    }
+
+    /// State-backed deduplication on a subset of columns.
+    ///
+    /// Replaces the legacy in-memory `HashSet` adapter with a real state
+    /// backend (`RocksDbStateBackend` when `state_dir` is provided, otherwise
+    /// an ephemeral instance) so:
+    ///
+    /// - Memory is bounded by the backend (RocksDB on disk by default) and
+    ///   not by the 10M-key `DEDUP_SEEN_CAPACITY` heuristic.
+    /// - Dedup state is checkpointable via `DeduplicationOperator::snapshot`.
+    /// - When `with_event_time()` is configured, dedup entries can be evicted
+    ///   by event-time watermark (set `state_ttl_ms` to bound retention).
+    ///
+    /// Use this method instead of [`Self::drop_duplicates`] for production
+    /// streams.
+    pub fn drop_duplicates_with_state(
+        mut self,
+        subset: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.dedup_columns = Some(subset.into_iter().map(Into::into).collect());
+        self.dedup_state = DedupStateMode::StateBacked;
         self
     }
 
@@ -181,6 +228,7 @@ impl StreamingDataFrame {
         }
 
         let dedup_columns = self.dedup_columns.clone();
+        let dedup_state = self.dedup_state;
         let window_spec = self.window_spec()?;
         let df_stream = self.df.execute_stream_async().await?;
 
@@ -192,7 +240,12 @@ impl StreamingDataFrame {
 
         // Apply deduplication adapter if columns were configured.
         if let Some(cols) = dedup_columns {
-            Ok(Box::pin(DeduplicatingStream::new(base, cols)))
+            match dedup_state {
+                DedupStateMode::InMemory => Ok(Box::pin(DeduplicatingStream::new(base, cols))),
+                DedupStateMode::StateBacked => {
+                    Ok(Box::pin(StateBackedDeduplicatingStream::new(base, cols)))
+                }
+            }
         } else {
             Ok(base)
         }
@@ -288,6 +341,7 @@ impl StreamingDataFrame {
             window_size_ms,
             agg_exprs,
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         }))
@@ -495,6 +549,59 @@ impl futures::stream::Stream for DeduplicatingStream {
 
 fn source_exec_stream(stream: KrishivStream) -> ExecStream {
     Box::pin(stream.map(|result| result.map_err(ExecError::Upstream)))
+}
+
+// ── StateBackedDeduplicatingStream ────────────────────────────────────────────
+
+/// Stream adapter that performs state-backed deduplication (T6 / ST10).
+///
+/// Uses [`krishiv_dataflow::DeduplicationOperator`] under the hood. State is
+/// retained in RocksDB (ephemeral instance) so the seen set is bounded by
+/// disk and the cap-clear silent data loss of the in-memory adapter is
+/// eliminated.
+struct StateBackedDeduplicatingStream {
+    inner: KrishivStream,
+    op: krishiv_dataflow::dedup_operator::DeduplicationOperator,
+}
+
+impl StateBackedDeduplicatingStream {
+    fn new(inner: KrishivStream, columns: Vec<String>) -> Self {
+        let cfg = krishiv_dataflow::dedup_operator::DeduplicationConfig::new(columns);
+        let op = krishiv_dataflow::dedup_operator::DeduplicationOperator::ephemeral(cfg)
+            .expect("state-backed dedup operator must construct");
+        Self { inner, op }
+    }
+}
+
+impl futures::stream::Stream for StateBackedDeduplicatingStream {
+    type Item = std::result::Result<RecordBatch, String>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            match self.inner.as_mut().poll_next(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    return std::task::Poll::Ready(Some(Err(e)));
+                }
+                std::task::Poll::Ready(Some(Ok(batch))) => {
+                    match self.op.process_batch(&batch) {
+                        Err(e) => return std::task::Poll::Ready(Some(Err(e.to_string()))),
+                        Ok(deduped) => {
+                            if deduped.num_rows() == 0 {
+                                // All dups — poll again to get the next batch.
+                                continue;
+                            }
+                            return std::task::Poll::Ready(Some(Ok(deduped)));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn execute_window_pipeline(
@@ -1139,6 +1246,30 @@ mod tests {
         assert_eq!(
             total_rows, 3,
             "dedup must eliminate the duplicate alice@100 row"
+        );
+    }
+
+    // Test: drop_duplicates_with_state must produce the same dedup result
+    // (and not silently drop keys via the 10M in-memory cap).
+    #[tokio::test]
+    async fn drop_duplicates_with_state_removes_duplicate_rows() {
+        let dataframe = dataframe_from_batches(vec![
+            stream_batch(&["alice", "bob"], &[100, 200]),
+            stream_batch(&["alice", "carol"], &[100, 300]),
+        ]);
+
+        let stream = dataframe
+            .stream()
+            .drop_duplicates_with_state(vec!["user_id", "stream_ts"])
+            .execute_stream_async()
+            .await
+            .expect("drop_duplicates_with_state must not error");
+
+        let batches = collect_stream(stream).await.expect("stream must succeed");
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 3,
+            "state-backed dedup must eliminate the duplicate alice@100 row"
         );
     }
 

@@ -148,6 +148,27 @@ fn build_operator(
     }
 }
 
+fn infer_agg_is_float(batch: &RecordBatch, agg_exprs: &[AggExpr]) -> ExecResult<Vec<bool>> {
+    agg_exprs
+        .iter()
+        .map(|expr| {
+            if expr.input_column.is_empty() {
+                return Ok(false);
+            }
+            batch
+                .schema()
+                .field_with_name(&expr.input_column)
+                .map(|field| *field.data_type() == arrow::datatypes::DataType::Float64)
+                .map_err(|_| {
+                    ExecError::InvalidWindowConfig(format!(
+                        "aggregate input column '{}' not found in batch schema",
+                        expr.input_column
+                    ))
+                })
+        })
+        .collect()
+}
+
 impl WindowOperatorState {
     fn process_batch(
         &mut self,
@@ -318,17 +339,7 @@ impl ContinuousWindowExecutor {
         // that `agg_is_float` reflects the actual aggregate input types instead
         // of hardcoding `false` (which silently truncates Float64 to Int64).
         if self.operator.is_none() && !input_batches.is_empty() {
-            let agg_is_float: Vec<bool> = self
-                .agg_exprs
-                .iter()
-                .map(|e| {
-                    input_batches[0]
-                        .schema()
-                        .field_with_name(&e.input_column)
-                        .map(|f| *f.data_type() == arrow::datatypes::DataType::Float64)
-                        .unwrap_or(false)
-                })
-                .collect();
+            let agg_is_float = infer_agg_is_float(&input_batches[0], &self.agg_exprs)?;
             self.operator = Some(build_operator(
                 &self.spec,
                 &self.agg_exprs,
@@ -430,17 +441,7 @@ impl ContinuousWindowExecutor {
 
         // Lazy-init operator from first batch's schema (Float64 awareness).
         if self.operator.is_none() {
-            let agg_is_float: Vec<bool> = self
-                .agg_exprs
-                .iter()
-                .map(|e| {
-                    input_batches[0]
-                        .schema()
-                        .field_with_name(&e.input_column)
-                        .map(|f| *f.data_type() == arrow::datatypes::DataType::Float64)
-                        .unwrap_or(false)
-                })
-                .collect();
+            let agg_is_float = infer_agg_is_float(&input_batches[0], &self.agg_exprs)?;
             self.operator = Some(build_operator(
                 &self.spec,
                 &self.agg_exprs,
@@ -452,7 +453,11 @@ impl ContinuousWindowExecutor {
         // Eagerly purge TTL-expired entries BEFORE taking the snapshot so that
         // the snapshot captures post-purge state.
         {
-            let op = self.operator.as_mut().unwrap();
+            let Some(op) = self.operator.as_mut() else {
+                return Err(ExecError::InvalidWindowConfig(
+                    "continuous operator was not initialized after schema inference".into(),
+                ));
+            };
             if self.last_watermark_ms != i64::MIN {
                 op.set_watermark(self.last_watermark_ms);
             }
@@ -478,7 +483,11 @@ impl ContinuousWindowExecutor {
                 // the in-memory view may diverge from persisted state on
                 // crash, causing duplicate or inconsistent window results
                 // after recovery.
-                let op = self.operator.as_mut().unwrap();
+                let Some(op) = self.operator.as_mut() else {
+                    return Err(ExecError::InvalidWindowConfig(format!(
+                        "continuous drain failed ({process_error}); rollback failed: operator missing"
+                    )));
+                };
                 op.load_snapshot_bytes(&state_snapshot)
                     .map_err(|restore_error| {
                         ExecError::InvalidWindowConfig(format!(
@@ -486,7 +495,12 @@ impl ContinuousWindowExecutor {
                              {restore_error}"
                         ))
                     })?;
-                let _ = op.checkpoint();
+                op.checkpoint().map_err(|checkpoint_error| {
+                    ExecError::InvalidWindowConfig(format!(
+                        "continuous drain failed ({process_error}); rollback checkpoint failed: \
+                         {checkpoint_error}"
+                    ))
+                })?;
                 self.watermark = watermark_snapshot;
                 self.last_watermark_ms = last_watermark_snapshot;
                 Err(process_error)
@@ -661,6 +675,50 @@ mod tests {
         assert!(
             output.is_empty(),
             "the failed cycle's first batch must not remain in window state"
+        );
+    }
+
+    #[test]
+    fn drain_errors_when_aggregate_input_column_is_missing() {
+        let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        spec.agg_exprs = vec![krishiv_plan::window::WindowAgg {
+            kind: krishiv_plan::window::WindowAggKind::Sum,
+            input_column: "amount".into(),
+            output_column: "total_amount".into(),
+        }];
+        let mut exec = ContinuousWindowExecutor::new(spec).expect("create");
+
+        let error = exec
+            .drain(vec![events_batch(1_000)])
+            .expect_err("missing aggregate input column must fail during lazy init");
+
+        assert!(matches!(error, ExecError::InvalidWindowConfig(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate input column 'amount' not found")
+        );
+    }
+
+    #[test]
+    fn transactional_drain_errors_when_aggregate_input_column_is_missing() {
+        let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        spec.agg_exprs = vec![krishiv_plan::window::WindowAgg {
+            kind: krishiv_plan::window::WindowAggKind::Sum,
+            input_column: "amount".into(),
+            output_column: "total_amount".into(),
+        }];
+        let mut exec = ContinuousWindowExecutor::new(spec).expect("create");
+
+        let error = exec
+            .drain_transactional(vec![events_batch(1_000)])
+            .expect_err("missing aggregate input column must fail before state changes");
+
+        assert!(matches!(error, ExecError::InvalidWindowConfig(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate input column 'amount' not found")
         );
     }
 }

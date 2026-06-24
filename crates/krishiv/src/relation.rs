@@ -93,6 +93,7 @@ impl StreamingChain {
                 .clone()
                 .unwrap_or_else(LocalWindowExecutionSpec::default_count_agg),
             state_ttl_ms,
+            allowed_lateness_ms: None,
             // NOTE(R5.2 gap): source_watermark_lags and source_id_column are always
             // empty/None here. Multi-source watermark from StreamingChain is not yet
             // plumbed through this path. See MultiSourceWatermarkSpec.

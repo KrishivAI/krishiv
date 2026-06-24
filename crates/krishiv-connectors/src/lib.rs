@@ -33,6 +33,8 @@ pub mod s3;
 pub mod schema_normalize;
 #[cfg(feature = "schema-registry")]
 pub mod schema_registry;
+/// T9: SQL connector support (Postgres / MySQL / MSSQL / Oracle).
+pub mod sql;
 pub mod transactional;
 #[cfg(feature = "kafka")]
 pub mod transactional_kafka;

@@ -42,7 +42,9 @@ pub use ids::{
     AttemptId, CoordinatorId, ExecutorId, FencingToken, IdError, JobId, LeaseGeneration,
     OperatorId, PartitionId, ProtoResult, StageId, TaskId, TransportVersion,
 };
-pub use io::{ConnectorCapabilityFlags, ShuffleReadConfig, ShuffleWriteConfig, TaskSpec};
+pub use io::{
+    ConnectorCapabilityFlags, ResourceProfile, ShuffleReadConfig, ShuffleWriteConfig, TaskSpec,
+};
 pub use job::{JobSpec, StageSpec};
 pub use lifecycle::{CoordinatorState, ExecutorState, JobKind, JobState, StageState, TaskState};
 pub use management::CoordinatorManagementService;

@@ -33,7 +33,7 @@ use super::scheduler::ResourceUsage;
 use super::snapshot::{JobDetailSnapshot, JobSnapshot, StageSnapshot, TaskSnapshot};
 
 /// Job record owned by the active coordinator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JobRecord {
     pub(crate) spec: JobSpec,
     pub(crate) state: JobState,
@@ -695,7 +695,7 @@ impl JobRecord {
 }
 
 /// Stage record owned by a job coordinator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StageRecord {
     pub(crate) spec: StageSpec,
     pub(crate) state: StageState,
@@ -882,7 +882,7 @@ impl StageRecord {
 }
 
 /// Task record owned by a job coordinator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskRecord {
     pub(crate) spec: TaskSpec,
     pub(crate) state: TaskState,

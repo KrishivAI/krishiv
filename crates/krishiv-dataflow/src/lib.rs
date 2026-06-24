@@ -59,6 +59,7 @@ pub mod broadcast_state;
 pub mod cep;
 pub mod connected_streams;
 pub mod continuous;
+pub mod dedup_operator;
 pub mod interval_join;
 pub mod join;
 pub mod live_table;

@@ -600,12 +600,10 @@ fn heartbeat_throttle_command_from_wire(
 ) -> HeartbeatThrottleCommand {
     let rows_per_second = if value.throttle_cleared {
         None
-    } else if value.rows_per_second > 0 {
-        Some(value.rows_per_second)
     } else {
-        // rows_per_second == 0 and throttle_cleared == false: treat as unlimited
-        // (defensive; prefer setting throttle_cleared = true on the sender side).
-        None
+        // `throttle_cleared` is the presence flag. A zero rows/s command is an
+        // intentional source pause, not the same as clearing the throttle.
+        Some(value.rows_per_second)
     };
     HeartbeatThrottleCommand {
         source_id: value.source_id,

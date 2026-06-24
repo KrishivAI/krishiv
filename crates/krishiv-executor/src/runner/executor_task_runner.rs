@@ -47,11 +47,6 @@ pub struct ExecutorTaskRunner {
     pub(crate) running_attempts: Option<Arc<DashMap<String, TaskAttemptRef>>>,
     /// Optional continuous streaming drain hook (in-process cluster).
     pub(crate) continuous_drainer: Option<Arc<dyn ContinuousJobDrainer>>,
-    /// Per-job `IncrementalFlow` state for `delta:step:` (IVM) fragments.
-    ///
-    /// Keyed by job-id string. Created on first use and reused across ticks so
-    /// that cumulative source snapshots and view baselines accumulate correctly.
-    pub(crate) ivm_jobs: crate::fragment::ivm::IvmJobMap,
     /// Per-job stateful `ContinuousWindowExecutor` instances for `stream:loop:` fragments (GAP-6).
     ///
     /// Keyed by job-id string.  The executor is created on first use and
@@ -190,7 +185,6 @@ impl ExecutorTaskRunner {
             checkpoint_runners: Arc::new(DashMap::new()),
             running_attempts: None,
             continuous_drainer: None,
-            ivm_jobs: Arc::new(DashMap::new()),
             loop_executors: Arc::new(DashMap::new()),
             continuous_inputs: Arc::new(DashMap::new()),
             streaming_advisors: Arc::new(DashMap::new()),
@@ -554,20 +548,20 @@ impl ExecutorTaskRunner {
                 }
             }
             crate::ExecutionModel::DeltaBatch => {
-                // IVM step task: bounded, runs one tick of an IncrementalFlow.
-                // Per-job state persists in `ivm_jobs` across ticks.
+                // Stateless IVM tick (coordinator-authoritative): the executor
+                // runs one tick on a transient flow and returns each view's
+                // full output. No per-job state is retained on the executor.
                 let timeout_secs = assignment
                     .task_timeout_secs()
                     .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
-                let ivm_jobs = Arc::clone(&self.ivm_jobs);
                 let fragment_body = fragment_body.to_string();
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    crate::fragment::ivm::execute_ivm_fragment(&ivm_jobs, &fragment_body),
+                    crate::fragment::ivm::execute_ivm_fragment(&fragment_body),
                 )
                 .await
                 {
-                    Ok(Ok(summary)) => {
+                    Ok(Ok((summary, blob))) => {
                         tracing::debug!(
                             active_views = summary.active_views,
                             total_output_rows = summary.total_output_rows,
@@ -576,7 +570,8 @@ impl ExecutorTaskRunner {
                         Ok(crate::runner::task_output::ExecutorTaskOutput::ivm_step(
                             summary.active_views,
                             summary.total_output_rows,
-                        ))
+                        )
+                        .with_ivm_output(blob))
                     }
                     Ok(Err(e)) => Err(ExecutorError::InvalidAssignment {
                         message: format!("IVM step failed: {e}"),

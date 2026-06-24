@@ -68,21 +68,23 @@ impl IncrementalView {
         // Apply the delta to the prior full snapshot — don't replace it with
         // just the delta's positive rows (that would lose prior state).
         if self.spec.is_materialized {
-            let mut snap = self
-                .snapshot
-                .lock()
-                .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-            let current = snap.take();
-            let updated = match crate::operators::stream::apply_delta(current, &output) {
-                Ok(rb) => rb,
-                Err(e) => {
-                    tracing::warn!(
-                        view = %self.spec.name,
-                        error = %e,
-                        output_rows = output.num_rows(),
-                        "apply_delta failed in publish_output — snapshot not updated"
-                    );
-                    return Err(e);
+            let updated = {
+                let mut snap = self
+                    .snapshot
+                    .lock()
+                    .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
+                let current = snap.take();
+                match crate::operators::stream::apply_delta(current, &output) {
+                    Ok(rb) => rb,
+                    Err(e) => {
+                        tracing::warn!(
+                            view = %self.spec.name,
+                            error = %e,
+                            output_rows = output.num_rows(),
+                            "apply_delta failed in publish_output — snapshot not updated"
+                        );
+                        return Err(e);
+                    }
                 }
             };
             tracing::debug!(
@@ -90,7 +92,23 @@ impl IncrementalView {
                 rows = updated.num_rows(),
                 "snapshot updated"
             );
-            *snap = Some(updated);
+            {
+                let mut snap = self
+                    .snapshot
+                    .lock()
+                    .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
+                *snap = Some(updated.clone());
+            }
+            // Keep the diff baseline in lockstep with the materialized snapshot.
+            // The incremental path (O(Δ) operators) never calls `diff_and_update`,
+            // so without this `full_output` would stay `None` and a later
+            // DiffBased step (e.g. on a remote executor restored from a
+            // checkpoint) would treat the entire output as new insertions.
+            let mut fo = self
+                .full_output
+                .lock()
+                .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
+            *fo = Some(updated);
         } else {
             tracing::debug!(
                 view = %self.spec.name,
@@ -115,6 +133,17 @@ impl IncrementalView {
             .lock()
             .map(|g| g.clone())
             .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))
+    }
+
+    /// Return the previous full output used as the diff-based IVM baseline.
+    ///
+    /// Exposed so a coordinator-authoritative checkpoint can capture view
+    /// baselines and ship them to a stateless executor.
+    pub fn full_output_baseline(&self) -> DeltaResult<Option<arrow::array::RecordBatch>> {
+        self.full_output
+            .lock()
+            .map(|g| g.clone())
+            .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Option<DeltaBatch>> {
@@ -145,6 +174,70 @@ impl IncrementalView {
             .lock()
             .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
         *guard = None;
+        Ok(())
+    }
+
+    /// Replace the view's full materialized state with `new_full`.
+    ///
+    /// Used by coordinator-authoritative IVM to apply a tick computed on a
+    /// remote executor: the executor returns the full output, and the
+    /// coordinator swaps it in wholesale. This recomputes the output delta
+    /// from the prior `full_output` baseline, then updates both `full_output`
+    /// and (for materialized views) the `snapshot`, and emits the delta to
+    /// subscribers. Replacing — rather than applying a delta — keeps the
+    /// baseline and the snapshot in lockstep, so a later central
+    /// `diff_and_update` cannot drift.
+    pub fn replace_full(&self, new_full: RecordBatch) -> DeltaResult<DeltaBatch> {
+        // Diff against the prior baseline and advance it under one lock.
+        let delta = {
+            let mut guard = self
+                .full_output
+                .lock()
+                .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
+            let delta = differentiate(&self.spec.output_schema, guard.as_ref(), &new_full)?;
+            *guard = Some(new_full.clone());
+            delta
+        };
+        if self.spec.is_materialized {
+            let mut snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
+            *snap = Some(new_full);
+        }
+        {
+            let mut lo = self
+                .last_output
+                .lock()
+                .map_err(|_| DeltaError::Operator("view output lock poisoned".into()))?;
+            *lo = Some(delta.clone());
+        }
+        let _ = self.sender.send(Some(delta.clone()));
+        Ok(delta)
+    }
+
+    /// Restore previously checkpointed view state (`snapshot` + `full_output`).
+    ///
+    /// Used to seed a transient flow on a remote executor so its single tick
+    /// computes correct output deltas. Both fields are optional; `None` resets
+    /// that field to its never-stepped state.
+    pub fn restore_state(
+        &self,
+        snapshot: Option<RecordBatch>,
+        full_output: Option<RecordBatch>,
+    ) -> DeltaResult<()> {
+        {
+            let mut snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
+            *snap = snapshot;
+        }
+        let mut fo = self
+            .full_output
+            .lock()
+            .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
+        *fo = full_output;
         Ok(())
     }
 }

@@ -94,6 +94,22 @@ pub struct KrishivMetrics {
     tasks_failed: AtomicU64,
     executor_lost: AtomicU64,
     shuffle_bytes_written: AtomicU64,
+    /// T19: total rows written to shuffle output (counter).
+    shuffle_records_written: AtomicU64,
+    /// T19: total bytes read from shuffle input (counter).
+    shuffle_read_bytes: AtomicU64,
+    /// T19: total rows read from shuffle input (counter).
+    shuffle_read_records: AtomicU64,
+    /// T19: total time spent on shuffle write paths in microseconds (counter).
+    shuffle_write_time_us: AtomicU64,
+    /// T19: total time spent on shuffle read paths in microseconds (counter).
+    shuffle_read_time_us: AtomicU64,
+    /// T19: local shuffle blocks fetched (counter).
+    shuffle_local_blocks_fetched: AtomicU64,
+    /// T19: remote shuffle blocks fetched (counter).
+    shuffle_remote_blocks_fetched: AtomicU64,
+    /// T19: time spent waiting for shuffle fetches to return in microseconds (counter).
+    shuffle_fetch_wait_time_us: AtomicU64,
     /// Total bytes spilled to local disk by memory-bounded operators (counter).
     spill_bytes_total: AtomicU64,
     /// Total spill events / spill files written (counter).
@@ -188,6 +204,50 @@ impl KrishivMetrics {
     pub fn add_shuffle_bytes_written(&self, bytes: u64) {
         self.shuffle_bytes_written
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// T19: increment the rows-written counter.
+    pub fn add_shuffle_records_written(&self, rows: u64) {
+        self.shuffle_records_written
+            .fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// T19: increment the shuffle-read bytes counter.
+    pub fn add_shuffle_read_bytes(&self, bytes: u64) {
+        self.shuffle_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// T19: increment the shuffle-read rows counter.
+    pub fn add_shuffle_read_records(&self, rows: u64) {
+        self.shuffle_read_records.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// T19: increment the shuffle-write time counter (microseconds).
+    pub fn add_shuffle_write_time_us(&self, us: u64) {
+        self.shuffle_write_time_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// T19: increment the shuffle-read time counter (microseconds).
+    pub fn add_shuffle_read_time_us(&self, us: u64) {
+        self.shuffle_read_time_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// T19: increment the local-blocks-fetched counter.
+    pub fn add_shuffle_local_blocks_fetched(&self, count: u64) {
+        self.shuffle_local_blocks_fetched
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// T19: increment the remote-blocks-fetched counter.
+    pub fn add_shuffle_remote_blocks_fetched(&self, count: u64) {
+        self.shuffle_remote_blocks_fetched
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// T19: increment the fetch-wait time counter (microseconds).
+    pub fn add_shuffle_fetch_wait_time_us(&self, us: u64) {
+        self.shuffle_fetch_wait_time_us
+            .fetch_add(us, Ordering::Relaxed);
     }
 
     /// Record a spill to local disk: total bytes written plus the number of
@@ -544,6 +604,120 @@ impl KrishivMetrics {
         .unwrap();
         writeln!(out, "# TYPE krishiv_shuffle_bytes_written_total counter").unwrap();
         writeln!(out, "krishiv_shuffle_bytes_written_total {shuffle_bytes}").unwrap();
+
+        // T19: emit the rest of the shuffle metrics so the Prometheus
+        // scrape reflects the same shape Spark's metric system exposes.
+        let shuffle_records = self.shuffle_records_written.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_shuffle_records_written_total Shuffle rows written"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_shuffle_records_written_total counter").unwrap();
+        writeln!(
+            out,
+            "krishiv_shuffle_records_written_total {shuffle_records}"
+        )
+        .unwrap();
+
+        let shuffle_read_bytes = self.shuffle_read_bytes.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_shuffle_read_bytes_total Shuffle bytes read"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_shuffle_read_bytes_total counter").unwrap();
+        writeln!(out, "krishiv_shuffle_read_bytes_total {shuffle_read_bytes}").unwrap();
+
+        let shuffle_read_records = self.shuffle_read_records.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_shuffle_read_records_total Shuffle rows read"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_shuffle_read_records_total counter").unwrap();
+        writeln!(
+            out,
+            "krishiv_shuffle_read_records_total {shuffle_read_records}"
+        )
+        .unwrap();
+
+        let shuffle_write_time_us = self.shuffle_write_time_us.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_shuffle_write_time_us_total Shuffle write time (us)"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_shuffle_write_time_us_total counter").unwrap();
+        writeln!(
+            out,
+            "krishiv_shuffle_write_time_us_total {shuffle_write_time_us}"
+        )
+        .unwrap();
+
+        let shuffle_read_time_us = self.shuffle_read_time_us.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_shuffle_read_time_us_total Shuffle read time (us)"
+        )
+        .unwrap();
+        writeln!(out, "# TYPE krishiv_shuffle_read_time_us_total counter").unwrap();
+        writeln!(
+            out,
+            "krishiv_shuffle_read_time_us_total {shuffle_read_time_us}"
+        )
+        .unwrap();
+
+        let local_blocks = self.shuffle_local_blocks_fetched.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_shuffle_local_blocks_fetched_total Local shuffle blocks fetched"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "# TYPE krishiv_shuffle_local_blocks_fetched_total counter"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "krishiv_shuffle_local_blocks_fetched_total {local_blocks}"
+        )
+        .unwrap();
+
+        let remote_blocks = self.shuffle_remote_blocks_fetched.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_shuffle_remote_blocks_fetched_total Remote shuffle blocks fetched"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "# TYPE krishiv_shuffle_remote_blocks_fetched_total counter"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "krishiv_shuffle_remote_blocks_fetched_total {remote_blocks}"
+        )
+        .unwrap();
+
+        let fetch_wait_us = self.shuffle_fetch_wait_time_us.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP krishiv_shuffle_fetch_wait_time_us_total Shuffle fetch wait time (us)"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "# TYPE krishiv_shuffle_fetch_wait_time_us_total counter"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "krishiv_shuffle_fetch_wait_time_us_total {fetch_wait_us}"
+        )
+        .unwrap();
 
         let queue_depth = self.job_queue_depth.load(Ordering::Relaxed);
         writeln!(
@@ -1061,5 +1235,38 @@ mod tests {
         let body = m.render_prometheus();
         assert!(body.contains("# HELP krishiv_checkpoint_epoch"));
         assert!(body.contains("# TYPE krishiv_checkpoint_epoch gauge"));
+    }
+}
+
+/// T19: the new shuffle metric methods increment the right counters
+/// and the Prometheus scrape surfaces the new fields.
+#[test]
+fn shuffle_metrics_increment_and_render() {
+    let m = KrishivMetrics::default();
+    m.add_shuffle_bytes_written(1024);
+    m.add_shuffle_records_written(8);
+    m.add_shuffle_read_bytes(512);
+    m.add_shuffle_read_records(4);
+    m.add_shuffle_write_time_us(1234);
+    m.add_shuffle_read_time_us(567);
+    m.add_shuffle_local_blocks_fetched(2);
+    m.add_shuffle_remote_blocks_fetched(1);
+    m.add_shuffle_fetch_wait_time_us(890);
+    let body = m.render_prometheus();
+    for required in [
+        "krishiv_shuffle_bytes_written_total 1024",
+        "krishiv_shuffle_records_written_total 8",
+        "krishiv_shuffle_read_bytes_total 512",
+        "krishiv_shuffle_read_records_total 4",
+        "krishiv_shuffle_write_time_us_total 1234",
+        "krishiv_shuffle_read_time_us_total 567",
+        "krishiv_shuffle_local_blocks_fetched_total 2",
+        "krishiv_shuffle_remote_blocks_fetched_total 1",
+        "krishiv_shuffle_fetch_wait_time_us_total 890",
+    ] {
+        assert!(
+            body.contains(required),
+            "Prometheus output missing {required}; body:\n{body}"
+        );
     }
 }

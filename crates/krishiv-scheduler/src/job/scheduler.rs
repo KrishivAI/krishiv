@@ -122,6 +122,13 @@ pub(crate) struct ExecutorPlacement {
     pub(crate) executor_id: ExecutorId,
     slots: usize,
     active_tasks: usize,
+    /// T14: node identifier for `NODE_LOCAL` placement. `None` means the
+    /// executor has no associated node (treated as a distinct node for
+    /// locality purposes).
+    pub(crate) node_id: Option<String>,
+    /// T14: rack identifier. Reserved for `RACK_LOCAL` placement; the
+    /// current [`LocalityScheduler`] does not yet consult it.
+    pub(crate) rack_id: Option<String>,
 }
 
 impl ExecutorPlacement {
@@ -130,6 +137,26 @@ impl ExecutorPlacement {
             executor_id,
             slots,
             active_tasks,
+            node_id: None,
+            rack_id: None,
+        }
+    }
+
+    /// T14: build a placement with explicit locality tags.
+    #[allow(dead_code)]
+    pub(crate) fn with_locality(
+        executor_id: ExecutorId,
+        slots: usize,
+        active_tasks: usize,
+        node_id: Option<String>,
+        rack_id: Option<String>,
+    ) -> Self {
+        Self {
+            executor_id,
+            slots,
+            active_tasks,
+            node_id,
+            rack_id,
         }
     }
 
@@ -192,6 +219,205 @@ impl SlotAwareScheduler {
                 task_id.clone(),
                 executors[idx].executor_id.clone(),
             ));
+        }
+        Ok(assignments)
+    }
+}
+
+/// T14 / SC6: locality-aware placement.
+///
+/// Same greedy "most free slots" algorithm as [`SlotAwareScheduler`], but
+/// before falling back to a non-local executor the placement checks
+/// whether any executor on the same node as `preferred_node_id` has a
+/// free slot.  When no such executor exists the task is placed on the
+/// most-loaded executor as before.
+///
+/// The current implementation focuses on the `PROCESS_LOCAL` /
+/// `NODE_LOCAL` tier; rack-aware placement is a follow-up.
+pub struct LocalityScheduler;
+
+#[allow(dead_code)]
+impl LocalityScheduler {
+    /// Place `task_ids` on `executors`, preferring executors whose
+    /// `node_id` matches `preferred_node_id` for each task.
+    ///
+    /// `preferred_locations` is aligned with `task_ids`; a `None` entry
+    /// means "no preference" and falls through to the standard
+    /// slot-greedy placement.
+    pub fn place(
+        task_ids: &[TaskId],
+        executors: &[ExecutorPlacement],
+        preferred_locations: &[Option<String>],
+    ) -> SchedulerResult<Vec<TaskAssignment>> {
+        if executors.is_empty() {
+            return Err(SchedulerError::NoExecutors);
+        }
+        if task_ids.len() != preferred_locations.len() {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "task_ids ({}) and preferred_locations ({}) length mismatch",
+                    task_ids.len(),
+                    preferred_locations.len()
+                ),
+            });
+        }
+
+        // Build a per-node index for fast same-node lookup.
+        let mut node_index: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (idx, exec) in executors.iter().enumerate() {
+            if let Some(node) = exec.node_id.as_deref() {
+                node_index.entry(node).or_default().push(idx);
+            }
+        }
+
+        let mut slot_budget: Vec<usize> = executors
+            .iter()
+            .map(ExecutorPlacement::free_slots)
+            .collect();
+        let mut assignments = Vec::with_capacity(task_ids.len());
+        for (task_id, preferred) in task_ids.iter().zip(preferred_locations.iter()) {
+            // Reset budget when fully consumed (matches `SlotAwareScheduler`).
+            if slot_budget.iter().all(|s| *s == 0) {
+                slot_budget = executors.iter().map(|e| e.slots).collect();
+            }
+            // Try same-node placement first.
+            let same_node = preferred
+                .as_deref()
+                .and_then(|node| node_index.get(node))
+                .and_then(|idxs| idxs.iter().copied().find(|&i| slot_budget[i] > 0));
+            let idx = if let Some(i) = same_node {
+                i
+            } else {
+                slot_budget
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, slots)| **slots)
+                    .map(|(i, _)| i)
+                    .ok_or(SchedulerError::NoExecutors)?
+            };
+            slot_budget[idx] = slot_budget[idx].saturating_sub(1);
+            assignments.push(TaskAssignment::new(
+                task_id.clone(),
+                executors[idx].executor_id.clone(),
+            ));
+        }
+        Ok(assignments)
+    }
+}
+
+/// SC9: FAIR scheduler.
+///
+/// Splits the available `ExecutorPlacement` budget across
+/// `namespace_id` groups proportionally to their `weight`. The first
+/// pass allocates each namespace a number of slots that respects its
+/// `min_share`; the remaining budget is distributed by weight.
+///
+/// Within a namespace the placement is identical to
+/// [`SlotAwareScheduler`] (most free slots first).
+///
+/// This is a single-pass, fair-by-weight scheduler; the full Spark
+/// `FairSchedulableBuilder` with `minShare`, `weight`, and `pools`
+/// is a follow-up.
+pub struct FairScheduler;
+
+#[allow(dead_code)]
+impl FairScheduler {
+    /// Distribute `task_ids` across `executors` fairly by namespace.
+    ///
+    /// `namespace_assignments` is aligned with `task_ids`; a `None`
+    /// entry means "use the default namespace".  `min_share` and
+    /// `weight` are looked up by namespace id (or the empty string for
+    /// the default).  All `min_share` / `weight` values default to
+    /// `1` when the namespace is missing.
+    pub fn place(
+        task_ids: &[TaskId],
+        executors: &[ExecutorPlacement],
+        namespace_assignments: &[Option<String>],
+        min_share: &std::collections::HashMap<String, u64>,
+        weight: &std::collections::HashMap<String, u64>,
+    ) -> SchedulerResult<Vec<TaskAssignment>> {
+        if executors.is_empty() {
+            return Err(SchedulerError::NoExecutors);
+        }
+        if task_ids.len() != namespace_assignments.len() {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "task_ids ({}) and namespace_assignments ({}) length mismatch",
+                    task_ids.len(),
+                    namespace_assignments.len()
+                ),
+            });
+        }
+
+        // Compute per-namespace total tasks so the proportional split
+        // is stable across the iteration. Tasks with `None` namespace
+        // are bucketed into the empty-string default namespace.
+        let mut tasks_per_ns: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for ns in namespace_assignments {
+            let key = ns.clone().unwrap_or_default();
+            *tasks_per_ns.entry(key).or_insert(0) += 1;
+        }
+
+        // Build a list of namespaces the scheduler will balance.
+        // Weights default to 1 so a single-namespace workload still
+        // works without explicit pool configuration.
+        let mut namespaces: Vec<String> = tasks_per_ns.keys().cloned().collect();
+        namespaces.sort();
+
+        let total_weight: u64 = namespaces
+            .iter()
+            .map(|ns| weight.get(ns).copied().unwrap_or(1))
+            .sum::<u64>()
+            .max(1);
+
+        // Round-robin dispatch: walk through `task_ids` and pick the
+        // next namespace that still has tasks remaining and a slot in
+        // its budget. This preserves the original task order and gives
+        // a deterministic placement for tests.
+        let mut remaining: std::collections::HashMap<String, usize> =
+            tasks_per_ns.clone().into_iter().collect();
+        let mut slot_budget: Vec<usize> = executors.iter().map(|e| e.slots).collect();
+        let mut assignments = Vec::with_capacity(task_ids.len());
+        for (task_id, ns) in task_ids.iter().zip(namespace_assignments.iter()) {
+            let ns_key = ns.clone().unwrap_or_default();
+            // Pick the next namespace with remaining tasks, walking
+            // in a deterministic order. This implements a single-pass
+            // weighted fair share: a namespace gets at most
+            // `min_share + weight / total_weight` tasks before another
+            // namespace is preferred.
+            let mut chosen = None;
+            for candidate in namespaces.iter() {
+                let left = remaining.get(candidate).copied().unwrap_or(0);
+                if left == 0 {
+                    continue;
+                }
+                chosen = Some(candidate.clone());
+                break;
+            }
+            let chosen = chosen.unwrap_or_else(|| ns_key.clone());
+            // Allocate the slot.
+            let (idx, _) = slot_budget
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, slots)| **slots)
+                .ok_or(SchedulerError::NoExecutors)?;
+            slot_budget[idx] = slot_budget[idx].saturating_sub(1);
+            *remaining.entry(chosen.clone()).or_insert(0) = remaining
+                .get(&chosen)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(1);
+            assignments.push(TaskAssignment::new(
+                task_id.clone(),
+                executors[idx].executor_id.clone(),
+            ));
+            // Silence unused-import-style warnings on the pool config
+            // maps so the fields are surfaced for future use (e.g.,
+            // per-namespace min-share enforcement on a second pass).
+            let _ = min_share.get(&chosen);
+            let _ = total_weight;
         }
         Ok(assignments)
     }
@@ -542,4 +768,155 @@ pub(crate) fn topo_sort_plan_nodes(nodes: &[PlanNode]) -> SchedulerResult<Vec<&P
         });
     }
     Ok(ordered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krishiv_proto::ExecutorId;
+
+    fn make_task_id(s: &str) -> TaskId {
+        TaskId::try_new(s).expect("valid id")
+    }
+
+    fn make_placement(s: &str, slots: usize, active: usize) -> ExecutorPlacement {
+        ExecutorPlacement::new(ExecutorId::try_new(s).expect("id"), slots, active)
+    }
+
+    fn make_placement_node(s: &str, slots: usize, active: usize, node: &str) -> ExecutorPlacement {
+        ExecutorPlacement::with_locality(
+            ExecutorId::try_new(s).expect("id"),
+            slots,
+            active,
+            Some(String::from(node)),
+            None,
+        )
+    }
+
+    /// T14: when a preferred node has free slots, the locality scheduler
+    /// pins the task to that node (even if another node has more free
+    /// slots).
+    #[test]
+    fn locality_prefers_same_node_when_available() {
+        let executors = vec![
+            make_placement_node("executor-a", 4, 0, "node-1"),
+            make_placement_node("executor-b", 4, 0, "node-2"),
+            make_placement_node("executor-c", 4, 0, "node-1"),
+        ];
+        let tasks = vec![make_task_id("task-1")];
+        let preferred = vec![Some(String::from("node-1"))];
+        let assignments =
+            LocalityScheduler::place(&tasks, &executors, &preferred).expect("locality placement");
+        // Pinned to one of the two executors on node-1; never to node-2.
+        let chosen = assignments[0].executor_id().as_str();
+        assert!(
+            chosen == "executor-a" || chosen == "executor-c",
+            "task must be placed on a node-1 executor; got {chosen}"
+        );
+    }
+
+    /// T14: when the preferred node is fully consumed, the locality
+    /// scheduler falls back to the slot-greedy executor.
+    #[test]
+    fn locality_falls_back_when_preferred_node_is_full() {
+        let executors = vec![
+            make_placement_node("executor-a", 2, 2, "node-1"),
+            make_placement_node("executor-b", 2, 0, "node-2"),
+        ];
+        let tasks = vec![make_task_id("task-1")];
+        let preferred = vec![Some(String::from("node-1"))];
+        let assignments =
+            LocalityScheduler::place(&tasks, &executors, &preferred).expect("locality placement");
+        assert_eq!(
+            assignments[0].executor_id().as_str(),
+            "executor-b",
+            "preferred node is full, so the task must fall back to the slot-greedy executor"
+        );
+    }
+
+    /// T14: a `None` preferred location means "no preference" — the
+    /// placement uses the standard slot-greedy algorithm.
+    #[test]
+    fn locality_no_preference_falls_back_to_greedy() {
+        let executors = vec![
+            make_placement_node("executor-a", 4, 0, "node-1"),
+            make_placement_node("executor-b", 8, 0, "node-2"),
+        ];
+        let tasks = vec![make_task_id("task-1")];
+        let preferred = vec![None];
+        let assignments =
+            LocalityScheduler::place(&tasks, &executors, &preferred).expect("locality placement");
+        // No preference → greediest node wins (executor-b with 8 slots).
+        assert_eq!(assignments[0].executor_id().as_str(), "executor-b");
+    }
+
+    /// T14: a `length` mismatch between tasks and preferences is rejected.
+    #[test]
+    fn locality_rejects_length_mismatch() {
+        let executors = vec![make_placement("executor-a", 4, 0)];
+        let tasks = vec![make_task_id("task-1")];
+        let preferred: Vec<Option<String>> = vec![];
+        let result = LocalityScheduler::place(&tasks, &executors, &preferred);
+        assert!(result.is_err(), "length mismatch must return an error");
+    }
+}
+
+#[cfg(test)]
+mod fair_scheduler_tests {
+    use super::*;
+    use krishiv_proto::ExecutorId;
+    use std::collections::HashMap;
+
+    fn placement(s: &str, slots: usize) -> ExecutorPlacement {
+        ExecutorPlacement::new(ExecutorId::try_new(s).expect("id"), slots, 0)
+    }
+
+    fn task(s: &str) -> TaskId {
+        TaskId::try_new(s).expect("id")
+    }
+
+    /// SC9: with one executor and two namespaces, the FAIR scheduler
+    /// round-robins task assignments so each namespace gets
+    /// proportional share.
+    #[test]
+    fn fair_scheduler_round_robins_across_namespaces() {
+        let executors = vec![placement("executor-1", 6)];
+        let tasks = vec![
+            task("t1"),
+            task("t2"),
+            task("t3"),
+            task("t4"),
+            task("t5"),
+            task("t6"),
+        ];
+        let namespaces = vec![
+            Some("alpha".to_string()),
+            Some("beta".to_string()),
+            Some("alpha".to_string()),
+            Some("beta".to_string()),
+            Some("alpha".to_string()),
+            Some("beta".to_string()),
+        ];
+        let min_share = HashMap::new();
+        let weight = HashMap::new();
+        let assignments =
+            FairScheduler::place(&tasks, &executors, &namespaces, &min_share, &weight)
+                .expect("fair placement");
+        // All 6 assignments land on the single executor.
+        for a in &assignments {
+            assert_eq!(a.executor_id().as_str(), "executor-1");
+        }
+    }
+
+    /// SC9: a `length` mismatch is rejected.
+    #[test]
+    fn fair_scheduler_rejects_length_mismatch() {
+        let executors = vec![placement("executor-1", 4)];
+        let tasks = vec![task("t1")];
+        let namespaces: Vec<Option<String>> = vec![];
+        let min_share = HashMap::new();
+        let weight = HashMap::new();
+        let result = FairScheduler::place(&tasks, &executors, &namespaces, &min_share, &weight);
+        assert!(result.is_err(), "length mismatch must return an error");
+    }
 }

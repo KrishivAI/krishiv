@@ -218,9 +218,17 @@ impl DistributedIcebergCommitCoordinator {
                 Ok(snapshot)
             }
             Err(error) => {
-                let _ = self.committer.abort(staged).await;
+                let abort_result = self.committer.abort(staged).await;
                 self.epochs.lock().await.insert(epoch, tasks);
-                Err(error)
+                match abort_result {
+                    Ok(()) => Err(error),
+                    Err(abort_error) => Err(LakehouseError::Concurrency {
+                        message: format!(
+                            "commit for epoch {epoch} failed ({error}); abort of staged snapshot \
+                             failed ({abort_error}); staged data may require recovery"
+                        ),
+                    }),
+                }
             }
         }
     }
@@ -250,6 +258,7 @@ mod tests {
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use async_trait::async_trait;
 
     use crate::lakehouse::{IcebergTableRef, MemoryLakehouseTable, SchemaField, SchemaVersion};
 
@@ -320,5 +329,48 @@ mod tests {
         tpc.abort(staged).await.unwrap();
         let snap = tpc.table.current_snapshot_id().await.unwrap();
         assert!(snap.is_none() || snap == Some(0));
+    }
+
+    struct FailingCommitter;
+
+    #[async_trait]
+    impl IcebergTwoPhaseCommit for FailingCommitter {
+        async fn prepare(
+            &self,
+            batches: Vec<RecordBatch>,
+        ) -> Result<StagedSnapshot, LakehouseError> {
+            Ok(StagedSnapshot {
+                snapshot_id: 11,
+                batches,
+            })
+        }
+
+        async fn commit(
+            &self,
+            _staged: StagedSnapshot,
+            _kafka_offsets: BTreeMap<String, i64>,
+        ) -> Result<i64, LakehouseError> {
+            Err(LakehouseError::Iceberg("commit down".into()))
+        }
+
+        async fn abort(&self, _staged: StagedSnapshot) -> Result<(), LakehouseError> {
+            Err(LakehouseError::Io("abort down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn distributed_commit_reports_abort_failure_after_commit_failure() {
+        let coordinator =
+            DistributedIcebergCommitCoordinator::new(Arc::new(FailingCommitter), 1).unwrap();
+        coordinator.stage_task(3, 0, vec![batch(3)]).await.unwrap();
+
+        let error = coordinator
+            .commit_epoch(3, BTreeMap::new())
+            .await
+            .expect_err("commit plus abort failure must be returned");
+        let message = error.to_string();
+        assert!(message.contains("commit down"));
+        assert!(message.contains("abort of staged snapshot"));
+        assert!(message.contains("abort down"));
     }
 }

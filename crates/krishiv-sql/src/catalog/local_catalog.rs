@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -45,6 +46,7 @@ use iceberg::{
     Catalog, CatalogBuilder, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit,
     TableCreation, TableIdent,
 };
+use krishiv_common::validate::validate_safe_id;
 
 use crate::catalog::LakehouseError;
 
@@ -102,25 +104,36 @@ impl LocalCatalog {
         namespace: &NamespaceIdent,
         table: &str,
     ) -> Result<String, LakehouseError> {
-        let mut dir = self.warehouse.clone();
-        for part in namespace.clone().inner() {
-            dir.push(part);
-        }
-        dir.push(table);
+        let dir = self.table_dir(namespace, table)?;
         // The directory must exist for canonicalize-free URI formatting; create it.
         fs::create_dir_all(&dir).map_err(|e| LakehouseError::Io(e.to_string()))?;
         path_to_uri(&dir)
     }
 
-    /// Local metadata directory for `{namespace}/{table}`.
-    fn table_metadata_dir(&self, namespace: &NamespaceIdent, table: &str) -> PathBuf {
+    fn table_dir(
+        &self,
+        namespace: &NamespaceIdent,
+        table: &str,
+    ) -> Result<PathBuf, LakehouseError> {
+        validate_namespace(namespace)?;
+        validate_path_component("table name", table)?;
         let mut dir = self.warehouse.clone();
         for part in namespace.clone().inner() {
             dir.push(part);
         }
         dir.push(table);
+        Ok(dir)
+    }
+
+    /// Local metadata directory for `{namespace}/{table}`.
+    fn table_metadata_dir(
+        &self,
+        namespace: &NamespaceIdent,
+        table: &str,
+    ) -> Result<PathBuf, LakehouseError> {
+        let mut dir = self.table_dir(namespace, table)?;
         dir.push(METADATA_DIR);
-        dir
+        Ok(dir)
     }
 
     /// Persist the latest metadata location for a table to `version-hint.text`.
@@ -130,7 +143,7 @@ impl LocalCatalog {
         table: &str,
         metadata_location: &str,
     ) -> Result<(), LakehouseError> {
-        let dir = self.table_metadata_dir(namespace, table);
+        let dir = self.table_metadata_dir(namespace, table)?;
         fs::create_dir_all(&dir).map_err(|e| LakehouseError::Io(e.to_string()))?;
         fs::write(dir.join(VERSION_HINT), metadata_location)
             .map_err(|e| LakehouseError::Io(e.to_string()))
@@ -181,11 +194,12 @@ impl Catalog for LocalCatalog {
     ) -> IcebergResult<Namespace> {
         // Materialise the namespace directory so the layout is observable on disk
         // even before any table is created.
+        validate_namespace(namespace).map_err(to_iceberg_err)?;
         let mut dir = self.warehouse.clone();
         for part in namespace.clone().inner() {
             dir.push(part);
         }
-        let _ = fs::create_dir_all(&dir);
+        fs::create_dir_all(&dir).map_err(|e| to_iceberg_err(LakehouseError::Io(e.to_string())))?;
         self.inner.create_namespace(namespace, properties).await
     }
 
@@ -245,10 +259,12 @@ impl Catalog for LocalCatalog {
     }
 
     async fn drop_table(&self, table: &TableIdent) -> IcebergResult<()> {
-        let dir = self.table_metadata_dir(table.namespace(), table.name());
+        let dir = self
+            .table_metadata_dir(table.namespace(), table.name())
+            .map_err(to_iceberg_err)?;
         self.inner.drop_table(table).await?;
         // Remove the version hint so a later recovery does not resurrect the table.
-        let _ = fs::remove_file(dir.join(VERSION_HINT));
+        remove_file_if_exists(&dir.join(VERSION_HINT)).map_err(to_iceberg_err)?;
         Ok(())
     }
 
@@ -257,17 +273,30 @@ impl Catalog for LocalCatalog {
     }
 
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> IcebergResult<()> {
+        let src_hint = self
+            .table_metadata_dir(src.namespace(), src.name())
+            .map_err(to_iceberg_err)?
+            .join(VERSION_HINT);
+        // Validate the destination path before mutating the in-memory catalog.
+        self.table_metadata_dir(dest.namespace(), dest.name())
+            .map_err(to_iceberg_err)?;
+
         self.inner.rename_table(src, dest).await?;
         // Mirror the version hint to the destination metadata dir for recovery.
-        if let Ok(table) = self.inner.load_table(dest).await
-            && let Some(loc) = table.metadata_location()
-        {
-            let _ = self.write_version_hint(dest.namespace(), dest.name(), loc);
-            let src_hint = self
-                .table_metadata_dir(src.namespace(), src.name())
-                .join(VERSION_HINT);
-            let _ = fs::remove_file(src_hint);
-        }
+        let table = self.inner.load_table(dest).await?;
+        let loc = table.metadata_location().ok_or_else(|| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                format!(
+                    "renamed table {}.{} has no metadata location",
+                    dest.namespace().clone().inner().join("."),
+                    dest.name()
+                ),
+            )
+        })?;
+        self.write_version_hint(dest.namespace(), dest.name(), loc)
+            .map_err(to_iceberg_err)?;
+        remove_file_if_exists(&src_hint).map_err(to_iceberg_err)?;
         Ok(())
     }
 
@@ -300,6 +329,25 @@ impl Catalog for LocalCatalog {
 
 fn to_iceberg_err(e: LakehouseError) -> iceberg::Error {
     iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string())
+}
+
+fn validate_namespace(namespace: &NamespaceIdent) -> Result<(), LakehouseError> {
+    for part in namespace.clone().inner() {
+        validate_path_component("namespace component", &part)?;
+    }
+    Ok(())
+}
+
+fn validate_path_component(label: &str, value: &str) -> Result<(), LakehouseError> {
+    validate_safe_id(value, label).map_err(|error| LakehouseError::Io(error.to_string()))
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), LakehouseError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(LakehouseError::Io(error.to_string())),
+    }
 }
 
 /// Convert an absolute local path to a `file://` URI.
@@ -432,6 +480,7 @@ mod tests {
         // version-hint.text must have been written.
         let hint = catalog
             .table_metadata_dir(&NamespaceIdent::new("sales".to_string()), "orders")
+            .unwrap()
             .join(VERSION_HINT);
         assert!(hint.is_file(), "version-hint.text should be persisted");
     }
@@ -524,5 +573,18 @@ mod tests {
         assert!(catalog.table_exists(&ident).await.unwrap());
         catalog.drop_table(&ident).await.unwrap();
         assert!(!catalog.table_exists(&ident).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn local_catalog_rejects_path_traversal_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = LocalCatalog::new(dir.path()).await.unwrap();
+
+        let bad_ns = NamespaceIdent::new("..".to_string());
+        assert!(catalog.table_location_uri(&bad_ns, "orders").is_err());
+
+        let good_ns = NamespaceIdent::new("sales".to_string());
+        assert!(catalog.table_location_uri(&good_ns, "../orders").is_err());
+        assert!(catalog.table_metadata_dir(&good_ns, "orders/2026").is_err());
     }
 }

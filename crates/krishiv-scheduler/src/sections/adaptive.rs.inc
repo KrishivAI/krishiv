@@ -46,6 +46,40 @@ fn hot_key_reports_appended_to_decision_log() {
 }
 
 #[test]
+fn hot_key_report_for_unknown_job_does_not_install_repartition_override() {
+    use krishiv_proto::{ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport};
+
+    let coordinator_id = CoordinatorId::try_new("coord-hk-unknown").unwrap();
+    let mut coordinator = Coordinator::active(coordinator_id);
+
+    let executor_id = ExecutorId::try_new("exec-hk-unknown").unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-1", 4))
+        .unwrap();
+
+    let job_id = JobId::try_new("job-hk-missing").unwrap();
+    let heartbeat = ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy)
+        .with_hot_key_reports(vec![HeartbeatHotKeyReport {
+            key: "stale-hot-key".into(),
+            estimated_count: 750,
+            max_error: 5,
+            heat_score: 0.8,
+            job_id: job_id.clone(),
+            source_id: "src-stale".into(),
+        }]);
+
+    let effects = coordinator.executor_heartbeat(heartbeat).unwrap();
+    assert!(
+        !effects.source_throttles.is_empty(),
+        "the reporting executor can still be throttled"
+    );
+    assert!(
+        !coordinator.skew_repartition_overrides.contains_key(&job_id),
+        "stale reports for unknown jobs must not affect future task placement"
+    );
+}
+
+#[test]
 fn hot_key_split_suppressed_by_override() {
     use krishiv_proto::{ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport};
 
@@ -391,4 +425,3 @@ fn assignment_flood_protection_basic() {
         "flood protection machinery should detect bad executor"
     );
 }
-

@@ -5709,6 +5709,7 @@ dependencies = [
  "futures",
  "indexmap 2.14.0",
  "krishiv-common",
+ "krishiv-metrics",
  "lz4_flex 0.11.6",
  "object_store 0.13.2",
  "parquet 58.3.0",

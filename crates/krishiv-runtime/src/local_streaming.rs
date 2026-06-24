@@ -43,6 +43,11 @@ pub struct LocalWindowExecutionSpec {
     pub window_size_ms: u64,
     pub agg_exprs: Vec<AggExpr>,
     pub state_ttl_ms: Option<u64>,
+    /// ST11: events arriving within `[watermark, watermark + allowed_lateness_ms)`
+    /// are kept for late-firing instead of being dropped. Mirrors the
+    /// `WindowExecutionSpec::allowed_lateness_ms` field; defaults to
+    /// `None` (no lateness).
+    pub allowed_lateness_ms: Option<u64>,
     /// Per-source watermark lags (R5.2). Effective watermark is the minimum across sources.
     pub source_watermark_lags: std::collections::HashMap<String, u64>,
     /// Source id column required when `source_watermark_lags` is non-empty.
@@ -69,6 +74,7 @@ impl LocalWindowExecutionSpec {
             window_size_ms,
             agg_exprs: Self::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         }
@@ -140,6 +146,7 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -159,6 +166,7 @@ mod tests {
             window_size_ms: 5_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -177,6 +185,8 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -195,6 +205,8 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -221,6 +233,7 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: Some(60_000),
+            allowed_lateness_ms: Some(1_000),
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -271,6 +284,8 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };

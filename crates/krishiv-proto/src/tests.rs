@@ -400,6 +400,19 @@ mod proto_tests {
             response_with_limit.throttle_commands()
         );
 
+        // Paused source: rows_per_second = Some(0).
+        let response_pause = ExecutorHeartbeatResponse::new(
+            LeaseGeneration::initial(),
+            TransportDisposition::Accepted,
+        )
+        .with_throttle_commands(vec![HeartbeatThrottleCommand {
+            source_id: "src-kafka-0".into(),
+            rows_per_second: Some(0),
+        }]);
+        let wire = executor_heartbeat_response_to_wire(response_pause.clone());
+        let rt = executor_heartbeat_response_from_wire(wire).unwrap();
+        assert_eq!(rt.throttle_commands(), response_pause.throttle_commands());
+
         // Cleared throttle: rows_per_second = None.
         let response_clear = ExecutorHeartbeatResponse::new(
             LeaseGeneration::initial(),

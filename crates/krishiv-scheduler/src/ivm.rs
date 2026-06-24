@@ -5,10 +5,16 @@
 //! Each IVM job is a long-lived flow held in-process. A job is either a single
 //! [`IncrementalFlow`] or, when its first view is a key-shardable aggregate, an
 //! auto-partitioned [`PartitionedIncrementalFlow`] — decided transparently at
-//! view-registration time (see [`IvmJobRegistry::register_view`]). For
-//! single-node mode the coordinator runs `step_datafusion()` inline; for
-//! distributed mode, remote executors feed deltas via the HTTP API and the
-//! coordinator still runs SQL computation centrally.
+//! view-registration time (see [`IvmJobRegistry::register_view`]).
+//!
+//! The coordinator's flow is the **single source of truth for every mode**
+//! (embedded, single-node, distributed), which keeps executors replaceable.
+//! For distributed mode with live executors, single-flow ticks are offloaded to
+//! an executor: the coordinator drains pending locally, ships a full state
+//! snapshot (`checkpoint_full`), and applies the returned view outputs via
+//! `apply_computed_tick`; on any failure it re-feeds pending and computes
+//! centrally. Partitioned jobs always compute centrally (shards already run in
+//! parallel in-process).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -217,6 +223,11 @@ pub struct IvmJobRegistry {
     jobs: Mutex<HashMap<String, IvmJob>>,
     /// Shard count used when a job's first view is auto-partitioned.
     default_shards: usize,
+    /// Per-job async step locks. Serialize concurrent `step` calls so two
+    /// simultaneous ticks cannot drain each other's pending or double-advance
+    /// the tick counter. Each job gets its own lock (created lazily, removed on
+    /// `delete`) so unrelated jobs never contend.
+    step_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl std::fmt::Debug for IvmJob {
@@ -233,6 +244,7 @@ impl Default for IvmJobRegistry {
         Self {
             jobs: Mutex::new(HashMap::new()),
             default_shards: default_ivm_shards(),
+            step_locks: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -247,7 +259,31 @@ impl IvmJobRegistry {
         Self {
             jobs: Mutex::new(HashMap::new()),
             default_shards: default_shards.max(1),
+            step_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Return the per-job async step lock (creating it if absent).
+    ///
+    /// The lock serializes concurrent `step`/dispatch calls for one job. It is
+    /// intentionally per-job so independent jobs step in parallel.
+    pub fn step_lock(&self, job_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(lock) = self
+            .step_locks
+            .lock()
+            .ok()
+            .and_then(|m| m.get(job_id).cloned())
+        {
+            return lock;
+        }
+        let mut locks = match self.step_locks.lock() {
+            Ok(l) => l,
+            Err(p) => p.into_inner(),
+        };
+        locks
+            .entry(job_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Create a new IVM job. Idempotent: returns `Ok` if the job already exists.
@@ -301,10 +337,14 @@ impl IvmJobRegistry {
 
     /// Delete a job. Returns `true` if the job existed.
     pub fn delete(&self, job_id: &str) -> bool {
-        self.jobs
+        let removed = self
+            .jobs
             .lock()
             .map(|mut j| j.remove(job_id).is_some())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        // Drop the per-job step lock so a recreated same-id job gets a fresh one.
+        let _ = self.step_locks.lock().map(|mut l| l.remove(job_id));
+        removed
     }
 
     /// List all job IDs.
@@ -708,5 +748,57 @@ mod tests {
         for h in handles {
             h.abort();
         }
+    }
+
+    // ── per-job step lock ─────────────────────────────────────────────────────
+
+    /// The step lock is per-job: same job → same lock, different jobs → different
+    /// locks. Deleting a job drops its lock so a recreated same-id job gets a
+    /// fresh one.
+    #[test]
+    fn step_lock_is_per_job_and_lifecycle_aware() {
+        let reg = IvmJobRegistry::with_default_shards(1);
+        let a1 = reg.step_lock("job-a");
+        let a2 = reg.step_lock("job-a");
+        let b = reg.step_lock("job-b");
+        // Same job → same lock Arc.
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "repeated step_lock must return the same Arc"
+        );
+        // Different job → different lock.
+        assert!(
+            !Arc::ptr_eq(&a1, &b),
+            "different jobs must have different locks"
+        );
+
+        // Delete + recreate → fresh lock (old one not resurrected).
+        reg.delete("job-a");
+        let a3 = reg.step_lock("job-a");
+        assert!(
+            !Arc::ptr_eq(&a1, &a3),
+            "deleted job must get a fresh lock on recreate"
+        );
+    }
+
+    /// The step lock actually serializes: a held lock blocks a second acquirer
+    /// until the first is released.
+    #[tokio::test]
+    async fn step_lock_serializes_concurrent_acquirers() {
+        let reg = IvmJobRegistry::with_default_shards(1);
+        let lock = reg.step_lock("job-s");
+
+        let g1 = lock.lock().await;
+        // While g1 is held, a second acquire should not complete immediately.
+        let try_second =
+            tokio::time::timeout(std::time::Duration::from_millis(50), lock.lock()).await;
+        assert!(
+            try_second.is_err(),
+            "second acquire must block while first is held"
+        );
+
+        drop(g1);
+        // Now the second acquire succeeds.
+        let _g2 = lock.lock().await;
     }
 }

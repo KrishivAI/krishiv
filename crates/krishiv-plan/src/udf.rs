@@ -48,6 +48,24 @@ impl From<arrow::error::ArrowError> for UdfError {
 // Scalar UDF trait
 // ---------------------------------------------------------------------------
 
+/// Volatility classification of a UDF (S3).
+///
+/// Mirrors DataFusion / Spark's `Volatility` enum so the optimizer can
+/// decide whether constant-folding, predicate pushdown, and result caching
+/// are safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Volatility {
+    /// Always returns the same output for the same input. Default.
+    #[default]
+    Immutable,
+    /// Returns the same output for the same input within a single query
+    /// (e.g. a function that reads a session-scoped parameter).
+    Stable,
+    /// May return a different value on every invocation. `current_timestamp`,
+    /// `rand`, `uuid` etc. The optimizer must not fold or cache the result.
+    Volatile,
+}
+
 /// A vectorized scalar function that operates over a [`RecordBatch`].
 ///
 /// Implementations receive an entire batch and must return an [`ArrayRef`]
@@ -61,6 +79,16 @@ pub trait ScalarUdf: Send + Sync + fmt::Debug {
 
     /// The output field (name + data-type) produced by this UDF.
     fn output_field(&self) -> &Field;
+
+    /// Volatility classification of the UDF (S3).
+    ///
+    /// Defaults to [`Volatility::Immutable`] so existing UDFs are unaffected.
+    /// Non-deterministic UDFs (`current_timestamp`, `rand`, `uuid`, …)
+    /// should override this to [`Volatility::Volatile`] so the optimizer
+    /// does not fold or cache their results.
+    fn volatility(&self) -> Volatility {
+        Volatility::Immutable
+    }
 
     /// Execute the UDF over `batch`, returning one value per row.
     fn call(&self, batch: &RecordBatch) -> Result<ArrayRef, UdfError>;
@@ -99,6 +127,15 @@ pub trait AggregateUdf: Send + Sync + fmt::Debug {
 
     /// The output field produced when the UDAF is finalised.
     fn output_field(&self) -> &Field;
+
+    /// Volatility classification of the UDAF (S3).
+    ///
+    /// Defaults to [`Volatility::Immutable`]. UDAFs that depend on external
+    /// state (e.g. session timeouts, randomness) should return
+    /// [`Volatility::Volatile`].
+    fn volatility(&self) -> Volatility {
+        Volatility::Immutable
+    }
 
     /// Merge new data from `batch` into `state`.
     fn accumulate(&self, state: &mut AggState, batch: &RecordBatch) -> Result<(), UdfError>;

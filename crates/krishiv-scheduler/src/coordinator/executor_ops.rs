@@ -215,22 +215,31 @@ impl Coordinator {
                 // same key across multiple tasks, producing incorrect window
                 // aggregation results. For streaming hot keys the only safe
                 // mitigation is source throttling (already applied above).
-                let is_streaming = self
+                match self
                     .job_coordinators
                     .get(&job_id)
-                    .map(|jc| jc.read_record().spec.kind() == JobKind::Streaming)
-                    .unwrap_or(false);
-                if !is_streaming {
-                    let buckets = self.exec.executors.list().len().max(2) as u32;
-                    self.skew_repartition_overrides
-                        .insert(job_id.clone(), buckets);
-                } else {
-                    tracing::debug!(
-                        job_id = %job_id,
-                        key = %report.key,
-                        "hot-key repartition override skipped for streaming job \
-                         (keyed state must stay pinned to its assigned task)"
-                    );
+                    .map(|jc| jc.read_record().spec.kind())
+                {
+                    Some(JobKind::Streaming) => {
+                        tracing::debug!(
+                            job_id = %job_id,
+                            key = %report.key,
+                            "hot-key repartition override skipped for streaming job \
+                             (keyed state must stay pinned to its assigned task)"
+                        );
+                    }
+                    Some(_) => {
+                        let buckets = self.exec.executors.list().len().max(2) as u32;
+                        self.skew_repartition_overrides
+                            .insert(job_id.clone(), buckets);
+                    }
+                    None => {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            key = %report.key,
+                            "hot-key repartition override skipped for unknown job"
+                        );
+                    }
                 }
             }
         }
@@ -266,6 +275,33 @@ impl Coordinator {
         self.executor_job_watermarks.remove(executor_id);
         krishiv_metrics::global_metrics().inc_executor_lost();
         Ok(())
+    }
+
+    /// T13 / SC5: graceful executor drain (`EXECUTOR_DECOMMISSION_SIGNAL`).
+    ///
+    /// Transitions the executor to [`ExecutorState::Draining`]:
+    ///
+    /// - The task-assignment path (which checks `can_accept_work()`)
+    ///   naturally excludes the executor from new task launches.
+    /// - The shuffle service port stays alive for an additional
+    ///   `decom_grace_ticks` (carried in the coordinator config) so
+    ///   in-flight consumers can finish pulling data after the
+    ///   executor's tasks have completed.
+    /// - The executor's heartbeat path is preserved; if the executor
+    ///   crashes during drain it will be promoted to `Lost` by the
+    ///   normal heartbeat-timeout path.
+    ///
+    /// Returns the executor's current `lease_generation` so callers can
+    /// pair this signal with a future lease renewal.
+    pub fn drain_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<LeaseGeneration> {
+        self.ensure_active()?;
+        let generation = self.exec.executors.drain_executor(executor_id)?;
+        tracing::info!(
+            executor_id = %executor_id,
+            lease_generation = %generation,
+            "executor marked for graceful drain (T13 / EXECUTOR_DECOMMISSION_SIGNAL)"
+        );
+        Ok(generation)
     }
 
     /// Checkpoint-protocol reaction to an executor loss.

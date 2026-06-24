@@ -91,7 +91,7 @@ pub(crate) fn sync_scalar_udfs_with_limits_for_policy(
             &udf_name,
             input_types,
             return_type,
-            Volatility::Immutable,
+            volatility_to_df(udf.volatility()),
             Arc::new(move |args: &[ColumnarValue]| {
                 let batch = columnar_values_to_record_batch(&input_schema, args)?;
                 // Sandboxed execution with caller-supplied ResourceLimits (Track E).
@@ -106,6 +106,16 @@ pub(crate) fn sync_scalar_udfs_with_limits_for_policy(
         ctx.register_udf(df_udf);
     }
     Ok(())
+}
+
+/// Map a `krishiv_plan::udf::Volatility` to a `datafusion::logical_expr::Volatility`.
+fn volatility_to_df(v: krishiv_plan::udf::Volatility) -> Volatility {
+    use krishiv_plan::udf::Volatility as Plan;
+    match v {
+        Plan::Immutable => Volatility::Immutable,
+        Plan::Stable => Volatility::Stable,
+        Plan::Volatile => Volatility::Volatile,
+    }
 }
 
 /// Register aggregate UDFs from `registry` with DataFusion (P1-21).
@@ -131,6 +141,7 @@ pub fn sync_aggregate_udfs(
             continue;
         };
         let udf = Arc::clone(udf);
+        let udaf_volatility = volatility_to_df(udf.volatility());
         let udf_name = udf.name().to_string();
         let input_types: Vec<DataType> = udf
             .input_schema()
@@ -156,7 +167,7 @@ pub fn sync_aggregate_udfs(
             &udf_name,
             input_types,
             Arc::clone(&return_type),
-            Volatility::Immutable,
+            udaf_volatility,
             accumulator,
             state_type,
         );

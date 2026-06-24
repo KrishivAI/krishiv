@@ -102,6 +102,7 @@ pub fn streaming_spec_from_plan(
         window_size_ms,
         agg_exprs,
         state_ttl_ms,
+        allowed_lateness_ms: None,
         source_watermark_lags,
         source_id_column,
     })

@@ -205,6 +205,7 @@ fn build_tumbling_spec(
         window_size_ms,
         agg_exprs,
         state_ttl_ms: keyed.inner.state_ttl_ms,
+        allowed_lateness_ms: None,
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
     };
@@ -385,6 +386,7 @@ impl SessionWindowedStream {
             window_size_ms: self.session_gap_ms,
             agg_exprs,
             state_ttl_ms: self.keyed.inner.state_ttl_ms,
+            allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         };
@@ -418,6 +420,7 @@ impl SlidingWindowedStream {
             window_size_ms: self.window_size_ms,
             agg_exprs,
             state_ttl_ms: self.keyed.inner.state_ttl_ms,
+            allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         };

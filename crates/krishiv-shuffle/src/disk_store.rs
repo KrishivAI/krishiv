@@ -391,25 +391,40 @@ impl ShuffleStore for LocalDiskShuffleStore {
             };
 
             if commit {
-                // Rename the sidecar (hash) file first, then the primary data file.
-                // This ensures that a crash at any point leaves a consistent state:
-                // - Crash before any rename: both files are still temp (safe)
-                // - Crash after hash rename only: hash exists without data (tolerated)
-                // - Crash after both renames: fully committed
-                // The old order (data then hash) could leave a committed data file
-                // without its hash sidecar, causing hash-mismatch on recovery.
-                std::fs::rename(&tmp_hash_path, &final_hash_path).map_err(|e| {
-                    io_err(format!(
-                        "failed to rename temp partition hash '{}' → '{}': {e}",
-                        tmp_hash_path.display(),
-                        final_hash_path.display()
-                    ))
-                })?;
+                // SH5: rename the primary data file first, fsync it, then
+                // rename the hash sidecar. The gap analysis identified the
+                // previous order (hash first, then data) as the bug: a
+                // crash between the two renames left a hash sidecar that
+                // pointed at a non-existent data file, and the read path
+                // tripped `ContentHashMismatch` on a partition that was
+                // actually uncorrupted.
+                //
+                // Crash-safety:
+                // - Crash before any rename: both files are still temp (safe).
+                // - Crash after data rename only: the data file exists
+                //   without its hash. The read path treats the missing
+                //   sidecar as "no verification" (warn + skip) so the
+                //   partition is still readable.
+                // - Crash after both renames: fully committed.
                 std::fs::rename(&tmp_path, &final_path).map_err(|e| {
                     io_err(format!(
                         "failed to rename temp partition '{}' → '{}': {e}",
                         tmp_path.display(),
                         final_path.display()
+                    ))
+                })?;
+                // fsync the data file before publishing its hash sidecar.
+                // The kernel may otherwise reorder the sidecar rename
+                // ahead of the data's metadata flush, leaving a window
+                // where the data is on disk in name only.
+                if let Ok(f) = std::fs::File::open(&final_path) {
+                    let _ = f.sync_all();
+                }
+                std::fs::rename(&tmp_hash_path, &final_hash_path).map_err(|e| {
+                    io_err(format!(
+                        "failed to rename temp partition hash '{}' → '{}': {e}",
+                        tmp_hash_path.display(),
+                        final_hash_path.display()
                     ))
                 })?;
                 // S4: Fsync the parent directory so the rename is durable.
@@ -484,45 +499,56 @@ impl ShuffleStore for LocalDiskShuffleStore {
             };
 
             let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-            let persisted_hash_bytes = std::fs::read(&hash_path).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ShuffleError::ContentHashMismatch {
-                        partition: format!("{:?}", key),
-                        expected: "persisted blake3 sidecar".to_string(),
-                        actual: "missing".to_string(),
+            // SH5: a missing hash sidecar is not a corruption signal —
+            // it means the data file was committed but the sidecar
+            // rename was lost (or the sidecar was never written in a
+            // pre-sidecar build). Log a warning and skip the verification
+            // rather than failing the read with `ContentHashMismatch`.
+            let persisted_hash: Option<[u8; 32]> = match std::fs::read(&hash_path) {
+                Ok(bytes) => match decode_hash(&bytes) {
+                    Some(h) => Some(h),
+                    None => {
+                        return Err(ShuffleError::ContentHashMismatch {
+                            partition: format!("{:?}", key),
+                            expected: "64 lowercase hex blake3 digest".to_string(),
+                            actual: "unparseable sidecar".to_string(),
+                        });
                     }
-                } else {
-                    io_err(format!(
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(
+                        partition = ?key,
+                        data_path = %path.display(),
+                        "shuffle partition has no hash sidecar; skipping verification"
+                    );
+                    None
+                }
+                Err(e) => {
+                    return Err(io_err(format!(
                         "failed to read partition hash file '{}': {e}",
                         hash_path.display()
-                    ))
+                    )));
                 }
-            })?;
-            let persisted_hash = decode_hash(&persisted_hash_bytes).ok_or_else(|| {
-                ShuffleError::ContentHashMismatch {
-                    partition: format!("{:?}", key),
-                    expected: "64 lowercase hex blake3 digest".to_string(),
-                    actual: String::from_utf8_lossy(&persisted_hash_bytes).into_owned(),
+            };
+
+            if let Some(persisted_hash) = persisted_hash {
+                if let Some(stored_ref) = content_hashes.get(&key)
+                    && *stored_ref != persisted_hash
+                {
+                    return Err(ShuffleError::ContentHashMismatch {
+                        partition: format!("{:?}", key),
+                        expected: encode_hash(stored_ref.value()),
+                        actual: encode_hash(&persisted_hash),
+                    });
                 }
-            })?;
-
-            if let Some(stored_ref) = content_hashes.get(&key)
-                && *stored_ref != persisted_hash
-            {
-                return Err(ShuffleError::ContentHashMismatch {
-                    partition: format!("{:?}", key),
-                    expected: encode_hash(stored_ref.value()),
-                    actual: encode_hash(&persisted_hash),
-                });
-            }
-
-            let computed = compute_hash_bytes(&raw_bytes);
-            if computed != persisted_hash {
-                return Err(ShuffleError::ContentHashMismatch {
-                    partition: format!("{:?}", key),
-                    expected: encode_hash(&persisted_hash),
-                    actual: encode_hash(&computed),
-                });
+                let computed = compute_hash_bytes(&raw_bytes);
+                if computed != persisted_hash {
+                    return Err(ShuffleError::ContentHashMismatch {
+                        partition: format!("{:?}", key),
+                        expected: encode_hash(&persisted_hash),
+                        actual: encode_hash(&computed),
+                    });
+                }
             }
 
             let parquet_bytes_frozen = bytes::Bytes::from(raw_bytes);
@@ -592,5 +618,84 @@ impl ShuffleStore for LocalDiskShuffleStore {
         self.content_hashes
             .retain(|(jid, _, _), _| jid != &job_id_owned);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn make_batch(values: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(values.to_vec())) as _],
+        )
+        .unwrap()
+    }
+
+    fn id(job: &str, stage: &str, part: u32) -> PartitionId {
+        PartitionId {
+            job_id: job.to_string(),
+            stage_id: stage.to_string(),
+            partition: part,
+        }
+    }
+
+    /// SH5: a shuffle write must produce a data file *and* a hash
+    /// sidecar; the read path must accept the data when the sidecar is
+    /// present and verify it.
+    #[tokio::test]
+    async fn write_then_read_round_trips_with_hash() {
+        let dir = tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).expect("store");
+        let partition = id("job-1", "stage-1", 0);
+        let sp = ShufflePartition {
+            id: partition.clone(),
+            schema: make_batch(&[1, 2, 3]).schema(),
+            batches: vec![make_batch(&[1, 2, 3])],
+        };
+        store.write_partition(sp, 1).await.expect("write");
+        let read = store
+            .read_partition(&partition)
+            .await
+            .expect("read")
+            .expect("partition present");
+        assert_eq!(read.batches.len(), 1);
+        assert_eq!(read.batches[0].num_rows(), 3);
+    }
+
+    /// SH5: a shuffle partition whose hash sidecar is missing must
+    /// still be readable (with a warning, not a hard `ContentHashMismatch`
+    /// error). This exercises the new data-first-then-hash rename order
+    /// and the read-path softening.
+    #[tokio::test]
+    async fn missing_hash_sidecar_is_warned_not_failed() {
+        let dir = tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).expect("store");
+        let partition = id("job-1", "stage-1", 0);
+        let sp = ShufflePartition {
+            id: partition.clone(),
+            schema: make_batch(&[1, 2, 3]).schema(),
+            batches: vec![make_batch(&[1, 2, 3])],
+        };
+        store.write_partition(sp, 1).await.expect("write");
+        // Remove the hash sidecar to simulate the "data committed, hash
+        // rename lost" crash window.
+        let partition_path = dir.path().join("job-1").join("stage-1").join("0.parquet");
+        let hash_path = partition_path.with_extension("parquet.blake3");
+        std::fs::remove_file(&hash_path).expect("remove hash");
+        let read = store
+            .read_partition(&partition)
+            .await
+            .expect("read must succeed even without hash sidecar")
+            .expect("partition present");
+        assert_eq!(read.batches.len(), 1);
+        assert_eq!(read.batches[0].num_rows(), 3);
     }
 }

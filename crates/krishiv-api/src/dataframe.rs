@@ -1302,6 +1302,45 @@ Execution statistics:
 
     /// Write the result of this DataFrame to Parquet.
     ///
+    /// Write the DataFrame to `path` as Parquet with dynamic-partition
+    /// overwrite semantics (S18 / `INSERT OVERWRITE TABLE … PARTITION (…)`).
+    ///
+    /// Each row's partition column values determine the partition directory
+    /// the file lands in (e.g. `dt=2026-01-01/part-*.parquet`); only the
+    /// partitions touched by the new data are overwritten — other
+    /// partitions in the destination are preserved.
+    ///
+    /// For distributed sessions backed by a SQL query, the write runs
+    /// through the distributed sink stage with `WriteMode::OverwriteDynamic`.
+    /// Embedded sessions are not yet supported (the API is wired but
+    /// returns `KrishivError::Unsupported`); use a SingleNode or Distributed
+    /// session for full correctness.
+    pub fn write_parquet_overwrite_partition(
+        &self,
+        path: &str,
+        partition_by: &[&str],
+    ) -> Result<()> {
+        let partition_strings: Vec<String> =
+            partition_by.iter().map(|s| (*s).to_string()).collect();
+        if let Some(()) = self.try_distributed_parquet_sink(
+            path,
+            krishiv_common::write_commit::WriteMode::OverwriteDynamic,
+            &partition_strings,
+        )? {
+            return Ok(());
+        }
+        // Embedded fallback: dynamic-partition overwrite requires the
+        // executor-side discovery of the produced partition set. A future
+        // release can either implement this in-process or reject at the
+        // call site once SingleNode mode grows a sink stage.
+        Err(KrishivError::Unsupported {
+            feature: "write_parquet_overwrite_partition in embedded mode requires the \
+                      distributed sink stage (use a SingleNode or Distributed session with \
+                      a SQL-backed DataFrame). See S18 in the Spark parity plan."
+                .to_string(),
+        })
+    }
+
     /// For distributed sessions backed by a SQL query, the write runs through
     /// the distributed sink stage (`path` becomes a directory of
     /// `part-*.parquet` files committed atomically on job success). Embedded

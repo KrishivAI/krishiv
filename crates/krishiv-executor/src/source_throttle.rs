@@ -4,7 +4,8 @@
 //! heartbeat response.  This module stores the current `rows_per_second` limit
 //! for each `source_id` and enforces a token-bucket algorithm.
 //!
-//! A `None` limit means "unlimited" (the throttle has been cleared).
+//! A `None` limit means "unlimited" (the throttle has been cleared). An explicit
+//! `Some(0)` means "pause this source".
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -45,14 +46,6 @@ impl TokenBucket {
         }
     }
 
-    fn clear() -> Self {
-        Self::new(0)
-    }
-
-    fn is_active(&self) -> bool {
-        self.rate > 0
-    }
-
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed_secs = now.duration_since(self.last_refill).as_secs_f64();
@@ -83,11 +76,11 @@ impl SourceThrottleTable {
     pub fn apply(&self, source_id: impl Into<String>, rows_per_second: Option<u64>) {
         let source_id = source_id.into();
         match rows_per_second {
-            Some(rps) if rps > 0 => {
+            Some(rps) => {
                 self.inner.insert(source_id, TokenBucket::new(rps));
             }
-            _ => {
-                self.inner.insert(source_id, TokenBucket::clear());
+            None => {
+                self.inner.remove(&source_id);
             }
         }
     }
@@ -101,15 +94,12 @@ impl SourceThrottleTable {
     }
 
     /// Number of rows the source is allowed to emit right now.
-    /// Returns the rate limit if active, or `None` if unlimited/unknown.
+    /// Returns the rate limit if throttled, or `None` if unlimited/unknown.
+    /// A returned `Some(0)` is an active pause command.
     pub fn active_limit(&self, source_id: &str) -> Option<u64> {
         let mut bucket = self.inner.get_mut(source_id)?;
         bucket.refill();
-        if bucket.is_active() {
-            Some(bucket.rate)
-        } else {
-            None
-        }
+        Some(bucket.rate)
     }
 
     /// Try to consume `requested` rows from the source's token bucket.
@@ -148,7 +138,6 @@ mod tests {
     #[test]
     fn token_bucket_new_has_full_capacity() {
         let mut tb = TokenBucket::new(100);
-        assert!(tb.is_active());
         // Should be able to consume up to rate immediately (burst = rate).
         let granted = tb.try_consume(100);
         assert_eq!(granted, 100);
@@ -159,8 +148,7 @@ mod tests {
 
     #[test]
     fn token_bucket_empty_pauses_source() {
-        let mut tb = TokenBucket::clear();
-        assert!(!tb.is_active());
+        let mut tb = TokenBucket::new(0);
         let granted = tb.try_consume(10_000);
         assert_eq!(granted, 0);
     }
@@ -182,10 +170,12 @@ mod tests {
         assert_eq!(limit, Some(1000));
 
         table.apply("src-a", Some(0));
-        assert_eq!(table.active_limit("src-a"), None);
+        assert_eq!(table.active_limit("src-a"), Some(0));
+        assert_eq!(table.try_consume("src-a", 10_000), 0);
 
         table.apply("src-a", None);
         assert_eq!(table.active_limit("src-a"), None);
+        assert_eq!(table.try_consume("src-a", 10_000), 10_000);
 
         assert_eq!(table.active_limit("src-z"), None);
     }

@@ -109,6 +109,13 @@ pub struct ExecutorTaskOutput {
     /// lets the coordinator decide whether to schedule the next streaming cycle
     /// immediately or wait for downstream to drain.
     pub(crate) backpressure: krishiv_common::BackpressureSignal,
+    /// Coordinator-authoritative IVM tick output: a framed `name → RecordBatch`
+    /// map of each view's full materialized output (via `encode_batch_map`).
+    /// `None` for non-IVM tasks; `Some(bytes)` for `IvmStep` tasks. Travelled
+    /// to the coordinator through the existing `inline_record_batch_ipc` channel
+    /// as a single raw blob (not decoded as Arrow IPC — the coordinator unpacks
+    /// it via `decode_batch_map`).
+    pub(crate) ivm_output: Option<Vec<u8>>,
 }
 
 impl ExecutorTaskOutput {
@@ -126,6 +133,7 @@ impl ExecutorTaskOutput {
             sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
+            ivm_output: None,
         }
     }
 
@@ -148,6 +156,7 @@ impl ExecutorTaskOutput {
             sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
+            ivm_output: None,
         }
     }
 
@@ -165,6 +174,7 @@ impl ExecutorTaskOutput {
             sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
+            ivm_output: None,
         }
     }
 
@@ -185,6 +195,7 @@ impl ExecutorTaskOutput {
             sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
+            ivm_output: None,
         }
     }
 
@@ -208,6 +219,7 @@ impl ExecutorTaskOutput {
             sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
+            ivm_output: None,
         }
     }
 
@@ -225,6 +237,7 @@ impl ExecutorTaskOutput {
             sink_staged_files: Vec::new(),
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
+            ivm_output: None,
         }
     }
 
@@ -240,6 +253,13 @@ impl ExecutorTaskOutput {
 
     pub(crate) fn with_record_batches(mut self, batches: Vec<RecordBatch>) -> Self {
         self.record_batches = batches;
+        self
+    }
+
+    /// Attach the framed view-output blob for a coordinator-authoritative
+    /// IVM tick (produced by `execute_ivm_fragment`).
+    pub(crate) fn with_ivm_output(mut self, blob: Option<Vec<u8>>) -> Self {
+        self.ivm_output = blob;
         self
     }
 
@@ -350,6 +370,13 @@ impl ExecutorTaskOutput {
         }
         if !self.sink_staged_files.is_empty() {
             meta = meta.with_sink_staged_files(self.sink_staged_files.clone());
+        }
+        // Coordinator-authoritative IVM: carry the framed view-output blob as a
+        // single raw entry in the inline-record-batch channel. The coordinator
+        // reads it via take_job_inline_results and unpacks with decode_batch_map
+        // (it is NOT Arrow IPC and must not be passed through the SQL decoder).
+        if let Some(blob) = &self.ivm_output {
+            meta = meta.with_inline_record_batch_ipc(vec![blob.clone()]);
         }
         meta
     }

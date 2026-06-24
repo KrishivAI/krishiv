@@ -487,8 +487,14 @@ impl CdcToLakehousePipeline {
             let snapshot_id = match iceberg.commit(staged.clone(), offsets).await {
                 Ok(snapshot_id) => snapshot_id,
                 Err(e) => {
-                    let _ = iceberg.abort(staged).await;
-                    return Err(ConnectorError::Cdc(format!("iceberg commit failed: {e}")));
+                    let message = match iceberg.abort(staged).await {
+                        Ok(()) => format!("iceberg commit failed: {e}"),
+                        Err(abort_error) => format!(
+                            "iceberg commit failed: {e}; abort of staged snapshot failed: \
+                             {abort_error}; staged data may require recovery"
+                        ),
+                    };
+                    return Err(ConnectorError::Cdc(message));
                 }
             };
             // Iceberg committed successfully — now safe to advance source offsets.
@@ -818,6 +824,65 @@ fn safe_payload_column(name: &str) -> String {
         format!("{name}_src")
     } else {
         name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::lakehouse::{IcebergTwoPhaseCommit, LakehouseError, StagedSnapshot};
+
+    struct FailingIcebergCommitter;
+
+    #[async_trait]
+    impl IcebergTwoPhaseCommit for FailingIcebergCommitter {
+        async fn prepare(
+            &self,
+            batches: Vec<RecordBatch>,
+        ) -> Result<StagedSnapshot, LakehouseError> {
+            Ok(StagedSnapshot {
+                snapshot_id: 7,
+                batches,
+            })
+        }
+
+        async fn commit(
+            &self,
+            _staged: StagedSnapshot,
+            _kafka_offsets: BTreeMap<String, i64>,
+        ) -> Result<i64, LakehouseError> {
+            Err(LakehouseError::Iceberg("commit down".into()))
+        }
+
+        async fn abort(&self, _staged: StagedSnapshot) -> Result<(), LakehouseError> {
+            Err(LakehouseError::Io("abort down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn iceberg_sink_reports_abort_failure_after_commit_failure() {
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders-topic",
+            vec!["localhost:9092".into()],
+            "local",
+            "warehouse.orders",
+            vec!["id".into()],
+        );
+        let source = InMemoryCdcEventSource::new([
+            r#"{"op":"c","after":{"id":"1"},"source":{"table":"orders"}}"#,
+        ]);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let error = pipeline
+            .run_with_iceberg_sink(source, &FailingIcebergCommitter, shutdown_rx)
+            .await
+            .expect_err("commit plus abort failure must be returned");
+        let message = error.to_string();
+        assert!(message.contains("commit down"));
+        assert!(message.contains("abort of staged snapshot failed"));
+        assert!(message.contains("abort down"));
     }
 }
 

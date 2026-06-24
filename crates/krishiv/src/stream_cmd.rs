@@ -229,6 +229,7 @@ fn parse_stream_submit(args: &[&str]) -> Result<StreamSubmitSpec, String> {
             window_size_ms,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         },

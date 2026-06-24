@@ -234,7 +234,13 @@ async fn content_hash_mismatch_detected_after_restart_on_tampered_partition() {
 }
 
 #[tokio::test]
-async fn disk_store_data_without_hash_sidecar_fails_closed_after_restart() {
+async fn disk_store_data_without_hash_sidecar_warns_not_fails_after_restart() {
+    // SH5: a missing hash sidecar is not a corruption signal — it can
+    // happen when the data file was committed but the sidecar rename was
+    // lost (the "data-then-hash" rename order still has a small
+    // crash window between the two renames). The read path must
+    // tolerate the missing sidecar with a warning, not a hard
+    // `ContentHashMismatch`.
     let dir = tempfile::tempdir().unwrap();
     let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
 
@@ -247,11 +253,9 @@ async fn disk_store_data_without_hash_sidecar_fails_closed_after_restart() {
     std::fs::remove_file(hash_path).unwrap();
 
     let restarted = LocalDiskShuffleStore::new(dir.path()).unwrap();
-    let err = restarted.read_partition(&id).await.unwrap_err();
-    assert!(
-        matches!(err, ShuffleError::ContentHashMismatch { .. }),
-        "expected ContentHashMismatch for local data without persisted hash, got {err}"
-    );
+    let read = restarted.read_partition(&id).await.expect("read must succeed");
+    let sp = read.expect("partition present");
+    assert_eq!(sp.batches.len(), 1);
 }
 
 #[tokio::test]

@@ -263,6 +263,19 @@ impl StreamingWindowOp {
             Self::Count(op) => op.flush(),
         }
     }
+
+    /// Forward the event-time watermark to the operator's state backend so that
+    /// TTL expiry checks use event time instead of wall-clock time (ST7).
+    ///
+    /// The `CountWindowOperator` is stateless; the call is a no-op for it.
+    fn set_watermark(&mut self, watermark_ms: i64) {
+        match self {
+            Self::Tumbling(op) => op.set_watermark(watermark_ms),
+            Self::Sliding(op) => op.set_watermark(watermark_ms),
+            Self::Session(op) => op.set_watermark(watermark_ms),
+            Self::Count(_) => {}
+        }
+    }
 }
 
 /// Build a state-backed streaming window operator for `spec`.
@@ -452,6 +465,9 @@ pub fn execute_streaming_window(
                     continue;
                 }
             };
+            // ST7: forward the watermark to the operator's state backend so TTL
+            // eviction is event-time-driven instead of wall-clock-driven.
+            op.set_watermark(wm);
             match op.process_batch(&batch, wm) {
                 Ok(output_batches) => {
                     for out_batch in output_batches {
@@ -532,6 +548,7 @@ pub fn local_spec_to_window_execution(params: LocalWindowParams) -> WindowExecut
             })
             .collect(),
         state_ttl_ms,
+        allowed_lateness_ms: None,
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
     }
@@ -586,6 +603,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: WindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: HashMap::from([("src-a".into(), 0), ("src-b".into(), 0)]),
             source_id_column: Some("source_id".into()),
         };

@@ -641,6 +641,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: WindowExecutionSpec::default_count_agg(),
             state_ttl_ms: Some(60_000),
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -676,6 +677,8 @@ mod tests {
             session_gap_ms: Some(5_000),
             agg_exprs: WindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };

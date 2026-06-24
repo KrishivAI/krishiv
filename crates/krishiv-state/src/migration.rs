@@ -100,6 +100,63 @@ pub fn migrate_snapshot(
     Ok(crate::snapshot::encode_snapshot_entries(&entries))
 }
 
+/// SH19: migrate every entry *value* AND *key* of a portable state
+/// snapshot from `from` to `to`. Use when a schema bump changes both
+/// the value layout *and* the key encoding (e.g. a key prefix swap or
+/// a hash algorithm change).
+///
+/// `key_migrator` is applied to the raw key bytes of every entry;
+/// passing `None` leaves the keys unchanged (equivalent to
+/// [`migrate_snapshot`]).
+///
+/// Empty snapshots pass through unchanged. Entry order is preserved
+/// — if `key_migrator` produces duplicate keys, the encoded
+/// snapshot will contain duplicates and downstream reads will see
+/// only one (the last one wins on the RocksDB side).  Callers that
+/// introduce a key collision must deduplicate themselves.
+/// SH19: type alias for a key-encoding migration closure.
+pub type KeyMigrationFn<'a> = &'a dyn Fn(&[u8]) -> Result<Vec<u8>, StateMigrationError>;
+
+/// SH19: migrate every entry *value* AND *key* of a portable state
+/// snapshot from `from` to `to`. Use when a schema bump changes both
+/// the value layout *and* the key encoding (e.g. a key prefix swap or
+/// a hash algorithm change).
+///
+/// `key_migrator` is applied to the raw key bytes of every entry;
+/// passing `None` leaves the keys unchanged (equivalent to
+/// [`migrate_snapshot`]).
+///
+/// Empty snapshots pass through unchanged. Entry order is preserved
+/// — if `key_migrator` produces duplicate keys, the encoded
+/// snapshot will contain duplicates and downstream reads will see
+/// only one (the last one wins on the RocksDB side).  Callers that
+/// introduce a key collision must deduplicate themselves.
+#[allow(clippy::type_complexity)]
+pub fn migrate_snapshot_with_keys(
+    snapshot_bytes: &[u8],
+    registry: &StateMigrationRegistry,
+    from: u32,
+    to: u32,
+    key_migrator: Option<KeyMigrationFn<'_>>,
+) -> Result<Vec<u8>, StateMigrationError> {
+    if from == to || snapshot_bytes.is_empty() {
+        return Ok(snapshot_bytes.to_vec());
+    }
+    let mut entries =
+        crate::snapshot::decode_snapshot_entries(snapshot_bytes).map_err(|error| {
+            StateMigrationError {
+                message: format!("snapshot decode before migration: {error}"),
+            }
+        })?;
+    for entry in &mut entries {
+        if let Some(km) = key_migrator {
+            entry.2 = km(&entry.2)?;
+        }
+        entry.3 = registry.migrate(from, to, &entry.3)?;
+    }
+    Ok(crate::snapshot::encode_snapshot_entries(&entries))
+}
+
 /// Thread-safe global registry for session-scoped migrations.
 #[derive(Default, Clone)]
 pub struct SharedStateMigrationRegistry {
@@ -222,5 +279,52 @@ mod tests {
         let reg = StateMigrationRegistry::new();
         let err = migrate_snapshot(&snapshot, &reg, 1, 3).expect_err("missing migration");
         assert!(err.message.contains("missing migration"));
+    }
+
+    /// SH19: when a `key_migrator` is supplied, every entry's key is
+    /// transformed as well as its value.
+    #[test]
+    fn migrate_snapshot_with_keys_transforms_keys() {
+        let entries = vec![(
+            "op".to_owned(),
+            "s".to_owned(),
+            b"k_old".to_vec(),
+            b"v".to_vec(),
+        )];
+        let snapshot = crate::snapshot::encode_snapshot_entries(&entries);
+        let mut reg = StateMigrationRegistry::new();
+        reg.register(1, 2, Arc::new(|bytes| Ok(bytes.to_vec())));
+        let migrated = migrate_snapshot_with_keys(
+            &snapshot,
+            &reg,
+            1,
+            2,
+            Some(&|key: &[u8]| {
+                let mut out = b"k_new_".to_vec();
+                out.extend_from_slice(&key[2..]);
+                Ok(out)
+            }),
+        )
+        .expect("migrate");
+        let decoded = crate::snapshot::decode_snapshot_entries(&migrated).expect("decode");
+        assert_eq!(decoded[0].2, b"k_new_old");
+    }
+
+    /// SH19: when no `key_migrator` is supplied, the keys are
+    /// preserved unchanged (equivalent to `migrate_snapshot`).
+    #[test]
+    fn migrate_snapshot_with_keys_passthrough_when_none() {
+        let entries = vec![(
+            "op".to_owned(),
+            "s".to_owned(),
+            b"k".to_vec(),
+            b"v".to_vec(),
+        )];
+        let snapshot = crate::snapshot::encode_snapshot_entries(&entries);
+        let mut reg = StateMigrationRegistry::new();
+        reg.register(1, 2, Arc::new(|bytes| Ok(bytes.to_vec())));
+        let migrated = migrate_snapshot_with_keys(&snapshot, &reg, 1, 2, None).expect("migrate");
+        let decoded = crate::snapshot::decode_snapshot_entries(&migrated).expect("decode");
+        assert_eq!(decoded[0].2, b"k");
     }
 }

@@ -1,52 +1,44 @@
 #![forbid(unsafe_code)]
 
-//! IVM (DeltaBatch) fragment execution — future distributed path, NOT currently active.
+//! Stateless IVM (DeltaBatch) fragment execution — coordinator-authoritative.
 //!
-//! IVM computation currently runs centrally on the coordinator via
-//! `api_ivm_step` in `ivm_http.rs`. The `delta:step:` task fragment format
-//! defined here is a **future optimization** for distributing IVM ticks to
-//! executors. The scheduler never dispatches these fragments today; reaching
-//! this code path is a bug and the executor will return an error.
+//! The coordinator is the single source of truth for an IVM job. Each tick it
+//! drains pending deltas locally, snapshots the full flow state (source
+//! snapshots + view baselines) via `IncrementalFlow::checkpoint_full`, and
+//! ships a self-contained `delta:step:` fragment to a registered executor.
+//!
+//! The executor performs **one stateless tick** on a *transient* flow:
+//!
+//! 1. register the shipped view specs,
+//! 2. restore the shipped state (so diffs use the correct baselines),
+//! 3. feed the tick's deltas,
+//! 4. run `step_datafusion`,
+//! 5. return each view's full materialized output as a framed
+//!    `name → RecordBatch` blob.
+//!
+//! No per-job state is retained on the executor: it is a replaceable worker.
+//! If the executor fails or is reassigned mid-tick, the coordinator re-feeds
+//! the pending deltas and computes centrally — so state can never diverge or
+//! be lost. See `submit_distributed_ivm_step` in `krishiv-scheduler`.
 //!
 //! # Fragment format
 //!
 //! ```text
-//! delta:step:{job_id}|{pending_deltas_json}|{view_specs_json}
+//! delta:step:{job_id}|{deltas_b64}|{specs_b64}|{state_b64}
 //! ```
 //!
-//! * `job_id` — matches the IVM job on the coordinator.
-//! * `pending_deltas_json` — JSON array of `{"source": "...", "delta_b64": "..."}` objects.
-//! * `view_specs_json` — JSON array of view spec objects (authoritative on each step so
-//!   the executor can update its local registry if the coordinator registered new views).
+//! Every payload part is base64-encoded, so a `|` inside a SQL string literal
+//! in `body_sql` cannot corrupt the framing. `state_b64` is the base64 of
+//! `IncrementalFlow::checkpoint_full`.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
-use dashmap::DashMap;
-use krishiv_ivm::{IncrementalFlow, IncrementalViewSpec, deserialize_delta_batch};
+use arrow::array::RecordBatch;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use krishiv_ivm::{
+    IncrementalFlow, IncrementalViewSpec, deserialize_delta_batch, encode_batch_map,
+};
 use serde::Deserialize;
-
-// ── per-job executor state ────────────────────────────────────────────────────
-
-/// Long-lived IVM state held on the executor between ticks.
-pub struct IvmJobState {
-    pub flow: IncrementalFlow,
-}
-
-impl IvmJobState {
-    pub fn new() -> Self {
-        Self {
-            flow: IncrementalFlow::new(),
-        }
-    }
-}
-
-impl Default for IvmJobState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub type IvmJobMap = Arc<DashMap<String, Arc<Mutex<IvmJobState>>>>;
 
 // ── fragment wire types ───────────────────────────────────────────────────────
 
@@ -75,8 +67,7 @@ pub struct SchemaFieldJson {
     pub nullable: bool,
 }
 
-fn parse_schema_fields(fields: &[SchemaFieldJson]) -> Option<arrow::datatypes::SchemaRef> {
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+fn parse_schema_fields(fields: &[SchemaFieldJson]) -> Option<SchemaRef> {
     let arrow_fields: Option<Vec<Field>> = fields
         .iter()
         .map(|f| {
@@ -107,6 +98,16 @@ fn parse_schema_fields(fields: &[SchemaFieldJson]) -> Option<arrow::datatypes::S
     Some(std::sync::Arc::new(Schema::new(arrow_fields?)))
 }
 
+fn empty_batch(schema: SchemaRef) -> RecordBatch {
+    let cols: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| arrow::array::new_empty_array(f.data_type()))
+        .collect();
+    RecordBatch::try_new(schema, cols)
+        .unwrap_or_else(|_| RecordBatch::new_empty(std::sync::Arc::new(Schema::empty())))
+}
+
 // ── fragment prefix ───────────────────────────────────────────────────────────
 
 /// Prefix for IVM step fragments.
@@ -114,51 +115,56 @@ pub const IVM_FRAGMENT_PREFIX: &str = "delta:step:";
 
 // ── execution ─────────────────────────────────────────────────────────────────
 
-/// Execute one IVM tick for a `delta:step:` fragment.
+/// Execute one stateless IVM tick for a `delta:step:` fragment.
 ///
-/// Decodes pending deltas and (optional) view spec updates from the fragment
-/// body, updates the executor's per-job `IncrementalFlow`, runs one tick,
-/// and returns `Ok(active_views)`.
+/// Returns `(StepSummary, Option<Vec<u8>>)` where the blob is the framed
+/// `name → RecordBatch` map of view full outputs (via `encode_batch_map`),
+/// which the coordinator applies to its authoritative flow.
 pub async fn execute_ivm_fragment(
-    ivm_jobs: &IvmJobMap,
     fragment_body: &str,
-) -> Result<krishiv_ivm::StepSummary, String> {
-    // Fragment format: "delta:step:{job_id}|{deltas_json}|{specs_json}"
+) -> Result<(krishiv_ivm::StepSummary, Option<Vec<u8>>), String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // Format: "delta:step:{job_id}|{deltas_b64}|{specs_b64}|{state_b64}"
     let rest = fragment_body
         .strip_prefix(IVM_FRAGMENT_PREFIX)
         .ok_or_else(|| "invalid IVM fragment: missing prefix".to_string())?;
-
-    let parts: Vec<&str> = rest.splitn(3, '|').collect();
-    if parts.len() < 2 {
+    let parts: Vec<&str> = rest.splitn(4, '|').collect();
+    if parts.len() < 4 {
         return Err(format!(
-            "invalid IVM fragment: expected at least 2 '|'-separated parts, got {}",
+            "invalid IVM fragment: expected 4 '|'-separated parts, got {}",
             parts.len()
         ));
     }
+    let _job_id = parts[0];
+    let deltas_b64 = parts[1];
+    let specs_b64 = parts[2];
+    let state_b64 = parts[3];
 
-    let job_id = parts[0];
-    let deltas_json = parts[1];
-    let specs_json = if parts.len() >= 3 { parts[2] } else { "[]" };
-
-    // Retrieve or create per-job state.
-    let state_arc = ivm_jobs
-        .entry(job_id.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(IvmJobState::new())))
-        .clone();
-
+    // Decode payloads.
+    let deltas_json = b64
+        .decode(deltas_b64)
+        .map_err(|e| format!("deltas b64: {e}"))?;
+    let deltas_str = std::str::from_utf8(&deltas_json).map_err(|e| format!("deltas utf8: {e}"))?;
     let pending_deltas: Vec<PendingDeltaJson> =
-        serde_json::from_str(deltas_json).map_err(|e| format!("delta decode: {e}"))?;
+        serde_json::from_str(deltas_str).map_err(|e| format!("deltas json: {e}"))?;
+
+    let specs_json = b64
+        .decode(specs_b64)
+        .map_err(|e| format!("specs b64: {e}"))?;
+    let specs_str = std::str::from_utf8(&specs_json).map_err(|e| format!("specs utf8: {e}"))?;
     let view_specs: Vec<ViewSpecJson> =
-        serde_json::from_str(specs_json).map_err(|e| format!("spec decode: {e}"))?;
+        serde_json::from_str(specs_str).map_err(|e| format!("specs json: {e}"))?;
 
-    let flow = {
-        let state = state_arc
-            .lock()
-            .map_err(|_| "ivm state lock poisoned".to_string())?;
-        state.flow.clone()
-    };
+    let state_bytes = b64
+        .decode(state_b64)
+        .map_err(|e| format!("state b64: {e}"))?;
 
-    // Apply view spec updates (idempotent via behavior-version reset).
+    // Build a transient flow. Register views BEFORE restoring state so the
+    // restored baselines land on real views (restore_full walks registered
+    // view names and seeds each view's snapshot + full_output).
+    let flow = IncrementalFlow::new();
     for vs in &view_specs {
         if let Some(schema) = parse_schema_fields(&vs.output_schema_fields) {
             let spec = IncrementalViewSpec {
@@ -172,28 +178,164 @@ pub async fn execute_ivm_fragment(
             flow.register_view(spec).map_err(|e| e.to_string())?;
         }
     }
+    flow.restore_full(&state_bytes)
+        .map_err(|e| format!("restore_full: {e}"))?;
+    // Force DiffBased: the transient flow's incremental-plan accumulators are
+    // empty (not transferable), so only full SQL recompute + diff is correct.
+    flow.force_diff_based()
+        .map_err(|e| format!("force_diff_based: {e}"))?;
 
-    // Feed pending deltas.
+    // Feed pending deltas (input dedup / zero-drop mirror the coordinator path).
     for pd in &pending_deltas {
-        let ipc_bytes =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &pd.delta_b64)
-                .map_err(|e| format!("base64 decode delta for '{}': {e}", pd.source))?;
-        let delta = deserialize_delta_batch(&ipc_bytes).map_err(|e| e.to_string())?;
+        let ipc_bytes = b64
+            .decode(&pd.delta_b64)
+            .map_err(|e| format!("base64 decode delta for '{}': {e}", pd.source))?;
+        let delta = deserialize_delta_batch(&ipc_bytes)
+            .map_err(|e| e.to_string())?
+            .drop_zeros()
+            .map_err(|e| e.to_string())?;
         flow.feed(pd.source.clone(), delta)
             .map_err(|e| e.to_string())?;
     }
 
     // Run one tick.
-    let result = flow.step_datafusion().await.map_err(|e| e.to_string());
+    let summary = flow.step_datafusion().await.map_err(|e| e.to_string())?;
 
-    // Write the modified flow back to shared state so subsequent ticks see
-    // view registrations and feed results from this tick.
-    {
-        let mut state = state_arc
-            .lock()
-            .map_err(|_| "ivm state lock poisoned".to_string())?;
-        state.flow = flow;
+    // Collect each view's full materialized output. Non-materialized or
+    // never-stepped views yield an empty batch over their schema so the
+    // coordinator's replace_full is a deterministic no-op.
+    let mut outputs: HashMap<String, RecordBatch> = HashMap::new();
+    let names = flow.view_names().map_err(|e| e.to_string())?;
+    for name in &names {
+        let snap = flow.snapshot(name).map_err(|e| e.to_string())?;
+        match snap {
+            Some(rb) => {
+                outputs.insert(name.clone(), rb);
+            }
+            None => {
+                if let Ok(Some(spec)) = flow.view_spec(name) {
+                    outputs.insert(name.clone(), empty_batch(spec.output_schema));
+                }
+            }
+        }
     }
 
-    result
+    let blob = encode_batch_map(&outputs).map_err(|e| e.to_string())?;
+    Ok((summary, Some(blob)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use krishiv_ivm::{DeltaBatch, IncrementalFlow, IncrementalViewSpec, decode_batch_map};
+
+    fn sales_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Float64,
+            false,
+        )]))
+    }
+
+    fn sales_batch(amounts: &[f64]) -> RecordBatch {
+        RecordBatch::try_new(
+            sales_schema(),
+            vec![Arc::new(Float64Array::from(amounts.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    fn sum_view_spec() -> IncrementalViewSpec {
+        IncrementalViewSpec {
+            name: "total_sales".into(),
+            body_sql: "SELECT SUM(amount) AS total FROM sales".into(),
+            output_schema: Arc::new(Schema::new(vec![Field::new(
+                "total",
+                DataType::Float64,
+                true,
+            )])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        }
+    }
+
+    fn total_of(map: &std::collections::HashMap<String, RecordBatch>) -> f64 {
+        map.get("total_sales")
+            .unwrap()
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    /// The stateless fragment round-trip: encode a tick on the coordinator side,
+    /// execute it on the executor, decode the result — and confirm it matches a
+    /// plain central tick. Also confirms statelessness: running the same fragment
+    /// twice does not accumulate (no per-job state on the executor).
+    #[tokio::test]
+    async fn fragment_round_trip_matches_central_and_is_stateless() {
+        // Baseline tick 1 on a coordinator flow.
+        let coord = IncrementalFlow::new();
+        coord.register_view(sum_view_spec()).unwrap();
+        coord
+            .feed(
+                "sales",
+                DeltaBatch::from_inserts(sales_batch(&[100.0, 200.0, 50.0])).unwrap(),
+            )
+            .unwrap();
+        coord.step_datafusion().await.unwrap();
+
+        // Tick 2 delta.
+        let delta = DeltaBatch::from_inserts(sales_batch(&[25.0, 10.0])).unwrap();
+        coord.feed("sales", delta.clone()).unwrap();
+
+        // Central reference tick 2.
+        let central = IncrementalFlow::new();
+        central.register_view(sum_view_spec()).unwrap();
+        central
+            .feed(
+                "sales",
+                DeltaBatch::from_inserts(sales_batch(&[100.0, 200.0, 50.0])).unwrap(),
+            )
+            .unwrap();
+        central.step_datafusion().await.unwrap();
+        central.feed("sales", delta.clone()).unwrap();
+        central.step_datafusion().await.unwrap();
+
+        // Build the dispatch fragment (what the coordinator sends).
+        let local_pending = coord.take_pending().unwrap();
+        let dispatch_deltas = krishiv_ivm::coalesce_pending(local_pending.clone()).unwrap();
+        let state = coord.checkpoint_full().unwrap();
+        let specs = coord.view_specs().unwrap();
+        let fragment = encode_ivm_step_fragment("job-1", &dispatch_deltas, &specs, &state).unwrap();
+
+        // Execute on the (stateless) executor — twice, to prove no accumulation.
+        let (summary1, blob1) = execute_ivm_fragment(&fragment).await.unwrap();
+        let (_summary2, blob2) = execute_ivm_fragment(&fragment).await.unwrap();
+
+        let out1 = decode_batch_map(blob1.as_ref().unwrap()).unwrap();
+        let out2 = decode_batch_map(blob2.as_ref().unwrap()).unwrap();
+
+        // Both runs produce the same full output (stateless: no accumulation).
+        assert!(
+            (total_of(&out1) - 385.0).abs() < 1e-9,
+            "first run total wrong"
+        );
+        assert!(
+            (total_of(&out2) - 385.0).abs() < 1e-9,
+            "second run total must match (stateless)"
+        );
+        // The tick produced real output (not fabricated zeros).
+        assert!(
+            summary1.total_output_rows > 0,
+            "summary must report real output rows"
+        );
+    }
 }

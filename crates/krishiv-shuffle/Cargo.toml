@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 krishiv-common = { path = "../krishiv-common" }
+krishiv-metrics = { path = "../krishiv-metrics" }
 axum = { workspace = true }
 dashmap = { workspace = true }
 arrow = { workspace = true }

@@ -92,6 +92,12 @@ struct IncrementalFlowInner {
 
     // Gap 6: LATENESS / watermark trackers per source.
     watermark_trackers: AHashMap<String, WatermarkTracker>,
+
+    // Coordinator-authoritative distributed IVM: when true, step_datafusion
+    // never uses cached incremental plans (whose accumulator state is not
+    // transferable) and always recomputes views via full SQL + diff. Set on
+    // the transient executor flow so a remote tick matches central compute.
+    force_diff_based: bool,
 }
 
 // ── IncrementalFlow ───────────────────────────────────────────────────────────
@@ -129,6 +135,7 @@ impl IncrementalFlow {
                 view_plan_sqls: AHashMap::new(),
                 source_ordinals: AHashMap::new(),
                 watermark_trackers: AHashMap::new(),
+                force_diff_based: false,
             })),
         }
     }
@@ -187,6 +194,20 @@ impl IncrementalFlow {
     pub fn enable_delta_checkpoints(&self) -> IvmResult<()> {
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.delta_checkpoint_enabled = true;
+        Ok(())
+    }
+
+    /// Force every `step_datafusion` to use full SQL recompute + diff
+    /// (`DiffBased`), bypassing cached incremental plans.
+    ///
+    /// Incremental plans carry accumulator state that is **not** captured by
+    /// `checkpoint_full`, so a transient executor flow restored from a
+    /// coordinator snapshot must not use them — it would emit deltas computed
+    /// against an empty accumulator rather than the restored baseline. Setting
+    /// this flag makes a remote tick bit-identical to a central tick.
+    pub fn force_diff_based(&self) -> IvmResult<()> {
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        inner.force_diff_based = true;
         Ok(())
     }
 
@@ -455,10 +476,12 @@ impl IncrementalFlow {
             view_prev_snapshots,
             view_plan_kinds,
             views_needing_plans,
+            force_diff_based,
         ) = {
             let mut inner = self.inner.lock().map_err(lock_err)?;
             let raw = std::mem::take(&mut inner.pending);
             let snapshots = inner.source_snapshots.clone();
+            let force_diff_based = inner.force_diff_based;
             let names = inner.view_registry.view_names().map_err(delta_err)?;
             let specs: Vec<IncrementalViewSpec> = names
                 .iter()
@@ -486,7 +509,15 @@ impl IncrementalFlow {
                 .filter(|n| !inner.view_plans.contains_key(n.as_str()))
                 .cloned()
                 .collect();
-            (raw, snapshots, specs, prev_outputs, plan_kinds, needs_plans)
+            (
+                raw,
+                snapshots,
+                specs,
+                prev_outputs,
+                plan_kinds,
+                needs_plans,
+                force_diff_based,
+            )
         };
 
         // ── Phase 2 (no lock): coalesce deltas ───────────────────────────────
@@ -556,7 +587,11 @@ impl IncrementalFlow {
             dirty_views.insert(view_name_lower);
 
             // Determine if this view gets an incremental plan (skip SQL) or DiffBased (run SQL).
-            let plan_is_incremental = if views_needing_plans.contains(view_name) {
+            // `force_diff_based` (transient executor flows) never uses incremental
+            // plans: their accumulator state is not transferable via checkpoint.
+            let plan_is_incremental = if force_diff_based {
+                false
+            } else if views_needing_plans.contains(view_name) {
                 let plan = crate::plan::build_view_plan(
                     ctx,
                     &spec.body_sql,
@@ -717,12 +752,17 @@ impl IncrementalFlow {
             .collect();
 
         for (view_name, view) in &dirty_view_arcs {
-            // Read plan kind (releases borrow immediately via .map).
-            let plan_kind = inner
-                .view_plans
-                .get(view_name)
-                .map(|p| p.kind())
-                .unwrap_or(ViewPlanKind::DiffBased);
+            // Read plan kind (releases borrow immediately via .map). Forced
+            // DiffBased (transient executor flows) ignores cached plans.
+            let plan_kind = if inner.force_diff_based {
+                ViewPlanKind::DiffBased
+            } else {
+                inner
+                    .view_plans
+                    .get(view_name)
+                    .map(|p| p.kind())
+                    .unwrap_or(ViewPlanKind::DiffBased)
+            };
 
             let output_delta = if plan_kind == ViewPlanKind::Incremental {
                 // O(Δ) path: apply stateful operator.
@@ -937,7 +977,128 @@ impl IncrementalFlow {
         Ok(())
     }
 
-    /// Serialize only the `DeltaBatch`es accumulated since the last call to
+    /// Re-insert previously drained pending deltas back into the queue.
+    ///
+    /// Used by coordinator-authoritative distributed dispatch to restore the
+    /// pending queue when a remote executor tick fails and the coordinator
+    /// must fall back to local compute. No tick is advanced.
+    pub fn re_feed(&self, pending: HashMap<String, Vec<DeltaBatch>>) -> IvmResult<()> {
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        for (source, batches) in pending {
+            inner.pending.entry(source).or_default().extend(batches);
+        }
+        Ok(())
+    }
+
+    /// Apply a tick that was computed remotely.
+    ///
+    /// `local_pending` is the pending queue the coordinator drained before
+    /// dispatch (it is *not* re-read from `self`). `view_full_outputs` is the
+    /// full materialized output per view, as computed by the executor. This
+    /// method coalesces the pending deltas, advances `source_snapshots`
+    /// deterministically (matching what `step_datafusion` does), replaces each
+    /// view's full state wholesale (so the diff baseline cannot drift), and
+    /// advances the tick.
+    ///
+    /// The coordinator's flow ends this call in exactly the same state the
+    /// executor's transient flow was in after its `step_datafusion`.
+    pub fn apply_computed_tick(
+        &self,
+        local_pending: HashMap<String, Vec<DeltaBatch>>,
+        view_full_outputs: HashMap<String, RecordBatch>,
+    ) -> IvmResult<StepSummary> {
+        let inputs = coalesce_pending(local_pending)?;
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+
+        // Advance source snapshots deterministically (mirrors step_datafusion).
+        for (name, delta) in &inputs {
+            let current = inner.source_snapshots.remove(name);
+            let updated = apply_delta(current, delta).map_err(delta_err)?;
+            inner.source_snapshots.insert(name.clone(), updated);
+        }
+
+        inner.tick += 1;
+        let mut total_output_rows = 0usize;
+        let mut active_views = 0usize;
+        for (name, full) in view_full_outputs {
+            if let Ok(view) = inner.view_registry.get(&name) {
+                let delta = view.replace_full(full).map_err(delta_err)?;
+                if !delta.is_empty() {
+                    total_output_rows += delta.num_rows();
+                    active_views += 1;
+                }
+            }
+        }
+        Ok(StepSummary {
+            total_output_rows,
+            active_views,
+        })
+    }
+
+    /// Serialize source snapshots **and** view state (snapshot + full-output
+    /// baseline) to a self-contained byte blob.
+    ///
+    /// This is the state-transfer payload for coordinator-authoritative
+    /// executor offload: a remote executor restores it into a transient flow,
+    /// feeds the tick's deltas, runs one `step_datafusion`, and returns the
+    /// resulting full view outputs. Capturing view baselines is what makes the
+    /// remote diff correct (the source-only [`checkpoint`] does not).
+    ///
+    /// Format: `u32 num_sources || (source entries) || u32 num_views || (view entries)`
+    /// where each entry is `u32 name_len || name || u32 ipc_len || arrow_ipc`.
+    pub fn checkpoint_full(&self) -> IvmResult<Vec<u8>> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        let mut out: Vec<u8> = Vec::new();
+        let sources: Vec<(&String, &RecordBatch)> = inner.source_snapshots.iter().collect();
+        out.extend_from_slice(&(sources.len() as u32).to_le_bytes());
+        for (name, snap) in sources {
+            encode_named_batch(&mut out, name, snap)?;
+        }
+        let names = inner.view_registry.view_names().map_err(delta_err)?;
+        out.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        for name in &names {
+            let view = inner.view_registry.get(name).map_err(delta_err)?;
+            let snap = view.snapshot().map_err(delta_err)?;
+            let full = view.full_output_baseline().map_err(delta_err)?;
+            // Encode snapshot (or empty) then full-output (or empty) so restore
+            // can reconstruct both fields. Empty rows are signalled by a zero
+            // IPC length followed by the schema-only batch.
+            encode_named_batch_optional(&mut out, name, snap.as_ref(), &view)?;
+            encode_named_batch_optional(&mut out, name, full.as_ref(), &view)?;
+        }
+        Ok(out)
+    }
+
+    /// Restore source snapshots and view state from [`checkpoint_full`] bytes.
+    pub fn restore_full(&self, bytes: &[u8]) -> IvmResult<()> {
+        let mut pos = 0usize;
+        let n_sources = read_u32(bytes, &mut pos)? as usize;
+        let mut source_snapshots: HashMap<String, RecordBatch> = HashMap::with_capacity(n_sources);
+        for _ in 0..n_sources {
+            let (name, batch) = decode_named_batch(bytes, &mut pos)?;
+            source_snapshots.insert(name, batch);
+        }
+        let n_views = read_u32(bytes, &mut pos)? as usize;
+        // Pairs of (snapshot, full_output) per view name.
+        let mut view_state: HashMap<String, (Option<RecordBatch>, Option<RecordBatch>)> =
+            HashMap::with_capacity(n_views);
+        for _ in 0..n_views {
+            let (name, snap) = decode_named_batch_opt(bytes, &mut pos)?;
+            let (_name2, full) = decode_named_batch_opt(bytes, &mut pos)?;
+            view_state.insert(name, (snap, full));
+        }
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        inner.source_snapshots = source_snapshots;
+        let names = inner.view_registry.view_names().map_err(delta_err)?;
+        for name in &names {
+            if let Ok(view) = inner.view_registry.get(name) {
+                let (snap, full) = view_state.get(name).cloned().unwrap_or((None, None));
+                view.restore_state(snap, full).map_err(delta_err)?;
+            }
+        }
+        Ok(())
+    }
+
     /// `checkpoint_delta` (or since `enable_delta_checkpoints` was called).
     ///
     /// The returned bytes can be applied on top of a full [`checkpoint`] via
@@ -1227,34 +1388,168 @@ fn lock_err<T>(_: T) -> IvmError {
     IvmError::execution("incremental flow lock poisoned")
 }
 
-// ── Fragment encoding helpers (for Gap-2 executor dispatch) ───────────────────
+// ── RecordBatch framing helpers (for checkpoint_full / restore_full) ──────────
 
-/// Encode pending deltas and view specs into a `delta:step:` fragment body.
+/// Encode `name` + a required `RecordBatch` as Arrow IPC into `out`.
+fn encode_named_batch(out: &mut Vec<u8>, name: &str, batch: &RecordBatch) -> IvmResult<()> {
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    let ipc = encode_record_batch_ipc(batch)?;
+    out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+    out.extend_from_slice(&ipc);
+    Ok(())
+}
+
+/// Encode `name` + an optional `RecordBatch`. `None` or a zero-row batch over
+/// the view's output schema still round-trips; absence is encoded as a schema-
+/// only IPC stream (zero data rows) so the schema is never lost.
+fn encode_named_batch_optional(
+    out: &mut Vec<u8>,
+    name: &str,
+    batch: Option<&RecordBatch>,
+    view: &krishiv_delta::IncrementalView,
+) -> IvmResult<()> {
+    let to_encode = match batch {
+        Some(b) if b.num_rows() > 0 => b.clone(),
+        _ => empty_batch_for_view(view)?,
+    };
+    encode_named_batch(out, name, &to_encode)
+}
+
+fn decode_named_batch(bytes: &[u8], pos: &mut usize) -> IvmResult<(String, RecordBatch)> {
+    let name = decode_name(bytes, pos)?;
+    let batch = decode_one_ipc(bytes, pos)?;
+    Ok((name, batch))
+}
+
+fn decode_named_batch_opt(
+    bytes: &[u8],
+    pos: &mut usize,
+) -> IvmResult<(String, Option<RecordBatch>)> {
+    let name = decode_name(bytes, pos)?;
+    let batch = decode_one_ipc(bytes, pos)?;
+    // A schema-only / zero-row batch encodes "no prior state".
+    let opt = if batch.num_rows() == 0 {
+        None
+    } else {
+        Some(batch)
+    };
+    Ok((name, opt))
+}
+
+fn decode_name(bytes: &[u8], pos: &mut usize) -> IvmResult<String> {
+    let name_len = read_u32(bytes, pos)? as usize;
+    let name = std::str::from_utf8(bytes.get(*pos..*pos + name_len).ok_or_else(slice_err)?)
+        .map_err(|e| IvmError::execution(e.to_string()))?
+        .to_string();
+    *pos += name_len;
+    Ok(name)
+}
+
+fn decode_one_ipc(bytes: &[u8], pos: &mut usize) -> IvmResult<RecordBatch> {
+    let ipc_len = read_u32(bytes, pos)? as usize;
+    let ipc = bytes.get(*pos..*pos + ipc_len).ok_or_else(slice_err)?;
+    *pos += ipc_len;
+    decode_record_batch_ipc(ipc)
+}
+
+fn encode_record_batch_ipc(batch: &RecordBatch) -> IvmResult<Vec<u8>> {
+    use arrow::ipc::writer::StreamWriter;
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
+            .map_err(|e| IvmError::execution(e.to_string()))?;
+        writer
+            .write(batch)
+            .map_err(|e| IvmError::execution(e.to_string()))?;
+        writer
+            .finish()
+            .map_err(|e| IvmError::execution(e.to_string()))?;
+    }
+    Ok(buf)
+}
+
+fn decode_record_batch_ipc(bytes: &[u8]) -> IvmResult<RecordBatch> {
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|e| IvmError::execution(e.to_string()))?;
+    reader
+        .next()
+        .ok_or_else(|| IvmError::execution("empty IPC stream in checkpoint_full"))?
+        .map_err(|e| IvmError::execution(e.to_string()))
+}
+
+fn empty_batch_for_view(view: &krishiv_delta::IncrementalView) -> IvmResult<RecordBatch> {
+    let schema = view.spec.output_schema.clone();
+    let cols: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| arrow::array::new_empty_array(f.data_type()))
+        .collect();
+    RecordBatch::try_new(schema, cols).map_err(|e| IvmError::execution(e.to_string()))
+}
+
+// ── Batch-map framing (executor → coordinator result return) ──────────────────
+
+/// Encode a `name → RecordBatch` map as a length-framed binary blob.
 ///
-/// Format: `delta:step:{job_id}|{pending_deltas_json}|{view_specs_json}`
+/// Used to return per-view full outputs from a stateless executor tick back to
+/// the authoritative coordinator. Format:
+/// `u32 count || (u32 name_len || name || u32 ipc_len || arrow_ipc)*`
+pub fn encode_batch_map(map: &HashMap<String, RecordBatch>) -> IvmResult<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    for (name, batch) in map {
+        encode_named_batch(&mut out, name, batch)?;
+    }
+    Ok(out)
+}
+
+/// Decode a blob produced by [`encode_batch_map`] back into a map.
+pub fn decode_batch_map(bytes: &[u8]) -> IvmResult<HashMap<String, RecordBatch>> {
+    let mut pos = 0usize;
+    let n = read_u32(bytes, &mut pos)? as usize;
+    let mut map = HashMap::with_capacity(n);
+    for _ in 0..n {
+        let (name, batch) = decode_named_batch(bytes, &mut pos)?;
+        map.insert(name, batch);
+    }
+    Ok(map)
+}
+
+// ── Fragment encoding helpers (coordinator-authoritative executor dispatch) ───
+
+/// Encode a coordinator-authoritative IVM dispatch fragment.
 ///
-/// The resulting string can be dispatched to an executor that runs
-/// `execute_ivm_fragment` to perform the SQL step remotely.
+/// Format: `delta:step:{job_id}|{deltas_b64}|{specs_b64}|{state_b64}`
+///
+/// Each `|`-separated payload part is **base64-encoded**, so a `|` inside a
+/// SQL string literal in `body_sql` cannot corrupt the framing. `state_b64`
+/// is the base64 of [`IncrementalFlow::checkpoint_full`]; the executor restores
+/// it into a transient flow so the remote tick sees correct source snapshots
+/// and view baselines.
 pub fn encode_ivm_step_fragment(
     job_id: &str,
     pending: &HashMap<String, DeltaBatch>,
     specs: &[IncrementalViewSpec],
+    state_bytes: &[u8],
 ) -> IvmResult<String> {
     use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
 
-    // Encode deltas as JSON array of {source, delta_b64}.
     let delta_entries: Vec<serde_json::Value> = pending
         .iter()
         .map(|(source, delta)| {
             let ipc = serialize_delta_batch(delta).map_err(delta_err)?;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&ipc);
-            Ok(serde_json::json!({ "source": source, "delta_b64": b64 }))
+            let enc = b64.encode(&ipc);
+            Ok(serde_json::json!({ "source": source, "delta_b64": enc }))
         })
         .collect::<IvmResult<_>>()?;
     let deltas_json =
         serde_json::to_string(&delta_entries).map_err(|e| IvmError::execution(e.to_string()))?;
+    let deltas_b64 = b64.encode(deltas_json);
 
-    // Encode view specs as JSON array.
     let spec_entries: Vec<serde_json::Value> = specs
         .iter()
         .map(|s| {
@@ -1281,14 +1576,20 @@ pub fn encode_ivm_step_fragment(
         .collect();
     let specs_json =
         serde_json::to_string(&spec_entries).map_err(|e| IvmError::execution(e.to_string()))?;
+    let specs_b64 = b64.encode(specs_json);
 
-    Ok(format!("delta:step:{job_id}|{deltas_json}|{specs_json}"))
+    let state_b64 = b64.encode(state_bytes);
+
+    Ok(format!(
+        "delta:step:{job_id}|{deltas_b64}|{specs_b64}|{state_b64}"
+    ))
 }
 
 // ── Integration tests (3d) ────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod integration_tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow::array::{Int32Array, RecordBatch};
@@ -1457,5 +1758,229 @@ mod integration_tests {
         let restored = deserialize_delta_batch(&bytes).unwrap();
         assert_eq!(restored.num_rows(), 1);
         assert_eq!(restored.weights().value(0), 1);
+    }
+
+    // ── coordinator-authoritative distributed IVM ──────────────────────────────
+
+    use arrow::array::Float64Array;
+
+    fn sales_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Float64,
+            false,
+        )]))
+    }
+
+    fn sales_batch(amounts: &[f64]) -> RecordBatch {
+        RecordBatch::try_new(
+            sales_schema(),
+            vec![Arc::new(Float64Array::from(amounts.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    fn sum_view_spec() -> krishiv_delta::IncrementalViewSpec {
+        krishiv_delta::IncrementalViewSpec {
+            name: "total_sales".into(),
+            body_sql: "SELECT SUM(amount) AS total FROM sales".into(),
+            output_schema: Arc::new(Schema::new(vec![Field::new(
+                "total",
+                DataType::Float64,
+                true,
+            )])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        }
+    }
+
+    fn sum_total(flow: &IncrementalFlow) -> f64 {
+        let snap = flow
+            .snapshot("total_sales")
+            .unwrap()
+            .expect("materialized snapshot must exist after step");
+        snap.column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    fn empty_view_batch(schema: &arrow::datatypes::SchemaRef) -> RecordBatch {
+        let cols: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|f| arrow::array::new_empty_array(f.data_type()))
+            .collect();
+        RecordBatch::try_new(schema.clone(), cols).unwrap()
+    }
+
+    /// `checkpoint_full` → `restore_full` must preserve view baselines so that a
+    /// transient (executor) flow computes the same next tick as the source flow.
+    #[tokio::test]
+    async fn checkpoint_full_restore_full_preserves_view_baseline() {
+        let flow = IncrementalFlow::new();
+        flow.register_view(sum_view_spec()).unwrap();
+        flow.feed(
+            "sales",
+            DeltaBatch::from_inserts(sales_batch(&[100.0, 200.0, 50.0])).unwrap(),
+        )
+        .unwrap();
+        flow.step_datafusion().await.unwrap();
+        assert!((sum_total(&flow) - 350.0).abs() < 1e-9);
+
+        // Capture full state and seed a fresh flow.
+        let state = flow.checkpoint_full().unwrap();
+        let remote = IncrementalFlow::new();
+        remote.register_view(sum_view_spec()).unwrap();
+        remote.restore_full(&state).unwrap();
+        // Mirror the executor: DiffBased only (no transferable plan accumulators).
+        remote.force_diff_based().unwrap();
+
+        // Both see the same next-tick result for the same delta.
+        let delta = DeltaBatch::from_inserts(sales_batch(&[25.0, 10.0])).unwrap();
+        flow.feed("sales", delta.clone()).unwrap();
+        remote.feed("sales", delta).unwrap();
+        flow.step_datafusion().await.unwrap();
+        remote.step_datafusion().await.unwrap();
+
+        assert!(
+            (sum_total(&flow) - 385.0).abs() < 1e-9,
+            "central total wrong"
+        );
+        assert!(
+            (sum_total(&remote) - 385.0).abs() < 1e-9,
+            "restored-flow total must match central after one tick"
+        );
+    }
+
+    /// The coordinator-authoritative offload protocol (drain → checkpoint_full →
+    /// remote compute → apply_computed_tick) must leave the authoritative flow
+    /// identical to a plain central `step_datafusion`. This is the core
+    /// correctness guarantee for distributed delta batch: no divergence, no
+    /// baseline drift, real `StepSummary`, correct snapshot.
+    #[tokio::test]
+    async fn apply_computed_tick_matches_central_step() {
+        let setup = |flow: &IncrementalFlow| {
+            flow.register_view(sum_view_spec()).unwrap();
+            flow.feed(
+                "sales",
+                DeltaBatch::from_inserts(sales_batch(&[100.0, 200.0, 50.0])).unwrap(),
+            )
+            .unwrap();
+        };
+
+        // Baseline tick 1 (identical on both flows).
+        let central = IncrementalFlow::new();
+        let auth = IncrementalFlow::new();
+        setup(&central);
+        setup(&auth);
+        central.step_datafusion().await.unwrap();
+        auth.step_datafusion().await.unwrap();
+        assert!((sum_total(&central) - 350.0).abs() < 1e-9);
+        assert!((sum_total(&auth) - 350.0).abs() < 1e-9);
+        let baseline_tick = auth.tick().unwrap();
+
+        // Tick 2: feed the same delta on both.
+        let delta = DeltaBatch::from_inserts(sales_batch(&[25.0, 10.0])).unwrap();
+        central.feed("sales", delta.clone()).unwrap();
+        auth.feed("sales", delta).unwrap();
+
+        // Central computes tick 2 directly.
+        let central_summary = central.step_datafusion().await.unwrap();
+
+        // Authoritative offload: drain pending, snapshot state, run a transient
+        // remote tick, then apply the returned outputs.
+        let local_pending = auth.take_pending().unwrap();
+        let state = auth.checkpoint_full().unwrap();
+        let specs = auth.view_specs().unwrap();
+
+        // Simulate the stateless executor: fresh flow, restore, feed, step.
+        let remote = IncrementalFlow::new();
+        for spec in &specs {
+            remote.register_view(spec.clone()).unwrap();
+        }
+        remote.restore_full(&state).unwrap();
+        // Mirror the executor: force DiffBased (no incremental-plan accumulators).
+        remote.force_diff_based().unwrap();
+        for (src, batches) in &local_pending {
+            for b in batches {
+                remote.feed(src, b.clone()).unwrap();
+            }
+        }
+        let remote_summary = remote.step_datafusion().await.unwrap();
+        let mut view_outputs: HashMap<String, RecordBatch> = HashMap::new();
+        for spec in &specs {
+            let snap = remote
+                .snapshot(&spec.name)
+                .unwrap()
+                .unwrap_or_else(|| empty_view_batch(&spec.output_schema));
+            view_outputs.insert(spec.name.clone(), snap);
+        }
+
+        // Apply the remote result to the authoritative flow.
+        let applied_summary = auth
+            .apply_computed_tick(local_pending, view_outputs)
+            .unwrap();
+
+        // The authoritative flow now matches the central flow exactly.
+        assert!(
+            (sum_total(&auth) - 385.0).abs() < 1e-9,
+            "authoritative total {} != 385",
+            sum_total(&auth)
+        );
+        assert!(
+            (sum_total(&auth) - sum_total(&central)).abs() < 1e-9,
+            "authoritative total must equal central total"
+        );
+        assert_eq!(
+            auth.tick().unwrap(),
+            baseline_tick + 1,
+            "apply_computed_tick must advance the tick exactly once"
+        );
+        assert_eq!(
+            auth.tick().unwrap(),
+            central.tick().unwrap(),
+            "tick counts must match"
+        );
+        // Real summaries (not fabricated zeros): the remote tick produced output.
+        assert_eq!(
+            remote_summary.total_output_rows, applied_summary.total_output_rows,
+            "applied summary must reflect the real remote output row count"
+        );
+    }
+
+    /// A failed offload that re-feeds pending must leave the flow able to compute
+    /// centrally with the same input (no data loss).
+    #[tokio::test]
+    async fn re_feed_restores_pending_for_central_fallback() {
+        let flow = IncrementalFlow::new();
+        flow.register_view(sum_view_spec()).unwrap();
+        flow.feed(
+            "sales",
+            DeltaBatch::from_inserts(sales_batch(&[10.0])).unwrap(),
+        )
+        .unwrap();
+        flow.step_datafusion().await.unwrap();
+
+        // Drain, then simulate a failed dispatch by re-feeding.
+        let pending = flow.take_pending().unwrap();
+        assert!(pending.is_empty(), "nothing pending right after a step");
+        flow.feed(
+            "sales",
+            DeltaBatch::from_inserts(sales_batch(&[5.0])).unwrap(),
+        )
+        .unwrap();
+        let pending = flow.take_pending().unwrap();
+        assert_eq!(pending.len(), 1, "one source pending after feed");
+        flow.re_feed(pending).unwrap();
+        // Central fallback now sees the re-fed pending and computes correctly.
+        flow.step_datafusion().await.unwrap();
+        assert!(
+            (sum_total(&flow) - 15.0).abs() < 1e-9,
+            "central fallback after re_feed must total 15"
+        );
     }
 }

@@ -487,9 +487,49 @@ impl Coordinator {
                     .unwrap_or_default();
                 if !stats.is_empty() && stats.iter().any(|s| s.serialized_bytes > 0) {
                     let aqe = krishiv_plan::optimizer::default_aqe_optimizer();
-                    let placeholder = krishiv_plan::PhysicalPlan::new(
+                    // T1: synthesize a minimal physical plan from the stats
+                    // so the AQE rules have at least one node to rewrite.
+                    // The scheduler doesn't preserve the original physical
+                    // plan at stage-succeeded time, so the AQE could only
+                    // previously fire on the empty placeholder, leaving
+                    // every rule (Coalesce, AutoPartition, Broadcast) as a
+                    // no-op. The synthesised plan carries one Exchange node
+                    // per stat so the rules' `plan.nodes()` walks observe
+                    // real data and the coalesce hint can be computed.
+                    let mut placeholder = krishiv_plan::PhysicalPlan::new(
                         job_id.as_str(),
                         krishiv_plan::ExecutionKind::Batch,
+                    );
+                    let output_count = stats.len() as u32;
+                    for (i, s) in stats.iter().enumerate() {
+                        use krishiv_plan::{NodeOp, Partitioning, PlanNode};
+                        let node = PlanNode::new(
+                            format!("aqe-shuffle-{i}"),
+                            format!("aqe-shuffle-{i}"),
+                            krishiv_plan::ExecutionKind::Batch,
+                        )
+                        .with_op(NodeOp::Exchange {
+                            partitioning: Partitioning::Hash {
+                                keys: vec![format!("k{i}")],
+                                buckets: output_count.max(1),
+                            },
+                        })
+                        .with_estimated_rows(Some(s.output_rows.max(1)));
+                        placeholder.add_node(node);
+                    }
+                    // A sink node so the rules' `terminal_indexes` check passes.
+                    use krishiv_plan::{NodeOp, PlanNode};
+                    let sink_id = "aqe-sink".to_string();
+                    placeholder.add_node(
+                        PlanNode::new(&sink_id, "aqe-sink", krishiv_plan::ExecutionKind::Batch)
+                            .with_op(NodeOp::Sink {
+                                format: "arrow".to_string(),
+                            })
+                            .with_inputs(
+                                (0..stats.len())
+                                    .map(|i| format!("aqe-shuffle-{i}"))
+                                    .collect::<Vec<_>>(),
+                            ),
                     );
                     match aqe.apply(placeholder, &stats) {
                         Ok((plan, applied)) if !applied.is_empty() => {
@@ -577,6 +617,18 @@ impl Coordinator {
                 self.job_inline_results.remove(&job_id);
             }
             self.queue_manager.on_job_complete(&job_id, &usage);
+
+            // SC13: append a `JobCompleted` event to the event log so the
+            // History Server can render a complete lifecycle. The
+            // `final_state` is a serialised string so the History
+            // Server doesn't have to re-resolve `JobState` variants.
+            if let Some(store) = &self.store {
+                let mut guard = store.inner();
+                let _ = guard.append_event(EventLogEvent::JobCompleted {
+                    job_id: job_id.clone(),
+                    final_state: state.to_string(),
+                });
+            }
 
             // Archive an immutable history record before the job is evicted.
             if let Some(jc) = self.job_coordinators.get(&job_id) {

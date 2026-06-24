@@ -2441,12 +2441,24 @@ fn df_plan_to_krishiv_nodes(
                 df_plan_to_krishiv_nodes(&join.right, table_row_counts, counter);
             nodes.extend(right_nodes);
             let id = format!("join-{idx}");
+            // T2: map every DataFusion join variant to its first-class plan
+            // counterpart instead of silently downgrading unknowns to `Inner`.
+            // `LeftSemi`/`RightSemi`/`LeftAnti`/`RightAnti` are the variants
+            // that were previously collapsed.
             let krishiv_join_type = match join.join_type {
                 datafusion::common::JoinType::Inner => krishiv_plan::JoinType::Inner,
                 datafusion::common::JoinType::Left => krishiv_plan::JoinType::Left,
                 datafusion::common::JoinType::Right => krishiv_plan::JoinType::Right,
                 datafusion::common::JoinType::Full => krishiv_plan::JoinType::Full,
-                _ => krishiv_plan::JoinType::Inner,
+                datafusion::common::JoinType::LeftSemi => krishiv_plan::JoinType::LeftSemi,
+                datafusion::common::JoinType::RightSemi => krishiv_plan::JoinType::RightSemi,
+                datafusion::common::JoinType::LeftAnti => krishiv_plan::JoinType::LeftAnti,
+                datafusion::common::JoinType::RightAnti => krishiv_plan::JoinType::RightAnti,
+                // DataFusion also exposes `LeftMark`/`RightMark` for some
+                // subquery-rewritten plans; treat them as Semi for now to
+                // preserve the prior behaviour. Future work can split them.
+                datafusion::common::JoinType::LeftMark => krishiv_plan::JoinType::LeftSemi,
+                datafusion::common::JoinType::RightMark => krishiv_plan::JoinType::RightSemi,
             };
             nodes.push(
                 PlanNode::new(&id, "Join", ExecutionKind::Batch)

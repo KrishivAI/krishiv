@@ -119,14 +119,32 @@ impl PlanSchema {
 }
 
 /// Join variant used in `NodeOp::Join`.
+///
+/// T2 (Spark parity): `LeftSemi`/`RightSemi`/`LeftAnti`/`RightAnti` were
+/// previously collapsed to `Inner` when the public `krishiv_api::JoinType`
+/// was lowered to the plan layer. They are now first-class variants.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum JoinType {
     Inner,
     Left,
     Right,
     Full,
+    /// Left semi-join — rows from the left input that have at least one match
+    /// in the right input.
     Semi,
+    /// Anti-join — rows from the left input that have no match in the right.
+    /// (Originally symmetric; preserved for back-compat.)
     Anti,
+    /// Left semi-join variant (Spark parity). Equivalent to `Semi` for the
+    /// left input; distinguished to match the public API and DataFusion's
+    /// 7-variant join enum.
+    LeftSemi,
+    /// Right semi-join variant (Spark parity). Mirror of `LeftSemi`.
+    RightSemi,
+    /// Left anti-join variant (Spark parity).
+    LeftAnti,
+    /// Right anti-join variant (Spark parity).
+    RightAnti,
     /// Cartesian product — no join predicate (E2.3).
     Cross,
     /// Nested-loop join; used for non-equi predicates (E2.3).
@@ -832,6 +850,41 @@ mod tests {
 
         assert!(description.contains("logical plan: demo"));
         assert!(description.contains("scan parquet"));
+    }
+
+    /// T2: every public API `JoinType` must have a first-class plan counterpart
+    /// (T2 — was previously collapsed to `Inner` for the four semi/anti
+    /// variants).
+    #[test]
+    fn join_type_variants_are_distinct() {
+        let all = [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+            JoinType::LeftSemi,
+            JoinType::RightSemi,
+            JoinType::LeftAnti,
+            JoinType::RightAnti,
+            JoinType::Cross,
+            JoinType::NestedLoop,
+        ];
+        // The four variants added in T2 must be distinct from `Inner`,
+        // `Semi`, and `Anti` so a JSON round-trip preserves the join kind.
+        assert_ne!(JoinType::LeftSemi, JoinType::Inner);
+        assert_ne!(JoinType::RightSemi, JoinType::Inner);
+        assert_ne!(JoinType::LeftAnti, JoinType::Inner);
+        assert_ne!(JoinType::RightAnti, JoinType::Inner);
+        assert_ne!(JoinType::LeftSemi, JoinType::Semi);
+        assert_ne!(JoinType::LeftAnti, JoinType::Anti);
+        // All variants must be unique among themselves.
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "{a:?} and {b:?} must be distinct");
+            }
+        }
     }
 
     #[test]

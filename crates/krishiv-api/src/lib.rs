@@ -70,8 +70,8 @@ pub use query::{QueryCompletion, QueryHandle, QueryId, QueryProgress, QueryStatu
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
 pub use streaming_builder::{
-    DataStreamReader, DataStreamWriter, ForeachBatchFn, StreamingOutputMode, StreamingQuery,
-    StreamingQueryProgress, StreamingTrigger,
+    DataStreamReader, DataStreamWriter, ForeachBatchFn, KafkaTransactionalConfig,
+    StreamingOutputMode, StreamingQuery, StreamingQueryProgress, StreamingTrigger,
 };
 pub use streaming_dataframe::{
     KrishivStream, NamedSideOutputStream, StreamingDataFrame, StreamingOutputStreams,

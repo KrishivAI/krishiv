@@ -479,12 +479,25 @@ async fn execute_shuffle_write_fragment(
             schema,
             batches: part_batches,
         };
+        // T19: capture the row count before `part_batches` is moved into
+        // the partition object below.
+        let rows_written: u64 = partition.batches.iter().map(|b| b.num_rows() as u64).sum();
+
+        // T19: time the shuffle write and increment the bytes / rows /
+        // time counters. The `write_partition` call is async; we measure
+        // wall-clock around it so the metric reflects end-to-end write
+        // time (serialise + IO).
+        let write_started = std::time::Instant::now();
         ctx.store
             .write_partition(partition, lease_token)
             .await
             .map_err(|e| ExecutorError::LocalExecution {
                 message: format!("shuffle write failed for partition {p}: {e}"),
             })?;
+        let write_elapsed_us = write_started.elapsed().as_micros() as u64;
+        krishiv_metrics::global_metrics().add_shuffle_bytes_written(size_bytes);
+        krishiv_metrics::global_metrics().add_shuffle_records_written(rows_written);
+        krishiv_metrics::global_metrics().add_shuffle_write_time_us(write_elapsed_us);
         outputs.push(krishiv_proto::ShufflePartitionOutput::new(
             p,
             size_bytes,
@@ -634,6 +647,11 @@ async fn execute_inmem_shuffle_read(
         partition: read_cfg.partition_id as u32,
     };
 
+    // T19: time the shuffle read and increment the bytes / rows / time
+    // counters. Local reads (`store.read_partition`) are intra-process;
+    // we count them as `local_blocks_fetched`.
+    let read_started = std::time::Instant::now();
+    let fetch_started = std::time::Instant::now();
     let partition = store
         .read_partition(&id)
         .await
@@ -643,9 +661,20 @@ async fn execute_inmem_shuffle_read(
                 read_cfg.partition_id
             ),
         })?;
+    let fetch_wait_us = fetch_started.elapsed().as_micros() as u64;
 
     let batches = partition.map(|p| p.batches).unwrap_or_default();
     let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let bytes_read: u64 = batches
+        .iter()
+        .map(|b| b.get_array_memory_size() as u64)
+        .sum();
+    let read_elapsed_us = read_started.elapsed().as_micros() as u64;
+    krishiv_metrics::global_metrics().add_shuffle_read_bytes(bytes_read);
+    krishiv_metrics::global_metrics().add_shuffle_read_records(row_count as u64);
+    krishiv_metrics::global_metrics().add_shuffle_read_time_us(read_elapsed_us);
+    krishiv_metrics::global_metrics().add_shuffle_fetch_wait_time_us(fetch_wait_us);
+    krishiv_metrics::global_metrics().add_shuffle_local_blocks_fetched(1);
     let batch_count = batches.len();
     let column_count = batches.first().map_or(0, |b| b.num_columns());
 

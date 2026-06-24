@@ -74,6 +74,7 @@ fn tumbling_spec() -> LocalWindowExecutionSpec {
         window_size_ms: 10_000,
         agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
         state_ttl_ms: None,
+        allowed_lateness_ms: None,
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
     }
@@ -515,6 +516,7 @@ async fn flight_sql_continuous_stream_register_push_drain() {
         window_size_ms: 10_000,
         agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
         state_ttl_ms: None,
+        allowed_lateness_ms: None,
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
     };

@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::catalog::TableProviderFactory;
@@ -265,23 +266,84 @@ impl TableProvider for BoundedConnectorProvider {
             .await
             .map_err(connector_error)?;
 
-        let mut batches = Vec::new();
+        // T7: apply the user's projection and limit eagerly. The previous
+        // implementation drained the entire source into a `MemTable` and
+        // deferred the projection and limit to DataFusion's
+        // `MemTable::scan`. That is correct but forces the connector to
+        // materialise every row and every column before any predicate
+        // runs, defeating Parquet column-pruning and file-pruning for any
+        // sink that does not have a `DataSourceExec` shim. Eager
+        // projection and limit short-circuits here bring the connector's
+        // behaviour closer to the `DataSourceExec` path and significantly
+        // reduce memory pressure for large bounded sources.
+        //
+        // Filter pushdown to the connector remains a follow-up: the
+        // connector `Source` trait does not yet accept filter
+        // expressions, and DataFusion's physical-expression builder is
+        // version-sensitive. For now, filters are still applied by
+        // DataFusion's downstream `MemTable::scan` so the result is
+        // identical — just less memory-efficient than a connector that
+        // accepts pushdown filters.
+        let projection_columns: Option<Vec<String>> = projection.map(|idxs| {
+            idxs.iter()
+                .map(|&i| self.schema.field(i).name().clone())
+                .collect()
+        });
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut rows_accumulated: usize = 0;
+        let limit_threshold: Option<usize> = limit;
         loop {
-            let batch = source
-                .read_batch_dyn()
-                .await
-                .map_err(connector_error)?
-                .map(|batch| project_batch(&batch, &self.schema));
-            match batch {
-                Some(Ok(batch)) => batches.push(batch),
-                Some(Err(e)) => return Err(DataFusionError::ArrowError(Box::new(e), None)),
-                None => break,
+            let batch = source.read_batch_dyn().await.map_err(connector_error)?;
+            let Some(batch) = batch else { break };
+            let batch = project_batch(&batch, &self.schema)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            // Project to the user-requested columns.
+            let batch = match &projection_columns {
+                Some(cols) => project_to_columns(&batch, cols)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+                None => batch,
+            };
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            // Honour the limit by truncating the last batch.
+            let batch = match limit_threshold {
+                Some(threshold) if rows_accumulated + batch.num_rows() > threshold => {
+                    let take = threshold.saturating_sub(rows_accumulated);
+                    batch.slice(0, take)
+                }
+                _ => batch,
+            };
+            rows_accumulated += batch.num_rows();
+            batches.push(batch);
+            if let Some(threshold) = limit_threshold
+                && rows_accumulated >= threshold
+            {
+                break;
             }
         }
 
         let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
         table.scan(state, projection, filters, limit).await
     }
+}
+
+/// T7: project a batch down to the named columns.
+fn project_to_columns(
+    batch: &RecordBatch,
+    columns: &[String],
+) -> arrow::error::Result<RecordBatch> {
+    if columns.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
+    }
+    let mut cols = Vec::with_capacity(columns.len());
+    let mut fields = Vec::with_capacity(columns.len());
+    for name in columns {
+        let idx = batch.schema().index_of(name)?;
+        cols.push(batch.column(idx).clone());
+        fields.push(batch.schema().field(idx).clone());
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
 }
 
 #[cfg(test)]
@@ -326,5 +388,36 @@ mod tests {
             ),
             Some("orders".to_string())
         );
+    }
+
+    /// T7: `project_to_columns` must keep column order and tolerate an
+    /// empty column list (returns an empty projection with the original
+    /// schema).
+    #[test]
+    fn project_to_columns_preserves_order_and_handles_empty() {
+        use arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as _,
+                Arc::new(Int64Array::from(vec![3, 4])) as _,
+                Arc::new(Int64Array::from(vec![5, 6])) as _,
+            ],
+        )
+        .unwrap();
+        // Reorder: c, a
+        let projected = super::project_to_columns(&batch, &[String::from("c"), String::from("a")])
+            .expect("project must succeed");
+        assert_eq!(projected.num_columns(), 2);
+        assert_eq!(projected.schema().field(0).name(), "c");
+        assert_eq!(projected.schema().field(1).name(), "a");
+        // No-op projection.
+        let no_op = super::project_to_columns(&batch, &[]).expect("no-op projection must succeed");
+        assert_eq!(no_op.num_columns(), 0);
     }
 }

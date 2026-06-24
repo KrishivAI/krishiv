@@ -63,6 +63,13 @@ pub struct WindowExecutionSpec {
     pub session_gap_ms: Option<u64>,
     pub agg_exprs: Vec<WindowAgg>,
     pub state_ttl_ms: Option<u64>,
+    /// ST11: events arriving within `[watermark, watermark + allowed_lateness_ms)`
+    /// are kept for late-firing instead of being dropped. Defaults to
+    /// `None` (no lateness — events past the watermark are dropped).
+    /// When `Some(0)` the behaviour is identical to `None` (drop on
+    /// arrival past the watermark).
+    #[serde(default)]
+    pub allowed_lateness_ms: Option<u64>,
     /// Per-source fixed-lag watermark (ms). When non-empty, effective watermark is the
     /// minimum across all configured sources (R5.2 multi-source reconciliation).
     #[serde(default)]
@@ -97,6 +104,7 @@ impl WindowExecutionSpec {
             session_gap_ms: None,
             agg_exprs: Self::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         }
@@ -149,6 +157,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
         session_gap_ms,
         agg_exprs: vec![parsed.agg],
         state_ttl_ms: parsed.ttl_ms,
+        allowed_lateness_ms: None,
         source_watermark_lags: parsed.source_watermark_lags,
         source_id_column: parsed.source_id_column,
     };
@@ -223,6 +232,22 @@ pub fn validate_window_execution_spec(spec: &WindowExecutionSpec) -> Result<(), 
     if spec.state_ttl_ms == Some(0) {
         return Err(PlanError::Validation(String::from(
             "window state_ttl_ms must be greater than zero",
+        )));
+    }
+    // ST11: `allowed_lateness_ms = Some(0)` is equivalent to `None` and
+    // is rejected here so the spec round-trips cleanly. `Some(n)` for
+    // `n > 0` is accepted; values larger than `u64::MAX / 2` are
+    // rejected to keep `watermark + allowed_lateness` additions safe.
+    if let Some(0) = spec.allowed_lateness_ms {
+        return Err(PlanError::Validation(String::from(
+            "window allowed_lateness_ms must be greater than zero (use None to disable)",
+        )));
+    }
+    if let Some(lat) = spec.allowed_lateness_ms
+        && lat > u64::MAX / 2
+    {
+        return Err(PlanError::Validation(String::from(
+            "window allowed_lateness_ms is implausibly large",
         )));
     }
     if spec.agg_exprs.is_empty() {
@@ -673,6 +698,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![WindowAgg::count("count")],
             state_ttl_ms: Some(30_000),
+            allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         };
@@ -707,6 +733,7 @@ mod tests {
                 },
             ],
             state_ttl_ms: Some(600_000),
+            allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some(String::from("source")),
         };
@@ -770,6 +797,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![WindowAgg::count("count")],
             state_ttl_ms: Some(600_000),
+            allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some("source_id".into()),
         };
@@ -819,6 +847,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![WindowAgg::count("count")],
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         };
@@ -841,10 +870,12 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![WindowAgg::count("count")],
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         };
         let frag = encode_stream_fragment(&spec).unwrap();
+        let parsed = parse_stream_fragment(&frag).expect("parse escaped fragment");
         let parsed = parse_stream_fragment(&frag).expect("parse escaped backslash");
         assert_eq!(parsed.key_col, "path\\to");
     }
@@ -864,6 +895,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![WindowAgg::count("count")],
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some("src:col".into()),
         };
@@ -946,6 +978,7 @@ mod tests {
                         session_gap_ms,
                         agg_exprs,
                         state_ttl_ms,
+                        allowed_lateness_ms: None,
                         source_watermark_lags: HashMap::new(),
                         source_id_column: None,
                     },
@@ -986,5 +1019,35 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod allowed_lateness_tests {
+    use super::*;
+
+    /// ST11: `allowed_lateness_ms` defaults to `None` (no lateness) on
+    /// the `tumbling` constructor and is accepted as a positive value
+    /// by the validator.
+    #[test]
+    fn allowed_lateness_defaults_to_none_and_validates_positive_value() {
+        let spec = WindowExecutionSpec::tumbling("k", "ts", 1_000);
+        assert_eq!(spec.allowed_lateness_ms, None);
+        validate_window_execution_spec(&spec).expect("default spec is valid");
+
+        let mut with_lat = spec.clone();
+        with_lat.allowed_lateness_ms = Some(2_000);
+        validate_window_execution_spec(&with_lat).expect("positive allowed_lateness_ms is valid");
+    }
+
+    /// ST11: `Some(0)` is rejected by the validator so a round-trip
+    /// through `encode_window_execution_spec` cannot store a zero
+    /// lateness that would be indistinguishable from `None` on read.
+    #[test]
+    fn allowed_lateness_zero_is_rejected() {
+        let mut spec = WindowExecutionSpec::tumbling("k", "ts", 1_000);
+        spec.allowed_lateness_ms = Some(0);
+        let err = validate_window_execution_spec(&spec).unwrap_err();
+        assert!(format!("{err}").contains("allowed_lateness_ms"));
     }
 }

@@ -5,7 +5,7 @@ use crate::io::TaskSpec;
 use crate::lifecycle::JobKind;
 
 /// Job submission contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JobSpec {
     job_id: JobId,
     name: String,
@@ -142,7 +142,7 @@ impl JobSpec {
 }
 
 /// Stage contract inside a job.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StageSpec {
     stage_id: StageId,
     name: String,

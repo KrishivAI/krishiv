@@ -128,6 +128,31 @@ impl ExecutorRegistry {
         Ok(())
     }
 
+    /// Mark an executor as Draining (T13 / SC5).
+    ///
+    /// `EXECUTOR_DECOMMISSION_SIGNAL` semantics: the executor should finish
+    /// its current work, receive no new task assignments, and serve shuffle
+    /// fetches for an additional `decom_grace_ticks` so in-flight consumers
+    /// can still pull data after the executor's tasks have finished.
+    ///
+    /// The function is idempotent: calling it on an already-Draining or
+    /// Lost executor is a no-op and returns the current `lease_generation`.
+    /// The scheduler task-assignment path checks
+    /// `ExecutorState::can_accept_work()` and therefore naturally excludes
+    /// Draining executors from new launches.
+    pub fn drain_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<LeaseGeneration> {
+        let executor = self.find_executor_mut(executor_id)?;
+        match executor.state {
+            ExecutorState::Draining | ExecutorState::Removed | ExecutorState::Lost => {
+                Ok(executor.lease_generation)
+            }
+            _ => {
+                executor.state = ExecutorState::Draining;
+                Ok(executor.lease_generation)
+            }
+        }
+    }
+
     /// Advance the deterministic heartbeat clock.
     pub fn advance_clock(&mut self, ticks: u64) -> Vec<ExecutorId> {
         self.current_tick = self.current_tick.saturating_add(ticks);
@@ -445,5 +470,62 @@ impl ExecutorHeartbeatAge {
     /// Heartbeat age in deterministic scheduler ticks.
     pub fn age_ticks(&self) -> u64 {
         self.age_ticks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krishiv_proto::{ExecutorId, ExecutorState};
+
+    fn make_descriptor(id: &str) -> ExecutorDescriptor {
+        ExecutorDescriptor::new(
+            ExecutorId::try_new(id).expect("id"),
+            "test-host".to_string(),
+            4,
+        )
+    }
+
+    #[test]
+    fn drain_executor_transitions_to_draining_and_is_idempotent() {
+        let mut registry = ExecutorRegistry::new(64, None);
+        let id = ExecutorId::try_new("executor-1").expect("id");
+        let gen0 = registry
+            .register(make_descriptor("executor-1"))
+            .expect("register");
+        // Simulate the heartbeat path: the executor transitions to Healthy
+        // after the first heartbeat.
+        registry
+            .heartbeat(ExecutorHeartbeat::new(id.clone(), ExecutorState::Healthy))
+            .expect("heartbeat");
+        assert_eq!(
+            registry.find_executor(&id).unwrap().state(),
+            ExecutorState::Healthy
+        );
+
+        // T13: first drain transitions to Draining. The drain is
+        // idempotent on the lease — it does not advance the generation
+        // because the existing tasks on the executor should keep running
+        // under the same lease. Generation advance happens later via the
+        // normal `mark_lost` / `register_again` path.
+        let gen1 = registry.drain_executor(&id).expect("first drain");
+        assert_eq!(gen1, gen0, "drain must NOT advance the lease generation");
+        assert_eq!(
+            registry.find_executor(&id).unwrap().state(),
+            ExecutorState::Draining
+        );
+        // `can_accept_work` returns false for Draining — task assignment
+        // naturally excludes the executor.
+        assert!(
+            !registry
+                .find_executor(&id)
+                .unwrap()
+                .state()
+                .can_accept_work()
+        );
+
+        // Second drain is a no-op (returns the current generation).
+        let gen2 = registry.drain_executor(&id).expect("second drain is no-op");
+        assert_eq!(gen2, gen1);
     }
 }

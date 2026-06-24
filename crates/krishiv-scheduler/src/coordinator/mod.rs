@@ -106,6 +106,11 @@ pub struct Coordinator {
     pub(crate) coordinator_id: CoordinatorId,
     pub(crate) state: CoordinatorState,
     pub(crate) config: CoordinatorConfig,
+    /// SC14: optional cluster manager for dynamic allocation. The
+    /// default is [`NoopClusterManager`] (a no-op for bare-metal and
+    /// `clusterd` modes); Kubernetes mode wires this to the
+    /// operator CRD API.
+    pub(crate) cluster_manager: Arc<dyn crate::cluster_control::ClusterManager>,
     /// Active durability profile for fail-closed admission and restore paths.
     pub(crate) durability_profile: DurabilityProfile,
     /// Executor-registry state (owned; mirrored into SharedCoordinator::executor_inner).
@@ -959,6 +964,7 @@ impl Coordinator {
             coordinator_id,
             state,
             config,
+            cluster_manager: Arc::new(crate::cluster_control::NoopClusterManager),
             durability_profile: DurabilityProfile::DevLocal,
             exec,
             store: None,
@@ -1023,6 +1029,20 @@ impl Coordinator {
     #[must_use]
     pub fn with_durability_profile(mut self, profile: DurabilityProfile) -> Self {
         self.durability_profile = profile;
+        self
+    }
+
+    /// SC14: attach a custom [`crate::cluster_control::ClusterManager`].
+    ///
+    /// The default is [`crate::cluster_control::NoopClusterManager`]
+    /// (a no-op for bare-metal and `clusterd` modes). Kubernetes mode
+    /// passes an implementation that talks to the operator CRD API.
+    #[must_use]
+    pub fn with_cluster_manager(
+        mut self,
+        manager: Arc<dyn crate::cluster_control::ClusterManager>,
+    ) -> Self {
+        self.cluster_manager = manager;
         self
     }
 

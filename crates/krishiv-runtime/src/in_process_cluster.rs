@@ -226,6 +226,7 @@ impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
                 })
                 .collect(),
             state_ttl_ms: spec.state_ttl_ms,
+            allowed_lateness_ms: spec.allowed_lateness_ms,
             source_watermark_lags: spec.source_watermark_lags.clone(),
             source_id_column: spec.source_id_column.clone(),
         }
@@ -280,6 +281,7 @@ impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
                 })
                 .collect(),
             state_ttl_ms: spec.state_ttl_ms,
+            allowed_lateness_ms: spec.allowed_lateness_ms,
             source_watermark_lags: spec.source_watermark_lags.clone(),
             source_id_column: spec.source_id_column.clone(),
         }
@@ -333,6 +335,7 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         }
@@ -440,6 +443,7 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -492,6 +496,7 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: vec![],
             state_ttl_ms: Some(60_000),
+            allowed_lateness_ms: Some(1_000),
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -517,6 +522,7 @@ mod tests {
             session_gap_ms: Some(5_000),
             agg_exprs: vec![],
             state_ttl_ms: Some(30_000),
+            allowed_lateness_ms: Some(2_000),
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -547,6 +553,7 @@ mod tests {
             window_size_ms: 5_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -568,6 +575,7 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: vec![],
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -589,6 +597,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![],
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -613,6 +622,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![],
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -636,6 +646,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![],
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -659,6 +670,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![],
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -680,6 +692,7 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };
@@ -698,6 +711,7 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
         };

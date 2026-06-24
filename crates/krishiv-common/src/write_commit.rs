@@ -107,6 +107,12 @@ pub enum WriteMode {
     ErrorIfExists,
     /// Silently skip publication if the destination already contains foreign files.
     Ignore,
+    /// Dynamic-partition overwrite (S18). On publish, only the partitions
+    /// touched by the new data are replaced; other partitions under the
+    /// destination are preserved. Spark-equivalent of
+    /// `INSERT OVERWRITE TABLE t PARTITION (…)` with no static partition
+    /// values.
+    OverwriteDynamic,
 }
 
 impl WriteMode {
@@ -118,10 +124,13 @@ impl WriteMode {
             "overwrite" => Ok(Self::Overwrite),
             "error_if_exists" | "errorifexists" | "error-if-exists" => Ok(Self::ErrorIfExists),
             "ignore" => Ok(Self::Ignore),
+            "overwrite_dynamic" | "overwritedynamic" | "overwrite-dynamic" => {
+                Ok(Self::OverwriteDynamic)
+            }
             other => Err(WriteCommitError::InvalidContract {
                 message: format!(
                     "unknown write mode '{other}'; expected append, overwrite, \
-                     error_if_exists, or ignore"
+                     error_if_exists, ignore, or overwrite_dynamic"
                 ),
             }),
         }
@@ -134,6 +143,7 @@ impl WriteMode {
             Self::Overwrite => "overwrite",
             Self::ErrorIfExists => "error_if_exists",
             Self::Ignore => "ignore",
+            Self::OverwriteDynamic => "overwrite_dynamic",
         }
     }
 }
@@ -662,6 +672,16 @@ pub fn publish_staged_outputs(
                 std::fs::remove_file(path).map_err(|e| WriteCommitError::io(path, e))?;
             }
         }
+        // S18: dynamic-partition overwrite preserves foreign partitions that
+        // are not produced by the new run. We approximate the Spark
+        // semantics by removing foreign entries *under the partitions we
+        // are about to publish into* while leaving sibling partitions alone.
+        // Per-partition publish below is responsible for restricting the
+        // deletion set to the produced partitions.
+        WriteMode::OverwriteDynamic => {
+            // The deletion is folded into the per-partition publish below
+            // so sibling partitions are preserved.
+        }
     }
 
     // Collect staged files and keep only the highest attempt per task+partition.
@@ -695,6 +715,11 @@ pub fn publish_staged_outputs(
     }
 
     let mut outcome = PublishOutcome::default();
+    // S18: track the set of partitions we are about to publish into so the
+    // `OverwriteDynamic` mode can clear foreign files in those partitions
+    // only (sibling partitions stay intact).
+    let mut dynamic_partitions_cleared: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for ((hive_path, task_id), entry) in winners {
         let index = task_index_from_task_id(&task_id);
         let final_name = final_part_file_name(index, job_id);
@@ -706,6 +731,23 @@ pub fn publish_staged_outputs(
         if final_path.exists() {
             outcome.skipped_existing += 1;
             continue;
+        }
+        // S18: per-partition overwrite. Before publishing into `hive_path`,
+        // remove foreign files in the same partition (but only the first
+        // time we see this partition to keep cost O(partitions-touched)).
+        if matches!(spec.mode, WriteMode::OverwriteDynamic)
+            && !hive_path.is_empty()
+            && dynamic_partitions_cleared.insert(hive_path.clone())
+        {
+            let partition_dir = dest_dir.join(&hive_path);
+            if let Ok(rd) = std::fs::read_dir(&partition_dir) {
+                for entry_res in rd.flatten() {
+                    let p = entry_res.path();
+                    if p.is_file() && p.file_name().and_then(|n| n.to_str()) != Some(&final_name) {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
+            }
         }
         move_file(&entry.path, &final_path)?;
         outcome.published.push(final_path);
@@ -743,12 +785,17 @@ mod tests {
             WriteMode::Overwrite,
             WriteMode::ErrorIfExists,
             WriteMode::Ignore,
+            WriteMode::OverwriteDynamic,
         ] {
             assert_eq!(WriteMode::parse(mode.as_token()).unwrap(), mode);
         }
         assert_eq!(
             WriteMode::parse("ErrorIfExists").unwrap(),
             WriteMode::ErrorIfExists
+        );
+        assert_eq!(
+            WriteMode::parse("overwrite_dynamic").unwrap(),
+            WriteMode::OverwriteDynamic
         );
         assert!(WriteMode::parse("truncate").is_err());
     }

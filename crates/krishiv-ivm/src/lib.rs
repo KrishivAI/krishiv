@@ -13,7 +13,10 @@ pub mod provenance;
 pub mod vector_sink;
 
 pub use error::{IvmError, IvmResult};
-pub use flow::{IncrementalFlow, StepSummary, coalesce_pending, encode_ivm_step_fragment};
+pub use flow::{
+    IncrementalFlow, StepSummary, coalesce_pending, decode_batch_map, encode_batch_map,
+    encode_ivm_step_fragment,
+};
 pub use partitioned::PartitionedIncrementalFlow;
 pub use plan::{
     ViewPlan, ViewPlanKind, build_view_plan, partition_key_for_view, partition_key_from_sql,

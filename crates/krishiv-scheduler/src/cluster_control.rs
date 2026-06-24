@@ -258,6 +258,52 @@ impl ClusterControlPlane {
     }
 }
 
+/// SC14: cluster manager trait for dynamic allocation.
+///
+/// The coordinator calls [`ClusterManager::request_workers`] when the
+/// pending task count exceeds a configurable threshold and
+/// [`ClusterManager::release_workers`] when executors go idle. The
+/// trait is provider-agnostic: the bare-metal and `clusterd` modes
+/// use [`NoopClusterManager`] (a no-op that returns the request
+/// unchanged), the Kubernetes mode wires it to the
+/// `krishiv-operator` CRD API.
+///
+/// Implementations must be `Send + Sync` because the coordinator
+/// dispatches on any thread.
+pub trait ClusterManager: Send + Sync {
+    /// Ask the cluster for `n` new executors. Returns the number of
+    /// workers actually granted (may be less than `n` if the cluster
+    /// is at capacity or a quota is in place). The default `NoopClusterManager`
+    /// returns 0 and logs a debug message.
+    fn request_workers(&self, n: usize) -> usize;
+
+    /// Release `n` executors back to the cluster. Default no-op.
+    fn release_workers(&self, _n: usize) {}
+
+    /// Return the number of workers currently allocated (for telemetry
+    /// and the heartbeat-driven `cluster_total_slots` gauge).
+    fn current_workers(&self) -> usize {
+        0
+    }
+}
+
+/// No-op implementation used by bare-metal and `clusterd` modes. The
+/// trait exists so the coordinator's call sites are always wired; the
+/// real cluster growth logic lives in the Kubernetes mode.
+pub struct NoopClusterManager;
+
+impl ClusterManager for NoopClusterManager {
+    fn request_workers(&self, _n: usize) -> usize {
+        0
+    }
+
+    fn release_workers(&self, _n: usize) {}
+
+    fn current_workers(&self) -> usize {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use krishiv_proto::{
@@ -350,5 +396,19 @@ mod tests {
         let bumped_again = leader.bump_fencing_token();
         assert_eq!(bumped_again, 3);
         assert_eq!(leader.fencing_token(), 3);
+    }
+}
+
+#[cfg(test)]
+mod cluster_manager_tests {
+    use super::*;
+
+    /// SC14: `NoopClusterManager` is a no-op (returns 0 / no growth).
+    #[test]
+    fn noop_cluster_manager_is_a_noop() {
+        let m = NoopClusterManager;
+        assert_eq!(m.request_workers(8), 0);
+        m.release_workers(4);
+        assert_eq!(m.current_workers(), 0);
     }
 }

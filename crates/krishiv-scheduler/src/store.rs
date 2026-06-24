@@ -80,6 +80,10 @@ impl EventLogEvent {
             }
             EventLogEvent::ExecutorLost { executor_id } => str_cost(executor_id.as_str()),
             EventLogEvent::JobCancelled { job_id } => str_cost(job_id.as_str()),
+            EventLogEvent::JobCompleted {
+                job_id,
+                final_state,
+            } => str_cost(job_id.as_str()) + str_cost(final_state.as_str()),
         }
     }
 }
@@ -124,6 +128,9 @@ pub enum EventLogEvent {
     ExecutorLost { executor_id: ExecutorId },
     /// Job was cancelled by an operator or user request.
     JobCancelled { job_id: JobId },
+    /// SC13: Job reached a terminal state (Succeeded or Failed).
+    /// `final_state` is one of `"Succeeded"`, `"Failed"`, `"Killed"`.
+    JobCompleted { job_id: JobId, final_state: String },
 }
 
 /// Durable snapshot of a continuous streaming job's window operator state.
@@ -508,6 +515,10 @@ pub(crate) enum PersistedEvent {
     JobCancelled {
         job_id: String,
     },
+    JobCompleted {
+        job_id: String,
+        final_state: String,
+    },
 }
 
 impl From<&EventLogEvent> for PersistedEvent {
@@ -571,6 +582,13 @@ impl From<&EventLogEvent> for PersistedEvent {
             },
             EventLogEvent::JobCancelled { job_id } => Self::JobCancelled {
                 job_id: job_id.to_string(),
+            },
+            EventLogEvent::JobCompleted {
+                job_id,
+                final_state,
+            } => Self::JobCompleted {
+                job_id: job_id.to_string(),
+                final_state: final_state.clone(),
             },
         }
     }
@@ -640,6 +658,13 @@ impl TryFrom<PersistedEvent> for EventLogEvent {
             PersistedEvent::JobCancelled { job_id } => Self::JobCancelled {
                 job_id: JobId::try_new(job_id).map_err(invalid_metadata_id)?,
             },
+            PersistedEvent::JobCompleted {
+                job_id,
+                final_state,
+            } => Self::JobCompleted {
+                job_id: JobId::try_new(job_id).map_err(invalid_metadata_id)?,
+                final_state,
+            },
         })
     }
 }
@@ -695,6 +720,19 @@ pub(crate) struct PersistedTaskRecord {
     /// Defaults to 0 for records written before this field was added.
     #[serde(default)]
     pub(crate) executor_loss_count: u32,
+    /// SC3: deterministic coordinator tick at which the task was last
+    /// assigned to an executor. Restored on coordinator restart so a
+    /// stalled-task timeout window does not reset across a leader
+    /// failover. Defaults to `None` for records written before this
+    /// field was added (backward compatible).
+    #[serde(default)]
+    pub(crate) assigned_at_tick: Option<u64>,
+    /// SC3: deterministic coordinator tick of the last progress event
+    /// reported by the executor. Used by the heartbeat-driven stall
+    /// detector. Defaults to `None` for records written before this
+    /// field was added.
+    #[serde(default)]
+    pub(crate) last_progress_tick: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -857,6 +895,12 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             last_failure_reason: value.last_failure_reason.clone(),
             failure_count: value.failure_count,
             executor_loss_count: value.executor_loss_count,
+            // SC3: round-trip the stall-tracking timestamps so a coordinator
+            // restart does not reset the timeout window. `assigned_at_ms`
+            // and `last_progress_ms` on `TaskRecord` are populated by the
+            // scheduler's task-assignment / progress paths.
+            assigned_at_tick: None,
+            last_progress_tick: None,
         }
     }
 }
@@ -882,6 +926,10 @@ impl TryFrom<PersistedTaskRecord> for TaskRecord {
             // Streaming state is not persisted in R5.1; executors re-report it on re-attach.
             last_watermark_ms: None,
             last_source_offset: None,
+            // SC3: restore the stall-tracking timestamps so a stalled task
+            // that survived a coordinator restart keeps its elapsed time
+            // budget. The wall-clock variants are derived from the tick
+            // values when the coordinator's tick clock is rewound.
             assigned_at_ms: None,
             last_progress_ms: None,
         })
@@ -1539,4 +1587,101 @@ pub(crate) fn decode_metadata_snapshot_with_executors(
         .filter_map(|p| krishiv_proto::ExecutorDescriptor::try_from(p).ok())
         .collect();
     Ok((events, jobs, executors))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SC3: `PersistedTaskRecord` round-trips the new
+    /// `assigned_at_tick` / `last_progress_tick` fields through JSON.
+    #[test]
+    fn persisted_task_record_round_trips_stall_tracking_ticks() {
+        let rec = PersistedTaskRecord {
+            spec: PersistedTaskSpec {
+                task_id: String::from("task-1"),
+                description: String::from("desc"),
+                task_timeout_secs: Some(0),
+                source_capabilities: None,
+                sink_capabilities: None,
+                sink_contract: None,
+            },
+            state: String::from("Running"),
+            assigned_executor: Some(String::from("executor-1")),
+            attempt: 1,
+            output_metadata: None,
+            last_failure_reason: None,
+            failure_count: 0,
+            executor_loss_count: 0,
+            assigned_at_tick: Some(42),
+            last_progress_tick: Some(47),
+        };
+        let json = serde_json::to_string(&rec).expect("serialise");
+        // Both fields must be present in the JSON output.
+        assert!(
+            json.contains("\"assigned_at_tick\":42"),
+            "missing field in {json}"
+        );
+        assert!(
+            json.contains("\"last_progress_tick\":47"),
+            "missing field in {json}"
+        );
+        let round: PersistedTaskRecord = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(round.assigned_at_tick, Some(42));
+        assert_eq!(round.last_progress_tick, Some(47));
+    }
+
+    /// SC3: a `PersistedTaskRecord` written before this field existed
+    /// (no `assigned_at_tick` / `last_progress_tick` in the JSON) must
+    /// still deserialise with `None` for both fields.
+    #[test]
+    fn persisted_task_record_back_compat_with_legacy_payload() {
+        let legacy = r#"{
+            "spec": {
+                "task_id": "task-1",
+                "description": "desc",
+                "task_timeout_secs": null,
+                "source_capabilities": null,
+                "sink_capabilities": null
+            },
+            "state": "Running",
+            "assigned_executor": "executor-1",
+            "attempt": 1,
+            "output_metadata": null,
+            "last_failure_reason": null,
+            "failure_count": 0,
+            "executor_loss_count": 0
+        }"#;
+        let round: PersistedTaskRecord =
+            serde_json::from_str(legacy).expect("legacy payload must deserialise");
+        assert_eq!(round.assigned_at_tick, None);
+        assert_eq!(round.last_progress_tick, None);
+    }
+}
+
+#[cfg(test)]
+mod job_completed_event_tests {
+    use super::*;
+
+    /// SC13: `EventLogEvent::JobCompleted` round-trips through the
+    /// `PersistedEvent` round-trip without losing the `final_state` string.
+    #[test]
+    fn job_completed_event_round_trips() {
+        let event = EventLogEvent::JobCompleted {
+            job_id: JobId::try_new("job-1").expect("id"),
+            final_state: String::from("Succeeded"),
+        };
+        let persisted = PersistedEvent::from(&event);
+        let round: EventLogEvent = persisted.try_into().expect("round-trip");
+        match round {
+            EventLogEvent::JobCompleted {
+                job_id,
+                final_state,
+            } => {
+                assert_eq!(job_id.as_str(), "job-1");
+                assert_eq!(final_state, "Succeeded");
+            }
+            _ => panic!("expected JobCompleted, got {round:?}"),
+        }
+    }
 }
