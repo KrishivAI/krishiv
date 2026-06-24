@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import type { JSX, ReactNode } from 'react';
 import { BrandLogo, SiteShell } from '@/components/Shell';
-import { CodeBlock, CodeBlockTabs, CodeBlockTabsList, CodeBlockTabsTrigger, CodeBlockTab, Pre } from 'fumadocs-ui/components/codeblock';
+import { CodeTabs } from '@/components/CodeTabs';
 import { githubUrl } from '@/lib/site';
 
 type IconName =
@@ -153,28 +153,17 @@ function DeveloperSection() {
 function CodeExamplePanel() {
   return (
     <div className="code-panel">
-      <CodeBlockTabs defaultValue="sql">
-        <CodeBlockTabsList>
-          <CodeBlockTabsTrigger value="sql">SQL</CodeBlockTabsTrigger>
-          <CodeBlockTabsTrigger value="rust">Rust</CodeBlockTabsTrigger>
-          <CodeBlockTabsTrigger value="python">Python</CodeBlockTabsTrigger>
-        </CodeBlockTabsList>
-        <CodeBlockTab value="sql">
-          <CodeBlock>
-            <Pre>
-{`SELECT customer_id, SUM(amount) AS total_spend
+      <CodeTabs
+        tabs={[
+          { id: 'sql', label: 'SQL', language: 'sql', code:
+`SELECT customer_id, SUM(amount) AS total_spend
 FROM orders
 WHERE event_time >= NOW() - INTERVAL '1' DAY
 GROUP BY customer_id
 ORDER BY total_spend DESC
-LIMIT 10;`}
-            </Pre>
-          </CodeBlock>
-        </CodeBlockTab>
-        <CodeBlockTab value="rust">
-          <CodeBlock>
-            <Pre>
-{`use krishiv_api::{Session, col, lit, sum, Result};
+LIMIT 10;` },
+          { id: 'rust', label: 'Rust', language: 'rust', code:
+`use krishiv_api::{Session, col, lit, sum, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -188,14 +177,9 @@ async fn main() -> Result<()> {
         .limit(10);
     df.show().await?;
     Ok(())
-}`}
-            </Pre>
-          </CodeBlock>
-        </CodeBlockTab>
-        <CodeBlockTab value="python">
-          <CodeBlock>
-            <Pre>
-{`import krishiv as ks
+}` },
+          { id: 'python', label: 'Python', language: 'python', code:
+`import krishiv as ks
 from krishiv.functions import col, lit, sum
 
 session = ks.Session.embedded()
@@ -206,11 +190,9 @@ df = (session.read_parquet("data/orders.parquet")
         .agg([sum(col("amount")).alias("total_spend")])
         .order_by(["total_spend"], ascending=False)
         .limit(10))
-df.show()`}
-            </Pre>
-          </CodeBlock>
-        </CodeBlockTab>
-      </CodeBlockTabs>
+df.show()` },
+        ]}
+      />
       <Link className="docs-link" href="/docs/latest/tutorial">→ A full end-to-end tutorial</Link>
     </div>
   );
