@@ -1,14 +1,13 @@
 {
   "title": "Documentation",
   "pages": [
+    "index",
     "---Getting Started---",
-    "getting-started",
     "getting-started/why-krishiv",
     "getting-started/tutorial",
     "getting-started/getting-started",
     "getting-started/installation",
     "---Concepts---",
-    "concepts",
     "concepts/how-it-executes",
     "concepts/execution-model",
     "concepts/architecture",
