@@ -273,6 +273,8 @@ impl Coordinator {
         self.handle_executor_loss_for_checkpoints(executor_id);
         self.reset_running_tasks_for_lost_executor(executor_id);
         self.executor_job_watermarks.remove(executor_id);
+        // SC14: release one worker back to the cluster.
+        self.cluster_manager.release_workers(1);
         krishiv_metrics::global_metrics().inc_executor_lost();
         Ok(())
     }
@@ -296,6 +298,8 @@ impl Coordinator {
     pub fn drain_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<LeaseGeneration> {
         self.ensure_active()?;
         let generation = self.exec.executors.drain_executor(executor_id)?;
+        // SC14: release one worker back to the cluster.
+        self.cluster_manager.release_workers(1);
         tracing::info!(
             executor_id = %executor_id,
             lease_generation = %generation,
@@ -632,8 +636,8 @@ impl Coordinator {
             })
             .collect();
 
-        for job_id in job_ids {
-            match self.assign_pending_tasks(&job_id) {
+        for job_id in &job_ids {
+            match self.assign_pending_tasks(job_id) {
                 Ok(0) | Err(SchedulerError::NoExecutors) => {}
                 Ok(count) => {
                     tracing::debug!(
@@ -649,6 +653,52 @@ impl Coordinator {
                         "failed to assign pending tasks after executor registration"
                     );
                 }
+            }
+        }
+
+        // SC14: dynamic allocation — if pending tasks exceed available
+        // executor capacity, ask the cluster manager for more workers.
+        self.maybe_request_workers();
+    }
+
+    /// SC14: request additional workers from the cluster when pending tasks
+    /// outnumber the available executor slots. The `ClusterManager` may return
+    /// fewer workers than requested (quota, capacity limits); the coordinator
+    /// will re-evaluate on the next dispatch tick.
+    fn maybe_request_workers(&mut self) {
+        let total_pending: usize = self
+            .job_coordinators
+            .iter()
+            .filter_map(|(_, jc)| {
+                let state = jc.read_record().state();
+                if state.is_terminal() || state == JobState::Queued {
+                    return None;
+                }
+                Some(
+                    jc.read_record()
+                        .stages
+                        .iter()
+                        .flat_map(|s| s.tasks())
+                        .filter(|t| t.state() == TaskState::Pending)
+                        .count(),
+                )
+            })
+            .sum();
+        if total_pending == 0 {
+            return;
+        }
+        let available = self.exec.executors.schedulable_executor_placements().len();
+        if total_pending > available {
+            let deficit = total_pending - available;
+            let granted = self.cluster_manager.request_workers(deficit);
+            if granted > 0 {
+                tracing::info!(
+                    pending = total_pending,
+                    available,
+                    requested = deficit,
+                    granted,
+                    "SC14: dynamic allocation — cluster granted new workers"
+                );
             }
         }
     }

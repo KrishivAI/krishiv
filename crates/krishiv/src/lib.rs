@@ -33,7 +33,12 @@
 //!     // Build the Arrow batch your workflow expects — for example read
 //!     // Parquet from object_store, fan in from a stream, or run a SQL
 //!     // query that returns RecordBatch.
-//!     let batch: RecordBatch = todo!();
+//!     let batch = RecordBatch::new_empty(std::sync::Arc::new(
+//!         arrow::datatypes::Schema::new(vec![
+//!             arrow::datatypes::Field::new("user_id", arrow::datatypes::DataType::Int64, false),
+//!             arrow::datatypes::Field::new("event_ts", arrow::datatypes::DataType::Int64, false),
+//!         ]),
+//!     ));
 //!     let stream = session
 //!         .memory_stream("events", vec![StreamBatch::new(0, batch)])?
 //!         .key_by("user_id")

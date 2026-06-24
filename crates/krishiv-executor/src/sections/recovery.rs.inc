@@ -4,9 +4,7 @@ mod phase3_recovery {
     use super::*;
     use std::sync::Mutex;
 
-    use krishiv_connectors::{
-        EpochTransactionLog, LocalParquetTwoPhaseCommitSink, TransactionalSinkParticipant as _,
-    };
+    use krishiv_connectors::{EpochTransactionLog, LocalParquetTwoPhaseCommitSink};
     use krishiv_proto::{CheckpointCompleteCommand, RestoreFromCheckpointCommand};
     use krishiv_state::checkpoint::{
         CheckpointMetadata, CheckpointStorage, IntegrityManifest, LocalFsCheckpointStorage,

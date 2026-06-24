@@ -138,6 +138,12 @@ pub struct ExecutorTaskRunner {
     /// `pre_commit` at the barrier, `commit_through` on completion
     /// notifications, `restore_to` on restore directives.
     pub transaction_log: crate::transactions::TwoPhaseSinkRegistry,
+
+    /// CO5: connector registry for opening sources/sinks by kind instead of
+    /// hard-coding concrete types in fragment execution paths. Defaults to
+    /// [`krishiv_connectors::registry::default_registry()`] so existing
+    /// single-type paths work unchanged.
+    pub connector_registry: Arc<krishiv_connectors::ConnectorRegistry>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -205,6 +211,7 @@ impl ExecutorTaskRunner {
             pending_restores: Arc::new(DashMap::new()),
             kafka_restore_offsets: Arc::new(DashMap::new()),
             transaction_log: crate::transactions::TwoPhaseSinkRegistry::new(),
+            connector_registry: Arc::new(krishiv_connectors::registry::default_registry()),
         }
     }
 
@@ -222,6 +229,18 @@ impl ExecutorTaskRunner {
     /// executor lease rather than `LeaseGeneration::initial()` (B10).
     pub fn with_live_lease(mut self, lease: crate::grpc_client::SharedLeaseGeneration) -> Self {
         self.live_lease = lease;
+        self
+    }
+
+    /// CO5: replace the default connector registry with a custom one.
+    ///
+    /// Use this to register additional source/sink drivers or override
+    /// defaults before the runner starts executing fragments.
+    pub fn with_connector_registry(
+        mut self,
+        registry: krishiv_connectors::ConnectorRegistry,
+    ) -> Self {
+        self.connector_registry = Arc::new(registry);
         self
     }
 

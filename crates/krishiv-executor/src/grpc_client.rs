@@ -67,12 +67,26 @@ type InterceptedCoordinatorClient =
 /// which enables verification of the coordinator's server certificate.
 /// When the env var is absent the function returns `None` (plaintext).
 ///
-/// Panics with a clear message when the CA cert file cannot be read —
-/// this is a fatal start-up misconfiguration.
+/// Build a [`tonic::transport::ClientTlsConfig`] from env vars.
+///
+/// When `KRISHIV_CA_CERT` is set the PEM is loaded as the trusted CA bundle,
+/// which enables verification of the coordinator's server certificate.
+/// When the env var is absent the function returns `None` (plaintext).
+/// Returns `None` and logs an error if the cert file cannot be read.
 fn client_tls_config_from_env() -> Option<tonic::transport::ClientTlsConfig> {
     if let Ok(ca_path) = std::env::var("KRISHIV_CA_CERT") {
-        let ca_pem = std::fs::read(&ca_path)
-            .unwrap_or_else(|e| panic!("KRISHIV_CA_CERT: cannot read '{ca_path}': {e}"));
+        let ca_pem = match std::fs::read(&ca_path) {
+            Ok(pem) => pem,
+            Err(e) => {
+                tracing::error!(
+                    ca_path = %ca_path,
+                    error = %e,
+                    "KRISHIV_CA_CERT: cannot read CA certificate file; \
+                     TLS will not be enabled"
+                );
+                return None;
+            }
+        };
         let ca = tonic::transport::Certificate::from_pem(ca_pem);
         return Some(tonic::transport::ClientTlsConfig::new().ca_certificate(ca));
     }

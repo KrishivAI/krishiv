@@ -229,9 +229,12 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+    use arrow::array::{Float64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
-    use krishiv_ivm::{DeltaBatch, IncrementalFlow, IncrementalViewSpec, decode_batch_map};
+    use krishiv_ivm::{
+        DeltaBatch, IncrementalFlow, IncrementalViewSpec, decode_batch_map,
+        encode_ivm_step_fragment,
+    };
 
     fn sales_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
