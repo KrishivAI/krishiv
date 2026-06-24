@@ -2,6 +2,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { Badge, SiteShell } from '@/components/Shell';
 import { DocsMobileControls } from '@/components/DocsMobile';
+import { CodeBlockBody } from '@/components/CodeBlockBody';
 import { docPages, getAllDocParams, getDoc, getGroupedPages } from '@/lib/docs-data';
 import { docsVersions } from '@/lib/versions';
 
@@ -47,7 +48,7 @@ export default async function DocPage({params}:{params:Promise<{version:string;s
           </Badge>
           <h1>{page.title}</h1>
           <p className="lead">{page.description}</p>
-          <div className="prose" dangerouslySetInnerHTML={{__html: page.body}}/>
+          <CodeBlockBody html={page.body}/>
           <div className="prevnext">
             {prev?<Link className="btn btn-secondary" href={`/docs/${version}${prev.slug?`/${prev.slug}`:''}`}>← {prev.title}</Link>:<span/>}
             {next?<Link className="btn btn-secondary" href={`/docs/${version}/${next.slug}`}>{next.title} →</Link>:<span/>}
