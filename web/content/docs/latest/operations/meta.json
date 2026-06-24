@@ -1,0 +1,9 @@
+{
+  "title": "Operations",
+  "pages": [
+    "scheduler",
+    "checkpointing",
+    "shuffle",
+    "deployment"
+  ]
+}

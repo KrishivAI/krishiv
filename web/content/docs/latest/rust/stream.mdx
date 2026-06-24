@@ -1,0 +1,61 @@
+---
+title: Stream & KeyedStream
+description: Streaming pipeline builder for unbounded, event-time workloads.
+status: Available
+---
+<h2 id="stream">Stream</h2>
+<Callout type="info" title="Common pattern"> Get a stream from `session.memory_stream(schema)` or a registered Kafka source, call `watermark`, then `key_by`, then `tumbling_window` or `sliding_window_ms`, then `agg`. See the <a href="/docs/latest/recipes/tumbling-window">Tumbling window recipe</a> for a full example.</Callout>
+<p>`Stream` wraps an unbounded data source and provides chaining methods to build streaming pipelines.</p>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`key_by(key_col)`</td><td>`Result&lt;KeyedStream&gt;`</td><td>Partition the stream by a key column for stateful ops.</td></tr>
+    <tr><td>`broadcast()`</td><td>`BroadcastStream`</td><td>Broadcast stream to all operator instances.</td></tr>
+    <tr><td>`connect(other: Stream)`</td><td>`ConnectedStreams`</td><td>Pair two streams for a co-process function.</td></tr>
+    <tr><td>`watermark(col, lag_ms)`</td><td>`Result&lt;Stream&gt;`</td><td>Assign a watermark using an event-time column and lag.</td></tr>
+    <tr><td>`with_watermark(spec: WatermarkSpec)`</td><td>`Result&lt;Stream&gt;`</td><td>Assign a watermark using a typed spec.</td></tr>
+    <tr><td>`with_multi_source_watermark(spec)`</td><td>`Result&lt;Stream&gt;`</td><td>Multi-source watermark alignment.</td></tr>
+    <tr><td>`with_state_ttl(config: StateTtlConfig)`</td><td>`Result&lt;Stream&gt;`</td><td>Attach a TTL policy to downstream keyed state.</td></tr>
+    <tr><td>`tumbling_window(size_ms)`</td><td>`WindowedStream`</td><td>Apply a tumbling window of the given duration.</td></tr>
+    <tr><td>`sliding_window_ms(size_ms, slide_ms)`</td><td>`WindowedStream`</td><td>Apply a sliding (hop) window.</td></tr>
+    <tr><td>`session_window_ms(gap_ms)`</td><td>`WindowedStream`</td><td>Apply a session window with inactivity gap.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="keyedstream">KeyedStream</h2>
+<p>`KeyedStream` is a stream partitioned by a key. Stateful operators (process functions, window aggregations) operate per-key.</p>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`tumbling_window(size_ms)`</td><td>`WindowedStream`</td><td>Fixed-size non-overlapping window per key.</td></tr>
+    <tr><td>`sliding_window_ms(size_ms, slide_ms)`</td><td>`WindowedStream`</td><td>Sliding/hop window per key.</td></tr>
+    <tr><td>`session_window_ms(gap_ms)`</td><td>`SessionWindowedStream`</td><td>Session window per key.</td></tr>
+    <tr><td>`window(spec: LocalWindowKind)`</td><td>`WindowedStream`</td><td>Apply a window using a typed spec.</td></tr>
+    <tr><td>`connect(other: KeyedStream)`</td><td>`ConnectedStreams`</td><td>Join two keyed streams for co-process.</td></tr>
+    <tr><td>`with_multi_source_watermark(spec)`</td><td>`Result&lt;KeyedStream&gt;`</td><td>Multi-source watermark for aligned processing.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="example">Example</h2>
+
+```rust
+use krishiv_api::{Session, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let session = Session::embedded().await?;
+    let (stream, sender) = session.memory_stream(schema)?;
+
+    // Build a keyed tumbling window
+    let windowed = stream
+        .watermark("event_time", 5000)?
+        .key_by("user_id")?
+        .tumbling_window(60_000); // 1-minute window
+
+    // Aggregate and collect
+    let agg = windowed.agg(vec![count(col("*")), sum(col("amount"))]);
+    // ... submit or collect
+    Ok(())
+}
+```
+

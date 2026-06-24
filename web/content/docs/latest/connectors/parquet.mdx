@@ -1,0 +1,103 @@
+---
+title: Parquet & Object Store
+description: Reading and writing Parquet on local disk, S3, Azure ADLS, and GCS.
+status: Available
+---
+<h2 id="local">Local Parquet</h2>
+
+```sql
+-- Register a local Parquet file as a SQL table
+CREATE EXTERNAL TABLE orders
+STORED AS PARQUET
+LOCATION 'data/orders.parquet';
+
+-- Or a directory of Parquet files
+CREATE EXTERNAL TABLE orders_partitioned
+STORED AS PARQUET
+LOCATION 'data/orders/';
+```
+
+
+<h2 id="s3">S3 (AWS or S3-compatible)</h2>
+
+```sql
+CREATE EXTERNAL TABLE orders_s3
+STORED AS PARQUET
+LOCATION 's3://my-bucket/data/orders/'
+OPTIONS (
+  'aws.region'             = 'us-east-1',
+  'aws.access_key_id'      = '...',
+  'aws.secret_access_key'  = '...'
+);
+```
+
+<Callout type="info">Credentials can also be provided via environment variables: `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, or instance metadata (EKS IRSA).</Callout>
+
+<h2 id="azure">Azure ADLS Gen2</h2>
+
+```sql
+CREATE EXTERNAL TABLE orders_adls
+STORED AS PARQUET
+LOCATION 'abfss://mycontainer@myaccount.dfs.core.windows.net/path/'
+OPTIONS (
+  'azure.account_name' = 'myaccount',
+  'azure.account_key'  = '...'
+);
+```
+
+
+<h2 id="gcs">Google Cloud Storage</h2>
+
+```sql
+CREATE EXTERNAL TABLE orders_gcs
+STORED AS PARQUET
+LOCATION 'gs://my-gcs-bucket/path/'
+OPTIONS (
+  'gcp.service_account_path' = '/path/to/service-account.json'
+);
+```
+
+
+<h2 id="rust-api">Rust API</h2>
+
+```rust
+// Local
+let df = session.read_parquet("data/orders.parquet").await?;
+
+// S3 (via registered object store)
+session.register_s3_object_store("my-bucket", s3_config)?;
+session.register_parquet("orders", "s3://my-bucket/orders/").await?;
+let df = session.table("orders")?;
+```
+
+
+<h2 id="python-api">Python API</h2>
+
+```python
+import krishiv as ks
+
+session = ks.Session.embedded()
+
+# Local
+df = session.read_parquet("data/orders.parquet")
+df.show()
+
+# Register and use as SQL table
+session.register_parquet("orders", "data/orders.parquet")
+session.sql("SELECT * FROM orders LIMIT 5").show()
+
+# Write
+df.write_parquet("/tmp/output.parquet")
+```
+
+
+<h2 id="write-options">Write Options</h2>
+<table class="api-table">
+  <thead><tr><th>Option</th><th>Default</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`compression`</td><td>`snappy`</td><td>`snappy` | `gzip` | `zstd` | `lz4` | `none`</td></tr>
+    <tr><td>`row_group_size`</td><td>`1048576`</td><td>Rows per Parquet row group.</td></tr>
+    <tr><td>`write_batch_size`</td><td>`1024`</td><td>Rows per Arrow write batch.</td></tr>
+    <tr><td>`max_row_group_size`</td><td>`1048576`</td><td>Maximum row group size.</td></tr>
+  </tbody>
+</table>

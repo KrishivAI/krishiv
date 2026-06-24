@@ -1,0 +1,14 @@
+{
+  "title": "Python API",
+  "pages": [
+    "index",
+    "session",
+    "dataframe",
+    "stream",
+    "functions",
+    "sinks",
+    "state",
+    "query-result",
+    "lakehouse"
+  ]
+}

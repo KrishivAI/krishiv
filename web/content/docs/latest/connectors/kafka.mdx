@@ -1,0 +1,105 @@
+---
+title: Kafka Connector
+description: Source and sink connector for Apache Kafka and Confluent.
+status: Available
+---
+<h2 id="requirements">Requirements</h2>
+<p>Enable the `kafka` Cargo feature. In Python: `maturin develop --features kafka`.</p>
+
+<h2 id="sql-ddl">SQL DDL</h2>
+
+```sql
+-- Kafka source (streaming)
+CREATE SOURCE orders_raw
+TYPE KAFKA
+OPTIONS (
+  'brokers'           = 'broker1:9092,broker2:9092',
+  'topic'             = 'orders',
+  'group.id'          = 'krishiv-consumer-1',
+  'auto.offset.reset' = 'latest',
+  'format'            = 'json'        -- 'json' | 'avro' | 'protobuf'
+)
+WITH SCHEMA (
+  order_id   BIGINT   NOT NULL,
+  customer   VARCHAR,
+  amount     DOUBLE,
+  event_time TIMESTAMP
+);
+
+-- Kafka sink
+CREATE SINK results_sink
+TYPE KAFKA
+OPTIONS (
+  'brokers' = 'broker1:9092',
+  'topic'   = 'results',
+  'format'  = 'json'
+);
+```
+
+
+<h2 id="rust-api">Rust API</h2>
+
+```rust
+use krishiv_api::{Session, Result};
+use arrow::datatypes::{DataType, Field, Schema};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let session = Session::embedded().await?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("order_id",   DataType::Int64,   false),
+        Field::new("customer",   DataType::Utf8,    true),
+        Field::new("amount",     DataType::Float64, true),
+        Field::new("event_time", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+    ]));
+    session.register_kafka_source(
+        "orders_raw",
+        schema,
+        "broker1:9092,broker2:9092",
+        "orders",
+        "krishiv-consumer-1",
+    )?;
+    let df = session.sql("SELECT * FROM orders_raw WHERE amount > 100").await?;
+    df.show().await?;
+    Ok(())
+}
+```
+
+
+<h2 id="python-api">Python API</h2>
+
+```python
+import krishiv as ks
+import pyarrow as pa
+
+session = ks.Session.embedded()
+schema = pa.schema([
+    pa.field("order_id",   pa.int64()),
+    pa.field("customer",   pa.utf8()),
+    pa.field("amount",     pa.float64()),
+    pa.field("event_time", pa.timestamp("ms")),
+])
+session.register_kafka_source(
+    "orders_raw", schema,
+    brokers="broker1:9092",
+    topic="orders",
+    group="krishiv-consumer-1",
+)
+session.sql("SELECT customer, SUM(amount) AS total FROM orders_raw GROUP BY customer").show()
+```
+
+
+<h2 id="options">Kafka Options</h2>
+<table class="api-table">
+  <thead><tr><th>Option</th><th>Default</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`brokers`</td><td>—</td><td>Comma-separated Kafka broker list. Required.</td></tr>
+    <tr><td>`topic`</td><td>—</td><td>Topic name. Required.</td></tr>
+    <tr><td>`group.id`</td><td>—</td><td>Consumer group ID. Required for sources.</td></tr>
+    <tr><td>`auto.offset.reset`</td><td>`latest`</td><td>`earliest` | `latest`</td></tr>
+    <tr><td>`format`</td><td>`json`</td><td>`json` | `avro` | `protobuf`</td></tr>
+    <tr><td>`schema.registry.url`</td><td>—</td><td>Confluent Schema Registry URL (required for Avro/Protobuf).</td></tr>
+    <tr><td>`fetch.message.max.bytes`</td><td>`1048576`</td><td>Max fetch size per partition.</td></tr>
+  </tbody>
+</table>

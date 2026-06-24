@@ -1,0 +1,16 @@
+{
+  "title": "SQL Reference",
+  "pages": [
+    "index",
+    "window-functions",
+    "match-recognize",
+    "merge-into",
+    "incremental-views",
+    "live-tables",
+    "pipeline-ddl",
+    "as-of-queries",
+    "set-commands",
+    "udf-sql",
+    "error-codes"
+  ]
+}

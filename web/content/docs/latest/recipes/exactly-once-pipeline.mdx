@@ -1,0 +1,51 @@
+---
+title: Exactly-once pipeline
+description: Build a pipeline with exactly-once delivery using a certified source/sink/checkpoint combination.
+status: Preview
+---
+<Callout type="warn" title="Important"> "Exactly-once" in Krishiv is a property of a <em>specific</em> source + sink + checkpoint combination, not a global guarantee. Use this recipe only with a certified combination; otherwise prefer <em>at-least-once</em> with an idempotent sink.</Callout>
+
+<h2 id="what">What "exactly-once" means here</h2>
+<p>The end-to-end delivery guarantee is the <em>weakest</em> guarantee supplied by the source, sink, checkpoint storage, and durability profile. Exactly-once requires all four:</p>
+<table class="api-table">
+  <thead><tr><th>Component</th><th>Requirement</th></tr></thead>
+  <tbody>
+    <tr><td>Source</td><td>Supports offset/position tracking (e.g. Kafka with `group.id`).</td></tr>
+    <tr><td>Sink</td><td>Transactional or two-phase. Output is committed atomically with the checkpoint.</td></tr>
+    <tr><td>Checkpoint storage</td><td>Atomic, fenced. Object store + etcd under `distributed-durable`.</td></tr>
+    <tr><td>Coordinator</td><td>Fenced with an epoch token so stale completions are rejected.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="skeleton">Skeleton (Kafka → Iceberg, distributed-durable)</h2>
+
+```bash
+export KRISHIV_DURABILITY_PROFILE=distributed-durable
+export KRISHIV_COORDINATOR=https://coord.internal:50051
+export KRISHIV_COORDINATOR_BEARER_TOKEN=...
+export KRISHIV_SHUFFLE_OBJECT_STORE_URI=s3://bucket/shuffle/
+```
+
+
+```sql
+-- A transactional Iceberg sink
+CREATE SINK orders_eo
+TYPE ICEBERG
+OPTIONS (
+  'catalog.uri' = 'http://catalog:8181',
+  'warehouse'   = 's3://bucket/wh',
+  'commit'      = 'transactional'
+);
+
+START PIPELINE orders_raw TO orders_eo
+AS SELECT * FROM orders_raw;
+```
+
+
+<h2 id="verify">Verify</h2>
+<ul>
+  <li>Force-kill an executor mid-pipeline; the coordinator fences it and restarts from the last committed checkpoint.</li>
+  <li>Replay the source; the sink should not produce duplicate committed snapshots.</li>
+  <li>Inspect commit metadata on the Iceberg table to confirm the snapshot lineage.</li>
+</ul>
+<p>See <a href="/docs/latest/connectors">Connectors</a> for the certified source/sink matrix and <a href="/docs/latest/operations/checkpointing">Checkpointing</a> for the protocol details.</p>

@@ -1,0 +1,47 @@
+---
+title: SQL UDFs — register and call a Python function from SQL
+description: Expose a Python or Rust callable as a SQL function.
+status: Available
+---
+<h2 id="python">Python (scalar UDF)</h2>
+
+```python
+import krishiv as ks
+
+session = ks.Session.embedded()
+
+@ks.udf(return_type="utf8")
+def greet(name: str) -> str:
+    return f"hello, {name}"
+
+session.register_udf("greet", greet, ["utf8"], "utf8")
+
+session.sql("SELECT greet(name) FROM users").show()
+```
+
+<Callout type="info">If you are using DataFusion-style registration, the supported call is `session.register_udf(name, fn, input_types, return_type)`. See <a href="/docs/latest/python/session">Python Session</a>.</Callout>
+
+<h2 id="rust">Rust (scalar UDF)</h2>
+
+```rust
+use krishiv_api::{col, Session};
+use datafusion::logical_expr::Volatility;
+use datafusion::functions_nested;
+
+#[tokio::main]
+async fn main() -> krishiv_api::Result<()> {
+    let session = Session::embedded().await?;
+    // Register a closure-based scalar UDF
+    session.register_table_udf_fn(
+        "shout",
+        std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+        |_args| Ok(arrow::array::RecordBatch::new_empty(std::sync::Arc::new(arrow::datatypes::Schema::empty()))),
+    )?;
+    Ok(())
+}
+```
+
+<Callout type="info">Most production UDFs are written as DataFusion `ScalarUDF` implementations and registered via `session.register_udf(udf)`. See the <a href="/docs/latest/rust/expressions">Rust Expressions</a> page for the patterns.</Callout>
+
+<h2 id="tvf">SQL-body table-valued function</h2>
+<p>For pure-SQL TVFs you do not need to register anything in code — see the <a href="/docs/latest/sql/udf-sql">SQL UDFs</a> reference.</p>

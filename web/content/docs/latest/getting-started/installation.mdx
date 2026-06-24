@@ -1,0 +1,65 @@
+---
+title: Installation
+description: Build features, Cargo feature presets, and Python setup.
+status: Available
+---
+<h2 id="rust-features">Rust Feature Presets</h2>
+<p>Cargo features select compiled capabilities. They are additive — do not use them as mutually exclusive mode switches.</p>
+<table class="api-table">
+  <thead><tr><th>Feature</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td>`minimal`</td><td>Smallest facade; no optional deployment capabilities.</td></tr>
+    <tr><td>`local`</td><td>Default developer build: embedded + single-node.</td></tr>
+    <tr><td>`embedded`</td><td>In-process API use; no optional dependencies.</td></tr>
+    <tr><td>`single-node`</td><td>Local daemon/in-process cluster with Flight SQL, shuffle, RocksDB metadata.</td></tr>
+    <tr><td>`distributed`</td><td>Remote cluster support with Flight SQL, shuffle, etcd metadata.</td></tr>
+    <tr><td>`k8s`</td><td>Distributed + Kubernetes operator/CRD.</td></tr>
+    <tr><td>`full`</td><td>Distributed/k8s, Kafka, primary Iceberg. Excludes AI/vector and secondary lakehouse formats.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="optional-features">Optional Integration Features</h2>
+<table class="api-table">
+  <thead><tr><th>Feature</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td>`flight-sql`</td><td>Arrow Flight SQL transport/server.</td></tr>
+    <tr><td>`shuffle`</td><td>Shuffle service/store.</td></tr>
+    <tr><td>`etcd`</td><td>etcd-backed scheduler metadata.</td></tr>
+    <tr><td>`kafka`</td><td>Kafka connector.</td></tr>
+    <tr><td>`iceberg`</td><td>Primary lakehouse platform.</td></tr>
+    <tr><td>`delta`</td><td>Optional experimental Delta compatibility.</td></tr>
+    <tr><td>`ui`</td><td>Operator UI integration.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="build-commands">Build Commands</h2>
+
+```bash
+just check                  # verify all four modes compile
+just build-single-node      # debug binary for local dev
+just build-bare-metal       # release binary for VMs
+just build-k8s              # release binary + operator for Kubernetes
+
+# GCC 15 workaround for RocksDB
+CXXFLAGS="-include cstdint" just build-single-node
+```
+
+
+<h2 id="python-features">Python Features</h2>
+<table class="api-table">
+  <thead><tr><th>Feature</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td>`kafka`</td><td>Kafka sources/connectors.</td></tr>
+    <tr><td>`iceberg`</td><td>Iceberg lakehouse bindings.</td></tr>
+    <tr><td>`vector-sinks`</td><td>Optional vector sink compatibility.</td></tr>
+    <tr><td>`qdrant`</td><td>Experimental Qdrant vector sink.</td></tr>
+    <tr><td>`pgvector`</td><td>Experimental pgvector sink.</td></tr>
+  </tbody>
+</table>
+
+```bash
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features iceberg
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features kafka
+```
+

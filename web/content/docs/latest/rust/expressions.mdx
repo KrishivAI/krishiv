@@ -1,0 +1,68 @@
+---
+title: Expressions
+description: Builder functions for constructing typed Expr values.
+status: Available
+---
+<h2 id="overview">Overview</h2>
+<p>The `Expr` type is the versioned expression AST used throughout `DataFrame`, `GroupedDataFrame`, and streaming operators. Build expressions using the provided constructor functions rather than constructing `Expr` directly.</p>
+
+<h2 id="column-literal">Column and Literal</h2>
+<table class="api-table">
+  <thead><tr><th>Function</th><th>Signature</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`col`</td><td>`col(name: &amp;str) -> Expr`</td><td>Reference a column by name.</td></tr>
+    <tr><td>`lit`</td><td>`lit(value: impl Into&lt;Literal&gt;) -> Expr`</td><td>Create a literal constant expression.</td></tr>
+    <tr><td>`expr`</td><td>`expr(sql: &amp;str) -> Result&lt;Expr&gt;`</td><td>Parse a SQL expression string into an `Expr`.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="aggregates">Aggregate Functions</h2>
+<table class="api-table">
+  <thead><tr><th>Function</th><th>Signature</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`count`</td><td>`count(expr: Expr) -> Expr`</td><td>Count non-null values.</td></tr>
+    <tr><td>`count_all`</td><td>`count_all() -> Expr`</td><td>Count all rows (`COUNT(*)`).</td></tr>
+    <tr><td>`sum`</td><td>`sum(expr: Expr) -> Expr`</td><td>Sum of numeric values.</td></tr>
+    <tr><td>`avg`</td><td>`avg(expr: Expr) -> Expr`</td><td>Arithmetic mean.</td></tr>
+    <tr><td>`min`</td><td>`min(expr: Expr) -> Expr`</td><td>Minimum value.</td></tr>
+    <tr><td>`max`</td><td>`max(expr: Expr) -> Expr`</td><td>Maximum value.</td></tr>
+    <tr><td>`function`</td><td>`function(name: &amp;str, args: Vec&lt;Expr&gt;) -> Expr`</td><td>Call a named SQL function or registered UDF.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="expr-methods">Expr Methods</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`.alias(name)`</td><td>Give an output alias to the expression.</td></tr>
+    <tr><td>`.gt(rhs)`</td><td>Greater-than comparison.</td></tr>
+    <tr><td>`.lt(rhs)`</td><td>Less-than comparison.</td></tr>
+    <tr><td>`.eq(rhs)`</td><td>Equality comparison.</td></tr>
+    <tr><td>`.and(rhs)`</td><td>Boolean AND.</td></tr>
+    <tr><td>`.or(rhs)`</td><td>Boolean OR.</td></tr>
+    <tr><td>`.not()`</td><td>Boolean NOT.</td></tr>
+    <tr><td>`.cast(data_type)`</td><td>Explicit type cast.</td></tr>
+    <tr><td>`.is_null()`</td><td>IS NULL predicate.</td></tr>
+    <tr><td>`.is_not_null()`</td><td>IS NOT NULL predicate.</td></tr>
+    <tr><td>`.asc()`</td><td>Wrap in ascending sort order.</td></tr>
+    <tr><td>`.desc()`</td><td>Wrap in descending sort order.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="example">Example</h2>
+
+```rust
+use krishiv_api::{col, lit, sum, count_all};
+
+let df = session.sql("SELECT * FROM sales").await?;
+let result = df
+    .filter(col("amount").gt(lit(100i64)))?
+    .group_by(vec![col("region")])?
+    .agg(vec![
+        sum(col("amount")).alias("total"),
+        count_all().alias("count"),
+    ])?
+    .sort(vec![col("total").desc()])?
+    .collect().await?;
+```
+

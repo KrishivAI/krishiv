@@ -1,0 +1,37 @@
+---
+title: AS-OF Queries
+description: Time-travel reads on Iceberg tables using FOR SYSTEM_TIME AS OF.
+status: Preview
+---
+<h2 id="overview">Overview</h2>
+<p>AS-OF queries read a historical snapshot of an Iceberg table as it existed at a given point in time. Krishiv preprocesses the `FOR SYSTEM_TIME AS OF` clause and resolves it to the appropriate snapshot before handing the rewritten query to DataFusion.</p>
+
+<h2 id="syntax">Syntax</h2>
+
+```sql
+SELECT *
+FROM <table> FOR SYSTEM_TIME AS OF TIMESTAMP '<iso-timestamp>'
+
+-- or using a binding expression
+SELECT *
+FROM <table> FOR SYSTEM_TIME AS OF <timestamp_expr>
+```
+
+
+<h2 id="example">Example</h2>
+
+```sql
+-- Read the orders table as it was at a specific point in time
+SELECT customer_id, SUM(amount) AS total
+FROM orders FOR SYSTEM_TIME AS OF TIMESTAMP '2024-01-15 12:00:00'
+GROUP BY customer_id;
+```
+
+
+<h2 id="notes">Notes</h2>
+<ul>
+  <li>Only supported on Iceberg tables registered under a `KrishivCatalog` catalog.</li>
+  <li>The snapshot closest to and not after the given timestamp is selected.</li>
+  <li>Multiple AS-OF refs in the same query are resolved independently.</li>
+  <li>Requires Iceberg catalog configured with the `iceberg` feature.</li>
+</ul>

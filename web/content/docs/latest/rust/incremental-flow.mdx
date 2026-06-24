@@ -1,0 +1,59 @@
+---
+title: IncrementalFlow
+description: Incremental view maintenance with DeltaBatch and tick-based processing.
+status: Experimental
+---
+<h2 id="overview">Overview</h2>
+<p>`IncrementalFlow` maintains query results incrementally by processing `DeltaBatch` changes (weighted Arrow rows with an `Int64 _weight` column: `+1` = insert, `-1` = retract).</p>
+
+<h2 id="construction">Construction</h2>
+<div class="api-sig">IncrementalFlow::new(session: &amp;Session) -> Result&lt;IncrementalFlow&gt;</div>
+
+<h2 id="methods">Methods</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`register_source(name, schema)`</td><td>`Result&lt;()&gt;`</td><td>Register a named source that accepts DeltaBatch input.</td></tr>
+    <tr><td>`register_view(name, query)`</td><td>`Result&lt;()&gt;`</td><td>Register a SQL query as an incrementally maintained view.</td></tr>
+    <tr><td>`tick(source_name, delta_batch)`</td><td>`Future&lt;Result&lt;StepSummary&gt;&gt;`</td><td>Deliver a delta batch and advance the view.</td></tr>
+    <tr><td>`snapshot(view_name)`</td><td>`Future&lt;Result&lt;Vec&lt;RecordBatch&gt;&gt;&gt;`</td><td>Read the current materialised snapshot of a view.</td></tr>
+    <tr><td>`watch_output(view_name)`</td><td>`Result&lt;Receiver&lt;DeltaBatch&gt;&gt;`</td><td>Subscribe to incremental output deltas from a view.</td></tr>
+    <tr><td>`checkpoint(path)`</td><td>`Future&lt;Result&lt;()&gt;&gt;`</td><td>Persist the current flow state to a checkpoint path.</td></tr>
+    <tr><td>`restore(path)`</td><td>`Future&lt;Result&lt;()&gt;&gt;`</td><td>Restore flow state from a checkpoint.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="step-summary">StepSummary</h2>
+<table class="api-table">
+  <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`rows_in`</td><td>`usize`</td><td>Rows received in this tick.</td></tr>
+    <tr><td>`rows_out`</td><td>`usize`</td><td>Delta rows emitted to output views.</td></tr>
+    <tr><td>`duration_ms`</td><td>`u64`</td><td>Wall-clock time to process this tick.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="example">Example</h2>
+
+```rust
+use krishiv_api::{Session, IncrementalFlow, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let session = Session::embedded().await?;
+    let mut flow = IncrementalFlow::new(&session)?;
+
+    flow.register_source("orders", orders_schema)?;
+    flow.register_view("totals",
+        "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id")?;
+
+    // Deliver a delta (weighted batch)
+    let summary = flow.tick("orders", delta_batch).await?;
+    println!("Processed {} rows, emitted {} delta rows", summary.rows_in, summary.rows_out);
+
+    // Read current view
+    let snapshot = flow.snapshot("totals").await?;
+    Ok(())
+}
+```
+

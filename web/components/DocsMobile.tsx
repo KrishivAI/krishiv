@@ -2,11 +2,11 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { GroupedPages } from '@/lib/docs-data';
 import type { docsVersions } from '@/lib/versions';
 
 type Version = (typeof docsVersions)[number];
 type Heading = { id: string; text: string };
+type GroupedPages = { group: string; pages: Array<{ slug: string; title: string; description: string }> };
 
 export function DocsMobileControls({
   title,
@@ -15,6 +15,7 @@ export function DocsMobileControls({
   groups,
   activeSlug,
   headings,
+  versionPathTemplate,
 }: {
   title: string;
   version: string;
@@ -22,6 +23,7 @@ export function DocsMobileControls({
   groups: GroupedPages[];
   activeSlug: string;
   headings: Heading[];
+  versionPathTemplate?: string;
 }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -30,7 +32,7 @@ export function DocsMobileControls({
   const searchInput = useRef<HTMLInputElement>(null);
   const allPages = useMemo(() => groups.flatMap((g) => g.pages.map((p) => ({ ...p, group: g.group }))), [groups]);
   const [query, setQuery] = useState('');
-  const results = allPages.filter((p) => `${p.title} ${p.description} ${p.group}`.toLowerCase().includes(query.toLowerCase())).slice(0, 8);
+  const results = allPages.filter((p: { title: string; description: string; group: string }) => `${p.title} ${p.description} ${p.group}`.toLowerCase().includes(query.toLowerCase())).slice(0, 8);
 
   useEffect(() => {
     document.body.classList.toggle('scroll-locked', drawerOpen || searchOpen);
@@ -43,13 +45,13 @@ export function DocsMobileControls({
 
   useEffect(() => { if (searchOpen) setTimeout(() => searchInput.current?.focus(), 30); }, [searchOpen]);
 
-  const versionPath = (slug: string) => `/docs/${slug}${activeSlug ? `/${activeSlug}` : ''}`;
+  const vPath = versionPathTemplate ? (v: string) => versionPathTemplate.replace(`/docs/${version}`, `/docs/${v}`) : (v: string) => `/docs/${v}${activeSlug ? `/${activeSlug}` : ''}`;
   return <>
     <div className="docs-mobile-toolbar" role="navigation" aria-label="Documentation controls">
       <button className="touch-button" aria-label="Open docs menu" onClick={() => setDrawerOpen(true)}>☰</button>
       <span className="docs-toolbar-title">{title}</span>
       <button className="touch-button" aria-label="Search docs" onClick={() => setSearchOpen(true)}>⌕</button>
-      <select className="docs-version-compact" aria-label="Documentation version" value={version} onChange={(e) => { window.location.href = versionPath(e.target.value); }}>
+      <select className="docs-version-compact" aria-label="Documentation version" value={version} onChange={(e) => { window.location.href = vPath(e.target.value); }}>
         {versions.map((v) => <option key={v.slug} value={v.slug}>{v.label}</option>)}
       </select>
     </div>
@@ -58,7 +60,7 @@ export function DocsMobileControls({
       <button className="docs-backdrop" aria-label="Close docs menu" onClick={() => setDrawerOpen(false)} />
       <aside className="docs-drawer" aria-label="Documentation menu">
         <div className="drawer-top"><strong>Documentation</strong><button className="touch-button" aria-label="Close docs menu" onClick={() => setDrawerOpen(false)}>×</button></div>
-        <label className="drawer-label">Version<select className="version" value={version} onChange={(e) => { window.location.href = versionPath(e.target.value); }}>{versions.map((v) => <option key={v.slug} value={v.slug}>{v.label}</option>)}</select></label>
+        <label className="drawer-label">Version<select className="version" value={version} onChange={(e) => { window.location.href = vPath(e.target.value); }}>{versions.map((v) => <option key={v.slug} value={v.slug}>{v.label}</option>)}</select></label>
         <button className="drawer-search" onClick={() => setSearchOpen(true)}>Search documentation</button>
         <nav className="drawer-nav">
           {groups.map(({ group, pages }) => {

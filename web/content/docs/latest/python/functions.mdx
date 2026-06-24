@@ -1,0 +1,105 @@
+---
+title: Expression Functions
+description: col, lit, expr, aggregate and scalar functions in krishiv.functions.
+status: Available
+---
+<h2 id="overview">Overview</h2>
+<p>Import from `krishiv.functions` or `krishiv.sql.functions`:</p>
+
+```python
+from krishiv.functions import col, lit, sum, avg, count, expr
+from krishiv.sql.functions import upper, lower, date_trunc, coalesce
+```
+
+
+<h2 id="column-literal">Column and Literal</h2>
+<table class="api-table">
+  <thead><tr><th>Function</th><th>Signature</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`col(name)`</td><td>`col(name: str) -> Column`</td><td>Reference a column by name.</td></tr>
+    <tr><td>`column(name)`</td><td>`column(name: str) -> Column`</td><td>Alias for `col`.</td></tr>
+    <tr><td>`lit(value)`</td><td>`lit(value: Any) -> Column`</td><td>Constant literal value (int, float, str, bool, None).</td></tr>
+    <tr><td>`expr(sql)`</td><td>`expr(sql: str) -> Column`</td><td>Parse a SQL expression string into a Column.</td></tr>
+    <tr><td>`call_function(name, *args)`</td><td>`Column`</td><td>Call a named SQL function or UDF with Column arguments.</td></tr>
+    <tr><td>`function(name, *args)`</td><td>`Column`</td><td>Alias for `call_function`.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="aggregates">Aggregate Functions</h2>
+<table class="api-table">
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`count(col='*')`</td><td>Count rows or non-null values of a column.</td></tr>
+    <tr><td>`count_all()`</td><td>COUNT(*) — count all rows.</td></tr>
+    <tr><td>`sum(col)`</td><td>Sum of numeric values.</td></tr>
+    <tr><td>`avg(col)`</td><td>Arithmetic mean.</td></tr>
+    <tr><td>`mean(col)`</td><td>Alias for `avg`.</td></tr>
+    <tr><td>`min(col)`</td><td>Minimum value.</td></tr>
+    <tr><td>`max(col)`</td><td>Maximum value.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="null-functions">Null / Conditional</h2>
+<table class="api-table">
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`coalesce(*cols)`</td><td>Return the first non-null value.</td></tr>
+    <tr><td>`ifnull(value, replacement)`</td><td>Return `replacement` if `value` is null.</td></tr>
+    <tr><td>`nullif(left, right)`</td><td>Return null if `left == right`, else `left`.</td></tr>
+    <tr><td>`isnull(col)`</td><td>True if the column is null.</td></tr>
+    <tr><td>`isnotnull(col)`</td><td>True if the column is not null.</td></tr>
+    <tr><td>`isnan(col)`</td><td>True if the value is NaN.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="string-functions">String Functions</h2>
+<table class="api-table">
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`upper(col)`</td><td>Convert to uppercase.</td></tr>
+    <tr><td>`lower(col)`</td><td>Convert to lowercase.</td></tr>
+    <tr><td>`length(col)`</td><td>String length (character count).</td></tr>
+    <tr><td>`trim(col)`</td><td>Strip leading and trailing whitespace.</td></tr>
+    <tr><td>`ltrim(col)`</td><td>Strip leading whitespace.</td></tr>
+    <tr><td>`rtrim(col)`</td><td>Strip trailing whitespace.</td></tr>
+    <tr><td>`concat(*cols)`</td><td>Concatenate strings.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="math-functions">Math Functions</h2>
+<table class="api-table">
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`abs(col)`</td><td>Absolute value.</td></tr>
+    <tr><td>`round(col, scale=0)`</td><td>Round to `scale` decimal places.</td></tr>
+    <tr><td>`floor(col)`</td><td>Floor (round down to integer).</td></tr>
+    <tr><td>`ceil(col)`</td><td>Ceiling (round up to integer).</td></tr>
+    <tr><td>`sqrt(col)`</td><td>Square root.</td></tr>
+    <tr><td>`exp(col)`</td><td>e raised to the power of `col`.</td></tr>
+    <tr><td>`log(col)`</td><td>Natural logarithm.</td></tr>
+    <tr><td>`sin(col)`</td><td>Sine (radians).</td></tr>
+    <tr><td>`cos(col)`</td><td>Cosine (radians).</td></tr>
+    <tr><td>`tan(col)`</td><td>Tangent (radians).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="date-functions">Date/Time Functions</h2>
+<table class="api-table">
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`current_date()`</td><td>Current date (evaluates at query planning time).</td></tr>
+    <tr><td>`current_timestamp()`</td><td>Current timestamp.</td></tr>
+    <tr><td>`date_trunc(unit, timestamp)`</td><td>Truncate to a time unit ('year', 'month', 'day', 'hour', 'minute', 'second').</td></tr>
+  </tbody>
+</table>
+
+<h2 id="sort-cast">Sort and Cast</h2>
+<table class="api-table">
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`asc(col)`</td><td>Wrap column in ascending sort order.</td></tr>
+    <tr><td>`desc(col)`</td><td>Wrap column in descending sort order.</td></tr>
+    <tr><td>`cast(col, data_type)`</td><td>Cast column to `data_type` string (e.g. `'int64'`, `'utf8'`).</td></tr>
+    <tr><td>`try_cast(col, data_type)`</td><td>Cast returning null on failure instead of erroring.</td></tr>
+  </tbody>
+</table>

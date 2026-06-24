@@ -1,0 +1,97 @@
+---
+title: Session & SessionBuilder
+description: Create and configure a Krishiv session for batch, streaming, or incremental work.
+status: Available
+---
+<h2 id="sessionbuilder">SessionBuilder</h2>
+<p>All sessions are constructed via `SessionBuilder`. The builder is obtained from `Session::builder()` and follows the builder pattern.</p>
+<div class="api-sig">Session::builder() -> SessionBuilder</div>
+
+<h2 id="builder-methods">Builder Methods</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`embedded()`</td><td>Shorthand for `SessionBuilder::default().build().await` in embedded mode.</td></tr>
+    <tr><td>`mode(ExecutionMode)`</td><td>Set the execution mode: `Embedded`, `SingleNode`, `Distributed`.</td></tr>
+    <tr><td>`coordinator_url(impl Into&lt;String&gt;)`</td><td>Flight/gRPC endpoint for distributed mode.</td></tr>
+    <tr><td>`with_auth(impl AuthProvider)`</td><td>Attach a bearer-token or custom auth provider.</td></tr>
+    <tr><td>`with_policy(impl PolicyHook)`</td><td>Attach a governance/access-control hook.</td></tr>
+    <tr><td>`target_parallelism(NonZeroUsize)`</td><td>DataFusion target partition count for parallel execution.</td></tr>
+    <tr><td>`with_iceberg_catalog(Arc&lt;KrishivCatalog&gt;, name)`</td><td>Register an Iceberg catalog under a given name (requires `iceberg-catalog` feature).</td></tr>
+    <tr><td>`with_shuffle_partitions(Option&lt;u32&gt;)`</td><td>Override shuffle bucket count; `None` = auto.</td></tr>
+    <tr><td>`config(key, value)`</td><td>Set a session config key.</td></tr>
+    <tr><td>`build() -> Result&lt;Session&gt;`</td><td>Construct and return the session (async, requires `.await`).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="session-constructors">Session Constructors</h2>
+<div class="api-sig">Session::embedded() -> impl Future&lt;Output = Result&lt;Session&gt;&gt;</div>
+<div class="api-sig">Session::from_env() -> impl Future&lt;Output = Result&lt;Session&gt;&gt;</div>
+<div class="api-sig">Session::connect(url: &amp;str) -> impl Future&lt;Output = Result&lt;Session&gt;&gt;</div>
+
+<h2 id="session-sql">SQL Methods</h2>
+<Callout type="info" title="Common methods"> Most workloads use `Session::embedded()`, `sql(query)`, `read_parquet(path)`, `register_parquet(name, path)`, and `table(name)`. The full tables below are the complete reference.</Callout>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`sql(query: &amp;str)`</td><td>`Future&lt;Result&lt;DataFrame&gt;&gt;`</td><td>Parse and plan a SQL query. Returns a lazy DataFrame.</td></tr>
+    <tr><td>`sql_with_timeout(query, ms)`</td><td>`Future&lt;Result&lt;DataFrame&gt;&gt;`</td><td>Same as `sql` with an execution timeout in milliseconds.</td></tr>
+    <tr><td>`prepare(query: &amp;str)`</td><td>`Future&lt;Result&lt;PreparedStatement&gt;&gt;`</td><td>Create a parameterised prepared statement.</td></tr>
+    <tr><td>`explain(query: &amp;str)`</td><td>`Future&lt;Result&lt;String&gt;&gt;`</td><td>Return the DataFusion logical plan as a string.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="session-data">Data Registration</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`read_parquet(path)`</td><td>`Future&lt;Result&lt;DataFrame&gt;&gt;`</td><td>Read a local Parquet file into a DataFrame.</td></tr>
+    <tr><td>`read_csv(path)`</td><td>`Future&lt;Result&lt;DataFrame&gt;&gt;`</td><td>Read a local CSV file.</td></tr>
+    <tr><td>`read_json(path)`</td><td>`Future&lt;Result&lt;DataFrame&gt;&gt;`</td><td>Read a local NDJSON file.</td></tr>
+    <tr><td>`register_parquet(name, path)`</td><td>`Future&lt;Result&lt;()&gt;&gt;`</td><td>Register a Parquet file as a named SQL table.</td></tr>
+    <tr><td>`register_record_batches(name, batches)`</td><td>`Future&lt;Result&lt;()&gt;&gt;`</td><td>Register in-memory Arrow batches as a SQL table.</td></tr>
+    <tr><td>`register_udf(udf: ScalarUdf)`</td><td>`Result&lt;()&gt;`</td><td>Register a scalar UDF.</td></tr>
+    <tr><td>`register_aggregate_udf(udf)`</td><td>`Result&lt;()&gt;`</td><td>Register an aggregate UDF.</td></tr>
+    <tr><td>`register_table_udf_fn(name, schema, f)`</td><td>`Result&lt;()&gt;`</td><td>Register a closure-based table-valued function.</td></tr>
+    <tr><td>`register_kafka_source(name, schema, brokers, topic, group)`</td><td>`Result&lt;()&gt;`</td><td>Register a Kafka topic as an unbounded streaming table.</td></tr>
+    <tr><td>`deregister_table(name)`</td><td>`Result&lt;()&gt;`</td><td>Remove a registered table.</td></tr>
+    <tr><td>`table_exists(name)`</td><td>`bool`</td><td>Check if a table is registered.</td></tr>
+    <tr><td>`list_tables()`</td><td>`Vec&lt;String&gt;`</td><td>List registered table names.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="session-streaming">Streaming Methods</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`memory_stream(schema)`</td><td>`Result&lt;(Stream, Sender)&gt;`</td><td>Create an in-memory stream and its push handle.</td></tr>
+    <tr><td>`from_bounded_stream(schema, batches)`</td><td>`Result&lt;Stream&gt;`</td><td>Create a bounded stream from a static list of batches.</td></tr>
+    <tr><td>`submit_stream_job(plan, name)`</td><td>`Future&lt;Result&lt;JobStatus&gt;&gt;`</td><td>Submit a streaming job to the scheduler.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="example">Example</h2>
+
+```rust
+use krishiv_api::{Session, Result};
+use arrow::datatypes::{DataType, Field, Schema};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let session = Session::embedded().await?;
+
+    // Register in-memory data
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id",  DataType::Int64,   false),
+        Field::new("val", DataType::Float64, true),
+    ]));
+    // ... build RecordBatch ...
+
+    // SQL query
+    let df = session.sql("SELECT id, val FROM my_table WHERE val > 10").await?;
+    df.show().await?;
+    Ok(())
+}
+```
+

@@ -1,0 +1,62 @@
+---
+title: Parquet → SQL aggregation
+description: Read a Parquet file, run a SQL aggregation, write to a new Parquet file.
+status: Available
+---
+<p>The shortest path from "I have a Parquet file" to "I have a result." Uses the embedded runtime — no cluster required.</p>
+
+<h2 id="python">Python</h2>
+
+```python
+import krishiv as ks
+
+session = ks.Session.embedded()
+
+orders = session.read_parquet("data/orders.parquet")
+session.register_parquet("orders", "data/orders.parquet")
+
+result = session.sql("""
+    SELECT customer_id, SUM(amount) AS total
+    FROM orders
+    WHERE event_time >= CURRENT_DATE - INTERVAL '30' DAY
+    GROUP BY customer_id
+    ORDER BY total DESC
+    LIMIT 100
+""")
+result.write_parquet("out/top_customers.parquet")
+result.show(10)
+```
+
+
+<h2 id="rust">Rust</h2>
+
+```rust
+use krishiv_api::{col, lit, sum, Session};
+
+#[tokio::main]
+async fn main() -> krishiv_api::Result<()> {
+    let session = Session::embedded().await?;
+    session.register_parquet("orders", "data/orders.parquet").await?;
+
+    let df = session.sql("
+        SELECT customer_id, SUM(amount) AS total
+        FROM orders
+        WHERE event_time >= CURRENT_DATE - INTERVAL '30' DAY
+        GROUP BY customer_id
+        ORDER BY total DESC
+        LIMIT 100
+    ").await?;
+    df.write_parquet("out/top_customers.parquet", None).await?;
+    df.show().await?;
+    Ok(())
+}
+```
+
+
+<h2 id="notes">Notes</h2>
+<ul>
+  <li>The internal data model is <strong>Apache Arrow RecordBatch</strong>; reading and writing both go through it.</li>
+  <li>SQL parsing and execution are delegated to <strong>DataFusion</strong>; you can use any standard DataFusion SQL syntax.</li>
+  <li>For larger files, prefer reading a directory of partitioned Parquet files instead of one giant file.</li>
+</ul>
+<p>See the <a href="/docs/latest/python/session">Python Session</a> and <a href="/docs/latest/connectors/parquet">Parquet &amp; Object Store</a> pages for full options.</p>

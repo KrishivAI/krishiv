@@ -1,0 +1,49 @@
+---
+title: SQL UDFs
+description: CREATE FUNCTION … RETURNS TABLE LANGUAGE SQL for SQL-body table functions.
+status: Available
+---
+<h2 id="overview">Overview</h2>
+<p>Krishiv intercepts `CREATE FUNCTION … RETURNS TABLE` DDL to register SQL-body table-valued functions (TVFs). The function body is a parameterised SQL query. Only `LANGUAGE SQL` is supported; other languages are rejected.</p>
+
+<h2 id="syntax">Syntax</h2>
+
+```sql
+CREATE FUNCTION <name>(<param> <type> [, ...])
+RETURNS TABLE (<col> <type> [, ...])
+LANGUAGE SQL
+AS '<sql-body>';
+```
+
+
+<h2 id="example">Example</h2>
+
+```sql
+-- Define a TVF that returns recent orders for a customer
+CREATE FUNCTION recent_orders(cust_id BIGINT)
+RETURNS TABLE (order_id BIGINT, amount DOUBLE, ts TIMESTAMP)
+LANGUAGE SQL
+AS 'SELECT order_id, amount, ts FROM orders WHERE customer_id = cust_id ORDER BY ts DESC LIMIT 10';
+
+-- Use the TVF in a query
+SELECT * FROM recent_orders(42);
+```
+
+
+<h2 id="rust-registration">Rust Registration (closure-based)</h2>
+
+```rust
+engine.register_table_udf_fn(
+    "generate_ints",
+    Schema::new(vec![Field::new("n", DataType::Int64, false)]),
+    |args| {
+        let count = match args.first() {
+            Some(ScalarValue::Int64(Some(n))) => *n,
+            _ => 10,
+        };
+        let arr = Int64Array::from_iter(0..count);
+        Ok(RecordBatch::try_from_iter([("n", Arc::new(arr) as _)])?)
+    },
+)?;
+```
+

@@ -1,0 +1,38 @@
+---
+title: Shuffle
+description: Shuffle service configuration for local, disk, and distributed deployments.
+status: Available
+---
+<h2 id="overview">Overview</h2>
+<p>Shuffle moves data between tasks across partition boundaries. The `krishiv-shuffle` crate provides pluggable shuffle backends selected by the active durability profile.</p>
+
+<h2 id="backends">Shuffle Backends</h2>
+<table class="api-table">
+  <thead><tr><th>Backend</th><th>Durability Profile</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>In-memory</td><td>`dev-local`</td><td>Arrow batches in a tokio channel. Zero durability; fastest path.</td></tr>
+    <tr><td>Local disk</td><td>`single-node-durable`</td><td>Batches spilled to local disk under `KRISHIV_SHUFFLE_DIR`. Survives task restart on same host.</td></tr>
+    <tr><td>Object store</td><td>`distributed-durable`</td><td>Batches written to S3/ADLS/GCS. Enables cross-host executor reassignment.</td></tr>
+    <tr><td>Flight</td><td>Any distributed</td><td>Direct Arrow Flight streaming between executor pairs (low-latency; no intermediate persistence).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="configuration">Configuration</h2>
+<table class="api-table">
+  <thead><tr><th>Environment Variable</th><th>Default</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`KRISHIV_SHUFFLE_DIR`</td><td>`/tmp/krishiv-shuffle`</td><td>Local disk spill directory (single-node profile).</td></tr>
+    <tr><td>`KRISHIV_SHUFFLE_OBJECT_STORE_URI`</td><td>—</td><td>Object store URI for distributed shuffle (e.g. `s3://bucket/shuffle/`).</td></tr>
+    <tr><td>`KRISHIV_SHUFFLE_PARTITIONS`</td><td>`auto`</td><td>Number of shuffle partitions. `auto` = `executor_count × 2`.</td></tr>
+    <tr><td>`KRISHIV_SHUFFLE_BATCH_SIZE`</td><td>`8192`</td><td>Maximum rows per shuffle batch.</td></tr>
+    <tr><td>`KRISHIV_SHUFFLE_COMPRESS`</td><td>`lz4`</td><td>Shuffle payload compression: `lz4` | `zstd` | `none`.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="partitioning">Partitioning</h2>
+<p>Krishiv supports three shuffle partitioning strategies:</p>
+<ul>
+  <li><strong>Hash partitioning:</strong> rows are hashed on one or more key columns. Used for `GROUP BY`, joins, and keyed operators.</li>
+  <li><strong>Range partitioning:</strong> rows are sorted and split at boundary values. Used for range-based aggregations.</li>
+  <li><strong>Broadcast:</strong> one partition is replicated to all downstream tasks. Used for small build-side joins.</li>
+</ul>

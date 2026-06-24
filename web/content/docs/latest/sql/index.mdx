@@ -1,0 +1,38 @@
+---
+title: SQL Overview
+description: "Krishiv SQL surface: DataFusion base plus Krishiv extensions."
+status: Available
+---
+<h2 id="overview">Overview</h2>
+<p>Krishiv SQL is built on <strong>DataFusion</strong>, which implements a broad subset of ANSI SQL. Krishiv adds extensions for streaming, incremental views, live tables, pipeline DDL, lakehouse DML, pattern matching, and session management.</p>
+
+<h2 id="standard-sql">Standard SQL (DataFusion)</h2>
+<p>All standard SELECT semantics are supported: projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET, CTEs (WITH), subqueries, UNNEST, window functions (`ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, etc.), UNION / INTERSECT / EXCEPT, JOINs, string/date/numeric/aggregate/array functions, CASE expressions, CAST, COALESCE, and NULLIF.</p>
+
+<h2 id="krishiv-extensions">Krishiv SQL Extensions</h2>
+<table class="api-table">
+  <thead><tr><th>Extension</th><th>Status</th><th>Summary</th></tr></thead>
+  <tbody>
+    <tr><td>Window functions: `tumble_start / tumble_end / hop_start / hop_end`</td><td>Available</td><td>Temporal bucket helpers for streaming GROUP BY.</td></tr>
+    <tr><td>`MATCH_RECOGNIZE`</td><td>Available</td><td>Complex Event Processing (CEP) pattern matching.</td></tr>
+    <tr><td>`MERGE INTO`</td><td>Preview</td><td>Upsert/delete on Iceberg tables.</td></tr>
+    <tr><td>`DELETE FROM &lt;iceberg-table&gt;`</td><td>Preview</td><td>Copy-on-write row delete on Iceberg.</td></tr>
+    <tr><td>`UPDATE &lt;iceberg-table&gt;`</td><td>Preview</td><td>Copy-on-write row update on Iceberg.</td></tr>
+    <tr><td>`CREATE INCREMENTAL VIEW`</td><td>Experimental</td><td>Register an incrementally maintained view.</td></tr>
+    <tr><td>`REFRESH / DROP INCREMENTAL VIEW`</td><td>Experimental</td><td>Lifecycle DDL for incremental views.</td></tr>
+    <tr><td>`CREATE LIVE TABLE`</td><td>Experimental</td><td>Register a live-ingestion table.</td></tr>
+    <tr><td>`REFRESH / DROP LIVE TABLE`</td><td>Experimental</td><td>Lifecycle DDL for live tables.</td></tr>
+    <tr><td>`CREATE SOURCE / CREATE SINK`</td><td>Experimental</td><td>Pipeline DDL for named sources and sinks.</td></tr>
+    <tr><td>`START PIPELINE`</td><td>Experimental</td><td>Start a named pipeline from registered source/sink.</td></tr>
+    <tr><td>`CREATE EXTERNAL TABLE … STORED AS KAFKA`</td><td>Preview</td><td>Register a Kafka topic as a streaming table.</td></tr>
+    <tr><td>`&lt;table&gt; FOR SYSTEM_TIME AS OF &lt;expr&gt;`</td><td>Preview</td><td>Time-travel read on Iceberg tables.</td></tr>
+    <tr><td>`CREATE FUNCTION … RETURNS TABLE LANGUAGE SQL`</td><td>Available</td><td>SQL-body table-valued functions.</td></tr>
+    <tr><td>`SET shuffle.partitions = N`</td><td>Available</td><td>Override shuffle bucket count for this session.</td></tr>
+    <tr><td>`DESCRIBE &lt;table&gt;`</td><td>Available</td><td>Return schema of a registered table.</td></tr>
+    <tr><td>`EXPLAIN [VERBOSE] &lt;query&gt;`</td><td>Available</td><td>Show DataFusion logical/physical plan.</td></tr>
+    <tr><td>`CALL system.&lt;proc&gt;(...)`</td><td>Preview</td><td>Iceberg maintenance procedures (expire_snapshots, rewrite_data_files, etc.).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="error-handling">Error Handling</h2>
+<p>SQL errors are returned as typed `SqlError` values: `EmptyQuery`, `EmptyTableName`, `Unsupported`, `DataFusion`, `Optimizer`, `AccessDenied`, `OperationCancelled`, `Timeout`.</p>

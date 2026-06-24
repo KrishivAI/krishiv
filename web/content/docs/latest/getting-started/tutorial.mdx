@@ -1,0 +1,152 @@
+---
+title: Your first Krishiv pipeline
+description: "A 15-minute end-to-end tutorial: read a file, run a query, write a result."
+status: Available
+---
+<p>This tutorial takes you from zero to a working pipeline that reads a CSV file, runs a SQL aggregation, and writes the result back to Parquet. Pick Python or Rust — both are first-class.</p>
+
+<h2 id="prereqs">Prerequisites</h2>
+<ul>
+  <li><strong>Python:</strong> Python 3.10+, then `pip install --no-build-isolation krishiv` (or build from source: `maturin develop --manifest-path crates/krishiv-python/Cargo.toml`).</li>
+  <li><strong>Rust:</strong> Rust 1.80+ and the `just` runner.</li>
+  <li>~50 lines of code, no external services.</li>
+</ul>
+
+<h2 id="step-1">Step 1 — Create the input</h2>
+<p>Create `data/orders.csv` with the following content (the path is referenced in later steps):</p>
+
+```csv
+order_id,customer_id,amount,event_time
+1,c1,42.50,1700000000
+2,c2,15.00,1700000060
+3,c1,9.99,1700000120
+4,c3,120.00,1700000180
+5,c2,7.50,1700000240
+6,c1,300.00,1700000300
+7,c3,55.25,1700000360
+8,c2,12.40,1700000420
+```
+
+
+<h2 id="step-2-py">Step 2a — Python pipeline</h2>
+<p>Create `pipeline.py`:</p>
+
+```python
+import krishiv as ks
+from krishiv.functions import col, sum, desc
+
+# 1. Create an in-process session (no daemon, no cluster).
+session = ks.Session.embedded()
+
+# 2. Register the CSV as a SQL table.
+session.register_csv("orders", "data/orders.csv")
+
+# 3. Run a SQL aggregation.
+top_customers = session.sql("""
+    SELECT customer_id, SUM(amount) AS total
+    FROM orders
+    GROUP BY customer_id
+    ORDER BY total DESC
+    LIMIT 5
+""")
+
+# 4. Print the result.
+print("Top customers by total spend:")
+top_customers.show()
+
+# 5. Write the result to a Parquet file.
+top_customers.write_parquet("out/top_customers.parquet")
+print("Wrote out/top_customers.parquet")
+```
+
+<p>Run it:</p>
+
+```bash
+python pipeline.py
+```
+
+<p>Expected output (numbers match the CSV above):</p>
+
+```text
+Top customers by total spend:
++--------------+-------+
+| customer_id  | total |
++--------------+-------+
+| c1           | 352.49|
+| c3           | 175.25|
+| c2           |  34.90|
++--------------+-------+
+
+Wrote out/top_customers.parquet
+```
+
+
+<h2 id="step-2-rs">Step 2b — Rust pipeline</h2>
+<p>Create `src/main.rs`:</p>
+
+```rust
+use krishiv_api::{col, desc, sum, Session};
+
+#[tokio::main]
+async fn main() -> krishiv_api::Result<()> {
+    let session = Session::embedded().await?;
+    session.register_csv("orders", "data/orders.csv").await?;
+
+    let df = session.sql("
+        SELECT customer_id, SUM(amount) AS total
+        FROM orders
+        GROUP BY customer_id
+        ORDER BY total DESC
+        LIMIT 5
+    ").await?;
+
+    println!("Top customers by total spend:");
+    df.show().await?;
+    df.write_parquet("out/top_customers.parquet", None).await?;
+    println!("Wrote out/top_customers.parquet");
+    Ok(())
+}
+```
+
+<p>Run it:</p>
+
+```bash
+cargo run
+```
+
+
+<h2 id="step-3">Step 3 — Inspect the result</h2>
+<p>Read the Parquet file you just wrote and confirm the schema:</p>
+
+```python
+import pyarrow.parquet as pq
+table = pq.read_table("out/top_customers.parquet")
+print(table.schema)
+print(table.to_pandas())
+```
+
+
+<h2 id="step-4">Step 4 — Modify the query</h2>
+<p>Try changing the query. Some ideas:</p>
+<ul>
+  <li>Add a `WHERE amount &gt; 20` filter.</li>
+  <li>Add `COUNT(*) AS n_orders` alongside `SUM(amount)`.</li>
+  <li>Switch the DataFrame API for the SQL string (see the <a href="/docs/latest/recipes/dataframe-101">DataFrame 101</a> recipe).</li>
+  <li>Read a Parquet file instead of CSV (see <a href="/docs/latest/connectors/parquet">Parquet &amp; Object Store</a>).</li>
+  <li>Run the same code against the `single-node` daemon for restart-durable state (see <a href="/docs/latest/recipes/single-node-deploy">Single-node deployment</a>).</li>
+</ul>
+
+<h2 id="what-you-learned">What you learned</h2>
+<ul>
+  <li>`Session.embedded()` creates an in-process engine — no daemon, no cluster.</li>
+  <li>`register_csv` / `register_parquet` expose a file as a SQL table.</li>
+  <li>SQL is parsed and planned by DataFusion and executed by the same runtime as DataFrame and Stream.</li>
+  <li>Results are Arrow `RecordBatch` values, and writes go back through Arrow.</li>
+</ul>
+
+<h2 id="next">Next steps</h2>
+<ul>
+  <li><a href="/docs/latest/recipes">Recipes</a> — task-oriented examples (tumbling windows, Iceberg upserts, Kafka pipelines, etc.)</li>
+  <li><a href="/docs/latest/concepts/how-it-executes">How Krishiv executes a query</a> — the journey from `session.sql(...)` to result</li>
+  <li><a href="/product/maturity">Feature Maturity</a> — what is production-ready today</li>
+</ul>

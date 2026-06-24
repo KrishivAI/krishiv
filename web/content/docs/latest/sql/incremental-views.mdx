@@ -1,0 +1,35 @@
+---
+title: Incremental Views
+description: CREATE INCREMENTAL VIEW DDL for incrementally maintained query results.
+status: Experimental
+---
+<h2 id="overview">Overview</h2>
+<p>Incremental views maintain a query result that updates incrementally when source data changes, rather than re-running the full query on each tick. Implemented via `IncrementalFlow` backed by `DeltaBatch` (weighted Arrow rows).</p>
+<Callout type="warn" title="Experimental"> End-to-end connector certification and distributed executor-side IVM are in progress.</Callout>
+
+<h2 id="ddl">DDL Statements</h2>
+<table class="api-table">
+  <thead><tr><th>Statement</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`CREATE INCREMENTAL VIEW &lt;name&gt; AS &lt;query&gt;`</td><td>Register an incremental view backed by a SQL query.</td></tr>
+    <tr><td>`DECLARE INCREMENTAL VIEW &lt;name&gt; AS &lt;query&gt; WITH ORDINAL`</td><td>Register with an explicit ordinal (row-position) column for ordered IVM.</td></tr>
+    <tr><td>`REFRESH INCREMENTAL VIEW &lt;name&gt;`</td><td>Re-evaluate and update the view from current source data.</td></tr>
+    <tr><td>`DROP INCREMENTAL VIEW &lt;name&gt;`</td><td>Remove the view registration.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="example">Example</h2>
+
+```sql
+CREATE INCREMENTAL VIEW order_totals AS
+SELECT customer_id, SUM(amount) AS total
+FROM orders
+GROUP BY customer_id;
+
+REFRESH INCREMENTAL VIEW order_totals;
+SELECT * FROM order_totals;
+```
+
+
+<h2 id="python-api">Python / Rust API</h2>
+<p>See the <a href="/docs/latest/python/session">Python Session</a> page for `IncrementalFlow` bindings. The SQL DDL and the `IncrementalFlow` API share the same underlying registry.</p>

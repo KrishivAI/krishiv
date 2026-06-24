@@ -1,0 +1,89 @@
+---
+title: How Krishiv executes a query
+description: A visual walkthrough from session.sql(...) to result — for a single batch SQL query.
+status: Available
+---
+<p>This page follows one query — `session.sql("SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id")` — from your code to the result, so the rest of the documentation has a place to anchor.</p>
+
+<h2 id="diagram">At a glance</h2>
+<pre>`Your code
+  session.sql("SELECT customer_id, SUM(amount) ... FROM orders ...")
+        │
+        ▼
+[1] SqlEngine.parse()        ── DataFusion SQL → LogicalPlan
+        │
+        ▼
+[2] Krishiv plan + optimizer ── typed Expr AST, predicate pushdown,
+        │                          policy/governance hooks
+        ▼
+[3] ExecutionRuntime.accept_plan()
+        │
+        ├── Embedded      →  [4a] in-process task graph
+        ├── SingleNode    →  [4a] in-process task graph + Flight endpoint
+        └── Distributed   →  [4b] remote coordinator gRPC
+                                  │
+                                  ▼
+[5] Coordinator.submit_job()
+        │  - job lifecycle, fencing, metadata store
+        ▼
+[6] Scheduler → Tasks → Executor(s)
+        │  - shuffle partitioning, source/sink wiring
+        ▼
+[7] DataFusion + Arrow operators
+        │  - scan, filter, aggregate, window, join, ...
+        ▼
+[8] Result: Vec&lt;RecordBatch&gt; (or streaming iterator)
+`</pre>
+
+<h2 id="step-by-step">Step by step</h2>
+
+<h3 id="step-1">1. Parse</h3>
+<p>`Session::sql(...)` hands the string to a DataFusion `SessionContext`. The result is a <strong>logical plan</strong> — a tree of relational operators (Scan, Filter, Aggregate, Project, …). At this point nothing has run yet.</p>
+
+<h3 id="step-2">2. Optimize</h3>
+<p>Krishiv runs the DataFusion optimizer, then layers its own plan-level transformations: predicate pushdown into source providers, projection pruning, governance/policy hooks, and UDF resolution. The output is a <strong>physical plan</strong> — operators with specific implementations, partitioning, and shuffle requirements.</p>
+
+<h3 id="step-3">3. Route</h3>
+<p>`ExecutionRuntime::accept_plan(plan)` decides where the work runs:</p>
+<table class="api-table">
+  <thead><tr><th>RuntimeMode</th><th>What happens</th></tr></thead>
+  <tbody>
+    <tr><td>`Embedded`</td><td>Build the task graph in-process and run it on the calling thread (or `spawn_blocking` for DataFusion work).</td></tr>
+    <tr><td>`SingleNode`</td><td>Same as embedded, but with a Flight SQL endpoint so other clients can attach.</td></tr>
+    <tr><td>`Distributed`</td><td>Serialize the plan and ship it to the coordinator gRPC endpoint. <strong>No silent fallback</strong> — if the endpoint is unreachable, the call fails.</td></tr>
+  </tbody>
+</table>
+
+<h3 id="step-4">4. Submit</h3>
+<p>The coordinator receives the plan, fragments it into tasks, and assigns each task to an executor. Each executor runs the task on the Arrow operator runtime inside `krishiv-dataflow` — queues, barriers, windows, stateful joins, all working on `RecordBatch` values.</p>
+
+<h3 id="step-5">5. Shuffle, state, and checkpoints</h3>
+<p>Cross-partition data flows through `krishiv-shuffle` (in-memory, local disk, or object store, depending on the durability profile). Stateful operators read and write to `krishiv-state` (in-memory or RocksDB). At configured intervals, the coordinator triggers a checkpoint that snapshots state and source offsets atomically.</p>
+
+<h3 id="step-6">6. Collect</h3>
+<p>For a batch query, the runtime gathers the terminal batches and returns them as a `Vec&lt;RecordBatch&gt;` (Rust) or a list of `pa.RecordBatch` (Python). For a streaming query, the same pipeline returns a stream / iterator instead.</p>
+
+<h2 id="arrow-everywhere">Arrow everywhere</h2>
+<p>The same `RecordBatch` type flows through every layer — sources, operators, shuffle, and sinks. There is no row-by-row marshalling and no JVM-style boxed objects. This is the main reason Krishiv is competitive with engines that have had years more development time: the columnar format does most of the heavy lifting, and Rust keeps the abstractions cheap.</p>
+
+<h2 id="durability">Where durability fits</h2>
+<p>Three explicit profiles control what the runtime uses for metadata, state, shuffle, and checkpoints:</p>
+<table class="api-table">
+  <thead><tr><th>Profile</th><th>State</th><th>Shuffle</th><th>Checkpoints</th></tr></thead>
+  <tbody>
+    <tr><td>`dev-local`</td><td>In-memory</td><td>In-memory</td><td>Ephemeral</td></tr>
+    <tr><td>`single-node-durable`</td><td>RocksDB</td><td>Local disk</td><td>Local filesystem</td></tr>
+    <tr><td>`distributed-durable`</td><td>RocksDB (restored)</td><td>Tiered (local + object store)</td><td>Object store + etcd</td></tr>
+  </tbody>
+</table>
+<p>See the <a href="/docs/latest/concepts/execution-model">Execution Model</a> reference for the full list of env vars and the <a href="/docs/latest/operations/checkpointing">Checkpointing</a> page for the protocol.</p>
+
+<h2 id="streaming">What changes for streaming</h2>
+<p>For streaming queries, the same pipeline runs as a long-lived <em>job</em>: a coordinator-owned process that ingests batches from sources (Kafka, memory streams, registered unbounded tables), processes them through the same operator runtime, and emits results. The plan is the same shape — what changes is that operators push their output to downstream operators instead of pulling all input first. See <a href="/docs/latest/python/stream">Python Stream</a> / <a href="/docs/latest/rust/stream">Rust Stream</a>.</p>
+
+<h2 id="see-also">See also</h2>
+<ul>
+  <li><a href="/docs/latest/concepts/execution-model">Execution Model</a> — `RuntimeMode`, `ExecutionPlacement`, durability profiles</li>
+  <li><a href="/docs/latest/concepts/architecture">Architecture</a> — crate boundaries and design invariants</li>
+  <li><a href="/docs/latest/concepts/distributed-mode">Distributed Mode</a> — what the coordinator and executors actually do</li>
+</ul>

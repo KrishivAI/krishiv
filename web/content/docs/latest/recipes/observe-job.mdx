@@ -1,0 +1,42 @@
+---
+title: Observing a running job
+description: See what a streaming job is doing right now — status, progress, plan.
+status: Preview
+---
+<h2 id="from-python">From Python</h2>
+
+```python
+import krishiv as ks
+
+session = ks.Session.from_env()
+
+for job in session.jobs():
+    print(job.id(), job.name(), job.state())
+
+# Or for a specific job handle
+handle = session.submit_async(plan)
+print(handle.status(), handle.progress())
+```
+
+
+<h2 id="explain">Explain the plan</h2>
+
+```python
+df = session.sql("SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id")
+print(df.explain())           # DataFusion logical + physical plan
+print(df.explain_logical())   # logical plan only
+```
+
+
+<h2 id="endpoints">HTTP endpoints (single-node or distributed)</h2>
+<table class="api-table">
+  <thead><tr><th>Path</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td>`GET /healthz`</td><td>Coordinator liveness.</td></tr>
+    <tr><td>`GET /readyz`</td><td>Coordinator readiness.</td></tr>
+    <tr><td>`GET /metrics`</td><td>Prometheus metrics (when `KRISHIV_METRICS_PORT` is set).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="logs">Logs</h2>
+<p>Set the log filter via `KRISHIV_LOG` (e.g. `info,krishiv_scheduler=debug`). The scheduler is the most common place to look first when a job is stuck.</p>

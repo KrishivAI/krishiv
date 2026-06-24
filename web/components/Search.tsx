@@ -2,34 +2,25 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { docPages } from '@/lib/docs-data';
+import searchIndex from '@/lib/search-index.json';
 
 type SearchItem = {
   title: string;
-  group: string;
   description: string;
   href: string;
-  body: string;
+  group: string;
 };
 
-function buildIndex(): SearchItem[] {
-  return docPages.map((p) => ({
-    title: p.title,
-    group: p.group,
-    description: p.description,
-    href: `/docs/latest${p.slug ? `/${p.slug}` : ''}`,
-    body: p.body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(),
-  }));
-}
+const INDEX: SearchItem[] = searchIndex as SearchItem[];
 
 function score(item: SearchItem, terms: string[]): number {
-  const hay = `${item.title} ${item.group} ${item.description} ${item.body}`.toLowerCase();
+  const hay = `${item.title} ${item.group} ${item.description}`.toLowerCase();
   let s = 0;
   for (const t of terms) {
     if (!t) continue;
     const idx = hay.indexOf(t);
     if (idx < 0) return -1;
-    s += (idx < 200 ? 100 - Math.min(idx, 99) : 10);
+    s += idx < 200 ? 100 - Math.min(idx, 99) : 10;
     if (item.title.toLowerCase().includes(t)) s += 50;
     if (item.group.toLowerCase().includes(t)) s += 20;
   }
@@ -40,7 +31,6 @@ export function SearchButton() {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
-  const index = useMemo(buildIndex, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -71,10 +61,10 @@ export function SearchButton() {
     return () => { document.body.classList.remove('scroll-locked'); };
   }, [open]);
 
-  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const terms = useMemo(() => query.toLowerCase().split(/\s+/).filter(Boolean), [query]);
   const results = terms.length === 0
-    ? index.slice(0, 8)
-    : index
+    ? INDEX.slice(0, 8)
+    : INDEX
         .map((i) => ({ i, s: score(i, terms) }))
         .filter((r) => r.s >= 0)
         .sort((a, b) => b.s - a.s)
@@ -109,7 +99,7 @@ export function SearchButton() {
               <button className="touch-button" onClick={() => setOpen(false)} aria-label="Close search" type="button">×</button>
             </div>
             <div className="search-results">
-              {results.length === 0 && <p className="muted" style={{ padding: 14, color: 'var(--muted)' }}>No matches. Try a different term or browse the <Link href="/docs/latest" onClick={() => setOpen(false)}>docs index</Link>.</p>}
+              {results.length === 0 && <p className="muted" style={{ padding: 14, color: 'var(--muted)' }}>No matches. Try a different term.</p>}
               {results.map((r) => (
                 <Link key={r.href} href={r.href} onClick={() => setOpen(false)}>
                   <strong>{r.title}</strong>

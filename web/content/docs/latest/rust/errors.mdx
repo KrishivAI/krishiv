@@ -1,0 +1,48 @@
+---
+title: Error Types
+description: KrishivError, Result, and error handling patterns.
+status: Available
+---
+<h2 id="krishiverror">KrishivError</h2>
+<p>`KrishivError` is the top-level error type returned by all public API methods. It is a non-exhaustive enum that aggregates errors from all Krishiv subsystems.</p>
+
+<div class="api-sig">pub type Result&lt;T&gt; = std::result::Result&lt;T, KrishivError&gt;;</div>
+
+<h2 id="variants">Key Variants</h2>
+<table class="api-table">
+  <thead><tr><th>Variant</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`Sql(SqlError)`</td><td>SQL planning or execution error from `krishiv-sql`.</td></tr>
+    <tr><td>`Runtime(String)`</td><td>Execution runtime error (coordinator, executor, or scheduler).</td></tr>
+    <tr><td>`Io(std::io::Error)`</td><td>Filesystem or network I/O error.</td></tr>
+    <tr><td>`Arrow(ArrowError)`</td><td>Apache Arrow schema or data error.</td></tr>
+    <tr><td>`Config(String)`</td><td>Session configuration error (missing endpoint, invalid option).</td></tr>
+    <tr><td>`Udf(UdfError)`</td><td>UDF registration or execution error.</td></tr>
+    <tr><td>`Cancelled`</td><td>Operation cancelled by the caller.</td></tr>
+    <tr><td>`Timeout`</td><td>Operation exceeded its configured timeout.</td></tr>
+    <tr><td>`AccessDenied(String)`</td><td>Request blocked by auth or policy hook.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="patterns">Error Handling Patterns</h2>
+
+```rust
+use krishiv_api::{Session, KrishivError, Result};
+
+async fn run() -> Result<()> {
+    let session = Session::embedded().await?;
+
+    match session.sql("SELECT bad syntax!!!").await {
+        Ok(df) => { df.show().await?; }
+        Err(KrishivError::Sql(e)) => {
+            eprintln!("SQL error: {e}");
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+```
+
+
+<h2 id="sql-error">SqlError</h2>
+<p>See the <a href="/docs/latest/sql/error-codes">SQL Error Codes</a> page for the full list of `SqlError` variants and their SQLSTATE codes.</p>

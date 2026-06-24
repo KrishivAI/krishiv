@@ -1,0 +1,65 @@
+---
+title: Sinks
+description: Sink classes for writing data to Parquet, Cassandra, Elasticsearch, HBase, and vector stores.
+status: Preview
+---
+<h2 id="overview">Overview</h2>
+<p>Sink classes accept Arrow `RecordBatch` data and write it to external systems. In most code paths you do not call a sink class directly — you call `df.write_parquet(path)` or `session.sql(...).write_*` and the framework picks the right sink. Construct a sink class directly only when you need the `write_batches` API for a batch list.</p>
+
+<h2 id="parquet">ParquetSink</h2>
+<div class="api-sig">ParquetSink(path: str)</div>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`path() -> str`</td><td>Return the target file path.</td></tr>
+  </tbody>
+</table>
+
+```python
+import krishiv as ks
+sink = ks.ParquetSink("/tmp/output.parquet")
+# Write is triggered by session.sql(...).write_parquet(sink)
+```
+
+
+<h2 id="cassandra">CassandraSink</h2>
+<div class="api-sig">CassandraSink(hosts: list[str], keyspace: str, table: str)</div>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`write_batches(batches: list[RecordBatch])`</td><td>Write a list of Arrow batches to Cassandra.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="elasticsearch">ElasticsearchSink</h2>
+<div class="api-sig">ElasticsearchSink(url: str, index: str)</div>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`write_batches(batches)`</td><td>Bulk-index batches into Elasticsearch.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="hbase">HBaseSink</h2>
+<div class="api-sig">HBaseSink(zookeeper_quorum: str, table: str)</div>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`write_batches(batches)`</td><td>Write batches to an HBase table.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="vector-sinks">Vector Sinks</h2>
+<p>Vector sinks implement a shared interface: `sink_name()`, `upsert_batch(batch)`, `delete_by_ids(ids)`, `query_nearest(vector, k)`. They require the `vector-sinks` or platform-specific Cargo feature.</p>
+<table class="api-table">
+  <thead><tr><th>Sink</th><th>Constructor</th><th>Feature</th></tr></thead>
+  <tbody>
+    <tr><td>`InMemoryVectorSink`</td><td>`InMemoryVectorSink(dim: int)`</td><td>Always available</td></tr>
+    <tr><td>`LanceDbSink`</td><td>`LanceDbSink.open(path, table)`</td><td>`vector-sinks`</td></tr>
+    <tr><td>`PineconeSink`</td><td>`PineconeSink(api_key, index_name)`</td><td>`vector-sinks`</td></tr>
+    <tr><td>`QdrantSink`</td><td>`QdrantSink.connect(url, collection)`</td><td>`qdrant`</td></tr>
+    <tr><td>`PgvectorSink`</td><td>`PgvectorSink.connect(conn_str, table)`</td><td>`pgvector`</td></tr>
+    <tr><td>`WeaviateSink`</td><td>`WeaviateSink(url, class_name)`</td><td>`vector-sinks`</td></tr>
+  </tbody>
+</table>
+<Callout type="info">Vector sinks that depend on a disabled Cargo feature return a friendly `RuntimeError` naming the missing feature and the `maturin develop --features` command.</Callout>

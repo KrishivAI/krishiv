@@ -1,0 +1,32 @@
+---
+title: SET Commands
+description: Session-level configuration via SET statements and environment variables.
+status: Available
+---
+<h2 id="set-statements">SET Statements</h2>
+<table class="api-table">
+  <thead><tr><th>Statement</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`SET shuffle.partitions = N`</td><td>Override the shuffle bucket count (positive integer). Pass `0` to restore auto-sizing.</td></tr>
+  </tbody>
+</table>
+
+```sql
+SET shuffle.partitions = 8;
+SELECT * FROM large_table;
+```
+
+
+<h2 id="env-vars">Environment Variables</h2>
+<table class="api-table">
+  <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`KRISHIV_COORDINATOR`</td><td>—</td><td>gRPC endpoint for distributed mode.</td></tr>
+    <tr><td>`KRISHIV_COORDINATOR_BEARER_TOKEN`</td><td>—</td><td>Bearer token sent to the coordinator.</td></tr>
+    <tr><td>`KRISHIV_EXECUTOR_TASK_BEARER_TOKEN`</td><td>—</td><td>Bearer token for executor gRPC.</td></tr>
+    <tr><td>`KRISHIV_PLAN_CACHE_MAX_ENTRIES`</td><td>256</td><td>Maximum cached query plans per SQL engine.</td></tr>
+    <tr><td>`KRISHIV_QUERY_MEMORY_LIMIT_BYTES`</td><td>none</td><td>Per-engine DataFusion memory pool limit; 0 = unbounded.</td></tr>
+    <tr><td>`KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT`</td><td>100000</td><td>Max rows materialised for MATCH_RECOGNIZE on streaming sources.</td></tr>
+    <tr><td>`KRISHIV_DURABILITY_PROFILE`</td><td>dev-local</td><td>One of `dev-local`, `single-node-durable`, `distributed-durable`.</td></tr>
+  </tbody>
+</table>

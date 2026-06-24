@@ -1,0 +1,68 @@
+---
+title: DataFrame
+description: Lazy query plan builder for batch and bounded streaming workloads.
+status: Available
+---
+<h2 id="overview">Overview</h2>
+<p>`DataFrame` is a lazy plan builder. Operations compose a logical plan; execution only happens on `collect()`, `show()`, or `execute_stream()`.</p>
+
+<h2 id="transforms">Transformation Methods</h2>
+<Callout type="info" title="Common methods"> `filter`, `select`, `group_by`, `agg`, `sort`, `limit`, `join`, and `with_column` cover ~90% of batch transformations. The rest are for specialized shapes.</Callout>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`select(exprs)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Project columns or expressions.</td></tr>
+    <tr><td>`select_columns(names)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Project by column name.</td></tr>
+    <tr><td>`filter(expr: Expr)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Apply a boolean filter predicate.</td></tr>
+    <tr><td>`group_by(exprs)`</td><td>`Result&lt;GroupedDataFrame&gt;`</td><td>Group rows for aggregation.</td></tr>
+    <tr><td>`sort(exprs)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Sort by expressions.</td></tr>
+    <tr><td>`limit(n: usize)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Retain at most `n` rows.</td></tr>
+    <tr><td>`join(right, kind, left_cols, right_cols)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Join with another DataFrame.</td></tr>
+    <tr><td>`join_on(right, kind, expr)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Join using an arbitrary ON expression.</td></tr>
+    <tr><td>`union(other)`</td><td>`Result&lt;DataFrame&gt;`</td><td>UNION ALL of two DataFrames.</td></tr>
+    <tr><td>`union_distinct(other)`</td><td>`Result&lt;DataFrame&gt;`</td><td>UNION DISTINCT (deduplicated).</td></tr>
+    <tr><td>`intersect(other)`</td><td>`Result&lt;DataFrame&gt;`</td><td>INTERSECT DISTINCT.</td></tr>
+    <tr><td>`except(other)`</td><td>`Result&lt;DataFrame&gt;`</td><td>EXCEPT DISTINCT.</td></tr>
+    <tr><td>`distinct()`</td><td>`Result&lt;DataFrame&gt;`</td><td>Remove duplicate rows.</td></tr>
+    <tr><td>`with_column(name, expr)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Add or replace a column.</td></tr>
+    <tr><td>`drop_columns(names)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Remove named columns.</td></tr>
+    <tr><td>`rename(old, new)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Rename a column.</td></tr>
+    <tr><td>`alias(name)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Alias the DataFrame as a subquery.</td></tr>
+    <tr><td>`repartition(n)`</td><td>`Result&lt;DataFrame&gt;`</td><td>Set the output partition count.</td></tr>
+    <tr><td>`cache()`</td><td>`Future&lt;Result&lt;DataFrame&gt;&gt;`</td><td>Materialise and cache results in-memory.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="execution">Execution Methods</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`collect()`</td><td>`Future&lt;Result&lt;Vec&lt;RecordBatch&gt;&gt;&gt;`</td><td>Execute and collect all batches into memory.</td></tr>
+    <tr><td>`collect_partitioned()`</td><td>`Future&lt;Result&lt;Vec&lt;Vec&lt;RecordBatch&gt;&gt;&gt;&gt;`</td><td>Collect preserving partition boundaries.</td></tr>
+    <tr><td>`show()`</td><td>`Future&lt;Result&lt;()&gt;&gt;`</td><td>Execute and print a formatted table to stdout.</td></tr>
+    <tr><td>`execute_stream()`</td><td>`Future&lt;Result&lt;SendableRecordBatchStream&gt;&gt;`</td><td>Execute as a streaming batch iterator.</td></tr>
+    <tr><td>`explain(verbose: bool)`</td><td>`Future&lt;Result&lt;DataFrame&gt;&gt;`</td><td>Return a DataFrame containing the plan text.</td></tr>
+    <tr><td>`explain_mode(mode: ExplainMode)`</td><td>`Future&lt;Result&lt;DataFrame&gt;&gt;`</td><td>Return plan text in the requested explain format.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="schema">Schema / Metadata</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`schema()`</td><td>`&amp;Schema`</td><td>Return the logical output schema.</td></tr>
+    <tr><td>`columns()`</td><td>`Vec&lt;&amp;str&gt;`</td><td>Return column names.</td></tr>
+    <tr><td>`is_bounded()`</td><td>`bool`</td><td>True if the plan is finite/batch; false if unbounded/streaming.</td></tr>
+    <tr><td>`boundedness()`</td><td>`Boundedness`</td><td>Enum: `Bounded` or `Unbounded`.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="io">Write Methods</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`write_parquet(path, opts)`</td><td>Write results to a local Parquet file.</td></tr>
+    <tr><td>`write_csv(path, opts)`</td><td>Write results to a CSV file.</td></tr>
+    <tr><td>`write_json(path)`</td><td>Write results as NDJSON.</td></tr>
+  </tbody>
+</table>

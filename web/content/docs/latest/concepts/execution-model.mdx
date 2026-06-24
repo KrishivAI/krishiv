@@ -1,0 +1,38 @@
+---
+title: Execution Model
+description: RuntimeMode, ExecutionPlacement, and how plans move through Krishiv.
+status: Available
+---
+<h2 id="runtime-vs-placement">RuntimeMode vs ExecutionPlacement</h2>
+<p>`RuntimeMode` is the user-visible mode; `ExecutionPlacement` describes where data-plane work may actually run. They are intentionally separate.</p>
+<table class="api-table">
+  <thead><tr><th>RuntimeMode</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`Embedded`</td><td>In-process; no daemon. Best for tests and local API use.</td></tr>
+    <tr><td>`SingleNode`</td><td>All engine pieces on one host; may use local daemon or in-process cluster.</td></tr>
+    <tr><td>`Distributed`</td><td>Remote coordinator/executor transport. Requires an explicit Flight coordinator URL.</td></tr>
+  </tbody>
+</table>
+<Callout type="info" title="Note"> Distributed sessions must not silently fall back to in-process execution. An explicit `KRISHIV_COORDINATOR` endpoint is required.</Callout>
+
+<h2 id="sync-async-seam">Sync/Async Seam</h2>
+<p>The primary sync methods (`collect_batch_sql`, `accept_plan`) delegate to async variants (`collect_batch_sql_async`) via `block_on` at a single seam. Callers inside Tokio contexts should prefer async variants. Remote runtimes drive Flight/gRPC calls directly in the async path; in-process runtimes off-load DataFusion work to the blocking pool via `spawn_blocking`.</p>
+
+<h2 id="durability-profiles">Durability Profiles</h2>
+<table class="api-table">
+  <thead><tr><th>Profile</th><th>State</th><th>Shuffle</th><th>Checkpoints</th></tr></thead>
+  <tbody>
+    <tr><td>`dev-local`</td><td>In-memory</td><td>In-memory</td><td>Ephemeral local; not restart-durable</td></tr>
+    <tr><td>`single-node-durable`</td><td>RocksDB local</td><td>Local disk</td><td>Local filesystem; restart-durable on one host</td></tr>
+    <tr><td>`distributed-durable`</td><td>RocksDB (restored from checkpoint)</td><td>Tiered: local + object store</td><td>Object store; etcd metadata; fenced coordination</td></tr>
+  </tbody>
+</table>
+
+<h2 id="delivery-guarantees">Delivery Guarantees</h2>
+<p>The end-to-end delivery guarantee is the <em>weakest</em> guarantee supplied by the source, sink, checkpoint storage, and selected durability profile.</p>
+<ul>
+  <li><strong>Best effort:</strong> failure can lose or duplicate records.</li>
+  <li><strong>At least once:</strong> acknowledged source positions are not advanced before durable output, but replay may duplicate output.</li>
+  <li><strong>Effectively once:</strong> deterministic/idempotent sink keys make repeated writes converge on one visible result.</li>
+  <li><strong>Exactly once:</strong> source position and sink publication are coordinated by checkpoint protocol and a transactional/two-phase sink. Requires certified source + sink + checkpoint combination.</li>
+</ul>

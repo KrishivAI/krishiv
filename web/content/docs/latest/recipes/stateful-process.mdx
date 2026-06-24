@@ -1,0 +1,30 @@
+---
+title: Stateful process function
+description: Run a per-key process function with ValueState.
+status: Available
+---
+<p>Process functions run per record with access to keyed state. Use them for running counts, de-duplication, pattern tracking, and per-key enrichment.</p>
+
+<h2 id="python">Python</h2>
+
+```python
+import krishiv as ks
+from krishiv import apply_process_function, ProcessContext, ValueState
+
+def count_per_key(ctx: ProcessContext, batch, state: ValueState):
+    seen = state.get_json() or 0
+    seen += batch.num_rows
+    state.set_json(seen)
+    ctx.emit(batch)
+
+session = ks.Session.embedded()
+stream, sender = session.memory_stream(schema)
+
+keyed = stream.key_by("user_id")
+out = apply_process_function(keyed, count_per_key, ValueState("seen"))
+```
+
+<Callout type="info">State is keyed by the `key_by` partition. `ValueState` stores one value per key. `MapState` and `ListState` are also available — see <a href="/docs/latest/python/state">Python State</a>.</Callout>
+
+<h2 id="state-durability">State durability</h2>
+<p>State is backed by `krishiv-state` — in-memory under `dev-local`, RocksDB under `single-node-durable` and `distributed-durable`. State is restored from checkpoint on restart.</p>

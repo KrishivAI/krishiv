@@ -1,0 +1,26 @@
+---
+title: Error Codes
+description: SQLSTATE error codes returned by Krishiv SQL operations.
+status: Available
+---
+<h2 id="overview">Overview</h2>
+<p>Krishiv maps SQL errors to standard SQLSTATE codes via the `sqlstate_for` function in `krishiv-sql`. Errors carry both a typed `SqlError` variant and an SQLSTATE string.</p>
+
+<h2 id="error-variants">SqlError Variants</h2>
+<table class="api-table">
+  <thead><tr><th>Variant</th><th>SQLSTATE</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`EmptyQuery`</td><td>42000</td><td>Query was empty or whitespace only.</td></tr>
+    <tr><td>`EmptyTableName`</td><td>42602</td><td>A table name argument was empty.</td></tr>
+    <tr><td>`Unsupported`</td><td>0A000</td><td>SQL feature not available in this release.</td></tr>
+    <tr><td>`InvalidTableFunction`</td><td>42883</td><td>Table function declaration or registration was invalid.</td></tr>
+    <tr><td>`DataFusion`</td><td>42000</td><td>DataFusion returned an error (message preserved).</td></tr>
+    <tr><td>`Optimizer`</td><td>42000</td><td>Krishiv plan optimizer failed.</td></tr>
+    <tr><td>`AccessDenied`</td><td>42501</td><td>Query blocked by auth or policy hook.</td></tr>
+    <tr><td>`OperationCancelled`</td><td>57014</td><td>Query was cancelled by the caller.</td></tr>
+    <tr><td>`Timeout`</td><td>57014</td><td>Query exceeded its configured execution timeout.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="feature-matrix">SQL Feature Matrix</h2>
+<p>The `feature_matrix()` function in `krishiv-sql::grammar` returns the full list of SQL features with their implementation status (`Available`, `Preview`, `Experimental`, `NotPlanned`). Use `features_by_status()` to filter by status or `features_for_category()` to filter by category.</p>

@@ -1,0 +1,79 @@
+---
+title: Stream & Windows
+description: Stream, KeyedStream, WindowedStream — streaming pipeline builders.
+status: Available
+---
+<h2 id="stream">Stream</h2>
+<Callout type="info" title="Common pattern"> Get a stream from `session.memory_stream(schema)` or `session.read_kafka(...)`, call `key_by`, then `tumbling_window` or `sliding_window_ms`, then `agg`, then `collect` (bounded) or `try_next` (unbounded). See <a href="/docs/latest/recipes/tumbling-window">Tumbling window recipe</a> for a full example.</Callout>
+<p>Obtained from `session.stream(name)`, `session.memory_stream(schema)`, or the top-level `read_kafka()` / `read_kinesis()` helpers.</p>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`key_by(key_col: str) -> KeyedStream`</td><td>`KeyedStream`</td><td>Partition the stream by a key column.</td></tr>
+    <tr><td>`broadcast() -> BroadcastStream`</td><td>`BroadcastStream`</td><td>Broadcast stream to all operator instances.</td></tr>
+    <tr><td>`connect(other: Stream) -> ConnectedStreams`</td><td>`ConnectedStreams`</td><td>Pair two streams for co-process.</td></tr>
+    <tr><td>`watermark(col, lag_ms) -> Stream`</td><td>`Stream`</td><td>Assign watermark using event-time column and lag.</td></tr>
+    <tr><td>`with_watermark(spec) -> Stream`</td><td>`Stream`</td><td>Assign watermark with a typed WatermarkSpec.</td></tr>
+    <tr><td>`with_multi_source_watermark(spec) -> Stream`</td><td>`Stream`</td><td>Multi-source watermark alignment.</td></tr>
+    <tr><td>`with_state_ttl(config) -> Stream`</td><td>`Stream`</td><td>Attach TTL policy to downstream keyed state.</td></tr>
+    <tr><td>`tumbling_window(size_ms) -> WindowedStream`</td><td>`WindowedStream`</td><td>Fixed-size non-overlapping window.</td></tr>
+    <tr><td>`tumbling_window_ms(size_ms) -> WindowedStream`</td><td>`WindowedStream`</td><td>Same as `tumbling_window`.</td></tr>
+    <tr><td>`sliding_window_ms(size_ms, slide_ms) -> WindowedStream`</td><td>`WindowedStream`</td><td>Sliding (hop) window.</td></tr>
+    <tr><td>`session_window_ms(gap_ms) -> WindowedStream`</td><td>`WindowedStream`</td><td>Session window with inactivity gap.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="keyedstream">KeyedStream</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`tumbling_window(size_ms) -> WindowedStream`</td><td>`WindowedStream`</td><td>Per-key tumbling window.</td></tr>
+    <tr><td>`tumbling_window_ms(size_ms) -> WindowedStream`</td><td>`WindowedStream`</td><td>Alias.</td></tr>
+    <tr><td>`sliding_window_ms(size_ms, slide_ms) -> WindowedStream`</td><td>`WindowedStream`</td><td>Per-key sliding window.</td></tr>
+    <tr><td>`session_window_ms(gap_ms) -> WindowedStream`</td><td>`WindowedStream`</td><td>Per-key session window.</td></tr>
+    <tr><td>`window(spec) -> WindowedStream`</td><td>`WindowedStream`</td><td>Apply a typed window specification.</td></tr>
+    <tr><td>`connect(other: KeyedStream) -> ConnectedStreams`</td><td>`ConnectedStreams`</td><td>Pair two keyed streams for co-process.</td></tr>
+    <tr><td>`with_multi_source_watermark(spec) -> KeyedStream`</td><td>`KeyedStream`</td><td>Multi-source watermark for aligned processing.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="windowedstream">WindowedStream</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>`agg(exprs) -> WindowedStream`</td><td>`WindowedStream`</td><td>Apply aggregate expressions to each window.</td></tr>
+    <tr><td>`collect() -> list[RecordBatch]`</td><td>`list`</td><td>Materialise all window results (bounded streams only).</td></tr>
+    <tr><td>`try_next() -> RecordBatch | None`</td><td>`RecordBatch | None`</td><td>Poll for the next window result batch.</td></tr>
+    <tr><td>`window_kind() -> str`</td><td>`str`</td><td>"Tumbling", "Sliding", or "Session".</td></tr>
+    <tr><td>`window_size_ms() -> int`</td><td>`int`</td><td>Window size in milliseconds.</td></tr>
+    <tr><td>`slide_ms() -> int | None`</td><td>`int | None`</td><td>Slide interval (sliding windows only).</td></tr>
+    <tr><td>`session_gap_ms() -> int | None`</td><td>`int | None`</td><td>Inactivity gap (session windows only).</td></tr>
+    <tr><td>`tumbling_window(size_ms) -> WindowedStream`</td><td>`WindowedStream`</td><td>Re-window an existing windowed stream.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="example">Example</h2>
+
+```python
+import krishiv as ks
+from krishiv.functions import count, sum, col
+
+session = ks.Session.embedded()
+schema = ...  # PyArrow Schema
+stream, sender = session.memory_stream(schema)
+
+windowed = (stream
+    .watermark("event_time", 5000)   # 5-second lag
+    .key_by("user_id")
+    .tumbling_window(60_000))        # 1-minute windows
+
+result = windowed.agg([count(col("*")).alias("events"), sum(col("amount")).alias("total")])
+
+# Push data
+import pyarrow as pa
+sender.send(pa.record_batch(...))
+
+# Collect results
+batches = result.collect()
+```
+

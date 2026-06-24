@@ -1,0 +1,18 @@
+{
+  "title": "Recipes",
+  "pages": [
+    "index",
+    "parquet-aggregation",
+    "dataframe-101",
+    "sql-udf",
+    "tumbling-window",
+    "kafka-to-parquet",
+    "stateful-process",
+    "iceberg-upsert",
+    "iceberg-time-travel",
+    "live-table",
+    "single-node-deploy",
+    "exactly-once-pipeline",
+    "observe-job"
+  ]
+}

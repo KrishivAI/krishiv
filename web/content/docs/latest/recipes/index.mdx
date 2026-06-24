@@ -1,0 +1,48 @@
+---
+title: "Recipes — \"I want to…\""
+description: Task-oriented examples for the things you actually do with Krishiv.
+status: Available
+---
+<p>Each recipe is a working example with status labels. Use them as starting points — every recipe links to the full reference page for deeper detail.</p>
+
+<h2 id="batch">Batch and SQL</h2>
+<table class="api-table">
+  <thead><tr><th>I want to…</th><th>Recipe</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>Run a SQL aggregation over a Parquet file</td><td><a href="/docs/latest/recipes/parquet-aggregation">Parquet → SQL aggregation</a></td><td>Available</td></tr>
+    <tr><td>Filter, group, and sort with the DataFrame API</td><td><a href="/docs/latest/recipes/dataframe-101">DataFrame 101</a></td><td>Available</td></tr>
+    <tr><td>Register a UDF and call it from SQL</td><td><a href="/docs/latest/recipes/sql-udf">SQL UDFs</a></td><td>Available</td></tr>
+  </tbody>
+</table>
+
+<h2 id="streaming">Streaming</h2>
+<table class="api-table">
+  <thead><tr><th>I want to…</th><th>Recipe</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>Compute tumbling-window counts over a stream</td><td><a href="/docs/latest/recipes/tumbling-window">Tumbling window aggregation</a></td><td>Available</td></tr>
+    <tr><td>Read from Kafka and write to Parquet</td><td><a href="/docs/latest/recipes/kafka-to-parquet">Kafka → Parquet pipeline</a></td><td>Preview</td></tr>
+    <tr><td>Maintain a stateful process function per key</td><td><a href="/docs/latest/recipes/stateful-process">Stateful process function</a></td><td>Available</td></tr>
+  </tbody>
+</table>
+
+<h2 id="lakehouse">Lakehouse</h2>
+<table class="api-table">
+  <thead><tr><th>I want to…</th><th>Recipe</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>Upsert into an Iceberg table from a source</td><td><a href="/docs/latest/recipes/iceberg-upsert">Iceberg upsert with MERGE INTO</a></td><td>Preview</td></tr>
+    <tr><td>Time-travel read on an Iceberg table</td><td><a href="/docs/latest/recipes/iceberg-time-travel">Iceberg time travel</a></td><td>Preview</td></tr>
+    <tr><td>Run a live ingestion table queryable from SQL</td><td><a href="/docs/latest/recipes/live-table">Live table ingestion</a></td><td>Experimental</td></tr>
+  </tbody>
+</table>
+
+<h2 id="operations">Operations</h2>
+<table class="api-table">
+  <thead><tr><th>I want to…</th><th>Recipe</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>Deploy Krishiv on a single host with durable state</td><td><a href="/docs/latest/recipes/single-node-deploy">Single-node durable deployment</a></td><td>Available</td></tr>
+    <tr><td>Build an exactly-once pipeline (certified combo)</td><td><a href="/docs/latest/recipes/exactly-once-pipeline">Exactly-once pipeline</a></td><td>Preview</td></tr>
+    <tr><td>See what a streaming job is doing right now</td><td><a href="/docs/latest/recipes/observe-job">Observing a running job</a></td><td>Preview</td></tr>
+  </tbody>
+</table>
+
+<Callout type="info" title="Tip"> Don't see your task? Check the <a href="/docs/latest">full docs index</a> or open an issue on <a href="https://github.com/krishiv-data/krishiv">GitHub</a>.</Callout>

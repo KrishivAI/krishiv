@@ -1,0 +1,9 @@
+{
+  "title": "Connectors",
+  "pages": [
+    "index",
+    "kafka",
+    "parquet",
+    "iceberg"
+  ]
+}
