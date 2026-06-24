@@ -3,8 +3,8 @@ import type { ReactNode } from 'react';
 import './global.css';
 
 export const metadata: Metadata = {
-  title: { default: 'Krishiv — One Engine for Batch and Streaming', template: '%s | Krishiv' },
-  description: 'Krishiv is a Rust-native compute engine for unified batch, streaming, and incremental data processing.',
+  title: { default: 'Krishiv — Rust-native batch, streaming & incremental compute', template: '%s | Krishiv' },
+  description: 'Krishiv is a Rust-native compute framework for batch SQL, streaming pipelines, and incremental view maintenance. Apache Arrow data model, DataFusion SQL, embedded to distributed.',
   icons: { icon: '/brand/favicon.svg' },
 };
 

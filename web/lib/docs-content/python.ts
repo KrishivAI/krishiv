@@ -70,6 +70,8 @@ result.show()
   </tbody>
 </table>
 
+<div class="note-box"><strong>Common methods:</strong> Most workloads use only a handful of <code>Session</code> methods. Start with: <code>embedded()</code>, <code>sql(query)</code>, <code>read_parquet(path)</code>, <code>register_parquet(name, path)</code>, <code>table(name)</code>, and <code>read_stream()</code>. The full tables below are the complete reference.</div>
+
 <h2 id="sql-methods">SQL Methods</h2>
 <table class="api-table">
   <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
@@ -169,6 +171,7 @@ result.show()
 <p><code>DataFrame</code> is lazy — operations build a logical plan. Execution happens on <code>collect()</code>, <code>show()</code>, or <code>write_*</code> methods.</p>
 
 <h2 id="transforms">Transformation Methods</h2>
+<div class="note-box"><strong>Common methods:</strong> <code>filter</code>, <code>select</code>, <code>group_by</code>, <code>agg</code>, <code>order_by</code>, <code>limit</code>, <code>join</code>, and <code>with_column</code> cover ~90% of batch transformations. Reach for <code>pivot</code>, <code>unpivot</code>, <code>sample</code>, and the rest only when you need them.</div>
 <table class="api-table">
   <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
   <tbody>
@@ -263,6 +266,7 @@ result.show()
     status: 'Available',
     body: `
 <h2 id="stream">Stream</h2>
+<div class="note-box"><strong>Common pattern:</strong> Get a stream from <code>session.memory_stream(schema)</code> or <code>session.read_kafka(...)</code>, call <code>key_by</code>, then <code>tumbling_window</code> or <code>sliding_window_ms</code>, then <code>agg</code>, then <code>collect</code> (bounded) or <code>try_next</code> (unbounded). See <a href="/docs/latest/recipes/tumbling-window">Tumbling window recipe</a> for a full example.</div>
 <p>Obtained from <code>session.stream(name)</code>, <code>session.memory_stream(schema)</code>, or the top-level <code>read_kafka()</code> / <code>read_kinesis()</code> helpers.</p>
 <table class="api-table">
   <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
@@ -450,7 +454,7 @@ from krishiv.sql.functions import upper, lower, date_trunc, coalesce
     status: 'Preview',
     body: `
 <h2 id="overview">Overview</h2>
-<p>Sink classes accept Arrow <code>RecordBatch</code> data and write it to external systems. All sinks take <code>&amp;RecordBatch</code> (borrow) — do not transfer ownership. They have no <code>flush()</code> method; batches are committed on <code>write_batches()</code> completion.</p>
+<p>Sink classes accept Arrow <code>RecordBatch</code> data and write it to external systems. In most code paths you do not call a sink class directly — you call <code>df.write_parquet(path)</code> or <code>session.sql(...).write_*</code> and the framework picks the right sink. Construct a sink class directly only when you need the <code>write_batches</code> API for a batch list.</p>
 
 <h2 id="parquet">ParquetSink</h2>
 <div class="api-sig">ParquetSink(path: str)</div>

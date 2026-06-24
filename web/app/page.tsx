@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import type { JSX, ReactNode } from 'react';
 import { BrandLogo, SiteShell } from '@/components/Shell';
+import { CodeTabs } from '@/components/CodeTabs';
 import { githubUrl } from '@/lib/site';
 
 type IconName =
@@ -22,7 +23,10 @@ type IconName =
   | 'kafka'
   | 'parquet'
   | 'cloud'
-  | 'catalog';
+  | 'catalog'
+  | 'check'
+  | 'flask'
+  | 'eye';
 
 const iconPaths: Record<IconName, JSX.Element> = {
   terminal: <><path d="M4 6.5 7 9l-3 2.5"/><path d="M9 12h4"/><rect x="2.5" y="3" width="15" height="14" rx="2"/></>,
@@ -44,33 +48,13 @@ const iconPaths: Record<IconName, JSX.Element> = {
   parquet: <><path d="m4 12 8-8"/><path d="m7 15 8-8"/><path d="M5.5 5.5h8v8h-8Z"/></>,
   cloud: <path d="M6.5 16h8a3.5 3.5 0 0 0 .4-7 5 5 0 0 0-9.6-1.5A4.3 4.3 0 0 0 6.5 16Z"/>,
   catalog: <><path d="M5 4h10v13H5z"/><path d="M8 4v13"/><path d="M10.5 7H13"/><path d="M10.5 10H13"/></>,
+  check: <><path d="m4 10 4 4 8-9"/></>,
+  flask: <><path d="M7 3v5L3 16a2 2 0 0 0 1.7 3h10.6A2 2 0 0 0 17 16L13 8V3"/><path d="M7 3h6"/><path d="M5 13h10"/></>,
+  eye: <><path d="M2 10s2.7-5 8-5 8 5 8 5-2.7 5-8 5-8-5-8-5Z"/><circle cx="10" cy="10" r="2.5"/></>,
 };
 
 function LineIcon({ name, className = '' }: { name: IconName; className?: string }) {
   return <svg className={className} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{iconPaths[name]}</svg>;
-}
-
-export function DataFlowParticles() {
-  return (
-    <svg className="flow-field" viewBox="0 0 980 330" preserveAspectRatio="none" aria-hidden="true">
-      <defs>
-        <radialGradient id="goldParticle"><stop offset="0" stopColor="#FFB52A"/><stop offset="1" stopColor="#F59E0B" stopOpacity="0"/></radialGradient>
-        <radialGradient id="whiteParticle"><stop offset="0" stopColor="#ECECEC"/><stop offset="1" stopColor="#ECECEC" stopOpacity="0"/></radialGradient>
-      </defs>
-      {Array.from({ length: 15 }).map((_, index) => {
-        const y = 72 + index * 13;
-        const curve = (index - 7) * 12;
-        return <path key={`in-${index}`} className="flow-line flow-line-gold" d={`M0 ${y - curve} C 170 ${y - curve * 1.8}, 260 ${162 + curve * .4}, 438 165`} />;
-      })}
-      {Array.from({ length: 15 }).map((_, index) => {
-        const y = 72 + index * 13;
-        const curve = (index - 7) * 12;
-        return <path key={`out-${index}`} className="flow-line flow-line-white" d={`M542 165 C 720 ${162 + curve * .4}, 810 ${y - curve * 1.8}, 980 ${y - curve}`} />;
-      })}
-      {Array.from({ length: 18 }).map((_, index) => <circle key={`g-${index}`} className={`particle particle-gold p-${index % 6}`} cx="0" cy="0" r={index % 3 === 0 ? 2.1 : 1.35} />)}
-      {Array.from({ length: 18 }).map((_, index) => <circle key={`w-${index}`} className={`particle particle-white p-${index % 6}`} cx="0" cy="0" r={index % 3 === 0 ? 1.9 : 1.25} />)}
-    </svg>
-  );
 }
 
 function HeroContent() {
@@ -78,7 +62,13 @@ function HeroContent() {
     <div className="hero-copy">
       <div className="hero-badge">Rust-native <span/> Unified Compute Engine</div>
       <h1>One engine for<br/><em>Batch</em>, Streaming,<br/>and <em>Incremental</em><br/>Processing</h1>
-      <p className="hero-lead">Krishiv unifies batch, streaming, and incremental workloads in a single, high-performance engine — from local development to distributed scale.</p>
+      <p className="hero-lead">
+        Krishiv is a Rust-native compute framework for batch SQL, streaming pipelines, and incremental
+        view maintenance. Apache&nbsp;Arrow is the in-memory data model; DataFusion drives SQL.
+      </p>
+      <p className="hero-lead" style={{ fontSize: 14, color: 'var(--muted-strong)', marginTop: -8 }}>
+        See <Link href="/product/maturity" style={{ textDecoration: 'underline' }}>feature maturity</Link> for what is currently production-ready vs. preview.
+      </p>
       <div className="hero-actions">
         <Link className="btn btn-primary" href="/docs/latest/getting-started">Get Started <span aria-hidden="true">→</span></Link>
         <a className="btn btn-secondary" href={githubUrl}><GithubMark/> Star on GitHub</a>
@@ -97,7 +87,6 @@ function RuntimeArchitectureDiagram() {
   ];
   return (
     <div className="architecture-stage" aria-label="Krishiv runtime architecture diagram">
-      <DataFlowParticles/>
       <div className="interface-row">{interfaces.map(([icon, label]) => <div className="interface-item" key={label}><LineIcon name={icon}/><span>{label}</span></div>)}</div>
       <div className="interface-lines" aria-hidden="true"><span/><span/><span/></div>
       <div className="runtime-stack">
@@ -107,48 +96,161 @@ function RuntimeArchitectureDiagram() {
   );
 }
 
-const capabilities: Array<[IconName, string, string]> = [
-  ['bolt', 'Unified Engine', 'One runtime for batch, streaming, and incremental processing.'],
-  ['delta', 'Incremental by Design', 'Compute only what changes with IVM and delta processing.'],
-  ['cube', 'Rust-Native Performance', 'Built for speed, safety, and predictable performance.'],
-  ['snowflake', 'Iceberg First', 'Native table format support with ACID guarantees.'],
-  ['server', 'Local to Distributed', 'Run locally, then scale to single-node or distributed clusters.'],
-  ['shield', 'Reliable Foundations', 'Correctness, state management, and fault tolerance.'],
+type Tier = 'green' | 'violet' | 'blue' | 'gray';
+const tierLabel: Record<Tier, string> = { green: 'Available', violet: 'Experimental', blue: 'Preview', gray: 'Planned' };
+
+const capabilities: Array<{ icon: IconName; title: string; tier: Tier; text: string }> = [
+  { icon: 'bolt', title: 'Unified Engine', tier: 'green', text: 'One runtime for batch, streaming, and incremental processing — shared Arrow batches, shared planning.' },
+  { icon: 'delta', title: 'Incremental Processing', tier: 'violet', text: 'DeltaBatch (weighted Arrow rows) and IncrementalFlow for view maintenance. Distributed executor IVM is in progress.' },
+  { icon: 'cube', title: 'Rust-Native Performance', tier: 'green', text: 'Rust 2024 + Tokio. Typed IDs, typed plans, typed errors, explicit capability flags.' },
+  { icon: 'snowflake', title: 'Iceberg Lakehouse', tier: 'blue', text: 'Apache Iceberg is the primary lakehouse target. REST, Hive, and Glue catalog paths; certification work continues.' },
+  { icon: 'server', title: 'Embedded & Single-Node', tier: 'green', text: 'Run in-process for tests and apps, or as a local daemon with RocksDB and local shuffle.' },
+  { icon: 'cluster', title: 'Distributed Mode', tier: 'blue', text: 'Remote coordinator + executor transport. Requires an explicit endpoint; no silent local fallback.' },
 ];
 
 function CapabilityStrip() {
-  return <section className="capability-strip" aria-label="Krishiv capabilities">{capabilities.map(([icon, title, text]) => <article key={title} className="capability-item"><LineIcon name={icon}/><div><h3>{title}</h3><p>{text}</p></div></article>)}</section>;
+  return (
+    <section className="capability-strip" aria-label="Krishiv capabilities">
+      {capabilities.map((c) => (
+        <article key={c.title} className="capability-item">
+          <LineIcon name={c.icon}/>
+          <div>
+            <h3>{c.title} <span className={`badge badge-${c.tier}`} style={{ marginLeft: 8, verticalAlign: 'middle', fontSize: 10 }}>{tierLabel[c.tier]}</span></h3>
+            <p>{c.text}</p>
+          </div>
+        </article>
+      ))}
+      <p className="muted" style={{ width: '100%', textAlign: 'center', fontSize: 13, marginTop: 8 }}>
+        Status reflects what is implemented today. See <Link href="/product/maturity" style={{ textDecoration: 'underline' }}>Feature Maturity</Link> for the full matrix.
+      </p>
+    </section>
+  );
 }
 
 function ExecutionJourney() {
-  const cards: Array<[IconName, string, string]> = [['laptop', 'Local Mode', 'Run and debug on your laptop.'], ['server', 'Single Node', 'Deploy to a server or VM for more power.'], ['cluster', 'Distributed Cluster', 'Scale out for massive data and high availability.']];
-  return <div className="journey-cards">{cards.map(([icon, title, text], index) => <article className={`journey-card ${index === 0 ? 'active' : ''}`} key={title}><LineIcon name={icon}/><h3>{title}</h3><p>{text}</p>{index < cards.length - 1 && <span className="journey-connector"/>}</article>)}</div>;
+  const cards: Array<[IconName, string, string, Tier]> = [
+    ['laptop', 'Embedded', 'Run and debug in-process. No daemon, no cluster.', 'green'],
+    ['server', 'Single Node', 'Local daemon with RocksDB state and local shuffle.', 'green'],
+    ['cluster', 'Distributed', 'Remote coordinator + executors. Explicit endpoint, no silent fallback.', 'blue'],
+  ];
+  return <div className="journey-cards">{cards.map(([icon, title, text, tier], index) => <article className={`journey-card ${index === 0 ? 'active' : ''}`} key={title}><LineIcon name={icon}/><h3>{title} <span className={`badge badge-${tier}`} style={{ marginLeft: 6, fontSize: 10 }}>{tierLabel[tier]}</span></h3><p>{text}</p>{index < cards.length - 1 && <span className="journey-connector"/>}</article>)}</div>;
+}
+
+function DeveloperSection() {
+  return (
+    <section className="developer-section">
+      <div className="developer-copy">
+        <p className="section-eyebrow">Developer Experience</p>
+        <h2>Start locally.<br/>Scale to single-node.<br/>Move to distributed when ready.</h2>
+        <p>Same APIs. Same engine. Krishiv grows with your workload — and the engine is honest about what is production-ready vs. preview.</p>
+        <ExecutionJourney/>
+      </div>
+      <CodeExamplePanel/>
+    </section>
+  );
 }
 
 function CodeExamplePanel() {
   return (
     <div className="code-panel">
-      <div className="code-tabs"><button className="active">SQL</button><button>Rust</button><button>Python</button></div>
-      <button className="copy-button" aria-label="Copy SQL example"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="7" y="5" width="9" height="12" rx="1.5"/><path d="M4 13V4.5A1.5 1.5 0 0 1 5.5 3H13"/></svg></button>
-      <pre aria-label="SQL example"><code>
-        <span className="line"><span className="num">1</span><span><b>SELECT</b> customer_id, <i>SUM</i>(amount) <u>AS</u> total_spend</span></span>
-        <span className="line"><span className="num">2</span><span><b>FROM</b> orders</span></span>
-        <span className="line"><span className="num">3</span><span><b>WHERE</b> event_time <em>&gt;=</em> <i>NOW</i>() - <u>INTERVAL</u> <mark>'1'</mark> DAY</span></span>
-        <span className="line"><span className="num">4</span><span><b>GROUP BY</b> customer_id;</span></span>
-        <span className="line"><span className="num">5</span><span></span></span>
-      </code></pre>
-      <Link className="docs-link" href="/docs/latest/sql">→ More examples in the docs</Link>
+      <CodeTabs
+        tabs={[
+          { id: 'sql', label: 'SQL', language: 'sql', code:
+`SELECT customer_id, SUM(amount) AS total_spend
+FROM orders
+WHERE event_time >= NOW() - INTERVAL '1' DAY
+GROUP BY customer_id
+ORDER BY total_spend DESC
+LIMIT 10;` },
+          { id: 'rust', label: 'Rust', language: 'rust', code:
+`use krishiv_api::{Session, col, lit, sum, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let session = Session::embedded().await?;
+    let df = session
+        .read_parquet("data/orders.parquet").await?
+        .filter(col("amount").gt(lit(100)))?
+        .group_by(vec![col("customer_id")])?
+        .agg(vec![sum(col("amount")).alias("total_spend")])?
+        .sort(vec![col("total_spend").desc()])?
+        .limit(10);
+    df.show().await?;
+    Ok(())
+}` },
+          { id: 'python', label: 'Python', language: 'python', code:
+`import krishiv as ks
+from krishiv.functions import col, lit, sum
+
+session = ks.Session.embedded()
+
+df = (session.read_parquet("data/orders.parquet")
+        .filter(col("amount") > lit(100))
+        .group_by(["customer_id"])
+        .agg([sum(col("amount")).alias("total_spend")])
+        .order_by(["total_spend"], ascending=False)
+        .limit(10))
+df.show()` },
+        ]}
+      />
+      <Link className="docs-link" href="/docs/latest/tutorial">→ A full end-to-end tutorial</Link>
     </div>
   );
 }
 
 function EcosystemRow() {
-  const items: Array<[IconName, string]> = [['snowflake', 'Apache Iceberg'], ['kafka', 'Apache Kafka'], ['parquet', 'Parquet'], ['cloud', 'Amazon S3'], ['catalog', 'Azure Data Lake']];
-  return <section className="ecosystem-row" aria-label="Connector ecosystem">{items.map(([icon, label]) => <span key={label}><LineIcon name={icon}/>{label}</span>)}<span>and more…</span></section>;
+  const items: Array<[IconName, string, Tier]> = [
+    ['snowflake', 'Apache Iceberg', 'blue'],
+    ['kafka', 'Apache Kafka', 'blue'],
+    ['parquet', 'Parquet', 'green'],
+    ['cloud', 'S3 / ADLS / GCS', 'blue'],
+    ['catalog', 'Hive / Glue / REST catalogs', 'blue'],
+  ];
+  return (
+    <section className="ecosystem-row" aria-label="Connector ecosystem">
+      {items.map(([icon, label, tier]) => <span key={label}><LineIcon name={icon}/>{label} <span className={`badge badge-${tier}`} style={{ marginLeft: 4, fontSize: 9 }}>{tierLabel[tier]}</span></span>)}
+      <span>and more…</span>
+    </section>
+  );
 }
 
-function GithubMark() { return <svg viewBox="0 0 20 20" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M10 .9a9.1 9.1 0 0 0-2.9 17.7c.46.08.63-.2.63-.44v-1.6c-2.57.56-3.11-1.1-3.11-1.1-.42-1.07-1.03-1.35-1.03-1.35-.84-.58.06-.57.06-.57.93.07 1.42.96 1.42.96.83 1.41 2.18 1 2.71.77.08-.6.32-1 .59-1.23-2.05-.23-4.2-1.02-4.2-4.55 0-1 .36-1.83.95-2.47-.1-.24-.41-1.18.09-2.44 0 0 .78-.25 2.5.94A8.7 8.7 0 0 1 10 5.2c.77 0 1.54.1 2.27.3 1.72-1.19 2.5-.94 2.5-.94.5 1.26.19 2.2.1 2.44.59.64.94 1.46.94 2.47 0 3.54-2.16 4.31-4.21 4.54.33.29.63.85.63 1.72v2.55c0 .25.17.53.64.44A9.1 9.1 0 0 0 10 .9Z"/></svg>; }
+function WhyKrishivSection() {
+  const cols: Array<{ icon: IconName; title: string; body: ReactNode }> = [
+    { icon: 'check', title: 'Honest maturity labels', body: <>Every page is tagged with <Link href="/product/maturity" style={{ textDecoration: 'underline' }}>Available / Experimental / Preview / Planned</Link>. The codebase backs the labels, not the other way around.</> },
+    { icon: 'flask', title: 'Recipes, not just reference', body: <>Task-oriented <Link href="/docs/latest/recipes" style={{ textDecoration: 'underline' }}>recipes</Link> for the things you actually do: tumbling windows, Iceberg upserts, Kafka→Parquet, exactly-once pipelines.</> },
+    { icon: 'eye', title: 'See how a query runs', body: <>A dedicated <Link href="/docs/latest/concepts/how-it-executes" style={{ textDecoration: 'underline' }}>execution walkthrough</Link> follows a SQL query from <code>session.sql(...)</code> through DataFusion, the coordinator, executors, and Arrow batches.</> },
+  ];
+  return (
+    <section className="developer-section" aria-label="Why Krishiv">
+      <div className="developer-copy">
+        <p className="section-eyebrow">Documentation that respects your time</p>
+        <h2>Why read these docs.</h2>
+        <p>Most engine sites are either encyclopedic reference or aspirational marketing. We try to be neither: the docs lead with what the engine actually does today, and how to do the next thing on your list.</p>
+      </div>
+      <div className="grid" style={{ gridTemplateColumns: '1fr', gap: 12 }}>
+        {cols.map((c) => (
+          <div className="card" key={c.title}>
+            <h3 style={{ display: 'flex', alignItems: 'center', gap: 8 }}><LineIcon name={c.icon}/> {c.title}</h3>
+            <p>{c.body}</p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function GithubMark() { return <svg viewBox="0 0 20 20" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M10 .9a9.1 9.1 0 0 0-2.9 17.7c.46.08.63-.2.63-.44v-1.6c-2.57.56-3.11-1.1-3.11-1.1-.42-1.07-1.03-1.03-1.03-1.03-.84-.58.06-.57.06-.57.93.07 1.42.96 1.42.96.83 1.41 2.18 1 2.71.77.08-.6.32-1 .59-1.23-2.05-.23-4.2-1.02-4.2-4.55 0-1 .36-1.83.95-2.47-.1-.24-.41-1.18.09-2.44 0 0 .78-.25 2.5.94A8.7 8.7 0 0 1 10 5.2c.77 0 1.54.1 2.27.3 1.72-1.19 2.5-.94 2.5-.94.5 1.26.19 2.2.1 2.44.59.64.94 1.46.94 2.47 0 3.54-2.16 4.31-4.21 4.54.33.29.63.85.63 1.72v2.55c0 .25.17.53.64.44A9.1 9.1 0 0 0 10 .9Z"/></svg>; }
 
 export default function Home() {
-  return <SiteShell><main className="landing"><section className="hero"><HeroContent/><RuntimeArchitectureDiagram/></section><CapabilityStrip/><section className="developer-section"><div className="developer-copy"><p className="section-eyebrow">Developer Experience</p><h2>Start locally.<br/>Scale without limits.</h2><p>Same APIs. Same engine. From your laptop to a distributed cluster — Krishiv grows with your workload.</p><ExecutionJourney/></div><CodeExamplePanel/></section><EcosystemRow/></main></SiteShell>;
+  return (
+    <SiteShell>
+      <main className="landing">
+        <section className="hero"><HeroContent/><RuntimeArchitectureDiagram/></section>
+        <CapabilityStrip/>
+        <DeveloperSection/>
+        <WhyKrishivSection/>
+        <EcosystemRow/>
+      </main>
+    </SiteShell>
+  );
 }

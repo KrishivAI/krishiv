@@ -270,12 +270,12 @@ OPTIONS (
 <pre><code class="language-sql">-- Snapshot read (current)
 SELECT * FROM my_catalog.ns.orders WHERE order_date &gt;= '2024-01-01';
 
--- Time travel by snapshot ID
-SELECT * FROM my_catalog.ns.orders FOR VERSION AS OF 1234567890;
-
--- Time travel by timestamp
-SELECT * FROM my_catalog.ns.orders FOR TIMESTAMP AS OF '2024-06-01 00:00:00';
+-- Time travel: Krishiv uses FOR SYSTEM_TIME AS OF (timestamp only).
+-- The closest snapshot at or before the given timestamp is selected.
+SELECT * FROM my_catalog.ns.orders
+FOR SYSTEM_TIME AS OF TIMESTAMP '2024-06-01 00:00:00';
 </code></pre>
+<p>Time travel is resolved by Krishiv before the query is handed to DataFusion. See <a href="/docs/latest/sql/as-of-queries">AS-OF Queries</a> for the full syntax and snapshot-selection rules.</p>
 
 <h2 id="writing">Writing Iceberg Tables</h2>
 <pre><code class="language-sql">-- Append

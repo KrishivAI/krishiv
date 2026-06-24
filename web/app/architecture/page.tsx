@@ -139,10 +139,10 @@ export default function Architecture() {
             </div>
           </div>
           <div className="actions">
-            <Link className="btn btn-primary" href="/docs/latest/architecture">
+            <Link className="btn btn-primary" href="/docs/latest/concepts/architecture">
               Read architecture docs
             </Link>
-            <Link className="btn btn-secondary" href="/docs/latest/execution/distributed-mode">
+            <Link className="btn btn-secondary" href="/docs/latest/concepts/distributed-mode">
               Distributed mode
             </Link>
           </div>

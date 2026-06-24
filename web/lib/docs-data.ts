@@ -4,8 +4,9 @@ import { sqlPages } from './docs-content/sql';
 import { rustPages } from './docs-content/rust';
 import { pythonPages } from './docs-content/python';
 import { connectorsPages } from './docs-content/connectors';
+import { recipesPages } from './docs-content/recipes';
 
-export type DocStatus = 'Available' | 'Experimental' | 'In Progress' | 'Preview';
+export type DocStatus = 'Available' | 'Experimental' | 'In Progress' | 'Preview' | 'Planned';
 
 export type DocPage = {
   slug: string;
@@ -13,13 +14,13 @@ export type DocPage = {
   description: string;
   status: DocStatus;
   group: string;
-  body: string; // HTML content
+  body: string;
 };
 
-// Ordered group list – determines sidebar order.
 export const GROUP_ORDER = [
   'Getting Started',
   'Concepts',
+  'Recipes',
   'SQL Reference',
   'Rust API',
   'Python API',
@@ -29,6 +30,7 @@ export const GROUP_ORDER = [
 
 export const docPages: DocPage[] = [
   ...gettingStartedPages,
+  ...recipesPages,
   ...sqlPages,
   ...rustPages,
   ...pythonPages,

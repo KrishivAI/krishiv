@@ -2,6 +2,7 @@ import Image from 'next/image';
 import Link from 'next/link';
 import type { ReactNode } from 'react';
 import { githubUrl, navItems } from '@/lib/site';
+import { SearchButton } from '@/components/Search';
 
 export function BrandLogo({ compact = false }: { compact?: boolean }) {
   return (
@@ -26,10 +27,6 @@ function GithubIcon() {
   return <svg viewBox="0 0 20 20" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M10 .9a9.1 9.1 0 0 0-2.9 17.7c.46.08.63-.2.63-.44v-1.6c-2.57.56-3.11-1.1-3.11-1.1-.42-1.07-1.03-1.35-1.03-1.35-.84-.58.06-.57.06-.57.93.07 1.42.96 1.42.96.83 1.41 2.18 1 2.71.77.08-.6.32-1 .59-1.23-2.05-.23-4.2-1.02-4.2-4.55 0-1 .36-1.83.95-2.47-.1-.24-.41-1.18.09-2.44 0 0 .78-.25 2.5.94A8.7 8.7 0 0 1 10 5.2c.77 0 1.54.1 2.27.3 1.72-1.19 2.5-.94 2.5-.94.5 1.26.19 2.2.1 2.44.59.64.94 1.46.94 2.47 0 3.54-2.16 4.31-4.21 4.54.33.29.63.85.63 1.72v2.55c0 .25.17.53.64.44A9.1 9.1 0 0 0 10 .9Z"/></svg>;
 }
 
-function SunIcon() {
-  return <svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true"><circle cx="10" cy="10" r="3.2"/><path d="M10 1.6v2M10 16.4v2M1.6 10h2M16.4 10h2M4 4l1.4 1.4M14.6 14.6 16 16M16 4l-1.4 1.4M5.4 14.6 4 16"/></svg>;
-}
-
 export function Header() {
   return (
     <header className="header">
@@ -38,8 +35,8 @@ export function Header() {
         {navItems.map((item) => <Link key={item.href} href={item.href}>{item.label}</Link>)}
       </nav>
       <div className="nav-actions">
-        <a className="icon-link" href={githubUrl} aria-label="GitHub"><GithubIcon /></a>
-        <span className="icon-link" aria-label="Theme"><SunIcon /></span>
+        <SearchButton/>
+        <a className="icon-link" href={githubUrl} aria-label="GitHub"><GithubIcon/></a>
         <Link className="btn btn-primary small" href="/docs/latest/getting-started">Get Started</Link>
       </div>
       <details className="mobile-menu">
@@ -57,8 +54,18 @@ export function Header() {
 export function Footer() {
   return (
     <footer className="footer">
-      <div><strong>Krishiv</strong><p>Rust-native compute for batch SQL, streaming pipelines, and incremental processing.</p></div>
-      <div className="footer-links"><Link href="/docs/latest">Docs</Link><Link href="/architecture">Architecture</Link><Link href="/release-notes">Release notes</Link><a href={githubUrl}>GitHub</a></div>
+      <div><strong>Krishiv</strong><p>Rust-native compute for batch SQL, streaming pipelines, and incremental processing. Apache&nbsp;Arrow · DataFusion · Tokio.</p></div>
+      <div className="footer-links">
+        <Link href="/docs/latest">Docs</Link>
+        <Link href="/docs/latest/getting-started">Quickstart</Link>
+        <Link href="/docs/latest/tutorial">Tutorial</Link>
+        <Link href="/docs/latest/recipes">Recipes</Link>
+        <Link href="/product/maturity">Maturity</Link>
+        <Link href="/architecture">Architecture</Link>
+        <Link href="/release-notes">Release notes</Link>
+        <a href="https://github.com/krishiv-data/krishiv/blob/main/LICENSE">License</a>
+        <a href={githubUrl}>GitHub</a>
+      </div>
     </footer>
   );
 }

@@ -94,6 +94,7 @@ async fn main() -> Result&lt;()&gt; {
 <div class="api-sig">Session::connect(url: &amp;str) -> impl Future&lt;Output = Result&lt;Session&gt;&gt;</div>
 
 <h2 id="session-sql">SQL Methods</h2>
+<div class="note-box"><strong>Common methods:</strong> Most workloads use <code>Session::embedded()</code>, <code>sql(query)</code>, <code>read_parquet(path)</code>, <code>register_parquet(name, path)</code>, and <code>table(name)</code>. The full tables below are the complete reference.</div>
 <table class="api-table">
   <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
   <tbody>
@@ -169,6 +170,7 @@ async fn main() -> Result&lt;()&gt; {
 <p><code>DataFrame</code> is a lazy plan builder. Operations compose a logical plan; execution only happens on <code>collect()</code>, <code>show()</code>, or <code>execute_stream()</code>.</p>
 
 <h2 id="transforms">Transformation Methods</h2>
+<div class="note-box"><strong>Common methods:</strong> <code>filter</code>, <code>select</code>, <code>group_by</code>, <code>agg</code>, <code>sort</code>, <code>limit</code>, <code>join</code>, and <code>with_column</code> cover ~90% of batch transformations. The rest are for specialized shapes.</div>
 <table class="api-table">
   <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
   <tbody>
@@ -238,6 +240,7 @@ async fn main() -> Result&lt;()&gt; {
     status: 'Available',
     body: `
 <h2 id="stream">Stream</h2>
+<div class="note-box"><strong>Common pattern:</strong> Get a stream from <code>session.memory_stream(schema)</code> or a registered Kafka source, call <code>watermark</code>, then <code>key_by</code>, then <code>tumbling_window</code> or <code>sliding_window_ms</code>, then <code>agg</code>. See the <a href="/docs/latest/recipes/tumbling-window">Tumbling window recipe</a> for a full example.</div>
 <p><code>Stream</code> wraps an unbounded data source and provides chaining methods to build streaming pipelines.</p>
 <table class="api-table">
   <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
