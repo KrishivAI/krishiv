@@ -153,6 +153,11 @@ impl PyStream {
         Ok(new_windowed_stream(pipeline))
     }
 
+    /// Session window alias: `session_window(gap_ms)` — same as `session_window_ms`.
+    pub fn session_window(&self, gap_ms: u64) -> PyResult<PyWindowedStream> {
+        self.session_window_ms(gap_ms)
+    }
+
     /// Connect this stream with another for dual-stream `CoProcessFunction` processing.
     pub fn connect(&self, other: &PyStream) -> PyConnectedStreams {
         PyConnectedStreams {
@@ -243,6 +248,11 @@ impl PyKeyedStream {
             pipeline: self.pipeline.clone(),
         };
         stream.session_window_ms(gap_ms)
+    }
+
+    /// Session window alias: `session_window(gap_ms)` — same as `session_window_ms`.
+    pub fn session_window(&self, gap_ms: u64) -> PyResult<PyWindowedStream> {
+        self.session_window_ms(gap_ms)
     }
 
     /// Connect this keyed stream with another for dual-stream co-processing.

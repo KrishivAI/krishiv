@@ -8,6 +8,8 @@ resources:
   - namespace.yaml
   - serviceaccount.yaml
   - rbac.yaml
+  # Auth secrets (required by operator and executor deployments)
+  - auth-secrets.yaml
   # Control plane
   - operator-deployment.yaml
   - coordinator-service.yaml

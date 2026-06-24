@@ -500,6 +500,25 @@ impl PySession {
         })
     }
 
+    /// Convenience: collect a DataFrame and register the result as a named SQL table.
+    pub fn register_dataframe(
+        &self,
+        py: Python<'_>,
+        name: String,
+        df: PyDataFrame,
+    ) -> PyResult<()> {
+        let batches = py.detach(|| {
+            krishiv_common::async_util::block_on(df.inner.collect_async())
+                .map_err(map_krishiv_error)
+        })?;
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .register_record_batches(&name, batches)
+                .map_err(map_krishiv_error)
+        })
+    }
+
     /// Deregister (drop) a named SQL table from this session.
     pub fn deregister_table(&self, name: String) -> PyResult<()> {
         self.inner

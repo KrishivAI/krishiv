@@ -105,7 +105,27 @@ build-k8s:
         --profile release-k8s \
         --target {{ target }}
 
+# Fast k8s build using dev-fast profile (no LTO, opt-level 0 for deps).
+# For constrained build VMs where release-k8s times out.
+build-fast-k8s:
+    {{ sccache_env }} {{ cargo }} build -p krishiv -p krishiv-operator \
+        --no-default-features --features k8s \
+        --profile dev-fast
+
 # ── Docker ────────────────────────────────────────────────────────────────────
+
+# Fast local Docker build using host-compiled binaries (dev-fast profile).
+# Use when Dockerfile.build multi-stage times out on constrained VMs.
+docker-fast:
+    @mkdir -p dist/docker
+    cp target/dev-fast/krishiv dist/docker/krishiv
+    cp target/dev-fast/krishiv-operator dist/docker/krishiv-operator 2>/dev/null || true
+    docker build \
+        --build-arg PROFILE=dev-fast \
+        -f Dockerfile.fast \
+        -t {{ image }} .
+    docker save {{ image }} | k3s ctr images import -
+    @echo "✓ loaded {{ image }} into k3s"
 
 # Multi-stage build → tag as IMAGE → load into local k3s (default: localhost/krishiv:local)
 # Single image works for single-node, bare-metal, and k8s — mode selected at runtime via KRISHIV_MODE.

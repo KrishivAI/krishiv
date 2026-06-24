@@ -28,6 +28,8 @@ pub struct QueryCommand {
     pub parquet_tables: Vec<(String, PathBuf)>,
     pub execution: QueryExecution,
     pub api_key: Option<String>,
+    #[allow(dead_code)] // parsed; wired to session timeout in a follow-up
+    pub timeout_secs: Option<u64>,
 }
 
 pub fn sql_help() -> String {
@@ -38,18 +40,23 @@ pub fn sql_help() -> String {
            krishiv sql --query <SQL> [OPTIONS]\n\
          \n\
          Options:\n\
-           -q, --query <SQL>           SQL statement (required)\n\
+           -q, --query <SQL>           SQL statement or semicolon-separated statements (required)\n\
            --mode <embedded|single-node|distributed>  Execution mode (default: embedded)\n\
            --local                     Use Session::execute_local\n\
            --remote                    Use Session::execute_remote (requires coordinator)\n\
+           --timeout <SECS>            Timeout in seconds for remote queries (default: 30)\n\
            --api-key <KEY>             Policy-enforced sql_as (requires KRISHIV_API_KEYS)\n\
            --parquet <table=path>      Register a Parquet table (repeatable)\n\
            -h, --help                  Show help\n\
+         \n\
+         Multi-statement: separate statements with semicolons. Only the last\n\
+         statement's result is printed; earlier statements execute for side effects.\n\
          \n\
          Examples:\n\
            krishiv sql --query \"select 1 as value\"\n\
            krishiv sql --local --mode single-node --query \"select 1\"\n\
            krishiv sql --remote -c http://127.0.0.1:50051 --query \"select 1\"\n\
+           krishiv sql --query \"CREATE TABLE t (id INT); INSERT INTO t VALUES (1); SELECT * FROM t\"\n\
            krishiv sql --api-key dev-key --query \"select * from people\"\n",
     )
 }
@@ -74,6 +81,7 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
     let mut parquet_tables = Vec::new();
     let mut execution = QueryExecution::Default;
     let mut api_key = None;
+    let mut timeout_secs = None;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx] {
@@ -118,6 +126,17 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
                         .to_string(),
                 );
             }
+            "--timeout" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --timeout"))?;
+                timeout_secs = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid timeout value: {value}"))?,
+                );
+            }
             "--help" | "-h" => return Err(String::from("help requested")),
             unknown => return Err(format!("unknown option: {unknown}")),
         }
@@ -138,6 +157,7 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
         parquet_tables,
         execution,
         api_key,
+        timeout_secs,
     })
 }
 
@@ -184,14 +204,37 @@ pub fn run_sql(command: &QueryCommand) -> CliResponse {
         Ok(session) => session,
         Err(message) => return CliResponse::err(format!("{message}\n"), 1),
     };
-    match block_on(async {
-        let df = query_dataframe(&session, command).await?;
-        let result = df.collect_async().await?;
-        result.pretty()
-    }) {
-        Ok(output) => CliResponse::ok(format!("{output}\n")),
-        Err(error) => CliResponse::err(format!("{error}\n"), 1),
+    let statements = split_statements(&command.query);
+    if statements.is_empty() {
+        return CliResponse::err(String::from("query is empty\n"), 1);
     }
+    let last_idx = statements.len() - 1;
+    let mut last_output = String::new();
+    for (i, stmt) in statements.iter().enumerate() {
+        let mut stmt_cmd = command.clone();
+        stmt_cmd.query = stmt.clone();
+        match block_on(async {
+            let df = query_dataframe(&session, &stmt_cmd).await?;
+            if i == last_idx {
+                let result = df.collect_async().await?;
+                result.pretty()
+            } else {
+                // Non-final statements: execute for side effects, discard result.
+                let _ = df.collect_async().await?;
+                Ok(String::new())
+            }
+        }) {
+            Ok(output) => {
+                if i == last_idx {
+                    last_output = output;
+                }
+            }
+            Err(error) => {
+                return CliResponse::err(format!("statement {} failed: {error}\n", i + 1), 1);
+            }
+        }
+    }
+    CliResponse::ok(format!("{last_output}\n"))
 }
 
 pub fn run_explain(command: &QueryCommand) -> CliResponse {
@@ -263,4 +306,24 @@ fn parse_parquet_spec(value: &str) -> Result<(String, PathBuf), String> {
         return Err(String::from("parquet path cannot be empty"));
     }
     Ok((table.to_owned(), PathBuf::from(path)))
+}
+
+/// Split a SQL string into statements on `;`, stripping `--` comment lines.
+fn split_statements(sql: &str) -> Vec<String> {
+    let stripped: String = sql
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("--") {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    stripped
+        .split(';')
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|s| !s.is_empty())
+        .collect()
 }

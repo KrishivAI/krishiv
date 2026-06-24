@@ -9,6 +9,8 @@ metadata:
     app.kubernetes.io/part-of: krishiv
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: krishiv
@@ -21,6 +23,11 @@ spec:
         app.kubernetes.io/part-of: krishiv
     spec:
       serviceAccountName: krishiv-controller
+      terminationGracePeriodSeconds: 30
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: operator
           image: localhost/krishiv:local
@@ -40,6 +47,10 @@ spec:
             - name: http
               containerPort: 2002
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: KRISHIV_COORDINATOR_ID
               valueFrom:
                 fieldRef:
@@ -70,6 +81,27 @@ spec:
                 secretKeyRef:
                   name: krishiv-executor-task-auth
                   key: token
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
           volumeMounts:
             - name: coordinator-auth
               mountPath: /var/run/krishiv/coordinator-auth

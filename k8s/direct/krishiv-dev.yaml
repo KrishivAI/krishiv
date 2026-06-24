@@ -8,6 +8,10 @@ spec:
   ports:
   - port: 2001
     name: grpc
+  - port: 2002
+    name: http
+  - port: 2003
+    name: flight
   clusterIP: None
   selector:
     app: krishiv-coordinator
@@ -31,9 +35,52 @@ spec:
         image: localhost/krishiv:local
         imagePullPolicy: Never
         command: ["/usr/local/bin/krishiv"]
-        args: ["coordinator", "--grpc-addr", "0.0.0.0:2001", "--durability-profile", "dev-local", "--insecure"]
+        args:
+        - coordinator
+        - --grpc-addr
+        - "0.0.0.0:2001"
+        - --flight-addr
+        - "0.0.0.0:2003"
+        - --http-addr
+        - "0.0.0.0:2002"
+        - --durability-profile
+        - dev-local
+        - --insecure
         ports:
         - containerPort: 2001
+          name: grpc
+        - containerPort: 2002
+          name: http
+        - containerPort: 2003
+          name: flight
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 2002
+          initialDelaySeconds: 2
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 2002
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: krishiv-executor
+  labels:
+    app: krishiv-executor
+spec:
+  clusterIP: None
+  selector:
+    app: krishiv-executor
+  ports:
+  - port: 2005
+    name: task-grpc
+  - port: 2006
+    name: barrier-grpc
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -58,6 +105,19 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
         command: ["/bin/sh", "-c"]
         args:
-        - "/usr/local/bin/krishiv executor --executor-id $POD_NAME --coordinator http://krishiv-coordinator.default.svc.cluster.local:2001 --connect"
+        - >-
+          /usr/local/bin/krishiv executor
+          --executor-id $POD_NAME
+          --coordinator http://krishiv-coordinator.default.svc.cluster.local:2001
+          --connect
+        ports:
+        - containerPort: 2005
+          name: task-grpc
+        - containerPort: 2006
+          name: barrier-grpc

@@ -1,5 +1,50 @@
 # Krishiv Implementation Status
 
+## 2026-06-24 — Bug fixes: CLI multi-statement + timeout, Python register_dataframe, session_window alias, Dockerfile.fast, justfile build-fast-k8s
+
+Fixed six issues identified during k8s testing:
+
+### Fixes applied
+
+| # | Issue | Fix |
+|---|-------|-----|
+| #2 | `krishiv sql --query` hangs 30s+ on unreachable coordinator | Added `--timeout <SECS>` flag to `QueryCommand` (default: 30) |
+| #3 | CLI `--query` only supports single SQL statements | Multi-statement via `;` separator; only last statement result printed |
+| #6 | Python `Session` lacks `register_dataframe()` convenience | Added `register_dataframe(name, df)` — collects then registers |
+| #8 | `session_window_ms()` naming inconsistent with `tumbling_window()` | Added `session_window(gap_ms)` alias on `PyStream` and `PyKeyedStream` |
+| #9 | Dockerfile.build times out on 2-core VM | New `Dockerfile.fast` using `ubuntu:26.04` (matches host glibc 2.43) |
+| #10 | No `build-fast-k8s` recipe in justfile | Added `build-fast-k8s` + `docker-fast` recipes |
+
+### Files changed
+
+- `crates/krishiv/src/query_cli.rs:28-31` — `timeout_secs` field on `QueryCommand`
+- `crates/krishiv/src/query_cli.rs:39-61` — Updated `sql_help()` with multi-statement + timeout docs
+- `crates/krishiv/src/query_cli.rs:201-237` — `run_sql()` iterates `split_statements()`, prints last result only
+- `crates/krishiv/src/query_cli.rs:306-328` — New `split_statements()` function
+- `crates/krishiv-python/src/session.rs:501-517` — New `register_dataframe()` method
+- `crates/krishiv-python/src/stream.rs:196-201` — `session_window()` alias on `PyStream`
+- `crates/krishiv-python/src/stream.rs:330-334` — `session_window()` alias on `PyKeyedStream`
+- `crates/krishiv-python/python/krishiv/krishiv.pyi` — Updated `.pyi` stubs
+- `Dockerfile.fast` (new) — Lightweight runtime image for pre-built binaries
+- `justfile:109-120` — `build-fast-k8s` and `docker-fast` recipes
+
+### Validation
+```
+cargo fmt --check                                                  pass
+cargo clippy --workspace --exclude krishiv-python
+    --exclude krishiv-chaos -- -D warnings                         pass (0 warnings)
+```
+
+### Next useful command
+```bash
+# Build and deploy with fixes:
+just build-fast-k8s && just docker-fast && just deploy-direct
+# Or rebuild Docker image:
+docker build --build-arg PROFILE=dev-fast -f Dockerfile.fast -t localhost/krishiv:local .
+```
+
+---
+
 ## 2026-06-24 — Distributed delta batch (IVM) made production-ready: coordinator-authoritative model
 
 Reimplemented the `ExecutionModel::DeltaBatch` (IVM tick) distributed dispatch

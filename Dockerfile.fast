@@ -1,0 +1,15 @@
+# Lightweight runtime image for pre-built binaries.
+# Use when the multi-stage Dockerfile.build times out on constrained VMs.
+# Binaries are staged into dist/docker/ by: just build-fast-k8s && just stage
+#
+# Base: ubuntu:26.04 — matches host glibc 2.43 (Debian Trixie only has 2.41).
+FROM ubuntu:26.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY dist/docker/krishiv          /usr/local/bin/krishiv
+COPY dist/docker/krishiv-operator /usr/local/bin/krishiv-operator
+
+ENTRYPOINT ["/usr/local/bin/krishiv"]

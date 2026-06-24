@@ -9,6 +9,11 @@ metadata:
     app.kubernetes.io/part-of: krishiv
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: krishiv
@@ -20,8 +25,22 @@ spec:
         app.kubernetes.io/component: executor
         app.kubernetes.io/part-of: krishiv
     spec:
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 60
       serviceAccountName: krishiv-controller
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: krishiv
+                    app.kubernetes.io/component: executor
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: executor
           image: localhost/krishiv:local
@@ -34,7 +53,28 @@ spec:
             - http://krishiv-coordinator.krishiv-system.svc:2001
             - --connect
             - --heartbeat-interval-secs
-            - "1"
+            - "10"
+            - --slots
+            - "2"
+            - --http-addr
+            - 0.0.0.0:2002
+            - --task-grpc-addr
+            - 0.0.0.0:2005
+            - --barrier-grpc-addr
+            - 0.0.0.0:2006
+            - --shuffle-flight-addr
+            - 0.0.0.0:2004
+            - --shuffle-dir
+            - /tmp/krishiv-shuffle
+          ports:
+            - name: health
+              containerPort: 2002
+            - name: shuffle-flight
+              containerPort: 2004
+            - name: task-grpc
+              containerPort: 2005
+            - name: barrier-grpc
+              containerPort: 2006
           env:
             - name: POD_IP
               valueFrom:
@@ -45,7 +85,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: KRISHIV_TASK_SLOTS
-              value: "1"
+              value: "2"
             - name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH
               value: "true"
             - name: KRISHIV_COORDINATOR_BEARER_TOKEN
@@ -58,4 +98,32 @@ spec:
                 secretKeyRef:
                   name: krishiv-executor-task-auth
                   key: token
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "sleep 5"
       volumes: []
