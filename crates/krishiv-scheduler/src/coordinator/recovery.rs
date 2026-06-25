@@ -140,6 +140,23 @@ impl Coordinator {
             }
         }
 
+        // R11: Immediately advance the heartbeat clock by the timeout so that
+        // restored executors that have not re-registered are evicted on the
+        // first heartbeat tick instead of persisting as stale endpoints for
+        // `heartbeat_timeout_ticks` (15+ seconds).  Live executors will
+        // re-register within seconds and reset their heartbeat tick.
+        let stale_ids = self
+            .exec
+            .executors
+            .advance_clock(self.config.heartbeat_timeout_ticks());
+        if !stale_ids.is_empty() {
+            tracing::info!(
+                count = stale_ids.len(),
+                "recovery: advanced heartbeat clock to evict {} stale restored executor(s)",
+                stale_ids.len()
+            );
+        }
+
         // Start the re-attach grace period.
         self.exec.ticks_since_restart = 0;
         self.exec.recovering = true;

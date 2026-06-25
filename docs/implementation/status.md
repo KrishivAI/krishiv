@@ -1,8 +1,8 @@
 # Krishiv Implementation Status
 
-## 2026-06-24 — Bug fixes: CLI multi-statement + timeout, Python register_dataframe, session_window alias, Dockerfile.fast, justfile build-fast-k8s
+## 2026-06-24 — Bug fixes: CLI multi-statement + timeout, Python register_dataframe, session_window alias, Dockerfile.fast, justfile build-fast-k8s, stale executor recovery
 
-Fixed six issues identified during k8s testing:
+Fixed seven issues identified during k8s testing:
 
 ### Fixes applied
 
@@ -11,9 +11,11 @@ Fixed six issues identified during k8s testing:
 | #2 | `krishiv sql --query` hangs 30s+ on unreachable coordinator | Added `--timeout <SECS>` flag to `QueryCommand` (default: 30) |
 | #3 | CLI `--query` only supports single SQL statements | Multi-statement via `;` separator; only last statement result printed |
 | #6 | Python `Session` lacks `register_dataframe()` convenience | Added `register_dataframe(name, df)` — collects then registers |
+| #7 | Float64 streaming agg support | Already handled correctly in `aggregate.rs:221` + `infer_agg_is_float` |
 | #8 | `session_window_ms()` naming inconsistent with `tumbling_window()` | Added `session_window(gap_ms)` alias on `PyStream` and `PyKeyedStream` |
 | #9 | Dockerfile.build times out on 2-core VM | New `Dockerfile.fast` using `ubuntu:26.04` (matches host glibc 2.43) |
 | #10 | No `build-fast-k8s` recipe in justfile | Added `build-fast-k8s` + `docker-fast` recipes |
+| #11 | Stale executor endpoints after coordinator restart | After `recover_from_store`, advance heartbeat clock by `heartbeat_timeout_ticks` so stale executors are evicted on the first tick instead of waiting 15+ seconds |
 
 ### Files changed
 
@@ -25,6 +27,7 @@ Fixed six issues identified during k8s testing:
 - `crates/krishiv-python/src/stream.rs:196-201` — `session_window()` alias on `PyStream`
 - `crates/krishiv-python/src/stream.rs:330-334` — `session_window()` alias on `PyKeyedStream`
 - `crates/krishiv-python/python/krishiv/krishiv.pyi` — Updated `.pyi` stubs
+- `crates/krishiv-scheduler/src/coordinator/recovery.rs:142-155` — R11: advance heartbeat clock after restore to evict stale executors
 - `Dockerfile.fast` (new) — Lightweight runtime image for pre-built binaries
 - `justfile:109-120` — `build-fast-k8s` and `docker-fast` recipes
 
