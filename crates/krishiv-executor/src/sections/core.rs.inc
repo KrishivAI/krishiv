@@ -1487,6 +1487,7 @@ async fn tpch_q1_style_shuffle_pipeline_produces_correct_aggregation() {
         store: Arc::clone(&store),
         local_dir: shuffle_dir.clone(),
         flight_endpoint: flight_endpoint.clone(),
+        ess_index: None,
     };
     let s0_runner = ExecutorTaskRunner::new(s0_inbox.clone()).with_shuffle(shuffle_ctx);
     s0_inbox.push(s0_assignment).unwrap();

@@ -11,6 +11,7 @@ use krishiv_proto::{
     StreamingTaskState, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState,
     TaskStatusResponse, TaskStatusUpdate, wire,
 };
+use krishiv_state::QueryableStateStore;
 use krishiv_state::checkpoint::{
     CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
     validate_epoch, validate_fencing_token_for_restore,
@@ -203,6 +204,17 @@ pub struct Coordinator {
     /// Per-executor, per-job event-time watermarks (ms since epoch) from streaming progress reports.
     /// Used to compute the global minimum watermark per job (F5: distributed watermark).
     pub(crate) executor_job_watermarks: HashMap<ExecutorId, HashMap<JobId, i64>>,
+
+    // ── SC11: cascade circuit breaker state ───────────────────────────────
+
+    /// Ring buffer of wall-clock timestamps (ms) at which executor losses were
+    /// recorded.  Entries older than `config.cascade_window_ms` are pruned each
+    /// time a new loss is recorded.
+    pub(crate) cascade_loss_timestamps: std::collections::VecDeque<u64>,
+
+    /// Wall-clock timestamp at which the cascade circuit breaker was last tripped.
+    /// `None` means the breaker is closed (normal operation).
+    pub(crate) cascade_tripped_at_ms: Option<u64>,
 }
 
 /// Describes a stalled task that must be cancelled and reset.
@@ -218,6 +230,24 @@ pub struct StallCancelWork {
     /// gRPC endpoint of the executor holding the task, or `None` for in-process.
     pub executor_endpoint: Option<String>,
     pub stall_secs: u64,
+}
+
+/// A straggler task eligible for speculative preemption.
+///
+/// Produced by [`Coordinator::collect_speculation_work`]; consumed by
+/// [`Coordinator::apply_speculation_preempts`].
+#[derive(Debug, Clone)]
+pub struct SpeculativeWork {
+    pub job_id: JobId,
+    pub stage_id: StageId,
+    pub task_id: TaskId,
+    pub attempt: u32,
+    /// gRPC endpoint of the current executor, for CancelTask RPC.
+    pub executor_endpoint: Option<String>,
+    /// How long the task has been running (ms).
+    pub running_ms: u64,
+    /// Median completed task duration for the stage (ms).
+    pub median_ms: u64,
 }
 
 /// Deferred work for Phase 2.3 distributed write commit.
@@ -331,6 +361,9 @@ pub struct SharedCoordinator {
     pub durability_profile: DurabilityProfile,
     /// Live leader-election fencing token mirrored from the CCP leader backend.
     pub leader_fencing_token: Arc<std::sync::atomic::AtomicU64>,
+    /// E4.4: Live operator state registry for queryable-state REST API.
+    /// Operator backends register here; deregistered on job eviction.
+    pub queryable_state: Arc<QueryableStateStore>,
 }
 
 impl SharedCoordinator {
@@ -347,6 +380,7 @@ impl SharedCoordinator {
             checkpoint_inner: Arc::new(RwLock::new(checkpoint_inner)),
             durability_profile,
             leader_fencing_token: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            queryable_state: Arc::new(QueryableStateStore::new()),
         }
     }
 
@@ -585,6 +619,35 @@ impl SharedCoordinator {
         coord.apply_stall_resets(&work);
     }
 
+    /// Run one speculative-execution tick: collect stragglers and reset them to
+    /// `Pending` so they can be rescheduled to a different executor.
+    ///
+    /// No-op when `speculative_execution_enabled` is `false`.  Called alongside
+    /// `detect_and_cancel_stalled_tasks` in the daemon heartbeat loop.
+    pub async fn run_speculative_execution(&self) {
+        let work: Vec<SpeculativeWork> = {
+            let coord = self.inner.read().await;
+            coord.collect_speculation_work()
+        };
+        if work.is_empty() {
+            return;
+        }
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for item in &work {
+                tracing::debug!(
+                    job_id = %item.job_id,
+                    stage_id = %item.stage_id,
+                    task_id = %item.task_id,
+                    running_ms = item.running_ms,
+                    median_ms = item.median_ms,
+                    "speculative preemption: resetting straggler task to Pending"
+                );
+            }
+        }
+        let mut coord = self.inner.write().await;
+        coord.apply_speculation_preempts(&work);
+    }
+
     /// Wait for any coordinator state change notification (executor, checkpoint, etc.).
     /// Used by the daemon tick to react promptly instead of pure periodic polling.
     pub async fn wait_for_change(&self) {
@@ -800,6 +863,7 @@ impl SharedCoordinator {
                             }
                         }
                         coord.detect_and_cancel_stalled_tasks().await;
+                        coord.run_speculative_execution().await;
                     }
                 }
                 .instrument(span),
@@ -988,6 +1052,8 @@ impl Coordinator {
             aqe_coalesce_hints: HashMap::new(),
             pending_sink_finalize: Vec::new(),
             executor_job_watermarks: HashMap::new(),
+            cascade_loss_timestamps: std::collections::VecDeque::new(),
+            cascade_tripped_at_ms: None,
         }
     }
 
@@ -1304,6 +1370,200 @@ impl Coordinator {
     fn detect_and_reset_stalled_tasks(&mut self) {
         let work = self.collect_stall_cancel_work();
         self.apply_stall_resets(&work);
+    }
+
+    /// Collect straggler tasks eligible for speculative preemption.
+    ///
+    /// Returns `Vec<SpeculativeWork>` for each Running task in a Running
+    /// `ShuffleMap` stage where:
+    ///   - at least `config.speculative_min_completed_tasks` tasks in the stage
+    ///     have Succeeded (so we have a stable median to compare against), and
+    ///   - the task has been Running for more than
+    ///     `median_completed_ms * config.speculative_slowdown_factor`.
+    ///
+    /// Only fires when `config.speculative_execution_enabled()` is `true`.
+    /// Never speculates on streaming jobs (straggler semantics don't apply).
+    pub(crate) fn collect_speculation_work(&self) -> Vec<SpeculativeWork> {
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        self.collect_speculation_work_at(now_ms)
+    }
+
+    /// Like [`collect_speculation_work`] but accepts an explicit `now_ms` so
+    /// tests can inject deterministic wall-clock values.
+    pub(crate) fn collect_speculation_work_at(&self, now_ms: u64) -> Vec<SpeculativeWork> {
+        if !self.config.speculative_execution_enabled() {
+            return Vec::new();
+        }
+        let factor = self.config.speculative_slowdown_factor();
+        let min_completed = self.config.speculative_min_completed_tasks();
+        let mut work = Vec::new();
+
+        for jc in self.job_coordinators.values() {
+            let record = jc.read_record();
+            // Skip streaming jobs — speculative execution is batch-only.
+            if record.spec.kind() == krishiv_proto::JobKind::Streaming {
+                continue;
+            }
+            for stage in record.stages() {
+                // Only speculate on Running ShuffleMap stages.
+                if stage.state() != krishiv_proto::StageState::Running {
+                    continue;
+                }
+                if stage.spec.kind() != krishiv_proto::StageKind::ShuffleMap {
+                    continue;
+                }
+
+                // Compute median duration of Succeeded tasks in this stage.
+                let mut durations_ms: Vec<u64> = stage
+                    .tasks()
+                    .iter()
+                    .filter(|t| t.state() == krishiv_proto::TaskState::Succeeded)
+                    .filter_map(|t| t.completed_duration_ms)
+                    .collect();
+
+                if durations_ms.len() < min_completed {
+                    continue;
+                }
+
+                durations_ms.sort_unstable();
+                let median_ms = durations_ms[durations_ms.len() / 2];
+                if median_ms == 0 {
+                    continue;
+                }
+                let threshold_ms = (median_ms as f64 * factor) as u64;
+
+                for task in stage.tasks() {
+                    if task.state() != krishiv_proto::TaskState::Running {
+                        continue;
+                    }
+                    let Some(started_ms) = task.assigned_at_ms else {
+                        continue;
+                    };
+                    let running_ms = now_ms.saturating_sub(started_ms);
+                    if running_ms <= threshold_ms {
+                        continue;
+                    }
+                    let executor_endpoint = task
+                        .assigned_executor()
+                        .and_then(|eid| self.exec.executors.find_executor(eid).ok())
+                        .and_then(|rec| rec.descriptor().task_endpoint().map(str::to_owned));
+                    work.push(SpeculativeWork {
+                        job_id: record.job_id().clone(),
+                        stage_id: stage.stage_id().clone(),
+                        task_id: task.task_id().clone(),
+                        attempt: task.attempt(),
+                        executor_endpoint,
+                        running_ms,
+                        median_ms,
+                    });
+                }
+            }
+        }
+        work
+    }
+
+    /// Preemptively re-schedule straggler tasks identified by
+    /// [`collect_speculation_work`].
+    ///
+    /// Each task is reset to `Pending` *without* consuming a retry attempt —
+    /// this is a preemptive preemption, not a failure-driven retry.  The task
+    /// will be re-assigned to a (possibly different) executor on the next
+    /// `launch_assigned_task_assignments` call.
+    pub(crate) fn apply_speculation_preempts(&mut self, work: &[SpeculativeWork]) {
+        for item in work {
+            let Some(jc) = self.job_coordinators.get(&item.job_id) else {
+                continue;
+            };
+            let mut record = jc.write_record();
+            let mut stage_affected = false;
+            for stage in record.stages_mut() {
+                if stage.stage_id() != &item.stage_id {
+                    continue;
+                }
+                for task in stage.tasks_mut() {
+                    if task.task_id() != &item.task_id || task.attempt() != item.attempt {
+                        continue;
+                    }
+                    if task.state() != krishiv_proto::TaskState::Running {
+                        continue;
+                    }
+                    tracing::info!(
+                        task_id = %item.task_id,
+                        running_ms = item.running_ms,
+                        median_ms = item.median_ms,
+                        "speculative preemption: re-scheduling straggler task"
+                    );
+                    // Reset to Pending without incrementing failure_count so
+                    // the per-task retry budget is not consumed.
+                    task.state = krishiv_proto::TaskState::Pending;
+                    task.assigned_executor = None;
+                    task.launch_in_flight = false;
+                    task.assigned_at_ms = None;
+                    task.last_progress_ms = None;
+                    stage_affected = true;
+                }
+                if stage_affected {
+                    stage.refresh_state();
+                }
+            }
+            if stage_affected {
+                record.refresh_state();
+            }
+        }
+    }
+
+    // ── SC11: cascade circuit breaker ─────────────────────────────────────
+
+    /// Record one executor loss and potentially trip the cascade circuit breaker.
+    ///
+    /// `now_ms` is the wall-clock time at which the loss occurred.  Old entries
+    /// outside the `cascade_window_ms` are pruned before the count is evaluated.
+    pub(crate) fn record_cascade_loss(&mut self, now_ms: u64) {
+        let window = self.config.cascade_window_ms();
+        let cutoff = now_ms.saturating_sub(window);
+        while self
+            .cascade_loss_timestamps
+            .front()
+            .copied()
+            .unwrap_or(u64::MAX)
+            < cutoff
+        {
+            self.cascade_loss_timestamps.pop_front();
+        }
+        self.cascade_loss_timestamps.push_back(now_ms);
+
+        let threshold = self.config.cascade_failure_threshold();
+        if self.cascade_loss_timestamps.len() >= threshold
+            && self.cascade_tripped_at_ms.is_none()
+        {
+            self.cascade_tripped_at_ms = Some(now_ms);
+            tracing::warn!(
+                losses_in_window = self.cascade_loss_timestamps.len(),
+                window_ms = window,
+                cooldown_ms = self.config.cascade_cooldown_ms(),
+                "SC11: cascade circuit breaker OPEN — suspending task assignments"
+            );
+        }
+    }
+
+    /// Returns `true` when the cascade circuit breaker is open (assignments
+    /// are paused) at `now_ms`.  Automatically resets the breaker if the
+    /// cooldown period has elapsed.
+    pub(crate) fn cascade_breaker_open(&mut self, now_ms: u64) -> bool {
+        let Some(tripped_at) = self.cascade_tripped_at_ms else {
+            return false;
+        };
+        let cooldown = self.config.cascade_cooldown_ms();
+        if now_ms.saturating_sub(tripped_at) >= cooldown {
+            self.cascade_tripped_at_ms = None;
+            tracing::info!(
+                tripped_at_ms = tripped_at,
+                cooldown_ms = cooldown,
+                "SC11: cascade circuit breaker CLOSED — resuming task assignments"
+            );
+            return false;
+        }
+        true
     }
 
     /// Collect staged sink finalization work for a job that just reached a

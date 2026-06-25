@@ -932,6 +932,7 @@ impl TryFrom<PersistedTaskRecord> for TaskRecord {
             // values when the coordinator's tick clock is rewound.
             assigned_at_ms: None,
             last_progress_ms: None,
+            completed_duration_ms: None,
         })
     }
 }

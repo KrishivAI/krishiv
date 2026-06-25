@@ -276,6 +276,9 @@ impl Coordinator {
         self.pending_source_throttles.remove(executor_id);
         // SC14: release one worker back to the cluster.
         self.cluster_manager.release_workers(1);
+        // SC11: record the loss in the cascade circuit breaker window.
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        self.record_cascade_loss(now_ms);
         krishiv_metrics::global_metrics().inc_executor_lost();
         Ok(())
     }
@@ -430,6 +433,7 @@ impl Coordinator {
         let in_grace_period = self.exec.recovering
             && self.exec.ticks_since_restart <= self.config.streaming_reattach_grace_ticks();
 
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
         let lost = self.exec.executors.advance_clock(ticks);
         let mut evicted: Vec<ExecutorId> = Vec::new();
         for lost_id in &lost {
@@ -441,6 +445,8 @@ impl Coordinator {
             self.handle_executor_loss_for_checkpoints(lost_id);
             self.reset_running_tasks_for_lost_executor(lost_id);
             self.prune_executor_channel(lost_id);
+            // SC11: record the eviction in the cascade circuit breaker window.
+            self.record_cascade_loss(now_ms);
             evicted.push(lost_id.clone());
         }
 

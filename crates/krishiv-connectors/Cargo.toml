@@ -75,6 +75,9 @@ elasticsearch = ["dep:elasticsearch", "dep:url"]
 cassandra = ["dep:scylla"]
 # E6.7: Apache HBase connector
 hbase = ["dep:hbase-thrift", "dep:thrift"]
+# T9: JDBC source/sink (Postgres in this build; MySQL requires adding the
+# mysql feature to the workspace sqlx dep)
+jdbc = ["dep:sqlx"]
 
 [dependencies]
 arrow = { workspace = true }

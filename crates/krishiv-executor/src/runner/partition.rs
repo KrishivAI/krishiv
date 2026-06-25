@@ -91,6 +91,8 @@ pub(crate) const PARQUET_SINK_PREFIX: &str = "parquet-sink:";
 #[cfg(feature = "kafka")]
 pub(crate) const KAFKA_TO_PARQUET_FRAGMENT: &str = "connector-pipeline:kafka-to-parquet";
 pub(crate) const SHUFFLE_WRITE_PREFIX: &str = "shuffle-write:";
+/// Registry-driven source partition prefix: `registry-connector:<kind>:<table>:<config_json>`.
+pub(crate) const REGISTRY_CONNECTOR_PARTITION_PREFIX: &str = "registry-connector:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalParquetPartition {

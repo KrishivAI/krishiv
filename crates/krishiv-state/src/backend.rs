@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::error::StateResult;
 use crate::namespace::Namespace;
 
@@ -93,4 +95,97 @@ pub trait StateBackend: Send + Sync {
     /// The default implementation is a no-op — backends that do not implement
     /// TTL expiry ignore the watermark.
     fn set_watermark(&mut self, _watermark_ms: i64) {}
+}
+
+// ── InMemoryStateBackend ──────────────────────────────────────────────────────
+
+/// Lightweight in-memory [`StateBackend`] for tests and embedded mode.
+///
+/// Data is stored in a `HashMap<(Namespace, Vec<u8>), Vec<u8>>` — it is
+/// **not** durable and will be lost on process exit.  Use
+/// [`crate::rocksdb_backend::RocksDbStateBackend`] for production deployments.
+#[derive(Debug, Default)]
+pub struct InMemoryStateBackend {
+    data: HashMap<(Namespace, Vec<u8>), Vec<u8>>,
+}
+
+impl StateBackend for InMemoryStateBackend {
+    fn get(&self, namespace: &Namespace, key: &[u8]) -> StateResult<Option<Vec<u8>>> {
+        Ok(self.data.get(&(namespace.clone(), key.to_vec())).cloned())
+    }
+
+    fn put(&mut self, namespace: &Namespace, key: Vec<u8>, value: Vec<u8>) -> StateResult<()> {
+        self.data.insert((namespace.clone(), key), value);
+        Ok(())
+    }
+
+    fn delete(&mut self, namespace: &Namespace, key: &[u8]) -> StateResult<()> {
+        self.data.remove(&(namespace.clone(), key.to_vec()));
+        Ok(())
+    }
+
+    fn clear_namespace(&mut self, namespace: &Namespace) -> StateResult<()> {
+        self.data.retain(|(ns, _), _| ns != namespace);
+        Ok(())
+    }
+
+    fn list_namespaces(&self) -> StateResult<Vec<Namespace>> {
+        let mut out: Vec<Namespace> = self
+            .data
+            .keys()
+            .map(|(ns, _)| ns.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        out.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        Ok(out)
+    }
+
+    fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>> {
+        let mut keys: Vec<Vec<u8>> = self
+            .data
+            .keys()
+            .filter_map(|(ns, key)| {
+                if ns == namespace {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+
+    fn snapshot(&self) -> StateResult<Vec<u8>> {
+        use std::io::Write;
+        let entry_count = self.data.len() as u64;
+        let mut buf = Vec::new();
+        buf.write_all(&1u32.to_le_bytes()).unwrap();
+        buf.write_all(&entry_count.to_le_bytes()).unwrap();
+        for ((ns, key), value) in &self.data {
+            let op_id = ns.operator_id().as_bytes();
+            let name = ns.state_name().as_bytes();
+            buf.write_all(&(op_id.len() as u64).to_le_bytes()).unwrap();
+            buf.write_all(op_id).unwrap();
+            buf.write_all(&(name.len() as u64).to_le_bytes()).unwrap();
+            buf.write_all(name).unwrap();
+            buf.write_all(&(key.len() as u64).to_le_bytes()).unwrap();
+            buf.write_all(key).unwrap();
+            buf.write_all(&(value.len() as u64).to_le_bytes()).unwrap();
+            buf.write_all(value).unwrap();
+        }
+        Ok(buf)
+    }
+
+    fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
+        use crate::snapshot::decode_snapshot_entries;
+        let entries = decode_snapshot_entries(bytes)?;
+        self.data.clear();
+        for (op_id, state_name, key, value) in entries {
+            let ns = Namespace::new(&op_id, &state_name);
+            self.data.insert((ns, key), value);
+        }
+        Ok(())
+    }
 }

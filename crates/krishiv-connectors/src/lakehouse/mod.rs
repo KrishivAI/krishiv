@@ -34,13 +34,16 @@ pub use delta_lake::{
 };
 pub use hudi::{
     HudiCowWriter, HudiObjectStoreReader, HudiObjectStoreWriter, HudiQueryType, HudiSnapshotReader,
-    HudiStageHandle, HudiTwoPhaseCommitSink, HudiWriteResult, write_hudi_cow_append,
+    HudiStageHandle, HudiTwoPhaseCommitSink, HudiWriteResult, ensure_hoodie_properties,
+    read_hoodie_properties, vacuum_hudi_table, write_hudi_cow_append,
     write_hudi_cow_fixture, write_hudi_cow_upsert,
 };
 pub use iceberg_fs::IcebergFsTable;
 #[cfg(feature = "iceberg")]
 pub use iceberg_native::IcebergNativeTwoPhaseCommit;
-pub use local_delta::{DeltaStageHandle, LocalDeltaTwoPhaseCommitSink};
+pub use local_delta::{
+    DeltaStageHandle, LocalDeltaTwoPhaseCommitSink, read_table_at_timestamp, vacuum_table,
+};
 pub use partition_spec::{PartitionField, PartitionSpecResolver, PartitionSpecVersion};
 pub use two_phase::{
     DistributedIcebergCommitCoordinator, IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY,

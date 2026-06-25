@@ -363,6 +363,9 @@ pub async fn spawn_coordinator_sidecars(
             loop {
                 ticker.tick().await;
                 let job_ids = gc_coordinator.write().await.take_gc_ready_jobs();
+                for job_id in &job_ids {
+                    gc_coordinator.queryable_state.deregister_job(job_id.as_str());
+                }
                 for job_id in job_ids {
                     if let Err(e) = store.delete_job_partitions(job_id.as_str()).await {
                         tracing::error!(job_id = %job_id, error = %e, "shuffle GC failed");
@@ -487,12 +490,17 @@ pub fn coordinator_http_router(
     };
     let ivm_routes = crate::ivm_http::ivm_router(ivm_state);
 
+    // E4.4: Queryable state REST API backed by the coordinator's live store.
+    let qs_routes =
+        crate::queryable_state_http::queryable_state_router(coordinator.queryable_state.clone());
+
     // All sub-routers are Router<()> (state already baked in), so no final
     // .with_state() call is needed here.
     Router::new()
         .merge(public)
         .merge(protected)
         .merge(ivm_routes)
+        .merge(qs_routes)
 }
 
 fn http_auth_required(config: &CoordinatorDaemonConfig) -> bool {

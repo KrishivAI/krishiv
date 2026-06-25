@@ -129,10 +129,15 @@ impl Coordinator {
     ///
     /// Called after a stage retry (P1.24) to move tasks from `Pending` back to
     /// `Assigned` so `launch_assigned_tasks` can launch them.
+    ///
+    /// SC10: each stage's `ResourceProfile` is used to filter the executor pool
+    /// before placement so that tasks with a large memory requirement are only
+    /// placed on executors that have enough headroom.
     pub fn assign_pending_tasks(&mut self, job_id: &JobId) -> SchedulerResult<usize> {
         self.ensure_active()?;
-        let executors = self.exec.executors.schedulable_executor_placements();
-        if executors.is_empty() {
+
+        // Fast-path: if NO executor is schedulable at all, bail early.
+        if self.exec.executors.schedulable_executor_placements().is_empty() {
             return Err(SchedulerError::NoExecutors);
         }
         {
@@ -141,33 +146,62 @@ impl Coordinator {
                 return Ok(0);
             }
         }
-        let mut job = self.find_job_mut(job_id)?;
-        let pending_task_ids: Vec<TaskId> = job
-            .stages
-            .iter()
-            .flat_map(|s| s.tasks())
-            .filter(|t| t.state() == TaskState::Pending)
-            .map(|t| t.task_id().clone())
-            .collect();
-        let count = pending_task_ids.len();
-        let assignments =
-            SlotAwareScheduler::place_task_ids_with_load(&pending_task_ids, &executors)?;
-        for task_id in pending_task_ids {
-            if let Some(assignment) = assignments
+
+        // SC10: collect (stage_index, pending_task_ids, resource_profile) tuples
+        // so we can filter executors per-stage.
+        let stage_work: Vec<(Vec<TaskId>, Option<krishiv_proto::ResourceProfile>)> = {
+            let job = self.find_job(job_id)?;
+            job.stages
                 .iter()
-                .find(|assignment| assignment.task_id() == &task_id)
-            {
-                job.apply_assignments(vec![assignment.clone()]);
+                .map(|s| {
+                    let pending: Vec<TaskId> = s
+                        .tasks()
+                        .iter()
+                        .filter(|t| t.state() == TaskState::Pending)
+                        .map(|t| t.task_id().clone())
+                        .collect();
+                    let profile = s.spec.resource_profile().cloned();
+                    (pending, profile)
+                })
+                .collect()
+        };
+
+        let mut total = 0usize;
+        for (pending_task_ids, profile) in stage_work {
+            if pending_task_ids.is_empty() {
+                continue;
+            }
+            // SC10: use profile-filtered executor pool for this stage.
+            let executors = self
+                .exec
+                .executors
+                .schedulable_placements_for_profile(profile.as_ref());
+            if executors.is_empty() {
+                // No executor satisfies this stage's resource requirements yet;
+                // leave the tasks Pending for the next dispatch tick.
+                continue;
+            }
+            let assignments =
+                SlotAwareScheduler::place_task_ids_with_load(&pending_task_ids, &executors)?;
+            let mut job = self.find_job_mut(job_id)?;
+            for task_id in &pending_task_ids {
+                if let Some(assignment) = assignments
+                    .iter()
+                    .find(|a| a.task_id() == task_id)
+                {
+                    job.apply_assignments(vec![assignment.clone()]);
+                    total += 1;
+                }
             }
         }
-        drop(job);
-        if count > 0 {
+
+        if total > 0 {
             self.persist_job_record(
                 job_id,
                 krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile),
             )?;
         }
-        Ok(count)
+        Ok(total)
     }
 
     /// Launch all assigned tasks for a job.
@@ -408,6 +442,17 @@ impl Coordinator {
         self.ensure_active()?;
 
         let assignment_start = std::time::Instant::now();
+
+        // SC11: cascade circuit breaker — pause all new assignments when many
+        // executors have failed in a short window (cluster instability).
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        if self.cascade_breaker_open(now_ms) {
+            tracing::debug!(
+                job_id = %job_id,
+                "SC11: cascade breaker open — skipping task launch"
+            );
+            return Ok(Vec::new());
+        }
 
         // PRR Parallel Execution - Circuit Breaker (IMM-1):
         // Filter out executors that have crossed the failure threshold before

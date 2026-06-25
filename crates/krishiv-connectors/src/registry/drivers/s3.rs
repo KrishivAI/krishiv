@@ -15,7 +15,7 @@ use crate::error::{ConnectorError, ConnectorResult};
 use crate::registry::descriptor::ConnectorDescriptor;
 use crate::registry::driver::{SinkDriver, SourceDriver};
 use crate::registry::kind::{ConnectorKind, ConnectorRole};
-use crate::s3::{S3Sink, S3Source};
+use crate::s3::{S3PrefixSource, S3Sink, S3Source};
 use crate::sink::DynSink;
 use crate::source::DynSource;
 
@@ -71,6 +71,47 @@ impl SourceDriver for S3SourceDriver {
             let store = local_object_store(config)?;
             let path = object_path(config)?;
             let source = S3Source::open(store, path).await?;
+            Ok(Box::new(source) as Box<dyn DynSource>)
+        })
+    }
+}
+
+/// Driver for [`S3PrefixSource`] — lists all `.parquet` objects under an
+/// object-store prefix and reads them in sorted key order.
+///
+/// Required config keys: `base_path` (object-store root) and `prefix` (path
+/// prefix within the store, must end with `/`).
+pub struct S3PrefixSourceDriver;
+
+impl SourceDriver for S3PrefixSourceDriver {
+    fn descriptor(&self) -> ConnectorDescriptor {
+        ConnectorDescriptor::new(
+            ConnectorKind::S3Prefix,
+            ConnectorRole::Source,
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable()
+                .with_checkpoint(),
+        )
+    }
+
+    fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
+        let _ = local_object_store(config)?;
+        let _ = config.required("prefix")?;
+        Ok(())
+    }
+
+    fn open<'a>(
+        &'a self,
+        config: &'a ConnectorConfig,
+    ) -> Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSource>>> + Send + 'a>> {
+        Box::pin(async move {
+            let store = local_object_store(config)?;
+            let prefix_str = config.required("prefix")?;
+            let prefix = ObjectPath::parse(prefix_str).map_err(|e| ConnectorError::Config {
+                message: format!("invalid prefix '{prefix_str}': {e}"),
+            })?;
+            let source = S3PrefixSource::open(store, prefix).await?;
             Ok(Box::new(source) as Box<dyn DynSource>)
         })
     }

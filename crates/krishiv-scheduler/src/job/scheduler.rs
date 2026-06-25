@@ -680,6 +680,7 @@ fn job_spec_from_exchange_stages(
         });
     }
 
+    let last_idx = stage_slices.len().saturating_sub(1);
     let mut spec = JobSpec::new(job_id, job_name, job_kind);
     let mut prev_stage_id: Option<StageId> = None;
     for (stage_idx, slice) in stage_slices.iter().enumerate() {
@@ -688,7 +689,16 @@ fn job_spec_from_exchange_stages(
                 message: error.to_string(),
             }
         })?;
-        let mut stage = StageSpec::new(stage_id.clone(), format!("{job_name}-stage-{stage_idx}"));
+        // The terminal slice has no Exchange node: it reads from shuffle and
+        // produces final output → Result.  All preceding slices end with an
+        // Exchange node and write to the shuffle store → ShuffleMap.
+        let stage_kind = if stage_idx == last_idx {
+            krishiv_proto::StageKind::Result
+        } else {
+            krishiv_proto::StageKind::ShuffleMap
+        };
+        let mut stage = StageSpec::new(stage_id.clone(), format!("{job_name}-stage-{stage_idx}"))
+            .with_kind(stage_kind);
         if let Some(upstream) = prev_stage_id.clone() {
             stage = stage.with_upstream_stage(upstream);
         }
@@ -906,6 +916,41 @@ mod fair_scheduler_tests {
         for a in &assignments {
             assert_eq!(a.executor_id().as_str(), "executor-1");
         }
+    }
+
+    /// SC1: exchange stages have ShuffleMap kind; the terminal stage has Result kind.
+    #[test]
+    fn exchange_stages_have_correct_stage_kind() {
+        use krishiv_plan::{ExecutionKind, NodeOp, Partitioning, PhysicalPlan, PlanNode};
+        use krishiv_proto::{JobId, StageKind};
+
+        let job_id = JobId::try_new("sc1-test").unwrap();
+        // Build a two-stage plan: map → exchange → reduce
+        let mut plan = PhysicalPlan::new("sc1", ExecutionKind::Batch);
+        plan.add_node(
+            PlanNode::new("map", "map", ExecutionKind::Batch).with_op(NodeOp::Exchange {
+                partitioning: Partitioning::Hash {
+                    keys: vec!["k".to_string()],
+                    buckets: 4,
+                },
+            }),
+        );
+        plan.add_node(
+            PlanNode::new("reduce", "reduce", ExecutionKind::Batch)
+                .with_inputs(vec!["map".to_string()]),
+        );
+        let spec = job_spec_from_physical_plan(job_id, &plan).expect("valid plan");
+        assert_eq!(spec.stages().len(), 2, "should have 2 stages");
+        assert_eq!(
+            spec.stages()[0].kind(),
+            StageKind::ShuffleMap,
+            "stage-0 (map→exchange) must be ShuffleMap"
+        );
+        assert_eq!(
+            spec.stages()[1].kind(),
+            StageKind::Result,
+            "stage-1 (terminal reduce) must be Result"
+        );
     }
 
     /// SC9: a `length` mismatch is rejected.

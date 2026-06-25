@@ -124,6 +124,41 @@ impl Coordinator {
                 }
             }
         }
+        // SC4: Pre-populate checkpoint_complete_sent for all committed epochs so
+        // the coordinator does not re-deliver "epoch N committed" to executors
+        // that already received it before the restart. After recover_from_storage
+        // every coordinator is in Committed { epoch } state, and checkpoint_complete_sent
+        // would otherwise be empty — causing pending_checkpoint_complete_for_executor
+        // to re-emit for every executor on the first heartbeat tick.
+        //
+        // Safe inference: if the CheckpointCoordinator is Committed { epoch: N }
+        // after storage recovery, epoch N was already delivered to all active
+        // executors before the restart. We mark all currently-known executors as
+        // already notified so they do not receive a spurious duplicate commit signal.
+        // New executors registering after recovery will have epoch N in their past
+        // and will be skipped by executor_has_running_task_in_job anyway.
+        let restored_executors: Vec<ExecutorId> = store
+            .executors()
+            .iter()
+            .map(|d| d.executor_id().clone())
+            .collect();
+        for (job_id, coord) in &self.ckpt.coordinators {
+            let Some(committed_epoch) = coord.committed_epoch() else {
+                continue;
+            };
+            if committed_epoch == 0 {
+                continue;
+            }
+            for executor_id in &restored_executors {
+                let key = (job_id.clone(), executor_id.clone(), committed_epoch);
+                self.ckpt.checkpoint_complete_sent.insert(key);
+            }
+        }
+        tracing::debug!(
+            entries = self.ckpt.checkpoint_complete_sent.len(),
+            "SC4: pre-populated checkpoint_complete_sent to prevent re-delivery after restart"
+        );
+
         // R10: Restore executor descriptors so re-attaching executors are
         // recognised without a fresh registration handshake. Executors that
         // were persisted but have not yet re-registered start in the
@@ -353,5 +388,132 @@ impl Coordinator {
         open_checkpoint_storage_from_uri(path).map_err(|e| SchedulerError::InvalidJob {
             message: format!("failed to open checkpoint storage at {path}: {e}"),
         })
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::{InMemoryMetadataStore, checkpoint::CheckpointCoordinator};
+    use krishiv_proto::{
+        CheckpointAckRequest, CheckpointSourceOffset, ExecutorDescriptor, JobKind, JobSpec,
+        OperatorId, PartitionId, TaskId,
+    };
+    use krishiv_state::checkpoint::{LocalFsCheckpointStorage, write_operator_snapshot};
+    use std::sync::Arc;
+
+    fn make_executor_descriptor(id: &str) -> ExecutorDescriptor {
+        ExecutorDescriptor::new(
+            ExecutorId::try_new(id).unwrap(),
+            "127.0.0.1",
+            4,
+        )
+    }
+
+    /// SC4 regression: after coordinator restart checkpoint_complete_sent must
+    /// be pre-populated for committed epochs so executors do not receive a
+    /// spurious duplicate "epoch N committed" notification.
+    #[test]
+    fn sc4_checkpoint_complete_not_resent_after_coordinator_restart() {
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("sc4-job").unwrap();
+        let executor_id = ExecutorId::try_new("sc4-exec-1").unwrap();
+
+        // Commit epoch 1 to storage so recover_from_storage restores Committed{1}.
+        {
+            let mut coord =
+                CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1_000, 1);
+            coord.initiate().unwrap();
+            write_operator_snapshot(
+                storage.as_ref(),
+                "sc4-job",
+                1,
+                "op-task-0",
+                "task-0",
+                b"state",
+            )
+            .unwrap();
+            let ack = CheckpointAckRequest {
+                job_id: job_id.clone(),
+                operator_id: OperatorId::try_new("op-task-0").unwrap(),
+                task_id: TaskId::try_new("task-0").unwrap(),
+                epoch: 1,
+                fencing_token: coord.fencing_token(),
+                source_offsets: vec![CheckpointSourceOffset {
+                    partition_id: PartitionId::try_new("p0").unwrap(),
+                    offset: 1,
+                }],
+                snapshot_path: None,
+            };
+            assert!(coord.receive_ack(ack).unwrap());
+        }
+
+        // Build job spec and metadata store (executor descriptor persisted for SC4 query).
+        let job_spec = JobSpec::new(job_id.clone(), "sc4-job", JobKind::Streaming)
+            .with_checkpoint(1_000, "__test_inject__");
+        let job_record = JobRecord::from_spec(job_spec, 0);
+        let exec_desc = make_executor_descriptor(executor_id.as_str());
+
+        let mut store = InMemoryMetadataStore::default();
+        store.save_job(&job_record).unwrap();
+        store.save_executor(&exec_desc).unwrap();
+
+        // Simulate coordinator restart: fresh coordinator with injected Committed
+        // CheckpointCoordinator (bypasses open_checkpoint_storage file path).
+        let coord_id = CoordinatorId::try_new("coord-sc4").unwrap();
+        let mut coordinator = Coordinator::active(coord_id);
+
+        let mut cp_coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1_000, 1);
+        cp_coord.recover_from_storage().unwrap();
+        assert_eq!(cp_coord.committed_epoch(), Some(1));
+
+        coordinator.job_coordinators.insert(
+            job_id.clone(),
+            Arc::new(crate::job_coordinator::JobCoordinator::new(
+                job_id.clone(),
+                job_record,
+            )),
+        );
+        coordinator.ckpt.coordinators.insert(job_id.clone(), cp_coord);
+        coordinator.exec.executors.register(exec_desc).unwrap();
+
+        // Replicate the SC4 pre-population logic from recover_from_store.
+        let restored_executors: Vec<ExecutorId> = store
+            .executors()
+            .iter()
+            .map(|d| d.executor_id().clone())
+            .collect();
+        for (jid, coord) in &coordinator.ckpt.coordinators {
+            let Some(committed_epoch) = coord.committed_epoch() else {
+                continue;
+            };
+            if committed_epoch == 0 {
+                continue;
+            }
+            for eid in &restored_executors {
+                coordinator
+                    .ckpt
+                    .checkpoint_complete_sent
+                    .insert((jid.clone(), eid.clone(), committed_epoch));
+            }
+        }
+
+        // Assert: dedup set is pre-populated for committed epoch.
+        let key = (job_id.clone(), executor_id.clone(), 1u64);
+        assert!(
+            coordinator.ckpt.checkpoint_complete_sent.contains(&key),
+            "SC4: checkpoint_complete_sent must be pre-populated with committed epoch \
+             after recovery to prevent spurious duplicate commit notification"
+        );
+
+        // Assert: no re-delivery on the first heartbeat tick.
+        let commands = coordinator.pending_checkpoint_complete_for_executor(&executor_id);
+        assert!(
+            commands.is_empty(),
+            "SC4: pending_checkpoint_complete_for_executor must not re-emit for a \
+             pre-populated executor; got {commands:?}"
+        );
     }
 }

@@ -10,6 +10,8 @@ use arrow::record_batch::RecordBatch;
 use futures::StreamExt as _;
 use krishiv_state::checkpoint::{CheckpointStorage, LocalFsCheckpointStorage};
 
+use krishiv_plan::NodeOp;
+
 use crate::error::{KrishivError, Result};
 use crate::query::QueryId;
 use crate::streaming_dataframe::KrishivStream;
@@ -579,6 +581,9 @@ impl DataStreamWriter {
             });
         }
 
+        // ST1-ST4: Enforce output mode / plan compatibility at start() time.
+        validate_output_mode_compatibility(output_mode, self.df.logical_plan())?;
+
         let (state_tx, state_rx) = tokio::sync::watch::channel(StreamingQueryState::Active);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
@@ -833,6 +838,70 @@ impl StreamingQueryManager {
     }
 }
 
+// ── Output mode / plan compatibility (ST1-ST4) ────────────────────────────────
+
+/// Validate that `mode` is compatible with the operators present in `plan`.
+///
+/// Rules (matching Spark Structured Streaming):
+/// - `Complete` requires at least one `Aggregate` node: the result table is
+///   rewritten wholesale each micro-batch, which only makes sense with aggregation.
+/// - `Update` requires at least one stateful operator (`Aggregate`, `Window`,
+///   `WindowJoin`, `Join`): an `Update`-mode plan with no stateful operators is
+///   semantically identical to `Append` and almost certainly a user mistake.
+/// - `Append` is always valid.
+fn validate_output_mode_compatibility(
+    mode: StreamingOutputMode,
+    plan: &krishiv_plan::LogicalPlan,
+) -> Result<()> {
+    // Pre-collected / test-scaffolded DataFrames have empty plans (no source
+    // nodes). There is nothing to validate against, so skip the check. Real
+    // streaming plans always have at least one Scan or StreamSource node.
+    if plan.nodes().is_empty() {
+        return Ok(());
+    }
+    match mode {
+        StreamingOutputMode::Append => Ok(()),
+        StreamingOutputMode::Complete => {
+            let has_agg = plan
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op(), Some(NodeOp::Aggregate { .. })));
+            if has_agg {
+                Ok(())
+            } else {
+                Err(KrishivError::InvalidConfig {
+                    message: "output_mode(Complete) requires an aggregation (GROUP BY) in the \
+                              streaming plan; use Append for non-aggregated sources"
+                        .to_string(),
+                })
+            }
+        }
+        StreamingOutputMode::Update => {
+            let has_stateful = plan.nodes().iter().any(|n| {
+                matches!(
+                    n.op(),
+                    Some(
+                        NodeOp::Aggregate { .. }
+                            | NodeOp::Window { .. }
+                            | NodeOp::WindowJoin { .. }
+                            | NodeOp::Join { .. }
+                    )
+                )
+            });
+            if has_stateful {
+                Ok(())
+            } else {
+                Err(KrishivError::InvalidConfig {
+                    message: "output_mode(Update) requires a stateful operator (aggregation, \
+                              window, or join) in the streaming plan; use Append for \
+                              stateless sources"
+                        .to_string(),
+                })
+            }
+        }
+    }
+}
+
 /// Return a `format` value stored in `options` (e.g. `kafka`, `parquet`).
 #[cfg(test)]
 fn format_name_from_options(options: &std::collections::HashMap<String, String>) -> Option<&str> {
@@ -840,6 +909,104 @@ fn format_name_from_options(options: &std::collections::HashMap<String, String>)
         .get("format")
         .map(String::as_str)
         .or_else(|| options.get("sink").map(String::as_str))
+}
+
+#[cfg(test)]
+mod output_mode_compat_tests {
+    use super::*;
+    use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PlanNode};
+
+    fn scan_only_plan() -> LogicalPlan {
+        LogicalPlan::new("q", ExecutionKind::Streaming).with_node(
+            PlanNode::new("scan", "scan", ExecutionKind::Streaming)
+                .with_op(NodeOp::Scan { table: "t".into(), filters: vec![] }),
+        )
+    }
+
+    fn plan_with_aggregate() -> LogicalPlan {
+        LogicalPlan::new("q", ExecutionKind::Streaming)
+            .with_node(
+                PlanNode::new("scan", "scan", ExecutionKind::Streaming)
+                    .with_op(NodeOp::Scan { table: "t".into(), filters: vec![] }),
+            )
+            .with_node(
+                PlanNode::new("agg", "agg", ExecutionKind::Streaming)
+                    .with_inputs(["scan"])
+                    .with_op(NodeOp::Aggregate { group_keys: vec!["region".into()] }),
+            )
+    }
+
+    fn plan_with_window() -> LogicalPlan {
+        use krishiv_plan::window::{WindowExecutionSpec, WindowKind};
+        LogicalPlan::new("q", ExecutionKind::Streaming)
+            .with_node(
+                PlanNode::new("scan", "scan", ExecutionKind::Streaming)
+                    .with_op(NodeOp::Scan { table: "t".into(), filters: vec![] }),
+            )
+            .with_node(
+                PlanNode::new("win", "win", ExecutionKind::Streaming)
+                    .with_inputs(["scan"])
+                    .with_op(NodeOp::Window {
+                        spec: Box::new(WindowExecutionSpec {
+                            window_kind: WindowKind::Tumbling,
+                            key_column: "k".into(),
+                            key_column_type: "utf8".into(),
+                            event_time_column: "ts".into(),
+                            watermark_lag_ms: 0,
+                            window_size_ms: 1000,
+                            slide_ms: None,
+                            session_gap_ms: None,
+                            agg_exprs: vec![],
+                            state_ttl_ms: None,
+                            allowed_lateness_ms: None,
+                            source_watermark_lags: Default::default(),
+                            source_id_column: None,
+                        }),
+                    }),
+            )
+    }
+
+    #[test]
+    fn append_always_valid_for_scan_only() {
+        assert!(validate_output_mode_compatibility(StreamingOutputMode::Append, &scan_only_plan()).is_ok());
+    }
+
+    #[test]
+    fn append_always_valid_with_aggregate() {
+        assert!(validate_output_mode_compatibility(StreamingOutputMode::Append, &plan_with_aggregate()).is_ok());
+    }
+
+    #[test]
+    fn complete_rejected_without_aggregate() {
+        let err = validate_output_mode_compatibility(StreamingOutputMode::Complete, &scan_only_plan());
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("Complete"), "error should mention Complete: {msg}");
+    }
+
+    #[test]
+    fn complete_accepted_with_aggregate() {
+        assert!(validate_output_mode_compatibility(StreamingOutputMode::Complete, &plan_with_aggregate()).is_ok());
+    }
+
+    #[test]
+    fn update_rejected_without_stateful_op() {
+        let err = validate_output_mode_compatibility(StreamingOutputMode::Update, &scan_only_plan());
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("Update"), "error should mention Update: {msg}");
+    }
+
+    #[test]
+    fn update_accepted_with_aggregate() {
+        assert!(validate_output_mode_compatibility(StreamingOutputMode::Update, &plan_with_aggregate()).is_ok());
+    }
+
+    #[test]
+    fn update_accepted_with_window() {
+        assert!(validate_output_mode_compatibility(StreamingOutputMode::Update, &plan_with_window()).is_ok());
+    }
+
 }
 
 /// Return a short, human-readable label for `trigger`.

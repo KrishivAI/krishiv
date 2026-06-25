@@ -220,9 +220,11 @@ fn role_rank(role: ConnectorRole) -> u8 {
 pub fn default_registry() -> ConnectorRegistry {
     let mut registry = ConnectorRegistry::new();
     registry.register_source(Arc::new(super::drivers::ParquetSourceDriver));
+    registry.register_source(Arc::new(super::drivers::ParquetDirectorySourceDriver));
     registry.register_sink(Arc::new(super::drivers::ParquetSinkDriver));
     registry.register_source(Arc::new(super::drivers::CsvSourceDriver));
     registry.register_source(Arc::new(super::drivers::S3SourceDriver));
+    registry.register_source(Arc::new(super::drivers::S3PrefixSourceDriver));
     registry.register_sink(Arc::new(super::drivers::S3SinkDriver));
     registry.register_two_phase_sink(Arc::new(super::drivers::LocalParquetTwoPhaseSinkDriver));
     #[cfg(feature = "avro")]
@@ -263,6 +265,11 @@ pub fn default_registry() -> ConnectorRegistry {
     #[cfg(feature = "hbase")]
     {
         registry.register_sink(Arc::new(super::drivers::HBaseSinkDriver));
+    }
+    #[cfg(feature = "jdbc")]
+    {
+        registry.register_source(Arc::new(super::drivers::JdbcSourceDriver));
+        registry.register_sink(Arc::new(super::drivers::JdbcSinkDriver));
     }
     #[cfg(feature = "vector-sinks")]
     {

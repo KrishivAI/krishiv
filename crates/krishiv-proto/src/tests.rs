@@ -755,17 +755,49 @@ mod proto_tests {
 /// failure) entirely on stable. These tests feed `from_wire` malformed,
 /// out-of-range, and empty field values — only `Ok`/`Err` are valid outcomes,
 /// a panic is a bug.
+///
+/// ## Coverage (task #21)
+///
+/// Currently covered:
+///   register_executor_request_from_wire
+///   register_executor_response_from_wire
+///   deregister_executor_request_from_wire
+///   deregister_executor_response_from_wire
+///   executor_heartbeat_request_from_wire
+///   executor_heartbeat_response_from_wire
+///   executor_task_assignment_from_wire
+///   task_status_request_from_wire
+///   task_status_response_from_wire
+///   task_cancellation_request_from_wire
+///   checkpoint_ack_request_from_wire
+///   checkpoint_ack_response_from_wire  (plain test — proptest! requires ≥1 arg)
+///   push_continuous_input_request_from_wire
+///   drain_continuous_output_request_from_wire
+///   drain_continuous_output_response_from_wire
+///   trigger_savepoint_request_from_wire
+///   restore_job_request_from_wire
 #[cfg(test)]
 mod wire_fuzz {
     use crate::wire::v1;
     use crate::wire::{
+        checkpoint_ack_request_from_wire, checkpoint_ack_response_from_wire,
         deregister_executor_request_from_wire, deregister_executor_response_from_wire,
-        register_executor_response_from_wire, task_cancellation_request_from_wire,
+        drain_continuous_output_request_from_wire, drain_continuous_output_response_from_wire,
+        executor_heartbeat_request_from_wire, executor_heartbeat_response_from_wire,
+        executor_task_assignment_from_wire, push_continuous_input_request_from_wire,
+        register_executor_request_from_wire, register_executor_response_from_wire,
+        restore_job_request_from_wire, task_cancellation_request_from_wire,
+        task_status_request_from_wire, task_status_response_from_wire,
+        trigger_savepoint_request_from_wire,
     };
     use proptest::prelude::*;
 
     fn arb_string() -> impl Strategy<Value = String> {
-        prop_oneof![Just(String::new()), "[a-zA-Z0-9_/:@.-]{0,32}", "\\PC{0,16}",]
+        prop_oneof![
+            Just(String::new()),
+            "[a-zA-Z0-9_/:@.-]{0,32}",
+            "\\PC{0,16}",
+        ]
     }
 
     fn arb_version() -> impl Strategy<Value = Option<v1::TransportVersion>> {
@@ -774,7 +806,54 @@ mod wire_fuzz {
         )
     }
 
+    fn arb_descriptor() -> impl Strategy<Value = Option<v1::ExecutorDescriptor>> {
+        prop::option::of(
+            (arb_string(), arb_string(), any::<u64>(), arb_string(), arb_string()).prop_map(
+                |(executor_id, host, slots, task_endpoint, barrier_endpoint)| {
+                    v1::ExecutorDescriptor {
+                        executor_id,
+                        host,
+                        slots,
+                        task_endpoint,
+                        barrier_endpoint,
+                    }
+                },
+            ),
+        )
+    }
+
+    // proptest! requires ≥1 strategy argument; zero-arg tests live outside.
+    #[test]
+    fn checkpoint_ack_response_none_never_panics() {
+        let _ = checkpoint_ack_response_from_wire(v1::CheckpointAckResponse { result: None });
+    }
+
     proptest! {
+        #[test]
+        fn register_executor_request_from_wire_never_panics(
+            version in arb_version(),
+            descriptor in arb_descriptor(),
+            trace_parent in arb_string(),
+            trace_state in arb_string(),
+        ) {
+            let wire = v1::RegisterExecutorRequest { version, descriptor, trace_parent, trace_state };
+            let _ = register_executor_request_from_wire(wire);
+        }
+
+        #[test]
+        fn register_executor_response_from_wire_never_panics(
+            version in arb_version(),
+            executor_id in arb_string(),
+            lease_generation in any::<u64>(),
+            disposition in any::<i32>(),
+            message in arb_string(),
+        ) {
+            let wire = v1::RegisterExecutorResponse {
+                version, executor_id, lease_generation, disposition, message,
+            };
+            let _ = register_executor_response_from_wire(wire);
+        }
+
         #[test]
         fn deregister_executor_request_from_wire_never_panics(
             version in arb_version(),
@@ -794,20 +873,160 @@ mod wire_fuzz {
             disposition in any::<i32>(),
             message in arb_string(),
         ) {
-            let wire = v1::DeregisterExecutorResponse { version, executor_id, lease_generation, disposition, message };
+            let wire = v1::DeregisterExecutorResponse {
+                version, executor_id, lease_generation, disposition, message,
+            };
             let _ = deregister_executor_response_from_wire(wire);
         }
 
         #[test]
-        fn register_executor_response_from_wire_never_panics(
+        fn executor_heartbeat_request_from_wire_never_panics(
             version in arb_version(),
             executor_id in arb_string(),
             lease_generation in any::<u64>(),
+            state in any::<i32>(),
+            memory_used in any::<u64>(),
+            memory_limit in any::<u64>(),
+            active_task_count in any::<u32>(),
+            cpu_cores_used in any::<f32>(),
+            network_sent in any::<u64>(),
+            network_recv in any::<u64>(),
+            trace_parent in arb_string(),
+            trace_state in arb_string(),
+        ) {
+            let wire = v1::ExecutorHeartbeatRequest {
+                version,
+                executor_id,
+                lease_generation,
+                state,
+                running_attempts: vec![],
+                memory_used_bytes: memory_used,
+                memory_limit_bytes: memory_limit,
+                active_task_count,
+                cpu_cores_used: cpu_cores_used.into(),
+                network_bytes_sent: network_sent,
+                network_bytes_recv: network_recv,
+                llm_quota_reports: vec![],
+                streaming_progress: vec![],
+                hot_key_reports: vec![],
+                streaming_task_states: vec![],
+                trace_parent,
+                trace_state,
+            };
+            let _ = executor_heartbeat_request_from_wire(wire);
+        }
+
+        #[test]
+        fn executor_heartbeat_response_from_wire_never_panics(
+            version in arb_version(),
+            lease_generation in any::<u64>(),
             disposition in any::<i32>(),
             message in arb_string(),
+            trace_parent in arb_string(),
+            trace_state in arb_string(),
         ) {
-            let wire = v1::RegisterExecutorResponse { version, executor_id, lease_generation, disposition, message };
-            let _ = register_executor_response_from_wire(wire);
+            let wire = v1::ExecutorHeartbeatResponse {
+                version,
+                lease_generation,
+                disposition,
+                message,
+                llm_throttles: vec![],
+                initiate_checkpoints: vec![],
+                completed_checkpoints: vec![],
+                restore_checkpoints: vec![],
+                source_throttles: vec![],
+                trace_parent,
+                trace_state,
+                global_watermarks: Default::default(),
+            };
+            let _ = executor_heartbeat_response_from_wire(wire);
+        }
+
+        #[test]
+        fn executor_task_assignment_from_wire_never_panics(
+            version in arb_version(),
+            job_id in arb_string(),
+            stage_id in arb_string(),
+            task_id in arb_string(),
+            attempt_id in any::<u32>(),
+            executor_id in arb_string(),
+            lease_generation in any::<u64>(),
+            trace_parent in arb_string(),
+            trace_state in arb_string(),
+        ) {
+            let wire = v1::ExecutorTaskAssignment {
+                version,
+                job_id,
+                stage_id,
+                task_id,
+                attempt_id,
+                executor_id,
+                lease_generation,
+                input_partitions: vec![],
+                plan_fragment: None,
+                output_contract: None,
+                task_timeout_secs: 0,
+                has_task_timeout_secs: false,
+                key_group_range_start: 0,
+                key_group_range_end: 0,
+                has_key_group_range: false,
+                cpu_limit_nanos: 0,
+                has_cpu_limit_nanos: false,
+                memory_limit_bytes: 0,
+                has_memory_limit_bytes: false,
+                shuffle_write: None,
+                shuffle_read: None,
+                requires_reattach: false,
+                trace_parent,
+                trace_state,
+            };
+            let _ = executor_task_assignment_from_wire(wire);
+        }
+
+        #[test]
+        fn task_status_request_from_wire_never_panics(
+            version in arb_version(),
+            job_id in arb_string(),
+            stage_id in arb_string(),
+            task_id in arb_string(),
+            attempt_id in any::<u32>(),
+            executor_id in arb_string(),
+            lease_generation in any::<u64>(),
+            state in any::<i32>(),
+            message in arb_string(),
+            trace_parent in arb_string(),
+            trace_state in arb_string(),
+        ) {
+            let wire = v1::TaskStatusRequest {
+                version,
+                job_id,
+                stage_id,
+                task_id,
+                attempt_id,
+                executor_id,
+                lease_generation,
+                state,
+                message,
+                output_metadata: None,
+                trace_parent,
+                trace_state,
+                missing_shuffle_partitions: vec![],
+            };
+            let _ = task_status_request_from_wire(wire);
+        }
+
+        #[test]
+        fn task_status_response_from_wire_never_panics(
+            version in arb_version(),
+            disposition in any::<i32>(),
+            message in arb_string(),
+            trace_parent in arb_string(),
+            trace_state in arb_string(),
+        ) {
+            let wire = v1::TaskStatusResponse {
+                version, disposition, message, trace_parent, trace_state,
+            };
+            let _ = task_status_response_from_wire(wire);
         }
 
         #[test]
@@ -819,8 +1038,92 @@ mod wire_fuzz {
             attempt_id in any::<u32>(),
             reason in arb_string(),
         ) {
-            let wire = v1::TaskCancellationRequest { version, job_id, stage_id, task_id, attempt_id, reason };
+            let wire = v1::TaskCancellationRequest {
+                version, job_id, stage_id, task_id, attempt_id, reason,
+            };
             let _ = task_cancellation_request_from_wire(wire);
+        }
+
+        #[test]
+        fn checkpoint_ack_request_from_wire_never_panics(
+            job_id in arb_string(),
+            operator_id in arb_string(),
+            task_id in arb_string(),
+            epoch in any::<u64>(),
+            fencing_token in any::<u64>(),
+            snapshot_path in arb_string(),
+        ) {
+            let wire = v1::CheckpointAckRequest {
+                job_id,
+                operator_id,
+                task_id,
+                epoch,
+                fencing_token,
+                source_offsets: vec![],
+                snapshot_path,
+            };
+            let _ = checkpoint_ack_request_from_wire(wire);
+        }
+
+        #[test]
+        fn push_continuous_input_request_from_wire_never_panics(
+            version in arb_version(),
+            job_id in arb_string(),
+            task_id in arb_string(),
+            payload in arb_string(),
+        ) {
+            let wire = v1::PushContinuousInputRequest {
+                version,
+                job_id,
+                task_id,
+                ipc_bytes: payload.into_bytes(),
+            };
+            let _ = push_continuous_input_request_from_wire(wire);
+        }
+
+        #[test]
+        fn drain_continuous_output_request_from_wire_never_panics(
+            version in arb_version(),
+            job_id in arb_string(),
+            task_id in arb_string(),
+        ) {
+            let wire = v1::DrainContinuousOutputRequest { version, job_id, task_id };
+            let _ = drain_continuous_output_request_from_wire(wire);
+        }
+
+        #[test]
+        fn drain_continuous_output_response_from_wire_never_panics(
+            version in arb_version(),
+            disposition in any::<i32>(),
+            payload in arb_string(),
+        ) {
+            let wire = v1::DrainContinuousOutputResponse {
+                version,
+                disposition,
+                ipc_bytes: payload.into_bytes(),
+            };
+            let _ = drain_continuous_output_response_from_wire(wire);
+        }
+
+        #[test]
+        fn trigger_savepoint_request_from_wire_never_panics(
+            job_id in arb_string(),
+            label in arb_string(),
+            stop in any::<bool>(),
+        ) {
+            let wire = v1::TriggerSavepointRequest { job_id, label, stop };
+            let _ = trigger_savepoint_request_from_wire(wire);
+        }
+
+        #[test]
+        fn restore_job_request_from_wire_never_panics(
+            job_id in arb_string(),
+            epoch in any::<u64>(),
+            storage_path in arb_string(),
+            from_savepoint in any::<bool>(),
+        ) {
+            let wire = v1::RestoreJobRequest { job_id, epoch, storage_path, from_savepoint };
+            let _ = restore_job_request_from_wire(wire);
         }
     }
 }

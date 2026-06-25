@@ -20,10 +20,14 @@ pub enum ConnectorRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConnectorKind {
     Parquet,
+    /// Multi-file Parquet directory source with Hive partition discovery.
+    ParquetDirectory,
     Csv,
     #[cfg(feature = "avro")]
     Avro,
     S3,
+    /// Multi-object S3 prefix source with Hive partition discovery.
+    S3Prefix,
     #[cfg(feature = "kafka")]
     Kafka,
     TwoPhaseParquet,
@@ -58,6 +62,12 @@ pub enum ConnectorKind {
     Cassandra,
     #[cfg(feature = "hbase")]
     HBase,
+    /// T9: JDBC source (Postgres/MySQL) using `sqlx`.
+    #[cfg(feature = "jdbc")]
+    Jdbc,
+    /// T9: JDBC sink (Postgres/MySQL) using `sqlx`.
+    #[cfg(feature = "jdbc")]
+    JdbcSink,
 }
 
 impl ConnectorKind {
@@ -65,6 +75,7 @@ impl ConnectorKind {
     pub fn parse(raw: &str) -> ConnectorResult<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
+            "parquet-directory" | "parquet_directory" => Ok(Self::ParquetDirectory),
             "csv" => Ok(Self::Csv),
             #[cfg(feature = "avro")]
             "avro" => Ok(Self::Avro),
@@ -73,6 +84,7 @@ impl ConnectorKind {
                 message: "avro connector requires the `avro` feature".into(),
             }),
             "s3" | "object_store" | "object-store" => Ok(Self::S3),
+            "s3-prefix" | "s3_prefix" => Ok(Self::S3Prefix),
             #[cfg(feature = "kafka")]
             "kafka" => Ok(Self::Kafka),
             #[cfg(not(feature = "kafka"))]
@@ -134,6 +146,18 @@ impl ConnectorKind {
             "hbase" => Err(ConnectorError::Unsupported {
                 message: "hbase connector requires the `hbase` feature".into(),
             }),
+            #[cfg(feature = "jdbc")]
+            "jdbc" | "postgres" | "postgresql" | "mysql" => Ok(Self::Jdbc),
+            #[cfg(not(feature = "jdbc"))]
+            "jdbc" | "postgres" | "postgresql" | "mysql" => Err(ConnectorError::Unsupported {
+                message: "jdbc connector requires the `jdbc` feature".into(),
+            }),
+            #[cfg(feature = "jdbc")]
+            "jdbc-sink" | "jdbc_sink" | "postgres-sink" | "mysql-sink" => Ok(Self::JdbcSink),
+            #[cfg(not(feature = "jdbc"))]
+            "jdbc-sink" | "jdbc_sink" | "postgres-sink" | "mysql-sink" => Err(ConnectorError::Unsupported {
+                message: "jdbc-sink connector requires the `jdbc` feature".into(),
+            }),
             other => Err(ConnectorError::Config {
                 message: format!("unknown connector kind '{other}'"),
             }),
@@ -143,7 +167,9 @@ impl ConnectorKind {
     /// Return the repository-published maturity for this connector kind.
     pub fn default_maturity(self) -> ConnectorMaturity {
         match self {
-            Self::Parquet | Self::S3 | Self::Csv => ConnectorMaturity::Preview,
+            Self::Parquet | Self::ParquetDirectory | Self::S3 | Self::S3Prefix | Self::Csv => {
+                ConnectorMaturity::Preview
+            }
             #[cfg(feature = "avro")]
             Self::Avro => ConnectorMaturity::Preview,
             #[cfg(feature = "kafka")]
@@ -173,6 +199,8 @@ impl ConnectorKind {
             Self::Cassandra => ConnectorMaturity::Preview,
             #[cfg(feature = "hbase")]
             Self::HBase => ConnectorMaturity::Preview,
+            #[cfg(feature = "jdbc")]
+            Self::Jdbc | Self::JdbcSink => ConnectorMaturity::Preview,
         }
     }
 
@@ -180,10 +208,12 @@ impl ConnectorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Parquet => "parquet",
+            Self::ParquetDirectory => "parquet-directory",
             Self::Csv => "csv",
             #[cfg(feature = "avro")]
             Self::Avro => "avro",
             Self::S3 => "s3",
+            Self::S3Prefix => "s3-prefix",
             #[cfg(feature = "kafka")]
             Self::Kafka => "kafka",
             Self::TwoPhaseParquet => "two-phase-parquet",
@@ -217,6 +247,10 @@ impl ConnectorKind {
             Self::Cassandra => "cassandra",
             #[cfg(feature = "hbase")]
             Self::HBase => "hbase",
+            #[cfg(feature = "jdbc")]
+            Self::Jdbc => "jdbc",
+            #[cfg(feature = "jdbc")]
+            Self::JdbcSink => "jdbc-sink",
         }
     }
 }

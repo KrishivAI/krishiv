@@ -579,11 +579,18 @@ mod aggregation_proptests {
         }
     }
 
+    fn read_i64(batch: &RecordBatch, col: &str, row: usize) -> i64 {
+        batch
+            .column(batch.schema().index_of(col).unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(row)
+    }
+
     proptest! {
-        /// Closing a single window over an arbitrary in-order event sequence
-        /// must never panic, and — when the sequence is non-empty — must
-        /// yield exactly one output row whose `cnt`/`sum_v` losslessly
-        /// reflect every accepted input row exactly once.
+        /// Every accepted event must be counted exactly once and summed
+        /// without loss — the fundamental correctness invariant.
         #[test]
         fn tumbling_window_count_and_sum_are_lossless(events in arb_single_window_events()) {
             let mut op = TumblingWindowOperator::new(spec());
@@ -599,25 +606,152 @@ mod aggregation_proptests {
                 let out = &outputs[0];
                 prop_assert_eq!(out.num_rows(), 1);
 
-                let cnt = out
-                    .column(out.schema().index_of("cnt").unwrap())
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .value(0);
-                let sum_v = out
-                    .column(out.schema().index_of("sum_v").unwrap())
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .value(0);
+                let cnt   = read_i64(out, "cnt",   0);
+                let sum_v = read_i64(out, "sum_v", 0);
 
                 prop_assert_eq!(cnt as usize, events.len());
                 prop_assert_eq!(sum_v, events.iter().map(|(_, v)| v).sum::<i64>());
             }
-
-            // No state should remain open once the only window has closed.
             prop_assert_eq!(op.open_window_count(), 0);
+        }
+
+        /// Processing N events as a single batch must produce the same count
+        /// as processing each event one row at a time (incremental path).
+        #[test]
+        fn tumbling_batch_vs_incremental_count_equal(events in arb_single_window_events()) {
+            // Batch path: all events in one RecordBatch.
+            let mut batch_op = TumblingWindowOperator::new(spec());
+            let batch = make_batch(&events);
+            let batch_out = batch_op.process_batch(&batch, 1000).expect("batch");
+
+            // Incremental path: one row per RecordBatch, watermark = 1000 only on last.
+            let mut incr_op = TumblingWindowOperator::new(spec());
+            let mut incr_out: Vec<RecordBatch> = vec![];
+            for (i, event) in events.iter().enumerate() {
+                let single = make_batch(std::slice::from_ref(event));
+                let wm = if i + 1 == events.len() { 1000 } else { 0 };
+                let mut rows = incr_op.process_batch(&single, wm).expect("incr");
+                incr_out.append(&mut rows);
+            }
+
+            let batch_cnt: i64 = batch_out.iter()
+                .map(|b| read_i64(b, "cnt", 0))
+                .sum();
+            let incr_cnt: i64 = incr_out.iter()
+                .map(|b| read_i64(b, "cnt", 0))
+                .sum();
+            prop_assert_eq!(batch_cnt, incr_cnt);
+        }
+
+        /// `window_start_ms` in the output must always be a multiple of
+        /// `window_size_ms` for non-negative timestamps (grid alignment).
+        #[test]
+        fn tumbling_window_start_is_grid_aligned(ts in 0i64..100_000_000i64) {
+            let size_ms: u64 = 1_000;
+            let start = TumblingWindowOperator::window_start(ts, size_ms);
+            prop_assert_eq!(
+                start % size_ms as i64,
+                0,
+                "window_start({}) = {} not aligned to grid {}", ts, start, size_ms
+            );
+            prop_assert!(start <= ts, "window_start must be ≤ event time");
+            prop_assert!(start + size_ms as i64 > ts, "event must fall within window");
+        }
+
+        /// The `min_v` output must be ≤ every input value; `max_v` must be ≥
+        /// every input value — both are trivially bounded by the data they saw.
+        #[test]
+        fn tumbling_min_and_max_are_tight_bounds(events in arb_single_window_events()) {
+            if events.is_empty() {
+                return Ok(());
+            }
+            let min_spec = TumblingWindowSpec {
+                key_column: "k".into(),
+                key_column_type: "utf8".into(),
+                event_time_column: "ts".into(),
+                window_size_ms: 1000,
+                agg_exprs: vec![
+                    AggExpr { function: AggFunction::Min, input_column: "v".into(), output_column: "min_v".into() },
+                    AggExpr { function: AggFunction::Max, input_column: "v".into(), output_column: "max_v".into() },
+                ],
+                agg_is_float: vec![false, false],
+            };
+            let mut op = TumblingWindowOperator::new(min_spec);
+            let batch = make_batch(&events);
+            let outputs = op.process_batch(&batch, 1000).expect("process_batch");
+            prop_assert_eq!(outputs.len(), 1);
+            let out = &outputs[0];
+            let min_v = read_i64(out, "min_v", 0);
+            let max_v = read_i64(out, "max_v", 0);
+            let expected_min = events.iter().map(|(_, v)| *v).min().unwrap();
+            let expected_max = events.iter().map(|(_, v)| *v).max().unwrap();
+            prop_assert_eq!(min_v, expected_min);
+            prop_assert_eq!(max_v, expected_max);
+        }
+
+        /// Late events (timestamps before `prev_watermark_ms`) must be
+        /// excluded from window counts entirely.
+        #[test]
+        fn tumbling_late_events_not_counted(
+            on_time in prop::collection::vec(500i64..1000, 1..16usize),
+            late    in prop::collection::vec(0i64..500,   1..8usize),
+        ) {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Utf8, false),
+                Field::new("ts", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ]));
+            let spec = TumblingWindowSpec {
+                key_column: "k".into(),
+                key_column_type: "utf8".into(),
+                event_time_column: "ts".into(),
+                window_size_ms: 1000,
+                agg_exprs: vec![AggExpr {
+                    function: AggFunction::Count,
+                    input_column: String::new(),
+                    output_column: "cnt".into(),
+                }],
+                agg_is_float: vec![false],
+            };
+            let mut op = TumblingWindowOperator::new(spec);
+
+            // First batch: on-time events, advances prev_watermark_ms to 500.
+            let first: Vec<(i64, i64)> = on_time.iter().map(|&t| (t, 0)).collect();
+            let ts_first: Vec<i64> = first.iter().map(|(t, _)| *t).collect();
+            let max_first = *ts_first.iter().max().unwrap();
+            let b1 = RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(StringArray::from(vec!["k"; first.len()])),
+                Arc::new(Int64Array::from(ts_first.clone())),
+                Arc::new(Int64Array::from(vec![0i64; first.len()])),
+            ]).unwrap();
+            // Watermark 500 — doesn't close [0,1000) window yet.
+            let _ = op.process_batch(&b1, 500).expect("first");
+
+            // Second batch: late events (ts < prev_watermark_ms = 500).
+            let ts_late: Vec<i64> = late.clone();
+            let b2 = RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(StringArray::from(vec!["k"; ts_late.len()])),
+                Arc::new(Int64Array::from(ts_late)),
+                Arc::new(Int64Array::from(vec![0i64; late.len()])),
+            ]).unwrap();
+            // Watermark 1000 — closes [0,1000) window, but late events excluded.
+            let outputs = op.process_batch(&b2, 1000).expect("second");
+
+            let cnt = outputs.iter()
+                .find(|b| b.schema().index_of("cnt").is_ok())
+                .map(|b| read_i64(b, "cnt", 0))
+                .unwrap_or(0);
+
+            // Output count must equal ONLY the on-time events (no late events).
+            prop_assert_eq!(
+                cnt as usize, on_time.len(),
+                "late events must be excluded; got {}, expected {}",
+                cnt, on_time.len()
+            );
+            prop_assert_eq!(
+                op.late_events_dropped as usize, late.len(),
+                "late_events_dropped counter must equal number of late events"
+            );
         }
     }
 }

@@ -14,7 +14,7 @@ pub trait JobSubmitter: Send + Sync {
 }
 
 /// Coordinator behavior knobs for deterministic R2 scheduler tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CoordinatorConfig {
     max_stage_retries: u32,
     heartbeat_timeout_ticks: u64,
@@ -52,6 +52,43 @@ pub struct CoordinatorConfig {
     /// micro-batches may need a higher value; batch jobs with a strict SLA
     /// can lower it.
     task_stall_timeout_ms: u64,
+
+    /// Enable speculative re-execution of straggler tasks.
+    ///
+    /// When `true`, the coordinator periodically checks for Running tasks that
+    /// are taking significantly longer than their sibling tasks in the same
+    /// stage, and preemptively re-schedules them to a different executor.
+    /// Requires at least `speculative_min_completed_tasks` tasks to have
+    /// already Succeeded in the stage so a meaningful median can be computed.
+    ///
+    /// Default: `false` (opt-in).
+    speculative_execution_enabled: bool,
+
+    /// Slowdown factor that triggers speculation.
+    ///
+    /// A Running task is a straggler when its elapsed time exceeds
+    /// `median_completed_duration_ms * speculative_slowdown_factor`.
+    /// Default: `1.5` (50 % slower than the median).
+    speculative_slowdown_factor: f64,
+
+    /// Minimum number of Succeeded tasks in the stage before speculation fires.
+    /// Ensures the median estimate is stable.  Default: `3`.
+    speculative_min_completed_tasks: usize,
+
+    // ── SC11: cascade circuit breaker ──────────────────────────────────────
+
+    /// Number of executor losses in `cascade_window_ms` that trips the cascade
+    /// circuit breaker.  Default: `5` (5 losses → cascade detected).
+    cascade_failure_threshold: usize,
+
+    /// Sliding window in milliseconds over which executor losses are counted.
+    /// Default: `30_000` (30 s).
+    cascade_window_ms: u64,
+
+    /// Cooldown in milliseconds after the cascade circuit breaker trips: no new
+    /// task assignments are issued during this period so the cluster can stabilise.
+    /// Default: `60_000` (60 s).
+    cascade_cooldown_ms: u64,
 }
 
 impl CoordinatorConfig {
@@ -67,6 +104,12 @@ impl CoordinatorConfig {
             circuit_breaker_failure_threshold: 5,
             inline_partition_limit_bytes: 3 * 1024 * 1024,
             task_stall_timeout_ms: 30 * 60 * 1_000,
+            speculative_execution_enabled: false,
+            speculative_slowdown_factor: 1.5,
+            speculative_min_completed_tasks: 3,
+            cascade_failure_threshold: 5,
+            cascade_window_ms: 30_000,
+            cascade_cooldown_ms: 60_000,
         }
     }
 
@@ -152,6 +195,81 @@ impl CoordinatorConfig {
     #[must_use]
     pub fn with_task_stall_timeout_ms(mut self, ms: u64) -> Self {
         self.task_stall_timeout_ms = ms.max(1);
+        self
+    }
+
+    /// Enable or disable speculative re-execution of straggler tasks.
+    #[must_use]
+    pub fn with_speculative_execution(mut self, enabled: bool) -> Self {
+        self.speculative_execution_enabled = enabled;
+        self
+    }
+
+    /// Set the slowdown factor that triggers speculation (default: 1.5).
+    #[must_use]
+    pub fn with_speculative_slowdown_factor(mut self, factor: f64) -> Self {
+        self.speculative_slowdown_factor = factor.max(1.0);
+        self
+    }
+
+    /// Set the minimum number of completed tasks needed before speculation fires.
+    #[must_use]
+    pub fn with_speculative_min_completed_tasks(mut self, n: usize) -> Self {
+        self.speculative_min_completed_tasks = n.max(1);
+        self
+    }
+
+    /// Whether speculative re-execution is enabled.
+    pub fn speculative_execution_enabled(&self) -> bool {
+        self.speculative_execution_enabled
+    }
+
+    /// Slowdown factor threshold for speculation.
+    pub fn speculative_slowdown_factor(&self) -> f64 {
+        self.speculative_slowdown_factor
+    }
+
+    /// Minimum completed tasks before speculation may fire.
+    pub fn speculative_min_completed_tasks(&self) -> usize {
+        self.speculative_min_completed_tasks
+    }
+
+    // ── SC11: cascade circuit breaker accessors ────────────────────────────
+
+    /// Number of executor losses within `cascade_window_ms` that trips the
+    /// cascade circuit breaker.
+    pub fn cascade_failure_threshold(&self) -> usize {
+        self.cascade_failure_threshold
+    }
+
+    /// Sliding window for cascade failure counting, in milliseconds.
+    pub fn cascade_window_ms(&self) -> u64 {
+        self.cascade_window_ms
+    }
+
+    /// Cooldown after cascade trip: no task assignments for this many ms.
+    pub fn cascade_cooldown_ms(&self) -> u64 {
+        self.cascade_cooldown_ms
+    }
+
+    /// Override the cascade failure threshold (default 5).
+    #[must_use]
+    pub fn with_cascade_failure_threshold(mut self, n: usize) -> Self {
+        self.cascade_failure_threshold = n.max(1);
+        self
+    }
+
+    /// Override the cascade window (default 30 000 ms).
+    #[must_use]
+    pub fn with_cascade_window_ms(mut self, ms: u64) -> Self {
+        self.cascade_window_ms = ms.max(1);
+        self
+    }
+
+    /// Override the cascade cooldown (default 60 000 ms).
+    #[must_use]
+    pub fn with_cascade_cooldown_ms(mut self, ms: u64) -> Self {
+        self.cascade_cooldown_ms = ms.max(1);
         self
     }
 }

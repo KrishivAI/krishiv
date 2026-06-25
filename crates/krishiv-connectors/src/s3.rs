@@ -8,16 +8,17 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use futures::StreamExt;
-use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload, path::Path};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt as _, PutPayload, path::Path};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
 };
 
 use crate::{
-    CheckpointSource, ConnectorCapabilities, ConnectorError, ConnectorResult, ParquetOffset, Sink,
-    Source,
+    CheckpointSource, ConnectorCapabilities, ConnectorError, ConnectorResult, MultiFileOffset,
+    ParquetOffset, Sink, Source,
 };
+use crate::partition::inject_partition_columns;
 
 // ---------------------------------------------------------------------------
 // S3Source
@@ -229,6 +230,206 @@ impl CheckpointSource for S3Source {
         // object has fewer batches than the requested index.
         self.cursor = offset.batch_index;
         self.stream = None;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3PrefixSource
+// ---------------------------------------------------------------------------
+
+/// List all `.parquet` objects whose path starts with `prefix` in `store`.
+///
+/// Returns objects sorted by their full path string so reads are deterministic.
+/// The `prefix` must end with `/` to avoid accidentally matching objects that
+/// share a common prefix string (e.g. `data/2024` vs `data/20240101`).
+pub async fn list_s3_parquet_objects(
+    store: Arc<dyn ObjectStore>,
+    prefix: &Path,
+) -> ConnectorResult<Vec<ObjectMeta>> {
+    use futures::TryStreamExt as _;
+    let mut metas: Vec<ObjectMeta> = store
+        .list(Some(prefix))
+        .try_collect()
+        .await
+        .map_err(|e| ConnectorError::ObjectStore {
+            message: format!("failed to list objects under '{}': {e}", prefix),
+            status: None,
+        })?;
+    metas.retain(|m| {
+        m.location
+            .as_ref()
+            .ends_with(".parquet")
+    });
+    metas.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
+    Ok(metas)
+}
+
+/// A bounded, rewindable source that reads all `.parquet` objects under an
+/// object-store prefix, in sorted key order.
+///
+/// Hive partition columns are parsed from each object's path relative to the
+/// `prefix` root and injected as `Utf8` columns on every batch.
+///
+/// Checkpointing uses [`MultiFileOffset`] — `(file_index, batch_index)` —
+/// identical semantics to [`ParquetDirectorySource`].
+pub struct S3PrefixSource {
+    store: Arc<dyn ObjectStore>,
+    /// Root prefix used for Hive partition parsing (treated as "root directory").
+    prefix: Path,
+    objects: Vec<ObjectMeta>,
+    file_index: usize,
+    batch_index: usize,
+    current_stream: Option<ObjectBatchStream>,
+}
+
+impl S3PrefixSource {
+    /// List all `.parquet` objects under `prefix` and prepare the source.
+    pub async fn open(store: Arc<dyn ObjectStore>, prefix: impl Into<Path>) -> ConnectorResult<Self> {
+        let prefix = prefix.into();
+        let objects = list_s3_parquet_objects(Arc::clone(&store), &prefix).await?;
+        Ok(Self {
+            store,
+            prefix,
+            objects,
+            file_index: 0,
+            batch_index: 0,
+            current_stream: None,
+        })
+    }
+
+    /// Number of objects discovered under the prefix.
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
+    async fn stream_skipped_to(
+        store: Arc<dyn ObjectStore>,
+        meta: &ObjectMeta,
+        skip: usize,
+    ) -> ConnectorResult<ObjectBatchStream> {
+        S3Source::stream_skipped_to(Arc::clone(&store), meta.location.clone(), meta.size, skip).await
+    }
+
+    async fn ensure_stream(&mut self) -> ConnectorResult<()> {
+        if self.current_stream.is_none() && self.file_index < self.objects.len() {
+            let stream = Self::stream_skipped_to(
+                Arc::clone(&self.store),
+                &self.objects[self.file_index],
+                self.batch_index,
+            )
+            .await?;
+            self.current_stream = Some(stream);
+        }
+        Ok(())
+    }
+
+    fn hive_parts_for_current(&self) -> Vec<(String, String)> {
+        if self.file_index >= self.objects.len() {
+            return vec![];
+        }
+        // Convert object path to a local-path-like structure for partition parsing.
+        let obj_path_str = self.objects[self.file_index].location.as_ref();
+        let prefix_str = self.prefix.as_ref();
+        // Strip the prefix and parse key=value segments.
+        let relative = obj_path_str.strip_prefix(prefix_str).unwrap_or(obj_path_str);
+        let relative = relative.trim_start_matches('/');
+        // Walk path segments.
+        let mut parts = Vec::new();
+        let segments: Vec<&str> = relative.split('/').collect();
+        for seg in segments.iter().take(segments.len().saturating_sub(1)) {
+            if let Some((k, v)) = seg.split_once('=')
+                && !k.is_empty()
+                && !v.is_empty()
+            {
+                parts.push((k.to_owned(), v.to_owned()));
+            }
+        }
+        parts
+    }
+}
+
+impl Source for S3PrefixSource {
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new()
+            .with_bounded()
+            .with_rewindable()
+            .with_checkpoint()
+    }
+
+    async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+        loop {
+            if self.file_index >= self.objects.len() {
+                return Ok(None);
+            }
+
+            self.ensure_stream().await?;
+
+            let stream = match self.current_stream.as_mut() {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+
+            match stream.next().await {
+                Some(Ok(batch)) => {
+                    self.batch_index = self.batch_index.saturating_add(1);
+                    let parts = self.hive_parts_for_current();
+                    let batch = inject_partition_columns(batch, &parts)?;
+                    return Ok(Some(batch));
+                }
+                Some(Err(e)) => {
+                    return Err(ConnectorError::Parquet(format!(
+                        "error reading batch from '{}': {e}",
+                        self.objects[self.file_index].location
+                    )));
+                }
+                None => {
+                    self.current_stream = None;
+                    self.file_index = self.file_index.saturating_add(1);
+                    self.batch_index = 0;
+                }
+            }
+        }
+    }
+
+    fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+        Some(Box::new(MultiFileOffset {
+            file_index: self.file_index,
+            batch_index: self.batch_index,
+        }))
+    }
+
+    fn reset(&mut self) {
+        self.file_index = 0;
+        self.batch_index = 0;
+        self.current_stream = None;
+    }
+}
+
+impl CheckpointSource for S3PrefixSource {
+    type Offset = MultiFileOffset;
+
+    fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset> {
+        Ok(MultiFileOffset {
+            file_index: self.file_index,
+            batch_index: self.batch_index,
+        })
+    }
+
+    fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()> {
+        if offset.file_index > self.objects.len() {
+            return Err(ConnectorError::Offset {
+                message: format!(
+                    "S3PrefixSource restore: file_index {} out of range (have {} objects)",
+                    offset.file_index,
+                    self.objects.len()
+                ),
+            });
+        }
+        // Lazy restore: adopt the offset and let ensure_stream do I/O on next read.
+        self.file_index = offset.file_index;
+        self.batch_index = offset.batch_index;
+        self.current_stream = None;
         Ok(())
     }
 }

@@ -16,7 +16,7 @@ use krishiv_proto::{
 
 use crate::runner::{
     CONNECTOR_PARQUET_PARTITION_PREFIX, LocalParquetPartition, OBJECT_PARQUET_PARTITION_PREFIX,
-    OBJECT_PARQUET_SINK_PREFIX,
+    OBJECT_PARQUET_SINK_PREFIX, REGISTRY_CONNECTOR_PARTITION_PREFIX,
 };
 use crate::{ExecutorError, ExecutorResult};
 
@@ -211,6 +211,85 @@ pub(crate) async fn read_object_parquet_partitions(
                 .map_err(|error| ExecutorError::LocalExecution {
                     message: format!("object-parquet read failed: {error}"),
                 })?
+        {
+            batches.push(batch);
+        }
+        result.push((table_name, batches));
+    }
+    Ok(result)
+}
+
+/// Read input partitions of the form `registry-connector:<kind>:<table_name>:<config_json>`
+/// using a pluggable [`ConnectorRegistry`].
+///
+/// The `config_json` segment is a JSON object whose keys map to
+/// [`ConnectorConfig`][krishiv_connectors::ConnectorConfig] properties.
+/// Example:
+/// ```text
+/// registry-connector:parquet-directory:my_table:{"path":"/data/year=2024","recursive":"true"}
+/// ```
+///
+/// This is the CO5 execution path that allows any registered connector (including
+/// the new `ParquetDirectorySource` and `S3PrefixSource`) to be used as an input
+/// partition source from fragment assignments.
+pub(crate) async fn read_registry_partitions(
+    registry: &krishiv_connectors::ConnectorRegistry,
+    partitions: &[krishiv_proto::InputPartition],
+) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
+    use krishiv_connectors::ConnectorConfig;
+
+    let mut result = Vec::new();
+    for partition in partitions {
+        let desc = partition.description().trim();
+        let Some(payload) = desc.strip_prefix(REGISTRY_CONNECTOR_PARTITION_PREFIX) else {
+            continue;
+        };
+        // Parse `<kind>:<table_name>:<config_json>` from the payload.
+        let mut parts = payload.splitn(3, ':');
+        let kind_str = parts.next().unwrap_or("").trim();
+        let table_name = parts.next().unwrap_or("").trim().to_owned();
+        let config_json = parts.next().unwrap_or("{}").trim();
+
+        if kind_str.is_empty() || table_name.is_empty() {
+            return Err(ExecutorError::InvalidAssignment {
+                message: format!(
+                    "registry-connector partition '{}' must have the form \
+                     registry-connector:<kind>:<table>:<config_json>",
+                    partition.partition_id()
+                ),
+            });
+        }
+
+        let props: std::collections::HashMap<String, String> =
+            serde_json::from_str(config_json).map_err(|e| ExecutorError::InvalidAssignment {
+                message: format!(
+                    "registry-connector partition '{}': invalid config JSON '{config_json}': {e}",
+                    partition.partition_id()
+                ),
+            })?;
+        let mut connector_config = ConnectorConfig::new(kind_str, kind_str);
+        for (k, v) in props {
+            connector_config = connector_config.with_property(k, v);
+        }
+
+        let mut source = registry
+            .open_source(&connector_config)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!(
+                    "registry-connector open failed for kind '{kind_str}' \
+                     (partition '{}'): {e}",
+                    partition.partition_id()
+                ),
+            })?;
+
+        let mut batches = Vec::new();
+        while let Some(batch) = source
+            .read_batch_dyn()
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("registry-connector read failed for kind '{kind_str}': {e}"),
+            })?
         {
             batches.push(batch);
         }

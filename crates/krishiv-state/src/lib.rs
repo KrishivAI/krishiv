@@ -22,6 +22,9 @@ pub mod savepoint;
 
 pub mod incremental_trace;
 
+/// T18: Flink-equivalent broadcast stream state.
+pub mod broadcast;
+
 // Named modules
 pub mod backend;
 pub mod error;
@@ -37,7 +40,8 @@ pub mod ttl;
 mod tests;
 
 // Re-export the full public API at crate root for source compatibility.
-pub use backend::StateBackend;
+pub use backend::{InMemoryStateBackend, StateBackend};
+pub use broadcast::{BroadcastBackend, BroadcastState, BroadcastStateDescriptor};
 pub use checkpoint::rescaling::{
     EntryRouting, KeyGroupRescaler, RescaleChecksum, redistribute_snapshots, window_group_key,
 };

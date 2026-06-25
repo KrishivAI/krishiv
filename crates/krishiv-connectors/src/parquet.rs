@@ -10,9 +10,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 
 use crate::{
-    CheckpointSource, ConnectorCapabilities, ConnectorError, ConnectorResult, ParquetOffset, Sink,
-    Source,
+    CheckpointSource, ConnectorCapabilities, ConnectorError, ConnectorResult, MultiFileOffset,
+    ParquetOffset, Sink, Source,
 };
+use crate::partition::{discover_hive_partitions, inject_partition_columns, list_parquet_files};
 
 // ---------------------------------------------------------------------------
 // ParquetSource
@@ -271,6 +272,207 @@ impl CheckpointSource for ParquetSource {
         let reader = self.reader_skipped_to(offset.batch_index)?;
         self.cursor = offset.batch_index;
         self.reader = Some(reader);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ParquetDirectorySource
+// ---------------------------------------------------------------------------
+
+/// A bounded, rewindable source that streams batches from all `.parquet` files
+/// under a directory, in sorted file-name order.
+///
+/// If the directory follows the Hive partition convention
+/// (`root/year=2024/month=01/part-0.parquet`), each batch is automatically
+/// extended with the partition key columns as `Utf8` string fields.
+///
+/// Checkpointing uses [`MultiFileOffset`], which encodes `(file_index,
+/// batch_index_within_file)` so restores can skip directly to the right file
+/// and batch without re-reading the full dataset.
+pub struct ParquetDirectorySource {
+    root: PathBuf,
+    files: Vec<PathBuf>,
+    /// Index of the file currently being read (or about to be opened).
+    file_index: usize,
+    /// Batch cursor within the current file.
+    batch_index: usize,
+    current_reader: Option<ParquetRecordBatchReader>,
+}
+
+impl ParquetDirectorySource {
+    /// Open all `.parquet` files in `dir`.
+    ///
+    /// When `recursive` is `true` the entire sub-tree is scanned; otherwise
+    /// only the immediate children of `dir` are included.
+    pub fn open(dir: impl AsRef<Path>, recursive: bool) -> ConnectorResult<Self> {
+        let root = dir.as_ref().to_path_buf();
+        let files = list_parquet_files(&root, recursive)?;
+        Ok(Self {
+            root,
+            files,
+            file_index: 0,
+            batch_index: 0,
+            current_reader: None,
+        })
+    }
+
+    /// Number of files discovered under the root directory.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Root directory this source was opened from.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn open_reader_at(path: &Path) -> ConnectorResult<ParquetRecordBatchReader> {
+        let file = File::open(path).map_err(|e| {
+            ConnectorError::Parquet(format!("failed to open '{}': {e}", path.display()))
+        })?;
+        ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| {
+                ConnectorError::Parquet(format!(
+                    "failed to build reader for '{}': {e}",
+                    path.display()
+                ))
+            })?
+            .build()
+            .map_err(|e| {
+                ConnectorError::Parquet(format!(
+                    "failed to create batch reader for '{}': {e}",
+                    path.display()
+                ))
+            })
+    }
+
+    /// Open the reader for `file_index`, skipping `skip` batches.
+    fn reader_for_file_at(files: &[PathBuf], file_index: usize, skip: usize) -> ConnectorResult<ParquetRecordBatchReader> {
+        let path = &files[file_index];
+        let mut reader = Self::open_reader_at(path)?;
+        for seen in 0..skip {
+            match reader.next() {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    return Err(ConnectorError::Parquet(format!("error skipping batch: {e}")));
+                }
+                None => {
+                    return Err(ConnectorError::Offset {
+                        message: format!(
+                            "ParquetDirectorySource: offset {skip} past end (reached {seen}) in '{}'",
+                            path.display()
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(reader)
+    }
+
+    fn ensure_reader(&mut self) -> ConnectorResult<()> {
+        if self.current_reader.is_none() && self.file_index < self.files.len() {
+            self.current_reader = Some(Self::reader_for_file_at(
+                &self.files,
+                self.file_index,
+                self.batch_index,
+            )?);
+        }
+        Ok(())
+    }
+}
+
+impl Source for ParquetDirectorySource {
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new()
+            .with_bounded()
+            .with_rewindable()
+            .with_checkpoint()
+    }
+
+    async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+        loop {
+            if self.file_index >= self.files.len() {
+                return Ok(None);
+            }
+
+            self.ensure_reader()?;
+
+            let reader = match self.current_reader.as_mut() {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+
+            match reader.next() {
+                Some(Ok(batch)) => {
+                    self.batch_index = self.batch_index.saturating_add(1);
+                    let parts = discover_hive_partitions(&self.root, &self.files[self.file_index]);
+                    let batch = inject_partition_columns(batch, &parts)?;
+                    return Ok(Some(batch));
+                }
+                Some(Err(e)) => {
+                    return Err(ConnectorError::Parquet(format!(
+                        "error reading batch from '{}': {e}",
+                        self.files[self.file_index].display()
+                    )));
+                }
+                None => {
+                    // Current file exhausted — advance to next.
+                    self.current_reader = None;
+                    self.file_index = self.file_index.saturating_add(1);
+                    self.batch_index = 0;
+                }
+            }
+        }
+    }
+
+    fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+        Some(Box::new(MultiFileOffset {
+            file_index: self.file_index,
+            batch_index: self.batch_index,
+        }))
+    }
+
+    fn reset(&mut self) {
+        self.file_index = 0;
+        self.batch_index = 0;
+        self.current_reader = None;
+    }
+}
+
+impl CheckpointSource for ParquetDirectorySource {
+    type Offset = MultiFileOffset;
+
+    fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset> {
+        Ok(MultiFileOffset {
+            file_index: self.file_index,
+            batch_index: self.batch_index,
+        })
+    }
+
+    fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()> {
+        if offset.file_index > self.files.len() {
+            return Err(ConnectorError::Offset {
+                message: format!(
+                    "ParquetDirectorySource restore: file_index {} out of range (have {} files)",
+                    offset.file_index,
+                    self.files.len()
+                ),
+            });
+        }
+        // Pre-open and position the reader eagerly to validate the offset.
+        let reader = if offset.file_index < self.files.len() {
+            Some(Self::reader_for_file_at(
+                &self.files,
+                offset.file_index,
+                offset.batch_index,
+            )?)
+        } else {
+            None
+        };
+        self.file_index = offset.file_index;
+        self.batch_index = offset.batch_index;
+        self.current_reader = reader;
         Ok(())
     }
 }

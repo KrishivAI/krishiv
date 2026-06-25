@@ -60,6 +60,7 @@ pub mod cep;
 pub mod connected_streams;
 pub mod continuous;
 pub mod dedup_operator;
+pub mod group_state;
 pub mod interval_join;
 pub mod join;
 pub mod live_table;
@@ -74,6 +75,7 @@ pub mod state_descriptor;
 pub mod temporal_join;
 #[cfg(test)]
 mod watermark_e2e;
+pub mod watermark_join;
 pub mod watermark_util;
 pub mod window;
 
@@ -96,7 +98,9 @@ pub use queue::{
     OperatorMessage, OperatorQueueError, OperatorQueueMetrics, OperatorQueueReceiver,
     OperatorQueueSender, operator_queue,
 };
+pub use group_state::{GroupState, GroupStateExecutor, GroupStateFn};
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
+pub use watermark_join::{WatermarkWindowJoinOperator, WatermarkWindowJoinSpec};
 pub use state_descriptor::{
     ListState, MapState, ReducingState, StateError, StateValue, ValueState,
 };

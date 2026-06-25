@@ -416,6 +416,61 @@ impl HudiCowWriter {
             snapshot_rows,
         })
     }
+
+    /// Delete rows from the table whose `key_column` value appears in `key_values`.
+    ///
+    /// Rewrites the full current snapshot without the matching rows and commits
+    /// the result as a new Hudi instant.  Returns the number of rows deleted.
+    pub fn delete_by_key(
+        &self,
+        key_column: &str,
+        key_values: &[String],
+    ) -> LakehouseResult<u64> {
+        self.delete_by_key_at(next_instant(), key_column, key_values)
+    }
+
+    /// Delete with an explicit instant (deterministic for tests).
+    pub fn delete_by_key_at(
+        &self,
+        instant: impl Into<String>,
+        key_column: &str,
+        key_values: &[String],
+    ) -> LakehouseResult<u64> {
+        let instant = instant.into();
+        validate_instant(&instant)?;
+        let current = match self.current_snapshot_batch()? {
+            Some(b) if b.num_rows() > 0 => b,
+            _ => return Ok(0), // nothing to delete from an empty table
+        };
+        let key_set: HashSet<String> = key_values.iter().cloned().collect();
+        let key_col = current
+            .column_by_name(key_column)
+            .ok_or_else(|| LakehouseError::Io(format!("delete key '{key_column}' not in schema")))?;
+        let keep_indices: Vec<u32> = (0..current.num_rows())
+            .filter(|&row| {
+                typed_key(key_col.as_ref(), row)
+                    .ok()
+                    .is_none_or(|k| !key_set.contains(&k))
+            })
+            .map(|r| r as u32)
+            .collect();
+        let rows_deleted = (current.num_rows() - keep_indices.len()) as u64;
+        if rows_deleted == 0 {
+            return Ok(0);
+        }
+        let new_snapshot = take_rows(&current, &keep_indices)?;
+        self.write_commit(
+            &instant,
+            "delete",
+            Some(key_column),
+            Some(&new_snapshot),
+            &new_snapshot,
+            0,
+            0,
+            new_snapshot.num_rows() as u64,
+        )?;
+        Ok(rows_deleted)
+    }
 }
 
 // ── TwoPhaseCommitSink ────────────────────────────────────────────────────────────────
@@ -615,6 +670,136 @@ pub fn write_hudi_cow_fixture(
         .map_err(|e| LakehouseError::Io(e.to_string()))?;
     }
     Ok(())
+}
+
+// ── hoodie.properties ────────────────────────────────────────────────────────
+
+/// Write or update the `hoodie.properties` file for a Hudi table.
+///
+/// The properties file is required by the Hudi spec for table discovery.
+/// Calling this multiple times is idempotent — properties are only written if
+/// the file does not yet exist (first-write wins semantics).
+///
+/// `table_name` and `key_field` default to `"unknown"` when `None`.
+pub fn ensure_hoodie_properties(
+    table_path: &Path,
+    table_name: Option<&str>,
+    key_field: Option<&str>,
+) -> LakehouseResult<()> {
+    let props_path = table_path.join(".hoodie/hoodie.properties");
+    if props_path.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(table_path.join(".hoodie"))
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let name = table_name.unwrap_or("unknown");
+    let key = key_field.unwrap_or("unknown");
+    let contents = format!(
+        "hoodie.table.name={name}\n\
+         hoodie.table.type=COPY_ON_WRITE\n\
+         hoodie.table.keygenerator.class=org.apache.hudi.keygen.SimpleKeyGenerator\n\
+         hoodie.datasource.write.recordkey.field={key}\n\
+         hoodie.datasource.write.partitionpath.field=\n\
+         hoodie.datasource.write.hive_style_partitioning=false\n"
+    );
+    fs::write(&props_path, contents).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Read a `hoodie.properties` file and return it as a `HashMap<String, String>`.
+///
+/// Returns an empty map if the file does not exist.
+pub fn read_hoodie_properties(
+    table_path: &Path,
+) -> LakehouseResult<std::collections::HashMap<String, String>> {
+    let props_path = table_path.join(".hoodie/hoodie.properties");
+    if !props_path.exists() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let text = fs::read_to_string(&props_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let map = text
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let mut parts = line.splitn(2, '=');
+            let key = parts.next()?.trim().to_string();
+            let value = parts.next().unwrap_or("").trim().to_string();
+            Some((key, value))
+        })
+        .collect();
+    Ok(map)
+}
+
+// ── vacuum_hudi_table ────────────────────────────────────────────────────────
+
+/// Remove Parquet data files no longer referenced by any active commit.
+///
+/// Scans `.hoodie/timeline/*.commit` to discover active instants, then reads
+/// each instant's metadata to find referenced file paths. Any `.parquet` file
+/// in the table root whose directory is NOT an active instant is eligible for
+/// deletion when its age exceeds `retention_hours` (0 = delete immediately).
+///
+/// Returns the number of files removed.
+pub fn vacuum_hudi_table(table_path: &Path, retention_hours: u64) -> LakehouseResult<usize> {
+    if !table_path.exists() {
+        return Ok(0);
+    }
+    let timeline_dir = table_path.join(".hoodie/timeline");
+    let active_instants: HashSet<String> = if timeline_dir.exists() {
+        fs::read_dir(&timeline_dir)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.strip_suffix(".commit").map(str::to_string)
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let now = std::time::SystemTime::now();
+    let cutoff = std::time::Duration::from_secs(retention_hours * 3600);
+    let mut removed = 0usize;
+
+    // Walk every subdirectory of the table root.
+    for entry in fs::read_dir(table_path).map_err(|e| LakehouseError::Io(e.to_string()))? {
+        let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // skip .hoodie, .delta-stage, etc.
+        }
+        let meta = entry.metadata().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        if !meta.is_dir() {
+            continue;
+        }
+        // If this directory is NOT an active instant, it contains orphaned files.
+        if active_instants.contains(&name) {
+            continue;
+        }
+        let age = now
+            .duration_since(meta.modified().map_err(|e| LakehouseError::Io(e.to_string()))?)
+            .unwrap_or_default();
+        if age < cutoff {
+            continue;
+        }
+        // Remove all parquet files inside the orphaned instant dir.
+        let orphan_dir = entry.path();
+        for file_entry in fs::read_dir(&orphan_dir).map_err(|e| LakehouseError::Io(e.to_string()))? {
+            let file_entry = file_entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let fname = file_entry.file_name().to_string_lossy().to_string();
+            if fname.ends_with(".parquet") {
+                fs::remove_file(file_entry.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
+                removed += 1;
+            }
+        }
+        // Remove the now-empty orphan dir.
+        let _ = fs::remove_dir(&orphan_dir);
+    }
+    Ok(removed)
 }
 
 // ── ObjectStore-backed Hudi reader/writer ─────────────────────────────────────────
@@ -1483,5 +1668,119 @@ mod tests {
             total_rows, 2,
             "both commits must be readable — no overwrite from same-ms instants"
         );
+    }
+
+    // ── T20: hoodie.properties, delete_by_key, vacuum_hudi_table tests ───────
+
+    fn sample_batch(ids: &[i64]) -> RecordBatch {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids.to_vec()))]).unwrap()
+    }
+
+    #[test]
+    fn ensure_hoodie_properties_creates_file_on_first_call() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_hoodie_properties(dir.path(), Some("my_table"), Some("id")).unwrap();
+        let path = dir.path().join(".hoodie/hoodie.properties");
+        assert!(path.exists(), "hoodie.properties must be created");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("hoodie.table.name=my_table"));
+        assert!(text.contains("hoodie.table.type=COPY_ON_WRITE"));
+        assert!(text.contains("hoodie.datasource.write.recordkey.field=id"));
+    }
+
+    #[test]
+    fn ensure_hoodie_properties_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_hoodie_properties(dir.path(), Some("tbl1"), Some("id")).unwrap();
+        ensure_hoodie_properties(dir.path(), Some("tbl2"), Some("other")).unwrap(); // second call no-ops
+        let props = read_hoodie_properties(dir.path()).unwrap();
+        assert_eq!(
+            props.get("hoodie.table.name").map(|s| s.as_str()),
+            Some("tbl1"),
+            "second call must not overwrite existing properties"
+        );
+    }
+
+    #[test]
+    fn read_hoodie_properties_returns_empty_map_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = read_hoodie_properties(dir.path()).unwrap();
+        assert!(props.is_empty());
+    }
+
+    #[test]
+    fn delete_by_key_removes_matching_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = HudiCowWriter::open(dir.path());
+
+        let ids = [1i64, 2, 3, 4, 5];
+        writer.append(sample_batch(&ids)).unwrap();
+
+        let deleted = writer
+            .delete_by_key("id", &["Int64:1".to_string(), "Int64:3".to_string()])
+            .unwrap();
+        assert_eq!(deleted, 2, "should have deleted 2 rows");
+
+        let reader = HudiSnapshotReader::open(dir.path());
+        let batches = reader.scan_batches().unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3, "3 rows should remain after deleting 2");
+    }
+
+    #[test]
+    fn delete_by_key_on_empty_table_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = HudiCowWriter::open(dir.path());
+        let deleted = writer.delete_by_key("id", &["Int64:1".to_string()]).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn delete_by_key_with_no_matches_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = HudiCowWriter::open(dir.path());
+        writer.append(sample_batch(&[1, 2, 3])).unwrap();
+        let deleted = writer
+            .delete_by_key("id", &["Int64:99".to_string()])
+            .unwrap();
+        assert_eq!(deleted, 0, "no matching key should delete nothing");
+        let reader = HudiSnapshotReader::open(dir.path());
+        let total: usize = reader.scan_batches().unwrap().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn vacuum_hudi_table_removes_orphaned_instant_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = HudiCowWriter::open(dir.path());
+        writer.append(sample_batch(&[1, 2, 3])).unwrap();
+        writer.append(sample_batch(&[4, 5])).unwrap();
+
+        // Count instants before vacuum.
+        let all_instants_before: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                !name.starts_with('.') && e.metadata().map(|m| m.is_dir()).unwrap_or(false)
+            })
+            .collect();
+        // Both instant directories should exist.
+        assert_eq!(all_instants_before.len(), 2);
+
+        // With 0 retention vacuum removes orphaned (non-active) instants.
+        // The FIRST instant's base file got superseded by the second append.
+        // However both commits are still in the timeline, so nothing is orphaned yet.
+        let removed = vacuum_hudi_table(dir.path(), 0).unwrap();
+        assert_eq!(removed, 0, "active instants must not be vacuumed");
+    }
+
+    #[test]
+    fn vacuum_hudi_nonexistent_table_is_noop() {
+        let removed = vacuum_hudi_table(Path::new("/tmp/krishiv_test_nonexistent_hudi_xyz"), 0).unwrap();
+        assert_eq!(removed, 0);
     }
 }

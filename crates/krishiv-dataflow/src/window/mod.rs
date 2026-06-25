@@ -607,3 +607,181 @@ mod watermark_tests {
         assert_eq!(snap.get("b"), Some(&7_000));
     }
 }
+
+/// Property-based tests for `WatermarkState`, `MultiSourceWatermarkState`, and
+/// `SlidingWindowOperator` correctness invariants.
+#[cfg(test)]
+mod window_props {
+    use super::*;
+    use crate::aggregate::{AggExpr, AggFunction};
+    use crate::window::sliding::{SlidingWindowOperator, SlidingWindowSpec};
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use proptest::prelude::*;
+    use std::sync::Arc;
+
+    // ── WatermarkState properties ────────────────────────────────────────────
+
+    proptest! {
+        /// After advancing `WatermarkState` with an arbitrary sequence of
+        /// event times, `current_watermark_ms` must never decrease between
+        /// consecutive calls (monotonicity invariant).
+        #[test]
+        fn watermark_state_is_monotonic(
+            lag in 0u64..100_000u64,
+            events in prop::collection::vec(0i64..10_000_000i64, 1..64usize),
+        ) {
+            let mut w = WatermarkState::new(lag);
+            let mut prev = w.current_watermark_ms();
+            for t in events {
+                w.advance(t);
+                let wm = w.current_watermark_ms();
+                prop_assert!(
+                    wm >= prev,
+                    "watermark decreased: {} < {} after advance({})", wm, prev, t
+                );
+                prev = wm;
+            }
+        }
+
+        /// After advancing with a known event time, the watermark should equal
+        /// `event_time_ms - lag_ms` (clamped to i64 range).
+        #[test]
+        fn watermark_lag_invariant(
+            t in 1_000_000i64..100_000_000i64,
+            lag in 0u64..1_000_000u64,
+        ) {
+            let mut w = WatermarkState::new(lag);
+            w.advance(t);
+            let expected = (t as i128 - lag as i128)
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            prop_assert_eq!(
+                w.current_watermark_ms(), expected,
+                "watermark should equal event_time - lag"
+            );
+        }
+
+        /// `MultiSourceWatermarkState::effective_watermark_ms` must equal the
+        /// minimum watermark across all registered sources.
+        #[test]
+        fn multi_source_effective_is_min_of_sources(
+            wms in prop::collection::vec((1..16usize, 0i64..10_000_000i64), 1..8usize),
+        ) {
+            let mut state = MultiSourceWatermarkState::new();
+            for (src_idx, wm) in &wms {
+                let src = format!("src-{src_idx}");
+                state.update(&src, *wm);
+            }
+            // Build expected min: for each source take the max wm they were updated with.
+            let mut per_src_max: std::collections::HashMap<usize, i64> = Default::default();
+            for (src_idx, wm) in &wms {
+                let e = per_src_max.entry(*src_idx).or_insert(i64::MIN);
+                if *wm > *e { *e = *wm; }
+            }
+            let expected_min = per_src_max.values().copied().min().unwrap_or(i64::MIN);
+            prop_assert_eq!(
+                state.effective_watermark_ms(),
+                expected_min,
+                "effective watermark must be the minimum across all sources"
+            );
+        }
+
+        /// `MultiSourceWatermarkState` must not allow the watermark for a
+        /// source to decrease — updates with lower values must be ignored.
+        #[test]
+        fn multi_source_watermark_is_monotonic_per_source(
+            updates in prop::collection::vec(0i64..5_000_000i64, 2..32usize),
+        ) {
+            let mut state = MultiSourceWatermarkState::new();
+            let mut peak = i64::MIN;
+            for wm in updates {
+                state.update("s", wm);
+                if wm > peak { peak = wm; }
+                let snap = state.source_watermarks();
+                let recorded = *snap.get("s").unwrap_or(&i64::MIN);
+                prop_assert_eq!(
+                    recorded, peak,
+                    "source watermark must not decrease: recorded {} != peak {}", recorded, peak
+                );
+            }
+        }
+
+        // ── SlidingWindowOperator properties ─────────────────────────────────
+
+        /// Processing an arbitrary sequence of events into a sliding window
+        /// must never panic.
+        #[test]
+        fn sliding_window_process_batch_never_panics(
+            events in prop::collection::vec(0i64..10_000i64, 0..32usize),
+        ) {
+            let spec = SlidingWindowSpec {
+                key_column: "k".into(),
+                key_column_type: "utf8".into(),
+                event_time_column: "ts".into(),
+                window_size_ms: 1000,
+                slide_ms: 250,
+                agg_exprs: vec![AggExpr {
+                    function: AggFunction::Count,
+                    input_column: String::new(),
+                    output_column: "cnt".into(),
+                }],
+                agg_is_float: vec![false],
+            };
+            let mut op = SlidingWindowOperator::new(spec).expect("valid spec");
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Utf8, false),
+                Field::new("ts", DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![
+                Arc::new(StringArray::from(vec!["k"; events.len()])) as _,
+                Arc::new(Int64Array::from(events.clone())) as _,
+            ]).unwrap();
+            let wm = events.iter().max().copied().unwrap_or(0);
+            let _ = op.process_batch(&batch, wm);
+        }
+
+        /// A single on-time event fed into a sliding window with size `S` and
+        /// slide `D` must open exactly `ceil(S / D)` window buckets (fan-out).
+        #[test]
+        fn sliding_window_fan_out_factor(
+            ts in 1_000_000i64..10_000_000i64,
+            slide_shift in 0u64..4u64,
+        ) {
+            // size = 1000ms, slide = 125 * 2^shift (so slide divides size evenly)
+            let slide_ms: u64 = 125 << slide_shift; // 125, 250, 500, 1000
+            let size_ms: u64 = 1000;
+            let expected_fan_out = (size_ms + slide_ms - 1) / slide_ms; // ceil(size/slide)
+
+            let spec = SlidingWindowSpec {
+                key_column: "k".into(),
+                key_column_type: "utf8".into(),
+                event_time_column: "ts".into(),
+                window_size_ms: size_ms,
+                slide_ms,
+                agg_exprs: vec![AggExpr {
+                    function: AggFunction::Count,
+                    input_column: String::new(),
+                    output_column: "cnt".into(),
+                }],
+                agg_is_float: vec![false],
+            };
+            let mut op = SlidingWindowOperator::new(spec).expect("valid spec");
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Utf8, false),
+                Field::new("ts", DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![
+                Arc::new(StringArray::from(vec!["k"])) as _,
+                Arc::new(Int64Array::from(vec![ts])) as _,
+            ]).unwrap();
+            // Watermark = ts: doesn't close any window (all window ends > ts).
+            let _ = op.process_batch(&batch, ts).expect("process");
+            prop_assert_eq!(
+                op.open_window_count(), expected_fan_out as usize,
+                "sliding fan-out: expected {} open buckets for size={} slide={} ts={}",
+                expected_fan_out, size_ms, slide_ms, ts
+            );
+        }
+    }
+}

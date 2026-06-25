@@ -45,7 +45,7 @@ pub use ids::{
 pub use io::{
     ConnectorCapabilityFlags, ResourceProfile, ShuffleReadConfig, ShuffleWriteConfig, TaskSpec,
 };
-pub use job::{JobSpec, StageSpec};
+pub use job::{JobSpec, StageKind, StageSpec};
 pub use lifecycle::{CoordinatorState, ExecutorState, JobKind, JobState, StageState, TaskState};
 pub use management::CoordinatorManagementService;
 pub use management::{

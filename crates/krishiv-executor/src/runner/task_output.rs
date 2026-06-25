@@ -426,12 +426,17 @@ pub struct ShuffleContext {
     pub store: std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
     pub local_dir: PathBuf,
     pub flight_endpoint: String,
+    /// When the External Shuffle Service is running in-process, sort-shuffle
+    /// writers register their output here so the ESS HTTP server can serve
+    /// partition-level range reads without a separate registration RPC.
+    pub ess_index: Option<krishiv_shuffle::SortShuffleIndex>,
 }
 
 impl fmt::Debug for ShuffleContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ShuffleContext")
             .field("flight_endpoint", &self.flight_endpoint)
+            .field("has_ess_index", &self.ess_index.is_some())
             .finish()
     }
 }

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use krishiv_proto::{
     ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, LeaseGeneration, TaskId,
+    ResourceProfile,
 };
 
 use crate::job::ExecutorPlacement;
@@ -259,6 +260,28 @@ impl ExecutorRegistry {
     }
 
     fn is_schedulable(&self, executor: &ExecutorRecord) -> bool {
+        self.is_schedulable_for_profile(executor, None)
+    }
+
+    /// Returns `true` when `executor` is schedulable AND satisfies the given
+    /// SC10 resource profile requirements.
+    ///
+    /// Memory check: if `profile.task_memory_bytes > 0` and the executor
+    /// reports both `memory_limit_bytes` and `memory_used_bytes` in its last
+    /// heartbeat, the executor is only considered eligible when
+    /// `available_memory >= task_memory_bytes`.  When the executor has not
+    /// reported memory capacity (common in unit tests and bare-metal deploys
+    /// without the health shim), the check is skipped so assignments still
+    /// proceed.
+    ///
+    /// CPU check (future): `task_cpus` is stored on the profile but not yet
+    /// used for placement filtering; it is reserved for a follow-up that adds
+    /// per-slot CPU accounting.
+    fn is_schedulable_for_profile(
+        &self,
+        executor: &ExecutorRecord,
+        profile: Option<&ResourceProfile>,
+    ) -> bool {
         if !executor.state().can_accept_work() || executor.descriptor().slots() == 0 {
             return false;
         }
@@ -269,7 +292,52 @@ impl ExecutorRegistry {
         {
             return false;
         }
+        // SC10: per-task memory requirement check.
+        if let Some(p) = profile {
+            if p.task_memory_bytes > 0 {
+                if let Some(snapshot) = &executor.health_snapshot {
+                    if let (Some(limit), Some(used)) =
+                        (snapshot.memory_limit_bytes, snapshot.memory_used_bytes)
+                    {
+                        let available = limit.saturating_sub(used);
+                        if available < p.task_memory_bytes {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
         true
+    }
+
+    /// SC10: return placements filtered by `resource_profile`.
+    ///
+    /// When `profile` is `None` this is identical to
+    /// [`schedulable_executor_placements`].
+    pub(crate) fn schedulable_placements_for_profile(
+        &self,
+        profile: Option<&ResourceProfile>,
+    ) -> Vec<ExecutorPlacement> {
+        let mut placements: Vec<_> = self
+            .executors
+            .values()
+            .filter(|executor| self.is_schedulable_for_profile(executor, profile))
+            .map(|executor| {
+                let active_tasks = executor
+                    .health_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.active_task_count)
+                    .map(|c| c as usize)
+                    .unwrap_or_else(|| executor.running_tasks.len());
+                ExecutorPlacement::new(
+                    executor.executor_id().clone(),
+                    executor.descriptor().slots(),
+                    active_tasks,
+                )
+            })
+            .collect();
+        placements.sort_by(|a, b| a.executor_id.as_str().cmp(b.executor_id.as_str()));
+        placements
     }
 
     /// Sum of available memory across schedulable executors that report

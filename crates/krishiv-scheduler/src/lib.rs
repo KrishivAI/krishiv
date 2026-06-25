@@ -76,7 +76,10 @@ pub use bounded_window::execute_bounded_window_coordinated;
 pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use config::{CoordinatorConfig, JobSubmitter, TlsConfig};
-pub use coordinator::{Coordinator, OrchestratorHandles, RestoreDirective, SharedCoordinator};
+pub use coordinator::{
+    Coordinator, OrchestratorHandles, RestoreDirective, SharedCoordinator, SpeculativeWork,
+    StallCancelWork,
+};
 pub use coordinator_daemon::{
     CoordinatorDaemonConfig, CoordinatorSidecarFn, JobCoordinatorDaemonConfig,
     build_leader_election, build_shared_coordinator, coordinator_daemon_help,

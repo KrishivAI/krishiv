@@ -911,6 +911,12 @@ pub struct TaskRecord {
     /// when no progress has been reported. Used by stall detection so that
     /// long-running tasks that are actively making progress are not killed.
     pub(crate) last_progress_ms: Option<u64>,
+    /// Wall-clock duration in ms from task assignment to successful completion.
+    /// Set when the task transitions to `Succeeded`; `None` otherwise.
+    /// Used by speculative execution to compute the median completed task
+    /// duration for a stage without requiring `assigned_at_ms` (which is
+    /// cleared on task completion).
+    pub(crate) completed_duration_ms: Option<u64>,
 }
 
 impl TaskRecord {
@@ -929,6 +935,7 @@ impl TaskRecord {
             last_source_offset: None,
             assigned_at_ms: None,
             last_progress_ms: None,
+            completed_duration_ms: None,
         }
     }
 
@@ -1062,6 +1069,14 @@ impl TaskRecord {
             let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
             self.assigned_at_ms = Some(now_ms);
             self.last_progress_ms = Some(now_ms);
+        } else if self.state == TaskState::Succeeded {
+            let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+            // Capture the wall-clock duration so speculative execution can
+            // compute the median completed task time for this stage without
+            // needing assigned_at_ms (which is cleared below).
+            self.completed_duration_ms = self.assigned_at_ms.map(|s| now_ms.saturating_sub(s));
+            self.assigned_at_ms = None;
+            self.last_progress_ms = None;
         } else if self.state.is_terminal() {
             self.assigned_at_ms = None;
             self.last_progress_ms = None;

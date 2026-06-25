@@ -1,5 +1,106 @@
 # Krishiv Implementation Status
 
+## 2026-06-25 — Spark/Flink parity gap batch 5 (tasks #13–#14)
+
+### Tasks completed
+
+| Task | Feature | Files changed |
+|------|---------|---------------|
+| #13 ST8 | `WatermarkWindowJoinOperator`: stream-to-stream join with watermark-bounded state | `krishiv-dataflow/src/watermark_join.rs` (new), `lib.rs` |
+| #14 K | `GroupStateFn` / `GroupStateExecutor`: `mapGroupsWithState` API | `krishiv-dataflow/src/group_state.rs` (new), `lib.rs` |
+
+### Details
+- **#13**: `WatermarkWindowJoinOperator` wraps the existing `PerKeyIntervalJoin` to expose a batch-level API (`process_left`, `process_right`, `advance_watermark`). Events within `±window_ms` of each other (per key) are matched; state older than `watermark − window_ms` is evicted on each `advance_watermark` call. Matched pairs returned as joined `RecordBatch` (left cols ∥ right cols).
+- **#14**: `GroupStateFn<S>` trait is called **once per group per micro-batch** (all rows for a key at once) — matching Spark's `mapGroupsWithState` semantics vs `ProcessFunction` which fires per-row. `GroupState<S>` provides `update`, `remove_state`, and `set_timeout_ms`. `GroupStateExecutor` groups rows by key, calls `on_group`, and drives timeout expiry via `fire_timeouts(watermark_ms)`.
+
+### Validation
+```
+cargo test -p krishiv-dataflow --lib watermark_join   10 passed
+cargo test -p krishiv-dataflow --lib group_state       9 passed
+cargo clippy -p krishiv-dataflow                       0 errors
+```
+
+### Next useful task
+All 24 Spark/Flink parity gap tasks complete.
+
+---
+
+## 2026-06-25 — Task #21: wire fuzz tests
+
+### Tasks completed
+
+| Task | Feature | Files changed |
+|------|---------|---------------|
+| #21 | proptest "never panics" for all 17 `*_from_wire` functions | `krishiv-proto/src/tests.rs` |
+
+### Details
+- Expanded `wire_fuzz` module with 17 proptest tests (16 inside `proptest!` + 1 plain `#[test]`).
+- Plain test required because `proptest!` macro requires ≥1 strategy argument — zero-arg tests live outside.
+- Corrected struct field names by reading actual `*_to_wire` function bodies rather than guessing.
+- Key fields fixed: `cpu_cores_used f32→f64`, added `streaming_task_states` / `trace_parent` / `trace_state` to heartbeat, replaced incorrect `fencing_token`/`watermark_ms` in task assignment, fixed streaming I/O field names (`ipc_bytes`, `task_id`), fixed savepoint fields (`label`/`stop`), fixed restore fields (`epoch`/`storage_path`/`from_savepoint`).
+
+### Validation
+```
+cargo test -p krishiv-proto --lib               80 passed (63 pre-existing + 17 new)
+```
+
+### Next useful task
+Task #22: Property-based tests for window aggregation correctness.
+
+---
+
+## 2026-06-25 — Spark/Flink parity gap batch 3 (tasks #15–#18)
+
+### Tasks completed
+
+| Task | Feature | Files changed |
+|------|---------|---------------|
+| #15 SC11 | Cascade circuit breaker: ring-buffer trip + cooldown | `scheduler/src/config.rs`, `coordinator/mod.rs`, `executor_ops.rs`, `task_assignment.rs` |
+| #16 SC10 | `ResourceProfile` per-stage memory/CPU placement filter | `krishiv-proto/src/job.rs`, `scheduler/src/heartbeat.rs`, `task_assignment.rs` |
+| #17 T9 | JDBC source/sink (Postgres, LIMIT/OFFSET + INSERT) | `krishiv-connectors/src/jdbc.rs` (new), `registry/drivers/jdbc.rs` (new) |
+| #18 | Broadcast state: Flink `BroadcastStream` equivalent | `krishiv-state/src/broadcast.rs` (new), `backend.rs` (+`InMemoryStateBackend`) |
+| #19 | Delta Lake hardening: schema enforcement, stats, protocol/metaData, vacuum, timestamp time travel | `local_delta.rs` |
+| #20 | Hudi: `delete_by_key`, `hoodie.properties`, `vacuum_hudi_table` | `hudi.rs` |
+
+### Validation
+```
+cargo check --workspace                                     ✓
+cargo check -p krishiv-connectors --features jdbc           ✓
+cargo test -p krishiv-scheduler --lib placement -- 4 new tests pass
+cargo test -p krishiv-connectors --features jdbc --lib jdbc  4 tests pass
+cargo test -p krishiv-state --lib broadcast                 11 tests pass
+```
+
+### Next useful task
+Task #19: Delta Lake hardening — see `crates/krishiv-connectors/src/lakehouse/` (`delta.rs` / `DeltaStore`).
+
+---
+
+## 2026-06-25 — Spark/Flink parity gap batch 2 (tasks #4–#9)
+
+Continued 24-task Spark/Flink parity gap implementation.  Completed tasks #4–#9 in this session.
+
+| Task | Feature | Files changed |
+|------|---------|---------------|
+| #4 SC1 | `StageKind::ShuffleMap / Result` | `krishiv-proto/src/job.rs`, `scheduler/src/job/scheduler.rs`, `coordinator/job_lifecycle.rs` |
+| #5 T11 | `SortShuffleWriter` — sort + Arrow IPC + index file | `krishiv-shuffle/src/sort_shuffle_writer.rs` (new) |
+| #6 T10 | External Shuffle Service daemon + `SortShuffleIndex` | `krishiv-shuffle/src/shuffle_svc.rs`, `executor/src/fragment/batch.rs` |
+| #7 AQE | Real per-partition IPC byte sizes → AQE optimizer | same `batch.rs` + T11 index reads |
+| #8 | Speculative execution: straggler preemption | `scheduler/src/config.rs`, `coordinator/mod.rs`, `job/record.rs` |
+| #9 SC14 | `KubernetesClusterManager` — k8s dynamic allocation | `krishiv-operator/src/cluster_manager.rs` (new) |
+
+### Validation
+```
+cargo check --workspace              ✓
+cargo test -p krishiv-scheduler --lib  360 passed (2 pre-existing failures unrelated)
+cargo test -p krishiv-operator --features k8s  all pass
+```
+
+### Next useful task
+Task #10 SH7: UnifiedMemoryManager across shuffle/execution/state — see `crates/krishiv-shuffle/src/spillable.rs` as starting point.
+
+---
+
 ## 2026-06-24 — Bug fixes: CLI multi-statement + timeout, Python register_dataframe, session_window alias, Dockerfile.fast, justfile build-fast-k8s, stale executor recovery
 
 Fixed seven issues identified during k8s testing:

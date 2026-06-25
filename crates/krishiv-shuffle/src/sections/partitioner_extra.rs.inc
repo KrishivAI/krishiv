@@ -295,6 +295,8 @@ async fn http_shuffle_svc_token_auth_enforced() {
     let state = crate::shuffle_svc::ShuffleSvcState {
         store,
         token: Some("secure-api-key".to_owned()),
+        ess_index: crate::shuffle_svc::SortShuffleIndex::new(),
+        push_store: crate::push_shuffle::PushShuffleStore::new(),
     };
     let app = axum::Router::new()
         .route(

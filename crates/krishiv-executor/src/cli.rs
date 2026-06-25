@@ -526,6 +526,7 @@ async fn heartbeat_loop(
                         store: Arc::clone(&backend),
                         local_dir,
                         flight_endpoint: endpoint,
+                        ess_index: None,
                     })
                     .with_inmem_shuffle(backend);
             }
@@ -535,6 +536,7 @@ async fn heartbeat_loop(
                         store: Arc::clone(&backend),
                         local_dir: shuffle_dir.clone().unwrap_or_default(),
                         flight_endpoint: String::new(),
+                        ess_index: None,
                     })
                     .with_inmem_shuffle(backend);
             }
@@ -559,6 +561,7 @@ async fn heartbeat_loop(
             store: Arc::new(krishiv_shuffle::ShuffleBackend::Local(disk)),
             local_dir: dir.clone(),
             flight_endpoint: endpoint,
+            ess_index: None,
         });
     }
     if krishiv_common::allows_unbounded_shuffle_store(durability_profile) {

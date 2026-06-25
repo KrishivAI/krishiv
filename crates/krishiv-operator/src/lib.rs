@@ -4,6 +4,8 @@
 
 pub mod constants;
 #[cfg(feature = "k8s")]
+pub mod cluster_manager;
+#[cfg(feature = "k8s")]
 pub mod controller;
 pub mod crd;
 #[cfg(feature = "k8s")]
@@ -24,6 +26,8 @@ pub mod webhook;
 mod tests;
 
 pub use constants::{API_GROUP, API_VERSION, EXECUTOR_ID_LABEL, FIELD_MANAGER, FINALIZER, KIND};
+#[cfg(feature = "k8s")]
+pub use cluster_manager::{KubernetesClusterManager, KubernetesClusterManagerConfig};
 #[cfg(feature = "k8s")]
 pub use controller::{
     KubernetesControllerConfig, KubernetesControllerRuntime, KubernetesReconcileReport,

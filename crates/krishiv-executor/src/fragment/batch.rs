@@ -12,17 +12,22 @@ use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDesc
 
 use super::common::{
     build_hot_key_reports, parse_local_parquet_partitions, read_connector_parquet_partitions,
-    read_inline_ipc_partitions, read_object_parquet_partitions, read_shuffle_flight_partitions,
-    sql_query_from_fragment, task_fragment_body, write_object_parquet_sink_for_task,
+    read_inline_ipc_partitions, read_object_parquet_partitions, read_registry_partitions,
+    read_shuffle_flight_partitions, sql_query_from_fragment, task_fragment_body,
+    write_object_parquet_sink_for_task,
 };
 use crate::runner::{
     ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, SHUFFLE_WRITE_PREFIX,
 };
 
 /// Register all input partitions from an assignment onto a SQL engine.
+///
+/// When `registry` is supplied, `registry-connector:` partitions are also
+/// resolved through it (CO5 — pluggable connector path).
 async fn load_input_tables(
     engine: &Arc<krishiv_sql::SqlEngine>,
     assignment: &krishiv_proto::ExecutorTaskAssignment,
+    registry: Option<&krishiv_connectors::ConnectorRegistry>,
 ) -> crate::ExecutorResult<()> {
     for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
         engine
@@ -61,6 +66,18 @@ async fn load_input_tables(
             .map_err(|e| crate::ExecutorError::LocalExecution {
                 message: e.to_string(),
             })?;
+    }
+    if let Some(reg) = registry {
+        for (table_name, batches) in
+            read_registry_partitions(reg, assignment.input_partitions()).await?
+        {
+            engine
+                .register_record_batches(&table_name, batches)
+                .await
+                .map_err(|e| crate::ExecutorError::LocalExecution {
+                    message: e.to_string(),
+                })?;
+        }
     }
     Ok(())
 }
@@ -122,6 +139,7 @@ pub(crate) async fn execute_batch_fragment(
                 ctx,
                 udf_limits.clone(),
                 engine_memory_limit,
+                Some(runner.connector_registry.as_ref()),
             )
             .await;
         } else {
@@ -142,6 +160,7 @@ pub(crate) async fn execute_batch_fragment(
                 store,
                 udf_limits.clone(),
                 engine_memory_limit,
+                Some(runner.connector_registry.as_ref()),
             )
             .await;
         } else {
@@ -201,6 +220,17 @@ pub(crate) async fn execute_batch_fragment(
         }
         // InlineIpc: Arrow IPC bytes delivered in-band with the task assignment.
         for (table_name, batches) in read_inline_ipc_partitions(assignment.input_partitions())? {
+            engine
+                .register_record_batches(&table_name, batches)
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: error.to_string(),
+                })?;
+        }
+        // CO5: registry-driven connector partitions (e.g. parquet-directory, s3-prefix).
+        for (table_name, batches) in
+            read_registry_partitions(runner.connector_registry.as_ref(), assignment.input_partitions()).await?
+        {
             engine
                 .register_record_batches(&table_name, batches)
                 .await
@@ -352,6 +382,7 @@ async fn execute_shuffle_write_fragment(
     ctx: &crate::runner::ShuffleContext,
     udf_limits: ResourceLimits,
     engine_memory_limit: Option<usize>,
+    registry: Option<&krishiv_connectors::ConnectorRegistry>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
@@ -405,7 +436,7 @@ async fn execute_shuffle_write_fragment(
         krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
             .with_udf_limits(udf_limits),
     );
-    load_input_tables(&limited_engine, assignment).await?;
+    load_input_tables(&limited_engine, assignment, registry).await?;
 
     let dataframe = limited_engine
         .sql(query)
@@ -512,6 +543,47 @@ async fn execute_shuffle_write_fragment(
         ));
     }
 
+    // ESS wiring: when an ESS index is configured, also write the sorted
+    // partition files so the ESS HTTP server can serve range reads.
+    // AQE T7: update outputs with real on-disk byte sizes from the index file
+    // so the AQE CoalesceRule uses accurate partition sizes instead of
+    // in-memory Arrow buffer estimates (which ignore compression).
+    if let Some(ess_index) = &ctx.ess_index {
+        let mut sort_writer = krishiv_shuffle::SortShuffleWriter::new(
+            job_id,
+            stage_id,
+            key_column,
+            num_partitions,
+            &ctx.local_dir,
+        )
+        .map_err(|e| ExecutorError::LocalExecution {
+            message: format!("ESS sort-shuffle writer init failed: {e}"),
+        })?;
+        for batch in &batches {
+            sort_writer.push(batch.clone()).map_err(|e| ExecutorError::LocalExecution {
+                message: format!("ESS sort-shuffle push failed: {e}"),
+            })?;
+        }
+        let files = sort_writer.flush().map_err(|e| ExecutorError::LocalExecution {
+            message: format!("ESS sort-shuffle flush failed: {e}"),
+        })?;
+        // T7: patch `size_bytes` in outputs with the real on-disk IPC sizes.
+        if let Ok(offsets) = files.read_offsets() {
+            for (p, output_entry) in outputs.iter_mut().enumerate() {
+                if p + 1 < offsets.len() {
+                    let real_bytes = offsets[p + 1].saturating_sub(offsets[p]);
+                    let endpoint = output_entry.flight_endpoint.clone();
+                    *output_entry = krishiv_proto::ShufflePartitionOutput::new(
+                        p as u32,
+                        real_bytes,
+                        endpoint,
+                    );
+                }
+            }
+        }
+        ess_index.register(job_id, stage_id, files);
+    }
+
     // Track heavy hitters (hot keys) during this shuffle write.
     let hot_key_reports =
         build_hot_key_reports(&batches, key_column, assignment.job_id(), stage_id);
@@ -528,6 +600,7 @@ async fn execute_inmem_shuffle_write(
     store: &std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
     udf_limits: ResourceLimits,
     engine_memory_limit: Option<usize>,
+    registry: Option<&krishiv_connectors::ConnectorRegistry>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
@@ -538,7 +611,7 @@ async fn execute_inmem_shuffle_write(
             .with_udf_limits(udf_limits),
     );
     let batches = if let Some(query) = sql_query_from_fragment(&fragment_body) {
-        load_input_tables(&limited_engine, assignment).await?;
+        load_input_tables(&limited_engine, assignment, registry).await?;
         let dataframe =
             limited_engine
                 .sql(query)

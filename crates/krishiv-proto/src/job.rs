@@ -1,7 +1,7 @@
 //! Job specs.
 
 use crate::ids::*;
-use crate::io::TaskSpec;
+use crate::io::{ResourceProfile, TaskSpec};
 use crate::lifecycle::JobKind;
 
 /// Job submission contract.
@@ -141,11 +141,27 @@ impl JobSpec {
     }
 }
 
+/// Distinguishes shuffle-writing stages from terminal result stages.
+///
+/// `ShuffleMap` stages write hash-partitioned output to the shuffle store so
+/// downstream `Result` stages can fetch it.  The AQE optimizer fires only on
+/// completed `ShuffleMap` stages — `Result` stages consume the coalesce hint
+/// produced by their upstream map stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StageKind {
+    /// Stage writes output to the shuffle store (default).
+    #[default]
+    ShuffleMap,
+    /// Terminal stage that reads from the shuffle store and produces final output.
+    Result,
+}
+
 /// Stage contract inside a job.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StageSpec {
     stage_id: StageId,
     name: String,
+    kind: StageKind,
     tasks: Vec<TaskSpec>,
     /// Stage ids that must be fully Succeeded before this stage may launch.
     /// Empty means this stage has no upstream shuffle dependencies.
@@ -160,6 +176,10 @@ pub struct StageSpec {
     /// Per-task retries are preferred over whole-stage retries for large jobs
     /// because only the failed task is reset, not all tasks.
     max_task_attempts: u32,
+    /// SC10: per-stage resource profile.  All tasks in this stage request the
+    /// same CPU and memory allocation.  The placement layer uses this to skip
+    /// executors that cannot satisfy the requirement.
+    resource_profile: Option<ResourceProfile>,
 }
 
 impl StageSpec {
@@ -168,11 +188,25 @@ impl StageSpec {
         Self {
             stage_id,
             name: name.into(),
+            kind: StageKind::ShuffleMap,
             tasks: Vec::new(),
             upstream_stage_ids: Vec::new(),
             output_partition_count: None,
             max_task_attempts: 1, // default: no retries
+            resource_profile: None,
         }
+    }
+
+    /// Mark this stage as a terminal result stage (reads shuffle, produces final output).
+    #[must_use]
+    pub fn with_kind(mut self, kind: StageKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Whether this stage writes to the shuffle store or reads from it.
+    pub fn kind(&self) -> StageKind {
+        self.kind
     }
 
     /// Set the maximum number of per-task execution attempts.
@@ -188,6 +222,21 @@ impl StageSpec {
     /// Maximum per-task execution attempts configured for this stage.
     pub fn max_task_attempts(&self) -> u32 {
         self.max_task_attempts
+    }
+
+    /// SC10: Set the per-stage resource profile.
+    ///
+    /// All tasks in this stage will be placed only on executors that can
+    /// satisfy the stated CPU and memory requirements.
+    #[must_use]
+    pub fn with_resource_profile(mut self, profile: ResourceProfile) -> Self {
+        self.resource_profile = Some(profile);
+        self
+    }
+
+    /// SC10: per-stage resource profile, if one was declared.
+    pub fn resource_profile(&self) -> Option<&ResourceProfile> {
+        self.resource_profile.as_ref()
     }
 
     /// Attach a task.
