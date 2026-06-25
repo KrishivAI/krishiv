@@ -1,4 +1,5 @@
 import type { DocPage } from '../docs-data';
+import { DIAGRAM_CDC_ICEBERG } from './diagrams';
 
 export const recipesPages: DocPage[] = [
   {
@@ -719,11 +720,12 @@ JOIN users u FOR SYSTEM_TIME AS OF c.event_time
     feature_flags: ['iceberg', 'kafka'],
     body: `
 <p>The CDC router bridges a Debezium-style Kafka topic (the standard for MySQL, Postgres, MongoDB change streams) into an Iceberg table. The destination is updated with <code>MERGE</code> semantics keyed by the row's primary key, so inserts, updates, and deletes all land in the right place.</p>
+${DIAGRAM_CDC_ICEBERG}
 
 <h2 id="topology">Topology</h2>
 <pre><code class="language-text">MySQL  ──►  Debezium  ──►  Kafka (orders.cdc)  ──►  Krishiv CDC router  ──►  Iceberg (orders)
-                                                                                  │
-                                                                                  └─►  DLQ
+                                                                                   │
+                                                                                   └─►  DLQ
 </code></pre>
 
 <h2 id="setup">Step 1 — Iceberg target</h2>

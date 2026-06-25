@@ -1,4 +1,5 @@
 import type { DocPage } from '../docs-data';
+import { DIAGRAM_IVM_TICK, DIAGRAM_MERGE_INTO } from './diagrams';
 
 export const sqlPages: DocPage[] = [
   {
@@ -219,6 +220,7 @@ MATCH_RECOGNIZE (
 <h2 id="overview">Overview</h2>
 <p><code>MERGE INTO</code> applies upsert and conditional delete logic to an Iceberg table using copy-on-write semantics. The target table must be managed by a registered <code>KrishivCatalog</code> Iceberg catalog.</p>
 <div class="warn-box"><strong>Preview:</strong> Copy-on-write semantics are implemented. Merge-on-read and distributed atomic commit certification are ongoing.</div>
+${DIAGRAM_MERGE_INTO}
 
 <h2 id="syntax">Syntax</h2>
 <pre><code class="language-sql">MERGE INTO &lt;target_table&gt; [AS &lt;alias&gt;]
@@ -256,6 +258,7 @@ WHEN NOT MATCHED THEN INSERT (product_id, quantity) VALUES (src.product_id, src.
 <h2 id="overview">Overview</h2>
 <p>Incremental views maintain a query result that updates incrementally when source data changes, rather than re-running the full query on each tick. Implemented via <code>IncrementalFlow</code> backed by <code>DeltaBatch</code> (weighted Arrow rows).</p>
 <div class="warn-box"><strong>Experimental:</strong> End-to-end connector certification and distributed executor-side IVM are in progress.</div>
+${DIAGRAM_IVM_TICK}
 
 <h2 id="ddl">DDL Statements</h2>
 <table class="api-table">

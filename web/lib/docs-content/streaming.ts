@@ -1,4 +1,5 @@
 import type { DocPage } from '../docs-data';
+import { DIAGRAM_WINDOWS, DIAGRAM_JOINS } from './diagrams';
 
 export const streamingPages: DocPage[] = [
   {
@@ -62,6 +63,7 @@ export const streamingPages: DocPage[] = [
     status: 'Available',
     body: `
 <p>Krishiv supports the three standard window types. All are defined as part of the operator runtime in <code>krishiv-dataflow</code> and have SQL equivalents in <code>krishiv-sql</code> for the <code>GROUP BY</code> form.</p>
+${DIAGRAM_WINDOWS}
 
 <h2 id="window-types">Window types</h2>
 <table class="api-table">
@@ -143,6 +145,7 @@ async fn main() -&gt; Result&lt;()&gt; {
     status: 'Available',
     body: `
 <p>Streaming joins in Krishiv come in three flavors. Pick by what you need: a slowly-changing dimension table, two correlated event streams, or a batch lookup.</p>
+${DIAGRAM_JOINS}
 
 <h2 id="temporal-join">Stream-table temporal join (as-of)</h2>
 <p>Join a stream against a versioned table where each row of the table has a validity window. The engine picks the version of the dimension row that was current at the time of the stream event. This is the SQL <code>FOR SYSTEM_TIME AS OF</code> pattern.</p>

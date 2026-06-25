@@ -1,4 +1,5 @@
 import type { DocPage } from '../docs-data';
+import { DIAGRAM_DISTRIBUTED_TOPOLOGY, DIAGRAM_INCREMENTAL_FLOW, DIAGRAM_PIPELINE_BUILDER } from './diagrams';
 
 export const gettingStartedPages: DocPage[] = [
   {
@@ -668,6 +669,8 @@ maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features kafk
 <div class="warn-box"><strong>Preview:</strong> Distributed mode has the building blocks in place — Flight coordinator, executor gRPC, bearer-token auth, etcd metadata, object-store shuffle, fenced checkpoints. End-to-end certification work continues; verify your specific workload with the maintainers before relying on it for production.</div>
 
 <h2 id="topology">Topology</h2>
+${DIAGRAM_DISTRIBUTED_TOPOLOGY}
+<p>The ASCII tree below is the same topology in text form, useful for grepping logs:</p>
 <pre><code>Client (Python / Rust / SQL)
    │  Arrow Flight SQL
    ▼
@@ -733,6 +736,7 @@ Arrow / DataFusion operators, shuffle, state, sources, sinks
     status: 'Experimental',
     body: `
 <p>Where <a href="/docs/latest/sql/incremental-views">Incremental Views</a> are the SQL face of IVM, <code>IncrementalFlow</code> is the Rust face. It gives you programmatic control over sources, views, ticks, checkpoints, and watches. Use it when you need a custom tick trigger, a non-SQL source, or a watch that pushes deltas to another system.</p>
+${DIAGRAM_INCREMENTAL_FLOW}
 
 <h2 id="shape">Shape of a flow</h2>
 <pre><code class="language-rust">use krishiv_ivm::IncrementalFlow;
@@ -815,6 +819,7 @@ flow.restore("s3://bucket/krishiv/ivm/").await?;
     status: 'Available',
     body: `
 <p>The Pipeline DSL is the canonical way to compose a multi-stage data flow in Rust. <code>PipelineBuilder</code> is the fluent entry point; <code>Pipeline</code> is the validated, runnable plan.</p>
+${DIAGRAM_PIPELINE_BUILDER}
 
 <h2 id="shape">Shape of a pipeline</h2>
 <pre><code class="language-rust">use krishiv_api::PipelineBuilder;

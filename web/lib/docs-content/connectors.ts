@@ -1,4 +1,5 @@
 import type { DocPage } from '../docs-data';
+import { DIAGRAM_ICEBERG_SNAPSHOTS } from './diagrams';
 
 export const connectorsPages: DocPage[] = [
   {
@@ -254,6 +255,7 @@ df.write_parquet("/tmp/output.parquet")
     body: `
 <h2 id="requirements">Requirements</h2>
 <p>Enable the <code>iceberg</code> Cargo/Python feature. Krishiv targets Apache Iceberg v2+ (v3 for row lineage). The primary certified catalog is REST.</p>
+${DIAGRAM_ICEBERG_SNAPSHOTS}
 
 <h2 id="catalog-registration">Catalog Registration</h2>
 <pre><code class="language-sql">CREATE CATALOG my_catalog

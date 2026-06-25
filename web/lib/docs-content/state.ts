@@ -1,4 +1,5 @@
 import type { DocPage } from '../docs-data';
+import { DIAGRAM_STATE_TYPES, DIAGRAM_TIMERS, DIAGRAM_SAVEPOINTS } from './diagrams';
 
 export const statePages: DocPage[] = [
   {
@@ -81,6 +82,7 @@ register_state_migration("my_state", 1, 2, state_migration::&lt;OldType, NewType
     status: 'Available',
     body: `
 <p>Five state primitives. All are per-key, named, and back by a state backend. They are <code>serde::Serialize + DeserializeOwned</code> by default (the blanket <code>StateValue</code> trait).</p>
+${DIAGRAM_STATE_TYPES}
 
 <h2 id="value">ValueState&lt;T&gt;</h2>
 <p>One value per key. The most common primitive.</p>
@@ -184,6 +186,7 @@ ttl.set_watermark(current_watermark_ms);
     status: 'Available',
     body: `
 <p>Checkpoints are coordinator-driven and automatic. <strong>Savepoints</strong> are user-triggered, named, and listable — useful for "snapshot before I deploy the new model" workflows. <strong>Schema migration</strong> is the mechanism for evolving the shape of state values across releases.</p>
+${DIAGRAM_SAVEPOINTS}
 
 <h2 id="savepoints">Savepoints</h2>
 <p>CLI:</p>
@@ -338,6 +341,7 @@ score = session.queryable_get("fraud_score", key=42)
     status: 'Available',
     body: `
 <p>Timers let a stateful function do work at a specific time, instead of in response to an event. They are the canonical way to implement "do X after N seconds of inactivity" or "emit the result of this window at 12:00:00".</p>
+${DIAGRAM_TIMERS}
 
 <h2 id="kinds">Timer kinds</h2>
 <table class="api-table">
