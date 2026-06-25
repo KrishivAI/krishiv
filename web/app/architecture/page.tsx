@@ -1,62 +1,11 @@
 import Link from 'next/link';
-import type { JSX } from 'react';
 import { Badge, Section, SiteShell } from '@/components/Shell';
-
-type ArchIcon = 'interfaces' | 'runtime' | 'foundation' | 'primitives' | 'ecosystem';
-
-const layers: Array<{ title: string; labels: string; icon: ArchIcon }> = [
-  { title: 'Interfaces', labels: 'SQL · Rust · Python', icon: 'interfaces' },
-  { title: 'Unified Runtime', labels: 'Batch · Streaming · Incremental Processing', icon: 'runtime' },
-  { title: 'Execution Foundation', labels: 'DataFusion · Apache Arrow', icon: 'foundation' },
-  { title: 'Distributed Primitives', labels: 'Scheduling · Shuffle · State · Checkpoints', icon: 'primitives' },
-  { title: 'Data Ecosystem', labels: 'Iceberg · Kafka · Parquet · Object Storage · Catalogs', icon: 'ecosystem' },
-];
-
-const layerIcons: Record<ArchIcon, JSX.Element> = {
-  interfaces: (
-    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M5 3L1 8l4 5M11 3l4 5-4 5"/>
-    </svg>
-  ),
-  runtime: (
-    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">
-      <circle cx="8" cy="8" r="7" opacity=".2"/>
-      <circle cx="8" cy="8" r="4" opacity=".55"/>
-      <circle cx="8" cy="8" r="1.75"/>
-    </svg>
-  ),
-  foundation: (
-    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">
-      <path d="M9.5 2L5.5 9H9l-1.5 5.5 6.5-8H10.5z"/>
-    </svg>
-  ),
-  primitives: (
-    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">
-      <circle cx="4" cy="4" r="2"/><circle cx="12" cy="4" r="2"/>
-      <circle cx="4" cy="12" r="2"/><circle cx="12" cy="12" r="2"/>
-      <rect x="6.25" y="3.25" width="3.5" height="1.5"/>
-      <rect x="6.25" y="11.25" width="3.5" height="1.5"/>
-      <rect x="3.25" y="6.25" width="1.5" height="3.5"/>
-      <rect x="11.25" y="6.25" width="1.5" height="3.5"/>
-    </svg>
-  ),
-  ecosystem: (
-    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">
-      <rect x="2" y="2" width="12" height="3" rx="1.5"/>
-      <rect x="2" y="6.5" width="12" height="3" rx="1.5"/>
-      <rect x="2" y="11" width="12" height="3" rx="1.5"/>
-    </svg>
-  ),
-};
-
-const requestFlow = [
-  'APIs accept SQL, Rust, or Python calls and create sessions or dataframes.',
-  'DataFusion parses and plans SQL; Krishiv plan and policy modules add typed runtime contracts.',
-  'ExecutionRuntime selects embedded, single-node, or remote placement without silent distributed fallback.',
-  'Coordinators own job/task lifecycle; executors run replaceable data-plane work.',
-  'State, checkpoints, shuffle, and connectors use durability profiles and explicit capabilities.',
-  'Results return as Arrow RecordBatch values or streaming batches depending on the API.',
-];
+import {
+  TopologyDiagram,
+  RequestFlowDiagram,
+  DataPlaneDiagram,
+  LifecycleDiagram,
+} from '@/components/ArchitectureDiagrams';
 
 export default function Architecture() {
   return (
@@ -64,86 +13,195 @@ export default function Architecture() {
       <main className="container">
         <section className="page-hero">
           <Badge tone="blue">Architecture</Badge>
-          <h1 className="gradient-text">A unified engine boundary for local and distributed data work.</h1>
+          <h1 className="gradient-text">One engine, three shapes, the same APIs.</h1>
           <p className="lead">
-            Krishiv routes APIs through one planning and runtime model, with scheduler, executor, state, shuffle, checkpoint, metadata, and connector behavior kept behind explicit crate APIs.
+            Krishiv runs the same SQL, Python, and Rust APIs in three forms: as a library
+            inside your process, as a daemon on a single host, and as a coordinator-plus-executors
+            cluster. The same plan flows through all three. The same code that runs locally
+            runs at scale.
+          </p>
+          <p className="lead" style={{ color: 'var(--muted)', fontSize: 15 }}>
+            This page is the mental model. For crate boundaries and design invariants, see
+            the <a href="/docs/latest/concepts/architecture">architecture reference</a> in
+            the docs.
           </p>
         </section>
 
-        <Section title="System layers">
-          <div className="arch-diagram" aria-label="Krishiv architecture layers" style={{ maxWidth: 560 }}>
-            {layers.map((layer, i) => (
-              <div key={layer.title}>
-                {i > 0 && (
-                  <div
-                    className="arch-connector"
-                    style={{
-                      '--delay-left': `${i * 0.22}s`,
-                      '--delay-right': `${i * 0.22 + 0.6}s`,
-                    } as React.CSSProperties}
-                  >
-                    <span className="arch-line arch-line-left"/>
-                    <span className="arch-line arch-line-right"/>
-                  </div>
-                )}
-                <div className="arch-layer">
-                  <span className="arch-icon">{layerIcons[layer.icon]}</span>
-                  <div>
-                    <p className="arch-layer-title">{layer.title}</p>
-                    <p className="arch-layer-labels">{layer.labels}</p>
-                  </div>
-                </div>
-              </div>
-            ))}
-            <p className="arch-maturity-link">
-              <a href="/product/maturity">Explore feature maturity →</a>
-            </p>
-          </div>
-        </Section>
-
-        <Section title="Request flow">
-          <div className="grid">
-            {requestFlow.map((item) => (
-              <div className="card" key={item}>
-                <p>{item}</p>
-              </div>
-            ))}
-          </div>
-        </Section>
-
-        <Section title="Batch, streaming, and delta / IVM">
-          <p className="lead">
-            Batch SQL, streaming windows, and delta-oriented IVM share Arrow and DataFusion foundations. IVM is experimental: IncrementalFlow exists, but distributed executor-side IVM is in progress.
+        <Section
+          eyebrow="The three shapes"
+          title="Run Krishiv the way that fits the workload"
+        >
+          <p style={{ color: 'var(--muted-strong)', maxWidth: 720 }}>
+            You pick the shape at startup. There is no silent fall-through from local to
+            distributed, and no surprise network calls when you only want a library.
+            The same code paths run in all three.
           </p>
-        </Section>
-
-        <Section title="State, checkpoints, scheduling, and shuffle">
-          <p className="lead">
-            Krishiv exposes dev-local, single-node-durable, and distributed-durable profiles. These profiles select metadata, shuffle, state, and checkpoint storage choices instead of implying universal exactly-once behavior.
-          </p>
-        </Section>
-
-        <Section title="Storage, catalogs, and topology">
-          <div className="split">
+          <div className="diagram">
+            <TopologyDiagram />
+          </div>
+          <div className="grid" style={{ marginTop: 20 }}>
             <div className="card">
-              <h3>Storage and catalogs</h3>
+              <h3 style={{ color: 'var(--text)', margin: '0 0 8px' }}>Embedded</h3>
               <p>
-                Iceberg is the primary lakehouse platform. REST catalog compatible paths, Hive, Glue, Parquet, Kafka, S3/object store, and ADLS are documented with preview or feature-gated maturity.
+                <code>Session.embedded()</code> runs Krishiv in your process. No daemon,
+                no cluster. Ideal for notebooks, scripts, tests, and libraries that need
+                SQL or DataFrame ops inline. Results are returned as in-memory Arrow buffers.
               </p>
             </div>
             <div className="card">
-              <h3>Local versus distributed</h3>
+              <h3 style={{ color: 'var(--text)', margin: '0 0 8px' }}>Single-node</h3>
               <p>
-                Embedded mode runs in process. Single-node runs components on one host. Distributed mode requires explicit remote endpoints, bearer-token production control-plane paths, and replaceable executors.
+                A local Krishiv daemon owns durable state, checkpoints, and one or more
+                task slots. Use it when you want a long-running pipeline with restarts but
+                do not need to scale out across hosts. Connects over Arrow Flight.
+              </p>
+            </div>
+            <div className="card">
+              <h3 style={{ color: 'var(--text)', margin: '0 0 8px' }}>Distributed</h3>
+              <p>
+                A coordinator schedules jobs across <em>N</em> executors. Each executor is
+                a replaceable worker; the coordinator is the single source of truth for
+                job state. Shuffle, state, and checkpoints live on a shared object store.
               </p>
             </div>
           </div>
+        </Section>
+
+        <Section
+          eyebrow="What happens when you press run"
+          title="A query, from your code to a result"
+        >
+          <p style={{ color: 'var(--muted-strong)', maxWidth: 720 }}>
+            The same flow runs whether you are calling from a Jupyter notebook or a
+            coordinator handling a thousand tasks. Stages you can ignore most of the
+            time, and the stages you can hook into when you need to.
+          </p>
+          <div className="diagram">
+            <RequestFlowDiagram />
+          </div>
+          <ol className="prose" style={{ color: 'var(--muted-strong)' }}>
+            <li>
+              <strong style={{ color: 'var(--text)' }}>Parse and bind.</strong> Your SQL or
+              DataFrame call enters a session. The session resolves table and UDF names
+              against its catalog and binds the expression tree to types.
+            </li>
+            <li>
+              <strong style={{ color: 'var(--text)' }}>Plan and optimize.</strong> The logical
+              plan is rewritten with cost-based rules, then fragmented into a physical plan
+              that can be split across executors when running distributed.
+            </li>
+            <li>
+              <strong style={{ color: 'var(--text)' }}>Execute.</strong> The plan is run as a
+              graph of Arrow operators. State, shuffle, and checkpoint hooks are wired in
+              here. Streaming pipelines add windows, watermarks, and timers.
+            </li>
+            <li>
+              <strong style={{ color: 'var(--text)' }}>Return.</strong> Batch results come
+              back as one or more <code>RecordBatch</code>es. Streaming results come as a
+              <code> RecordBatchStream</code> you iterate.
+            </li>
+          </ol>
+        </Section>
+
+        <Section
+          eyebrow="How a cluster is laid out"
+          title="Control plane above, data plane below"
+        >
+          <p style={{ color: 'var(--muted-strong)', maxWidth: 720 }}>
+            The coordinator is the only component that owns job state. Executors are
+            replaceable workers — losing one means restarting the tasks it was running,
+            not losing the job. State and checkpoints are pulled out of the workers
+            into a shared store so executors can be added or removed freely.
+          </p>
+          <div className="diagram">
+            <DataPlaneDiagram />
+          </div>
+          <div className="split" style={{ marginTop: 20 }}>
+            <div className="card">
+              <h3 style={{ color: 'var(--text)', margin: '0 0 8px' }}>Coordinator</h3>
+              <p>
+                Owns the job catalog, schedules tasks, holds leadership for exactly one
+                active coordinator per job, and applies committed state changes from
+                executors. It does not run data.
+              </p>
+            </div>
+            <div className="card">
+              <h3 style={{ color: 'var(--text)', margin: '0 0 8px' }}>Executors</h3>
+              <p>
+                Run tasks, hold local state, and report progress. Each executor registers
+                with the coordinator and runs whatever tasks it is offered. They do not
+                talk to each other directly — all communication routes through the
+                coordinator or shared shuffle.
+              </p>
+            </div>
+          </div>
+        </Section>
+
+        <Section
+          eyebrow="From submit to result"
+          title="The pipeline lifecycle"
+        >
+          <p style={{ color: 'var(--muted-strong)', maxWidth: 720 }}>
+            Whether you submit a SQL batch query or a streaming pipeline, the lifecycle
+            is the same five steps. The differences (continuous vs one-shot, recovery
+            vs restart) show up in the last two stages.
+          </p>
+          <div className="diagram">
+            <LifecycleDiagram />
+          </div>
+          <ul className="prose" style={{ color: 'var(--muted-strong)' }}>
+            <li>
+              <strong style={{ color: 'var(--text)' }}>Validate</strong> catches missing
+              columns, type mismatches, and unresolved UDFs at submit time — before any
+              executor is asked to do work.
+            </li>
+            <li>
+              <strong style={{ color: 'var(--text)' }}>Plan</strong> builds a fragment graph
+              the coordinator can split across executors, with cost estimates used to
+              place joins and aggregations.
+            </li>
+            <li>
+              <strong style={{ color: 'var(--text)' }}>Run</strong> streams or batches data
+              through the plan. On failure, executors restart from the last committed
+              checkpoint — they do not re-run from the source.
+            </li>
+          </ul>
+        </Section>
+
+        <Section
+          eyebrow="Where to read more"
+          title="Honest boundaries"
+        >
+          <p style={{ color: 'var(--muted-strong)', maxWidth: 720 }}>
+            The architecture is one engine, but its maturity is not uniform.
+            <a href="/product/maturity"> Feature maturity</a> is the source of truth for
+            what is ready to depend on. The short version:
+          </p>
+          <ul className="prose" style={{ color: 'var(--muted-strong)' }}>
+            <li>
+              <strong style={{ color: 'var(--text)' }}>Available:</strong> in-process batch
+              and streaming SQL, the Python and Rust APIs, single-node deployment, the
+              Iceberg and Parquet connectors.
+            </li>
+            <li>
+              <strong style={{ color: 'var(--text)' }}>Preview:</strong> distributed
+              execution and end-to-end pipeline exactly-once. The shape is right; the
+              tuning and certification are still in progress.
+            </li>
+            <li>
+              <strong style={{ color: 'var(--text)' }}>Experimental:</strong> incremental
+              view maintenance and the IncrementalFlow API.
+            </li>
+          </ul>
           <div className="actions">
             <Link className="btn btn-primary" href="/docs/latest/concepts/architecture">
-              Read architecture docs
+              Architecture reference
             </Link>
             <Link className="btn btn-secondary" href="/docs/latest/concepts/distributed-mode">
               Distributed mode
+            </Link>
+            <Link className="btn btn-secondary" href="/product/maturity">
+              Feature maturity
             </Link>
           </div>
         </Section>

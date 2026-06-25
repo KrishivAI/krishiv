@@ -30,3 +30,15 @@ html,body{max-width:100%;overflow-x:hidden}button,select,a.btn,.icon-link,.mobil
 .codeblock-copy.copied{color:#b8f7c8;border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.08)}
 .codeblock-wrap pre,
 .prose pre.codeblock-pre{background:transparent;border:0;border-radius:0;margin:0;padding:18px 20px;box-shadow:none}
+
+/* Architecture page */
+.actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:24px}
+.diagram{overflow-x:auto;padding:24px;display:grid;place-items:center}
+.diagram svg{max-width:100%;height:auto;display:block}
+.card h3{font-size:16px;font-weight:650;letter-spacing:-.01em}
+.architecture-page .lead{max-width:780px}
+@media(max-width:760px){
+  .diagram{padding:16px 12px}
+  .actions{flex-direction:column;align-items:stretch}
+  .actions .btn{width:100%}
+}
