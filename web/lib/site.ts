@@ -1,9 +1,7 @@
 export const navItems = [
-  { label: 'Product', href: '/product' },
   { label: 'Docs', href: '/docs/latest' },
   { label: 'Architecture', href: '/architecture' },
   { label: 'Blog', href: '/blog' },
-  { label: 'GitHub', href: '/github' },
 ];
 
 export const publicFacts = [
@@ -15,4 +13,4 @@ export const publicFacts = [
   { name: 'Kafka, Parquet, S3, ADLS', status: 'Preview', text: 'Connector contracts and implementations exist with maturity labels; end-to-end guarantees depend on certified combinations.' },
 ];
 
-export const githubUrl = 'https://github.com/krishiv-data/krishiv';
+export const githubUrl = 'https://github.com/KrishivAI/krishiv';

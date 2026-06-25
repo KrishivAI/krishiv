@@ -51,7 +51,7 @@ export const recipesPages: DocPage[] = [
   </tbody>
 </table>
 
-<div class="note-box"><strong>Tip:</strong> Don't see your task? Check the <a href="/docs/latest">full docs index</a> or open an issue on <a href="https://github.com/krishiv-data/krishiv">GitHub</a>.</div>
+<div class="note-box"><strong>Tip:</strong> Don't see your task? Check the <a href="/docs/latest">full docs index</a> or open an issue on <a href="https://github.com/KrishivAI/krishiv">GitHub</a>.</div>
 `,
   },
 

@@ -63,7 +63,7 @@ export function Footer() {
         <Link href="/product/maturity">Maturity</Link>
         <Link href="/architecture">Architecture</Link>
         <Link href="/release-notes">Release notes</Link>
-        <a href="https://github.com/krishiv-data/krishiv/blob/main/LICENSE">License</a>
+        <a href={`${githubUrl}/blob/main/LICENSE`}>License</a>
         <a href={githubUrl}>GitHub</a>
       </div>
     </footer>
