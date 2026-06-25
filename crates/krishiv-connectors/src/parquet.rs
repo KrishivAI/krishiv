@@ -146,9 +146,24 @@ impl ParquetSource {
         // `ParquetRecordBatchReaderBuilder` in `parquet = 58.x`). The
         // executor / DataFusion layers can wire those toggles via
         // `ArrowReaderOptions` once the version is bumped.
-        let _ = self.options.pushdown_filters;
-        let _ = self.options.enable_page_index;
-        let _ = self.options.enable_bloom_filter;
+        if self.options.pushdown_filters {
+            tracing::debug!(
+                path = %self.path.display(),
+                "pushdown_filters requested but not yet wired for Parquet 58.x"
+            );
+        }
+        if self.options.enable_page_index {
+            tracing::debug!(
+                path = %self.path.display(),
+                "enable_page_index requested but not yet wired for Parquet 58.x"
+            );
+        }
+        if self.options.enable_bloom_filter {
+            tracing::debug!(
+                path = %self.path.display(),
+                "enable_bloom_filter requested but not yet wired for Parquet 58.x"
+            );
+        }
         builder.build().map_err(|e| {
             ConnectorError::Parquet(format!("failed to create Parquet batch reader: {e}"))
         })
@@ -186,7 +201,10 @@ impl ParquetSource {
         if self.reader.is_none() {
             self.reader = Some(self.reader_skipped_to(self.cursor)?);
         }
-        Ok(self.reader.as_mut().expect("reader populated above"))
+        Ok(self
+            .reader
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("reader populated above")))
     }
 
     /// Return the path this source was opened from.

@@ -345,7 +345,7 @@ pub(crate) fn build_window_record_batch(
     } = input;
     let schema = Arc::clone(schema);
     let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = vec![
-        key_value_to_typed_array(key_type, key_value),
+        key_value_to_typed_array(key_type, key_value)?,
         Arc::new(Int64Array::from(vec![window_start_ms])),
         Arc::new(Int64Array::from(vec![window_end_ms])),
     ];
@@ -380,37 +380,38 @@ fn key_type_to_arrow_data_type(key_type: &str) -> DataType {
     }
 }
 
-fn key_value_to_typed_array(key_type: &str, key_value: &str) -> Arc<dyn arrow::array::Array> {
+fn key_value_to_typed_array(
+    key_type: &str,
+    key_value: &str,
+) -> Result<Arc<dyn arrow::array::Array>, ExecError> {
     match key_type {
         "int32" => {
-            let v = key_value.parse::<i32>().unwrap_or_else(|_| {
-                tracing::warn!(key = key_value, "failed to parse key as int32, using 0");
-                0
-            });
-            Arc::new(Int32Array::from(vec![v]))
+            let v = key_value.parse::<i32>().map_err(|e| {
+                ExecError::InvalidInput(format!("failed to parse key '{key_value}' as int32: {e}"))
+            })?;
+            Ok(Arc::new(Int32Array::from(vec![v])))
         }
         "int64" => {
-            let v = key_value.parse::<i64>().unwrap_or_else(|_| {
-                tracing::warn!(key = key_value, "failed to parse key as int64, using 0");
-                0
-            });
-            Arc::new(Int64Array::from(vec![v]))
+            let v = key_value.parse::<i64>().map_err(|e| {
+                ExecError::InvalidInput(format!("failed to parse key '{key_value}' as int64: {e}"))
+            })?;
+            Ok(Arc::new(Int64Array::from(vec![v])))
         }
         "float64" => {
-            let v = key_value.parse::<f64>().unwrap_or_else(|_| {
-                tracing::warn!(key = key_value, "failed to parse key as float64, using 0.0");
-                0.0
-            });
-            Arc::new(Float64Array::from(vec![v]))
+            let v = key_value.parse::<f64>().map_err(|e| {
+                ExecError::InvalidInput(format!(
+                    "failed to parse key '{key_value}' as float64: {e}"
+                ))
+            })?;
+            Ok(Arc::new(Float64Array::from(vec![v])))
         }
         "bool" => {
-            let v = key_value.parse::<bool>().unwrap_or_else(|_| {
-                tracing::warn!(key = key_value, "failed to parse key as bool, using false");
-                false
-            });
-            Arc::new(BooleanArray::from(vec![v]))
+            let v = key_value.parse::<bool>().map_err(|e| {
+                ExecError::InvalidInput(format!("failed to parse key '{key_value}' as bool: {e}"))
+            })?;
+            Ok(Arc::new(BooleanArray::from(vec![v])))
         }
-        _ => Arc::new(StringArray::from(vec![key_value])),
+        _ => Ok(Arc::new(StringArray::from(vec![key_value]))),
     }
 }
 

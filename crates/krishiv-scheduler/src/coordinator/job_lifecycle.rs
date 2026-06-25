@@ -274,9 +274,11 @@ impl Coordinator {
 
         if let Some(store) = &self.store {
             let mut guard = store.inner();
-            let _ = guard.append_event(EventLogEvent::JobCancelled {
+            if let Err(e) = guard.append_event(EventLogEvent::JobCancelled {
                 job_id: job_id.clone(),
-            });
+            }) {
+                tracing::warn!(job_id = %job_id, error = %e, "failed to append JobCancelled event");
+            }
         }
 
         if !self.gc_ready_jobs.contains(job_id) {
@@ -624,10 +626,12 @@ impl Coordinator {
             // Server doesn't have to re-resolve `JobState` variants.
             if let Some(store) = &self.store {
                 let mut guard = store.inner();
-                let _ = guard.append_event(EventLogEvent::JobCompleted {
+                if let Err(e) = guard.append_event(EventLogEvent::JobCompleted {
                     job_id: job_id.clone(),
                     final_state: state.to_string(),
-                });
+                }) {
+                    tracing::warn!(job_id = %job_id, error = %e, "failed to append JobCompleted event");
+                }
             }
 
             // Archive an immutable history record before the job is evicted.

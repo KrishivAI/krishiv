@@ -380,6 +380,13 @@ async fn execute_shuffle_write_fragment(
             message: String::from("shuffle-write key_column and num_partitions must be non-empty"),
         });
     }
+    if num_partitions > 10_000 {
+        return Err(ExecutorError::InvalidAssignment {
+            message: format!(
+                "shuffle-write num_partitions {num_partitions} exceeds maximum of 10,000"
+            ),
+        });
+    }
 
     let query = assignment
         .output_contract()
@@ -884,12 +891,14 @@ async fn execute_broker_kafka_two_phase(
 
     // The configured sink path is the transactional output directory: each
     // committed file is `<epoch>-<n>.parquet`, staged as `.parquet.tmp`.
-    std::fs::create_dir_all(sink_path).map_err(|error| ExecutorError::LocalExecution {
-        message: format!(
-            "cannot create transactional parquet output dir '{}': {error}",
-            sink_path.display()
-        ),
-    })?;
+    tokio::fs::create_dir_all(sink_path)
+        .await
+        .map_err(|error| ExecutorError::LocalExecution {
+            message: format!(
+                "cannot create transactional parquet output dir '{}': {error}",
+                sink_path.display()
+            ),
+        })?;
     let job_id_str = assignment.job_id().as_str().to_owned();
     let sink_dir = sink_path.to_path_buf();
     let participant = runner

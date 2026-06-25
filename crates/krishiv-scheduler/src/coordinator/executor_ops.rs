@@ -273,6 +273,7 @@ impl Coordinator {
         self.handle_executor_loss_for_checkpoints(executor_id);
         self.reset_running_tasks_for_lost_executor(executor_id);
         self.executor_job_watermarks.remove(executor_id);
+        self.pending_source_throttles.remove(executor_id);
         // SC14: release one worker back to the cluster.
         self.cluster_manager.release_workers(1);
         krishiv_metrics::global_metrics().inc_executor_lost();
@@ -561,8 +562,7 @@ impl Coordinator {
                 let mut stage_affected = false;
                 for task in &mut stage.tasks {
                     if task.assigned_executor.as_ref() == Some(lost_id)
-                        && (task.state == TaskState::Running
-                            || (task.state == TaskState::Assigned && task.launch_in_flight()))
+                        && matches!(task.state, TaskState::Running | TaskState::Assigned)
                     {
                         task.executor_loss_count = task.executor_loss_count.saturating_add(1);
                         task.assigned_executor = None;

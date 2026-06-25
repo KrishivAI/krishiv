@@ -261,8 +261,8 @@ pub struct ContinuousWindowExecutor {
     ///
     /// Persisted across drain cycles so that `purge_expired` at the start of
     /// each cycle uses the watermark from the previous cycle rather than falling
-    /// back to wall-clock time.  Starts at `i64::MIN` (no watermark seen yet).
-    last_watermark_ms: i64,
+    /// back to wall-clock time.  `None` when no watermark has been observed yet.
+    last_watermark_ms: Option<i64>,
     /// Total rows rejected by `quality_hook` across all drain cycles.
     rejected_rows_total: u64,
 }
@@ -295,7 +295,7 @@ impl ContinuousWindowExecutor {
             state_dir: state_dir.map(|p| p.to_path_buf()),
             operator: None,
             quality_hook: None,
-            last_watermark_ms: i64::MIN,
+            last_watermark_ms: None,
             rejected_rows_total: 0,
         })
     }
@@ -358,10 +358,10 @@ impl ContinuousWindowExecutor {
 
         // Propagate the most recently known event-time watermark to the TTL
         // state backend before eviction so that purge_expired uses event time.
-        // On the very first drain cycle last_watermark_ms == i64::MIN and the
+        // On the very first drain cycle last_watermark_ms is None and the
         // backend falls back to wall-clock time (no-op for non-TTL operators).
-        if self.last_watermark_ms != i64::MIN {
-            op.set_watermark(self.last_watermark_ms);
+        if let Some(wm) = self.last_watermark_ms {
+            op.set_watermark(wm);
         }
 
         // Eagerly evict stale TTL entries before processing new data.
@@ -389,7 +389,7 @@ impl ContinuousWindowExecutor {
             // Keep the TTL backend's event-time reference current as the
             // watermark advances within this drain cycle.
             op.set_watermark(wm);
-            self.last_watermark_ms = wm;
+            self.last_watermark_ms = Some(wm);
             raw.extend(op.process_batch(batch, wm)?);
         }
         if raw.is_empty() {
@@ -458,8 +458,8 @@ impl ContinuousWindowExecutor {
                     "continuous operator was not initialized after schema inference".into(),
                 ));
             };
-            if self.last_watermark_ms != i64::MIN {
-                op.set_watermark(self.last_watermark_ms);
+            if let Some(wm) = self.last_watermark_ms {
+                op.set_watermark(wm);
             }
             op.purge_expired()?;
         }
@@ -547,13 +547,13 @@ impl ContinuousWindowExecutor {
     /// Most recently observed watermark, used to restore `last_watermark_ms`
     /// after a snapshot/restore cycle.
     pub fn last_watermark_ms(&self) -> i64 {
-        self.last_watermark_ms
+        self.last_watermark_ms.unwrap_or(i64::MIN)
     }
 
     /// C9: Replace the current window state with the contents of a snapshot
     /// previously produced by [`snapshot`].
     ///
-    /// The watermark is reset to `i64::MIN` (the executor will advance it on
+    /// The watermark is reset to `None` (the executor will advance it on
     /// the first batch). Call this immediately after [`new`] and before any
     /// [`drain`] calls when resuming an executor from a checkpoint.
     pub fn restore_from_snapshot(&mut self, bytes: &[u8]) -> ExecResult<()> {
@@ -567,7 +567,7 @@ impl ContinuousWindowExecutor {
                 ));
             }
         }
-        self.last_watermark_ms = i64::MIN;
+        self.last_watermark_ms = None;
         Ok(())
     }
 

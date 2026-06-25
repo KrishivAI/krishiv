@@ -1131,6 +1131,9 @@ impl Session {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, query = %query, "failed to extract table references for policy check");
+                    return Err(KrishivError::AccessDenied {
+                        reason: format!("access denied: could not verify query policy ({e})"),
+                    });
                 }
             }
         }

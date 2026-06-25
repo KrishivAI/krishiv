@@ -322,6 +322,11 @@ impl IncrementalFlow {
             // This may allow a small number of duplicate rows through on the
             // next tick, which is acceptable for at-least-once semantics.
             if seen.len() >= DEDUP_SEEN_CAPACITY {
+                tracing::warn!(
+                    source = %source_name,
+                    capacity = DEDUP_SEEN_CAPACITY,
+                    "dedup set capacity reached; clearing to prevent unbounded growth"
+                );
                 seen.clear();
             }
             let data = batch.data_batch();
@@ -651,7 +656,14 @@ impl IncrementalFlow {
                     loop {
                         let new_full = match execute_view_sql(ctx, spec).await {
                             Ok(rb) => rb,
-                            Err(_) => make_empty_batch!(spec),
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "view SQL execution failed; using empty batch"
+                                );
+                                make_empty_batch!(spec)
+                            }
                         };
                         let prev = view_full_outputs.get(view_name).map(|b| b as &RecordBatch);
                         let converged = differentiate(&spec.output_schema, prev, &new_full)
@@ -698,7 +710,14 @@ impl IncrementalFlow {
                 } else {
                     let new_full = match execute_view_sql(ctx, spec).await {
                         Ok(rb) => rb,
-                        Err(_) => make_empty_batch!(spec),
+                        Err(e) => {
+                            tracing::warn!(
+                                view = %view_name,
+                                error = %e,
+                                "view SQL execution failed; using empty batch"
+                            );
+                            make_empty_batch!(spec)
+                        }
                     };
                     view_full_outputs.insert(view_name.clone(), new_full);
                 }
@@ -1113,7 +1132,10 @@ impl IncrementalFlow {
         out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         for (name, delta_list) in entries {
             let combined = if delta_list.len() == 1 {
-                delta_list.into_iter().next().unwrap()
+                delta_list
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| IvmError::execution("empty delta list in checkpoint"))?
             } else {
                 DeltaBatch::concat(&delta_list).map_err(delta_err)?
             };
@@ -1203,7 +1225,10 @@ pub(crate) fn hash_row(batch: &RecordBatch, row: usize) -> u64 {
 }
 
 fn scalar_to_string(arr: &dyn arrow::array::Array, row: usize) -> String {
-    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::array::{
+        BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+        LargeStringArray, StringArray, UInt32Array, UInt64Array,
+    };
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
         return if a.is_null(row) {
             "NULL".into()
@@ -1212,6 +1237,20 @@ fn scalar_to_string(arr: &dyn arrow::array::Array, row: usize) -> String {
         };
     }
     if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<UInt64Array>() {
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<UInt32Array>() {
         return if a.is_null(row) {
             "NULL".into()
         } else {
@@ -1232,6 +1271,13 @@ fn scalar_to_string(arr: &dyn arrow::array::Array, row: usize) -> String {
             a.value(row).to_string()
         };
     }
+    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
+    }
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
         return if a.is_null(row) {
             "NULL".into()
@@ -1239,7 +1285,31 @@ fn scalar_to_string(arr: &dyn arrow::array::Array, row: usize) -> String {
             a.value(row).to_string()
         };
     }
-    "NULL".to_string()
+    if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            a.value(row).to_string()
+        };
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
+        return if a.is_null(row) {
+            "NULL".into()
+        } else {
+            let bytes = a.value(row);
+            let mut s = String::with_capacity(2 + bytes.len() * 2);
+            s.push_str("0x");
+            for b in bytes {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        };
+    }
+    if arr.is_null(row) {
+        "NULL".into()
+    } else {
+        format!("<unsupported type: {}>", arr.data_type())
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1250,7 +1320,10 @@ pub fn coalesce_pending(
     raw.into_iter()
         .map(|(name, deltas)| {
             let batch = if deltas.len() == 1 {
-                deltas.into_iter().next().unwrap()
+                deltas
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| IvmError::execution("empty delta list"))?
             } else {
                 DeltaBatch::concat(&deltas).map_err(delta_err)?
             };

@@ -138,7 +138,7 @@ impl CountWindowOperator {
                         .take(self.spec.size as usize)
                         .map(|c| &c.agg),
                     &self.spec.agg_exprs,
-                );
+                )?;
                 output.push(build_window_record_batch(WindowRecordBatchInput {
                     schema: &self.output_schema,
                     key_type: &self.spec.key_column_type,
@@ -168,8 +168,8 @@ impl CountWindowOperator {
                 continue;
             }
             let window_start = state.window_start_row;
-            let window_end = window_start + state.buf.len() as u64;
-            let merged = fold_agg_states(state.buf.iter().map(|c| &c.agg), &self.spec.agg_exprs);
+            let window_end = window_start.saturating_add(state.buf.len() as u64);
+            let merged = fold_agg_states(state.buf.iter().map(|c| &c.agg), &self.spec.agg_exprs)?;
             output.push(build_window_record_batch(WindowRecordBatchInput {
                 schema: &self.output_schema,
                 key_type: &self.spec.key_column_type,
@@ -190,21 +190,27 @@ impl CountWindowOperator {
 fn fold_agg_states<'a>(
     iter: impl Iterator<Item = &'a AggState>,
     agg_exprs: &[AggExpr],
-) -> AggState {
+) -> ExecResult<AggState> {
     let mut merged = AggState::new(agg_exprs);
     for contrib in iter {
         for (i, agg) in agg_exprs.iter().enumerate() {
             match agg.function {
                 AggFunction::Count => {
-                    merged.values[i] = merged.values[i]
-                        .checked_add(contrib.values[i])
-                        .unwrap_or(i64::MAX);
+                    merged.values[i] =
+                        merged.values[i]
+                            .checked_add(contrib.values[i])
+                            .ok_or_else(|| {
+                                ExecError::InvalidInput("count overflow in fold_agg_states".into())
+                            })?;
                     merged.has_value[i] = true;
                 }
                 AggFunction::Sum => {
-                    merged.values[i] = merged.values[i]
-                        .checked_add(contrib.values[i])
-                        .unwrap_or(i64::MAX);
+                    merged.values[i] =
+                        merged.values[i]
+                            .checked_add(contrib.values[i])
+                            .ok_or_else(|| {
+                                ExecError::InvalidInput("sum overflow in fold_agg_states".into())
+                            })?;
                     merged.float_values[i] += contrib.float_values[i];
                     if contrib.has_value[i] {
                         merged.has_value[i] = true;
@@ -238,7 +244,7 @@ fn fold_agg_states<'a>(
             }
         }
     }
-    merged
+    Ok(merged)
 }
 
 #[cfg(test)]

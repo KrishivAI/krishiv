@@ -678,7 +678,7 @@ Execution statistics:
             "local-{}",
             self.next_job_id.fetch_add(1, Ordering::SeqCst)
         ))
-        .expect("job id is always non-empty");
+        .unwrap_or_else(|e| unreachable!("job id is always non-empty: {e}"));
         self.update_job(&id, name, JobState::Pending);
         id
     }

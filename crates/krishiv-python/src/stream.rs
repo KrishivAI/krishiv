@@ -341,8 +341,11 @@ impl PyWindowedStream {
     pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         let mut rx_guard = slf.stream_rx.lock().unwrap_or_else(|e| e.into_inner());
         if rx_guard.is_none() {
-            if let Ok(rx) = crate::stream_exec::spawn_pipeline_stream(slf.pipeline.clone()) {
-                *rx_guard = Some(rx);
+            match crate::stream_exec::spawn_pipeline_stream(slf.pipeline.clone()) {
+                Ok(rx) => *rx_guard = Some(rx),
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to spawn pipeline stream in __aiter__; __anext__ will raise StopAsyncIteration");
+                }
             }
         }
         drop(rx_guard);

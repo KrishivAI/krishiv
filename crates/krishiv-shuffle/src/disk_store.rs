@@ -417,8 +417,14 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 // The kernel may otherwise reorder the sidecar rename
                 // ahead of the data's metadata flush, leaving a window
                 // where the data is on disk in name only.
-                if let Ok(f) = std::fs::File::open(&final_path) {
-                    let _ = f.sync_all();
+                if let Ok(f) = std::fs::File::open(&final_path)
+                    && let Err(e) = f.sync_all()
+                {
+                    tracing::warn!(
+                        path = %final_path.display(),
+                        error = %e,
+                        "failed to fsync data file; durability may be compromised"
+                    );
                 }
                 std::fs::rename(&tmp_hash_path, &final_hash_path).map_err(|e| {
                     io_err(format!(
