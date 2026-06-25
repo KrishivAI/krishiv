@@ -1,35 +1,52 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
   <title id="title">Krishiv mark</title>
-  <desc id="desc">Geometric K mark built from columnar data blocks, streaming paths, and runtime nodes.</desc>
+  <desc id="desc">Geometric K mark — columnar spine (vertical batch/IVM axis) with two streaming arms (batch/streaming I/O) and three gold nodes for sources, sinks, and the runtime center.</desc>
   <defs>
-    <linearGradient id="krishiv-frame" x1="24" y1="24" x2="232" y2="232" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#F59E0B"/>
-      <stop offset="0.52" stop-color="#38BDF8"/>
-      <stop offset="1" stop-color="#6366F1"/>
+    <linearGradient id="ks-frame" x1="6" y1="6" x2="58" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB52A"/>
+      <stop offset="0.55" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#B86A00"/>
     </linearGradient>
-    <linearGradient id="krishiv-spine" x1="68" y1="48" x2="124" y2="208" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FBBF24"/>
+    <linearGradient id="ks-stroke" x1="14" y1="10" x2="50" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB52A"/>
       <stop offset="1" stop-color="#F59E0B"/>
     </linearGradient>
-    <linearGradient id="krishiv-upper" x1="120" y1="128" x2="204" y2="56" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#F5F7FB"/>
-      <stop offset="1" stop-color="#38BDF8"/>
+    <linearGradient id="ks-spine" x1="20" y1="10" x2="28" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFCB47"/>
+      <stop offset="1" stop-color="#D07A00"/>
     </linearGradient>
-    <linearGradient id="krishiv-lower" x1="120" y1="128" x2="212" y2="200" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#F5F7FB"/>
-      <stop offset="1" stop-color="#6366F1"/>
-    </linearGradient>
+    <radialGradient id="ks-glow" cx="32" cy="32" r="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F59E0B" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#F59E0B" stop-opacity="0"/>
+    </radialGradient>
   </defs>
-  <rect x="12" y="12" width="232" height="232" rx="56" fill="#0B1020"/>
-  <rect x="14" y="14" width="228" height="228" rx="54" fill="none" stroke="url(#krishiv-frame)" stroke-width="4" stroke-opacity="0.72"/>
-  <path d="M116 128L196 60" fill="none" stroke="url(#krishiv-upper)" stroke-width="40" stroke-linecap="round"/>
-  <path d="M116 128L204 196" fill="none" stroke="url(#krishiv-lower)" stroke-width="40" stroke-linecap="round"/>
-  <rect x="64" y="44" width="56" height="168" rx="16" fill="url(#krishiv-spine)"/>
-  <rect x="80" y="64" width="24" height="28" rx="6" fill="#0B1020" opacity="0.66"/>
-  <rect x="80" y="112" width="24" height="28" rx="6" fill="#0B1020" opacity="0.66"/>
-  <rect x="80" y="160" width="24" height="28" rx="6" fill="#0B1020" opacity="0.66"/>
-  <path d="M32 80h32M32 128h32M32 176h32" fill="none" stroke="#38BDF8" stroke-width="10" stroke-linecap="round" opacity="0.78"/>
-  <circle cx="196" cy="60" r="16" fill="#38BDF8"/>
-  <circle cx="204" cy="196" r="16" fill="#6366F1"/>
-  <circle cx="128" cy="128" r="14" fill="#22C55E"/>
+
+  <!-- Surface tile (matches site surface token) -->
+  <rect x="3" y="3" width="58" height="58" rx="14" fill="#101010"/>
+
+  <!-- Soft inner glow -->
+  <rect x="3" y="3" width="58" height="58" rx="14" fill="url(#ks-glow)"/>
+
+  <!-- Frame stroke (gold) -->
+  <rect x="3.5" y="3.5" width="57" height="57" rx="13.5" fill="none" stroke="url(#ks-frame)" stroke-width="1" stroke-opacity="0.65"/>
+
+  <!-- Columnar spine: a vertical gold bar with 3 segment ticks (the "columnar data blocks") -->
+  <rect x="19" y="11" width="9" height="42" rx="2" fill="url(#ks-spine)"/>
+  <rect x="20.5" y="15" width="6" height="9" rx="1.25" fill="#101010" fill-opacity="0.7"/>
+  <rect x="20.5" y="27.5" width="6" height="9" rx="1.25" fill="#101010" fill-opacity="0.7"/>
+  <rect x="20.5" y="40" width="6" height="9" rx="1.25" fill="#101010" fill-opacity="0.7"/>
+
+  <!-- Top arm: source / streaming-in -->
+  <path d="M28 32L48 14" fill="none" stroke="url(#ks-stroke)" stroke-width="7" stroke-linecap="round"/>
+
+  <!-- Bottom arm: sink / streaming-out -->
+  <path d="M28 32L50 50" fill="none" stroke="url(#ks-stroke)" stroke-width="7" stroke-linecap="round"/>
+
+  <!-- I/O node markers: two at the arm tips, one at the spine midpoint -->
+  <circle cx="48" cy="14" r="3.25" fill="#FFB52A"/>
+  <circle cx="50" cy="50" r="3.25" fill="#F59E0B"/>
+  <circle cx="23.5" cy="32" r="2.75" fill="#FFCB47"/>
+
+  <!-- Tiny "data tick" rails on the left edge — three short gold strokes, like a columnar mini-row indicator -->
+  <path d="M8 18h6M8 32h6M8 46h6" fill="none" stroke="#F59E0B" stroke-width="1.5" stroke-linecap="round" stroke-opacity="0.55"/>
 </svg>

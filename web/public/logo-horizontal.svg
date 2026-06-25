@@ -1,44 +1,52 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 88" role="img" aria-label="Krishiv">
-  <title>Krishiv</title>
-  <desc>Krishiv wordmark for a Rust-native batch SQL, streaming, and lakehouse compute framework.</desc>
   <defs>
-    <linearGradient id="krishiv-logo-frame" x1="10" y1="10" x2="70" y2="70" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#F59E0B"/>
-      <stop offset="0.52" stop-color="#38BDF8"/>
-      <stop offset="1" stop-color="#6366F1"/>
+    <linearGradient id="ks-frame" x1="10" y1="10" x2="70" y2="70" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB52A"/>
+      <stop offset="0.55" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#B86A00"/>
     </linearGradient>
-    <linearGradient id="krishiv-logo-spine" x1="24" y1="18" x2="40" y2="70" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FBBF24"/>
+    <linearGradient id="ks-stroke" x1="18" y1="14" x2="54" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB52A"/>
       <stop offset="1" stop-color="#F59E0B"/>
     </linearGradient>
-    <linearGradient id="krishiv-logo-word" x1="96" y1="28" x2="224" y2="56" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#F5F7FB"/>
-      <stop offset="0.72" stop-color="#DDE7F5"/>
-      <stop offset="1" stop-color="#38BDF8"/>
+    <linearGradient id="ks-spine" x1="24" y1="14" x2="32" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFCB47"/>
+      <stop offset="1" stop-color="#D07A00"/>
     </linearGradient>
+    <linearGradient id="ks-word" x1="96" y1="32" x2="220" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F5F5F5"/>
+      <stop offset="1" stop-color="#FFD18A"/>
+    </linearGradient>
+    <radialGradient id="ks-glow" cx="38" cy="38" r="28" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F59E0B" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#F59E0B" stop-opacity="0"/>
+    </radialGradient>
   </defs>
-  <rect width="360" height="88" rx="18" fill="#0B1020"/>
-  <rect x="0.5" y="0.5" width="359" height="87" rx="17.5" fill="none" stroke="#2A3858" opacity="0.8"/>
-  <g transform="translate(8 8)">
-    <rect x="3" y="3" width="58" height="58" rx="14" fill="#0B1020"/>
-    <rect x="3.5" y="3.5" width="57" height="57" rx="13.5" fill="none" stroke="url(#krishiv-logo-frame)" stroke-opacity="0.72"/>
-    <path d="M29 32L49 15" fill="none" stroke="#DDF7FF" stroke-width="10" stroke-linecap="round"/>
-    <path d="M29 32L51 49" fill="none" stroke="#C4B5FD" stroke-width="10" stroke-linecap="round"/>
-    <rect x="16" y="11" width="14" height="42" rx="4" fill="url(#krishiv-logo-spine)"/>
-    <rect x="20" y="16" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
-    <rect x="20" y="28" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
-    <rect x="20" y="40" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
-    <path d="M8 20h8M8 32h8M8 44h8" fill="none" stroke="#38BDF8" stroke-width="2.5" stroke-linecap="round" opacity="0.78"/>
-    <circle cx="49" cy="15" r="4" fill="#38BDF8"/>
-    <circle cx="51" cy="49" r="4" fill="#6366F1"/>
-    <circle cx="32" cy="32" r="3.5" fill="#22C55E"/>
+
+  <rect x="6" y="14" width="68" height="68" rx="16" fill="#101010"/>
+  <rect x="6" y="14" width="68" height="68" rx="16" fill="url(#ks-glow)"/>
+  <rect x="6.5" y="14.5" width="67" height="67" rx="15.5" fill="none" stroke="url(#ks-frame)" stroke-width="1" stroke-opacity="0.65"/>
+
+  <g transform="translate(6 14)">
+    <rect x="19" y="11" width="9" height="42" rx="2" fill="url(#ks-spine)"/>
+    <rect x="20.5" y="15" width="6" height="9" rx="1.25" fill="#101010" fill-opacity="0.7"/>
+    <rect x="20.5" y="27.5" width="6" height="9" rx="1.25" fill="#101010" fill-opacity="0.7"/>
+    <rect x="20.5" y="40" width="6" height="9" rx="1.25" fill="#101010" fill-opacity="0.7"/>
+    <path d="M28 32L48 14" fill="none" stroke="url(#ks-stroke)" stroke-width="7" stroke-linecap="round"/>
+    <path d="M28 32L50 50" fill="none" stroke="url(#ks-stroke)" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="48" cy="14" r="3.25" fill="#FFB52A"/>
+    <circle cx="50" cy="50" r="3.25" fill="#F59E0B"/>
+    <circle cx="23.5" cy="32" r="2.75" fill="#FFCB47"/>
+    <path d="M8 18h6M8 32h6M8 46h6" fill="none" stroke="#F59E0B" stroke-width="1.5" stroke-linecap="round" stroke-opacity="0.55"/>
   </g>
-  <text x="92" y="44" fill="url(#krishiv-logo-word)" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="31" font-weight="800" letter-spacing="0">Krishiv</text>
-  <text x="94" y="65" fill="#A8B3C7" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="11" font-weight="600" letter-spacing="0">Batch SQL / streaming / lakehouse runtime</text>
-  <g transform="translate(282 26)">
-    <rect width="54" height="24" rx="12" fill="#121A2E" stroke="#2A3858"/>
-    <circle cx="16" cy="12" r="4" fill="#F59E0B"/>
-    <circle cx="28" cy="12" r="4" fill="#38BDF8"/>
-    <circle cx="40" cy="12" r="4" fill="#22C55E"/>
+
+  <text x="92" y="48" fill="url(#ks-word)" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="32" font-weight="800" letter-spacing="-0.5">Krishiv</text>
+  <text x="94" y="70" fill="#A3A3A3" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="11" font-weight="600" letter-spacing="0">Batch SQL · Streaming · Lakehouse</text>
+
+  <g transform="translate(282 30)">
+    <rect width="58" height="24" rx="12" fill="#101010" stroke="#2A2A2A"/>
+    <circle cx="17" cy="12" r="3.5" fill="#F59E0B"/>
+    <circle cx="29" cy="12" r="3.5" fill="#FFB52A"/>
+    <circle cx="41" cy="12" r="3.5" fill="#FFCB47"/>
   </g>
 </svg>

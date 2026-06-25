@@ -1,27 +1,16 @@
-![Krishiv logo](docs/assets/krishiv-logo.svg)
-
-# Krishiv
+<p align="center">
+  <img src="docs/assets/krishiv-banner.svg" alt="Krishiv — Rust-native batch SQL, streaming, and lakehouse compute" width="100%">
+</p>
 
 Krishiv is a Rust-native hybrid compute framework that unifies **batch SQL**,
 **streaming pipelines**, and **incremental view maintenance (IVM)** under a
 single Apache Arrow / DataFusion engine.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                       Krishiv Engine                         │
-│                                                              │
-│  Mode 1: Batch SQL       Mode 2: Streaming   Mode 3: Delta  │
-│  ─────────────────       ───────────────────  ─────────────  │
-│  One-shot DataFusion     Event windows +      Tick-driven    │
-│  query over Arrow        watermarks           Z-set IVM      │
-│  RecordBatches           RecordBatches        DeltaBatch     │
-│                                                              │
-│         Apache Arrow columnar memory model (in-process)      │
-│         DataFusion SQL engine (local + distributed)          │
-│         RocksDB durable state (traces, checkpoints)          │
-│         Iceberg / Delta / Hudi lakehouse connectors          │
-└──────────────────────────────────────────────────────────────┘
-```
+The same plan runs in three shapes — **embedded** in your process, as a
+**single-node** daemon, or as a **coordinator-plus-executors** cluster. The
+same code reads Parquet, subscribes to Kafka, and writes Iceberg. The same
+SQL powers batch reports, real-time aggregations, and incrementally maintained
+views.
 
 ## Compute Modes
 

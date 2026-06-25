@@ -1,35 +1,34 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Krishiv mark">
-  <title>Krishiv mark</title>
-  <desc>Geometric K mark built from columnar data blocks, streaming paths, and runtime nodes.</desc>
   <defs>
-    <linearGradient id="krishiv-frame" x1="6" y1="6" x2="58" y2="58" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#F59E0B"/>
-      <stop offset="0.52" stop-color="#38BDF8"/>
-      <stop offset="1" stop-color="#6366F1"/>
+    <linearGradient id="ks-frame" x1="6" y1="6" x2="58" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB52A"/>
+      <stop offset="0.55" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#B86A00"/>
     </linearGradient>
-    <linearGradient id="krishiv-spine" x1="17" y1="12" x2="31" y2="52" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FBBF24"/>
+    <linearGradient id="ks-stroke" x1="14" y1="10" x2="50" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB52A"/>
       <stop offset="1" stop-color="#F59E0B"/>
     </linearGradient>
-    <linearGradient id="krishiv-upper" x1="30" y1="32" x2="51" y2="14" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#F5F7FB"/>
-      <stop offset="1" stop-color="#38BDF8"/>
+    <linearGradient id="ks-spine" x1="20" y1="10" x2="28" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFCB47"/>
+      <stop offset="1" stop-color="#D07A00"/>
     </linearGradient>
-    <linearGradient id="krishiv-lower" x1="30" y1="32" x2="53" y2="50" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#F5F7FB"/>
-      <stop offset="1" stop-color="#6366F1"/>
-    </linearGradient>
+    <radialGradient id="ks-glow" cx="32" cy="32" r="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F59E0B" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#F59E0B" stop-opacity="0"/>
+    </radialGradient>
   </defs>
-  <rect x="3" y="3" width="58" height="58" rx="14" fill="#0B1020"/>
-  <rect x="3.5" y="3.5" width="57" height="57" rx="13.5" fill="none" stroke="url(#krishiv-frame)" stroke-opacity="0.72"/>
-  <path d="M29 32L49 15" fill="none" stroke="url(#krishiv-upper)" stroke-width="10" stroke-linecap="round"/>
-  <path d="M29 32L51 49" fill="none" stroke="url(#krishiv-lower)" stroke-width="10" stroke-linecap="round"/>
-  <rect x="16" y="11" width="14" height="42" rx="4" fill="url(#krishiv-spine)"/>
-  <rect x="20" y="16" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
-  <rect x="20" y="28" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
-  <rect x="20" y="40" width="6" height="7" rx="1.5" fill="#0B1020" opacity="0.66"/>
-  <path d="M8 20h8M8 32h8M8 44h8" fill="none" stroke="#38BDF8" stroke-width="2.5" stroke-linecap="round" opacity="0.78"/>
-  <circle cx="49" cy="15" r="4" fill="#38BDF8"/>
-  <circle cx="51" cy="49" r="4" fill="#6366F1"/>
-  <circle cx="32" cy="32" r="3.5" fill="#22C55E"/>
+  <rect x="3" y="3" width="58" height="58" rx="14" fill="#101010"/>
+  <rect x="3" y="3" width="58" height="58" rx="14" fill="url(#ks-glow)"/>
+  <rect x="3.5" y="3.5" width="57" height="57" rx="13.5" fill="none" stroke="url(#ks-frame)" stroke-width="1" stroke-opacity="0.65"/>
+  <rect x="19" y="11" width="9" height="42" rx="2" fill="url(#ks-spine)"/>
+  <rect x="20.5" y="15" width="6" height="9" rx="1.25" fill="#101010" fill-opacity="0.7"/>
+  <rect x="20.5" y="27.5" width="6" height="9" rx="1.25" fill="#101010" fill-opacity="0.7"/>
+  <rect x="20.5" y="40" width="6" height="9" rx="1.25" fill="#101010" fill-opacity="0.7"/>
+  <path d="M28 32L48 14" fill="none" stroke="url(#ks-stroke)" stroke-width="7" stroke-linecap="round"/>
+  <path d="M28 32L50 50" fill="none" stroke="url(#ks-stroke)" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="48" cy="14" r="3.25" fill="#FFB52A"/>
+  <circle cx="50" cy="50" r="3.25" fill="#F59E0B"/>
+  <circle cx="23.5" cy="32" r="2.75" fill="#FFCB47"/>
+  <path d="M8 18h6M8 32h6M8 46h6" fill="none" stroke="#F59E0B" stroke-width="1.5" stroke-linecap="round" stroke-opacity="0.55"/>
 </svg>
