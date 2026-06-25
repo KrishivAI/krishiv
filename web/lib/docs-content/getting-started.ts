@@ -720,7 +720,201 @@ Arrow / DataFusion operators, shuffle, state, sources, sinks
   <li><a href="/docs/latest/recipes/single-node-deploy">Single-node durable recipe</a> — quick local daemon setup.</li>
   <li><a href="/docs/latest/operations/scheduler">Scheduler</a> — coordinator lifecycle and task state machine.</li>
   <li><a href="/docs/latest/operations/shuffle">Shuffle</a> — backends and configuration.</li>
-  <li><a href="/docs/latest/operations/checkpointing">Checkpointing</a> — protocol and recovery.</li>
+    <li><a href="/docs/latest/operations/checkpointing">Checkpointing</a> — protocol and recovery.</li>
+</ul>
+`,
+  },
+
+  {
+    slug: 'concepts/incremental-flow',
+    group: 'Concepts',
+    title: 'IncrementalFlow',
+    description: 'The programmatic API for incremental view maintenance: sources, views, ticks, checkpoints, watches.',
+    status: 'Experimental',
+    body: `
+<p>Where <a href="/docs/latest/sql/incremental-views">Incremental Views</a> are the SQL face of IVM, <code>IncrementalFlow</code> is the Rust face. It gives you programmatic control over sources, views, ticks, checkpoints, and watches. Use it when you need a custom tick trigger, a non-SQL source, or a watch that pushes deltas to another system.</p>
+
+<h2 id="shape">Shape of a flow</h2>
+<pre><code class="language-rust">use krishiv_ivm::IncrementalFlow;
+
+let mut flow = IncrementalFlow::new();
+
+// 1. Declare one or more sources (record-batched inputs)
+flow.register_source("orders", orders_schema)?;
+
+// 2. Declare views as SQL; the flow orders them topologically
+flow.register_view("order_totals",
+    "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id")?;
+flow.register_view("top_customers",
+    "SELECT * FROM order_totals ORDER BY total DESC LIMIT 10")?;
+
+// 3. Drive ticks; each tick returns a StepSummary
+let summary = flow.tick("orders", delta_batch).await?;
+println!("rows_in={} rows_out={} duration_ms={}",
+    summary.rows_in, summary.rows_out, summary.duration_ms);
+
+// 4. Read snapshots (current materialised state) or watch for deltas
+let snapshot = flow.snapshot("top_customers").await?;
+let mut rx = flow.watch_output("top_customers")?;
+while let Some(delta) = rx.recv().await { /* … */ }
+</code></pre>
+
+<h2 id="step">Step and StepSummary</h2>
+<p>Each <code>tick(source, DeltaBatch)</code> call:</p>
+<ol>
+<li>Integrates the delta into the source's running snapshot (via <code>apply_delta</code>).</li>
+<li>Walks the view DAG in topological order.</li>
+<li>Diffs each view's full SQL result against its previous output to produce a true <code>DeltaBatch</code>.</li>
+<li>Emits the non-empty deltas to watches and downstream views.</li>
+</ol>
+<p>StepSummary reports <code>rows_in</code> (rows received this tick), <code>rows_out</code> (delta rows emitted), and <code>duration_ms</code>.</p>
+
+<h2 id="delta-batch">DeltaBatch (the data type)</h2>
+<p><code>DeltaBatch</code> is a <code>RecordBatch</code> with one extra <code>Int64</code> column named <code>_weight</code> (value <code>+1</code> for inserts, <code>-1</code> for retractions, <code>0</code> for cancelled-by-update). The runtime treats weights &ne; 0 as "row presence" with multiplicity; <code>0</code> weights are dropped before emission.</p>
+
+<h2 id="dirty">Dirty-bit scheduling</h2>
+<p>When the planner sees that a view's SQL references no dirty source or upstream view, that view is skipped in the tick. This makes the per-tick cost proportional to the size of the change, not the size of the data.</p>
+
+<h2 id="dedup">Content-addressed dedup</h2>
+<p>Opt-in per source. Krishiv hashes each incoming batch; identical back-to-back batches (same content) are coalesced. Capped at <code>DEDUP_SEEN_CAPACITY = 10 000 000</code> entries; older entries are dropped silently and counted via <code>krishiv_dedup_dropped_total</code>.</p>
+
+<h2 id="checkpoint">Checkpoint and restore</h2>
+<pre><code class="language-rust">flow.checkpoint("s3://bucket/krishiv/ivm/").await?;
+// … time passes, possibly failures …
+flow.restore("s3://bucket/krishiv/ivm/").await?;
+// the next tick resumes from the restored state
+</code></pre>
+<p>Delta checkpoints (per source) serialise only the delta since the last checkpoint. The full state is rebuilt by replaying deltas on restore.</p>
+
+<h2 id="checkpoint-full">Full checkpoints (for migrations)</h2>
+<p><code>checkpoint_full(path)</code> writes the entire materialised state, not just the delta. Use for cross-version migrations where the delta format may have changed.</p>
+
+<h2 id="force-diff">Coordinator-authoritative remote ticks</h2>
+<p>When a flow runs in distributed mode, <code>force_diff_based()</code> makes a remote tick bit-identical to a central tick. The coordinator acquires a per-job <code>step_lock</code>, parallelises the step across executors for partitioned views, and waits for all shards to finish before publishing. On failure it re-feeds the pending delta rather than re-computing from the source.</p>
+
+<h2 id="partitioning">Partitioned flows</h2>
+<p><code>PartitionedIncrementalFlow</code> shards the source data by a partition key (typically a hash of the primary key). Each shard is an independent flow; the coordinator merges the deltas. Use for very high-volume sources or when the materialised state does not fit in one executor's memory.</p>
+
+<h2 id="vector">Vector views</h2>
+<p>You can register a view whose body is a vector-store query (e.g. "k-nearest neighbours to this embedding"). The view's materialised state is a list of point ids + payloads. <code>IvmVectorSink::spawn_vector_view</code> wires a flow to a vector store; <code>VectorViewSpec</code> configures the distance metric and index parameters.</p>
+
+<h2 id="see-also">See also</h2>
+<ul>
+  <li><a href="/docs/latest/sql/incremental-views">Incremental Views (SQL)</a></li>
+  <li><a href="/docs/latest/state/timers">Timers</a></li>
+  <li><a href="/docs/latest/recipes/live-table">Live Table recipe</a></li>
+</ul>
+`,
+  },
+
+  {
+    slug: 'concepts/pipeline-builder',
+    group: 'Concepts',
+    title: 'Pipeline Builder',
+    description: 'Fluent Rust API for sources, views, sinks, CDC, and data-quality expectations.',
+    status: 'Available',
+    body: `
+<p>The Pipeline DSL is the canonical way to compose a multi-stage data flow in Rust. <code>PipelineBuilder</code> is the fluent entry point; <code>Pipeline</code> is the validated, runnable plan.</p>
+
+<h2 id="shape">Shape of a pipeline</h2>
+<pre><code class="language-rust">use krishiv_api::PipelineBuilder;
+
+let pipeline = PipelineBuilder::new("orders_to_totals")
+    .source("orders", source_cdc)             // CDC change stream
+    .source("users", source_memory)            // in-memory reference data
+    .view("enriched",
+          "SELECT o.*, u.tier FROM orders o JOIN users u ON o.user_id = u.id",
+          /* materialized = */ true)
+    .view("totals",
+          "SELECT user_id, SUM(amount) AS total FROM enriched GROUP BY user_id",
+          /* materialized = */ true)
+    .flow("top", "SELECT * FROM totals ORDER BY total DESC LIMIT 100")  // fan-in via UNION ALL
+    .sink_memory("enriched", vec![])         // also tee to memory for tests
+    .sink("totals", sink_iceberg)              // primary sink
+    .expect("totals", "non_negative_total",
+            "total &gt;= 0", OnViolation::Drop)
+    .build()?;
+
+pipeline.validate()?;
+let report = pipeline.run(RunPolicy::Coalesce).await?;
+</code></pre>
+
+<h2 id="modes">Pipeline modes</h2>
+<p><code>PipelineMode</code> is auto-inferred from the source kind:</p>
+<table class="api-table">
+<thead><tr><th>Source</th><th>Mode</th><th>Behavior</th></tr></thead>
+<tbody>
+<tr><td><code>source_cdc(...)</code></td><td><code>Ivm</code></td><td>Each tick produces a <code>DeltaBatch</code>; views are updated incrementally.</td></tr>
+<tr><td><code>source_memory(...)</code></td><td><code>Batch</code></td><td>The whole batch is run once; <code>run</code> blocks until the result is emitted.</td></tr>
+<tr><td>Any other</td><td><code>Stream</code></td><td>Continuous query with the configured trigger.</td></tr>
+</tbody>
+</table>
+<p>Override with <code>.mode(PipelineMode::Ivm)</code> when the inference is wrong (e.g. a Kafka source in a non-IVM pipeline).</p>
+
+<h2 id="sources">Sources</h2>
+<table class="api-table">
+<thead><tr><th>Method</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>.source(name, Ingest)</code></td><td>Bounded source: file, in-memory batches, or a SQL subquery.</td></tr>
+<tr><td><code>.source_cdc(name, Vec&lt;CdcChange&gt;)</code></td><td>CDC source: <code>insert</code> / <code>delete</code> / <code>update(before, after)</code> records.</td></tr>
+<tr><td><code>.source_memory(name, Vec&lt;RecordBatch&gt;)</code></td><td>In-memory batches (tests and one-shots).</td></tr>
+</tbody>
+</table>
+<p>For streaming sources (Kafka, Kinesis, Pulsar) build the flow with the lower-level <code>DataStreamWriter</code> or use <code>Pipeline::run</code> in stream mode against a registered source.</p>
+
+<h2 id="views">Views</h2>
+<table class="api-table">
+<thead><tr><th>Method</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>.view(name, sql, materialized)</code></td><td>Register a view. <code>materialized = true</code> materialises it; <code>false</code> inlines the query on read.</td></tr>
+<tr><td><code>.temp_view(name, sql)</code></td><td>A non-materialised view (always inlined). For ad-hoc helpers.</td></tr>
+<tr><td><code>.flow(target, sql)</code></td><td>Append a view to another view's <code>UNION ALL</code>. Use for fan-in pipelines.</td></tr>
+</tbody>
+</table>
+
+<h2 id="sinks">Sinks</h2>
+<table class="api-table">
+<thead><tr><th>Method</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>.sink(view, Egress)</code></td><td>Send a view's output to a sink (Parquet, Iceberg, Kafka, etc.).</td></tr>
+<tr><td><code>.sink_memory(view, Arc&lt;Mutex&lt;Vec&lt;RecordBatch&gt;&gt;&gt;)</code></td><td>Send to an in-memory buffer (tests, sampling).</td></tr>
+</tbody>
+</table>
+<p>One pipeline can fan out the same view to multiple sinks.</p>
+
+<h2 id="expectations">Expectations (DLT-style data quality)</h2>
+<p>Attach a quality gate to a view:</p>
+<pre><code class="language-rust">use krishiv_api::{Expectation, OnViolation};
+
+let exp = Expectation::new("totals", "non_negative_total", "total &gt;= 0", OnViolation::Drop);
+let pipeline = builder.expect("totals", "non_negative_total", "total &gt;= 0", OnViolation::Drop).build()?;
+</code></pre>
+<p><code>OnViolation::Drop</code> removes the offending rows; <code>OnViolation::Fail</code> fails the run. Counters in <code>krishiv_dataquality_dropped_total</code> and <code>krishiv_dataquality_failed_total</code>.</p>
+
+<h2 id="run-policy">RunPolicy</h2>
+<p>Controls how the runtime schedules ticks:</p>
+<ul>
+<li><code>RunPolicy::Coalesce</code> — batch up source updates that arrive within a window. Default for IVM and stream modes.</li>
+<li><code>RunPolicy::Immediate</code> — tick on every source update. Lowest latency, highest overhead.</li>
+<li><code>RunPolicy::Batched(interval)</code> — tick on a wall-clock interval. Use for backfills.</li>
+</ul>
+<p>Combine with <code>pipeline.run(policy)</code> to start, or <code>pipeline.refresh(policy)</code> to force a full-state rebuild from sources.</p>
+
+<h2 id="validate">Validation</h2>
+<p>Before <code>run</code>, <code>Pipeline::validate()</code> checks:</p>
+<ul>
+<li>All referenced sources exist.</li>
+<li>All view SQL parses.</li>
+<li>All sink connectors are available given the active Cargo features.</li>
+<li>The inferred mode matches the requested mode.</li>
+</ul>
+<p>Returns a <code>Vec&lt;ValidationError&gt;</code> (empty on success). Wire this into CI for pre-deployment checks.</p>
+
+<h2 id="see-also">See also</h2>
+<ul>
+  <li><a href="/docs/latest/sql/pipeline-ddl">Pipeline DDL</a></li>
+  <li><a href="/docs/latest/cli/pipeline">CLI: pipeline</a></li>
+  <li><a href="/docs/latest/connectors/quality">Data Quality &amp; Dead Letter</a></li>
 </ul>
 `,
   },

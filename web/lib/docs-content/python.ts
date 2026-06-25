@@ -170,91 +170,175 @@ result.show()
 <h2 id="overview">Overview</h2>
 <p><code>DataFrame</code> is lazy — operations build a logical plan. Execution happens on <code>collect()</code>, <code>show()</code>, or <code>write_*</code> methods.</p>
 
-<h2 id="transforms">Transformation Methods</h2>
 <div class="note-box"><strong>Common methods:</strong> <code>filter</code>, <code>select</code>, <code>group_by</code>, <code>agg</code>, <code>order_by</code>, <code>limit</code>, <code>join</code>, and <code>with_column</code> cover ~90% of batch transformations. Reach for <code>pivot</code>, <code>unpivot</code>, <code>sample</code>, and the rest only when you need them.</div>
-<table class="api-table">
-  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
-  <tbody>
-    <tr><td><code>select(*cols)</code></td><td><code>DataFrame</code></td><td>Project columns or Column expressions.</td></tr>
-    <tr><td><code>select_columns(*names)</code></td><td><code>DataFrame</code></td><td>Project by column name strings.</td></tr>
-    <tr><td><code>select_exprs(*exprs)</code></td><td><code>DataFrame</code></td><td>Project using SQL expression strings.</td></tr>
-    <tr><td><code>filter(condition)</code></td><td><code>DataFrame</code></td><td>Apply a boolean Column or SQL string condition.</td></tr>
-    <tr><td><code>filter_column(col_name, condition)</code></td><td><code>DataFrame</code></td><td>Filter using a named column and a Column condition.</td></tr>
-    <tr><td><code>group_by(*cols)</code></td><td><code>GroupedDataFrame</code></td><td>Group by columns for aggregation.</td></tr>
-    <tr><td><code>group_by_columns(*names)</code></td><td><code>GroupedDataFrame</code></td><td>Group by column name strings.</td></tr>
-    <tr><td><code>order_by(*cols, ascending=True)</code></td><td><code>DataFrame</code></td><td>Sort by columns or Column expressions.</td></tr>
-    <tr><td><code>sort(*cols)</code></td><td><code>DataFrame</code></td><td>Alias for <code>order_by</code>.</td></tr>
-    <tr><td><code>limit(n: int)</code></td><td><code>DataFrame</code></td><td>Keep at most <code>n</code> rows.</td></tr>
-    <tr><td><code>join(other, on, how='inner')</code></td><td><code>DataFrame</code></td><td>Join with another DataFrame.</td></tr>
-    <tr><td><code>join_on(other, condition, how='inner')</code></td><td><code>DataFrame</code></td><td>Join using a Column condition expression.</td></tr>
-    <tr><td><code>union(other)</code></td><td><code>DataFrame</code></td><td>UNION ALL (preserves duplicates).</td></tr>
-    <tr><td><code>union_distinct(other)</code></td><td><code>DataFrame</code></td><td>UNION DISTINCT.</td></tr>
-    <tr><td><code>intersect(other)</code></td><td><code>DataFrame</code></td><td>INTERSECT DISTINCT.</td></tr>
-    <tr><td><code>intersect_distinct(other)</code></td><td><code>DataFrame</code></td><td>Alias for <code>intersect</code>.</td></tr>
-    <tr><td><code>except_(other)</code></td><td><code>DataFrame</code></td><td>EXCEPT DISTINCT.</td></tr>
-    <tr><td><code>except_distinct(other)</code></td><td><code>DataFrame</code></td><td>Alias for <code>except_</code>.</td></tr>
-    <tr><td><code>distinct()</code></td><td><code>DataFrame</code></td><td>Remove duplicate rows.</td></tr>
-    <tr><td><code>with_column(name, col_expr)</code></td><td><code>DataFrame</code></td><td>Add or replace a column.</td></tr>
-    <tr><td><code>rename(old, new)</code></td><td><code>DataFrame</code></td><td>Rename a column.</td></tr>
-    <tr><td><code>drop_columns(*names)</code></td><td><code>DataFrame</code></td><td>Remove columns by name.</td></tr>
-    <tr><td><code>drop_nulls(*cols)</code></td><td><code>DataFrame</code></td><td>Drop rows with nulls in any (or specific) columns.</td></tr>
-    <tr><td><code>fill_null(value, *cols)</code></td><td><code>DataFrame</code></td><td>Fill null values with a constant or per-column map.</td></tr>
-    <tr><td><code>sample(fraction, seed=None)</code></td><td><code>DataFrame</code></td><td>Random row sampling.</td></tr>
-    <tr><td><code>repartition(n)</code></td><td><code>DataFrame</code></td><td>Set the output partition count.</td></tr>
-    <tr><td><code>alias(name)</code></td><td><code>DataFrame</code></td><td>Alias the DataFrame as a subquery name.</td></tr>
-    <tr><td><code>pivot(index, columns, values, agg='first')</code></td><td><code>DataFrame</code></td><td>Pivot rows to columns.</td></tr>
-    <tr><td><code>unpivot(ids, values, var_col, val_col)</code></td><td><code>DataFrame</code></td><td>Melt columns into rows.</td></tr>
-    <tr><td><code>cache()</code></td><td><code>DataFrame</code></td><td>Materialise and cache the result in memory.</td></tr>
-    <tr><td><code>persist()</code></td><td><code>DataFrame</code></td><td>Same as <code>cache()</code>.</td></tr>
-    <tr><td><code>unpersist()</code></td><td><code>DataFrame</code></td><td>Release cached data.</td></tr>
-    <tr><td><code>to_streaming()</code></td><td><code>StreamingDataFrame</code></td><td>Convert to a structured streaming DataFrame.</td></tr>
-  </tbody>
-</table>
 
-<h2 id="execution">Execution Methods</h2>
-<table class="api-table">
-  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
-  <tbody>
-    <tr><td><code>collect() -> list[RecordBatch]</code></td><td><code>list</code></td><td>Execute and collect all Arrow batches.</td></tr>
-    <tr><td><code>collect_async() -> Awaitable</code></td><td><code>Awaitable</code></td><td>Async collect for use in async contexts.</td></tr>
-    <tr><td><code>collect_batches() -> list[RecordBatch]</code></td><td><code>list</code></td><td>Alias for <code>collect()</code>.</td></tr>
-    <tr><td><code>collect_pretty() -> str</code></td><td><code>str</code></td><td>Execute and return a formatted ASCII table string.</td></tr>
-    <tr><td><code>collect_with_stats() -> tuple</code></td><td><code>tuple</code></td><td>Execute and return <code>(batches, ExecutionStats)</code>.</td></tr>
-    <tr><td><code>show(n=20)</code></td><td><code>None</code></td><td>Execute and print the first <code>n</code> rows.</td></tr>
-    <tr><td><code>describe() -> DataFrame</code></td><td><code>DataFrame</code></td><td>Return summary statistics (count, mean, std, min, max).</td></tr>
-    <tr><td><code>num_rows() -> int</code></td><td><code>int</code></td><td>Execute and return the row count.</td></tr>
-    <tr><td><code>execute_stream_async() -> Awaitable</code></td><td><code>Awaitable</code></td><td>Async execute returning a batch iterator.</td></tr>
-  </tbody>
-</table>
-
-<h2 id="metadata">Schema / Metadata</h2>
-<table class="api-table">
-  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
-  <tbody>
-    <tr><td><code>schema() -> Schema</code></td><td><code>Schema</code></td><td>Return the Arrow schema of the output.</td></tr>
-    <tr><td><code>columns() -> list[str]</code></td><td><code>list[str]</code></td><td>Return column names.</td></tr>
-    <tr><td><code>is_bounded() -> bool</code></td><td><code>bool</code></td><td>True for finite/batch DataFrames.</td></tr>
-    <tr><td><code>boundedness() -> str</code></td><td><code>str</code></td><td>"Bounded" or "Unbounded".</td></tr>
-    <tr><td><code>explain(verbose=False) -> str</code></td><td><code>str</code></td><td>Return the query plan as a string.</td></tr>
-    <tr><td><code>explain_logical() -> str</code></td><td><code>str</code></td><td>Return the logical plan only.</td></tr>
-    <tr><td><code>explain_mode(mode) -> str</code></td><td><code>str</code></td><td>Return plan in a specific format mode.</td></tr>
-    <tr><td><code>create_or_replace_temp_view(name)</code></td><td><code>None</code></td><td>Register the DataFrame as a named SQL temp view.</td></tr>
-  </tbody>
-</table>
-
-<h2 id="write">Write Methods</h2>
+<h2 id="project">Project / Schema</h2>
 <table class="api-table">
   <thead><tr><th>Method</th><th>Description</th></tr></thead>
   <tbody>
-    <tr><td><code>write_parquet(path, compression=None)</code></td><td>Write to a local Parquet file.</td></tr>
-    <tr><td><code>write_parquet_with_options(path, opts)</code></td><td>Write with typed options (compression, row_group_size).</td></tr>
-    <tr><td><code>write_csv(path)</code></td><td>Write to a CSV file.</td></tr>
-    <tr><td><code>write_csv_with_options(path, opts)</code></td><td>Write CSV with options (delimiter, has_header).</td></tr>
-    <tr><td><code>write_json(path)</code></td><td>Write as NDJSON.</td></tr>
-    <tr><td><code>write_file(path)</code></td><td>Write to a file (format inferred from extension).</td></tr>
-    <tr><td><code>write_stream() -> DataStreamWriter</code></td><td>Get a structured streaming writer for this DataFrame.</td></tr>
+    <tr><td><code>select(*cols)</code></td><td>Project by Column expressions, names, or SQL strings.</td></tr>
+    <tr><td><code>select_columns(*names)</code></td><td>Project by column name strings.</td></tr>
+    <tr><td><code>select_exprs(*exprs)</code></td><td>Project by SQL expression strings.</td></tr>
+    <tr><td><code>with_column(name, col_expr)</code></td><td>Add or replace a column.</td></tr>
+    <tr><td><code>drop_columns(*names)</code></td><td>Remove columns by name.</td></tr>
+    <tr><td><code>rename(old, new)</code></td><td>Rename a single column.</td></tr>
+    <tr><td><code>alias(name)</code></td><td>Alias the DataFrame as a subquery name.</td></tr>
   </tbody>
 </table>
+<pre><code class="language-python">df.select(col("customer_id"), sum(col("amount")).alias("total"))
+df.with_column("is_high_value", col("total") &gt; lit(1000))
+df.rename("cust", "customer_id")
+</code></pre>
+
+<h2 id="filter">Filter / Shape</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>filter(condition)</code></td><td>Boolean Column or SQL string.</td></tr>
+    <tr><td><code>filter_column(col_name, condition)</code></td><td>Filter on a named column.</td></tr>
+    <tr><td><code>where(condition)</code></td><td>Alias for <code>filter</code>.</td></tr>
+    <tr><td><code>limit(n: int)</code></td><td>Keep at most <code>n</code> rows.</td></tr>
+    <tr><td><code>distinct()</code></td><td>Remove duplicate rows.</td></tr>
+    <tr><td><code>drop_nulls(*cols)</code></td><td>Drop rows with NULL in any (or all) of the named columns.</td></tr>
+    <tr><td><code>fill_null(value, *cols)</code></td><td>Fill NULLs with a constant or a per-column map.</td></tr>
+    <tr><td><code>sample(fraction, seed=None)</code></td><td>Random row sampling (Bernoulli).</td></tr>
+    <tr><td><code>repartition(n)</code></td><td>Set the output partition count.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="group">Group / Aggregate</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>group_by(*cols)</code></td><td>Group by Column expressions.</td></tr>
+    <tr><td><code>group_by_columns(*names)</code></td><td>Group by column name strings.</td></tr>
+    <tr><td><code>GroupedDataFrame.agg(*exprs)</code></td><td>Apply aggregates. Returns a DataFrame.</td></tr>
+    <tr><td><code>GroupedDataFrame.agg_columns(*cols)</code></td><td>Typed-Column overload.</td></tr>
+    <tr><td><code>GroupedDataFrame.agg_grouping_sets(spec, *exprs)</code></td><td><code>GROUPING SETS</code> (or CUBE / ROLLUP via spec).</td></tr>
+    <tr><td><code>GroupedDataFrame.count()</code></td><td>Shorthand for <code>agg([count_all()])</code>.</td></tr>
+    <tr><td><code>GroupedDataFrame.cube(*cols)</code> / <code>rollup(*cols)</code></td><td>CUBE / ROLLUP shortcuts.</td></tr>
+  </tbody>
+</table>
+<pre><code class="language-python">(df.group_by("region")
+   .agg(sum(col("amount")).alias("total"),
+        count_all().alias("n"))
+   .order_by("total", ascending=False)
+   .limit(10))
+</code></pre>
+
+<h2 id="join">Join</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>join(other, on, how='inner')</code></td><td>Equi-join. <code>on</code> is a column name or a list.</td></tr>
+    <tr><td><code>join_on(other, condition, how='inner')</code></td><td>Join with an arbitrary ON expression (non-equi).</td></tr>
+  </tbody>
+</table>
+<p><code>how</code> is one of <code>'inner'</code>, <code>'left'</code>, <code>'right'</code>, <code>'full'</code>, <code>'left_semi'</code>, <code>'right_semi'</code>, <code>'left_anti'</code>, <code>'right_anti'</code>.</p>
+<p>For temporal / interval joins on streaming input, see <a href="/docs/latest/streaming/joins">Streaming Joins</a>.</p>
+
+<h2 id="set">Set operations</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>SQL</th></tr></thead>
+  <tbody>
+    <tr><td><code>union(other)</code></td><td><code>UNION ALL</code></td></tr>
+    <tr><td><code>union_distinct(other)</code></td><td><code>UNION DISTINCT</code></td></tr>
+    <tr><td><code>intersect(other)</code> / <code>intersect_distinct(other)</code></td><td><code>INTERSECT DISTINCT</code></td></tr>
+    <tr><td><code>except_(other)</code> / <code>except_distinct(other)</code></td><td><code>EXCEPT DISTINCT</code></td></tr>
+  </tbody>
+</table>
+<p>All require matching schemas. Use <code>select</code> first to align columns.</p>
+
+<h2 id="reshape">Reshape</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>pivot(group, pivot_column, aggregate, values)</code></td><td>Pivot rows to columns. <code>agg</code> defaults to <code>'first'</code>.</td></tr>
+    <tr><td><code>unpivot(ids, values, var_col, val_col)</code></td><td>Melt columns into rows.</td></tr>
+  </tbody>
+</table>
+<p>For the SQL syntax form of <code>PIVOT</code> / <code>UNPIVOT</code>, see <a href="/docs/latest/sql/pivot-unpivot">SQL PIVOT / UNPIVOT</a>.</p>
+
+<h2 id="stream">Stream</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>to_streaming()</code></td><td><code>StreamingDataFrame</code></td><td>Convert to a structured streaming pipeline.</td></tr>
+  </tbody>
+</table>
+<p>Once on a <code>StreamingDataFrame</code>, see <a href="/docs/latest/python/stream">Stream</a> for windowed, keyed, and side-output operators.</p>
+
+<h2 id="cache">Cache</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>cache()</code></td><td>Materialise in memory. Future <code>collect</code>/<code>show</code> skip recomputation.</td></tr>
+    <tr><td><code>persist()</code></td><td>Alias for <code>cache</code>.</td></tr>
+    <tr><td><code>unpersist()</code></td><td>Drop the cached materialisation.</td></tr>
+    <tr><td><code>create_or_replace_temp_view(name)</code></td><td>Register as a SQL temp view for the rest of the session.</td></tr>
+  </tbody>
+</table>
+<div class="note-box"><strong>Note:</strong> <code>cache</code> holds a copy in RAM. For large results, write to Parquet and re-read instead.</div>
+
+<h2 id="write">Write</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>write() -&gt; DataFrameWriter</code></td><td>Return a writer with format-specific options.</td></tr>
+    <tr><td><code>write_parquet(path, compression=None)</code></td><td>Local Parquet file or object-store URI.</td></tr>
+    <tr><td><code>write_parquet_with_options(path, *, compression, max_row_group_size)</code></td><td>Same with typed options.</td></tr>
+    <tr><td><code>write_csv(path)</code></td><td>Local CSV file.</td></tr>
+    <tr><td><code>write_csv_with_options(path, *, delimiter, has_header)</code></td><td>Same with options.</td></tr>
+    <tr><td><code>write_json(path)</code></td><td>NDJSON.</td></tr>
+    <tr><td><code>write_file(path, format, *, mode, partition_by, max_rows_per_file)</code></td><td>Unified writer; format inferred if omitted.</td></tr>
+    <tr><td><code>write_stream() -&gt; DataStreamWriter</code></td><td>Streaming writer. See <a href="/docs/latest/streaming/queries-and-lifecycle">Queries and Lifecycle</a>.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="execute">Execute</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>collect() -&gt; list[RecordBatch]</code></td><td>Execute and collect all Arrow batches.</td></tr>
+    <tr><td><code>collect_async() -&gt; Awaitable</code></td><td>Async version, for use in async contexts.</td></tr>
+    <tr><td><code>collect_batches()</code></td><td>Alias for <code>collect</code>.</td></tr>
+    <tr><td><code>collect_pretty() -&gt; str</code></td><td>Return a formatted ASCII table string.</td></tr>
+    <tr><td><code>collect_with_stats() -&gt; tuple</code></td><td>Returns <code>(batches, ExecutionStats)</code> with output_rows and cpu_nanos.</td></tr>
+    <tr><td><code>show(n=20)</code></td><td>Print the first <code>n</code> rows.</td></tr>
+    <tr><td><code>describe() -&gt; DataFrame</code></td><td>Summary statistics: count, null_count, mean, std, min, max, median.</td></tr>
+    <tr><td><code>num_rows() -&gt; int</code></td><td>Execute and return the row count.</td></tr>
+    <tr><td><code>execute_stream_async() -&gt; Awaitable</code></td><td>Async execute returning a batch iterator.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="explain">Explain</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>explain(verbose=False) -&gt; str</code></td><td>Default plan text (logical + physical).</td></tr>
+    <tr><td><code>explain_logical() -&gt; str</code></td><td>Logical plan only.</td></tr>
+    <tr><td><code>explain_mode(mode) -&gt; str</code></td><td>Specify the explain mode. <code>mode</code> is one of <code>'logical'</code>, <code>'physical'</code>, <code>'analyze'</code>.</td></tr>
+  </tbody>
+</table>
+<p><code>explain</code> is free — it does not run the plan, just inspects it. Use it to verify pushdown, partition pruning, and join order.</p>
+
+<h2 id="schema">Schema and metadata</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>schema() -&gt; Schema</code></td><td>Arrow schema of the output.</td></tr>
+    <tr><td><code>columns() -&gt; list[str]</code></td><td>Column names.</td></tr>
+    <tr><td><code>is_bounded() -&gt; bool</code></td><td>True for batch / False for streaming.</td></tr>
+    <tr><td><code>boundedness() -&gt; str</code></td><td><code>'bounded'</code> or <code>'unbounded'</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="see-also">See also</h2>
+<ul>
+  <li><a href="/docs/latest/rust/dataframe">Rust DataFrame</a> — same surface in Rust</li>
+  <li><a href="/docs/latest/python/stream">Python Stream</a> — for unbounded plans</li>
+  <li><a href="/docs/latest/streaming/queries-and-lifecycle">Queries and Lifecycle</a> — write_stream, output modes, triggers</li>
+</ul>
 `,
   },
 

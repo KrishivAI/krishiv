@@ -169,66 +169,162 @@ async fn main() -> Result&lt;()&gt; {
 <h2 id="overview">Overview</h2>
 <p><code>DataFrame</code> is a lazy plan builder. Operations compose a logical plan; execution only happens on <code>collect()</code>, <code>show()</code>, or <code>execute_stream()</code>.</p>
 
-<h2 id="transforms">Transformation Methods</h2>
 <div class="note-box"><strong>Common methods:</strong> <code>filter</code>, <code>select</code>, <code>group_by</code>, <code>agg</code>, <code>sort</code>, <code>limit</code>, <code>join</code>, and <code>with_column</code> cover ~90% of batch transformations. The rest are for specialized shapes.</div>
-<table class="api-table">
-  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
-  <tbody>
-    <tr><td><code>select(exprs)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Project columns or expressions.</td></tr>
-    <tr><td><code>select_columns(names)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Project by column name.</td></tr>
-    <tr><td><code>filter(expr: Expr)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Apply a boolean filter predicate.</td></tr>
-    <tr><td><code>group_by(exprs)</code></td><td><code>Result&lt;GroupedDataFrame&gt;</code></td><td>Group rows for aggregation.</td></tr>
-    <tr><td><code>sort(exprs)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Sort by expressions.</td></tr>
-    <tr><td><code>limit(n: usize)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Retain at most <code>n</code> rows.</td></tr>
-    <tr><td><code>join(right, kind, left_cols, right_cols)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Join with another DataFrame.</td></tr>
-    <tr><td><code>join_on(right, kind, expr)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Join using an arbitrary ON expression.</td></tr>
-    <tr><td><code>union(other)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>UNION ALL of two DataFrames.</td></tr>
-    <tr><td><code>union_distinct(other)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>UNION DISTINCT (deduplicated).</td></tr>
-    <tr><td><code>intersect(other)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>INTERSECT DISTINCT.</td></tr>
-    <tr><td><code>except(other)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>EXCEPT DISTINCT.</td></tr>
-    <tr><td><code>distinct()</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Remove duplicate rows.</td></tr>
-    <tr><td><code>with_column(name, expr)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Add or replace a column.</td></tr>
-    <tr><td><code>drop_columns(names)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Remove named columns.</td></tr>
-    <tr><td><code>rename(old, new)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Rename a column.</td></tr>
-    <tr><td><code>alias(name)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Alias the DataFrame as a subquery.</td></tr>
-    <tr><td><code>repartition(n)</code></td><td><code>Result&lt;DataFrame&gt;</code></td><td>Set the output partition count.</td></tr>
-    <tr><td><code>cache()</code></td><td><code>Future&lt;Result&lt;DataFrame&gt;&gt;</code></td><td>Materialise and cache results in-memory.</td></tr>
-  </tbody>
-</table>
 
-<h2 id="execution">Execution Methods</h2>
-<table class="api-table">
-  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
-  <tbody>
-    <tr><td><code>collect()</code></td><td><code>Future&lt;Result&lt;Vec&lt;RecordBatch&gt;&gt;&gt;</code></td><td>Execute and collect all batches into memory.</td></tr>
-    <tr><td><code>collect_partitioned()</code></td><td><code>Future&lt;Result&lt;Vec&lt;Vec&lt;RecordBatch&gt;&gt;&gt;&gt;</code></td><td>Collect preserving partition boundaries.</td></tr>
-    <tr><td><code>show()</code></td><td><code>Future&lt;Result&lt;()&gt;&gt;</code></td><td>Execute and print a formatted table to stdout.</td></tr>
-    <tr><td><code>execute_stream()</code></td><td><code>Future&lt;Result&lt;SendableRecordBatchStream&gt;&gt;</code></td><td>Execute as a streaming batch iterator.</td></tr>
-    <tr><td><code>explain(verbose: bool)</code></td><td><code>Future&lt;Result&lt;DataFrame&gt;&gt;</code></td><td>Return a DataFrame containing the plan text.</td></tr>
-    <tr><td><code>explain_mode(mode: ExplainMode)</code></td><td><code>Future&lt;Result&lt;DataFrame&gt;&gt;</code></td><td>Return plan text in the requested explain format.</td></tr>
-  </tbody>
-</table>
-
-<h2 id="schema">Schema / Metadata</h2>
-<table class="api-table">
-  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
-  <tbody>
-    <tr><td><code>schema()</code></td><td><code>&amp;Schema</code></td><td>Return the logical output schema.</td></tr>
-    <tr><td><code>columns()</code></td><td><code>Vec&lt;&amp;str&gt;</code></td><td>Return column names.</td></tr>
-    <tr><td><code>is_bounded()</code></td><td><code>bool</code></td><td>True if the plan is finite/batch; false if unbounded/streaming.</td></tr>
-    <tr><td><code>boundedness()</code></td><td><code>Boundedness</code></td><td>Enum: <code>Bounded</code> or <code>Unbounded</code>.</td></tr>
-  </tbody>
-</table>
-
-<h2 id="io">Write Methods</h2>
+<h2 id="project">Project / Schema</h2>
 <table class="api-table">
   <thead><tr><th>Method</th><th>Description</th></tr></thead>
   <tbody>
-    <tr><td><code>write_parquet(path, opts)</code></td><td>Write results to a local Parquet file.</td></tr>
-    <tr><td><code>write_csv(path, opts)</code></td><td>Write results to a CSV file.</td></tr>
-    <tr><td><code>write_json(path)</code></td><td>Write results as NDJSON.</td></tr>
+    <tr><td><code>select(&amp;[Expr])</code></td><td>Project by expressions: column refs, literals, function calls.</td></tr>
+    <tr><td><code>select_columns(&amp;[&amp;str])</code></td><td>Project by column name strings.</td></tr>
+    <tr><td><code>select_exprs(&amp;[&amp;str])</code></td><td>Project by SQL expression strings.</td></tr>
+    <tr><td><code>with_column(name, expr)</code></td><td>Add or replace a column. Use for derived columns that reference the input.</td></tr>
+    <tr><td><code>drop_columns(&amp;[&amp;str])</code></td><td>Remove named columns.</td></tr>
+    <tr><td><code>rename(old, new)</code></td><td>Rename a single column.</td></tr>
+    <tr><td><code>alias(name)</code></td><td>Alias the DataFrame as a subquery name. Affects the generated SQL only.</td></tr>
   </tbody>
 </table>
+<pre><code class="language-rust">df.select(&amp;[col("customer_id"), sum(col("amount")).alias("total")])?
+df.with_column("is_high_value", col("total").gt(lit(1000)))?
+df.rename("cust", "customer_id")?
+</code></pre>
+
+<h2 id="filter">Filter / Shape</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>filter(Expr)</code></td><td>Apply a boolean filter predicate.</td></tr>
+    <tr><td><code>where(Expr)</code></td><td>Alias for <code>filter</code>.</td></tr>
+    <tr><td><code>limit(n: usize)</code></td><td>Retain at most <code>n</code> rows.</td></tr>
+    <tr><td><code>distinct()</code></td><td>Remove duplicate rows.</td></tr>
+    <tr><td><code>drop_nulls(&amp;[&amp;str])</code></td><td>Drop rows with NULL in any of the named columns.</td></tr>
+    <tr><td><code>fill_null(column, value)</code></td><td>Fill NULLs in a column with a constant or a per-column map.</td></tr>
+    <tr><td><code>sample(fraction: f64)</code></td><td>Bernoulli sample: keep each row with probability <code>fraction</code>.</td></tr>
+    <tr><td><code>repartition(n: usize, key_columns)</code></td><td>Insert a hash exchange on <code>key_columns</code> and produce <code>n</code> partitions. Without <code>key_columns</code>, this is a round-robin repartition.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="group">Group / Aggregate</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>group_by(&amp;[Expr])</code></td><td>Group rows for aggregation. Returns a <code>GroupedDataFrame</code>.</td></tr>
+    <tr><td><code>GroupedDataFrame::agg(&amp;[Expr])</code></td><td>Apply aggregates to each group.</td></tr>
+    <tr><td><code>GroupedDataFrame::agg_grouping_sets(spec, &amp;[Expr])</code></td><td>Aggregates with <code>GROUPING SETS</code> (or <code>CUBE</code> / <code>ROLLUP</code> via the <code>GroupingSpec</code> enum).</td></tr>
+    <tr><td><code>GroupedDataFrame::count()</code></td><td>Shorthand for <code>agg([count_all()])</code>.</td></tr>
+  </tbody>
+</table>
+<pre><code class="language-rust">df.group_by(&amp;[col("region")])?
+  .agg(&amp;[sum(col("amount")).alias("total"), count_all().alias("n")])?
+</code></pre>
+
+<h2 id="join">Join</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>join(right, JoinType, left_cols, right_cols)</code></td><td>Equi-join on matching column names.</td></tr>
+    <tr><td><code>join_on(right, JoinType, expr)</code></td><td>Join with an arbitrary ON expression (non-equi).</td></tr>
+  </tbody>
+</table>
+<p><code>JoinType</code> is an enum: <code>Inner</code>, <code>Left</code>, <code>Right</code>, <code>Full</code>, <code>LeftSemi</code>, <code>RightSemi</code>, <code>LeftAnti</code>, <code>RightAnti</code>.</p>
+<p>For temporal / interval joins on streaming input, see <a href="/docs/latest/streaming/joins">Streaming Joins</a>.</p>
+
+<h2 id="set">Set operations</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>SQL</th></tr></thead>
+  <tbody>
+    <tr><td><code>union(other)</code></td><td><code>UNION ALL</code></td></tr>
+    <tr><td><code>union_distinct(other)</code></td><td><code>UNION DISTINCT</code></td></tr>
+    <tr><td><code>intersect(other)</code></td><td><code>INTERSECT DISTINCT</code></td></tr>
+    <tr><td><code>except(other)</code></td><td><code>EXCEPT DISTINCT</code></td></tr>
+  </tbody>
+</table>
+<p>All four require matching schemas. Use <code>select</code> first to align columns.</p>
+
+<h2 id="stream">Stream</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>stream()</code></td><td><code>StreamingDataFrame</code></td><td>Convert a bounded plan into a streaming pipeline.</td></tr>
+    <tr><td><code>to_streaming()</code></td><td><code>StreamingDataFrame</code></td><td>Alias.</td></tr>
+  </tbody>
+</table>
+<p>Once on a <code>StreamingDataFrame</code>, see <a href="/docs/latest/rust/stream">Stream</a> for windowed, keyed, and side-output operators.</p>
+
+<h2 id="cache">Cache</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>cache()</code></td><td>Materialise the result in memory and reuse it. Future <code>collect</code>/<code>show</code> skip recomputation.</td></tr>
+    <tr><td><code>persist()</code></td><td>Alias for <code>cache</code>.</td></tr>
+    <tr><td><code>unpersist()</code></td><td>Drop the cached materialisation.</td></tr>
+    <tr><td><code>create_or_replace_temp_view(name)</code></td><td>Register the DataFrame as a SQL temp view for the rest of the session.</td></tr>
+  </tbody>
+</table>
+<div class="note-box"><strong>Note:</strong> <code>cache</code> holds a copy in RAM. For large results, write to Parquet/CSV/JSON and re-read instead.</div>
+
+<h2 id="write">Write</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>write() -&gt; DataFrameWriter</code></td><td>Return a writer with format-specific options.</td></tr>
+    <tr><td><code>write_parquet(path)</code></td><td>Write to a local Parquet file or object-store URI.</td></tr>
+    <tr><td><code>write_parquet_with_options(path, opts)</code></td><td>Same with compression, row group size, etc.</td></tr>
+    <tr><td><code>write_parquet_overwrite_partition(path, partition_by)</code></td><td><code>INSERT OVERWRITE TABLE … PARTITION (…)</code> semantics. <em>Returns <code>KrishivError::Unsupported</code> in embedded mode.</em></td></tr>
+    <tr><td><code>write_csv(path)</code></td><td>Write to a CSV file.</td></tr>
+    <tr><td><code>write_csv_with_options(path, opts)</code></td><td>Same with delimiter / <code>has_header</code> options.</td></tr>
+    <tr><td><code>write_json(path)</code></td><td>Write as NDJSON.</td></tr>
+    <tr><td><code>write_stream() -&gt; DataStreamWriter</code></td><td>Return a streaming writer for this DataFrame. See <a href="/docs/latest/streaming/queries-and-lifecycle">Queries and Lifecycle</a>.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="execute">Execute</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>collect()</code></td><td><code>Future&lt;Result&lt;QueryResult&gt;&gt;</code></td><td>Execute and collect. Calling on a streaming plan returns <code>KrishivError::Unsupported</code>.</td></tr>
+    <tr><td><code>collect_async()</code></td><td>Async version.</td></tr>
+    <tr><td><code>collect_partitioned()</code></td><td>Collect preserving partition boundaries.</td></tr>
+    <tr><td><code>collect_with_stats()</code></td><td>Returns <code>(QueryResult, QueryExecutionStats)</code> with output_rows and cpu_nanos.</td></tr>
+    <tr><td><code>execute() -&gt; ExecutionResult</code></td><td>Unified batch-or-stream entry: returns <code>Batch(Vec&lt;RecordBatch&gt;)</code> for bounded plans, <code>Stream(KrishivStream)</code> for unbounded.</td></tr>
+    <tr><td><code>execute_stream_async()</code></td><td><code>KrishivStream</code></td><td>Pin&lt;Box&lt;dyn Stream&gt;&gt; for streaming plans.</td></tr>
+    <tr><td><code>submit_async()</code></td><td><code>QueryHandle</code></td><td>Submit the plan asynchronously and return a handle for status / cancellation.</td></tr>
+    <tr><td><code>show(n)</code></td><td>Execute and print the first <code>n</code> rows (default 20).</td></tr>
+    <tr><td><code>describe()</code></td><td>Return a DataFrame with summary statistics: count, null_count, mean, std, min, max, median.</td></tr>
+    <tr><td><code>num_rows()</code></td><td><code>Result&lt;usize&gt;</code></td><td>Execute and return the row count.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="explain">Explain</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>explain() -&gt; String</code></td><td>Default plan text (logical + physical).</td></tr>
+    <tr><td><code>explain_logical() -&gt; String</code></td><td>Logical plan only.</td></tr>
+    <tr><td><code>explain(verbose: bool)</code></td><td>Detailed plan with operator stats.</td></tr>
+    <tr><td><code>explain_mode(ExplainMode) -&gt; String</code></td><td>Specify the explain mode. <code>ExplainMode ∈ {Logical, Physical, Analyze}</code>.</td></tr>
+  </tbody>
+</table>
+<p><code>Explain</code> is free — it does not run the plan, just inspects the logical and physical plans. Use it to verify pushdown, partition pruning, and join order.</p>
+
+<h2 id="schema-meta">Schema and metadata</h2>
+<table class="api-table">
+  <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>schema() -&gt; &amp;Schema</code></td><td>Logical output schema.</td></tr>
+    <tr><td><code>columns() -&gt; Vec&lt;&amp;str&gt;</code></td><td>Column names.</td></tr>
+    <tr><td><code>logical_plan() -&gt; &amp;LogicalPlan</code></td><td>The unoptimised logical plan tree.</td></tr>
+    <tr><td><code>boundedness() -&gt; Boundedness</code></td><td><code>Bounded</code> or <code>Unbounded</code>.</td></tr>
+    <tr><td><code>is_bounded() -&gt; bool</code></td><td>Shorthand.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="see-also">See also</h2>
+<ul>
+  <li><a href="/docs/latest/python/dataframe">Python DataFrame</a> — same surface in Python</li>
+  <li><a href="/docs/latest/rust/stream">Stream</a> — for unbounded plans</li>
+  <li><a href="/docs/latest/streaming/queries-and-lifecycle">Queries and Lifecycle</a> — write_stream, output modes, triggers</li>
+</ul>
 `,
   },
 

@@ -5,6 +5,11 @@ import { rustPages } from './docs-content/rust';
 import { pythonPages } from './docs-content/python';
 import { connectorsPages } from './docs-content/connectors';
 import { recipesPages } from './docs-content/recipes';
+import { streamingPages } from './docs-content/streaming';
+import { statePages } from './docs-content/state';
+import { observabilityPages } from './docs-content/observability';
+import { cliPages } from './docs-content/cli';
+import { toolingPages } from './docs-content/tooling';
 
 export type DocStatus = 'Available' | 'Experimental' | 'In Progress' | 'Preview' | 'Planned';
 
@@ -15,6 +20,8 @@ export type DocPage = {
   status: DocStatus;
   group: string;
   body: string;
+  feature_flags?: string[];
+  since?: string;
 };
 
 export const GROUP_ORDER = [
@@ -22,19 +29,29 @@ export const GROUP_ORDER = [
   'Concepts',
   'Recipes',
   'SQL Reference',
+  'Streaming',
+  'State',
+  'CLI Reference',
+  'Observability',
   'Rust API',
   'Python API',
   'Connectors',
+  'Tooling',
   'Operations',
 ] as const;
 
 export const docPages: DocPage[] = [
   ...gettingStartedPages,
   ...recipesPages,
+  ...streamingPages,
+  ...statePages,
+  ...cliPages,
+  ...observabilityPages,
   ...sqlPages,
   ...rustPages,
   ...pythonPages,
   ...connectorsPages,
+  ...toolingPages,
 ];
 
 export type GroupedPages = { group: string; pages: DocPage[] };
