@@ -427,12 +427,10 @@ async fn streaming_e2e_coordinator_reattach_preserves_watermark() {
             .unwrap();
     }
 
-    let (task_id, lease) = {
+    let task_id = {
         let coordinator = shared.read().await;
         let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
-        let task_id = detail.stages()[0].tasks()[0].task_id().clone();
-        let lease = coordinator.executor_snapshots()[0].lease_generation();
-        (task_id, lease)
+        detail.stages()[0].tasks()[0].task_id().clone()
     };
 
     {
@@ -441,6 +439,12 @@ async fn streaming_e2e_coordinator_reattach_preserves_watermark() {
         coordinator.persist_jobs_to_store(&mut store).unwrap();
         coordinator.recover_from_store(&store).unwrap();
     }
+
+    // Read the lease AFTER recover_from_store: the recovery path calls
+    // advance_clock(heartbeat_timeout_ticks) to evict stale executors, which
+    // marks the registered executor Lost and bumps its lease generation.
+    // The heartbeat must use the current (post-recovery) lease.
+    let lease = shared.read().await.executor_snapshots()[0].lease_generation();
 
     let reported_watermark_ms: i64 = 7_500;
     let reported_offset = b"events:0:offset-99".to_vec();

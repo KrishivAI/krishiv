@@ -255,6 +255,11 @@ pub struct ContinuousWindowExecutor {
     state_dir: Option<std::path::PathBuf>,
     watermark: WatermarkTracker,
     operator: Option<WindowOperatorState>,
+    /// Snapshot bytes to load as a full restore on the next operator init.
+    /// Set by `restore_from_snapshot` when the operator hasn't been built yet.
+    pending_restore: Option<Vec<u8>>,
+    /// Additional snapshots to merge additively after `pending_restore` is applied.
+    pending_merges: Vec<Vec<u8>>,
     /// Optional data-quality gate applied to each emitted output batch.
     quality_hook: Option<Box<dyn StreamQualityHook>>,
     /// Most recently computed event-time watermark in milliseconds.
@@ -294,6 +299,8 @@ impl ContinuousWindowExecutor {
             agg_exprs,
             state_dir: state_dir.map(|p| p.to_path_buf()),
             operator: None,
+            pending_restore: None,
+            pending_merges: Vec::new(),
             quality_hook: None,
             last_watermark_ms: None,
             rejected_rows_total: 0,
@@ -340,12 +347,22 @@ impl ContinuousWindowExecutor {
         // of hardcoding `false` (which silently truncates Float64 to Int64).
         if self.operator.is_none() && !input_batches.is_empty() {
             let agg_is_float = infer_agg_is_float(&input_batches[0], &self.agg_exprs)?;
-            self.operator = Some(build_operator(
+            let mut op = build_operator(
                 &self.spec,
                 &self.agg_exprs,
                 self.state_dir.as_deref(),
                 &agg_is_float,
-            )?);
+            )?;
+            if let Some(bytes) = self.pending_restore.take() {
+                op.load_snapshot_bytes(&bytes)
+                    .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?;
+            }
+            for bytes in std::mem::take(&mut self.pending_merges) {
+                op.merge_snapshot_bytes(&bytes).map_err(|e| {
+                    ExecError::InvalidWindowConfig(format!("merge restore failed: {e}"))
+                })?;
+            }
+            self.operator = Some(op);
         }
 
         let Some(op) = &mut self.operator else {
@@ -442,12 +459,22 @@ impl ContinuousWindowExecutor {
         // Lazy-init operator from first batch's schema (Float64 awareness).
         if self.operator.is_none() {
             let agg_is_float = infer_agg_is_float(&input_batches[0], &self.agg_exprs)?;
-            self.operator = Some(build_operator(
+            let mut op = build_operator(
                 &self.spec,
                 &self.agg_exprs,
                 self.state_dir.as_deref(),
                 &agg_is_float,
-            )?);
+            )?;
+            if let Some(bytes) = self.pending_restore.take() {
+                op.load_snapshot_bytes(&bytes)
+                    .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?;
+            }
+            for bytes in std::mem::take(&mut self.pending_merges) {
+                op.merge_snapshot_bytes(&bytes).map_err(|e| {
+                    ExecError::InvalidWindowConfig(format!("merge restore failed: {e}"))
+                })?;
+            }
+            self.operator = Some(op);
         }
 
         // Eagerly purge TTL-expired entries BEFORE taking the snapshot so that
@@ -571,13 +598,15 @@ impl ContinuousWindowExecutor {
     /// [`drain`] calls when resuming an executor from a checkpoint.
     pub fn restore_from_snapshot(&mut self, bytes: &[u8]) -> ExecResult<()> {
         match &mut self.operator {
-            Some(op) => op
-                .load_snapshot_bytes(bytes)
-                .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?,
+            Some(op) => {
+                op.load_snapshot_bytes(bytes)
+                    .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?;
+            }
             None => {
-                return Err(ExecError::InvalidWindowConfig(
-                    "cannot restore snapshot before operator is initialized".into(),
-                ));
+                // Operator is built lazily on the first batch; stash the
+                // snapshot so it is applied immediately after initialization.
+                self.pending_restore = Some(bytes.to_vec());
+                self.pending_merges.clear();
             }
         }
         self.last_watermark_ms = None;
@@ -596,9 +625,13 @@ impl ContinuousWindowExecutor {
             Some(op) => op
                 .merge_snapshot_bytes(bytes)
                 .map_err(|e| ExecError::InvalidWindowConfig(format!("merge restore failed: {e}"))),
-            None => Err(ExecError::InvalidWindowConfig(
-                "cannot merge snapshot before operator is initialized".into(),
-            )),
+            None => {
+                // Operator is built lazily; stash the merge to apply after init.
+                // A merge without a prior restore is still valid (idempotent merge
+                // of disjoint task snapshots during a rescaled recovery).
+                self.pending_merges.push(bytes.to_vec());
+                Ok(())
+            }
         }
     }
 }
@@ -711,6 +744,27 @@ mod tests {
                 .to_string()
                 .contains("aggregate input column 'amount' not found")
         );
+    }
+
+    #[test]
+    fn restore_before_first_drain_applies_snapshot_on_next_batch() {
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+
+        // First executor: run one batch and snapshot.
+        let mut exec1 = ContinuousWindowExecutor::new(spec.clone()).expect("create");
+        exec1.drain(vec![events_batch(5_000)]).expect("drain1");
+        let snap = exec1.snapshot().expect("snapshot");
+
+        // Second executor: restore BEFORE any drain (operator is None).
+        let mut exec2 = ContinuousWindowExecutor::new(spec).expect("create");
+        exec2
+            .restore_from_snapshot(&snap)
+            .expect("restore before first drain must not fail");
+
+        // The first drain after restore should succeed and apply the snapshot.
+        exec2
+            .drain(vec![events_batch(15_000)])
+            .expect("drain after deferred restore must succeed");
     }
 
     #[test]
