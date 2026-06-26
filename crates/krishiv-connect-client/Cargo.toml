@@ -1,0 +1,16 @@
+[package]
+name = "krishiv-connect-client"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight Spark Connect-style client for Krishiv over Flight SQL"
+
+[dependencies]
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+[lints]
+workspace = true
