@@ -99,6 +99,45 @@ cargo test -p krishiv-state --lib                   327 passed
 
 ---
 
+## 2026-06-26 — Post-audit fix batch (Fixes #1–#8)
+
+### Fixes applied
+
+| Fix | Description | Key files |
+|-----|-------------|-----------|
+| #2 | `peek_snapshot_bytes()` — read-only snapshot (no `checkpoint()` side-effect); queryable state wired into streaming runner | `continuous.rs`, `streaming.rs`, `executor_task_runner.rs`, `in_process.rs` |
+| #3 | `execute_window_join_fragment` dispatch for `window-join:<json>` fragments | `streaming.rs` |
+| #4/#7 | `GroupStateExecutor` LRU eviction via IndexMap; correct `apply_group_state` (timeout independent of state value) | `group_state.rs` |
+| #5 | `concat_row_batches` prefixes colliding column names with `left_`/`right_` | `watermark_join.rs` |
+| #6 | `GroupStateSnapshot` and `WatermarkWindowJoinOperator` snapshot/restore | `group_state.rs`, `watermark_join.rs` |
+| #8 | `push_store` threaded into `ShuffleContext` for T12 push-shuffle path | `task_output.rs`, `batch.rs`, `cli.rs`, `core.rs.inc` |
+| ST8 | `WatermarkWindowJoinOperator` — wraps `PerKeyIntervalJoin`, evicts on watermark advance | `watermark_join.rs` |
+| K | `GroupStateFn`/`GroupStateExecutor` — Spark `mapGroupsWithState` equivalent | `group_state.rs` |
+
+### Validation
+
+```
+cargo fmt --check                          pass
+cargo clippy -p krishiv-dataflow
+  -p krishiv-executor -p krishiv-shuffle
+  -p krishiv-state -- -D warnings          pass (0 warnings)
+cargo test -p krishiv-dataflow --lib       266 passed, 0 failed
+cargo test -p krishiv-executor --lib       218 passed, 3 pre-existing failures
+```
+
+Pre-existing failures (existed at bb27dc3, unrelated to these changes):
+- `phase3_recovery::full_checkpoint_kill_restore_cycle_preserves_window_state` — restore called before lazy operator init
+- `phase3_recovery::soak_repeated_kill_restore_preserves_aggregates` — same root cause
+- `streaming_e2e_coordinator_reattach_preserves_watermark` — `recover_from_store` calls `advance_clock(3)` which marks the registered executor Lost and bumps its lease; test captures stale lease
+
+### Next useful task
+
+Fix the 3 pre-existing test failures:
+1. `ContinuousWindowExecutor::restore_from_snapshot` should eagerly initialize the operator if None (lazy init blocks restore)
+2. `streaming_e2e_coordinator_reattach_preserves_watermark` test should capture lease after `recover_from_store`, not before
+
+---
+
 ## 2026-06-26 — Spark/Flink parity gap batch: P1–P12 enhancements
 
 ### Tasks completed
