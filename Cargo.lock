@@ -5345,6 +5345,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-connect-client"
+version = "0.1.0"
+dependencies = [
+ "arrow 58.3.0",
+ "arrow-flight",
+ "bytes",
+ "futures",
+ "tokio",
+ "tonic 0.14.6",
+]
+
+[[package]]
 name = "krishiv-connectors"
 version = "0.1.0"
 dependencies = [
@@ -5455,6 +5467,7 @@ dependencies = [
  "krishiv-state",
  "object_store 0.13.2",
  "parquet 58.3.0",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tempfile",

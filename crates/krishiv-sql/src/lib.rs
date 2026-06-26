@@ -25,6 +25,7 @@ use object_store::aws::AmazonS3Builder;
 use krishiv_plan::optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
+pub mod analyze;
 pub mod catalog;
 pub mod cep_sql;
 mod connector_table;
@@ -3050,6 +3051,11 @@ fn public_data_type_to_arrow(
                 .collect::<Vec<_>>()
                 .into(),
         ),
+        // Variant: stored as JSON-encoded UTF-8 until Arrow gains a
+        // native variant logical type. Read/write paths use Utf8
+        // columns and the datafusion engine treats the values as
+        // opaque strings.
+        ExprDataType::Variant => DataType::Utf8,
     }
 }
 

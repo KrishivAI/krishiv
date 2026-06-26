@@ -18,6 +18,9 @@ pub mod csv_json;
 pub mod elasticsearch_sink;
 #[cfg(feature = "hbase")]
 pub mod hbase_connector;
+/// T9: JDBC source/sink implementation (Postgres; MySQL requires mysql sqlx feature).
+#[cfg(feature = "jdbc")]
+pub mod jdbc;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 #[cfg(feature = "kafka")]
@@ -36,9 +39,6 @@ pub mod schema_normalize;
 pub mod schema_registry;
 /// T9: SQL connector support (Postgres / MySQL / MSSQL / Oracle).
 pub mod sql;
-/// T9: JDBC source/sink implementation (Postgres; MySQL requires mysql sqlx feature).
-#[cfg(feature = "jdbc")]
-pub mod jdbc;
 pub mod transactional;
 #[cfg(feature = "kafka")]
 pub mod transactional_kafka;
@@ -73,11 +73,11 @@ pub use error::{ConnectorError, ConnectorResult};
 #[cfg(feature = "kafka")]
 pub use kafka_transactional_sink::RdkafkaTransactionalSink;
 pub use offset::{CommitHandle, MultiFileOffset, Offset, OffsetCommitter, ParquetOffset};
+pub use parquet::ParquetDirectorySource;
 pub use quality::{
     CompiledDataQualityConfig, CompiledQualityRule, ConnectorQualityHook, DataQualityCheckResult,
     DataQualityConfig, DataQualityRule, DeadLetterSink, QualityAction, RejectedRow,
 };
-pub use parquet::ParquetDirectorySource;
 pub use registry::{
     ConnectorDescriptor, ConnectorKind, ConnectorRegistry, ConnectorRole, OpenedTwoPhaseSink,
     SinkDriver, SourceDriver, TwoPhaseSinkDriver, default_registry,
@@ -116,10 +116,10 @@ pub use lakehouse::{
     LakehouseTable, MemoryDeltaStore, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable,
     MergeDeltaResult, MultiWriterGuard, PartitionField, PartitionSpecResolver,
     PartitionSpecVersion, RedbDeltaStore, SchemaField, SchemaVersion, StagedSnapshot,
-    check_write_precondition, kafka_offsets_json, merge_delta, parse_kafka_offsets_json,
-    ensure_hoodie_properties, read_hoodie_properties, remove_merge_key_column,
-    vacuum_hudi_table, vacuum_table, read_table_at_timestamp,
-    write_delta, write_hudi_cow_append, write_hudi_cow_fixture, write_hudi_cow_upsert,
+    check_write_precondition, ensure_hoodie_properties, kafka_offsets_json, merge_delta,
+    parse_kafka_offsets_json, read_hoodie_properties, read_table_at_timestamp,
+    remove_merge_key_column, vacuum_hudi_table, vacuum_table, write_delta, write_hudi_cow_append,
+    write_hudi_cow_fixture, write_hudi_cow_upsert,
 };
 #[cfg(all(feature = "lakehouse", feature = "kafka"))]
 pub use lakehouse::{KafkaDeltaStore, RdkafkaDeltaStore};

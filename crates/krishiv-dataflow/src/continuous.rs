@@ -544,6 +544,19 @@ impl ContinuousWindowExecutor {
         }
     }
 
+    /// Serialize state backend contents without running `checkpoint()`.
+    ///
+    /// Use this for read-only observation (e.g. queryable state) where you
+    /// must not mutate the operator state as a side effect.
+    pub fn peek_snapshot_bytes(&self) -> ExecResult<Vec<u8>> {
+        match &self.operator {
+            Some(op) => op
+                .snapshot_state_bytes()
+                .map_err(|e| ExecError::InvalidWindowConfig(format!("peek snapshot failed: {e}"))),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Most recently observed watermark, used to restore `last_watermark_ms`
     /// after a snapshot/restore cycle.
     pub fn last_watermark_ms(&self) -> i64 {

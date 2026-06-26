@@ -9,11 +9,11 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 
+use crate::partition::{discover_hive_partitions, inject_partition_columns, list_parquet_files};
 use crate::{
     CheckpointSource, ConnectorCapabilities, ConnectorError, ConnectorResult, MultiFileOffset,
     ParquetOffset, Sink, Source,
 };
-use crate::partition::{discover_hive_partitions, inject_partition_columns, list_parquet_files};
 
 // ---------------------------------------------------------------------------
 // ParquetSource
@@ -116,7 +116,82 @@ impl ParquetSource {
         })?;
         let schema = builder.schema().clone();
         let row_count = u64::try_from(builder.metadata().file_metadata().num_rows()).ok();
+        // Bloom-filter inventory: at minimum, surface which columns have
+        // bloom filters in the file footer. The DataFusion layer (when
+        // enabled) uses this to apply a probe-side runtime filter.
+        let _ = Self::probe_bloom_filters_from_metadata(builder.metadata());
         Ok((schema, row_count))
+    }
+
+    /// Probe the file footer for bloom-filter metadata. The current
+    /// `parquet = 58.x` crate does not expose `with_bloom_filter` on
+    /// the reader builder, but it does expose the column-level bloom
+    /// filter information via the file metadata. We surface the
+    /// presence as a `tracing::debug!` line for now; once the Parquet
+    /// crate is bumped, the runtime filter can be wired through
+    /// `ArrowReaderOptions`.
+    fn probe_bloom_filters_from_metadata(
+        metadata: &parquet::file::metadata::ParquetMetaData,
+    ) -> std::collections::BTreeSet<String> {
+        let mut cols_with_bf: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for rg_idx in 0..metadata.num_row_groups() {
+            let rg = metadata.row_group(rg_idx);
+            for col in rg.columns() {
+                if col.bloom_filter_offset().is_some() {
+                    let path: Vec<String> = col.column_descr().path().parts().to_vec();
+                    if !path.is_empty() {
+                        cols_with_bf.insert(path.join("."));
+                    }
+                }
+            }
+        }
+        if !cols_with_bf.is_empty() {
+            tracing::debug!(
+                columns = ?cols_with_bf,
+                "Parquet file has bloom filters for {} column(s); \
+                 pushdown becomes effective when `parquet` crate is bumped past 58.x",
+                cols_with_bf.len()
+            );
+        }
+        cols_with_bf
+    }
+
+    /// Public helper: return the set of columns that have a bloom
+    /// filter in this Parquet file. Returns an empty set if the file
+    /// has no bloom-filter metadata or if the file is not yet opened.
+    ///
+    /// Callers (the connector registry, the CBO, the executor's
+    /// runtime filter layer) can use this to decide whether bloom
+    /// filter pushdown is even possible for the file.
+    pub fn bloom_filter_columns(&self) -> std::collections::BTreeSet<String> {
+        match self.probe_bloom_filter_columns(&self.path) {
+            Ok(cols) => cols,
+            Err(e) => {
+                tracing::debug!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "failed to probe bloom-filter columns"
+                );
+                std::collections::BTreeSet::new()
+            }
+        }
+    }
+
+    fn probe_bloom_filter_columns(
+        &self,
+        path: &Path,
+    ) -> ConnectorResult<std::collections::BTreeSet<String>> {
+        let file = File::open(path).map_err(|e| {
+            ConnectorError::Parquet(format!("failed to open '{}': {e}", path.display()))
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+            ConnectorError::Parquet(format!(
+                "failed to build Parquet reader for '{}': {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Self::probe_bloom_filters_from_metadata(builder.metadata()))
     }
 
     /// Return the total row count from the Parquet footer, as read at open time.
@@ -348,14 +423,20 @@ impl ParquetDirectorySource {
     }
 
     /// Open the reader for `file_index`, skipping `skip` batches.
-    fn reader_for_file_at(files: &[PathBuf], file_index: usize, skip: usize) -> ConnectorResult<ParquetRecordBatchReader> {
+    fn reader_for_file_at(
+        files: &[PathBuf],
+        file_index: usize,
+        skip: usize,
+    ) -> ConnectorResult<ParquetRecordBatchReader> {
         let path = &files[file_index];
         let mut reader = Self::open_reader_at(path)?;
         for seen in 0..skip {
             match reader.next() {
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
-                    return Err(ConnectorError::Parquet(format!("error skipping batch: {e}")));
+                    return Err(ConnectorError::Parquet(format!(
+                        "error skipping batch: {e}"
+                    )));
                 }
                 None => {
                     return Err(ConnectorError::Offset {

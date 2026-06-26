@@ -102,6 +102,47 @@ pub struct UnifiedMemoryManager {
     shuffle_used: AtomicU64,
     execution_used: AtomicU64,
     state_used: AtomicU64,
+    /// Per-stage memory reservations (stage_id → bytes reserved).
+    /// A stage's reservation sits on top of the global region counters and
+    /// counts against the same total budget; releasing the reservation
+    /// returns the bytes to the region pool.
+    stage_reservations: std::sync::Mutex<StageReservationMap>,
+}
+
+/// In-memory map of stage_id → reserved bytes.
+///
+/// Splitting this out keeps the lock-poisoning surface contained and lets
+/// callers iterate / serialise reservations if they need to.
+#[derive(Debug, Default, Clone)]
+pub struct StageReservationMap {
+    by_stage: std::collections::BTreeMap<String, u64>,
+}
+
+impl StageReservationMap {
+    /// Sum of every active stage reservation.
+    pub fn total(&self) -> u64 {
+        self.by_stage.values().copied().sum()
+    }
+
+    /// Bytes reserved for a specific stage (0 if none).
+    pub fn get(&self, stage_id: &str) -> u64 {
+        self.by_stage.get(stage_id).copied().unwrap_or(0)
+    }
+
+    /// Insert / overwrite a stage reservation; returns the previous value.
+    pub fn insert(&mut self, stage_id: String, bytes: u64) -> u64 {
+        self.by_stage.insert(stage_id, bytes).unwrap_or(0)
+    }
+
+    /// Remove a stage reservation; returns the previous value.
+    pub fn remove(&mut self, stage_id: &str) -> u64 {
+        self.by_stage.remove(stage_id).unwrap_or(0)
+    }
+
+    /// Snapshot every `(stage_id, bytes)` pair.
+    pub fn entries(&self) -> Vec<(String, u64)> {
+        self.by_stage.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
 }
 
 impl std::fmt::Debug for UnifiedMemoryManager {
@@ -109,7 +150,10 @@ impl std::fmt::Debug for UnifiedMemoryManager {
         f.debug_struct("UnifiedMemoryManager")
             .field("total_bytes", &self.config.total_bytes)
             .field("shuffle_used", &self.shuffle_used.load(Ordering::Relaxed))
-            .field("execution_used", &self.execution_used.load(Ordering::Relaxed))
+            .field(
+                "execution_used",
+                &self.execution_used.load(Ordering::Relaxed),
+            )
             .field("state_used", &self.state_used.load(Ordering::Relaxed))
             .finish()
     }
@@ -128,7 +172,8 @@ pub struct MemoryUsageSnapshot {
 impl MemoryUsageSnapshot {
     /// Free bytes remaining in the pool.
     pub fn free_bytes(&self) -> u64 {
-        self.total_capacity_bytes.saturating_sub(self.total_used_bytes)
+        self.total_capacity_bytes
+            .saturating_sub(self.total_used_bytes)
     }
 
     /// Fractional utilization 0.0–1.0.
@@ -148,6 +193,7 @@ impl UnifiedMemoryManager {
             shuffle_used: AtomicU64::new(0),
             execution_used: AtomicU64::new(0),
             state_used: AtomicU64::new(0),
+            stage_reservations: std::sync::Mutex::new(StageReservationMap::default()),
         })
     }
 
@@ -203,11 +249,11 @@ impl UnifiedMemoryManager {
 
     /// Release `bytes` previously reserved for `region`. Saturates at zero.
     pub fn release(&self, region: MemoryRegion, bytes: u64) {
-        let _ = self.region_used(region).fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_sub(bytes)),
-        );
+        let _ =
+            self.region_used(region)
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(bytes))
+                });
     }
 
     /// Return the current usage snapshot.
@@ -259,6 +305,105 @@ impl UnifiedMemoryManager {
         let used = self.region_used(region).load(Ordering::Relaxed);
         used > self.region_min_bytes(region)
     }
+
+    // ── Per-stage memory budgets ──────────────────────────────────────────
+    //
+    // A *stage reservation* sits on top of the per-region counters: the
+    // reservation bytes are added to whichever region the stage charges
+    // against, and counted again in the per-stage accounting so a single
+    // stage cannot blow the global pool even if no other region is busy.
+
+    /// Try to reserve `bytes` for `region` on behalf of `stage_id`.
+    ///
+    /// Per-stage reservations are idempotent: a second call with the same
+    /// `stage_id` *replaces* the prior reservation (the bytes are released
+    /// first, then the new amount is charged). This matches the
+    //  coordinator's re-planning loop, which calls `try_reserve_stage` again
+    ///  when a stage's AQE-decided size changes.
+    pub fn try_reserve_stage(&self, stage_id: &str, region: MemoryRegion, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        // First, drop any prior reservation for this stage so we never
+        // double-count the same stage against the total pool.
+        let prior = {
+            let mut map = match self.stage_reservations.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            map.remove(stage_id)
+        };
+        if prior > 0 {
+            self.region_used(region).fetch_sub(prior, Ordering::Relaxed);
+        }
+        // Now attempt to charge the new amount.
+        if !self.try_reserve(region, bytes) {
+            // Roll back the prior reservation release so the region's
+            // accounting is unchanged on failure.
+            if prior > 0 {
+                self.region_used(region).fetch_add(prior, Ordering::Relaxed);
+            }
+            // Reinstall the prior reservation so subsequent calls see it.
+            let mut map = match self.stage_reservations.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if prior > 0 {
+                map.insert(stage_id.to_owned(), prior);
+            }
+            return false;
+        }
+        // Bookkeeping: install the new reservation.
+        let mut map = match self.stage_reservations.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        map.insert(stage_id.to_owned(), bytes);
+        true
+    }
+
+    /// Release the per-stage reservation for `stage_id`.
+    ///
+    /// Returns the bytes that were reserved (0 if the stage had none).
+    /// After this call the bytes return to the region pool and the
+    /// `stage_id` key is removed.
+    pub fn release_stage(&self, stage_id: &str, region: MemoryRegion) -> u64 {
+        let prior = {
+            let mut map = match self.stage_reservations.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            map.remove(stage_id)
+        };
+        if prior > 0 {
+            self.release(region, prior);
+        }
+        prior
+    }
+
+    /// Currently reserved bytes for `stage_id`.
+    pub fn stage_reserved(&self, stage_id: &str) -> u64 {
+        match self.stage_reservations.lock() {
+            Ok(g) => g.get(stage_id),
+            Err(p) => p.into_inner().get(stage_id),
+        }
+    }
+
+    /// Snapshot of every active stage reservation.
+    pub fn stage_reservations(&self) -> StageReservationMap {
+        match self.stage_reservations.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Sum of every active stage reservation.
+    pub fn stage_reservation_total(&self) -> u64 {
+        match self.stage_reservations.lock() {
+            Ok(g) => g.total(),
+            Err(p) => p.into_inner().total(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -272,7 +417,10 @@ mod tests {
         assert!(umm.try_reserve(MemoryRegion::Execution, 400));
         assert!(umm.try_reserve(MemoryRegion::State, 200));
         assert_eq!(umm.total_used_bytes(), 900);
-        assert!(!umm.try_reserve(MemoryRegion::Shuffle, 200), "would exceed 1000");
+        assert!(
+            !umm.try_reserve(MemoryRegion::Shuffle, 200),
+            "would exceed 1000"
+        );
         assert!(umm.try_reserve(MemoryRegion::Shuffle, 100), "exactly fits");
         assert_eq!(umm.total_used_bytes(), 1000);
     }
@@ -312,9 +460,9 @@ mod tests {
     #[test]
     fn is_region_under_pressure_respects_threshold() {
         let config = UnifiedMemoryConfig::with_total(1000)
-            .with_shuffle_min(0.3)    // min = 300
-            .with_execution_min(0.4)  // min = 400
-            .with_state_min(0.2);     // min = 200
+            .with_shuffle_min(0.3) // min = 300
+            .with_execution_min(0.4) // min = 400
+            .with_state_min(0.2); // min = 200
         let umm = UnifiedMemoryManager::new(config);
 
         // Fill to 80% total (800 bytes), 400 in shuffle (exceeds min 300).
@@ -325,5 +473,92 @@ mod tests {
         assert!(umm.is_region_under_pressure(MemoryRegion::Shuffle, 0.75));
         // Execution used 400 = min 400 → NOT over min, no pressure.
         assert!(!umm.is_region_under_pressure(MemoryRegion::Execution, 0.75));
+    }
+
+    // ── Per-stage reservation tests ──────────────────────────────────────
+
+    #[test]
+    fn stage_reservation_charges_against_region() {
+        let umm = UnifiedMemoryManager::with_total(1000);
+        assert!(umm.try_reserve_stage("stage-A", MemoryRegion::Execution, 300));
+        assert_eq!(umm.region_used_bytes(MemoryRegion::Execution), 300);
+        assert_eq!(umm.stage_reserved("stage-A"), 300);
+        assert_eq!(umm.stage_reservation_total(), 300);
+    }
+
+    #[test]
+    fn stage_reservation_release_returns_bytes_to_pool() {
+        let umm = UnifiedMemoryManager::with_total(1000);
+        umm.try_reserve_stage("stage-A", MemoryRegion::Execution, 300);
+        umm.try_reserve_stage("stage-B", MemoryRegion::Execution, 300);
+        assert_eq!(umm.total_used_bytes(), 600);
+        let released = umm.release_stage("stage-A", MemoryRegion::Execution);
+        assert_eq!(released, 300);
+        assert_eq!(umm.total_used_bytes(), 300);
+        assert_eq!(umm.stage_reserved("stage-A"), 0);
+        assert_eq!(umm.stage_reserved("stage-B"), 300);
+    }
+
+    #[test]
+    fn stage_reservation_fails_when_pool_full() {
+        let umm = UnifiedMemoryManager::with_total(500);
+        assert!(umm.try_reserve_stage("stage-A", MemoryRegion::Shuffle, 300));
+        // Now fill the rest of the pool with non-stage reservations.
+        assert!(umm.try_reserve(MemoryRegion::Execution, 200));
+        // A new stage request that would push the pool over 500 must fail
+        // and must NOT consume any bytes.
+        assert!(!umm.try_reserve_stage("stage-B", MemoryRegion::Shuffle, 100));
+        assert_eq!(umm.total_used_bytes(), 500);
+        assert_eq!(umm.stage_reserved("stage-B"), 0);
+    }
+
+    #[test]
+    fn stage_reservation_replace_on_replan() {
+        // Coordinator re-plans stage-A: re-issuing with a different size
+        // must replace the prior reservation rather than stack on top.
+        let umm = UnifiedMemoryManager::with_total(1000);
+        assert!(umm.try_reserve_stage("stage-A", MemoryRegion::Execution, 300));
+        assert_eq!(umm.region_used_bytes(MemoryRegion::Execution), 300);
+        // Re-plan: grow to 500.
+        assert!(umm.try_reserve_stage("stage-A", MemoryRegion::Execution, 500));
+        assert_eq!(umm.region_used_bytes(MemoryRegion::Execution), 500);
+        assert_eq!(umm.stage_reserved("stage-A"), 500);
+        assert_eq!(
+            umm.stage_reservation_total(),
+            500,
+            "replace must not double-count"
+        );
+        // Re-plan: shrink to 100.
+        assert!(umm.try_reserve_stage("stage-A", MemoryRegion::Execution, 100));
+        assert_eq!(umm.region_used_bytes(MemoryRegion::Execution), 100);
+        assert_eq!(umm.stage_reserved("stage-A"), 100);
+    }
+
+    #[test]
+    fn stage_reservation_snapshot_round_trip() {
+        let umm = UnifiedMemoryManager::with_total(1000);
+        umm.try_reserve_stage("s1", MemoryRegion::Shuffle, 100);
+        umm.try_reserve_stage("s2", MemoryRegion::Execution, 200);
+        let snap = umm.stage_reservations();
+        assert_eq!(snap.total(), 300);
+        assert_eq!(snap.get("s1"), 100);
+        assert_eq!(snap.get("s2"), 200);
+        let entries = snap.entries();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn stage_reservation_zero_bytes_is_no_op() {
+        let umm = UnifiedMemoryManager::with_total(1000);
+        assert!(umm.try_reserve_stage("stage-A", MemoryRegion::Execution, 0));
+        assert_eq!(umm.stage_reserved("stage-A"), 0);
+        assert_eq!(umm.total_used_bytes(), 0);
+    }
+
+    #[test]
+    fn stage_release_on_unknown_stage_returns_zero() {
+        let umm = UnifiedMemoryManager::with_total(1000);
+        let released = umm.release_stage("never-allocated", MemoryRegion::Execution);
+        assert_eq!(released, 0);
     }
 }

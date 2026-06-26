@@ -84,7 +84,10 @@ impl SourceDriver for ParquetDirectorySourceDriver {
     ) -> Pin<Box<dyn Future<Output = ConnectorResult<Box<dyn DynSource>>> + Send + 'a>> {
         Box::pin(async move {
             let path = require_path(config)?;
-            let recursive = config.get("recursive").map(|v| v == "true").unwrap_or(false);
+            let recursive = config
+                .get("recursive")
+                .map(|v| v == "true")
+                .unwrap_or(false);
             let source = ParquetDirectorySource::open(path, recursive)?;
             Ok(Box::new(source) as Box<dyn DynSource>)
         })

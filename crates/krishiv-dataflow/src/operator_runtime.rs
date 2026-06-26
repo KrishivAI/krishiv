@@ -554,6 +554,35 @@ pub fn local_spec_to_window_execution(params: LocalWindowParams) -> WindowExecut
     }
 }
 
+/// ST8: Execute a stream-stream watermark-bounded window join over pre-collected batches.
+///
+/// Routes left and right batches (interleaved by index) through a
+/// [`WatermarkWindowJoinOperator`].  After processing, calls
+/// `advance_watermark(final_watermark_ms)` to flush any remaining state.
+/// Returns joined `RecordBatch`es (left cols ∥ right cols, with `left_` /
+/// `right_` prefixes when column names collide).
+pub fn execute_window_join(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    spec: crate::watermark_join::WatermarkWindowJoinSpec,
+    final_watermark_ms: i64,
+) -> ExecResult<Vec<RecordBatch>> {
+    use crate::watermark_join::WatermarkWindowJoinOperator;
+    let mut op = WatermarkWindowJoinOperator::new(spec);
+    let mut out = Vec::new();
+    let max_side = left_batches.len().max(right_batches.len());
+    for i in 0..max_side {
+        if let Some(lb) = left_batches.get(i) {
+            out.extend(op.process_left(lb));
+        }
+        if let Some(rb) = right_batches.get(i) {
+            out.extend(op.process_right(rb));
+        }
+    }
+    op.advance_watermark(final_watermark_ms);
+    Ok(out)
+}
+
 /// Bridge enum matching the runtime local window kind (avoids circular deps).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalWindowKindBridge {

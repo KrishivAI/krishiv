@@ -228,8 +228,11 @@ pub(crate) async fn execute_batch_fragment(
                 })?;
         }
         // CO5: registry-driven connector partitions (e.g. parquet-directory, s3-prefix).
-        for (table_name, batches) in
-            read_registry_partitions(runner.connector_registry.as_ref(), assignment.input_partitions()).await?
+        for (table_name, batches) in read_registry_partitions(
+            runner.connector_registry.as_ref(),
+            assignment.input_partitions(),
+        )
+        .await?
         {
             engine
                 .register_record_batches(&table_name, batches)
@@ -512,14 +515,38 @@ async fn execute_shuffle_write_fragment(
             .iter()
             .map(|b| b.get_array_memory_size() as u64)
             .sum();
+        let rows_written: u64 = part_batches.iter().map(|b| b.num_rows() as u64).sum();
+
+        // T12: if a push-shuffle store is wired, serialise partition to IPC
+        // before transferring ownership to write_partition.
+        if let Some(ps) = ctx.push_store.as_ref() {
+            use arrow::ipc::writer::StreamWriter;
+            let mut ipc_bytes: Vec<u8> = Vec::new();
+            if !part_batches.is_empty() {
+                let mut w = StreamWriter::try_new(&mut ipc_bytes, &schema).map_err(|e| {
+                    ExecutorError::LocalExecution {
+                        message: format!("push-shuffle ipc writer init failed: {e}"),
+                    }
+                })?;
+                for batch in &part_batches {
+                    w.write(batch).map_err(|e| ExecutorError::LocalExecution {
+                        message: format!("push-shuffle ipc write failed: {e}"),
+                    })?;
+                }
+                w.finish().map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("push-shuffle ipc finish failed: {e}"),
+                })?;
+            }
+            if !ipc_bytes.is_empty() {
+                ps.push(job_id, stage_id, p, ipc_bytes);
+            }
+        }
+
         let partition = ShufflePartition {
             id,
             schema,
             batches: part_batches,
         };
-        // T19: capture the row count before `part_batches` is moved into
-        // the partition object below.
-        let rows_written: u64 = partition.batches.iter().map(|b| b.num_rows() as u64).sum();
 
         // T19: time the shuffle write and increment the bytes / rows /
         // time counters. The `write_partition` call is async; we measure
@@ -560,24 +587,25 @@ async fn execute_shuffle_write_fragment(
             message: format!("ESS sort-shuffle writer init failed: {e}"),
         })?;
         for batch in &batches {
-            sort_writer.push(batch.clone()).map_err(|e| ExecutorError::LocalExecution {
-                message: format!("ESS sort-shuffle push failed: {e}"),
-            })?;
+            sort_writer
+                .push(batch.clone())
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("ESS sort-shuffle push failed: {e}"),
+                })?;
         }
-        let files = sort_writer.flush().map_err(|e| ExecutorError::LocalExecution {
-            message: format!("ESS sort-shuffle flush failed: {e}"),
-        })?;
+        let files = sort_writer
+            .flush()
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("ESS sort-shuffle flush failed: {e}"),
+            })?;
         // T7: patch `size_bytes` in outputs with the real on-disk IPC sizes.
         if let Ok(offsets) = files.read_offsets() {
             for (p, output_entry) in outputs.iter_mut().enumerate() {
                 if p + 1 < offsets.len() {
                     let real_bytes = offsets[p + 1].saturating_sub(offsets[p]);
                     let endpoint = output_entry.flight_endpoint.clone();
-                    *output_entry = krishiv_proto::ShufflePartitionOutput::new(
-                        p as u32,
-                        real_bytes,
-                        endpoint,
-                    );
+                    *output_entry =
+                        krishiv_proto::ShufflePartitionOutput::new(p as u32, real_bytes, endpoint);
                 }
             }
         }

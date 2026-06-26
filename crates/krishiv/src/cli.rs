@@ -10,6 +10,7 @@ use krishiv_scheduler::{Coordinator, JobDetailSnapshot, JobSnapshot};
 use krishiv_state::checkpoint::{
     LocalFsCheckpointStorage, list_valid_epochs, read_epoch_metadata, validate_epoch,
 };
+use krishiv_state::savepoint_rename::SavepointRenameMap;
 
 use crate::remote_client::RemoteCoordinatorClient;
 
@@ -131,6 +132,12 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["jobs", "--help"] | ["jobs", "-h"] => CliResponse::ok(jobs_help()),
         ["state"] | ["state", "--help"] | ["state", "-h"] => CliResponse::ok(state_help()),
         ["savepoint", "--help"] | ["savepoint", "-h"] => CliResponse::ok(savepoint_help()),
+        ["savepoint", "rename", "--help"] | ["savepoint", "rename", "-h"] => {
+            CliResponse::ok(savepoint_rename_help())
+        }
+        ["savepoint", "rename-map", "--help"] | ["savepoint", "rename-map", "-h"] => {
+            CliResponse::ok(savepoint_rename_map_help())
+        }
         ["restore", "--help"] | ["restore", "-h"] => CliResponse::ok(restore_help()),
         ["checkpoints", "--help"] | ["checkpoints", "-h"] => CliResponse::ok(checkpoints_help()),
         ["local"] | ["local", "--help"] | ["local", "-h"] => {
@@ -144,6 +151,8 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["help", "jobs"] => CliResponse::ok(jobs_help()),
         ["help", "state"] => CliResponse::ok(state_help()),
         ["help", "savepoint"] => CliResponse::ok(savepoint_help()),
+        ["help", "savepoint", "rename"] => CliResponse::ok(savepoint_rename_help()),
+        ["help", "savepoint", "rename-map"] => CliResponse::ok(savepoint_rename_map_help()),
         ["help", "restore"] => CliResponse::ok(restore_help()),
         ["help", "checkpoints"] => CliResponse::ok(checkpoints_help()),
         ["help", "local"] => CliResponse::ok(crate::local_cluster::local_help()),
@@ -169,6 +178,8 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["submit", rest @ ..] => run_submit(rest),
         ["jobs", rest @ ..] => run_jobs(rest),
         ["state", rest @ ..] => run_state(rest, &coordinator_mode),
+        ["savepoint", "rename", rest @ ..] => run_savepoint_rename(rest),
+        ["savepoint", "rename-map", rest @ ..] => run_savepoint_rename_map(rest),
         ["savepoint", rest @ ..] => run_savepoint(rest, &coordinator_mode),
         ["restore", rest @ ..] => run_restore(rest, &coordinator_mode),
         ["checkpoints", rest @ ..] => run_checkpoints(rest, &coordinator_mode),
@@ -653,8 +664,124 @@ pub fn savepoint_help() -> String {
          Options:\n\
            --job <JOB_ID>   Job ID of the streaming job (required)\n\
            --label <LABEL>  Human-readable label for this savepoint (optional)\n\
-           -h, --help       Show help\n",
+           -h, --help       Show help\n\
+         \n\
+         Subcommands:\n\
+           rename       Generate a savepoint rename-map JSON template\n\
+           rename-map   Validate and summarise an existing rename-map file\n",
     )
+}
+
+pub fn savepoint_rename_help() -> String {
+    String::from(
+        "Generate a savepoint rename-map JSON template.\n\
+         \n\
+         Usage:\n\
+           krishiv savepoint rename [--output <PATH>]\n\
+         \n\
+         Writes an empty `{}` JSON object to stdout (or `--output <PATH>`)\n\
+         that the user fills in with `{\"old_id\": \"new_id\"}`. Pass the file\n\
+         to `savepoint rename-map` to validate, or to the coordinator's\n\
+         restore path to apply at restore time.\n\
+         \n\
+         Options:\n\
+           --output <PATH>   File to write the template to (default: stdout)\n\
+           -h, --help        Show help\n",
+    )
+}
+
+pub fn savepoint_rename_map_help() -> String {
+    String::from(
+        "Validate and summarise a savepoint rename-map JSON file.\n\
+         \n\
+         Usage:\n\
+           krishiv savepoint rename-map --file <PATH>\n\
+         \n\
+         Validates that the file is well-formed and prints a summary\n\
+         of the rename entries (old → new). Exits non-zero on any\n\
+         validation failure so the command is CI-friendly.\n\
+         \n\
+         Options:\n\
+           --file <PATH>   Path to the rename-map JSON file (required)\n\
+           -h, --help      Show help\n",
+    )
+}
+
+fn run_savepoint_rename(args: &[&str]) -> CliResponse {
+    let mut output: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--output" if i + 1 < args.len() => {
+                output = Some(args[i + 1]);
+                i += 2;
+            }
+            other => {
+                return CliResponse::err(
+                    format!(
+                        "unexpected argument '{other}'\n\n{}",
+                        savepoint_rename_help()
+                    ),
+                    2,
+                );
+            }
+        }
+    }
+    let map = SavepointRenameMap::new();
+    let json = match map.to_json() {
+        Ok(j) => j,
+        Err(e) => return CliResponse::err(format!("template generation failed: {e}\n"), 1),
+    };
+    match output {
+        Some(path) => match std::fs::write(path, &json) {
+            Ok(()) => CliResponse::ok(format!(
+                "Wrote empty savepoint rename-map template to {path}\n"
+            )),
+            Err(e) => CliResponse::err(format!("failed to write '{path}': {e}\n"), 1),
+        },
+        None => CliResponse::ok(format!("{json}\n")),
+    }
+}
+
+fn run_savepoint_rename_map(args: &[&str]) -> CliResponse {
+    let mut file: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--file" if i + 1 < args.len() => {
+                file = Some(args[i + 1]);
+                i += 2;
+            }
+            other => {
+                return CliResponse::err(
+                    format!(
+                        "unexpected argument '{other}'\n\n{}",
+                        savepoint_rename_map_help()
+                    ),
+                    2,
+                );
+            }
+        }
+    }
+    let Some(path) = file else {
+        return CliResponse::err(
+            format!("--file is required\n\n{}", savepoint_rename_map_help()),
+            2,
+        );
+    };
+    let map = match SavepointRenameMap::load_json(path) {
+        Ok(m) => m,
+        Err(e) => return CliResponse::err(format!("load failed: {e}\n"), 1),
+    };
+    if let Err(e) = map.validate() {
+        return CliResponse::err(format!("validation failed: {e}\n"), 1);
+    }
+    let mut out = format!("Savepoint rename map: {path}\n\nOLD → NEW\n");
+    for (old, new) in map.iter() {
+        out.push_str(&format!("{old} → {new}\n"));
+    }
+    out.push_str(&format!("\n{} rename entries.\n", map.len()));
+    CliResponse::ok(out)
 }
 
 fn run_savepoint(args: &[&str], mode: &CoordinatorMode) -> CliResponse {

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use krishiv_proto::{
-    ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, LeaseGeneration, TaskId,
-    ResourceProfile,
+    ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, LeaseGeneration,
+    ResourceProfile, TaskId,
 };
 
 use crate::job::ExecutorPlacement;
@@ -293,18 +293,15 @@ impl ExecutorRegistry {
             return false;
         }
         // SC10: per-task memory requirement check.
-        if let Some(p) = profile {
-            if p.task_memory_bytes > 0 {
-                if let Some(snapshot) = &executor.health_snapshot {
-                    if let (Some(limit), Some(used)) =
-                        (snapshot.memory_limit_bytes, snapshot.memory_used_bytes)
-                    {
-                        let available = limit.saturating_sub(used);
-                        if available < p.task_memory_bytes {
-                            return false;
-                        }
-                    }
-                }
+        if let Some(p) = profile
+            && p.task_memory_bytes > 0
+            && let Some(snapshot) = &executor.health_snapshot
+            && let (Some(limit), Some(used)) =
+                (snapshot.memory_limit_bytes, snapshot.memory_used_bytes)
+        {
+            let available = limit.saturating_sub(used);
+            if available < p.task_memory_bytes {
+                return false;
             }
         }
         true

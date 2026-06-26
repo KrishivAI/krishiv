@@ -64,8 +64,7 @@ impl SortShuffleIndex {
 
     /// Remove all entries for a completed or cancelled job.
     pub fn remove_job(&self, job_id: &str) {
-        self.inner
-            .retain(|(jid, _), _| jid.as_str() != job_id);
+        self.inner.retain(|(jid, _), _| jid.as_str() != job_id);
     }
 }
 

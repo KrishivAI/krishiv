@@ -309,6 +309,17 @@ pub struct ColumnStatistics {
     pub min_value: Option<String>,
     /// String representation of the maximum value, if known.
     pub max_value: Option<String>,
+    /// Number of distinct values (NDV) for the column, if known.
+    ///
+    /// Drives join-order cost estimation and broadcast sizing: a column
+    /// with NDV ≈ 1 is a hot join key, while a column with NDV ≈ row
+    /// count is a near-unique key (build-side fan-out is high).
+    pub distinct_count: Option<u64>,
+    /// Wall-clock Unix timestamp (seconds) when these stats were
+    /// collected by `ANALYZE TABLE`. The CBO refuses to use stats
+    /// older than `stats_max_age_secs` to avoid optimising against
+    /// stale cardinality information.
+    pub collected_at_secs: Option<u64>,
 }
 
 impl ColumnStatistics {
@@ -343,6 +354,48 @@ impl ColumnStatistics {
     pub fn with_max(mut self, max: impl Into<String>) -> Self {
         self.max_value = Some(max.into());
         self
+    }
+
+    /// Set the NDV (number of distinct values) for the column.
+    #[must_use]
+    pub fn with_distinct_count(mut self, ndv: u64) -> Self {
+        self.distinct_count = Some(ndv);
+        self
+    }
+
+    /// Stamp the wall-clock timestamp (seconds) at which these stats
+    /// were collected. Stamped by [`analyze_table`][crate::analyze::analyze_table]
+    /// so the CBO can detect stale stats.
+    #[must_use]
+    pub fn with_collected_at_secs(mut self, secs: u64) -> Self {
+        self.collected_at_secs = Some(secs);
+        self
+    }
+
+    /// Selectivity of a single-point equality filter on this column.
+    ///
+    /// `1.0 / distinct_count` when both are known; otherwise `None`.
+    /// `0.0` when `distinct_count == 0` (the column is all-null or empty).
+    pub fn equality_selectivity(&self) -> Option<f64> {
+        let ndv = self.distinct_count?;
+        if ndv == 0 {
+            Some(0.0)
+        } else {
+            Some(1.0 / ndv as f64)
+        }
+    }
+
+    /// Whether the stats are "fresh" given a current timestamp and a
+    /// maximum age in seconds.
+    ///
+    /// Stats without a collection timestamp are considered fresh by
+    /// default (back-compat for manually-curated stats). Stats older
+    /// than `max_age_secs` are stale.
+    pub fn is_fresh(&self, now_secs: u64, max_age_secs: u64) -> bool {
+        match self.collected_at_secs {
+            None => true,
+            Some(ts) => now_secs.saturating_sub(ts) <= max_age_secs,
+        }
     }
 }
 

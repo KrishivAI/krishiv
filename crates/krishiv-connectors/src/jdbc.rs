@@ -37,13 +37,13 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 
 use crate::capabilities::ConnectorCapabilities;
 use crate::error::{ConnectorError, ConnectorResult};
-use crate::source::Source;
 use crate::sink::Sink;
+use crate::source::Source;
 
 const DEFAULT_BATCH_SIZE: u32 = 1_000;
 
@@ -99,10 +99,9 @@ impl JdbcSource {
             .await
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
         // When the table is empty, infer schema from column metadata.
-        let cols = rows.first().map_or_else(
-            || vec![],
-            |row| row.columns().iter().collect::<Vec<_>>(),
-        );
+        let cols = rows
+            .first()
+            .map_or_else(|| vec![], |row| row.columns().iter().collect::<Vec<_>>());
         let schema = pg_columns_to_schema(cols);
         let schema = Arc::new(schema);
         self.schema = Some(Arc::clone(&schema));
@@ -112,7 +111,9 @@ impl JdbcSource {
 
 impl Source for JdbcSource {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new().with_bounded().with_rewindable()
+        ConnectorCapabilities::new()
+            .with_bounded()
+            .with_rewindable()
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
@@ -135,9 +136,7 @@ impl Source for JdbcSource {
         let schema = match &self.schema {
             Some(s) => Arc::clone(s),
             None => {
-                let s = Arc::new(pg_columns_to_schema(
-                    rows[0].columns().iter().collect(),
-                ));
+                let s = Arc::new(pg_columns_to_schema(rows[0].columns().iter().collect()));
                 self.schema = Some(Arc::clone(&s));
                 s
             }
@@ -342,27 +341,51 @@ fn bind_column_value<'q>(
     }
     let bound = match col.data_type() {
         DataType::Int16 => {
-            let v = col.as_any().downcast_ref::<Int16Array>().unwrap().value(row_idx);
+            let v = col
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(row_idx);
             q.bind(v)
         }
         DataType::Int32 => {
-            let v = col.as_any().downcast_ref::<Int32Array>().unwrap().value(row_idx);
+            let v = col
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row_idx);
             q.bind(v)
         }
         DataType::Int64 => {
-            let v = col.as_any().downcast_ref::<Int64Array>().unwrap().value(row_idx);
+            let v = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row_idx);
             q.bind(v)
         }
         DataType::Float32 => {
-            let v = col.as_any().downcast_ref::<Float32Array>().unwrap().value(row_idx);
+            let v = col
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row_idx);
             q.bind(v)
         }
         DataType::Float64 => {
-            let v = col.as_any().downcast_ref::<Float64Array>().unwrap().value(row_idx);
+            let v = col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row_idx);
             q.bind(v)
         }
         DataType::Boolean => {
-            let v = col.as_any().downcast_ref::<BooleanArray>().unwrap().value(row_idx);
+            let v = col
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row_idx);
             q.bind(v)
         }
         DataType::Utf8 => {
@@ -377,7 +400,7 @@ fn bind_column_value<'q>(
         other => {
             return Err(ConnectorError::Io(std::io::Error::other(format!(
                 "unsupported column type for JDBC bind: {other}"
-            ))))
+            ))));
         }
     };
     Ok(bound)
@@ -400,11 +423,7 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
         let ids: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), Some(2), None]));
-        let names: ArrayRef = Arc::new(StringArray::from(vec![
-            Some("alice"),
-            Some("bob"),
-            None,
-        ]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None]));
         let batch = RecordBatch::try_new(schema, vec![ids, names]).unwrap();
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 2);
@@ -432,7 +451,9 @@ mod tests {
     fn source_and_sink_capabilities() {
         // We can't instantiate without a live PgPool, so verify the capability
         // values via the builder methods directly.
-        let source_caps = ConnectorCapabilities::new().with_bounded().with_rewindable();
+        let source_caps = ConnectorCapabilities::new()
+            .with_bounded()
+            .with_rewindable();
         assert!(source_caps.is_bounded());
         assert!(source_caps.is_rewindable());
 

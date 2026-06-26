@@ -137,7 +137,12 @@ impl Coordinator {
         self.ensure_active()?;
 
         // Fast-path: if NO executor is schedulable at all, bail early.
-        if self.exec.executors.schedulable_executor_placements().is_empty() {
+        if self
+            .exec
+            .executors
+            .schedulable_executor_placements()
+            .is_empty()
+        {
             return Err(SchedulerError::NoExecutors);
         }
         {
@@ -185,10 +190,7 @@ impl Coordinator {
                 SlotAwareScheduler::place_task_ids_with_load(&pending_task_ids, &executors)?;
             let mut job = self.find_job_mut(job_id)?;
             for task_id in &pending_task_ids {
-                if let Some(assignment) = assignments
-                    .iter()
-                    .find(|a| a.task_id() == task_id)
-                {
+                if let Some(assignment) = assignments.iter().find(|a| a.task_id() == task_id) {
                     job.apply_assignments(vec![assignment.clone()]);
                     total += 1;
                 }

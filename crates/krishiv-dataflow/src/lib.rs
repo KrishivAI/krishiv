@@ -60,6 +60,8 @@ pub mod cep;
 pub mod connected_streams;
 pub mod continuous;
 pub mod dedup_operator;
+/// P8: Delta Join — stateless stream-stream join for append-only streams.
+pub mod delta_join;
 pub mod group_state;
 pub mod interval_join;
 pub mod join;
@@ -89,8 +91,9 @@ pub use broadcast_state::{
 };
 pub use connected_streams::{CoProcessExecutor, CoProcessFunction, ConnectedStreams};
 pub use continuous::ContinuousWindowExecutor;
+pub use group_state::{GroupState, GroupStateExecutor, GroupStateFn};
 pub use operator_config::{OperatorConfig, OperatorUid};
-pub use operator_runtime::{execute_bounded_window, execute_streaming_window};
+pub use operator_runtime::{execute_bounded_window, execute_streaming_window, execute_window_join};
 pub use process_fn::{
     ProcessContext, ProcessFunction, ProcessFunctionExecutor, TimerEntry, TimerKind,
 };
@@ -98,12 +101,11 @@ pub use queue::{
     OperatorMessage, OperatorQueueError, OperatorQueueMetrics, OperatorQueueReceiver,
     OperatorQueueSender, operator_queue,
 };
-pub use group_state::{GroupState, GroupStateExecutor, GroupStateFn};
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
-pub use watermark_join::{WatermarkWindowJoinOperator, WatermarkWindowJoinSpec};
 pub use state_descriptor::{
     ListState, MapState, ReducingState, StateError, StateValue, ValueState,
 };
+pub use watermark_join::{WatermarkWindowJoinOperator, WatermarkWindowJoinSpec};
 pub use window::{
     CountWindowOperator, CountWindowSpec, MultiSourceWatermarkState, SessionWindowOperator,
     SessionWindowSpec, SlidingWindowOperator, SlidingWindowSpec, StateBackedSessionWindowOperator,

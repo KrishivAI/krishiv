@@ -103,8 +103,7 @@ async fn deregister_via_grpc_endpoint_transitions_executor_to_removed() {
     });
 
     let runtime = ExecutorRuntime::new(
-        ExecutorConfig::new("exec-dereg-test", "pod-dereg", 1, format!("http://{addr}"))
-            .unwrap(),
+        ExecutorConfig::new("exec-dereg-test", "pod-dereg", 1, format!("http://{addr}")).unwrap(),
     );
 
     runtime.register_with_grpc_endpoint().await.unwrap();
@@ -281,8 +280,7 @@ async fn executor_task_grpc_requires_configured_bearer_token() {
     let err = wire::v1::executor_task_server::ExecutorTask::assign_task(
         &service,
         tonic::Request::new(
-            wire::executor_task_assignment_to_wire(demo_assignment("task-auth-missing"))
-                .unwrap(),
+            wire::executor_task_assignment_to_wire(demo_assignment("task-auth-missing")).unwrap(),
         ),
     )
     .await
@@ -443,11 +441,9 @@ fn local_parquet_partition_descriptors_are_validated() {
         InputPartition::new("part-2", "local-parquet:people:/tmp/people-2.parquet"),
     ])
     .unwrap_err();
-    assert!(
-        duplicate
-            .to_string()
-            .contains("duplicate local Parquet table name")
-    );
+    assert!(duplicate
+        .to_string()
+        .contains("duplicate local Parquet table name"));
 
     let non_local = crate::runner::parse_local_parquet_partitions(&[
         InputPartition::new("part-1", "local-parquet:people:/tmp/people.parquet"),
@@ -461,11 +457,9 @@ fn local_parquet_partition_descriptors_are_validated() {
         "local-parquet:people",
     )])
     .unwrap_err();
-    assert!(
-        malformed
-            .to_string()
-            .contains("local-parquet:<table>:<path>")
-    );
+    assert!(malformed
+        .to_string()
+        .contains("local-parquet:<table>:<path>"));
 }
 
 #[tokio::test]
@@ -567,11 +561,7 @@ async fn select_one_assignment_flows_over_grpc_and_reports_output_metadata() {
     let coordinator = NetworkCoordinatorService::new(format!("http://{coordinator_addr}"));
     let registration = coordinator
         .register_executor(tonic::Request::new(RegisterExecutorRequest::new(
-            krishiv_proto::ExecutorDescriptor::new(
-                executor_id.clone(),
-                "pod-network-runner",
-                1,
-            ),
+            krishiv_proto::ExecutorDescriptor::new(executor_id.clone(), "pod-network-runner", 1),
         )))
         .await
         .unwrap()
@@ -600,9 +590,9 @@ async fn select_one_assignment_flows_over_grpc_and_reports_output_metadata() {
             .remove(0)
     };
 
-    let mut executor_client = wire::v1::executor_task_client::ExecutorTaskClient::connect(
-        format!("http://{executor_addr}"),
-    )
+    let mut executor_client = wire::v1::executor_task_client::ExecutorTaskClient::connect(format!(
+        "http://{executor_addr}"
+    ))
     .await
     .unwrap();
     let assign_response = executor_client
@@ -723,9 +713,9 @@ async fn local_parquet_assignment_flows_over_grpc_and_reports_output_metadata() 
         local_parquet_assignment(launched, &parquet_path)
     };
 
-    let mut executor_client = wire::v1::executor_task_client::ExecutorTaskClient::connect(
-        format!("http://{executor_addr}"),
-    )
+    let mut executor_client = wire::v1::executor_task_client::ExecutorTaskClient::connect(format!(
+        "http://{executor_addr}"
+    ))
     .await
     .unwrap();
     let assign_response = executor_client
@@ -837,8 +827,8 @@ fn write_people_parquet(path: &std::path::Path) {
         ],
     )
     .unwrap_or_else(|error| panic!("unexpected record batch error: {error}"));
-    let file = File::create(path)
-        .unwrap_or_else(|error| panic!("unexpected parquet file error: {error}"));
+    let file =
+        File::create(path).unwrap_or_else(|error| panic!("unexpected parquet file error: {error}"));
     let mut writer = ArrowWriter::try_new(file, schema, None)
         .unwrap_or_else(|error| panic!("unexpected parquet writer error: {error}"));
     writer
@@ -952,11 +942,7 @@ async fn bounded_window_rejects_multiple_input_tables() {
     let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
     let error = runner
         .run_assignment_with(
-            bounded_window_assignment(
-                "job-window-input-count",
-                "events",
-                &["events", "events"],
-            ),
+            bounded_window_assignment("job-window-input-count", "events", &["events", "events"]),
             &AcceptingCoordinatorService,
         )
         .await
@@ -1044,8 +1030,8 @@ async fn executor_runs_parquet_task_via_connector_source() {
 #[tokio::test]
 async fn executor_reads_object_parquet_source_and_writes_object_sink() {
     allow_anonymous_for_tests();
-    use krishiv_connectors::Source;
     use krishiv_connectors::parquet::ParquetSource;
+    use krishiv_connectors::Source;
 
     let temp = tempdir().unwrap();
     let object_root = temp.path().join("object-store");
@@ -1128,8 +1114,8 @@ async fn executor_reads_object_parquet_source_and_writes_object_sink() {
 #[cfg(feature = "kafka")]
 #[tokio::test]
 async fn executor_runs_kafka_to_parquet_pipeline_on_real_runner() {
-    use krishiv_connectors::Source;
     use krishiv_connectors::parquet::ParquetSource;
+    use krishiv_connectors::Source;
 
     let temp = tempdir().unwrap();
     let output_path = temp.path().join("events.parquet");
@@ -1488,6 +1474,7 @@ async fn tpch_q1_style_shuffle_pipeline_produces_correct_aggregation() {
         local_dir: shuffle_dir.clone(),
         flight_endpoint: flight_endpoint.clone(),
         ess_index: None,
+        push_store: None,
     };
     let s0_runner = ExecutorTaskRunner::new(s0_inbox.clone()).with_shuffle(shuffle_ctx);
     s0_inbox.push(s0_assignment).unwrap();
@@ -1668,4 +1655,3 @@ fn execution_model_streaming_exact_prefix() {
 }
 
 use crate::barrier::{BarrierSimulator, BarrierSnapshot};
-

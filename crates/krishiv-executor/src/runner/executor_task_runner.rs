@@ -144,6 +144,13 @@ pub struct ExecutorTaskRunner {
     /// [`krishiv_connectors::registry::default_registry()`] so existing
     /// single-type paths work unchanged.
     pub connector_registry: Arc<krishiv_connectors::ConnectorRegistry>,
+
+    /// E4.4: Optional handle to the coordinator's queryable-state registry.
+    ///
+    /// When set, streaming `stream:loop:` drain cycles publish a snapshot of
+    /// the window operator's state after each batch so external callers can
+    /// perform point lookups via the REST API without stopping the job.
+    pub(crate) queryable_state: Option<Arc<krishiv_state::QueryableStateStore>>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -212,7 +219,17 @@ impl ExecutorTaskRunner {
             kafka_restore_offsets: Arc::new(DashMap::new()),
             transaction_log: crate::transactions::TwoPhaseSinkRegistry::new(),
             connector_registry: Arc::new(krishiv_connectors::registry::default_registry()),
+            queryable_state: None,
         }
+    }
+
+    /// Attach the coordinator's queryable-state registry.
+    ///
+    /// When set, each `stream:loop:` drain cycle publishes a state snapshot so
+    /// external callers can query live window state via the REST API.
+    pub fn with_queryable_state(mut self, store: Arc<krishiv_state::QueryableStateStore>) -> Self {
+        self.queryable_state = Some(store);
+        self
     }
 
     /// Set the root directory for durable window operator state.

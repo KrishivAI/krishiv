@@ -19,6 +19,8 @@ mod local_delta;
 #[cfg(feature = "iceberg")]
 pub mod maintenance;
 mod partition_spec;
+/// P12: Streaming Lakehouse Unification — unified streaming source/sink over Delta, Hudi, Paimon.
+pub mod streaming_unify;
 mod two_phase;
 
 pub use as_of::AsOfSpec;
@@ -35,8 +37,8 @@ pub use delta_lake::{
 pub use hudi::{
     HudiCowWriter, HudiObjectStoreReader, HudiObjectStoreWriter, HudiQueryType, HudiSnapshotReader,
     HudiStageHandle, HudiTwoPhaseCommitSink, HudiWriteResult, ensure_hoodie_properties,
-    read_hoodie_properties, vacuum_hudi_table, write_hudi_cow_append,
-    write_hudi_cow_fixture, write_hudi_cow_upsert,
+    read_hoodie_properties, vacuum_hudi_table, write_hudi_cow_append, write_hudi_cow_fixture,
+    write_hudi_cow_upsert,
 };
 pub use iceberg_fs::IcebergFsTable;
 #[cfg(feature = "iceberg")]

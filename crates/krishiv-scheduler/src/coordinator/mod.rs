@@ -206,7 +206,6 @@ pub struct Coordinator {
     pub(crate) executor_job_watermarks: HashMap<ExecutorId, HashMap<JobId, i64>>,
 
     // ── SC11: cascade circuit breaker state ───────────────────────────────
-
     /// Ring buffer of wall-clock timestamps (ms) at which executor losses were
     /// recorded.  Entries older than `config.cascade_window_ms` are pruned each
     /// time a new loss is recorded.
@@ -1533,9 +1532,7 @@ impl Coordinator {
         self.cascade_loss_timestamps.push_back(now_ms);
 
         let threshold = self.config.cascade_failure_threshold();
-        if self.cascade_loss_timestamps.len() >= threshold
-            && self.cascade_tripped_at_ms.is_none()
-        {
+        if self.cascade_loss_timestamps.len() >= threshold && self.cascade_tripped_at_ms.is_none() {
             self.cascade_tripped_at_ms = Some(now_ms);
             tracing::warn!(
                 losses_in_window = self.cascade_loss_timestamps.len(),

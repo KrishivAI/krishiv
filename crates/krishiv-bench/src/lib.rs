@@ -9,6 +9,8 @@
 
 pub mod phase_i;
 
+pub mod tpcds;
+
 pub mod tpch {
     //! TPC-H query texts, per-query table sets, and the scale-factor ladder.
 

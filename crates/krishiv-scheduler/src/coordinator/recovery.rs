@@ -403,11 +403,7 @@ mod recovery_tests {
     use std::sync::Arc;
 
     fn make_executor_descriptor(id: &str) -> ExecutorDescriptor {
-        ExecutorDescriptor::new(
-            ExecutorId::try_new(id).unwrap(),
-            "127.0.0.1",
-            4,
-        )
+        ExecutorDescriptor::new(ExecutorId::try_new(id).unwrap(), "127.0.0.1", 4)
     }
 
     /// SC4 regression: after coordinator restart checkpoint_complete_sent must
@@ -476,7 +472,10 @@ mod recovery_tests {
                 job_record,
             )),
         );
-        coordinator.ckpt.coordinators.insert(job_id.clone(), cp_coord);
+        coordinator
+            .ckpt
+            .coordinators
+            .insert(job_id.clone(), cp_coord);
         coordinator.exec.executors.register(exec_desc).unwrap();
 
         // Replicate the SC4 pre-population logic from recover_from_store.
@@ -493,10 +492,11 @@ mod recovery_tests {
                 continue;
             }
             for eid in &restored_executors {
-                coordinator
-                    .ckpt
-                    .checkpoint_complete_sent
-                    .insert((jid.clone(), eid.clone(), committed_epoch));
+                coordinator.ckpt.checkpoint_complete_sent.insert((
+                    jid.clone(),
+                    eid.clone(),
+                    committed_epoch,
+                ));
             }
         }
 

@@ -927,14 +927,14 @@ mod fair_scheduler_tests {
         let job_id = JobId::try_new("sc1-test").unwrap();
         // Build a two-stage plan: map → exchange → reduce
         let mut plan = PhysicalPlan::new("sc1", ExecutionKind::Batch);
-        plan.add_node(
-            PlanNode::new("map", "map", ExecutionKind::Batch).with_op(NodeOp::Exchange {
+        plan.add_node(PlanNode::new("map", "map", ExecutionKind::Batch).with_op(
+            NodeOp::Exchange {
                 partitioning: Partitioning::Hash {
                     keys: vec!["k".to_string()],
                     buckets: 4,
                 },
-            }),
-        );
+            },
+        ));
         plan.add_node(
             PlanNode::new("reduce", "reduce", ExecutionKind::Batch)
                 .with_inputs(vec!["map".to_string()]),

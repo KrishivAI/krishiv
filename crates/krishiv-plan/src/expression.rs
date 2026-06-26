@@ -36,6 +36,12 @@ pub enum ExprDataType {
         value: Box<ExprDataType>,
     },
     Struct(Vec<ExprField>),
+    /// Semi-structured JSON-like data type (Spark VARIANT equivalent).
+    ///
+    /// Stores arbitrary JSON without a fixed schema. Query-time access uses
+    /// `variant_get(column, 'path')` and schema is applied at read time.
+    /// Arrow serialization uses `Binary` with a variant encoding prefix.
+    Variant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -581,6 +587,7 @@ fn type_sql(data_type: &ExprDataType) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        ExprDataType::Variant => "VARIANT".into(),
     }
 }
 
@@ -650,5 +657,23 @@ mod tests {
             expr.normalize_json().unwrap(),
             expr.normalize_json().unwrap()
         );
+    }
+
+    #[test]
+    fn variant_type_sql_name() {
+        assert_eq!(type_sql(&ExprDataType::Variant), "VARIANT");
+    }
+
+    #[test]
+    fn variant_type_validates() {
+        assert!(ExprDataType::Variant.validate().is_ok());
+    }
+
+    #[test]
+    fn variant_type_round_trips_via_serde() {
+        let t = ExprDataType::Variant;
+        let json = serde_json::to_string(&t).unwrap();
+        let back: ExprDataType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
     }
 }

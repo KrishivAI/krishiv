@@ -178,13 +178,19 @@ mod tests {
         let root = Path::new("/data");
         let file = Path::new("/data/2024/01/part-0.parquet");
         let parts = discover_hive_partitions(root, file);
-        assert!(parts.is_empty(), "plain segments should not produce partition columns");
+        assert!(
+            parts.is_empty(),
+            "plain segments should not produce partition columns"
+        );
     }
 
     #[test]
     fn inject_partition_columns_appends_utf8_columns() {
         let batch = minimal_batch(3);
-        let parts = vec![("year".into(), "2024".into()), ("month".into(), "01".into())];
+        let parts = vec![
+            ("year".into(), "2024".into()),
+            ("month".into(), "01".into()),
+        ];
         let out = inject_partition_columns(batch, &parts).unwrap();
         assert_eq!(out.num_columns(), 3);
         assert_eq!(out.schema().field(1).name(), "year");
@@ -214,13 +220,21 @@ mod tests {
         .unwrap();
         let parts = vec![("year".into(), "2024".into())];
         let out = inject_partition_columns(batch, &parts).unwrap();
-        assert_eq!(out.num_columns(), 2, "existing 'year' column must not be duplicated");
+        assert_eq!(
+            out.num_columns(),
+            2,
+            "existing 'year' column must not be duplicated"
+        );
         let year_col = out
             .column(1)
             .as_any()
             .downcast_ref::<ArrowStringArray>()
             .unwrap();
-        assert_eq!(year_col.value(0), "2023", "original value must be preserved");
+        assert_eq!(
+            year_col.value(0),
+            "2023",
+            "original value must be preserved"
+        );
     }
 
     #[test]

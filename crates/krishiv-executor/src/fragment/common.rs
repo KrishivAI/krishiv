@@ -260,8 +260,8 @@ pub(crate) async fn read_registry_partitions(
             });
         }
 
-        let props: std::collections::HashMap<String, String> =
-            serde_json::from_str(config_json).map_err(|e| ExecutorError::InvalidAssignment {
+        let props: std::collections::HashMap<String, String> = serde_json::from_str(config_json)
+            .map_err(|e| ExecutorError::InvalidAssignment {
                 message: format!(
                     "registry-connector partition '{}': invalid config JSON '{config_json}': {e}",
                     partition.partition_id()
@@ -272,24 +272,24 @@ pub(crate) async fn read_registry_partitions(
             connector_config = connector_config.with_property(k, v);
         }
 
-        let mut source = registry
-            .open_source(&connector_config)
-            .await
-            .map_err(|e| ExecutorError::LocalExecution {
+        let mut source = registry.open_source(&connector_config).await.map_err(|e| {
+            ExecutorError::LocalExecution {
                 message: format!(
                     "registry-connector open failed for kind '{kind_str}' \
                      (partition '{}'): {e}",
                     partition.partition_id()
                 ),
-            })?;
+            }
+        })?;
 
         let mut batches = Vec::new();
-        while let Some(batch) = source
-            .read_batch_dyn()
-            .await
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: format!("registry-connector read failed for kind '{kind_str}': {e}"),
-            })?
+        while let Some(batch) =
+            source
+                .read_batch_dyn()
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("registry-connector read failed for kind '{kind_str}': {e}"),
+                })?
         {
             batches.push(batch);
         }

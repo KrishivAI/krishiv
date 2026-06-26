@@ -31,10 +31,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arrow::record_batch::RecordBatch;
+use indexmap::IndexMap;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
-use crate::join::extract_agg_key;
 use crate::ExecError;
 use crate::ExecResult;
+use crate::join::extract_agg_key;
+
+const DEFAULT_GROUP_STATE_MAX_KEYS: usize = 100_000;
 
 // ── GroupState ────────────────────────────────────────────────────────────────
 
@@ -135,6 +140,9 @@ pub struct GroupStateExecutor<S> {
     /// Event-time timeouts: `deadline_ms → Set<key>`.
     timeouts: BTreeMap<i64, HashSet<String>>,
     current_watermark_ms: i64,
+    /// LRU eviction cap: oldest key is dropped when `states.len() > max_keys`.
+    max_keys: usize,
+    access_order: IndexMap<String, ()>,
 }
 
 impl<S: Send + 'static> GroupStateExecutor<S> {
@@ -149,7 +157,15 @@ impl<S: Send + 'static> GroupStateExecutor<S> {
             states: HashMap::new(),
             timeouts: BTreeMap::new(),
             current_watermark_ms: i64::MIN,
+            max_keys: DEFAULT_GROUP_STATE_MAX_KEYS,
+            access_order: IndexMap::new(),
         }
+    }
+
+    /// Override the default LRU cap (default: 100 000 keys).
+    pub fn with_max_keys(mut self, max_keys: usize) -> Self {
+        self.max_keys = max_keys;
+        self
     }
 
     /// Process one micro-batch.
@@ -184,11 +200,14 @@ impl<S: Send + 'static> GroupStateExecutor<S> {
 
         let mut output = Vec::new();
         for (key, rows) in &groups {
+            self.touch_key(key);
             let row_refs: Vec<(&RecordBatch, usize)> = rows.iter().map(|&r| (batch, r)).collect();
             let mut gs = GroupState::new(self.states.remove(key));
             let mut emitted = self.func.on_group(key, &row_refs, &mut gs)?;
             output.append(&mut emitted);
             self.apply_group_state(key, gs);
+            // Evict only after applying state so the cap accounts for the new entry.
+            self.maybe_evict_lru();
         }
 
         Ok(output)
@@ -213,6 +232,7 @@ impl<S: Send + 'static> GroupStateExecutor<S> {
                 continue;
             };
             for key in keys {
+                self.touch_key(&key);
                 let mut gs = GroupState::new(self.states.remove(&key));
                 let mut emitted = self.func.on_group(&key, &[], &mut gs)?;
                 output.append(&mut emitted);
@@ -239,30 +259,93 @@ impl<S: Send + 'static> GroupStateExecutor<S> {
 
     // ── Private ────────────────────────────────────────────────────────────────
 
-    fn apply_group_state(&mut self, key: &str, gs: GroupState<S>) {
-        if gs.remove || gs.value.is_none() {
-            // Remove state and cancel any pending timeout.
-            self.timeouts.values_mut().for_each(|set| {
-                set.remove(key);
-            });
-            self.timeouts.retain(|_, set| !set.is_empty());
-        } else {
-            if let Some(s) = gs.value {
-                self.states.insert(key.to_owned(), s);
-            }
-            // Register or update timeout.
-            if let Some(deadline) = gs.expires_at_ms {
-                // Cancel any previous timeout for this key.
-                self.timeouts.values_mut().for_each(|set| {
-                    set.remove(key);
+    fn touch_key(&mut self, key: &str) {
+        self.access_order.shift_remove(key);
+        self.access_order.insert(key.to_owned(), ());
+    }
+
+    fn maybe_evict_lru(&mut self) {
+        while self.states.len() > self.max_keys {
+            if let Some((oldest, _)) = self.access_order.shift_remove_index(0) {
+                self.states.remove(&oldest);
+                // Cancel timeouts for evicted key.
+                self.timeouts.values_mut().for_each(|s| {
+                    s.remove(&oldest);
                 });
-                self.timeouts.retain(|_, set| !set.is_empty());
-                self.timeouts
-                    .entry(deadline)
-                    .or_default()
-                    .insert(key.to_owned());
+                self.timeouts.retain(|_, s| !s.is_empty());
+            } else {
+                break;
             }
         }
+    }
+
+    fn apply_group_state(&mut self, key: &str, gs: GroupState<S>) {
+        if gs.remove {
+            // Explicit removal: discard state and cancel all timeouts for this key.
+            self.states.remove(key);
+            self.access_order.shift_remove(key);
+            self.cancel_timeout(key);
+            return;
+        }
+        // Persist state if the function produced a value.
+        if let Some(s) = gs.value {
+            self.states.insert(key.to_owned(), s);
+        }
+        // Register or update the timeout if one was set, independent of whether
+        // state was updated. This allows set_timeout_ms() without update() to work.
+        if let Some(deadline) = gs.expires_at_ms {
+            self.cancel_timeout(key);
+            self.timeouts
+                .entry(deadline)
+                .or_default()
+                .insert(key.to_owned());
+        }
+    }
+
+    fn cancel_timeout(&mut self, key: &str) {
+        self.timeouts.values_mut().for_each(|s| {
+            s.remove(key);
+        });
+        self.timeouts.retain(|_, s| !s.is_empty());
+    }
+}
+
+// ── Snapshot / restore (requires S: Serialize + DeserializeOwned) ─────────────
+
+/// Serialized snapshot of `GroupStateExecutor` state (excludes the user fn).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct GroupStateSnapshot {
+    pub states_json: String,
+    pub timeouts: BTreeMap<i64, HashSet<String>>,
+    pub current_watermark_ms: i64,
+}
+
+impl<S: Send + 'static + Serialize + DeserializeOwned> GroupStateExecutor<S> {
+    /// Serialize current per-group states + timeout index into a JSON snapshot.
+    pub fn snapshot(&self) -> Result<GroupStateSnapshot, serde_json::Error> {
+        let states_json = serde_json::to_string(&self.states)?;
+        Ok(GroupStateSnapshot {
+            states_json,
+            timeouts: self.timeouts.clone(),
+            current_watermark_ms: self.current_watermark_ms,
+        })
+    }
+
+    /// Restore states + timeout index from a previously generated snapshot.
+    ///
+    /// The user function is not touched — callers must construct the executor
+    /// with the same function before calling `restore`.
+    pub fn restore(&mut self, snap: GroupStateSnapshot) -> Result<(), serde_json::Error> {
+        let states: HashMap<String, S> = serde_json::from_str(&snap.states_json)?;
+        self.states = states;
+        self.access_order = self
+            .states
+            .keys()
+            .map(|k| (k.clone(), ()))
+            .collect::<IndexMap<_, _>>();
+        self.timeouts = snap.timeouts;
+        self.current_watermark_ms = snap.current_watermark_ms;
+        Ok(())
     }
 }
 
@@ -294,16 +377,8 @@ mod tests {
     }
 
     fn single_i64_batch(v: i64) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "out",
-            DataType::Int64,
-            false,
-        )]));
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![v])) as _],
-        )
-        .unwrap()
+        let schema = Arc::new(Schema::new(vec![Field::new("out", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![v])) as _]).unwrap()
     }
 
     fn extract_i64_col0(batch: &RecordBatch, row: usize) -> i64 {
@@ -432,8 +507,7 @@ mod tests {
 
     #[test]
     fn timeout_fires_when_watermark_advances() {
-        let mut exec =
-            GroupStateExecutor::new("key", Box::new(TimeoutFn { timeout_ms: 1000 }));
+        let mut exec = GroupStateExecutor::new("key", Box::new(TimeoutFn { timeout_ms: 1000 }));
         let b = batch_with_key_and_val(&["k"], &[42]);
         exec.process_batch(&b, 0).unwrap();
         assert_eq!(exec.pending_timeout_count(), 1);
@@ -452,14 +526,17 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(v, 42);
-        assert_eq!(exec.active_group_count(), 0, "state should be removed after timeout");
+        assert_eq!(
+            exec.active_group_count(),
+            0,
+            "state should be removed after timeout"
+        );
         assert_eq!(exec.pending_timeout_count(), 0);
     }
 
     #[test]
     fn timeout_is_not_fired_again_after_state_removed() {
-        let mut exec =
-            GroupStateExecutor::new("key", Box::new(TimeoutFn { timeout_ms: 500 }));
+        let mut exec = GroupStateExecutor::new("key", Box::new(TimeoutFn { timeout_ms: 500 }));
         let b = batch_with_key_and_val(&["k"], &[7]);
         exec.process_batch(&b, 0).unwrap();
         exec.fire_timeouts(600).unwrap();
@@ -494,7 +571,10 @@ mod tests {
         exec.process_batch(&b, 0).unwrap();
         // Watermark at 600 — old deadline 500 should not fire; new deadline is 2000.
         let out = exec.fire_timeouts(600).unwrap();
-        assert!(out.is_empty(), "rescheduled timeout must not fire at old deadline");
+        assert!(
+            out.is_empty(),
+            "rescheduled timeout must not fire at old deadline"
+        );
         // Watermark at 2001 — new deadline fires.
         let out = exec.fire_timeouts(2001).unwrap();
         assert_eq!(out.len(), 1);
@@ -518,5 +598,102 @@ mod tests {
         let mut exec = GroupStateExecutor::new("nonexistent", Box::new(SumFn));
         let b = batch_with_key_and_val(&["k"], &[1]);
         assert!(exec.process_batch(&b, 0).is_err());
+    }
+
+    // ── LRU eviction ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn lru_eviction_caps_state_size() {
+        let mut exec = GroupStateExecutor::new("key", Box::new(SumFn)).with_max_keys(3);
+        // Insert 4 unique keys — the oldest should be evicted.
+        for (k, v) in [("a", 1i64), ("b", 2), ("c", 3), ("d", 4)] {
+            exec.process_batch(&batch_with_key_and_val(&[k], &[v]), 0)
+                .unwrap();
+        }
+        assert!(
+            exec.active_group_count() <= 3,
+            "LRU cap must keep at most 3 keys, got {}",
+            exec.active_group_count()
+        );
+    }
+
+    // ── Snapshot / restore (Fix #6) ───────────────────────────────────────────
+
+    #[test]
+    fn snapshot_and_restore_preserves_state() {
+        let mut exec = GroupStateExecutor::new("key", Box::new(SumFn));
+        // Accumulate state for two keys.
+        exec.process_batch(&batch_with_key_and_val(&["x", "y"], &[10, 20]), 0)
+            .unwrap();
+        let snap = exec.snapshot().expect("snapshot must succeed");
+
+        // Create a fresh executor and restore.
+        let mut exec2 = GroupStateExecutor::new("key", Box::new(SumFn));
+        exec2.restore(snap).expect("restore must succeed");
+        assert_eq!(
+            exec2.active_group_count(),
+            2,
+            "restored executor must have 2 keys"
+        );
+
+        // Further accumulation on the restored executor should see prior state.
+        exec2
+            .process_batch(&batch_with_key_and_val(&["x"], &[5]), 0)
+            .unwrap();
+        assert_eq!(exec2.active_group_count(), 2);
+    }
+
+    #[test]
+    fn snapshot_watermark_is_preserved() {
+        let mut exec = GroupStateExecutor::new("key", Box::new(SumFn));
+        exec.process_batch(&batch_with_key_and_val(&["k"], &[1]), 5_000)
+            .unwrap();
+        let snap = exec.snapshot().expect("snapshot");
+        assert_eq!(snap.current_watermark_ms, 5_000);
+    }
+
+    // ── Fix #7: set_timeout_ms without update() works ─────────────────────────
+
+    #[test]
+    fn timeout_without_state_value_is_registered() {
+        // A function that calls set_timeout_ms but does NOT call state.update().
+        struct TimeoutOnlyFn;
+        impl GroupStateFn<i64> for TimeoutOnlyFn {
+            fn on_group(
+                &mut self,
+                _key: &str,
+                rows: &[(&RecordBatch, usize)],
+                state: &mut GroupState<i64>,
+            ) -> ExecResult<Vec<RecordBatch>> {
+                if rows.is_empty() {
+                    return Ok(vec![single_i64_batch(99)]);
+                }
+                // Only set a timeout — no state.update().
+                state.set_timeout_ms(1000);
+                Ok(vec![])
+            }
+        }
+        let mut exec = GroupStateExecutor::new("key", Box::new(TimeoutOnlyFn));
+        exec.process_batch(&batch_with_key_and_val(&["k"], &[0]), 0)
+            .unwrap();
+        // Timeout must be registered even though no state value was set.
+        assert_eq!(
+            exec.pending_timeout_count(),
+            1,
+            "timeout must be registered without update()"
+        );
+        let out = exec.fire_timeouts(1001).unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "timeout must fire when watermark crosses deadline"
+        );
+        let v = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(v, 99);
     }
 }

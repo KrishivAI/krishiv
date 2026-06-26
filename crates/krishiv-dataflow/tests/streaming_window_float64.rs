@@ -48,6 +48,7 @@ fn streaming_window_preserves_float64_sum() {
             output_column: "amount_sum".into(),
         }],
         state_ttl_ms: None,
+        allowed_lateness_ms: None,
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
     };

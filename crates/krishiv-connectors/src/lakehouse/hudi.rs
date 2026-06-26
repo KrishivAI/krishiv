@@ -421,11 +421,7 @@ impl HudiCowWriter {
     ///
     /// Rewrites the full current snapshot without the matching rows and commits
     /// the result as a new Hudi instant.  Returns the number of rows deleted.
-    pub fn delete_by_key(
-        &self,
-        key_column: &str,
-        key_values: &[String],
-    ) -> LakehouseResult<u64> {
+    pub fn delete_by_key(&self, key_column: &str, key_values: &[String]) -> LakehouseResult<u64> {
         self.delete_by_key_at(next_instant(), key_column, key_values)
     }
 
@@ -443,9 +439,9 @@ impl HudiCowWriter {
             _ => return Ok(0), // nothing to delete from an empty table
         };
         let key_set: HashSet<String> = key_values.iter().cloned().collect();
-        let key_col = current
-            .column_by_name(key_column)
-            .ok_or_else(|| LakehouseError::Io(format!("delete key '{key_column}' not in schema")))?;
+        let key_col = current.column_by_name(key_column).ok_or_else(|| {
+            LakehouseError::Io(format!("delete key '{key_column}' not in schema"))
+        })?;
         let keep_indices: Vec<u32> = (0..current.num_rows())
             .filter(|&row| {
                 typed_key(key_col.as_ref(), row)
@@ -772,7 +768,9 @@ pub fn vacuum_hudi_table(table_path: &Path, retention_hours: u64) -> LakehouseRe
         if name.starts_with('.') {
             continue; // skip .hoodie, .delta-stage, etc.
         }
-        let meta = entry.metadata().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let meta = entry
+            .metadata()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         if !meta.is_dir() {
             continue;
         }
@@ -781,18 +779,24 @@ pub fn vacuum_hudi_table(table_path: &Path, retention_hours: u64) -> LakehouseRe
             continue;
         }
         let age = now
-            .duration_since(meta.modified().map_err(|e| LakehouseError::Io(e.to_string()))?)
+            .duration_since(
+                meta.modified()
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?,
+            )
             .unwrap_or_default();
         if age < cutoff {
             continue;
         }
         // Remove all parquet files inside the orphaned instant dir.
         let orphan_dir = entry.path();
-        for file_entry in fs::read_dir(&orphan_dir).map_err(|e| LakehouseError::Io(e.to_string()))? {
+        for file_entry in
+            fs::read_dir(&orphan_dir).map_err(|e| LakehouseError::Io(e.to_string()))?
+        {
             let file_entry = file_entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
             let fname = file_entry.file_name().to_string_lossy().to_string();
             if fname.ends_with(".parquet") {
-                fs::remove_file(file_entry.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
+                fs::remove_file(file_entry.path())
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
                 removed += 1;
             }
         }
@@ -1734,7 +1738,9 @@ mod tests {
     fn delete_by_key_on_empty_table_is_noop() {
         let dir = tempfile::tempdir().unwrap();
         let writer = HudiCowWriter::open(dir.path());
-        let deleted = writer.delete_by_key("id", &["Int64:1".to_string()]).unwrap();
+        let deleted = writer
+            .delete_by_key("id", &["Int64:1".to_string()])
+            .unwrap();
         assert_eq!(deleted, 0);
     }
 
@@ -1748,7 +1754,12 @@ mod tests {
             .unwrap();
         assert_eq!(deleted, 0, "no matching key should delete nothing");
         let reader = HudiSnapshotReader::open(dir.path());
-        let total: usize = reader.scan_batches().unwrap().iter().map(|b| b.num_rows()).sum();
+        let total: usize = reader
+            .scan_batches()
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
         assert_eq!(total, 3);
     }
 
@@ -1780,7 +1791,8 @@ mod tests {
 
     #[test]
     fn vacuum_hudi_nonexistent_table_is_noop() {
-        let removed = vacuum_hudi_table(Path::new("/tmp/krishiv_test_nonexistent_hudi_xyz"), 0).unwrap();
+        let removed =
+            vacuum_hudi_table(Path::new("/tmp/krishiv_test_nonexistent_hudi_xyz"), 0).unwrap();
         assert_eq!(removed, 0);
     }
 }

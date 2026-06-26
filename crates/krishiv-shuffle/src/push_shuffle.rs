@@ -28,13 +28,20 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+/// Composite key for the push-shuffle store: `(job_id, stage_id, partition_idx)`.
+pub type PushShuffleKey = (String, String, u32);
+
+/// Inner map for [`PushShuffleStore`]: one entry per partition holds the
+/// ordered list of IPC payloads pushed by the map tasks.
+type PushShuffleMap = DashMap<PushShuffleKey, Vec<Vec<u8>>>;
+
 /// In-process store for push-based shuffle data.
 ///
 /// Shared (via `Arc`) between the executor push path and the ESS HTTP handler.
 #[derive(Clone, Default)]
 pub struct PushShuffleStore {
     /// (job_id, stage_id, partition_idx) → ordered list of IPC payloads
-    inner: Arc<DashMap<(String, String, u32), Vec<Vec<u8>>>>,
+    inner: Arc<PushShuffleMap>,
 }
 
 impl PushShuffleStore {

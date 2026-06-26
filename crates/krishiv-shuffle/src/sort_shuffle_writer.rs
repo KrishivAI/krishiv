@@ -170,7 +170,10 @@ impl SortShuffleWriter {
         // Write data file atomically via a temp file.
         let tmp_data = self.output_dir.join(format!("{base}.data.tmp"));
         std::fs::write(&tmp_data, &data_buf).map_err(|e| {
-            io_err(format!("failed to write data file '{}': {e}", tmp_data.display()))
+            io_err(format!(
+                "failed to write data file '{}': {e}",
+                tmp_data.display()
+            ))
         })?;
         std::fs::rename(&tmp_data, &data_path).map_err(|e| {
             io_err(format!(
@@ -187,7 +190,10 @@ impl SortShuffleWriter {
         }
         let tmp_idx = self.output_dir.join(format!("{base}.index.tmp"));
         std::fs::write(&tmp_idx, &idx_buf).map_err(|e| {
-            io_err(format!("failed to write index file '{}': {e}", tmp_idx.display()))
+            io_err(format!(
+                "failed to write index file '{}': {e}",
+                tmp_idx.display()
+            ))
         })?;
         std::fs::rename(&tmp_idx, &index_path).map_err(|e| {
             io_err(format!(
@@ -294,8 +300,7 @@ mod tests {
     #[test]
     fn sort_shuffle_writer_roundtrip_offsets() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer =
-            SortShuffleWriter::new("job1", "stage1", "k", 4, dir.path()).unwrap();
+        let mut writer = SortShuffleWriter::new("job1", "stage1", "k", 4, dir.path()).unwrap();
 
         // Push rows across two batches so the concat+sort path is exercised.
         writer.push(make_batch(&[8, 1, 3, 0])).unwrap();
@@ -328,8 +333,7 @@ mod tests {
     #[test]
     fn sort_shuffle_writer_empty_push() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer =
-            SortShuffleWriter::new("job2", "stage1", "k", 2, dir.path()).unwrap();
+        let mut writer = SortShuffleWriter::new("job2", "stage1", "k", 2, dir.path()).unwrap();
         // No rows pushed — flush should still produce valid (empty) files.
         writer.push(make_batch(&[])).unwrap();
         let files = writer.flush().unwrap();

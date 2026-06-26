@@ -527,6 +527,7 @@ async fn heartbeat_loop(
                         local_dir,
                         flight_endpoint: endpoint,
                         ess_index: None,
+                        push_store: None,
                     })
                     .with_inmem_shuffle(backend);
             }
@@ -537,6 +538,7 @@ async fn heartbeat_loop(
                         local_dir: shuffle_dir.clone().unwrap_or_default(),
                         flight_endpoint: String::new(),
                         ess_index: None,
+                        push_store: None,
                     })
                     .with_inmem_shuffle(backend);
             }
@@ -562,6 +564,7 @@ async fn heartbeat_loop(
             local_dir: dir.clone(),
             flight_endpoint: endpoint,
             ess_index: None,
+            push_store: None,
         });
     }
     if krishiv_common::allows_unbounded_shuffle_store(durability_profile) {

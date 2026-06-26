@@ -155,9 +155,11 @@ impl ConnectorKind {
             #[cfg(feature = "jdbc")]
             "jdbc-sink" | "jdbc_sink" | "postgres-sink" | "mysql-sink" => Ok(Self::JdbcSink),
             #[cfg(not(feature = "jdbc"))]
-            "jdbc-sink" | "jdbc_sink" | "postgres-sink" | "mysql-sink" => Err(ConnectorError::Unsupported {
-                message: "jdbc-sink connector requires the `jdbc` feature".into(),
-            }),
+            "jdbc-sink" | "jdbc_sink" | "postgres-sink" | "mysql-sink" => {
+                Err(ConnectorError::Unsupported {
+                    message: "jdbc-sink connector requires the `jdbc` feature".into(),
+                })
+            }
             other => Err(ConnectorError::Config {
                 message: format!("unknown connector kind '{other}'"),
             }),

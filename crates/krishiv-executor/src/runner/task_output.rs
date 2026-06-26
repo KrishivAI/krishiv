@@ -430,6 +430,9 @@ pub struct ShuffleContext {
     /// writers register their output here so the ESS HTTP server can serve
     /// partition-level range reads without a separate registration RPC.
     pub ess_index: Option<krishiv_shuffle::SortShuffleIndex>,
+    /// T12: optional push-shuffle store — when set, each partition's IPC bytes
+    /// are also pushed here so reduce-side tasks can read without a Flight hop.
+    pub push_store: Option<std::sync::Arc<krishiv_shuffle::PushShuffleStore>>,
 }
 
 impl fmt::Debug for ShuffleContext {

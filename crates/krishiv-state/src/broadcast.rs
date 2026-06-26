@@ -270,21 +270,20 @@ mod tests {
         let reader = BroadcastState::open(descriptor, backend);
 
         writer.put(b"key".to_vec(), b"value".to_vec()).unwrap();
-        assert_eq!(reader.get(b"key").unwrap().as_deref(), Some(b"value".as_ref()));
+        assert_eq!(
+            reader.get(b"key").unwrap().as_deref(),
+            Some(b"value".as_ref())
+        );
     }
 
     /// Two handles with different descriptor names have independent namespaces.
     #[test]
     fn different_descriptors_are_isolated() {
         let backend = Arc::new(Mutex::new(InMemoryStateBackend::default()));
-        let mut rules = BroadcastState::open(
-            BroadcastStateDescriptor::new("rules"),
-            Arc::clone(&backend),
-        );
-        let model = BroadcastState::open(
-            BroadcastStateDescriptor::new("model"),
-            Arc::clone(&backend),
-        );
+        let mut rules =
+            BroadcastState::open(BroadcastStateDescriptor::new("rules"), Arc::clone(&backend));
+        let model =
+            BroadcastState::open(BroadcastStateDescriptor::new("model"), Arc::clone(&backend));
 
         rules.put(b"r1".to_vec(), b"deny".to_vec()).unwrap();
         assert!(model.get(b"r1").unwrap().is_none());

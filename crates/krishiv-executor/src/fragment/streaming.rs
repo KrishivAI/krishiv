@@ -35,6 +35,12 @@ const STREAM_CEP_PREFIX: &str = krishiv_plan::cep::STREAM_CEP_PREFIX;
 ///  4. Returns any newly emitted (closed) window batches.
 const STREAM_LOOP_PREFIX: &str = "stream:loop:";
 
+/// Fragment prefix for ST8 stream-to-stream watermark join.
+///
+/// Format: `window-join:<json>` where `<json>` is a serialised
+/// [`WatermarkWindowJoinSpec`][krishiv_dataflow::WatermarkWindowJoinSpec].
+const WINDOW_JOIN_PREFIX: &str = "window-join:";
+
 /// Parse `stream-kafka:` partitions into batches with schema `(key, ts, val)`.
 fn parse_stream_kafka_partitions(
     partitions: &[krishiv_proto::InputPartition],
@@ -332,6 +338,62 @@ fn execute_cep_fragment(
     Ok(output)
 }
 
+/// ST8: Execute a `window-join:` fragment using [`WatermarkWindowJoinOperator`].
+///
+/// Fragment format: `window-join:<json>` where `<json>` is a serialised
+/// `WatermarkWindowJoinSpec`.  Input partitions with even indices are treated
+/// as the left stream; odd indices as the right stream.
+fn execute_window_join_fragment(
+    assignment: &ExecutorTaskAssignment,
+    fragment: &str,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    let json = fragment.strip_prefix(WINDOW_JOIN_PREFIX).ok_or_else(|| {
+        ExecutorError::InvalidAssignment {
+            message: format!(
+                "execute_window_join_fragment: wrong prefix; expected '{WINDOW_JOIN_PREFIX}'"
+            ),
+        }
+    })?;
+
+    let spec: krishiv_dataflow::WatermarkWindowJoinSpec =
+        serde_json::from_str(json).map_err(|e| ExecutorError::InvalidAssignment {
+            message: format!("window-join: invalid spec JSON: {e}"),
+        })?;
+
+    // Partition input into left (even indices) and right (odd indices).
+    let all_partitions =
+        crate::fragment::common::read_inline_ipc_partitions(assignment.input_partitions())
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("window-join: failed to decode input partitions: {e}"),
+            })?;
+
+    let (left_batches, right_batches): (Vec<_>, Vec<_>) = all_partitions
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, (_src, batches))| batches.into_iter().map(move |b| (i, b)))
+        .partition(|(i, _)| i % 2 == 0);
+
+    let left: Vec<_> = left_batches.into_iter().map(|(_, b)| b).collect();
+    let right: Vec<_> = right_batches.into_iter().map(|(_, b)| b).collect();
+
+    let out =
+        krishiv_dataflow::execute_window_join(&left, &right, spec, i64::MAX).map_err(|e| {
+            ExecutorError::LocalExecution {
+                message: format!("window-join: execution error: {e}"),
+            }
+        })?;
+
+    let total_rows: usize = out.iter().map(|b| b.num_rows()).sum();
+    let total_batches = out.len();
+    let column_count = out.first().map(|b| b.num_columns()).unwrap_or(0);
+    Ok(ExecutorTaskOutput::streaming_window(
+        total_rows,
+        total_batches,
+        column_count,
+        out,
+    ))
+}
+
 /// Execute a `stream:loop:` fragment using `ContinuousWindowExecutor` (GAP-6).
 ///
 /// Creates or reuses a per-job stateful executor stored in
@@ -461,6 +523,25 @@ fn execute_loop_fragment(
         let wm = exec.last_watermark_ms();
         (batches, wm)
     };
+
+    // Fix #2: after each drain cycle, push a read-only snapshot into the
+    // queryable-state store so REST point-lookups can serve the latest state
+    // without contending with the hot processing path.
+    if let Some(qs) = runner.queryable_state.as_ref() {
+        use krishiv_state::StateBackend as _;
+        // Use peek_snapshot_bytes (no checkpoint() side-effect) so the normal
+        // checkpoint lifecycle is not disturbed by queryable-state observation.
+        executor_arc
+            .lock()
+            .ok()
+            .and_then(|exec| exec.peek_snapshot_bytes().ok())
+            .and_then(|bytes| {
+                let mut backend = krishiv_state::RocksDbStateBackend::ephemeral().ok()?;
+                backend.load_snapshot(&bytes).ok()?;
+                qs.register(job_id, "window-exec", std::sync::Arc::new(backend));
+                Some(())
+            });
+    }
 
     let total_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
     let total_batches = output_batches.len();
@@ -600,6 +681,11 @@ pub(crate) async fn execute_streaming_fragment(
     // shared across drain cycles via runner.loop_executors.
     if fragment.starts_with(STREAM_LOOP_PREFIX) {
         return execute_loop_fragment(runner, assignment, fragment);
+    }
+
+    // ST8: watermark-bounded stream-to-stream join.
+    if fragment.starts_with(WINDOW_JOIN_PREFIX) {
+        return execute_window_join_fragment(assignment, fragment);
     }
 
     let mut plan_spec =

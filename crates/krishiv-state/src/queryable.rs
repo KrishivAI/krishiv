@@ -121,6 +121,37 @@ impl QueryableStateStore {
         }
     }
 
+    /// Scan all key-value pairs in namespace `(op_id, state_name)` for job
+    /// `job_id`. Returns `(key, value)` pairs.
+    ///
+    /// This is the full-scan counterpart to [`get`](Self::get) for building
+    /// DataFrames over live operator state.
+    pub fn scan(
+        &self,
+        job_id: &str,
+        op_id: &str,
+        state_name: &str,
+    ) -> StateResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let map = self.backends.read().map_err(|_| StateError::LockPoisoned {
+            message: "queryable state registry lock poisoned".into(),
+        })?;
+        let k = registry_key(job_id, op_id);
+        match map.get(&k) {
+            None => Ok(Vec::new()),
+            Some(backend) => {
+                let ns = Namespace::new(op_id, state_name);
+                let keys = backend.list_keys(&ns)?;
+                let mut results = Vec::with_capacity(keys.len());
+                for key in keys {
+                    if let Some(value) = backend.get(&ns, &key)? {
+                        results.push((key, value));
+                    }
+                }
+                Ok(results)
+            }
+        }
+    }
+
     /// Return a `QueryableStateHandle` for point lookups on a specific operator.
     ///
     /// Returns `Err` if the operator is not registered.
@@ -284,5 +315,30 @@ mod tests {
 
         let val = store.get("job-1", "op-1", "s", b"k").unwrap();
         assert_eq!(val, Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn scan_returns_all_key_value_pairs() {
+        let store = QueryableStateStore::new();
+        let mut b = RocksDbStateBackend::new().unwrap();
+        let ns = Namespace::new("op-1", "counts");
+        b.put(&ns, b"user-a".to_vec(), b"10".to_vec()).unwrap();
+        b.put(&ns, b"user-b".to_vec(), b"20".to_vec()).unwrap();
+        b.put(&ns, b"user-c".to_vec(), b"30".to_vec()).unwrap();
+        store.register("job-1", "op-1", Arc::new(b));
+
+        let mut pairs = store.scan("job-1", "op-1", "counts").unwrap();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], (b"user-a".to_vec(), b"10".to_vec()));
+        assert_eq!(pairs[1], (b"user-b".to_vec(), b"20".to_vec()));
+        assert_eq!(pairs[2], (b"user-c".to_vec(), b"30".to_vec()));
+    }
+
+    #[test]
+    fn scan_returns_empty_for_unregistered_operator() {
+        let store = QueryableStateStore::new();
+        let pairs = store.scan("job-99", "op-1", "counts").unwrap();
+        assert!(pairs.is_empty());
     }
 }

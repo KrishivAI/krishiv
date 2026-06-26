@@ -134,7 +134,8 @@ pub fn version_at_timestamp(root: &Path, timestamp_ms: i64) -> LakehouseResult<O
             continue;
         };
         let Ok(v) = stem.parse::<u64>() else { continue };
-        let text = fs::read_to_string(entry.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let text =
+            fs::read_to_string(entry.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
         for line in text.lines() {
             let val: serde_json::Value = match serde_json::from_str(line) {
                 Ok(v) => v,
@@ -189,11 +190,23 @@ fn compute_add_stats(batches: &[RecordBatch]) -> serde_json::Value {
                 let v = formatter.value(row).to_string();
                 col_min = Some(match col_min.take() {
                     None => v.clone(),
-                    Some(m) => if v < m { v.clone() } else { m },
+                    Some(m) => {
+                        if v < m {
+                            v.clone()
+                        } else {
+                            m
+                        }
+                    }
                 });
                 col_max = Some(match col_max.take() {
                     None => v.clone(),
-                    Some(m) => if v > m { v.clone() } else { m },
+                    Some(m) => {
+                        if v > m {
+                            v.clone()
+                        } else {
+                            m
+                        }
+                    }
                 });
             }
         }
@@ -284,7 +297,14 @@ fn uuid_v4_hex() -> String {
         .unwrap_or_default()
         .subsec_nanos();
     // Not cryptographic — just needs to be unique per table creation.
-    format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}", t, t >> 4, t >> 8, t >> 16, t as u64 * 0xdead_beef)
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        t,
+        t >> 4,
+        t >> 8,
+        t >> 16,
+        t as u64 * 0xdead_beef
+    )
 }
 
 /// Remove Parquet files that are no longer referenced by any Delta log version
@@ -327,9 +347,14 @@ pub fn vacuum_table(path: &str, retention_hours: u64) -> LakehouseResult<usize> 
             continue;
         }
         // Check modification time.
-        let meta = entry.metadata().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let meta = entry
+            .metadata()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let age = now
-            .duration_since(meta.modified().map_err(|e| LakehouseError::Io(e.to_string()))?)
+            .duration_since(
+                meta.modified()
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?,
+            )
             .unwrap_or_default();
         if age >= cutoff_duration {
             fs::remove_file(entry.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -376,14 +401,12 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
     fs::create_dir_all(root).map_err(|e| LakehouseError::Io(e.to_string()))?;
 
     // ── Schema enforcement (T19): reject append if schemas are incompatible ──
-    if !overwrite {
-        if let Some(existing) = existing_table_schema(root)? {
-            let incoming = batches[0].schema();
-            if existing.as_ref() != incoming.as_ref() {
-                return Err(LakehouseError::Io(format!(
-                    "schema mismatch on append: existing={existing:?}, incoming={incoming:?}"
-                )));
-            }
+    if !overwrite && let Some(existing) = existing_table_schema(root)? {
+        let incoming = batches[0].schema();
+        if existing.as_ref() != incoming.as_ref() {
+            return Err(LakehouseError::Io(format!(
+                "schema mismatch on append: existing={existing:?}, incoming={incoming:?}"
+            )));
         }
     }
 
@@ -397,8 +420,8 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
     let file_path = root.join(&file_name);
     let schema = batches[0].schema();
     let f = File::create(&file_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-    let mut writer =
-        ArrowWriter::try_new(f, schema.clone(), None).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let mut writer = ArrowWriter::try_new(f, schema.clone(), None)
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
     for batch in &batches {
         writer
             .write(batch)
@@ -438,7 +461,8 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
         writeln!(log, "{commit}").map_err(|e| LakehouseError::Io(e.to_string()))?;
         // S6: Emit remove actions for every file deleted during overwrite.
         for removed in &removed_paths {
-            let remove = json!({"remove":{"path":removed,"dataChange":true,"deletionTimestamp":ts}});
+            let remove =
+                json!({"remove":{"path":removed,"dataChange":true,"deletionTimestamp":ts}});
             writeln!(log, "{remove}").map_err(|e| LakehouseError::Io(e.to_string()))?;
         }
         writeln!(log, "{add}").map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -722,9 +746,8 @@ mod tests {
         let schema2 = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Float64, false),
         ]));
-        let floats: Arc<dyn arrow::array::Array> = Arc::new(
-            arrow::array::Float64Array::from(vec![1.0, 2.0]),
-        );
+        let floats: Arc<dyn arrow::array::Array> =
+            Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0]));
         let bad_batch = RecordBatch::try_new(schema2, vec![floats]).unwrap();
         let err = write_table(&path, vec![bad_batch], false).unwrap_err();
         assert!(
@@ -802,11 +825,20 @@ mod tests {
         assert!(dir.path().join("part-00001.parquet").exists());
 
         let removed = vacuum_table(&path, 0).unwrap();
-        assert_eq!(removed, 1, "exactly the one overwritten file should be removed");
+        assert_eq!(
+            removed, 1,
+            "exactly the one overwritten file should be removed"
+        );
 
         // Active file must still exist; unreferenced one must be gone.
-        assert!(!dir.path().join("part-00000.parquet").exists(), "tombstoned file removed");
-        assert!(dir.path().join("part-00001.parquet").exists(), "active file retained");
+        assert!(
+            !dir.path().join("part-00000.parquet").exists(),
+            "tombstoned file removed"
+        );
+        assert!(
+            dir.path().join("part-00001.parquet").exists(),
+            "active file retained"
+        );
 
         // Table still readable after vacuum.
         let rows = read_table(&path, None).unwrap();
@@ -850,7 +882,11 @@ mod tests {
 
         // version_at_timestamp at ts_between must return version 0.
         let v = version_at_timestamp(root, ts_between).unwrap();
-        assert_eq!(v, Some(0), "timestamp between v0 and v1 should resolve to v0");
+        assert_eq!(
+            v,
+            Some(0),
+            "timestamp between v0 and v1 should resolve to v0"
+        );
 
         // A very large timestamp should return version 1.
         let v2 = version_at_timestamp(root, i64::MAX).unwrap();

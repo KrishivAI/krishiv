@@ -229,7 +229,6 @@ mod gap_tests {
         let c = MetadataDurability::LocalFile;
         assert_ne!(a, c);
         let _ = format!("{a:?}");
-        let _ = std::hash::Hash::hash(&a, &mut std::collections::hash_map::DefaultHasher::new());
     }
 
     #[test]

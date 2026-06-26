@@ -793,11 +793,7 @@ mod wire_fuzz {
     use proptest::prelude::*;
 
     fn arb_string() -> impl Strategy<Value = String> {
-        prop_oneof![
-            Just(String::new()),
-            "[a-zA-Z0-9_/:@.-]{0,32}",
-            "\\PC{0,16}",
-        ]
+        prop_oneof![Just(String::new()), "[a-zA-Z0-9_/:@.-]{0,32}", "\\PC{0,16}",]
     }
 
     fn arb_version() -> impl Strategy<Value = Option<v1::TransportVersion>> {
@@ -808,17 +804,24 @@ mod wire_fuzz {
 
     fn arb_descriptor() -> impl Strategy<Value = Option<v1::ExecutorDescriptor>> {
         prop::option::of(
-            (arb_string(), arb_string(), any::<u64>(), arb_string(), arb_string()).prop_map(
-                |(executor_id, host, slots, task_endpoint, barrier_endpoint)| {
-                    v1::ExecutorDescriptor {
-                        executor_id,
-                        host,
-                        slots,
-                        task_endpoint,
-                        barrier_endpoint,
-                    }
-                },
-            ),
+            (
+                arb_string(),
+                arb_string(),
+                any::<u64>(),
+                arb_string(),
+                arb_string(),
+            )
+                .prop_map(
+                    |(executor_id, host, slots, task_endpoint, barrier_endpoint)| {
+                        v1::ExecutorDescriptor {
+                            executor_id,
+                            host,
+                            slots,
+                            task_endpoint,
+                            barrier_endpoint,
+                        }
+                    },
+                ),
         )
     }
 

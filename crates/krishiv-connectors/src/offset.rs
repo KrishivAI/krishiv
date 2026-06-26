@@ -98,7 +98,10 @@ impl Offset for MultiFileOffset {
             .map_err(|_| ConnectorError::Offset {
                 message: "MultiFileOffset decode: batch_index exceeds usize".into(),
             })?;
-        Ok(Self { file_index, batch_index })
+        Ok(Self {
+            file_index,
+            batch_index,
+        })
     }
 }
 

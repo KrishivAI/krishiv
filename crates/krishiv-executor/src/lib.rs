@@ -12,6 +12,7 @@ pub mod barrier_grpc;
 pub mod barrier_transport;
 pub mod cli;
 pub mod error;
+pub mod ess_client;
 pub mod execution_model;
 pub(crate) mod fragment;
 pub mod grpc;

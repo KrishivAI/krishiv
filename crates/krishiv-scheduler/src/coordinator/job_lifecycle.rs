@@ -500,7 +500,10 @@ impl Coordinator {
                             .map(|s| s.spec.kind() == krishiv_proto::StageKind::ShuffleMap)
                     })
                     .unwrap_or(true); // default to true for backwards-compat with unlabelled stages
-                if is_shuffle_map && !stats.is_empty() && stats.iter().any(|s| s.serialized_bytes > 0) {
+                if is_shuffle_map
+                    && !stats.is_empty()
+                    && stats.iter().any(|s| s.serialized_bytes > 0)
+                {
                     let aqe = krishiv_plan::optimizer::default_aqe_optimizer();
                     // T1: synthesize a minimal physical plan from the stats
                     // so the AQE rules have at least one node to rewrite.

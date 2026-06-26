@@ -12,6 +12,8 @@ pub mod error;
 pub mod expression;
 pub mod incremental_flow;
 pub mod io;
+/// P11: Materialized Table API — materialized tables with managed refresh lifecycle.
+pub mod materialized_table;
 pub mod pipeline;
 pub mod prepared;
 pub mod process;
@@ -20,6 +22,7 @@ pub mod session;
 pub mod stream;
 pub mod streaming_builder;
 pub mod streaming_dataframe;
+pub mod timers;
 pub mod types;
 pub mod window;
 

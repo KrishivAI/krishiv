@@ -76,7 +76,6 @@ pub struct CoordinatorConfig {
     speculative_min_completed_tasks: usize,
 
     // ── SC11: cascade circuit breaker ──────────────────────────────────────
-
     /// Number of executor losses in `cascade_window_ms` that trips the cascade
     /// circuit breaker.  Default: `5` (5 losses → cascade detected).
     cascade_failure_threshold: usize,

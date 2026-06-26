@@ -364,7 +364,9 @@ pub async fn spawn_coordinator_sidecars(
                 ticker.tick().await;
                 let job_ids = gc_coordinator.write().await.take_gc_ready_jobs();
                 for job_id in &job_ids {
-                    gc_coordinator.queryable_state.deregister_job(job_id.as_str());
+                    gc_coordinator
+                        .queryable_state
+                        .deregister_job(job_id.as_str());
                 }
                 for job_id in job_ids {
                     if let Err(e) = store.delete_job_partitions(job_id.as_str()).await {

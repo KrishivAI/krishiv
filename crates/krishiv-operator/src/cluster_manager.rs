@@ -19,6 +19,7 @@ use std::sync::{
 
 use k8s_openapi::api::core::v1::{Container, EnvVar, Pod, PodSpec};
 use kube::Client;
+#[allow(unused_imports)]
 use kube::api::{Api, DeleteParams, ObjectMeta as KubeMeta, PostParams};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -50,8 +51,13 @@ pub struct KubernetesClusterManagerConfig {
 /// Messages sent from the synchronous trait surface to the async background
 /// actor.
 enum AllocRequest {
-    Create { pod_name: String, executor_id: String },
-    Delete { pod_name: String },
+    Create {
+        pod_name: String,
+        executor_id: String,
+    },
+    Delete {
+        pod_name: String,
+    },
 }
 
 /// Kubernetes implementation of [`ClusterManager`].
@@ -112,7 +118,14 @@ impl ClusterManager for KubernetesClusterManager {
         for _ in 0..actual {
             let (pod_name, executor_id) = self.next_pod_name();
             // Non-blocking try_send: if the channel is full, skip gracefully.
-            if self.tx.try_send(AllocRequest::Create { pod_name, executor_id }).is_ok() {
+            if self
+                .tx
+                .try_send(AllocRequest::Create {
+                    pod_name,
+                    executor_id,
+                })
+                .is_ok()
+            {
                 granted += 1;
             }
         }
@@ -142,7 +155,10 @@ async fn run_alloc_actor(
 ) {
     while let Some(req) = rx.recv().await {
         match req {
-            AllocRequest::Create { pod_name, executor_id } => {
+            AllocRequest::Create {
+                pod_name,
+                executor_id,
+            } => {
                 let pod = build_pool_pod(&config, &pod_name, &executor_id);
                 let pods: Api<Pod> = Api::namespaced(client.clone(), &config.namespace);
                 match pods.create(&PostParams::default(), &pod).await {
@@ -188,9 +204,8 @@ fn build_pool_pod(
     executor_id: &str,
 ) -> Pod {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-    let labels = std::collections::BTreeMap::from([
-        (POOL_LABEL.to_owned(), config.pool_name.clone()),
-    ]);
+    let labels =
+        std::collections::BTreeMap::from([(POOL_LABEL.to_owned(), config.pool_name.clone())]);
     Pod {
         metadata: ObjectMeta {
             name: Some(pod_name.to_owned()),

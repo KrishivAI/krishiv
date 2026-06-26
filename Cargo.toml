@@ -4,6 +4,7 @@ members = [
     "crates/krishiv-ivm",
     "crates/krishiv-api",
     "crates/krishiv-common",
+    "crates/krishiv-connect-client",
     "crates/krishiv-connectors",
     "crates/krishiv-dataflow",
     "crates/krishiv-delta",

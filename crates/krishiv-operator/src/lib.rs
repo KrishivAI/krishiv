@@ -2,9 +2,9 @@
 
 //! Public facade for `krishiv-operator`.
 
-pub mod constants;
 #[cfg(feature = "k8s")]
 pub mod cluster_manager;
+pub mod constants;
 #[cfg(feature = "k8s")]
 pub mod controller;
 pub mod crd;
@@ -25,9 +25,9 @@ pub mod webhook;
 #[cfg(all(test, feature = "k8s"))]
 mod tests;
 
-pub use constants::{API_GROUP, API_VERSION, EXECUTOR_ID_LABEL, FIELD_MANAGER, FINALIZER, KIND};
 #[cfg(feature = "k8s")]
 pub use cluster_manager::{KubernetesClusterManager, KubernetesClusterManagerConfig};
+pub use constants::{API_GROUP, API_VERSION, EXECUTOR_ID_LABEL, FIELD_MANAGER, FINALIZER, KIND};
 #[cfg(feature = "k8s")]
 pub use controller::{
     KubernetesControllerConfig, KubernetesControllerRuntime, KubernetesReconcileReport,

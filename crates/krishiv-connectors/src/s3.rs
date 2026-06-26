@@ -14,11 +14,11 @@ use parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
 };
 
+use crate::partition::inject_partition_columns;
 use crate::{
     CheckpointSource, ConnectorCapabilities, ConnectorError, ConnectorResult, MultiFileOffset,
     ParquetOffset, Sink, Source,
 };
-use crate::partition::inject_partition_columns;
 
 // ---------------------------------------------------------------------------
 // S3Source
@@ -248,19 +248,16 @@ pub async fn list_s3_parquet_objects(
     prefix: &Path,
 ) -> ConnectorResult<Vec<ObjectMeta>> {
     use futures::TryStreamExt as _;
-    let mut metas: Vec<ObjectMeta> = store
-        .list(Some(prefix))
-        .try_collect()
-        .await
-        .map_err(|e| ConnectorError::ObjectStore {
-            message: format!("failed to list objects under '{}': {e}", prefix),
-            status: None,
-        })?;
-    metas.retain(|m| {
-        m.location
-            .as_ref()
-            .ends_with(".parquet")
-    });
+    let mut metas: Vec<ObjectMeta> =
+        store
+            .list(Some(prefix))
+            .try_collect()
+            .await
+            .map_err(|e| ConnectorError::ObjectStore {
+                message: format!("failed to list objects under '{}': {e}", prefix),
+                status: None,
+            })?;
+    metas.retain(|m| m.location.as_ref().ends_with(".parquet"));
     metas.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
     Ok(metas)
 }
@@ -285,7 +282,10 @@ pub struct S3PrefixSource {
 
 impl S3PrefixSource {
     /// List all `.parquet` objects under `prefix` and prepare the source.
-    pub async fn open(store: Arc<dyn ObjectStore>, prefix: impl Into<Path>) -> ConnectorResult<Self> {
+    pub async fn open(
+        store: Arc<dyn ObjectStore>,
+        prefix: impl Into<Path>,
+    ) -> ConnectorResult<Self> {
         let prefix = prefix.into();
         let objects = list_s3_parquet_objects(Arc::clone(&store), &prefix).await?;
         Ok(Self {
@@ -308,7 +308,8 @@ impl S3PrefixSource {
         meta: &ObjectMeta,
         skip: usize,
     ) -> ConnectorResult<ObjectBatchStream> {
-        S3Source::stream_skipped_to(Arc::clone(&store), meta.location.clone(), meta.size, skip).await
+        S3Source::stream_skipped_to(Arc::clone(&store), meta.location.clone(), meta.size, skip)
+            .await
     }
 
     async fn ensure_stream(&mut self) -> ConnectorResult<()> {
@@ -332,7 +333,9 @@ impl S3PrefixSource {
         let obj_path_str = self.objects[self.file_index].location.as_ref();
         let prefix_str = self.prefix.as_ref();
         // Strip the prefix and parse key=value segments.
-        let relative = obj_path_str.strip_prefix(prefix_str).unwrap_or(obj_path_str);
+        let relative = obj_path_str
+            .strip_prefix(prefix_str)
+            .unwrap_or(obj_path_str);
         let relative = relative.trim_start_matches('/');
         // Walk path segments.
         let mut parts = Vec::new();

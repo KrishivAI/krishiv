@@ -52,6 +52,8 @@ pub enum FieldType {
     Utf8,
     Binary,
     Timestamp,
+    /// Semi-structured JSON-like data (Spark VARIANT equivalent).
+    Variant,
 }
 
 /// One field in a plan schema.
@@ -260,6 +262,21 @@ pub enum NodeOp {
         key_column: String,
         event_time_column: String,
         stage_column: String,
+    },
+    /// AQE skew mitigation: split a hot partition into N sub-partitions by
+    /// appending a `salt` column to the join key. The build side is
+    /// replicated `factor` times so that each salted sub-partition of the
+    /// probe side joins against the full build side in parallel. The
+    /// `unsalt` node strips the salt column from the post-join output.
+    ///
+    /// Equivalent to Spark AQE's `OptimizeSkewedJoin` rule.
+    SkewJoin {
+        /// The join key columns on both sides (must match).
+        keys: Vec<String>,
+        /// Number of sub-partitions the hot side is split into.
+        factor: u32,
+        /// Original join type — kept so the executor can dispatch correctly.
+        join_type: JoinType,
     },
     /// Operator not covered by the above variants.
     Other { description: String },

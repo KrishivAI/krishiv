@@ -83,6 +83,16 @@ pub struct StreamingQueryProgress {
     pub last_checkpoint_epoch: Option<u64>,
     /// Current event-time watermark in ms (lower bound on future event times).
     pub current_watermark_ms: Option<i64>,
+    /// Total state size in bytes across all stateful operators in this query.
+    /// Mirrors Spark's `stateOperator.progress.totalStateRows` concept.
+    pub state_size_bytes: Option<u64>,
+    /// Number of task retries triggered by the scheduler for this micro-batch.
+    /// High values may indicate straggler executors or resource contention.
+    pub num_retries: Option<u32>,
+    /// Backpressure tokens indicating how many more rows the source could
+    /// produce before the pipeline is saturated. `None` when backpressure
+    /// is not active or not tracked.
+    pub backpressure_tokens: Option<u64>,
 }
 
 /// High-level status of a streaming query.
@@ -918,21 +928,27 @@ mod output_mode_compat_tests {
 
     fn scan_only_plan() -> LogicalPlan {
         LogicalPlan::new("q", ExecutionKind::Streaming).with_node(
-            PlanNode::new("scan", "scan", ExecutionKind::Streaming)
-                .with_op(NodeOp::Scan { table: "t".into(), filters: vec![] }),
+            PlanNode::new("scan", "scan", ExecutionKind::Streaming).with_op(NodeOp::Scan {
+                table: "t".into(),
+                filters: vec![],
+            }),
         )
     }
 
     fn plan_with_aggregate() -> LogicalPlan {
         LogicalPlan::new("q", ExecutionKind::Streaming)
             .with_node(
-                PlanNode::new("scan", "scan", ExecutionKind::Streaming)
-                    .with_op(NodeOp::Scan { table: "t".into(), filters: vec![] }),
+                PlanNode::new("scan", "scan", ExecutionKind::Streaming).with_op(NodeOp::Scan {
+                    table: "t".into(),
+                    filters: vec![],
+                }),
             )
             .with_node(
                 PlanNode::new("agg", "agg", ExecutionKind::Streaming)
                     .with_inputs(["scan"])
-                    .with_op(NodeOp::Aggregate { group_keys: vec!["region".into()] }),
+                    .with_op(NodeOp::Aggregate {
+                        group_keys: vec!["region".into()],
+                    }),
             )
     }
 
@@ -940,8 +956,10 @@ mod output_mode_compat_tests {
         use krishiv_plan::window::{WindowExecutionSpec, WindowKind};
         LogicalPlan::new("q", ExecutionKind::Streaming)
             .with_node(
-                PlanNode::new("scan", "scan", ExecutionKind::Streaming)
-                    .with_op(NodeOp::Scan { table: "t".into(), filters: vec![] }),
+                PlanNode::new("scan", "scan", ExecutionKind::Streaming).with_op(NodeOp::Scan {
+                    table: "t".into(),
+                    filters: vec![],
+                }),
             )
             .with_node(
                 PlanNode::new("win", "win", ExecutionKind::Streaming)
@@ -968,30 +986,47 @@ mod output_mode_compat_tests {
 
     #[test]
     fn append_always_valid_for_scan_only() {
-        assert!(validate_output_mode_compatibility(StreamingOutputMode::Append, &scan_only_plan()).is_ok());
+        assert!(
+            validate_output_mode_compatibility(StreamingOutputMode::Append, &scan_only_plan())
+                .is_ok()
+        );
     }
 
     #[test]
     fn append_always_valid_with_aggregate() {
-        assert!(validate_output_mode_compatibility(StreamingOutputMode::Append, &plan_with_aggregate()).is_ok());
+        assert!(
+            validate_output_mode_compatibility(StreamingOutputMode::Append, &plan_with_aggregate())
+                .is_ok()
+        );
     }
 
     #[test]
     fn complete_rejected_without_aggregate() {
-        let err = validate_output_mode_compatibility(StreamingOutputMode::Complete, &scan_only_plan());
+        let err =
+            validate_output_mode_compatibility(StreamingOutputMode::Complete, &scan_only_plan());
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("Complete"), "error should mention Complete: {msg}");
+        assert!(
+            msg.contains("Complete"),
+            "error should mention Complete: {msg}"
+        );
     }
 
     #[test]
     fn complete_accepted_with_aggregate() {
-        assert!(validate_output_mode_compatibility(StreamingOutputMode::Complete, &plan_with_aggregate()).is_ok());
+        assert!(
+            validate_output_mode_compatibility(
+                StreamingOutputMode::Complete,
+                &plan_with_aggregate()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn update_rejected_without_stateful_op() {
-        let err = validate_output_mode_compatibility(StreamingOutputMode::Update, &scan_only_plan());
+        let err =
+            validate_output_mode_compatibility(StreamingOutputMode::Update, &scan_only_plan());
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
         assert!(msg.contains("Update"), "error should mention Update: {msg}");
@@ -999,14 +1034,19 @@ mod output_mode_compat_tests {
 
     #[test]
     fn update_accepted_with_aggregate() {
-        assert!(validate_output_mode_compatibility(StreamingOutputMode::Update, &plan_with_aggregate()).is_ok());
+        assert!(
+            validate_output_mode_compatibility(StreamingOutputMode::Update, &plan_with_aggregate())
+                .is_ok()
+        );
     }
 
     #[test]
     fn update_accepted_with_window() {
-        assert!(validate_output_mode_compatibility(StreamingOutputMode::Update, &plan_with_window()).is_ok());
+        assert!(
+            validate_output_mode_compatibility(StreamingOutputMode::Update, &plan_with_window())
+                .is_ok()
+        );
     }
-
 }
 
 /// Return a short, human-readable label for `trigger`.
@@ -1309,6 +1349,9 @@ async fn drain_and_call(
         Some("AvailableNow"),
         last_checkpoint_epoch,
         None,
+        None,
+        None,
+        None,
     );
     Ok(())
 }
@@ -1397,6 +1440,9 @@ async fn processing_time_loop(
             output_rows,
             Some(trigger_label.as_str()),
             last_checkpoint_epoch,
+            None,
+            None,
+            None,
             None,
         );
         epoch += 1;
@@ -1496,6 +1542,9 @@ async fn continuous_loop(
             Some(interval_label.as_str()),
             last_checkpoint_epoch,
             None,
+            None,
+            None,
+            None,
         );
         epoch += 1;
 
@@ -1516,6 +1565,9 @@ fn update_progress(
     trigger: Option<&str>,
     last_checkpoint_epoch: Option<u64>,
     current_watermark_ms: Option<i64>,
+    state_size_bytes: Option<u64>,
+    num_retries: Option<u32>,
+    backpressure_tokens: Option<u64>,
 ) {
     let snapshot = StreamingQueryProgress {
         epoch,
@@ -1524,6 +1576,9 @@ fn update_progress(
         trigger: trigger.map(str::to_owned),
         last_checkpoint_epoch,
         current_watermark_ms,
+        state_size_bytes,
+        num_retries,
+        backpressure_tokens,
     };
     if let Ok(mut guard) = progress.lock() {
         *guard = Some(snapshot.clone());

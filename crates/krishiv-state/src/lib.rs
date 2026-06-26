@@ -19,6 +19,7 @@ pub mod migration;
 pub mod incremental_checkpoint;
 pub mod queryable;
 pub mod savepoint;
+pub mod savepoint_rename;
 
 pub mod incremental_trace;
 
@@ -26,7 +27,11 @@ pub mod incremental_trace;
 pub mod broadcast;
 
 // Named modules
+/// P6: Async Operator Execution — non-blocking state access for streaming operators.
+pub mod async_operator;
 pub mod backend;
+/// P5: Disaggregated State Backend — DFS-primary with local disk cache.
+pub mod dfs_backend;
 pub mod error;
 pub mod inspector;
 pub mod namespace;
@@ -51,6 +56,7 @@ pub use checkpoint::{
     open_checkpoint_storage_from_uri,
 };
 pub use compatibility::OperatorStateDescriptor;
+pub use dfs_backend::{DisaggregatedConfig, DisaggregatedStateBackend};
 pub use error::{StateError, StateResult};
 pub use incremental_checkpoint::{
     EpochMetaFile, RocksDbIncrementalCheckpointer, SstEpochManifest, SstFileRef,

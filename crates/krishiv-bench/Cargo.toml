@@ -18,6 +18,10 @@ harness = false
 name = "nexmark"
 harness = false
 
+[[bench]]
+name = "tpcds_smoke"
+harness = false
+
 [dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 krishiv-sql = { path = "../krishiv-sql" }

@@ -1151,7 +1151,7 @@ mod tests {
             .expect("bind");
         let addr: std::net::SocketAddr = listener
             .local_addr()
-            .map_err(|e| format!("local_addr: {e}"))?;
+            .map_err(|e| Box::<dyn std::error::Error>::from(format!("local_addr: {e}")))?;
         let incoming = tonic::transport::server::TcpIncoming::from(listener);
 
         // 40 chunks * 2 MiB = 80 MiB, over the 64 MiB cap while each chunk
@@ -1169,7 +1169,8 @@ mod tests {
         });
 
         let url = format!("http://{addr}");
-        let pool = FlightClientPool::new(url).map_err(|e| format!("pool: {e}"))?;
+        let pool = FlightClientPool::new(url)
+            .map_err(|e| Box::<dyn std::error::Error>::from(format!("pool: {e}")))?;
         let action =
             crate::flight_action::KrishivFlightAction::Explain(crate::flight_action::ExplainBody {
                 sql: "SELECT 1".into(),
@@ -1186,6 +1187,7 @@ mod tests {
             other => panic!("expected Transport size-limit error, got {other:?}"),
         }
         server.abort();
+        Ok(())
     }
 
     #[tokio::test]
