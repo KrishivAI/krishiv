@@ -8,6 +8,14 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.1.0-rc.1] - 2026-06-26
+
+### Added
+
 - Public engine contracts, connector maturity, and durable metadata versions.
 - Typed Rust/Python DataFrame APIs and Iceberg-first build defaults.
 - Phase 5 open-source governance, security, compatibility, benchmarking, and
@@ -41,6 +49,9 @@ Semantic Versioning as described in `docs/RELEASE.md`.
   (`check_parity_manifest.py`); SBOM and checksum generation (`generate_sbom.py`);
   migration note coverage check (`check_migration_notes.py`); master gate script
   (`check_phase_i_gate.py`); runnable examples (`basic_sql`, `streaming_word_count`).
+- CI: replaced self-hosted runners with ubuntu-latest, optimized workflow triggers.
+- Crate READMEs for all 24 workspace crates.
+- Universal `skills/` directory for multi-agent skill sharing.
 
 ### Changed
 
@@ -51,6 +62,11 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Migration Notes
 
+- **`Session.sql_async` (Python)**: Signature updated to align with the Rust Session API. Use `Session.sql_async (same name, updated signature)`.
+- **`Stream._tumbling_window_secs_body` (Python)**: Internal helper renamed/updated. Underscore-prefixed, not part of the stable public API. Use `Stream.tumbling_window (public stable API unchanged)`.
+- **`SqlDataFrame` (SQL)**: Derive set changed as part of SQL API surface cleanup. Use `SqlDataFrame (struct retained, derive set updated)`.
+- **`DataFrameWriter::option` (Rust)**: Writer option() inventory id changed. Use `DataFrameWriter::option(mut self, key, value)`.
+- **`StreamingDataFrame` (Rust)**: Gained `Clone` derive for Python streaming join bindings. Use `StreamingDataFrame (#[derive(Clone)] retained)`.
 - **`DataFrame` (Python)**: The legacy `Relation` class (previously exported as the
   unified wrapper) was renamed before Phase A. Use `DataFrame` — `Relation` is a
   deprecated alias that will be removed in 1.0.
