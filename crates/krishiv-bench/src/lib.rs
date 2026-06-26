@@ -7,6 +7,8 @@
 //! (`tpch_distributed`) bench targets consume these definitions so the two
 //! harnesses always measure identical workloads.
 
+/// Structured benchmark results and comparison framework.
+pub mod comparison;
 pub mod phase_i;
 
 pub mod tpcds;
@@ -129,6 +131,128 @@ pub mod tpch {
 
     /// Tables read by [`Q18`].
     pub const Q18_TABLES: &[&str] = &["lineitem", "orders", "customer"];
+
+    /// TPC-H Q9: product type profit measure — complex 6-table join with
+    /// group-by on nation and year.
+    pub const Q9: &str = "SELECT \
+        n_name, \
+        EXTRACT(YEAR FROM o_orderdate) AS o_year, \
+        SUM(l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity) AS sum_profit \
+        FROM lineitem \
+        JOIN orders ON l_orderkey = o_orderkey \
+        JOIN part ON l_partkey = p_partkey \
+        JOIN partsupp ON l_partkey = ps_partkey AND l_suppkey = ps_suppkey \
+        JOIN supplier ON l_suppkey = s_suppkey \
+        JOIN nation ON s_nationkey = n_nationkey \
+        WHERE p_name LIKE '%green%' \
+        GROUP BY n_name, EXTRACT(YEAR FROM o_orderdate) \
+        ORDER BY n_name, o_year DESC";
+
+    /// Tables read by [`Q9`].
+    pub const Q9_TABLES: &[&str] = &[
+        "lineitem", "orders", "part", "partsupp", "supplier", "nation",
+    ];
+
+    /// TPC-H Q12: shipping mode order priority — two-table join with
+    /// EXISTS/NOT EXISTS subqueries.
+    pub const Q12: &str = "SELECT \
+        l_shipmode, \
+        SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' \
+            THEN 1 ELSE 0 END) AS high_line_count, \
+        SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' \
+            THEN 1 ELSE 0 END) AS low_line_count \
+        FROM orders, lineitem \
+        WHERE o_orderkey = l_orderkey \
+          AND l_shipmode IN ('MAIL', 'SHIP') \
+          AND l_commitdate < l_receiptdate \
+          AND l_shipdate < l_commitdate \
+          AND l_receiptdate >= '1994-01-01' \
+          AND l_receiptdate < '1995-01-01' \
+        GROUP BY l_shipmode \
+        ORDER BY l_shipmode";
+
+    /// Tables read by [`Q12`].
+    pub const Q12_TABLES: &[&str] = &["lineitem", "orders"];
+
+    /// TPC-H Q14: promotion effect — conditional ratio query with LIKE filter.
+    pub const Q14: &str = "SELECT \
+        100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' \
+            THEN l_extendedprice * (1 - l_discount) \
+            ELSE 0 END) / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue \
+        FROM lineitem, part \
+        WHERE l_partkey = p_partkey \
+          AND l_shipdate >= '1995-09-01' \
+          AND l_shipdate < '1995-10-01'";
+
+    /// Tables read by [`Q14`].
+    pub const Q14_TABLES: &[&str] = &["lineitem", "part"];
+
+    /// TPC-H Q19: discounted revenue — complex filter on part attributes and
+    /// shipping conditions.
+    pub const Q19: &str = "SELECT SUM(l_extendedprice * (1 - l_discount)) AS revenue \
+        FROM lineitem, part \
+        WHERE (p_brand = 'Brand#12' \
+            AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') \
+            AND l_quantity >= 1 AND l_quantity <= 11 \
+            AND p_size BETWEEN 1 AND 5 \
+            AND l_shipmode IN ('AIR', 'AIR REG') \
+            AND l_shipinstruct = 'DELIVER IN PERSON') \
+           OR (p_brand = 'Brand#23' \
+            AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') \
+            AND l_quantity >= 10 AND l_quantity <= 20 \
+            AND p_size BETWEEN 1 AND 10 \
+            AND l_shipmode IN ('AIR', 'AIR REG') \
+            AND l_shipinstruct = 'DELIVER IN PERSON') \
+           OR (p_brand = 'Brand#34' \
+            AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') \
+            AND l_quantity >= 20 AND l_quantity <= 30 \
+            AND p_size BETWEEN 1 AND 15 \
+            AND l_shipmode IN ('AIR', 'AIR REG') \
+            AND l_shipinstruct = 'DELIVER IN PERSON')";
+
+    /// Tables read by [`Q19`].
+    pub const Q19_TABLES: &[&str] = &["lineitem", "part"];
+
+    /// TPC-H Q22: global sales opportunity — subquery with IN and AVG on
+    /// customer balance.
+    pub const Q22: &str = "SELECT \
+        cntrycode, \
+        COUNT(*) AS numcust, \
+        SUM(c_acctbal) AS totacctbal \
+        FROM ( \
+            SELECT SUBSTRING(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal \
+            FROM customer \
+            WHERE SUBSTRING(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17') \
+              AND c_acctbal > ( \
+                  SELECT AVG(c_acctbal) \
+                  FROM customer \
+                  WHERE c_acctbal > 0.00 \
+                    AND SUBSTRING(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17') \
+              ) \
+              AND NOT EXISTS ( \
+                  SELECT * FROM orders WHERE o_custkey = c_custkey \
+              ) \
+        ) AS custsale \
+        GROUP BY cntrycode \
+        ORDER BY cntrycode";
+
+    /// Tables read by [`Q22`].
+    pub const Q22_TABLES: &[&str] = &["customer", "orders"];
+
+    /// All queries as `(name, sql, tables)` for iteration in benchmarks.
+    pub const ALL_QUERIES: &[(&str, &str, &[&str])] = &[
+        ("q1", Q1, Q1_TABLES),
+        ("q3", Q3, Q3_TABLES),
+        ("q5", Q5, Q5_TABLES),
+        ("q6", Q6, Q6_TABLES),
+        ("q9", Q9, Q9_TABLES),
+        ("q10", Q10, Q10_TABLES),
+        ("q12", Q12, Q12_TABLES),
+        ("q14", Q14, Q14_TABLES),
+        ("q18", Q18, Q18_TABLES),
+        ("q19", Q19, Q19_TABLES),
+        ("q22", Q22, Q22_TABLES),
+    ];
 
     /// Scale factors recognised by the ladder, with the env var naming the
     /// Parquet data directory for each.

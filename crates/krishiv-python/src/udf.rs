@@ -838,3 +838,227 @@ pub(crate) fn build_python_table_udf(
         output_schema,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// CoGroupMap UDF
+// ---------------------------------------------------------------------------
+
+/// Python-backed co-group map UDF.
+///
+/// The Python callable receives:
+/// - `key: str`
+/// - `left: list[pyarrow.RecordBatch]`
+/// - `right: list[pyarrow.RecordBatch]`
+///
+/// It must return a `list[pyarrow.RecordBatch]` (may be empty).
+pub(crate) struct PythonCoGroupMapUdf {
+    callable: Py<PyAny>,
+    name: String,
+    left_schema: Schema,
+    right_schema: Schema,
+    output_schema: Schema,
+}
+
+impl std::fmt::Debug for PythonCoGroupMapUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonCoGroupMapUdf")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl krishiv_plan::udf::CoGroupUdf for PythonCoGroupMapUdf {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn left_schema(&self) -> &Schema {
+        &self.left_schema
+    }
+
+    fn right_schema(&self) -> &Schema {
+        &self.right_schema
+    }
+
+    fn output_schema(&self) -> &Schema {
+        &self.output_schema
+    }
+
+    fn call(
+        &self,
+        key: &str,
+        left: &[RecordBatch],
+        right: &[RecordBatch],
+    ) -> Result<Vec<RecordBatch>, krishiv_plan::udf::UdfError> {
+        Python::attach(|py| {
+            // Convert left batches to Python list.
+            let left_list = PyList::new(
+                py,
+                left.iter()
+                    .map(|b| crate::arrow_compat::PyArrowBatch::new(b.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                message: format!("co_group: left list build failed: {e}"),
+            })?;
+
+            // Convert right batches to Python list.
+            let right_list = PyList::new(
+                py,
+                right
+                    .iter()
+                    .map(|b| crate::arrow_compat::PyArrowBatch::new(b.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                message: format!("co_group: right list build failed: {e}"),
+            })?;
+
+            let result = self
+                .callable
+                .call1(py, (key, left_list, right_list))
+                .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                    message: format!("co_group callable failed: {e}"),
+                })?;
+
+            // Expect a list of RecordBatches back.
+            let py_list = result.downcast_bound::<PyList>(py).map_err(|_| {
+                krishiv_plan::udf::UdfError::Execution {
+                    message: "co_group callable must return a list[pyarrow.RecordBatch]".into(),
+                }
+            })?;
+
+            let mut batches = Vec::with_capacity(py_list.len());
+            for item in py_list.iter() {
+                let batch = item
+                    .extract::<crate::arrow_compat::PyArrowBatch>()
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: format!("co_group output batch extraction failed: {e}"),
+                    })?
+                    .into_inner();
+                batches.push(batch);
+            }
+            Ok(batches)
+        })
+    }
+}
+
+/// Build a Python co-group map UDF.
+pub(crate) fn build_python_co_group_udf(
+    py: Python<'_>,
+    name: String,
+    callable: Py<PyAny>,
+    left_types: &Bound<'_, PyDict>,
+    right_types: &Bound<'_, PyDict>,
+    output_types: &Bound<'_, PyDict>,
+) -> PyResult<Arc<dyn krishiv_plan::udf::CoGroupUdf>> {
+    let left_schema = schema_from_input_types(left_types)?;
+    let right_schema = schema_from_input_types(right_types)?;
+    let output_schema = schema_from_input_types(output_types)?;
+    Ok(Arc::new(PythonCoGroupMapUdf {
+        callable: callable.clone_ref(py),
+        name,
+        left_schema,
+        right_schema,
+        output_schema,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// MapPandasIter UDF
+// ---------------------------------------------------------------------------
+
+/// Python-backed map-pandas-iter UDF.
+///
+/// The Python callable receives a `list[pyarrow.RecordBatch]` and must return
+/// a `list[pyarrow.RecordBatch]`.  On the Python side, callers may convert
+/// each batch to pandas with `.to_pandas()` if they prefer.
+pub(crate) struct PythonMapPandasIterUdf {
+    callable: Py<PyAny>,
+    name: String,
+    input_schema: Schema,
+    output_schema: Schema,
+}
+
+impl std::fmt::Debug for PythonMapPandasIterUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonMapPandasIterUdf")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl krishiv_plan::udf::MapPandasIterUdf for PythonMapPandasIterUdf {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn input_schema(&self) -> &Schema {
+        &self.input_schema
+    }
+
+    fn output_schema(&self) -> &Schema {
+        &self.output_schema
+    }
+
+    fn map_batches(
+        &self,
+        batches: &[RecordBatch],
+    ) -> Result<Vec<RecordBatch>, krishiv_plan::udf::UdfError> {
+        Python::attach(|py| {
+            let py_batches = PyList::new(
+                py,
+                batches
+                    .iter()
+                    .map(|b| crate::arrow_compat::PyArrowBatch::new(b.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                message: format!("map_pandas_iter: batch list build failed: {e}"),
+            })?;
+
+            let result = self.callable.call1(py, (py_batches,)).map_err(|e| {
+                krishiv_plan::udf::UdfError::Execution {
+                    message: format!("map_pandas_iter callable failed: {e}"),
+                }
+            })?;
+
+            let py_list = result.downcast_bound::<PyList>(py).map_err(|_| {
+                krishiv_plan::udf::UdfError::Execution {
+                    message: "map_pandas_iter callable must return a list[pyarrow.RecordBatch]"
+                        .into(),
+                }
+            })?;
+
+            let mut out_batches = Vec::with_capacity(py_list.len());
+            for item in py_list.iter() {
+                let batch = item
+                    .extract::<crate::arrow_compat::PyArrowBatch>()
+                    .map_err(|e| krishiv_plan::udf::UdfError::Execution {
+                        message: format!("map_pandas_iter output batch extraction failed: {e}"),
+                    })?
+                    .into_inner();
+                out_batches.push(batch);
+            }
+            Ok(out_batches)
+        })
+    }
+}
+
+/// Build a Python map-pandas-iter UDF.
+pub(crate) fn build_python_map_pandas_iter_udf(
+    py: Python<'_>,
+    name: String,
+    callable: Py<PyAny>,
+    input_types: &Bound<'_, PyDict>,
+    output_types: &Bound<'_, PyDict>,
+) -> PyResult<Arc<dyn krishiv_plan::udf::MapPandasIterUdf>> {
+    let input_schema = schema_from_input_types(input_types)?;
+    let output_schema = schema_from_input_types(output_types)?;
+    Ok(Arc::new(PythonMapPandasIterUdf {
+        callable: callable.clone_ref(py),
+        name,
+        input_schema,
+        output_schema,
+    }))
+}

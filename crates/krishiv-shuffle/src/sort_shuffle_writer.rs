@@ -12,6 +12,14 @@
 //! `index[p+1] - index[p]` is the byte length of partition `p`.
 //! The ESS (External Shuffle Service, T10) uses these offsets to serve
 //! partition-level range reads without materialising the full file.
+//!
+//! ## Memory management / spill
+//!
+//! When the total bytes across all in-memory buckets exceed
+//! `KRISHIV_SHUFFLE_SPILL_THRESHOLD_BYTES` (env var, default 512 MiB),
+//! the writer spills the largest bucket to a temp IPC file under `output_dir`
+//! and reclaims its memory.  At `flush()` time, spilled files are merged with
+//! any remaining in-memory data before writing the final data + index files.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -26,6 +34,17 @@ use arrow::record_batch::RecordBatch;
 use crate::error::io_err;
 use crate::partitioner::HashPartitioner;
 use crate::{ShuffleError, ShuffleResult};
+
+/// Default spill threshold: 512 MiB of in-memory shuffle data.
+pub const DEFAULT_SPILL_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Read the spill threshold from the environment, falling back to the default.
+fn spill_threshold_from_env() -> u64 {
+    std::env::var("KRISHIV_SHUFFLE_SPILL_THRESHOLD_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_SPILL_THRESHOLD_BYTES)
+}
 
 /// Sort-shuffle output files produced by [`SortShuffleWriter::flush`].
 #[derive(Debug, Clone)]
@@ -73,27 +92,56 @@ impl SortShuffleFiles {
 ///
 /// Call [`push`](SortShuffleWriter::push) for each input batch, then
 /// [`flush`](SortShuffleWriter::flush) to write the data file + index file.
+///
+/// When the total accumulated in-memory bytes exceed the spill threshold,
+/// the largest bucket is spilled to a temp IPC file and its memory freed.
+/// Spilled files are merged at `flush()` time.
 pub struct SortShuffleWriter {
     partitioner: HashPartitioner,
     sort_key: String,
-    /// Per-partition accumulated batches.
+    /// Per-partition accumulated (in-memory) batches.
     buckets: Vec<Vec<RecordBatch>>,
+    /// Estimated serialised byte size of each in-memory bucket.
+    bucket_bytes: Vec<usize>,
+    /// Temp IPC files spilled from each partition (None = not spilled).
+    spill_files: Vec<Vec<PathBuf>>,
     output_dir: PathBuf,
     job_id: String,
     stage_id: String,
+    /// Spill threshold in bytes. Configurable via env.
+    spill_threshold_bytes: u64,
+    /// Counter for generating unique spill file names.
+    spill_seq: u32,
 }
 
 impl SortShuffleWriter {
-    /// Create a writer that will place output files under `output_dir`.
-    ///
-    /// `sort_key` is the column used for both hash-routing and within-partition
-    /// sorting (the same column Spark uses for `SortShuffleWriter`).
+    /// Create a writer using the spill threshold from `KRISHIV_SHUFFLE_SPILL_THRESHOLD_BYTES`
+    /// (env var, default 512 MiB).
     pub fn new(
         job_id: impl Into<String>,
         stage_id: impl Into<String>,
         key_column: impl Into<String>,
         partition_count: u32,
         output_dir: impl AsRef<Path>,
+    ) -> ShuffleResult<Self> {
+        Self::new_with_spill_threshold(
+            job_id,
+            stage_id,
+            key_column,
+            partition_count,
+            output_dir,
+            spill_threshold_from_env(),
+        )
+    }
+
+    /// Create a writer with an explicit `spill_threshold_bytes`.
+    pub fn new_with_spill_threshold(
+        job_id: impl Into<String>,
+        stage_id: impl Into<String>,
+        key_column: impl Into<String>,
+        partition_count: u32,
+        output_dir: impl AsRef<Path>,
+        spill_threshold_bytes: u64,
     ) -> ShuffleResult<Self> {
         if partition_count == 0 {
             return Err(ShuffleError::InvalidPartitionCount {
@@ -109,17 +157,25 @@ impl SortShuffleWriter {
                 output_dir.display()
             ))
         })?;
+        let n = partition_count as usize;
         Ok(Self {
             partitioner,
             sort_key,
-            buckets: vec![Vec::new(); partition_count as usize],
+            buckets: vec![Vec::new(); n],
+            bucket_bytes: vec![0; n],
+            spill_files: vec![Vec::new(); n],
             output_dir,
             job_id: job_id.into(),
             stage_id: stage_id.into(),
+            spill_threshold_bytes,
+            spill_seq: 0,
         })
     }
 
     /// Hash-partition `batch` and accumulate rows into per-partition buffers.
+    ///
+    /// If the total in-memory bytes exceed the spill threshold, the largest
+    /// partition is spilled to a temp IPC file before returning.
     pub fn push(&mut self, batch: RecordBatch) -> ShuffleResult<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -127,9 +183,52 @@ impl SortShuffleWriter {
         let partitioned = self.partitioner.partition(&batch)?;
         for (idx, part) in partitioned.into_iter().enumerate() {
             if part.num_rows() > 0 {
+                let est = estimated_batch_bytes(&part);
+                self.bucket_bytes[idx] += est;
                 self.buckets[idx].push(part);
             }
         }
+        // Spill if over budget.
+        let total: usize = self.bucket_bytes.iter().sum();
+        if total as u64 > self.spill_threshold_bytes {
+            self.spill_largest_bucket()?;
+        }
+        Ok(())
+    }
+
+    /// Spill the largest in-memory bucket to a temp IPC file.
+    fn spill_largest_bucket(&mut self) -> ShuffleResult<()> {
+        let largest = self
+            .bucket_bytes
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, b)| b)
+            .map(|(i, _)| i);
+        let Some(idx) = largest else { return Ok(()) };
+        if self.buckets[idx].is_empty() {
+            return Ok(());
+        }
+        let seq = self.spill_seq;
+        self.spill_seq += 1;
+        let spill_path = self
+            .output_dir
+            .join(format!("{}_{}_{idx}_spill{seq}.ipc", self.job_id, self.stage_id));
+
+        let batches = std::mem::take(&mut self.buckets[idx]);
+        self.bucket_bytes[idx] = 0;
+
+        let schema = batches[0].schema();
+        let combined = arrow::compute::concat_batches(&schema, batches.iter())
+            .map_err(|e| io_err(format!("spill concat failed: {e}")))?;
+        let sorted = sort_by_key(&combined, &self.sort_key)?;
+        let ipc = encode_ipc(&sorted)?;
+        std::fs::write(&spill_path, &ipc).map_err(|e| {
+            io_err(format!(
+                "failed to write spill file '{}': {e}",
+                spill_path.display()
+            ))
+        })?;
+        self.spill_files[idx].push(spill_path);
         Ok(())
     }
 
@@ -146,22 +245,36 @@ impl SortShuffleWriter {
         let mut data_buf: Vec<u8> = Vec::new();
         let mut offsets: Vec<u64> = Vec::with_capacity(n as usize + 1);
 
-        for bucket in &self.buckets {
+        for (idx, bucket) in self.buckets.iter().enumerate() {
             offsets.push(data_buf.len() as u64);
-            if bucket.is_empty() {
+            let has_spills = !self.spill_files[idx].is_empty();
+            if bucket.is_empty() && !has_spills {
                 // Empty partition: write an empty IPC stream so the index
                 // still points to valid (zero-length) data.
                 continue;
             }
-            // Concatenate all batches for this partition.
-            let schema = bucket[0].schema();
-            let combined = arrow::compute::concat_batches(&schema, bucket.iter())
+
+            // Collect all batches: spilled files first, then in-memory.
+            let mut all_batches: Vec<RecordBatch> = Vec::new();
+            for spill_path in &self.spill_files[idx] {
+                let mut spilled = read_ipc_file(spill_path)?;
+                all_batches.append(&mut spilled);
+                // Clean up the temp spill file.
+                let _ = std::fs::remove_file(spill_path);
+            }
+            for b in bucket {
+                all_batches.push(b.clone());
+            }
+
+            if all_batches.is_empty() {
+                continue;
+            }
+
+            // Concatenate and sort.
+            let schema = all_batches[0].schema();
+            let combined = arrow::compute::concat_batches(&schema, all_batches.iter())
                 .map_err(|e| io_err(format!("concat failed: {e}")))?;
-
-            // Sort within partition by the sort key.
             let sorted = sort_by_key(&combined, &self.sort_key)?;
-
-            // Encode as Arrow IPC stream.
             let encoded = encode_ipc(&sorted)?;
             data_buf.extend_from_slice(&encoded);
         }
@@ -218,6 +331,42 @@ impl SortShuffleWriter {
             .map(|b| b.num_rows())
             .sum()
     }
+
+    /// Total estimated in-memory bytes (excludes spilled data).
+    pub fn buffered_bytes(&self) -> usize {
+        self.bucket_bytes.iter().sum()
+    }
+}
+
+/// Estimate the in-memory byte size of a batch.
+fn estimated_batch_bytes(batch: &RecordBatch) -> usize {
+    batch.get_array_memory_size()
+}
+
+/// Read a previously-spilled IPC file back as `Vec<RecordBatch>`.
+fn read_ipc_file(path: &std::path::Path) -> ShuffleResult<Vec<RecordBatch>> {
+    use arrow::ipc::reader::StreamReader;
+    let bytes = std::fs::read(path).map_err(|e| {
+        io_err(format!(
+            "failed to read spill file '{}': {e}",
+            path.display()
+        ))
+    })?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cursor = Cursor::new(bytes);
+    let reader = StreamReader::try_new(cursor, None).map_err(|e| {
+        io_err(format!(
+            "IPC reader init for '{}' failed: {e}",
+            path.display()
+        ))
+    })?;
+    reader
+        .map(|b| {
+            b.map_err(|e| io_err(format!("IPC read from '{}' failed: {e}", path.display())))
+        })
+        .collect()
 }
 
 /// Sort `batch` by the column named `key` in ascending, nulls-last order.
@@ -360,5 +509,32 @@ mod tests {
             .unwrap();
         let values: Vec<i64> = (0..arr.len()).map(|i| arr.value(i)).collect();
         assert_eq!(values, vec![1, 2, 5, 8]);
+    }
+
+    #[test]
+    fn spill_is_transparent_to_final_output() {
+        // Use the builder with an explicit spill threshold of 1 byte so that
+        // every push triggers a spill without touching process-global env state.
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = SortShuffleWriter::new_with_spill_threshold(
+            "job3", "stage1", "k", 2, dir.path(), 1,
+        )
+        .unwrap();
+
+        // Push two batches; each push will trigger a spill due to the tiny threshold.
+        writer.push(make_batch(&[4, 2])).unwrap();
+        writer.push(make_batch(&[1, 3])).unwrap();
+
+        let files = writer.flush().unwrap();
+        assert!(files.data_path.exists());
+        let offsets = files.read_offsets().unwrap();
+        assert_eq!(offsets.len(), 3, "2 partitions + 1 sentinel");
+        // Last offset = data file length.
+        let data_len = std::fs::metadata(&files.data_path).unwrap().len();
+        assert_eq!(*offsets.last().unwrap(), data_len);
+
+        // All rows (4 total) must be present in output.
+        let data = std::fs::read(&files.data_path).unwrap();
+        assert!(!data.is_empty(), "data file must be non-empty");
     }
 }

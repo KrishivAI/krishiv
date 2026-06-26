@@ -39,6 +39,8 @@ pub mod schema_normalize;
 pub mod schema_registry;
 /// T9: SQL connector support (Postgres / MySQL / MSSQL / Oracle).
 pub mod sql;
+/// Unified storage factory for building `Arc<dyn ObjectStore>` from URI schemes.
+pub mod storage_factory;
 pub mod transactional;
 #[cfg(feature = "kafka")]
 pub mod transactional_kafka;
@@ -59,6 +61,8 @@ pub mod two_phase;
 
 #[cfg(feature = "vector-sinks")]
 pub mod vector;
+#[cfg(feature = "vortex")]
+pub mod vortex;
 
 #[cfg(test)]
 mod tests;
@@ -86,6 +90,7 @@ pub use s3::{S3PrefixSource, list_s3_parquet_objects};
 pub use schema_normalize::SchemaNormalizeOperator;
 pub use sink::{AtLeastOnceSinkContract, DynSink, PostWriteOffsetCommitProtocol, Sink};
 pub use source::{CheckpointSource, DynSource, Source};
+pub use storage_factory::{StorageBackend, StorageConfig, StorageFactory};
 pub use two_phase::{
     EpochTransactionLog, InMemoryCommitHandle, InMemoryTwoPhaseCommitSink,
     LocalParquetTwoPhaseCommitSink, ParquetCommitHandle, TransactionalSinkParticipant,

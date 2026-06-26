@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1.7
+#
+# Minimal production Docker image for Krishiv.
+#
+# Uses the pre-built binaries from Dockerfile.build and copies them into
+# a minimal runtime image. This image is ~50MB vs ~200MB for the full
+# builder-based image.
+#
+# Build prerequisites:
+#   just build-k8s          # or: cargo build --release --features k8s
+#   just stage              # copies binaries to dist/docker/
+#
+# Usage:
+#   docker build -f Dockerfile.prod -t krishiv:prod .
+#   docker build --build-arg BASE_IMAGE=debian:trixie-slim \
+#       -f Dockerfile.prod -t krishiv:prod .
+
+ARG BASE_IMAGE=debian:trixie-slim
+
+# ── Stage 1: Build binaries (reuse Dockerfile.build logic) ────────────────────
+# This stage is optional — if binaries are already built, use Dockerfile.fast.
+# For CI, we build from source to ensure reproducibility.
+FROM rust:1.92-slim AS builder
+
+ARG FEATURES=full
+ARG PROFILE=release-k8s
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl-dev \
+        pkg-config \
+        cmake \
+        mold \
+        clang \
+        libclang-dev \
+        g++ \
+        make \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CXXFLAGS="-include cstdint" \
+    CARGO_INCREMENTAL=0 \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    set -e; \
+    PKGS="-p krishiv"; \
+    case "$FEATURES" in *k8s*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
+    cargo build $PKGS \
+        --no-default-features --features "$FEATURES" \
+        --profile "$PROFILE"; \
+    mkdir -p /out; \
+    OUTDIR="target/$PROFILE"; \
+    case "$PROFILE" in dev|test) OUTDIR="target/debug" ;; esac; \
+    cp "$OUTDIR/krishiv" /out/krishiv; \
+    if [ -f "$OUTDIR/krishiv-operator" ]; then \
+        cp "$OUTDIR/krishiv-operator" /out/krishiv-operator; \
+    fi
+
+# ── Stage 2: Minimal runtime ──────────────────────────────────────────────────
+# Strip debug symbols and copy only the binaries + CA certs.
+FROM ${BASE_IMAGE} AS runtime
+
+# Install only the minimal runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r krishiv && useradd -r -g krishiv krishiv
+
+# Copy binaries
+COPY --from=builder /out/krishiv /usr/local/bin/krishiv
+COPY --from=builder --chown=krishiv:krishiv /out/krishiv-operator* /usr/local/bin/
+
+# Create data directories
+RUN mkdir -p /var/lib/krishiv/data /var/lib/krishiv/checkpoints /var/lib/krishiv/logs \
+    && chown -R krishiv:krishiv /var/lib/krishiv
+
+USER krishiv
+WORKDIR /var/lib/krishiv
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf http://localhost:50051/healthz || exit 1
+
+ENV RUST_LOG="info" \
+    KRISHIV_LOCAL_DATA_DIR="/var/lib/krishiv/data"
+
+EXPOSE 50051
+
+ENTRYPOINT ["/usr/local/bin/krishiv"]
+CMD ["local", "start"]

@@ -45,6 +45,10 @@ local-catalog = ["dep:iceberg"]
 postgres-catalog = ["dep:sqlx", "dep:iceberg"]
 rest-catalog = ["dep:iceberg-catalog-rest", "dep:iceberg"]
 iceberg-datafusion = ["dep:iceberg-datafusion", "dep:iceberg", "local-catalog"]
+# Unity Catalog backend (uses UC's built-in Iceberg REST endpoint).
+unity-catalog = ["rest-catalog"]
+# AWS Glue catalog backend (uses Glue's built-in Iceberg REST endpoint).
+glue-catalog = ["rest-catalog"]
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -28,22 +28,27 @@ use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 pub mod analyze;
 pub mod catalog;
 pub mod cep_sql;
-mod connector_table;
+
+pub mod connector_table;
 pub mod create_function_ddl;
 pub mod grammar;
 pub mod incremental_view;
 pub mod introspection_sql;
-mod kafka_table;
-mod lakehouse;
+
+pub mod kafka_table;
+pub mod lakehouse;
 pub mod live_table;
 pub mod pipeline_ddl;
 pub mod pivot_sql;
 pub mod recursive_cte;
+/// Spark SQL extensions: LATERAL VIEW, TABLESAMPLE, TRANSFORM, DESCRIBE EXTENDED, etc.
+pub mod spark_sql_ext;
 pub mod sqlstate;
 pub mod subquery;
 pub mod unnest_sql;
 
 pub mod streaming;
+pub mod streaming_tvf;
 mod udf;
 mod window_functions;
 
@@ -294,17 +299,45 @@ pub fn query_memory_limit_from_env() -> Option<usize> {
     )
 }
 
+/// Resolve the batch size from `KRISHIV_BATCH_SIZE` env var.
+///
+/// Falls back to DataFusion's default (8192) if unset or invalid.
+pub fn batch_size_from_env() -> usize {
+    std::env::var("KRISHIV_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8192)
+}
+
+/// Resolve the default parallelism from `KRISHIV_TARGET_PARALLELISM` env var.
+///
+/// Falls back to available parallelism if unset.
+pub fn default_parallelism_from_env() -> NonZeroUsize {
+    std::env::var("KRISHIV_TARGET_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
+        })
+}
+
 /// Build the DataFusion session config with a configurable parallelism level.
 ///
 /// When `target_partitions > 1`, round-robin repartitioning is enabled so
 /// DataFusion can balance work across threads for hash-join build,
 /// aggregation spill, and parquet scan parallelism.
+///
+/// `execution.batch_size` is set from `KRISHIV_BATCH_SIZE` (default: 8192).
 fn build_single_node_session_config(
     target_partitions: NonZeroUsize,
 ) -> datafusion::prelude::SessionConfig {
     let tp = target_partitions.get();
+    let batch_size = batch_size_from_env();
     let mut config = datafusion::prelude::SessionConfig::new()
         .with_target_partitions(tp)
+        .with_batch_size(batch_size)
         .set_bool(
             "datafusion.optimizer.enable_round_robin_repartition",
             tp > 1,
@@ -1844,6 +1877,9 @@ impl SqlEngine {
                 .await?;
             return Ok(self.attach_query_metadata(self.make_sql_df("cep", dataframe), query));
         }
+
+        // Rewrite TUMBLE/HOP/SESSION TVFs before other preprocessing.
+        let query = &streaming_tvf::rewrite_window_tvfs(query);
 
         let (rewritten, as_ofs) =
             lakehouse::preprocess_as_of_sql(query).unwrap_or_else(|_| (query.to_string(), vec![]));

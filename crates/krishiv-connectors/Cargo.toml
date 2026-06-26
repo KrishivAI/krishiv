@@ -78,6 +78,10 @@ hbase = ["dep:hbase-thrift", "dep:thrift"]
 # T9: JDBC source/sink (Postgres in this build; MySQL requires adding the
 # mysql feature to the workspace sqlx dep)
 jdbc = ["dep:sqlx"]
+# Vortex columnar format: zero-copy Arrow reads, filter/projection pushdown.
+vortex = ["dep:vortex"]
+# Cloud object-store backends (S3, GCS, Azure). Enables `object_store` cloud features.
+cloud = ["object_store/aws", "object_store/gcp", "object_store/azure"]
 
 [dependencies]
 arrow = { workspace = true }
@@ -123,6 +127,8 @@ elasticsearch = { version = "9.1.0-alpha.1", optional = true }
 scylla = { version = "1.7.0", optional = true }
 hbase-thrift = { version = "1.2.0", optional = true }
 thrift = { version = "0.17", optional = true }
+# Vortex feature dependencies
+vortex = { workspace = true, optional = true }
 
 [dev-dependencies]
 mockito = { workspace = true }

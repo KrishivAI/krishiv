@@ -84,7 +84,7 @@ tempfile = "3"
 prost = "0.14.4"
 prost-build = "0.14.4"
 protoc-bin-vendored = "3.2.0"
-tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["fs", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1.18", features = ["net"] }
 tonic = { version = "0.14.6", features = ["transport", "tls-ring"] }
 tonic-prost = "0.14.6"
@@ -126,9 +126,20 @@ sqlparser = "0.62.0"
 url = "2"
 wiremock = "0.6"
 sysinfo = "0.35"
+vortex = { version = "0.75.0", features = ["files", "tokio"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Warn on unwrap/expect/panic so new code must justify each use.
+# These are currently warn (not deny) because ~4500 existing violations
+# would break CI. New modules should add #![deny(clippy::unwrap_used,
+# clippy::expect_used, clippy::panic)] individually. Track progress with:
+# cargo clippy --workspace -- -W clippy::unwrap_used 2>&1 | grep "warning:" | wc -l
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
 
 
 [profile.dev]

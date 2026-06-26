@@ -7,6 +7,8 @@ use pyo3::prelude::*;
 
 mod agg;
 pub mod arrow_compat;
+/// Optimized Arrow IPC paths for zero-copy-like UDF performance.
+pub mod arrow_fast;
 mod batch;
 mod blocking_session;
 mod dataframe;

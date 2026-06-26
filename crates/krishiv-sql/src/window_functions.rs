@@ -28,6 +28,8 @@ pub fn register_window_functions(ctx: &SessionContext) -> Result<(), DataFusionE
     ctx.register_udf(make_tumble_end());
     ctx.register_udf(make_hop_start());
     ctx.register_udf(make_hop_end());
+    ctx.register_udf(make_session_start());
+    ctx.register_udf(make_session_end());
     Ok(())
 }
 
@@ -101,6 +103,42 @@ fn make_hop_end() -> datafusion::logical_expr::ScalarUDF {
                 }
             })
         }),
+    )
+}
+
+/// SESSION_START(ts_ms, gap_ms) → marker for the session window start.
+///
+/// In the TVF rewrite, session boundaries require a reduce-side computation
+/// (group consecutive events within `gap_ms` of each other).  This UDF returns
+/// a pessimistic estimate: the event timestamp itself, so that `GROUP BY
+/// session_start(ts, gap)` groups identically-timestamped events together.
+/// Real session window merging is performed by the streaming executor when
+/// the query is dispatched to `GroupStateExecutor` via the session window
+/// operator.
+fn make_session_start() -> datafusion::logical_expr::ScalarUDF {
+    create_udf(
+        "session_start",
+        vec![DataType::Int64, DataType::Int64],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| {
+            // Return the event timestamp as the provisional session start.
+            apply2(&args[0], &args[1], |t, _gap| t)
+        }),
+    )
+}
+
+/// SESSION_END(ts_ms, gap_ms) → provisional session end estimate.
+///
+/// Returns `ts + gap_ms` as the upper bound of the session window containing
+/// the event.  Final session merging is performed by the streaming executor.
+fn make_session_end() -> datafusion::logical_expr::ScalarUDF {
+    create_udf(
+        "session_end",
+        vec![DataType::Int64, DataType::Int64],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| apply2(&args[0], &args[1], |t, gap| t + gap)),
     )
 }
 

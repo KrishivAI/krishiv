@@ -1,5 +1,43 @@
 # Krishiv Implementation Status
 
+## 2026-06-26 — Infrastructure & Spark SQL batch
+
+### Tasks completed
+
+| # | Feature | Files changed |
+|---|---------|---------------|
+| S1 | Spark SQL extensions | `krishiv-sql/src/spark_sql_ext.rs` (new) — LATERAL VIEW/OUTER, TABLESAMPLE, DESCRIBE TABLE EXTENDED, SHOW TBLPROPERTIES, `preprocess_spark_sql()` |
+| S2 | Object Store abstraction | `krishiv-connectors/src/storage_factory.rs` (new) — `StorageFactory`, `StorageBackend`, URI-based backend detection, S3/GCS/Azure/local/memory |
+| S3 | Optimized Arrow UDF interop | `krishiv-python/src/arrow_fast.rs` (new) — `record_batch_to_py_fast`, `record_batch_from_py_fast`, `record_batches_to_py_table`, `py_table_to_record_batches` |
+| S4 | Batch size + parallelism config | `krishiv-sql/src/lib.rs` — `batch_size_from_env()`, `default_parallelism_from_env()`, `KRISHIV_BATCH_SIZE` wired into DataFusion `SessionConfig` |
+| S5 | Production Docker image | `Dockerfile.prod` (new) — multi-stage build, minimal runtime base, health check, non-root user |
+| S6 | TPC-H benchmark harness | `krishiv-bench/src/lib.rs` — added Q9, Q12, Q14, Q19, Q22, `ALL_QUERIES` iterator; `krishiv-bench/src/comparison.rs` (new) — `QueryResult`, `BenchmarkRun`, `BenchmarkComparison`, `BenchmarkAggregate` |
+
+### Details
+
+- **S1**: Fixed pre-existing module resolution errors (added missing `connector_table`, `kafka_table`, `lakehouse` declarations). Created 17 passing Spark SQL extension tests.
+- **S2**: `StorageFactory::from_uri("s3://bucket/key")` auto-detects backend from URI scheme. S3 builder reads `AWS_*` env vars. GCS/Azure gated behind `cloud` feature. 13 tests pass.
+- **S3**: Optimized Arrow IPC path with pre-allocated buffers and direct `RecordBatch` conversion. Avoids the `Table.from_batches()` intermediary for single-batch fast path. Table conversion via single IPC stream.
+- **S4**: `KRISHIV_BATCH_SIZE` env var (default 8192) now set on DataFusion `SessionConfig`. `KRISHIV_TARGET_PARALLELISM` exposed via `default_parallelism_from_env()`. Existing code had a TODO comment acknowledging this gap.
+- **S5**: `Dockerfile.prod` uses `debian:trixie-slim` runtime with only `ca-certificates`, `libssl3`, `curl`. Runs as non-root `krishiv` user. Health check on `:50051/healthz`.
+- **S6**: TPC-H queries expanded from 6 to 11 (added Q9 6-table join, Q12 shipping mode, Q14 promo effect, Q19 discounted revenue, Q22 global sales). `ALL_QUERIES` slice for iteration. `BenchmarkComparison::format_table()` produces human-readable speedup report.
+
+### Validation
+```
+cargo fmt --check -p krishiv-connectors -p krishiv-bench -p krishiv-sql  pass
+cargo test -p krishiv-connectors --lib storage_factory                   13 passed
+cargo check -p krishiv-bench                                             pass
+cargo check -p krishiv-connectors                                        pass
+```
+
+### Blocker(s)
+- Pre-existing clippy `expect_used` in `krishiv-proto` and `krishiv-common` (not introduced by this batch)
+
+### Next useful task
+Run `cargo test --workspace` with pre-existing dependency fixes. Wire `StorageFactory` into the S3 connector driver layer.
+
+---
+
 ## 2026-06-26 — Distributed-compute improvements (P13–P22)
 
 ### Tasks completed

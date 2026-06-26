@@ -165,6 +165,71 @@ pub trait TableUdf: Send + Sync + fmt::Debug {
 }
 
 // ---------------------------------------------------------------------------
+// CoGroup map UDF trait
+// ---------------------------------------------------------------------------
+
+/// A co-group map function that receives all rows for a single key from two
+/// input streams and emits zero or more output rows.
+///
+/// Used for streaming ML feature joins:
+/// ```text
+/// features = left_stream.co_group(right_stream, key="user_id", fn=join_fn)
+/// ```
+///
+/// The function receives all batches for a key from both sides and must
+/// return zero or more output batches.
+pub trait CoGroupUdf: Send + Sync + fmt::Debug {
+    /// Unique name used to look up this UDF in a [`UdfRegistry`].
+    fn name(&self) -> &str;
+
+    /// Schema of the left input stream.
+    fn left_schema(&self) -> &Schema;
+
+    /// Schema of the right input stream.
+    fn right_schema(&self) -> &Schema;
+
+    /// Schema of the output stream.
+    fn output_schema(&self) -> &Schema;
+
+    /// Invoke the function with all `left` and `right` batches for one key.
+    ///
+    /// Returns zero or more output batches.
+    fn call(
+        &self,
+        key: &str,
+        left: &[RecordBatch],
+        right: &[RecordBatch],
+    ) -> Result<Vec<RecordBatch>, UdfError>;
+}
+
+// ---------------------------------------------------------------------------
+// Map-pandas-iter UDF trait
+// ---------------------------------------------------------------------------
+
+/// A stateful iterator-over-batches map function.
+///
+/// Receives batches from one partition one at a time; may return multiple
+/// output batches per input batch. The Python callable receives a pandas
+/// DataFrame iterator and must yield pandas DataFrames.
+///
+/// This mirrors PySpark's `mapInPandas` / Flink Python DataStream `map`.
+pub trait MapPandasIterUdf: Send + Sync + fmt::Debug {
+    /// Unique name used to look up this UDF in a [`UdfRegistry`].
+    fn name(&self) -> &str;
+
+    /// Schema of the input batches.
+    fn input_schema(&self) -> &Schema;
+
+    /// Schema of the output batches.
+    fn output_schema(&self) -> &Schema;
+
+    /// Process the provided `batches` and return all output batches.
+    ///
+    /// Implementations may buffer or emit eagerly.
+    fn map_batches(&self, batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, UdfError>;
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -174,7 +239,8 @@ pub struct UdfRegistry {
     scalars: HashMap<String, Arc<dyn ScalarUdf>>,
     aggregates: HashMap<String, Arc<dyn AggregateUdf>>,
     tables: HashMap<String, Arc<dyn TableUdf>>,
-    // Sandboxed execution limits.
+    co_groups: HashMap<String, Arc<dyn CoGroupUdf>>,
+    map_pandas_iters: HashMap<String, Arc<dyn MapPandasIterUdf>>,
 }
 
 impl UdfRegistry {
@@ -206,6 +272,18 @@ impl UdfRegistry {
         self.tables.insert(udf.name().to_owned(), udf);
     }
 
+    /// Register a co-group map UDF; replaces any existing registration with
+    /// the same name.
+    pub fn register_co_group(&mut self, udf: Arc<dyn CoGroupUdf>) {
+        self.co_groups.insert(udf.name().to_owned(), udf);
+    }
+
+    /// Register a map-pandas-iter UDF; replaces any existing registration with
+    /// the same name.
+    pub fn register_map_pandas_iter(&mut self, udf: Arc<dyn MapPandasIterUdf>) {
+        self.map_pandas_iters.insert(udf.name().to_owned(), udf);
+    }
+
     /// Look up a scalar UDF by name.
     pub fn get_scalar(&self, name: &str) -> Option<&Arc<dyn ScalarUdf>> {
         self.scalars.get(name)
@@ -219,6 +297,16 @@ impl UdfRegistry {
     /// Look up a table UDTF by name.
     pub fn get_table(&self, name: &str) -> Option<&Arc<dyn TableUdf>> {
         self.tables.get(name)
+    }
+
+    /// Look up a co-group map UDF by name.
+    pub fn get_co_group(&self, name: &str) -> Option<&Arc<dyn CoGroupUdf>> {
+        self.co_groups.get(name)
+    }
+
+    /// Look up a map-pandas-iter UDF by name.
+    pub fn get_map_pandas_iter(&self, name: &str) -> Option<&Arc<dyn MapPandasIterUdf>> {
+        self.map_pandas_iters.get(name)
     }
 
     /// Return the names of all registered scalar UDFs.
@@ -238,6 +326,20 @@ impl UdfRegistry {
     /// Return the names of all registered table UDTFs.
     pub fn table_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.tables.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Return the names of all registered co-group map UDFs.
+    pub fn co_group_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.co_groups.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Return the names of all registered map-pandas-iter UDFs.
+    pub fn map_pandas_iter_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.map_pandas_iters.keys().map(String::as_str).collect();
         names.sort_unstable();
         names
     }
