@@ -138,6 +138,30 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 
+# Runtime-panic equivalents — same risk class as panic/unwrap.
+todo = "deny"
+unimplemented = "deny"
+
+# Debug artifacts must not survive commit.
+dbg_macro = "deny"
+
+# Daemon process must use tracing, not stdout/stderr.
+print_stdout = "deny"
+print_stderr = "deny"
+
+# Readability: wildcard imports obscure symbol origins.
+wildcard_imports = "deny"
+
+# OOB indexing panics at runtime — use .get() with error handling.
+# Currently allow: ~200 violations across 52 files need a dedicated fix pass.
+# Partial fixes already applied to krishiv-delta, krishiv-state, krishiv-common.
+indexing_slicing = "allow"
+
+# Async correctness: holding a lock/refcell borrow across .await risks
+# deadlock or panic on the executor thread.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+
 
 [profile.dev]
 split-debuginfo = "unpacked"

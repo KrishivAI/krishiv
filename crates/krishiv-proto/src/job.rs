@@ -1,6 +1,6 @@
 //! Job specs.
 
-use crate::ids::*;
+use crate::ids::{JobId, StageId};
 use crate::io::{ResourceProfile, TaskSpec};
 use crate::lifecycle::JobKind;
 

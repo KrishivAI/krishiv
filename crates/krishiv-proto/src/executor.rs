@@ -1,7 +1,7 @@
 //! Executor types.
 
-use crate::ids::*;
-use crate::lifecycle::*;
+use crate::ids::{ExecutorId, JobId, LeaseGeneration, TaskId, TransportVersion};
+use crate::lifecycle::ExecutorState;
 use crate::task::TransportDisposition;
 
 /// Executor registration contract.

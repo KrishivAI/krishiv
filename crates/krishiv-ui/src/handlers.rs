@@ -8,7 +8,7 @@ use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpe
 use krishiv_scheduler::{ExecutorRecord, JobDetailSnapshot, JobSnapshot, StabilityMetrics};
 
 use crate::router::ui_auth_token;
-use crate::views::*;
+use crate::views::{Pagination, JobsResponse, JobDetailResponse, ExecutorsResponse, QueuesResponse, NamespaceQuotaView, SubmitTemplate, HealthTemplate, ExecutorView, JobSummaryView, GlobalMetricsView, SystemMetricsView, MetricsTemplate, SqlQueryRequest, SqlQueryResponse, JobCheckpointsResponse, JobsFilter, JobsTemplate, JobTemplate, ExecutorDetailResponse, ExecutorTemplate, CheckpointsTemplate, JobDiagnoseTemplate, JobHistoryListResponse, JobHistoryView, HistoryTemplate, HistoryDetailTemplate, JobDetailView, ResourceUsageView, StageView, TaskView, ConnectorCapabilityView, hex_encode};
 use crate::{UiError, UiResult, UiState};
 
 pub(crate) async fn healthz() -> &'static str {
@@ -656,8 +656,8 @@ fn extract_columns_and_rows(
 }
 
 fn scalar_array_to_json(array: &dyn arrow::array::Array, idx: usize) -> serde_json::Value {
-    use arrow::array::*;
-    use arrow::datatypes::*;
+    use arrow::array::{Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array, Float32Array, Float64Array, BooleanArray, StringArray, LargeStringArray, TimestampSecondArray};
+    use arrow::datatypes::DataType;
     match array.data_type() {
         DataType::Int8 => array
             .as_any()

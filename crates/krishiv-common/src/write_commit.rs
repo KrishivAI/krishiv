@@ -474,7 +474,9 @@ pub fn split_batches_by_partition_columns(
             let mask = row_groups
                 .entry(key)
                 .or_insert_with(|| vec![false; batch.num_rows()]);
-            mask[row] = true;
+            if let Some(flag) = mask.get_mut(row) {
+                *flag = true;
+            }
         }
 
         for (key, mask) in row_groups {

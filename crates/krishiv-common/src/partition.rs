@@ -268,10 +268,21 @@ pub fn partition_record_batches_by_key(
                     "batch {batch_idx} has more rows than the Arrow gather index can represent"
                 ))
             })?;
-            row_indices[partition.0].push(row_idx);
+            row_indices
+                .get_mut(partition.0)
+                .ok_or_else(|| {
+                    PartitionError::new(format!(
+                        "batch {batch_idx}: partition index {} is out of range [0, {})",
+                        partition.0,
+                        shard_count.get()
+                    ))
+                })?
+                .push(row_idx);
         }
 
-        for (shard_idx, indices) in row_indices.into_iter().enumerate() {
+        for (shard_idx, (shard, indices)) in
+            shards.iter_mut().zip(row_indices).enumerate()
+        {
             if indices.is_empty() {
                 continue;
             }
@@ -281,7 +292,7 @@ pub fn partition_record_batches_by_key(
                     "failed to materialize batch {batch_idx} shard {shard_idx}: {error}"
                 ))
             })?;
-            shards[shard_idx].push(partition);
+            shard.push(partition);
         }
     }
 

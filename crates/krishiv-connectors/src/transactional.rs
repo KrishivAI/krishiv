@@ -75,7 +75,7 @@ impl InMemoryTransactionalProducer {
 
 #[cfg(feature = "kafka")]
 pub mod rdkafka_txn {
-    use super::*;
+    use super::ConnectorError;
     use rdkafka::ClientConfig;
     use rdkafka::producer::{FutureProducer, Producer};
     use rdkafka::util::Timeout;

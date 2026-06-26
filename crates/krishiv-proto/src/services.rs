@@ -1,8 +1,13 @@
 //! Service traits.
 
-use crate::checkpoint::*;
-use crate::executor::*;
-use crate::task::*;
+use crate::checkpoint::{CheckpointAckRequest, CheckpointAckResponse};
+use crate::executor::{DeregisterExecutorRequest, DeregisterExecutorResponse};
+use crate::task::{
+    DrainContinuousOutputRequest, DrainContinuousOutputResponse, ExecutorHeartbeatRequest,
+    ExecutorHeartbeatResponse, ExecutorTaskAssignment, PushContinuousInputRequest,
+    RegisterExecutorRequest, RegisterExecutorResponse, TaskCancellationRequest,
+    TaskStatusRequest, TaskStatusResponse,
+};
 
 /// Tonic-shaped coordinator service implemented by the active job coordinator.
 ///

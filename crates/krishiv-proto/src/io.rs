@@ -1,6 +1,6 @@
 //! IO and task specs.
 
-use crate::ids::*;
+use crate::ids::{StageId, TaskId};
 
 /// Connector capability flags surfaced in task metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

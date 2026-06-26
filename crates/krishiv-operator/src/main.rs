@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// CLI entry point intentionally prints to stdout/stderr.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::error::Error;
 #[cfg(feature = "k8s")]

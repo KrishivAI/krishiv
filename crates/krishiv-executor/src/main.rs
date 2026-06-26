@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// CLI entry point intentionally writes errors to stderr.
+#![allow(clippy::print_stderr)]
 
 use std::env;
 use std::process;

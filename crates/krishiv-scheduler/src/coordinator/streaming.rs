@@ -1,4 +1,4 @@
-use super::*;
+use super::{Coordinator, StreamingTaskState, StreamingProgressReport, JobId, ExecutorId, JobKind, TaskState};
 
 impl Coordinator {
     /// Update a task record's last-known watermark and source offset from executor-reported state.

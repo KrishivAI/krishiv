@@ -80,7 +80,7 @@ pub fn consolidate_batch(
     let output_rows: Vec<(usize, i64)> = key_order
         .iter()
         .filter_map(|k| {
-            let (row_idx, w) = groups[k];
+            let &(row_idx, w) = groups.get(k)?;
             if w != 0 { Some((row_idx, w)) } else { None }
         })
         .collect();

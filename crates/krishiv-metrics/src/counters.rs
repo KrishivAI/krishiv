@@ -70,7 +70,9 @@ impl KrishivHistogram {
                 break;
             }
         }
-        self.counts[bucket_idx].fetch_add(1, Ordering::Relaxed);
+        if let Some(counter) = self.counts.get(bucket_idx) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Snapshot the current count, sum, per-bucket counts, and bucket count.

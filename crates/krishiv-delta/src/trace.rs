@@ -96,41 +96,55 @@ impl Trace {
             return;
         }
         self.total_rows += batch.num_rows();
-        self.levels[0].push(batch);
+        if let Some(l) = self.levels.get_mut(0) {
+            l.push(batch);
+        }
         self.cascade_merge(0);
     }
 
     fn cascade_merge(&mut self, level: usize) {
-        if self.levels[level].len() < MERGE_THRESHOLD {
+        // Bounds guard: level must be a valid index.
+        let lvl_len = match self.levels.get(level) {
+            Some(l) => l.len(),
+            None => return,
+        };
+        if lvl_len < MERGE_THRESHOLD {
             return;
         }
+        // Take the current level's batches (leaves an empty Vec in place).
+        let batches = match self.levels.get_mut(level) {
+            Some(l) => std::mem::take(l),
+            None => return,
+        };
         // If we're at the top level, consolidate in place instead of discarding.
         // Without this, the top level grows without bound and probe latency
         // degrades linearly with total history.
         if level + 1 >= NUM_LEVELS {
-            let batches: Vec<DeltaBatch> = std::mem::take(&mut self.levels[level]);
             if let Ok(merged) = DeltaBatch::concat(&batches) {
                 if let Ok(consolidated) = consolidate_batch(merged, &[], &self.data_schema) {
-                    self.levels[level].push(consolidated);
-                } else {
-                    // Restore on error.
-                    self.levels[level] = batches;
+                    if let Some(l) = self.levels.get_mut(level) {
+                        l.push(consolidated);
+                    }
+                } else if let Some(l) = self.levels.get_mut(level) {
+                    *l = batches;
                 }
-            } else {
-                self.levels[level] = batches;
+            } else if let Some(l) = self.levels.get_mut(level) {
+                *l = batches;
             }
             return;
         }
-        let batches: Vec<DeltaBatch> = std::mem::take(&mut self.levels[level]);
         if let Ok(merged) = DeltaBatch::concat(&batches)
             && let Ok(consolidated) = consolidate_batch(merged, &[], &self.data_schema)
+            && let Some(next) = self.levels.get_mut(level + 1)
         {
-            self.levels[level + 1].push(consolidated);
+            next.push(consolidated);
             self.cascade_merge(level + 1);
             return;
         }
         // On error, restore the batches to the current level so no data is lost.
-        self.levels[level] = batches;
+        if let Some(l) = self.levels.get_mut(level) {
+            *l = batches;
+        }
     }
 
     // ── Probe ────────────────────────────────────────────────────────────────

@@ -1,3 +1,6 @@
+// Bench binary intentionally prints to stdout/stderr.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use krishiv_api::{SessionBuilder, StreamBatch};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fs::File;

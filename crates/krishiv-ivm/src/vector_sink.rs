@@ -219,7 +219,7 @@ fn extract_f32_list_at(arr: &dyn Array, row: usize) -> IvmResult<Vec<f32>> {
 // ── InMemoryVectorSink (for tests and in-process HTTP use) ───────────────────
 
 pub mod testing {
-    use super::*;
+    use super::{Arc, IvmVectorSink, VectorFuture};
     use std::collections::HashMap;
     use std::sync::Mutex;
 

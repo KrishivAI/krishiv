@@ -1,4 +1,6 @@
 //! Executor process CLI (`krishiv executor` / `krishiv-executor`).
+// CLI binary intentionally writes to stdout/stderr for user-facing output.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::env;
 use std::net::SocketAddr;

@@ -304,7 +304,7 @@ impl DeltaStore for KafkaDeltaStore {
 
 #[cfg(feature = "kafka")]
 mod kafka_delta {
-    use super::*;
+    use super::{LakehouseError, DeltaStore, RecordBatch, DeltaOp, encode_entry, DeltaEntry};
     use std::sync::Mutex;
 
     use rdkafka::ClientConfig;

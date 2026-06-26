@@ -459,8 +459,8 @@ impl StateBackend for DisaggregatedStateBackend {
                     // Format: `{op_id}__{state_name}__{hash}.dat`
                     if let Some(rest) = name.strip_suffix(".dat") {
                         let parts: Vec<&str> = rest.splitn(3, "__").collect();
-                        if parts.len() == 3 {
-                            namespaces.insert(Namespace::new(parts[0], parts[1]));
+                        if let [op_id, state_name, _] = parts.as_slice() {
+                            namespaces.insert(Namespace::new(*op_id, *state_name));
                         }
                     }
                 }
@@ -473,8 +473,8 @@ impl StateBackend for DisaggregatedStateBackend {
                     && let Some(rest) = name.strip_suffix(".dat")
                 {
                     let parts: Vec<&str> = rest.splitn(3, "__").collect();
-                    if parts.len() == 3 {
-                        namespaces.insert(Namespace::new(parts[0], parts[1]));
+                    if let [op_id, state_name, _] = parts.as_slice() {
+                        namespaces.insert(Namespace::new(*op_id, *state_name));
                     }
                 }
             }
@@ -517,13 +517,13 @@ impl StateBackend for DisaggregatedStateBackend {
                     && let Some(rest) = name.strip_suffix(".dat")
                 {
                     let parts: Vec<&str> = rest.splitn(3, "__").collect();
-                    if parts.len() == 3 {
+                    if let [op_id, state_name, hash] = parts.as_slice() {
                         if let Ok(data) = std::fs::read(entry.path()) {
                             // Extract key hash from filename
-                            let key_hash = parts[2].as_bytes().to_vec();
+                            let key_hash = hash.as_bytes().to_vec();
                             entries.push((
-                                parts[0].to_string(),
-                                parts[1].to_string(),
+                                (*op_id).to_string(),
+                                (*state_name).to_string(),
                                 key_hash,
                                 data,
                             ));

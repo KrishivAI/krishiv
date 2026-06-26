@@ -1264,12 +1264,12 @@ fn build_sink_dispatcher(
                                 epoch
                             });
                     }
-                    eprintln!(
-                        "[streaming-console] epoch={} mode=Update schema={:?} \
-                         new_or_updated_rows={}",
+                    tracing::debug!(
                         epoch,
-                        batch.schema(),
-                        kept
+                        mode = "Update",
+                        new_or_updated_rows = kept,
+                        schema = ?batch.schema(),
+                        "streaming-console"
                     );
                 }
             }

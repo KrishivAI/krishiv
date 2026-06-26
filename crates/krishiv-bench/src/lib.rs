@@ -282,6 +282,7 @@ pub mod tpch {
             }
             match dir {
                 Some(d) => dirs.push((*sf, d)),
+                #[allow(clippy::print_stderr)]
                 None => eprintln!("skipping TPC-H {sf}: {var} not set"),
             }
         }

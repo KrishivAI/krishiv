@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// CLI binary intentionally writes help text to stdout.
+#![allow(clippy::print_stdout)]
 
 //! Standalone `krishiv-coordinator` binary (alias for `krishiv coordinator`).
 

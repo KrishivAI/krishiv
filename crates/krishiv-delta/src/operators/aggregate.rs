@@ -270,7 +270,7 @@ impl IncrementalAggOp {
                 group_state.resize(self.aggregations.len(), AggState::default());
             }
 
-            for (ai, agg) in self.aggregations.iter().enumerate() {
+            for (state, agg) in group_state.iter_mut().zip(self.aggregations.iter()) {
                 let input_val_str = match agg.input_col() {
                     Some(col) => {
                         if let Ok(idx) = data.schema().index_of(col) {
@@ -281,7 +281,7 @@ impl IncrementalAggOp {
                     }
                     None => "".to_string(),
                 };
-                group_state[ai].apply_delta_for_agg(agg, &input_val_str, w);
+                state.apply_delta_for_agg(agg, &input_val_str, w);
             }
 
             // GC empty groups: a group is empty when ALL its per-agg states are empty
@@ -339,10 +339,10 @@ impl IncrementalAggOp {
 }
 
 fn compute_agg_values(states: &[AggState], aggregations: &[Aggregation]) -> Vec<Option<f64>> {
-    aggregations
+    states
         .iter()
-        .enumerate()
-        .map(|(ai, agg)| states[ai].current_value(agg))
+        .zip(aggregations.iter())
+        .map(|(state, agg)| state.current_value(agg))
         .collect()
 }
 
@@ -361,7 +361,7 @@ fn build_output_batch(
     // output schema's declared type so downstream operators see correct types.
     let mut cols: Vec<Arc<dyn Array>> = Vec::new();
     for gi in 0..n_group {
-        let vals: Vec<Option<&str>> = group_rows.iter().map(|r| r[gi].as_deref()).collect();
+        let vals: Vec<Option<&str>> = group_rows.iter().map(|r| r.get(gi).and_then(|s| s.as_deref())).collect();
         let string_col: Arc<dyn Array> = Arc::new(StringArray::from(vals));
         let target = output_schema.field(gi).data_type();
         if target == &DataType::Utf8 || target == &DataType::LargeUtf8 {
@@ -377,12 +377,12 @@ fn build_output_batch(
             Aggregation::Count { .. } => {
                 let vals: Int64Array = agg_values
                     .iter()
-                    .map(|row| row[ai].map(|v| v as i64))
+                    .map(|row| row.get(ai).copied().flatten().map(|v| v as i64))
                     .collect();
                 cols.push(Arc::new(vals) as Arc<dyn Array>);
             }
             _ => {
-                let vals: Float64Array = agg_values.iter().map(|row| row[ai]).collect();
+                let vals: Float64Array = agg_values.iter().map(|row| row.get(ai).copied().flatten()).collect();
                 cols.push(Arc::new(vals) as Arc<dyn Array>);
             }
         }

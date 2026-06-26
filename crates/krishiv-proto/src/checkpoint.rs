@@ -1,6 +1,6 @@
 //! Checkpoint messages.
 
-use crate::ids::*;
+use crate::ids::{FencingToken, JobId, OperatorId, PartitionId, TaskId};
 
 // ── Checkpoint control-plane messages ─────────────────────────────────────────
 

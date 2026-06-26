@@ -111,7 +111,7 @@ impl DeltaBatch {
                 "_weight column must be Int64".into(),
             ));
         }
-        let data_schema = Arc::new(Schema::new(inner.schema().fields()[..ncols - 1].to_vec()));
+        let data_schema = Arc::new(Schema::new(inner.schema().fields().iter().take(ncols - 1).cloned().collect::<Vec<_>>()));
         Ok(Self { inner, data_schema })
     }
 
@@ -166,7 +166,7 @@ impl DeltaBatch {
         let ncols = self.inner.num_columns() - 1;
         RecordBatch::try_new(
             self.data_schema.clone(),
-            self.inner.columns()[..ncols].to_vec(),
+            self.inner.columns().iter().take(ncols).cloned().collect::<Vec<_>>(),
         )
         .unwrap_or_else(|_| RecordBatch::new_empty(self.data_schema.clone()))
     }
@@ -198,7 +198,7 @@ impl DeltaBatch {
         let weights = self.weights();
         let negated: Int64Array = weights.iter().map(|w| w.map(|v| -v)).collect();
         let mut cols: Vec<Arc<dyn Array>> =
-            self.inner.columns()[..self.inner.num_columns() - 1].to_vec();
+            self.inner.columns().iter().take(self.inner.num_columns() - 1).cloned().collect::<Vec<_>>();
         cols.push(Arc::new(negated));
         let inner = RecordBatch::try_new(self.inner.schema(), cols)?;
         Ok(Self {
@@ -210,11 +210,9 @@ impl DeltaBatch {
     /// Concatenate multiple `DeltaBatch`es with identical data schemas.
     /// Does NOT consolidate — use `consolidate()` afterwards if needed.
     pub fn concat(batches: &[DeltaBatch]) -> DeltaResult<Self> {
-        if batches.is_empty() {
-            return Err(DeltaError::Operator("cannot concat empty slice".into()));
-        }
-        let schema = batches[0].inner.schema();
-        let data_schema = batches[0].data_schema.clone();
+        let first = batches.first().ok_or_else(|| DeltaError::Operator("cannot concat empty slice".into()))?;
+        let schema = first.inner.schema();
+        let data_schema = first.data_schema.clone();
         let inners: Vec<&RecordBatch> = batches.iter().map(|b| &b.inner).collect();
         let inner = concat_batches(&schema, inners)?;
         Ok(Self { inner, data_schema })
@@ -229,7 +227,7 @@ impl DeltaBatch {
         let weights = self.weights();
         let clamped: Int64Array = weights.iter().map(|w| w.map(|v| v.signum())).collect();
         let mut cols: Vec<Arc<dyn Array>> =
-            self.inner.columns()[..self.inner.num_columns() - 1].to_vec();
+            self.inner.columns().iter().take(self.inner.num_columns() - 1).cloned().collect::<Vec<_>>();
         cols.push(Arc::new(clamped));
         let inner = RecordBatch::try_new(self.inner.schema(), cols)?;
         Ok(Self {
@@ -355,7 +353,7 @@ pub fn deserialize_delta_batch(bytes: &[u8]) -> DeltaResult<DeltaBatch> {
     use std::io::Cursor;
     // Strip magic prefix if present (versioned format); otherwise treat as legacy.
     let ipc_bytes = if bytes.starts_with(DELTA_BATCH_MAGIC) {
-        &bytes[DELTA_BATCH_MAGIC.len()..]
+        bytes.get(DELTA_BATCH_MAGIC.len()..).unwrap_or(bytes)
     } else {
         bytes
     };

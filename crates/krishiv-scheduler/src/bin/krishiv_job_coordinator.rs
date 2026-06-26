@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// CLI binary intentionally writes help text to stdout.
+#![allow(clippy::print_stdout)]
 
 //! Per-job coordinator process (JCP) for bare-metal / shared-metadata deployments.
 //!

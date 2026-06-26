@@ -134,15 +134,15 @@ pub enum EntryRouting {
 /// callers treat such entries as broadcast state.
 pub fn window_group_key(state_key: &[u8]) -> Option<&[u8]> {
     for (prefix, trailing) in WINDOW_STATE_KEY_LAYOUTS {
-        let plen = prefix.len();
-        if state_key.len() < plen + 4 + trailing || &state_key[..plen] != *prefix {
+        if !state_key.starts_with(prefix) || state_key.len() < prefix.len() + 4 + trailing {
             continue;
         }
-        let rest = &state_key[plen..];
-        let key_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        let rest = state_key.get(prefix.len()..)?;
+        let len_bytes: [u8; 4] = rest.get(..4)?.try_into().ok()?;
+        let key_len = u32::from_le_bytes(len_bytes) as usize;
         // Exact structural match required: prefix + len + key + trailing.
         if rest.len() == 4 + key_len + trailing {
-            return Some(&rest[4..4 + key_len]);
+            return rest.get(4..4 + key_len);
         }
     }
     None
@@ -218,18 +218,20 @@ pub fn redistribute_snapshots(
             Some(existing) => {
                 // Watermarks are 8-byte LE i64 values: keep the minimum.
                 if existing.3.len() == 8 && entry.3.len() == 8 {
-                    let old_bytes: [u8; 8] =
-                        existing.3[..8]
-                            .try_into()
-                            .map_err(|_| StateError::SnapshotCorrupt {
-                                message: "watermark value is not 8 bytes".into(),
-                            })?;
-                    let new_bytes: [u8; 8] =
-                        entry.3[..8]
-                            .try_into()
-                            .map_err(|_| StateError::SnapshotCorrupt {
-                                message: "watermark value is not 8 bytes".into(),
-                            })?;
+                    let old_bytes: [u8; 8] = {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(existing.3.get(..8).ok_or_else(|| StateError::SnapshotCorrupt {
+                            message: "watermark value is not 8 bytes".into(),
+                        })?);
+                        arr
+                    };
+                    let new_bytes: [u8; 8] = {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(entry.3.get(..8).ok_or_else(|| StateError::SnapshotCorrupt {
+                            message: "watermark value is not 8 bytes".into(),
+                        })?);
+                        arr
+                    };
                     let old = i64::from_le_bytes(old_bytes);
                     let new = i64::from_le_bytes(new_bytes);
                     if new < old {
