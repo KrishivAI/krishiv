@@ -319,7 +319,7 @@ pub fn default_parallelism_from_env() -> NonZeroUsize {
         .and_then(|v| v.parse::<usize>().ok())
         .and_then(NonZeroUsize::new)
         .unwrap_or_else(|| {
-            std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
+            std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
         })
 }
 
@@ -451,7 +451,7 @@ impl SqlEngine {
         match Self::build_local(
             None,
             WindowFnRegistration::Register,
-            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::MIN,
             memory_limit_bytes,
         ) {
             Ok(engine) => engine,
@@ -464,7 +464,7 @@ impl SqlEngine {
                 Self::build_local(
                     None,
                     WindowFnRegistration::Skip,
-                    NonZeroUsize::new(1).unwrap(),
+                    NonZeroUsize::MIN,
                     memory_limit_bytes,
                 )
                 .unwrap_or_else(|err| {
@@ -476,13 +476,10 @@ impl SqlEngine {
                     Self::build_local(
                         None,
                         WindowFnRegistration::Skip,
-                        NonZeroUsize::new(1).unwrap(),
+                        NonZeroUsize::MIN,
                         None,
                     )
-                    .expect(
-                        "SqlEngine::build_local without a memory limit and with \
-                         WindowFnRegistration::Skip is infallible",
-                    )
+                    .unwrap_or_else(|_| Self::build_absolute_minimal(NonZeroUsize::MIN))
                 })
             }
         }
@@ -496,7 +493,7 @@ impl SqlEngine {
         Self::build_local(
             None,
             WindowFnRegistration::Register,
-            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::MIN,
             query_memory_limit_from_env(),
         )
     }
@@ -516,7 +513,7 @@ impl SqlEngine {
         Self::build_local(
             Some(catalog),
             WindowFnRegistration::Register,
-            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::MIN,
             query_memory_limit_from_env(),
         )
     }
@@ -699,6 +696,50 @@ impl SqlEngine {
             pipeline_registry: Arc::new(pipeline_ddl::PipelineRegistry::new()),
             operation_registry: Arc::new(OperationRegistry::new()),
         })
+    }
+
+    /// Build the absolute minimal engine: no catalog, no window UDFs, no memory
+    /// limit. Every step is infallible, so the return type is `Self`. Used as
+    /// the last-resort fallback in `new_with_memory_limit`.
+    fn build_absolute_minimal(target_partitions: NonZeroUsize) -> Self {
+        let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
+            Arc::new(RwLock::new(std::collections::HashSet::new()));
+        let dummy_state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .build();
+        let mut table_factories = dummy_state.table_factories().clone();
+        crate::connector_table::register_connector_table_factories(
+            &mut table_factories,
+            streaming_sources.clone(),
+        );
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(build_single_node_session_config(target_partitions))
+            .with_table_factories(table_factories)
+            .build();
+        let context = SessionContext::new_with_state(state);
+        Self {
+            context,
+            target_parallelism: target_partitions,
+            krishiv_catalog: None,
+            udf_registry: None,
+            streaming_sources,
+            streaming_registration: Arc::new(Mutex::new(())),
+            has_streaming_sources: Arc::new(AtomicBool::new(false)),
+            udf_limits: None,
+            udf_registry_version: Arc::new(AtomicU64::new(0)),
+            udf_last_synced_version: Arc::new(AtomicU64::new(u64::MAX)),
+            plan_cache: Arc::new(Mutex::new(PlanCache::new(resolve_plan_cache_max_entries()))),
+            shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
+            table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            memory_limit_bytes: None,
+            #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+            iceberg_catalogs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            live_table_registry: Arc::new(live_table::LiveTableRegistry::new()),
+            incremental_view_registry: Arc::new(incremental_view::IncrementalViewRegistry::new()),
+            pipeline_registry: Arc::new(pipeline_ddl::PipelineRegistry::new()),
+            operation_registry: Arc::new(OperationRegistry::new()),
+        }
     }
 
     /// Register an unbounded continuous table, returning its typed input.

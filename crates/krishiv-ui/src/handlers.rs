@@ -450,7 +450,7 @@ pub(crate) async fn api_history_detail(
         .ok_or_else(|| {
             UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownJob {
                 job_id: krishiv_proto::JobId::try_new(job_id)
-                    .unwrap_or_else(|_| krishiv_proto::JobId::try_new("unknown").unwrap()),
+                    .unwrap_or_else(|_| krishiv_proto::JobId::new_validated("unknown")),
             })
         })
 }
@@ -490,7 +490,7 @@ pub(crate) async fn ui_history_detail(
         .ok_or_else(|| {
             UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownJob {
                 job_id: krishiv_proto::JobId::try_new(job_id)
-                    .unwrap_or_else(|_| krishiv_proto::JobId::try_new("unknown").unwrap()),
+                    .unwrap_or_else(|_| krishiv_proto::JobId::new_validated("unknown")),
             })
         })?;
     let template = HistoryDetailTemplate {

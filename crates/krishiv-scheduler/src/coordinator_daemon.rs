@@ -80,10 +80,12 @@ pub struct CoordinatorDaemonConfig {
 impl CoordinatorDaemonConfig {
     /// Minimal config for HTTP router construction when full daemon flags are unavailable.
     pub fn http_sidecar(profile: DurabilityProfile) -> Self {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let loopback_any = std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
         Self {
             coordinator_id: String::from("coord-http"),
-            grpc_addr: "127.0.0.1:0".parse().expect("valid addr"),
-            http_addr: Some("127.0.0.1:0".parse().expect("valid addr")),
+            grpc_addr: loopback_any,
+            http_addr: Some(loopback_any),
             shuffle_dir: None,
             durability_profile: profile,
             metadata_backend: None,
@@ -717,11 +719,20 @@ pub fn parse_coordinator_daemon_config(
         grpc_addr: env::var("KRISHIV_GRPC_ADDR")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| "0.0.0.0:2001".parse().unwrap()),
+            .unwrap_or_else(|| {
+                use std::net::{Ipv4Addr, SocketAddrV4};
+                std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 2001))
+            }),
         http_addr: env::var("KRISHIV_HTTP_ADDR")
             .ok()
             .and_then(|value| value.parse().ok())
-            .or_else(|| Some("0.0.0.0:2002".parse().unwrap())),
+            .or_else(|| {
+                use std::net::{Ipv4Addr, SocketAddrV4};
+                Some(std::net::SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::UNSPECIFIED,
+                    2002,
+                )))
+            }),
         shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR").ok().map(PathBuf::from),
         durability_profile: env::var("KRISHIV_DURABILITY_PROFILE")
             .ok()

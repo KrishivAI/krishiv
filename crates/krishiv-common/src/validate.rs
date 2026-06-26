@@ -114,8 +114,10 @@ pub fn validate_sql_identifier(name: &str) -> Result<(), ValidationError> {
         });
     }
     let mut chars = name.chars();
-    // SAFETY: non-empty guard above guarantees at least one char.
-    let first = chars.next().expect("non-empty checked above");
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return Err(ValidationError { message: "identifier cannot be empty".into() }),
+    };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return Err(ValidationError {
             message: format!("invalid identifier (must start with letter or _): {name}"),

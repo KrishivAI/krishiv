@@ -437,7 +437,7 @@ impl SessionBuilder {
 
         let udf_registry = Arc::new(RwLock::new(UdfRegistry::new()));
         let parallelism = self.target_parallelism.unwrap_or_else(|| {
-            std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(1).unwrap())
+            std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)
         });
         #[cfg_attr(not(feature = "iceberg-catalog"), allow(unused_mut))]
         let mut sql_engine = SqlEngine::new()

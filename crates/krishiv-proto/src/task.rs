@@ -21,14 +21,12 @@ pub struct KeyGroupRange {
 impl KeyGroupRange {
     /// Create an inclusive key-group range.
     ///
-    /// # Panics
-    ///
-    /// Panics if `start > end`. This check runs in release builds too (unlike
-    /// `debug_assert!`) because an inverted range silently corrupts key-group
-    /// partitioning. Use [`KeyGroupRange::try_new`] to handle invalid input
-    /// without panicking.
+    /// Panics in debug builds if `start > end`. Call [`KeyGroupRange::try_new`]
+    /// for fallible construction in production paths where inputs are not
+    /// statically known to be valid.
     pub fn new(start: u32, end: u32) -> Self {
-        Self::try_new(start, end).expect("KeyGroupRange::new: start must not exceed end")
+        debug_assert!(start <= end, "KeyGroupRange::new: start must not exceed end");
+        Self { start, end }
     }
 
     /// Create an inclusive key-group range, returning an error if `start > end`.

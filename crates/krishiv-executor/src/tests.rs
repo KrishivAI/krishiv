@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod executor_tests {
     use std::fs::File;
     use std::sync::Arc;

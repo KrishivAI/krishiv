@@ -63,6 +63,13 @@ macro_rules! id_type {
                 Ok(Self(value))
             }
 
+            /// Construct from a value that has already been validated, or from
+            /// a hardcoded literal known to be non-empty. The caller asserts
+            /// that the value satisfies the same invariant as `try_new`.
+            pub fn new_validated(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
             /// Borrow the identifier string.
             pub fn as_str(&self) -> &str {
                 &self.0

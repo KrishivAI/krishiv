@@ -79,7 +79,7 @@ fn read_prepared_stmt_capacity() -> std::num::NonZeroUsize {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_PREPARED_STMT_CAPACITY);
-    std::num::NonZeroUsize::new(n.max(1)).unwrap()
+    std::num::NonZeroUsize::new(n.max(1)).unwrap_or(std::num::NonZeroUsize::MIN)
 }
 
 fn read_max_concurrent_queries() -> Option<usize> {

@@ -74,9 +74,12 @@ impl<T: Send + 'static> StateFuture<T> {
     /// Await the state access and apply the transformation.
     pub async fn await_result(self) -> StateResult<T> {
         let value = self.inner.await?;
-        let transform = self
-            .transform
-            .expect("StateFuture must have a transform callback");
+        let transform = self.transform.ok_or_else(|| {
+            crate::error::StateError::BackendUnavailable {
+                message: "StateFuture must have a transform callback".to_string(),
+                source: None,
+            }
+        })?;
         Ok(transform(value))
     }
 }
@@ -233,6 +236,7 @@ impl BatchedStateAccess {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::backend::InMemoryStateBackend;

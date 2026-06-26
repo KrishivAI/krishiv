@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod scheduler_tests {
     use std::sync::{Arc, Mutex, Once};
 

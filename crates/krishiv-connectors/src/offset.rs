@@ -90,14 +90,20 @@ impl Offset for MultiFileOffset {
                 ),
             });
         }
-        let file_index = usize::try_from(u64::from_le_bytes(bytes[0..8].try_into().unwrap()))
-            .map_err(|_| ConnectorError::Offset {
+        let file_index = {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&bytes[0..8]);
+            usize::try_from(u64::from_le_bytes(arr)).map_err(|_| ConnectorError::Offset {
                 message: "MultiFileOffset decode: file_index exceeds usize".into(),
-            })?;
-        let batch_index = usize::try_from(u64::from_le_bytes(bytes[8..16].try_into().unwrap()))
-            .map_err(|_| ConnectorError::Offset {
+            })?
+        };
+        let batch_index = {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&bytes[8..16]);
+            usize::try_from(u64::from_le_bytes(arr)).map_err(|_| ConnectorError::Offset {
                 message: "MultiFileOffset decode: batch_index exceeds usize".into(),
-            })?;
+            })?
+        };
         Ok(Self {
             file_index,
             batch_index,

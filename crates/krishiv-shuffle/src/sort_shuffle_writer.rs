@@ -83,7 +83,11 @@ impl SortShuffleFiles {
         }
         Ok(bytes
             .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(c);
+                u64::from_le_bytes(arr)
+            })
             .collect())
     }
 }

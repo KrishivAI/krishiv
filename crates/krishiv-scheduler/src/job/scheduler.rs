@@ -486,7 +486,12 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
         for stage in spec.stages() {
             let idx = *stage_id_to_idx
                 .get(stage.stage_id())
-                .expect("stage just indexed");
+                .ok_or_else(|| SchedulerError::InvalidJob {
+                    message: format!(
+                        "internal error: stage '{}' missing from index during cycle detection",
+                        stage.stage_id()
+                    ),
+                })?;
             in_degree[idx] = in_degree[idx].saturating_add(stage.upstream_stage_ids().len());
         }
         let mut queue: std::collections::VecDeque<usize> = in_degree

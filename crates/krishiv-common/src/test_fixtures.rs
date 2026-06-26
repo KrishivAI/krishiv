@@ -7,6 +7,7 @@
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::error::ArrowError;
 use std::sync::Arc;
 
 /// Create a canonical test schema containing `"user_id"` (Utf8) and `"ts"` (Int64).
@@ -18,14 +19,14 @@ fn make_test_user_ts_schema() -> SchemaRef {
 }
 
 /// Create a canonical test `RecordBatch` containing `"user_id"` (String) and `"ts"` (Int64).
-///
-/// # Panics
-/// Panics only if the schema and array lengths are mismatched.
-pub fn make_test_user_ts_batch(users: Vec<&str>, timestamps: Vec<i64>) -> RecordBatch {
+pub fn make_test_user_ts_batch(
+    users: Vec<&str>,
+    timestamps: Vec<i64>,
+) -> Result<RecordBatch, ArrowError> {
     let schema = make_test_user_ts_schema();
     let user_array = Arc::new(StringArray::from(users)) as ArrayRef;
     let ts_array = Arc::new(Int64Array::from(timestamps)) as ArrayRef;
-    RecordBatch::try_new(schema, vec![user_array, ts_array]).expect("schema and array length match")
+    RecordBatch::try_new(schema, vec![user_array, ts_array])
 }
 
 /// Create a canonical test schema containing `"key"` (Utf8) and `"ts"` (Int64).
@@ -37,12 +38,12 @@ fn make_test_key_ts_schema() -> SchemaRef {
 }
 
 /// Create a canonical test `RecordBatch` containing `"key"` (String) and `"ts"` (Int64).
-///
-/// # Panics
-/// Panics only if the schema and array lengths are mismatched.
-pub fn make_test_key_ts_batch(keys: Vec<&str>, timestamps: Vec<i64>) -> RecordBatch {
+pub fn make_test_key_ts_batch(
+    keys: Vec<&str>,
+    timestamps: Vec<i64>,
+) -> Result<RecordBatch, ArrowError> {
     let schema = make_test_key_ts_schema();
     let key_array = Arc::new(StringArray::from(keys)) as ArrayRef;
     let ts_array = Arc::new(Int64Array::from(timestamps)) as ArrayRef;
-    RecordBatch::try_new(schema, vec![key_array, ts_array]).expect("schema and array length match")
+    RecordBatch::try_new(schema, vec![key_array, ts_array])
 }

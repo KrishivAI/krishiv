@@ -314,9 +314,10 @@ impl OperatorCliConfig {
             bootstrap_executor_slots: None,
             status_addr: None,
             executor_grpc_addr: None,
-            http_sidecar_addr: "0.0.0.0:2002"
-                .parse()
-                .expect("default sidecar addr is valid"),
+            http_sidecar_addr: std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                2002,
+            )),
             coordinator_endpoint: std::env::var("KRISHIV_COORDINATOR_ENDPOINT")
                 .unwrap_or_else(|_| String::from("http://krishiv-coordinator:2001")),
             help: false,

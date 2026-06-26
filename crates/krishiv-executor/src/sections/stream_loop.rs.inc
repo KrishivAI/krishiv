@@ -11,7 +11,7 @@ async fn stream_loop_emits_window_via_continuous_executor() {
     let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(
         vec!["a", "a"],
         vec![100_i64, 12_000_i64],
-    );
+    ).unwrap();
 
     let drainer = OneShotDrainer::new(vec![batch]);
     let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
@@ -47,11 +47,11 @@ async fn stream_loop_reuses_executor_state_across_drains() {
 
     // First drain: single event in [0, 10000).  Window not yet emitted.
     let batch1 =
-        krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![500_i64]);
+        krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![500_i64]).unwrap();
 
     // Second drain: event that advances watermark past 10000, closing the window.
     let batch2 =
-        krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![15_000_i64]);
+        krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![15_000_i64]).unwrap();
 
     // The runner is CLONED between drains to simulate a re-used runner; its
     // `loop_executors` Arc is shared so state survives.
@@ -109,7 +109,7 @@ async fn stream_loop_without_drainer_processes_inline_input() {
     let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(
         vec!["a", "a"],
         vec![100_i64, 12_000_i64],
-    );
+    ).unwrap();
     let assignment = make_loop_assignment_with_batches(&fragment, &[batch]);
     let output = runner
         .execute_streaming_fragment(&assignment)
@@ -125,7 +125,7 @@ async fn stream_loop_without_drainer_processes_inline_input() {
 async fn legacy_stream_continuous_fragment_is_rejected() {
     let fragment = "stream:continuous:legacy-job";
     let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-    let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![100_i64]);
+    let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![100_i64]).unwrap();
     let assignment = make_loop_assignment_with_batches(fragment, &[batch]);
 
     let error = runner

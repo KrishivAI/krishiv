@@ -778,11 +778,13 @@ mod tests {
     use crate::local_streaming::LocalWindowExecutionSpec;
 
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn in_process_windowed_stream_returns_batches() {
         let batch = krishiv_common::test_fixtures::make_test_user_ts_batch(
             vec!["a", "b"],
             vec![1_000, 5_000],
-        );
+        )
+        .unwrap();
         let spec = LocalWindowExecutionSpec::new_test_tumbling("user_id", "ts", 10_000);
         let cluster = InProcessCluster::new().unwrap();
         let out = cluster

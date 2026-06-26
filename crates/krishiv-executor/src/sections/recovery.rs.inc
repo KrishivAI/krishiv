@@ -205,7 +205,7 @@ mod phase3_recovery {
             vec![krishiv_common::test_fixtures::make_test_key_ts_batch(
                 vec!["a", "a"],
                 vec![500_i64, 900_i64],
-            )],
+            ).unwrap()],
         );
         let out = runner1
             .execute_streaming_fragment(&make_loop_assignment(&fragment))
@@ -255,7 +255,7 @@ mod phase3_recovery {
             vec![krishiv_common::test_fixtures::make_test_key_ts_batch(
                 vec!["a"],
                 vec![15_000_i64],
-            )],
+            ).unwrap()],
         );
         let out = runner2
             .execute_streaming_fragment(&make_loop_assignment(&fragment))
@@ -294,7 +294,7 @@ mod phase3_recovery {
             vec![krishiv_common::test_fixtures::make_test_key_ts_batch(
                 vec!["a"],
                 vec![500_i64],
-            )],
+            ).unwrap()],
         );
         runner
             .execute_streaming_fragment(&make_loop_assignment(&fragment))
@@ -329,7 +329,7 @@ mod phase3_recovery {
             vec![krishiv_common::test_fixtures::make_test_key_ts_batch(
                 vec!["a"],
                 vec![900_i64],
-            )],
+            ).unwrap()],
         );
         runner
             .execute_streaming_fragment(&make_loop_assignment(&fragment))
@@ -349,7 +349,7 @@ mod phase3_recovery {
             vec![krishiv_common::test_fixtures::make_test_key_ts_batch(
                 vec!["a"],
                 vec![15_000_i64],
-            )],
+            ).unwrap()],
         );
         let out = runner
             .execute_streaming_fragment(&make_loop_assignment(&fragment))
@@ -441,7 +441,7 @@ mod phase3_recovery {
             })
             .unwrap();
         let batch =
-            krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![500_i64]);
+            krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![500_i64]).unwrap();
         participant.lock().unwrap().stage(&batch).unwrap();
 
         let coordinator = P3RecordingCoordinator::default();
@@ -511,7 +511,7 @@ mod phase3_recovery {
             })
             .unwrap();
         let batch =
-            krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![500_i64]);
+            krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![500_i64]).unwrap();
         {
             let mut guard = participant.lock().unwrap();
             guard.stage(&batch).unwrap();
@@ -614,7 +614,7 @@ mod phase3_recovery {
             let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(
                 vec![key.as_str()],
                 vec![ts],
-            );
+            ).unwrap();
 
             // Control path.
             let out = control.drain(vec![batch.clone()]).unwrap();

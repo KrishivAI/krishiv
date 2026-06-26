@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use krishiv_api::{BlockingSession, DataFrame, QueryResult, Session, SessionBuilder};
 
 use crate::error::{GatewayError, GatewayResult};
+use krishiv_sql::sqlstate::INTERNAL_ERROR;
 
 /// Blocking SQL gateway session backed by the public Krishiv APIs.
 ///
@@ -149,19 +150,31 @@ impl PooledSession<'_> {
     pub fn execute_sql(&self, query: &str) -> GatewayResult<GatewayQueryResult> {
         self.session
             .as_ref()
-            .expect("session present")
+            .ok_or_else(|| GatewayError {
+                sqlstate: INTERNAL_ERROR.to_string(),
+                message: "internal: pool session not present".into(),
+            })?
             .execute_sql(query)
     }
 
     pub fn collect(&self, dataframe: DataFrame) -> GatewayResult<GatewayQueryResult> {
         self.session
             .as_ref()
-            .expect("session present")
+            .ok_or_else(|| GatewayError {
+                sqlstate: INTERNAL_ERROR.to_string(),
+                message: "internal: pool session not present".into(),
+            })?
             .collect(dataframe)
     }
 
-    pub fn session(&self) -> &Session {
-        self.session.as_ref().expect("session present").session()
+    pub fn session(&self) -> GatewayResult<&Session> {
+        Ok(self.session
+            .as_ref()
+            .ok_or_else(|| GatewayError {
+                sqlstate: INTERNAL_ERROR.to_string(),
+                message: "internal: pool session not present".into(),
+            })?
+            .session())
     }
 }
 
@@ -359,6 +372,6 @@ mod tests {
     fn pooled_session_exposes_inner_session() {
         let pool = SessionPool::new_embedded(1).expect("pool");
         let borrowed = pool.acquire().expect("acquire");
-        let _: &Session = borrowed.session();
+        let _: &Session = borrowed.session().expect("session present");
     }
 }

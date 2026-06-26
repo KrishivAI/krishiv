@@ -10,12 +10,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|dir| format!("{dir}/stream_data.parquet"))
         .unwrap_or_else(|_| "/home/code/krishiv/tpch_sf10/stream_data.parquet".to_string());
     session
-        .register_parquet_stream("stream_data", std::path::Path::new(&data_path))
-        .unwrap();
+        .register_parquet_stream("stream_data", std::path::Path::new(&data_path))?;
 
     let is_streaming = session
-        .is_streaming_query("SELECT * FROM stream_data")
-        .unwrap();
+        .is_streaming_query("SELECT * FROM stream_data")?;
     println!("Is streaming: {}", is_streaming);
 
     let start = Instant::now();

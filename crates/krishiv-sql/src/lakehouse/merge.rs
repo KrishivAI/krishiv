@@ -14,18 +14,18 @@ use crate::SqlError;
 use crate::SqlResult;
 
 /// Match `alias.col = alias.col` in the ON clause, capturing alias and col for both sides.
-static KEY_COL_RE: LazyLock<Regex> = LazyLock::new(|| {
+static KEY_COL_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(
         r"(?i)((?:\w+|`[^`]+`))\.((?:\w+|`[^`]+`))\s*=\s*((?:\w+|`[^`]+`))\.((?:\w+|`[^`]+`))",
     )
-    .unwrap()
+    .ok()
 });
 
-static MERGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+static MERGE_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(
         r"(?is)^\s*MERGE\s+INTO\s+([`\w.:/-]+)\s+USING\s+([`\w.]+)\s+ON\s+(.+?)(?:\s+WHEN\s+MATCHED\s+THEN\s+UPDATE\s+SET\s+.+?)?(?:\s+WHEN\s+NOT\s+MATCHED\s+THEN\s+INSERT\s*(?:\([^)]*\))?\s*(?:VALUES\s*\([^)]*\)|\*)?)?\s*$",
     )
-    .unwrap()
+    .ok()
 });
 
 /// MERGE metrics returned as a single-row batch.
@@ -46,6 +46,8 @@ pub struct MergeTargetUnsupportedError {
 /// Parse and execute a MERGE INTO statement when matched.
 pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec<RecordBatch>> {
     let caps = MERGE_RE
+        .as_ref()
+        .ok_or_else(|| SqlError::DataFusion { message: "MERGE regex failed to compile".into() })?
         .captures(sql)
         .ok_or_else(|| SqlError::Unsupported {
             feature: "MERGE INTO syntax".into(),
@@ -75,6 +77,8 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
     }
 
     let merge_key: String = KEY_COL_RE
+        .as_ref()
+        .ok_or_else(|| SqlError::DataFusion { message: "KEY_COL regex failed to compile".into() })?
         .captures(on_clause)
         .ok_or_else(|| SqlError::Unsupported {
             feature:
@@ -276,6 +280,7 @@ fn merge_metrics_batch(inserted: u64, updated: u64, deleted: u64) -> SqlResult<R
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
@@ -287,27 +292,27 @@ mod tests {
     fn merge_regex_matches_basic_statement() {
         let sql = "MERGE INTO delta.`/tmp/t` USING staging ON target.id = source.id \
                    WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *";
-        assert!(MERGE_RE.is_match(sql));
+        assert!(MERGE_RE.as_ref().unwrap().is_match(sql));
     }
 
     #[test]
     fn merge_regex_matches_matched_only() {
         let sql = "MERGE INTO delta.`/tmp/t` USING staging ON target.id = source.id \
                    WHEN MATCHED THEN UPDATE SET *";
-        assert!(MERGE_RE.is_match(sql));
+        assert!(MERGE_RE.as_ref().unwrap().is_match(sql));
     }
 
     #[test]
     fn merge_regex_matches_not_matched_only() {
         let sql = "MERGE INTO delta.`/tmp/t` USING staging ON target.id = source.id \
                    WHEN NOT MATCHED THEN INSERT *";
-        assert!(MERGE_RE.is_match(sql));
+        assert!(MERGE_RE.as_ref().unwrap().is_match(sql));
     }
 
     #[test]
     fn merge_key_column_extraction() {
         let on = "target.id = source.id";
-        let caps = KEY_COL_RE.captures(on).unwrap();
+        let caps = KEY_COL_RE.as_ref().unwrap().captures(on).unwrap();
         // caps: (left_alias, left_col, right_alias, right_col)
         assert_eq!(caps.get(1).map(|m| m.as_str()), Some("target"));
         assert_eq!(caps.get(2).map(|m| m.as_str()), Some("id"));
@@ -317,7 +322,7 @@ mod tests {
     fn merge_key_column_extraction_reversed() {
         // ON clause written source.col = target.col — must still extract target col.
         let on = "source.id = target.id";
-        let caps = KEY_COL_RE.captures(on).unwrap();
+        let caps = KEY_COL_RE.as_ref().unwrap().captures(on).unwrap();
         assert_eq!(caps.get(1).map(|m| m.as_str()), Some("source"));
         assert_eq!(caps.get(3).map(|m| m.as_str()), Some("target"));
     }
@@ -325,7 +330,7 @@ mod tests {
     #[test]
     fn merge_key_extracts_first_column_from_compound() {
         let on = "target.id = source.id AND target.date = source.date";
-        let caps = KEY_COL_RE.captures(on).unwrap();
+        let caps = KEY_COL_RE.as_ref().unwrap().captures(on).unwrap();
         assert_eq!(caps.get(2).map(|m| m.as_str()), Some("id"));
     }
 

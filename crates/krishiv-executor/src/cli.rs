@@ -492,8 +492,7 @@ async fn heartbeat_loop(
         // When both a local shuffle-dir and an s3:// URI are set, build a tiered
         // backend: local disk for fast P2P reads, object store for durability.
         // This is the preferred topology for distributed-durable deployments.
-        let backend = if uri.starts_with("s3://") && shuffle_dir.is_some() {
-            let local_dir = shuffle_dir.as_deref().expect("checked above");
+        let backend = if let (true, Some(local_dir)) = (uri.starts_with("s3://"), shuffle_dir.as_deref()) {
             open_tiered_shuffle_backend(local_dir, &uri).map_err(|e| {
                 format!(
                     "tiered shuffle (local={} s3={uri}): {e}",

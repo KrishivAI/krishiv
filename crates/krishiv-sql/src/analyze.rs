@@ -179,8 +179,7 @@ fn string_values(array: &dyn Array) -> Box<dyn Iterator<Item = String> + '_> {
             } else {
                 let arr = array
                     .as_any()
-                    .downcast_ref::<arrow::array::Int32Array>()
-                    .expect("Int32Array downcast");
+                    .downcast_ref::<arrow::array::Int32Array>()?;
                 Some(arr.value(i).to_string())
             }
         })),
@@ -190,8 +189,7 @@ fn string_values(array: &dyn Array) -> Box<dyn Iterator<Item = String> + '_> {
             } else {
                 let arr = array
                     .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .expect("Int64Array downcast");
+                    .downcast_ref::<arrow::array::Int64Array>()?;
                 Some(arr.value(i).to_string())
             }
         })),
@@ -201,8 +199,7 @@ fn string_values(array: &dyn Array) -> Box<dyn Iterator<Item = String> + '_> {
             } else {
                 let arr = array
                     .as_any()
-                    .downcast_ref::<arrow::array::Float64Array>()
-                    .expect("Float64Array downcast");
+                    .downcast_ref::<arrow::array::Float64Array>()?;
                 Some(format!("{}", arr.value(i)))
             }
         })),
@@ -212,8 +209,7 @@ fn string_values(array: &dyn Array) -> Box<dyn Iterator<Item = String> + '_> {
             } else {
                 let arr = array
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .expect("StringArray downcast");
+                    .downcast_ref::<arrow::array::StringArray>()?;
                 Some(arr.value(i).to_string())
             }
         })),
@@ -223,8 +219,7 @@ fn string_values(array: &dyn Array) -> Box<dyn Iterator<Item = String> + '_> {
             } else {
                 let arr = array
                     .as_any()
-                    .downcast_ref::<arrow::array::BooleanArray>()
-                    .expect("BooleanArray downcast");
+                    .downcast_ref::<arrow::array::BooleanArray>()?;
                 Some(arr.value(i).to_string())
             }
         })),

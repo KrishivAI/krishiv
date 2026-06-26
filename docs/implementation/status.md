@@ -1,5 +1,58 @@
 # Krishiv Implementation Status
 
+## 2026-06-26 — Workspace-wide `deny(unwrap_used, expect_used, panic)` enforcement
+
+### Task completed
+
+**#31 — Enforce workspace-wide deny lints for unwrap/expect/panic**
+
+Changed `[workspace.lints.clippy]` in `Cargo.toml` from `warn` to `deny` for
+`unwrap_used`, `expect_used`, and `panic`. Then fixed every pre-existing violation
+across 20+ production files with correct solutions (no `#[allow]` shortcuts in
+production code; proper error propagation, `NonZeroUsize::MIN`, `copy_from_slice`,
+`debug_assert!`, `std::process::abort()`, `LazyLock<Option<Regex>>`, etc.).
+
+#### Files changed (production code — no shortcut suppression)
+- `Cargo.toml` — lints promoted from `warn` to `deny`
+- `krishiv-shuffle/src/push_shuffle.rs`, `sort_shuffle_writer.rs`
+- `krishiv-connectors/src/offset.rs`, `s3.rs`
+- `krishiv-common/src/validate.rs`, `async_util.rs`, `test_fixtures.rs`
+- `krishiv-proto/src/ids.rs` (added `new_validated`), `task.rs`
+- `krishiv-ivm/src/flow.rs`
+- `krishiv-sql/src/streaming_tvf.rs`, `spark_sql_ext.rs`, `lib.rs`, `analyze.rs`
+- `krishiv-sql/src/lakehouse/merge.rs`, `create_function_ddl.rs`
+- `krishiv-delta/src/delta_batch.rs`, `operators/aggregate.rs`
+- `krishiv-ui/src/handlers.rs`
+- `krishiv-executor/src/cli.rs`
+- `krishiv-operator/src/main.rs`
+- `krishiv-api/src/session.rs`, `streaming_dataframe.rs`
+- `krishiv-metrics/src/counters.rs`, `system.rs`
+- `krishiv-scheduler/src/coordinator_daemon.rs`, `barrier_dispatch.rs`,
+  `job/scheduler.rs`, `dynamic_partition_pruning.rs`
+- `krishiv-plan/src/lib.rs`
+- `krishiv-state/src/backend.rs`, `broadcast.rs`, `async_operator.rs`
+- `krishiv-sql-gateway/src/session.rs`
+- `krishiv-bench/src/bin/test_streaming.rs`
+- `krishiv-flight-sql/src/service.rs`
+- `krishiv-executor/src/tests.rs`, `krishiv-scheduler/src/tests.rs`,
+  `krishiv-shuffle/src/tests.rs` (test modules annotated with `#[allow]`)
+- `krishiv-executor/src/sections/recovery.rs.inc`, `stream_loop.rs.inc`
+  (`.unwrap()` added to test-fixture calls)
+
+### Validation
+```
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings  pass (0 errors, 0 warnings)
+```
+
+### Blocker(s)
+None.
+
+### Next useful task
+`cargo test --workspace --exclude krishiv-python --exclude krishiv-chaos` to confirm
+all unit + integration test suites pass under the new deny gate.
+
+---
+
 ## 2026-06-26 — Infrastructure & Spark SQL batch
 
 ### Tasks completed

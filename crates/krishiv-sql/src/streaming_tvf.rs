@@ -43,8 +43,6 @@
 //! GROUP BY key, window_start, window_end
 //! ```
 
-use std::fmt::Write as FmtWrite;
-
 /// Parse a quoted interval string to milliseconds.
 /// Supports `'N unit'` where unit is one of: millisecond(s), second(s),
 /// minute(s), hour(s), day(s).  Returns `None` if unparseable.
@@ -129,12 +127,12 @@ impl<'a> ArgScanner<'a> {
                             '(' => depth += 1,
                             ')' => {
                                 if depth == 0 {
-                                    return Some((&self.src[start..i].trim(), c));
+                                    return Some((self.src[start..i].trim(), c));
                                 }
                                 depth -= 1;
                             }
                             ',' if depth == 0 => {
-                                return Some((&self.src[start..i].trim(), c));
+                                return Some((self.src[start..i].trim(), c));
                             }
                             _ => {}
                         }
@@ -143,7 +141,7 @@ impl<'a> ArgScanner<'a> {
             }
         }
         if end > start {
-            Some((&self.src[start..end].trim(), '\0'))
+            Some((self.src[start..end].trim(), '\0'))
         } else {
             None
         }
@@ -303,47 +301,33 @@ pub fn find_window_tvf(sql: &str) -> Option<(usize, WindowTvf<'_>, usize)> {
 
 /// Emit SQL for a window TVF call.
 fn emit_tvf_subquery(tvf: &WindowTvf<'_>) -> String {
-    let mut out = String::new();
     match tvf {
         WindowTvf::Tumble {
             source,
             ts_col,
             size_ms,
-        } => {
-            write!(
-                out,
-                "(SELECT *, tumble_start({ts_col}, {size_ms}) AS window_start, \
-                 tumble_end({ts_col}, {size_ms}) AS window_end FROM {source}) AS _tvf_window"
-            )
-            .unwrap();
-        }
+        } => format!(
+            "(SELECT *, tumble_start({ts_col}, {size_ms}) AS window_start, \
+             tumble_end({ts_col}, {size_ms}) AS window_end FROM {source}) AS _tvf_window"
+        ),
         WindowTvf::Hop {
             source,
             ts_col,
             slide_ms,
             size_ms,
-        } => {
-            write!(
-                out,
-                "(SELECT *, hop_start({ts_col}, {slide_ms}, {size_ms}) AS window_start, \
-                 hop_end({ts_col}, {slide_ms}, {size_ms}) AS window_end FROM {source}) AS _tvf_window"
-            )
-            .unwrap();
-        }
+        } => format!(
+            "(SELECT *, hop_start({ts_col}, {slide_ms}, {size_ms}) AS window_start, \
+             hop_end({ts_col}, {slide_ms}, {size_ms}) AS window_end FROM {source}) AS _tvf_window"
+        ),
         WindowTvf::Session {
             source,
             ts_col,
             gap_ms,
-        } => {
-            write!(
-                out,
-                "(SELECT *, session_start({ts_col}, {gap_ms}) AS window_start, \
-                 session_end({ts_col}, {gap_ms}) AS window_end FROM {source}) AS _tvf_window"
-            )
-            .unwrap();
-        }
+        } => format!(
+            "(SELECT *, session_start({ts_col}, {gap_ms}) AS window_start, \
+             session_end({ts_col}, {gap_ms}) AS window_end FROM {source}) AS _tvf_window"
+        ),
     }
-    out
 }
 
 /// Rewrite all window TVF calls in `sql` to subquery form.

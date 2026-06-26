@@ -122,76 +122,74 @@ impl SystemMetrics {
 
     /// Render system metrics in Prometheus text exposition format.
     pub fn render_prometheus(&self) -> String {
+        self.render_prometheus_inner().unwrap_or_default()
+    }
+
+    fn render_prometheus_inner(&self) -> Result<String, std::fmt::Error> {
         let mut out = String::with_capacity(1024);
 
         let rss = self.process_memory_bytes();
         writeln!(
             out,
             "# HELP krishiv_process_memory_bytes Resident set size (RSS) of the current process"
-        )
-        .unwrap();
-        writeln!(out, "# TYPE krishiv_process_memory_bytes gauge").unwrap();
-        writeln!(out, "krishiv_process_memory_bytes {rss}").unwrap();
+        )?;
+        writeln!(out, "# TYPE krishiv_process_memory_bytes gauge")?;
+        writeln!(out, "krishiv_process_memory_bytes {rss}")?;
 
         let cpu = self.process_cpu_usage_x100();
         writeln!(
             out,
             "# HELP krishiv_process_cpu_usage CPU usage of the current process (percentage x 100)"
-        )
-        .unwrap();
-        writeln!(out, "# TYPE krishiv_process_cpu_usage gauge").unwrap();
-        writeln!(out, "krishiv_process_cpu_usage {cpu}").unwrap();
+        )?;
+        writeln!(out, "# TYPE krishiv_process_cpu_usage gauge")?;
+        writeln!(out, "krishiv_process_cpu_usage {cpu}")?;
 
         let vmem = self.process_virtual_memory_bytes();
         writeln!(
             out,
             "# HELP krishiv_process_virtual_memory_bytes Virtual memory of the current process"
-        )
-        .unwrap();
-        writeln!(out, "# TYPE krishiv_process_virtual_memory_bytes gauge").unwrap();
-        writeln!(out, "krishiv_process_virtual_memory_bytes {vmem}").unwrap();
+        )?;
+        writeln!(out, "# TYPE krishiv_process_virtual_memory_bytes gauge")?;
+        writeln!(out, "krishiv_process_virtual_memory_bytes {vmem}")?;
 
         let threads = self.process_thread_count();
         writeln!(
             out,
             "# HELP krishiv_process_threads Number of threads in the current process"
-        )
-        .unwrap();
-        writeln!(out, "# TYPE krishiv_process_threads gauge").unwrap();
-        writeln!(out, "krishiv_process_threads {threads}").unwrap();
+        )?;
+        writeln!(out, "# TYPE krishiv_process_threads gauge")?;
+        writeln!(out, "krishiv_process_threads {threads}")?;
 
         let sys_total = self.system_total_memory_bytes();
         writeln!(
             out,
             "# HELP krishiv_system_memory_bytes_total Total system memory"
-        )
-        .unwrap();
-        writeln!(out, "# TYPE krishiv_system_memory_bytes_total gauge").unwrap();
-        writeln!(out, "krishiv_system_memory_bytes_total {sys_total}").unwrap();
+        )?;
+        writeln!(out, "# TYPE krishiv_system_memory_bytes_total gauge")?;
+        writeln!(out, "krishiv_system_memory_bytes_total {sys_total}")?;
 
         let sys_avail = self.system_available_memory_bytes();
         writeln!(
             out,
             "# HELP krishiv_system_memory_bytes_available Available system memory"
-        )
-        .unwrap();
-        writeln!(out, "# TYPE krishiv_system_memory_bytes_available gauge").unwrap();
-        writeln!(out, "krishiv_system_memory_bytes_available {sys_avail}").unwrap();
+        )?;
+        writeln!(out, "# TYPE krishiv_system_memory_bytes_available gauge")?;
+        writeln!(out, "krishiv_system_memory_bytes_available {sys_avail}")?;
 
         let sys_cpu = self.system_cpu_usage_x100();
         writeln!(
             out,
             "# HELP krishiv_system_cpu_usage System-wide CPU usage (percentage x 100)"
-        )
-        .unwrap();
-        writeln!(out, "# TYPE krishiv_system_cpu_usage gauge").unwrap();
-        writeln!(out, "krishiv_system_cpu_usage {sys_cpu}").unwrap();
+        )?;
+        writeln!(out, "# TYPE krishiv_system_cpu_usage gauge")?;
+        writeln!(out, "krishiv_system_cpu_usage {sys_cpu}")?;
 
-        out
+        Ok(out)
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -124,14 +124,16 @@ impl Coordinator {
     ) {
         for (task_id, ack) in acks {
             let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
+            let operator_id = match krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str())) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id; skipping ack");
+                    continue;
+                }
+            };
             let request = CheckpointAckRequest {
                 job_id: job_id.clone(),
-                operator_id: krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id");
-                        krishiv_proto::OperatorId::try_new("op-unknown".to_string())
-                            .expect("static operator_id is valid")
-                    }),
+                operator_id,
                 task_id: task_id.clone(),
                 epoch,
                 fencing_token,
@@ -175,14 +177,16 @@ impl Coordinator {
         let mut post_commit_jobs = Vec::new();
         for (task_id, ack) in acks {
             let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
+            let operator_id = match krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str())) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id; skipping ack");
+                    continue;
+                }
+            };
             let request = CheckpointAckRequest {
                 job_id: job_id.clone(),
-                operator_id: krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id");
-                        krishiv_proto::OperatorId::try_new("op-unknown".to_string())
-                            .expect("static operator_id is valid")
-                    }),
+                operator_id,
                 task_id: task_id.clone(),
                 epoch,
                 fencing_token,
@@ -323,28 +327,31 @@ pub async fn dispatch_barrier_plan(
 
 /// Build a [`CheckpointAckRequest`] from one barrier ack so the barrier transport
 /// and the `checkpoint_ack` RPC produce identical acks for the same task/epoch.
+///
+/// Returns `Err` when a valid `OperatorId` cannot be derived from `task_id`
+/// (e.g. the task-id string is empty or all-whitespace). The caller should
+/// log the error and skip the ack for that task.
 fn barrier_ack_to_checkpoint_ack(
     job_id: &JobId,
     epoch: u64,
     fencing_token: FencingToken,
     task_id: &TaskId,
     ack: &krishiv_proto::wire::v1::BarrierAck,
-) -> CheckpointAckRequest {
+) -> Result<CheckpointAckRequest, String> {
     let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
-    CheckpointAckRequest {
+    let operator_id = krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
+        .map_err(|e| {
+            format!("failed to derive operator_id from task_id '{}': {e}", task_id.as_str())
+        })?;
+    Ok(CheckpointAckRequest {
         job_id: job_id.clone(),
-        operator_id: krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
-            .unwrap_or_else(|e| {
-                tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id");
-                krishiv_proto::OperatorId::try_new("op-unknown".to_string())
-                    .expect("static operator_id is valid")
-            }),
+        operator_id,
         task_id: task_id.clone(),
         epoch,
         fencing_token,
         source_offsets: Vec::new(),
         snapshot_path,
-    }
+    })
 }
 
 /// Run pending barrier dispatches against a shared coordinator (background loop).
@@ -388,7 +395,19 @@ pub async fn drive_barrier_dispatches(
         shared.write().await.mark_barrier_dispatched(&job_id, epoch);
 
         for (task_id, ack) in &acks {
-            let request = barrier_ack_to_checkpoint_ack(&job_id, epoch, fencing, task_id, ack);
+            let request = match barrier_ack_to_checkpoint_ack(&job_id, epoch, fencing, task_id, ack) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        task_id = %task_id,
+                        epoch,
+                        error = %e,
+                        "skipping barrier ack: could not build checkpoint ack request"
+                    );
+                    continue;
+                }
+            };
 
             // Phase 1: in-memory ack processing under the dedicated checkpoint
             // inner lock — the single quorum owner shared with the gRPC path.

@@ -161,7 +161,9 @@ impl S3Source {
             .await?;
             self.stream = Some(stream);
         }
-        Ok(self.stream.as_mut().expect("stream populated above"))
+        self.stream.as_mut().ok_or_else(|| ConnectorError::Config {
+            message: "internal: stream not populated after ensure_stream".into(),
+        })
     }
 
     /// Return the object path this source was opened from.

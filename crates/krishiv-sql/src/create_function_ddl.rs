@@ -18,11 +18,11 @@ use arrow::record_batch::RecordBatch;
 use regex::Regex;
 use std::sync::LazyLock;
 
-static CREATE_FUNCTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+static CREATE_FUNCTION_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(
         r"(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(\w+)\s*\(([^)]*)\)\s*RETURNS\s+TABLE\s*\(([^)]*)\)(?:\s+LANGUAGE\s+(\w+))?(?:\s+AS\s+'((?:[^']|'')*)')?\s*;?\s*$",
     )
-    .expect("CREATE FUNCTION regex is valid")
+    .ok()
 });
 
 use krishiv_plan::udf::{ScalarValue, TableUdf, UdfError};
@@ -88,6 +88,8 @@ pub fn parse_create_function(sql: &str) -> Result<CreateFunctionDdl, String> {
     //   [LANGUAGE <lang>]
     //   [AS '<body>']
     let caps = CREATE_FUNCTION_RE
+        .as_ref()
+        .ok_or_else(|| "CREATE FUNCTION regex failed to compile".to_string())?
         .captures(sql)
         .ok_or_else(|| "SQL does not match CREATE FUNCTION … RETURNS TABLE pattern".to_string())?;
 
@@ -498,8 +500,10 @@ fn bind_sql_body_args(sql: &str, args: &[ScalarValue]) -> Result<String, UdfErro
             _ => {
                 let ch = sql[index..]
                     .chars()
-                    .next()
-                    .expect("index is within the SQL string");
+            .next()
+            .ok_or_else(|| UdfError::InvalidArgument {
+                message: "unexpected end of SQL string".to_owned(),
+            })?;
                 output.push(ch);
                 index += ch.len_utf8();
             }
@@ -530,7 +534,9 @@ fn copy_quoted_segment(
         let ch = sql[index..]
             .chars()
             .next()
-            .expect("index is within the SQL string");
+            .ok_or_else(|| UdfError::InvalidArgument {
+                message: "unexpected end of SQL string".to_owned(),
+            })?;
         index += ch.len_utf8();
     }
     Err(UdfError::InvalidArgument {
@@ -556,8 +562,10 @@ fn copy_block_comment(sql: &str, start: usize, output: &mut String) -> Result<us
         } else {
             let ch = sql[index..]
                 .chars()
-                .next()
-                .expect("index is within the SQL string");
+            .next()
+            .ok_or_else(|| UdfError::InvalidArgument {
+                message: "unexpected end of SQL string".to_owned(),
+            })?;
             index += ch.len_utf8();
         }
     }
@@ -614,6 +622,7 @@ fn scalar_to_sql_literal(value: &ScalarValue) -> Result<String, UdfError> {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use arrow::array::{ArrayRef, Int64Array};

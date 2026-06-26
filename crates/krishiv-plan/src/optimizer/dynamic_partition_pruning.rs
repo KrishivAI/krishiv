@@ -195,16 +195,15 @@ impl AqeRule for DynamicPartitionPruningRule {
                 // between build and probe. We keep the original
                 // partitioning and op intact; downstream executor code
                 // looks for the DppAdvice fields on the plan's metadata.
-                let mut new_op = node.op().cloned();
                 let label_suffix = format!("DppProbeFilter(key={key})");
                 let new_label = format!("{} ({label_suffix})", node.label());
-                let mut new_node = node.clone().with_label(new_label);
-                if new_op.is_none() {
-                    new_op = Some(NodeOp::Other {
-                        description: label_suffix,
-                    });
-                }
-                new_node = new_node.with_op(new_op.unwrap());
+                // Preserve the original op if present; otherwise annotate with
+                // a descriptive `Other` op so the executor can identify the DPP
+                // probe filter annotation.
+                let new_op = node.op().cloned().unwrap_or(NodeOp::Other {
+                    description: label_suffix,
+                });
+                let new_node = node.clone().with_label(new_label).with_op(new_op);
                 rewritten.add_node(new_node);
             } else {
                 rewritten.add_node(node.clone());

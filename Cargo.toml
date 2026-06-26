@@ -132,14 +132,11 @@ vortex = { version = "0.75.0", features = ["files", "tokio"] }
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-# Warn on unwrap/expect/panic so new code must justify each use.
-# These are currently warn (not deny) because ~4500 existing violations
-# would break CI. New modules should add #![deny(clippy::unwrap_used,
-# clippy::expect_used, clippy::panic)] individually. Track progress with:
-# cargo clippy --workspace -- -W clippy::unwrap_used 2>&1 | grep "warning:" | wc -l
-unwrap_used = "warn"
-expect_used = "warn"
-panic = "warn"
+# Deny unwrap/expect/panic workspace-wide. All violations have been
+# resolved with proper error handling; new code must not regress.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
 
 
 [profile.dev]

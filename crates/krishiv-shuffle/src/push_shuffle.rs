@@ -75,7 +75,7 @@ impl PushShuffleStore {
             entry.clone()
         };
         if chunks.len() == 1 {
-            return Some(chunks.into_iter().next().unwrap());
+            return chunks.into_iter().next();
         }
         let total: usize = chunks.iter().map(|b| b.len()).sum();
         let mut merged = Vec::with_capacity(total);

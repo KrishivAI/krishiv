@@ -740,7 +740,6 @@ impl PhysicalPlan {
 }
 
 fn describe_plan(plan_type: &str, name: &str, kind: ExecutionKind, nodes: &[PlanNode]) -> String {
-    use std::fmt::Write;
     let mut output = format!("{plan_type} plan: {name}\nkind: {kind}\nnodes:");
     if nodes.is_empty() {
         output.push_str(" <empty>");
@@ -748,25 +747,23 @@ fn describe_plan(plan_type: &str, name: &str, kind: ExecutionKind, nodes: &[Plan
     }
 
     for node in nodes {
-        write!(
-            output,
+        output.push_str(&format!(
             "\n- {} [{}] {}",
             node.id(),
             node.kind(),
             node.label()
-        )
-        .unwrap();
+        ));
         if !node.inputs().is_empty() {
-            write!(output, " <- {}", node.inputs().join(", ")).unwrap();
+            output.push_str(&format!(" <- {}", node.inputs().join(", ")));
         }
         if node.partitioning() != &Partitioning::Unpartitioned {
-            write!(output, " [partitioning: {}]", node.partitioning()).unwrap();
+            output.push_str(&format!(" [partitioning: {}]", node.partitioning()));
         }
         if node.broadcast_eligible() {
             output.push_str(" [broadcast-eligible]");
         }
         if let Some(rows) = node.estimated_rows() {
-            write!(output, " [est-rows: {rows}]").unwrap();
+            output.push_str(&format!(" [est-rows: {rows}]"));
         }
     }
 

@@ -148,11 +148,12 @@ impl DeltaBatch {
 
     /// The weight column as an `Int64Array`.
     pub fn weights(&self) -> &Int64Array {
+        static EMPTY: std::sync::OnceLock<Int64Array> = std::sync::OnceLock::new();
         self.inner
             .column(self.inner.num_columns() - 1)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .expect("weight column is always Int64; enforced at construction")
+            .unwrap_or_else(|| EMPTY.get_or_init(|| Int64Array::from(Vec::<i64>::new())))
     }
 
     /// The full inner `RecordBatch` including the `_weight` column.
@@ -167,7 +168,7 @@ impl DeltaBatch {
             self.data_schema.clone(),
             self.inner.columns()[..ncols].to_vec(),
         )
-        .expect("data columns always match data_schema")
+        .unwrap_or_else(|_| RecordBatch::new_empty(self.data_schema.clone()))
     }
 
     // ── Filtering by weight sign ───────────────────────────────────────────────

@@ -243,7 +243,7 @@ impl StreamingDataFrame {
             match dedup_state {
                 DedupStateMode::InMemory => Ok(Box::pin(DeduplicatingStream::new(base, cols))),
                 DedupStateMode::StateBacked => {
-                    Ok(Box::pin(StateBackedDeduplicatingStream::new(base, cols)))
+                    Ok(Box::pin(StateBackedDeduplicatingStream::new(base, cols)?))
                 }
             }
         } else {
@@ -565,11 +565,13 @@ struct StateBackedDeduplicatingStream {
 }
 
 impl StateBackedDeduplicatingStream {
-    fn new(inner: KrishivStream, columns: Vec<String>) -> Self {
+    fn new(inner: KrishivStream, columns: Vec<String>) -> Result<Self> {
         let cfg = krishiv_dataflow::dedup_operator::DeduplicationConfig::new(columns);
         let op = krishiv_dataflow::dedup_operator::DeduplicationOperator::ephemeral(cfg)
-            .expect("state-backed dedup operator must construct");
-        Self { inner, op }
+            .map_err(|e| KrishivError::InvalidConfig {
+                message: format!("state-backed dedup operator failed to construct: {e}"),
+            })?;
+        Ok(Self { inner, op })
     }
 }
 

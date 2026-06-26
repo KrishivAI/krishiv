@@ -309,14 +309,13 @@ impl IncrementalAggOp {
                 .map(|s| s.iter().any(|a| a.count != 0))
                 .unwrap_or(false);
 
-            if has_before {
-                let vals = compute_agg_values(before_states.as_ref().unwrap(), &self.aggregations);
+            if has_before && let Some(states) = before_states.as_ref() {
+                let vals = compute_agg_values(states, &self.aggregations);
                 out_group_rows.push(group_key.clone());
                 out_weights.push(-1);
                 agg_values.push(vals);
             }
-            if has_after {
-                let after_states = self.state.get(group_key).unwrap();
+            if has_after && let Some(after_states) = self.state.get(group_key) {
                 let vals = compute_agg_values(after_states, &self.aggregations);
                 out_group_rows.push(group_key.clone());
                 out_weights.push(1);

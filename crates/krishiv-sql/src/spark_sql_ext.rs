@@ -269,7 +269,7 @@ pub fn rewrite_describe_extended(sql: &str) -> SqlResult<String> {
     }
 
     // Remove EXTENDED keyword
-    let result = regex_replace(&sql, r"(?i)\bEXTENDED\b\s*", "")?;
+    let result = regex_replace(sql, r"(?i)\bEXTENDED\b\s*", "")?;
     Ok(result.trim().to_string())
 }
 

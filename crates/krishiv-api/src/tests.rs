@@ -409,12 +409,14 @@ fn tumbling_window_carries_correct_config() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)]
 fn tumbling_window_collect_executes_in_embedded_mode() {
     let session = Session::builder().build().unwrap();
     let batch = krishiv_common::test_fixtures::make_test_user_ts_batch(
         vec!["a", "a", "b"],
         vec![1_000, 5_000, 2_000],
-    );
+    )
+    .unwrap();
     let stream = session
         .memory_stream("events", vec![StreamBatch::new(0, batch)])
         .unwrap();
@@ -429,12 +431,14 @@ fn tumbling_window_collect_executes_in_embedded_mode() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)]
 fn sliding_window_collect_via_unified_runtime() {
     let session = Session::builder().build().unwrap();
     let batch = krishiv_common::test_fixtures::make_test_user_ts_batch(
         vec!["a", "a", "b"],
         vec![1_000, 5_000, 2_000],
-    );
+    )
+    .unwrap();
     let stream = session
         .memory_stream("events", vec![StreamBatch::new(0, batch)])
         .unwrap();
@@ -448,10 +452,12 @@ fn sliding_window_collect_via_unified_runtime() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)]
 fn session_window_collect_via_unified_runtime() {
     let session = Session::builder().build().unwrap();
     let batch =
-        krishiv_common::test_fixtures::make_test_user_ts_batch(vec!["a", "b"], vec![1_000, 8_000]);
+        krishiv_common::test_fixtures::make_test_user_ts_batch(vec!["a", "b"], vec![1_000, 8_000])
+            .unwrap();
     let stream = session
         .memory_stream("events", vec![StreamBatch::new(0, batch)])
         .unwrap();
@@ -465,9 +471,11 @@ fn session_window_collect_via_unified_runtime() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)]
 fn session_subsequent_window_collects() {
     let session = Session::builder().build().unwrap();
-    let batch = krishiv_common::test_fixtures::make_test_user_ts_batch(vec!["a"], vec![1_000]);
+    let batch =
+        krishiv_common::test_fixtures::make_test_user_ts_batch(vec!["a"], vec![1_000]).unwrap();
     for _ in 0..2 {
         let stream = session
             .memory_stream("events", vec![StreamBatch::new(0, batch.clone())])

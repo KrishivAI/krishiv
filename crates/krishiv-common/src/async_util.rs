@@ -32,8 +32,8 @@ fn fallback_runtime() -> &'static tokio::runtime::Runtime {
             builder.worker_threads(threads);
         }
         builder.build().unwrap_or_else(|e| {
-            tracing::error!(error = %e, "failed to create fallback Tokio runtime; panicking");
-            panic!("failed to create fallback Tokio runtime: {e}");
+            tracing::error!(error = %e, "failed to create fallback Tokio runtime; aborting process");
+            std::process::abort()
         })
     })
 }

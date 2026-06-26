@@ -1446,7 +1446,9 @@ fn sql_identifiers(sql: &str) -> Vec<String> {
 fn read_u32(bytes: &[u8], pos: &mut usize) -> IvmResult<u32> {
     let slice = bytes.get(*pos..*pos + 4).ok_or_else(slice_err)?;
     *pos += 4;
-    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(slice);
+    Ok(u32::from_le_bytes(arr))
 }
 
 fn slice_err() -> IvmError {

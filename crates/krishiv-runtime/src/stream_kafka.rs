@@ -114,8 +114,10 @@ mod tests {
 
     use super::encode_stream_kafka_partition;
 
+    #[allow(clippy::unwrap_used)]
     fn make_batch(keys: &[&str], times: &[i64]) -> RecordBatch {
         krishiv_common::test_fixtures::make_test_key_ts_batch(keys.to_vec(), times.to_vec())
+            .unwrap()
     }
 
     fn make_batch_with_value(keys: &[&str], times: &[i64], values: &[i64]) -> RecordBatch {
