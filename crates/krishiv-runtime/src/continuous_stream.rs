@@ -186,11 +186,11 @@ impl ContinuousStreamRegistry {
             .ok_or_else(|| ContinuousStreamError::JobNotFound {
                 job_id: job_id.to_owned(),
             })?;
-        if batches.is_empty() {
+        let [first_batch, rest @ ..] = batches.as_slice() else {
             return Ok(());
-        }
-        let incoming_schema = batches[0].schema();
-        for batch in &batches[1..] {
+        };
+        let incoming_schema = first_batch.schema();
+        for batch in rest {
             if batch.schema() != incoming_schema {
                 return Err(ContinuousStreamError::SchemaMismatch {
                     job_id: job_id.to_owned(),

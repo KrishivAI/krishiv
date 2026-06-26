@@ -484,10 +484,8 @@ async fn execute_shuffle_write_fragment(
                 message: format!("hash partition failed: {e}"),
             })?;
         for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
-            if bucket_batch.num_rows() > 0 {
-                if let Some(v) = partition_batches.get_mut(bucket_idx) {
-                    v.push(bucket_batch);
-                }
+            if bucket_batch.num_rows() > 0 && let Some(v) = partition_batches.get_mut(bucket_idx) {
+                v.push(bucket_batch);
             }
         }
     }
@@ -687,14 +685,12 @@ async fn execute_inmem_shuffle_write(
                         message: format!("hash partition failed: {e}"),
                     })?;
             for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
-                if bucket_batch.num_rows() > 0 {
-                    partition_batches[bucket_idx].push(bucket_batch);
+                if bucket_batch.num_rows() > 0 && let Some(v) = partition_batches.get_mut(bucket_idx) {
+                    v.push(bucket_batch);
                 }
             }
-        } else {
-            if let Some(v) = partition_batches.first_mut() {
-                v.push(batch.clone());
-            }
+        } else if let Some(v) = partition_batches.first_mut() {
+            v.push(batch.clone());
         }
     }
 

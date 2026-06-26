@@ -170,11 +170,10 @@ impl DataFrameReader {
                 options.has_header = parse_bool(&key, &value)?;
             }
             (Some(FileReadOptions::Csv(options)), "delimiter") => {
-                let bytes = value.as_bytes();
-                if bytes.len() != 1 {
-                    return Err(invalid("CSV delimiter must be one byte"));
+                match value.as_bytes() {
+                    [b] => options.delimiter = *b,
+                    _ => return Err(invalid("CSV delimiter must be one byte")),
                 }
-                options.delimiter = bytes[0];
             }
             (Some(FileReadOptions::Csv(options)), "malformedRecords" | "malformed_records") => {
                 options.malformed_records = parse_malformed_policy(&key, &value)?;
@@ -193,11 +192,10 @@ impl DataFrameReader {
                 if key == "header" {
                     options.has_header = parse_bool(&key, &value)?;
                 } else {
-                    let bytes = value.as_bytes();
-                    if bytes.len() != 1 {
-                        return Err(invalid("CSV delimiter must be one byte"));
+                    match value.as_bytes() {
+                        [b] => options.delimiter = *b,
+                        _ => return Err(invalid("CSV delimiter must be one byte")),
                     }
-                    options.delimiter = bytes[0];
                 }
                 self.file_options = Some(FileReadOptions::Csv(options));
             }

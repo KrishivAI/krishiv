@@ -279,7 +279,7 @@ pub fn encode_batches(batches: &[RecordBatch]) -> RuntimeResult<String> {
     if batches.is_empty() {
         return Ok(String::new());
     }
-    let schema = batches[0].schema();
+    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
     let mut buffer = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut buffer, &schema)

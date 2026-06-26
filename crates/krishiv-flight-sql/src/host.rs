@@ -311,7 +311,7 @@ impl FlightExecutionHost {
                 }
 
                 // Encode the record batches as an Arrow IPC stream.
-                let schema = batches[0].schema();
+                let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| std::sync::Arc::new(Schema::empty()));
                 let mut ipc_buf = Vec::new();
                 {
                     let mut writer = StreamWriter::try_new(&mut ipc_buf, &schema)

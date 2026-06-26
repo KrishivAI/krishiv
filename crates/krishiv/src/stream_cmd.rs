@@ -148,7 +148,8 @@ fn parse_stream_submit(args: &[&str]) -> Result<StreamSubmitSpec, String> {
     let mut session_gap_ms = 5_000u64;
     let mut idx = 0;
     while idx < args.len() {
-        match args[idx] {
+        let Some(&arg) = args.get(idx) else { break; };
+        match arg {
             "--job-id" => {
                 idx += 1;
                 job_id = Some(
@@ -241,7 +242,8 @@ fn parse_job_and_parquet(args: &[&str]) -> Result<(String, PathBuf), String> {
     let mut path = None;
     let mut idx = 0;
     while idx < args.len() {
-        match args[idx] {
+        let Some(&arg) = args.get(idx) else { break; };
+        match arg {
             "--job-id" => {
                 idx += 1;
                 job_id = Some(
@@ -270,7 +272,8 @@ fn parse_job_id_only(args: &[&str]) -> Result<String, String> {
     let mut job_id = None;
     let mut idx = 0;
     while idx < args.len() {
-        match args[idx] {
+        let Some(&arg) = args.get(idx) else { break; };
+        match arg {
             "--job-id" => {
                 idx += 1;
                 job_id = Some(

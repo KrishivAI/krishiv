@@ -93,7 +93,8 @@ fn parse_data_dir(args: &[&str]) -> Result<(PathBuf, usize), String> {
     let mut executors = 2usize;
     let mut i = 0;
     while i < args.len() {
-        match args[i] {
+        let Some(&arg) = args.get(i) else { break; };
+        match arg {
             "--data-dir" => {
                 i += 1;
                 dir = PathBuf::from(args.get(i).ok_or("missing --data-dir value")?);
@@ -121,7 +122,8 @@ fn parse_http_addr(args: &[&str]) -> Result<Option<String>, String> {
     let mut addr = std::env::var("KRISHIV_CLUSTER_HTTP_ADDR").ok();
     let mut idx = 0;
     while idx < args.len() {
-        if args[idx] == "--http-addr" {
+        let Some(&arg) = args.get(idx) else { break; };
+        if arg == "--http-addr" {
             idx += 1;
             addr = Some(
                 args.get(idx)

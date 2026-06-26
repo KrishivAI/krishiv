@@ -741,18 +741,11 @@ pub(crate) async fn execute_streaming_fragment(
     if !batches.is_empty() {
         plan_spec.key_column = String::from("key");
         plan_spec.event_time_column = String::from("ts");
-        if plan_spec
-            .agg_exprs
-            .first()
-            .is_some_and(|a| a.kind == WindowAggKind::Sum)
-            && plan_spec
-                .agg_exprs
-                .first()
-                .is_some_and(|a| a.input_column.is_empty())
+        if plan_spec.agg_exprs.first().is_some_and(|a| a.kind == WindowAggKind::Sum)
+            && plan_spec.agg_exprs.first().is_some_and(|a| a.input_column.is_empty())
+            && let Some(agg) = plan_spec.agg_exprs.first_mut()
         {
-            if let Some(agg) = plan_spec.agg_exprs.first_mut() {
-                agg.input_column = String::from("val");
-            }
+            agg.input_column = String::from("val");
         }
     }
     // GAP-2: compute the observed event-time watermark from input batches BEFORE

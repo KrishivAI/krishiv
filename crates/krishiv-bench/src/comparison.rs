@@ -206,7 +206,7 @@ impl BenchmarkAggregate {
             .into_iter()
             .map(|(name, mut durations)| {
                 durations.sort();
-                let median = durations[durations.len() / 2];
+                let median = durations.get(durations.len() / 2).copied().unwrap_or(Duration::ZERO);
                 (name, median)
             })
             .collect()

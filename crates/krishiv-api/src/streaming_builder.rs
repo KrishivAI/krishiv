@@ -270,7 +270,7 @@ impl StreamingQuery {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let take = n.min(history.len());
-        history[history.len() - take..].to_vec()
+        history.get(history.len() - take..).unwrap_or(&[]).to_vec()
     }
 
     /// Return the current high-level query status (state, mode, progress, exception).

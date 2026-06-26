@@ -60,7 +60,7 @@ fn bind_parameters(sql: &str, parameters: &[ScalarValue]) -> Result<String> {
     let mut last = 0usize;
     scan_sql_with_offsets(sql, |start, end, index| {
         output.push_str(&sql[last..start]);
-        output.push_str(&parameters[index - 1].to_sql_literal());
+        output.push_str(&parameters.get(index.wrapping_sub(1)).map(|p| p.to_sql_literal()).unwrap_or_default());
         last = end;
     })?;
     output.push_str(&sql[last..]);
@@ -78,7 +78,7 @@ fn scan_sql_with_offsets(sql: &str, mut visit: impl FnMut(usize, usize, usize)) 
     let mut line_comment = false;
     let mut block_comment = false;
     while index < bytes.len() {
-        let byte = bytes[index];
+        let Some(&byte) = bytes.get(index) else { break; };
         if line_comment {
             if byte == b'\n' {
                 line_comment = false;

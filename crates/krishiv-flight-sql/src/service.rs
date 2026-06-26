@@ -349,13 +349,13 @@ impl FlightSqlService for KrishivFlightSqlService {
         // (whose first four bytes are ASCII SQL and parse as a huge length) are
         // decoded as the original query instead of being silently truncated.
         let handle = &ticket.statement_handle;
-        let (transaction_id, query_bytes): (Option<Vec<u8>>, &[u8]) = if handle.len() >= 4 {
-            let txn_len = u32::from_be_bytes([handle[0], handle[1], handle[2], handle[3]]) as usize;
+        let (transaction_id, query_bytes): (Option<Vec<u8>>, &[u8]) = if let Some(prefix) = handle.get(..4) {
+            let txn_len = u32::from_be_bytes(prefix.try_into().unwrap_or([0; 4])) as usize;
             let txn_end = 4 + txn_len;
             if txn_len > 0 && handle.len() >= txn_end {
-                (Some(handle[4..txn_end].to_vec()), &handle[txn_end..])
+                (Some(handle.get(4..txn_end).unwrap_or(&[]).to_vec()), handle.get(txn_end..).unwrap_or(&[]))
             } else if txn_len == 0 {
-                (None, &handle[4..])
+                (None, handle.get(4..).unwrap_or(&[]))
             } else {
                 (None, handle)
             }
@@ -398,11 +398,7 @@ impl FlightSqlService for KrishivFlightSqlService {
             // _permit drops here
         };
 
-        let schema: Arc<Schema> = if batches.is_empty() {
-            Arc::new(Schema::empty())
-        } else {
-            batches[0].schema()
-        };
+        let schema: Arc<Schema> = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
 
         let flight_data = batches_to_flight_data(&schema, batches)
             .map_err(|e| Status::internal(e.to_string()))?

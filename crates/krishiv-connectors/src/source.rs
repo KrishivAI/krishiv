@@ -107,6 +107,9 @@ pub trait DynSource: Send {
     fn current_offset_dyn(&self) -> Option<Box<dyn Any + Send>>;
 
     fn reset_dyn(&mut self);
+
+    /// Downcast to `&dyn Any` for type-specific operations.
+    fn as_any(&self) -> &dyn Any;
 }
 
 impl<T: Source + Send> DynSource for T {
@@ -132,5 +135,9 @@ impl<T: Source + Send> DynSource for T {
 
     fn reset_dyn(&mut self) {
         self.reset();
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

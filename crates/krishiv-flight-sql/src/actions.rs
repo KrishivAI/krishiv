@@ -22,10 +22,10 @@ pub(crate) fn count_sql_params(sql: &str) -> usize {
     let mut max = 0usize;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'$' {
+        if bytes.get(i) == Some(&b'$') {
             i += 1;
             let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
+            while bytes.get(i).is_some_and(|b| b.is_ascii_digit()) {
                 i += 1;
             }
             if i > start
@@ -170,10 +170,10 @@ pub(crate) fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
     let mut text_start = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
-        if bytes[i] == b'$' {
+        if bytes.get(i) == Some(&b'$') {
             let digit_start = i + 1;
             let mut j = digit_start;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
+            while bytes.get(j).is_some_and(|b| b.is_ascii_digit()) {
                 j += 1;
             }
             if j > digit_start
@@ -201,7 +201,7 @@ pub(crate) fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, Kri
     if batches.is_empty() {
         return Ok(Vec::new());
     }
-    let schema = batches[0].schema();
+    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
     let mut buf = Vec::new();
     {
         let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)

@@ -157,7 +157,7 @@ fn flag_value(args: &[&str], flag: &str) -> Option<String> {
 fn positional(args: &[&str]) -> Option<String> {
     let mut i = 0;
     while i < args.len() {
-        let a = args[i];
+        let Some(&a) = args.get(i) else { break; };
         if a == "--name" || a == "--dir" {
             i += 2;
             continue;

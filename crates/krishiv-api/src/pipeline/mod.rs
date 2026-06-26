@@ -32,6 +32,45 @@ pub use driver::RunPolicy;
 pub use sink::Egress;
 pub use source::{CdcChange, Ingest};
 
+/// Configuration for backpressure in streaming mode.
+#[derive(Debug, Clone)]
+pub struct BackpressureConfig {
+    /// Maximum bytes in flight before applying backpressure.
+    pub max_bytes_in_flight: usize,
+    /// Maximum rows in flight before applying backpressure.
+    pub max_rows_in_flight: usize,
+}
+
+impl Default for BackpressureConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes_in_flight: 1024 * 1024 * 10, // 10MB
+            max_rows_in_flight: 10_000,
+        }
+    }
+}
+
+/// Configuration for streaming execution.
+#[derive(Debug, Clone)]
+pub struct StreamingConfig {
+    /// How the driver advances the logical clock.
+    pub run_policy: RunPolicy,
+    /// Backpressure configuration.
+    pub backpressure: BackpressureConfig,
+    /// Checkpoint interval in milliseconds. `None` disables checkpointing.
+    pub checkpoint_interval_ms: Option<u64>,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            run_policy: RunPolicy::EveryMs(100),
+            backpressure: BackpressureConfig::default(),
+            checkpoint_interval_ms: None,
+        }
+    }
+}
+
 use std::sync::Arc;
 
 use crate::{Result, Session};
@@ -87,6 +126,8 @@ pub struct Pipeline {
     views: Vec<ViewDef>,
     sinks: Vec<(String, Egress)>,
     expectations: Vec<Expectation>,
+    /// Streaming configuration (only used in Stream mode).
+    streaming_config: Option<StreamingConfig>,
 }
 
 /// Builder returned by [`Session::pipeline`](crate::Session::pipeline).
@@ -101,6 +142,8 @@ pub struct PipelineBuilder {
     /// Append flows `(target, select_sql)` — multiple with the same target are
     /// `UNION ALL`-ed into a single view at [`build`](PipelineBuilder::build).
     flows: Vec<(String, String)>,
+    /// Streaming configuration (only used in Stream mode).
+    streaming_config: Option<StreamingConfig>,
 }
 
 impl PipelineBuilder {

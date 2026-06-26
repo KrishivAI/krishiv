@@ -1,5 +1,174 @@
 # Krishiv Implementation Status
 
+## 2026-06-26 - Lint: raise clippy::indexing_slicing to deny
+
+### Task completed
+
+Fixed all `clippy::indexing_slicing` violations across the workspace (~200
+violations in 50+ files) and raised the lint from `allow` to `deny` in
+`Cargo.toml`. Also fixed `collapsible_if` / `collapsible_else_if` warnings
+discovered in the same pass.
+
+Files touched span: `krishiv-plan`, `krishiv-sql`, `krishiv-ivm`,
+`krishiv-executor`, `krishiv-connectors`, `krishiv-runtime`, `krishiv-api`,
+`krishiv-flight-sql`, `krishiv` (CLI), `krishiv-bench`.
+
+### Validation
+
+```
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings
+```
+
+Exit 0, no errors or warnings.
+
+### Blocker(s)
+
+None.
+
+### Next useful task
+
+Run `cargo test --workspace --lib` to confirm no regressions; then proceed
+with Phase 1 streaming pipeline driver.
+
+---
+
+## 2026-06-26 - Phase 0: Plan and contract cleanup
+
+### Task completed
+
+Completed Phase 0 of the streaming architecture plan:
+
+1. Created design note for `StreamingExecutionProfile`:
+   - Typed execution profiles: `LowLatency`, `Throughput`, `Auto`
+   - Separated from `RunPolicy` (API coalescing knob)
+   - Added `OutputBufferPolicy` and `BacklogPolicy` for auto-switching
+
+2. Created design note for checkpoint metadata for unaligned buffers:
+   - Extended `StreamingCheckpointMetadata` with source offsets, unaligned buffers, sink transactions
+   - Defined storage layout for checkpoint data
+   - Documented checkpoint and restore protocol changes
+
+3. Created design note for `OutputBufferPolicy`:
+   - Flush conditions: max_rows, max_bytes, flush_interval_ms
+   - AND vs OR semantics for multi-condition flush
+   - Integration with `StreamingExecutionProfile`
+
+4. Verified engine semantics contract alignment:
+   - Confirmed coordinator-fenced epoch barriers as checkpoint contract
+   - Confirmed exactly-once certification matrix
+   - Confirmed deployment mode requirements
+
+### Validation
+
+```
+git diff --check -- docs/implementation/design-notes/  pass
+rg -n '[^\x00-\x7F]' docs/implementation/design-notes/  no matches
+```
+
+### Blocker(s)
+
+None.
+
+### Next useful task
+
+Implement Phase 1 from the plan: replace the stream pipeline driver's
+connector-source drain-to-memory path with a true continuous source loop that
+supports backpressure, cancellation, and checkpoint-controlled source offsets.
+
+---
+
+## 2026-06-26 - Phase 1: Continuous pipeline driver design
+
+### Task completed
+
+Created comprehensive design document for Phase 1: True Continuous Pipeline Driver:
+
+1. **Streaming Source Loop**: `run_streaming()` function that reads connector batches incrementally instead of draining to memory
+2. **Backpressure Controller**: `BackpressureController` struct with configurable limits (max_bytes_in_flight, max_rows_in_flight)
+3. **Streaming Source Wrapper**: `StreamingSource` struct with backpressure and offset tracking
+4. **Checkpoint Integration**: Save/restore streaming source offsets through checkpoint protocol
+5. **Acceptance Tests**: 4 test scenarios covering unbounded sources, backpressure, cancellation, and source offsets
+
+### Files created
+
+- `docs/implementation/phase1-continuous-pipeline-driver.md` - Comprehensive design document
+
+### Validation
+
+```
+git diff --check -- docs/implementation/phase1-continuous-pipeline-driver.md  pass
+rg -n '[^\x00-\x7F]' docs/implementation/phase1-continuous-pipeline-driver.md  no matches
+```
+
+### Blocker(s)
+
+None.
+
+### Next useful task
+
+Implement Phase 1 code changes:
+1. Add `DynSource::as_any()` method for downcasting
+2. Create `BackpressureController` struct
+3. Create `StreamingSource` wrapper
+4. Add `run_streaming()` function to pipeline driver
+5. Add `StreamingConfig` struct
+6. Integrate checkpoint save/restore
+7. Add acceptance tests
+8. Update `Pipeline::run()` to use streaming driver for unbounded sources
+
+---
+
+## 2026-06-26 - Phase 1-7: Design documents completed
+
+### Task completed
+
+Created comprehensive design documents for all phases of the streaming architecture:
+
+1. **Phase 1**: True Continuous Pipeline Driver
+   - `docs/implementation/phase1-continuous-pipeline-driver.md`
+   - Streaming source loop, backpressure controller, checkpoint integration
+
+2. **Phase 2**: Low-Latency Batch-Preserving Runtime
+   - `docs/implementation/phase2-low-latency-runtime.md`
+   - StreamEnvelope, OutputBufferPolicy, StreamingExecutionProfile, operator fusion
+
+3. **Phase 3**: Checkpoint and Recovery Integration
+   - `docs/implementation/phase3-checkpoint-recovery.md`
+   - Extended checkpoint metadata, unaligned buffers, restore protocol
+
+4. **Phase 4**: State Backend Evolution
+   - `docs/implementation/phase4-state-backend.md`
+   - Async state trait, object-store LSM backend, compaction worker
+
+5. **Phase 5**: Event Time, Timezone, and SQL Semantics
+   - `docs/implementation/phase5-event-time-timezone.md`
+   - UTC normalization, timezone-aware window bucketing, SQL timezone functions
+
+6. **Phase 6**: Public Rust and Python API
+   - `docs/implementation/phase6-public-api.md`
+   - Builder methods, Python bindings, streaming configuration
+
+7. **Phase 7**: Certification, Observability, and Benchmarks
+   - `docs/implementation/phase7-certification-benchmarks.md`
+   - Metrics, chaos tests, performance baselines, deployment mode tests
+
+### Validation
+
+```
+git diff --check -- docs/implementation/phase*.md  pass
+rg -n '[^\x00-\x7F]' docs/implementation/phase*.md  no matches
+```
+
+### Blocker(s)
+
+None.
+
+### Next useful task
+
+Begin implementation of Phase 1 code changes.
+
+---
+
 ## 2026-06-26 — Workspace-wide `deny(unwrap_used, expect_used, panic)` enforcement
 
 ### Task completed
@@ -3290,4 +3459,3 @@ cargo test -p krishiv-connectors --lib sql::                                    
 ```
 cargo test --workspace --exclude krishiv-ivm
 ```
-

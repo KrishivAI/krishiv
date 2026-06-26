@@ -149,7 +149,8 @@ fn parse_data_dir(args: &[&str]) -> Result<PathBuf, String> {
     );
     let mut idx = 0;
     while idx < args.len() {
-        match args[idx] {
+        let Some(&arg) = args.get(idx) else { break; };
+        match arg {
             "--data-dir" => {
                 idx += 1;
                 dir = PathBuf::from(
@@ -174,7 +175,8 @@ fn parse_http_addr(args: &[&str]) -> Result<Option<String>, String> {
     let mut addr = std::env::var("KRISHIV_LOCAL_HTTP_ADDR").ok();
     let mut idx = 0;
     while idx < args.len() {
-        if args[idx] == "--http-addr" {
+        let Some(&arg) = args.get(idx) else { break; };
+        if arg == "--http-addr" {
             idx += 1;
             addr = Some(
                 args.get(idx)

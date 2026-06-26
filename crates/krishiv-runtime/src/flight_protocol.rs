@@ -119,7 +119,7 @@ pub(crate) fn parquet_file_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<S
         return Ok(String::new());
     }
 
-    let schema = batches[0].schema();
+    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
     let mut buf = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut buf, &schema)

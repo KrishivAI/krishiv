@@ -84,7 +84,8 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
     let mut timeout_secs = None;
     let mut idx = 0;
     while idx < args.len() {
-        match args[idx] {
+        let Some(&arg) = args.get(idx) else { break; };
+        match arg {
             "--query" | "-q" => {
                 idx += 1;
                 let value = args
