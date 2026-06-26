@@ -74,7 +74,10 @@ pub fn parse_match_recognize(sql: &str) -> SqlResult<Option<MatchRecognizeStatem
             feature: "MATCH_RECOGNIZE PATTERN must contain at least one stage".into(),
         });
     }
-    let mut pattern = Pattern::begin(stages[0]);
+    let first_stage = stages.first().copied().ok_or_else(|| SqlError::Unsupported {
+        feature: "MATCH_RECOGNIZE PATTERN stage list is empty".into(),
+    })?;
+    let mut pattern = Pattern::begin(first_stage);
     for stage in stages.iter().skip(1) {
         pattern = pattern.followed_by(*stage);
     }
@@ -141,7 +144,9 @@ pub fn execute_match_recognize(
     }
 
     // Locate key and event-time column indices.
-    let schema = source_batches[0].schema();
+    let schema = source_batches.first().ok_or_else(|| SqlError::Unsupported {
+        feature: "source_batches is empty".into(),
+    })?.schema();
     let key_idx = schema
         .index_of(&stmt.key_column)
         .map_err(|_| SqlError::Unsupported {
@@ -216,7 +221,8 @@ pub fn execute_match_recognize(
         // Materialise the single-row slice only for the matcher call — still
         // O(n) slices in the worst case, but they are short-lived and not
         // accumulated in the events Vec.
-        let row = source_batches[*batch_idx].slice(*row_idx, 1);
+        let Some(batch) = source_batches.get(*batch_idx) else { continue; };
+        let row = batch.slice(*row_idx, 1);
         let state = key_states.entry(key.clone()).or_default();
         // Track (stage_index, start_time_ms) together so we can detect both
         // new partial starts AND restarts-after-expiry (where stage_index stays
@@ -273,7 +279,9 @@ pub fn execute_streaming_match_recognize(
         return Ok(Vec::new());
     }
 
-    let schema = new_batches[0].schema();
+    let schema = new_batches.first().ok_or_else(|| SqlError::Unsupported {
+        feature: "new_batches is empty".into(),
+    })?.schema();
     let key_idx = schema
         .index_of(&stmt.key_column)
         .map_err(|_| SqlError::Unsupported {
@@ -341,7 +349,8 @@ pub fn execute_streaming_match_recognize(
 
     for (key, event_time, batch_idx, row_idx) in &events {
         max_event_time = Some(max_event_time.unwrap_or(*event_time).max(*event_time));
-        let row = new_batches[*batch_idx].slice(*row_idx, 1);
+        let Some(batch) = new_batches.get(*batch_idx) else { continue; };
+        let row = batch.slice(*row_idx, 1);
         for &stage in &stage_names {
             let completed = state.process_event(key.clone(), stage, row.clone(), *event_time);
             if !completed.is_empty() {

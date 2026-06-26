@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
 
-use crate::aggregate::AggState;
+use crate::aggregate::{AggEntry, AggState};
 
 /// Persist window accumulators to a state backend.
 ///
@@ -43,11 +43,11 @@ pub fn persist_window_accumulators(
 
     for ((key, win_start), agg) in accumulators {
         let payload = serde_json::json!({
-            "values": agg.values,
-            "has_value": agg.has_value,
-            "avg_sums": agg.avg_sums,
-            "avg_counts": agg.avg_counts,
-            "float_values": agg.float_values,
+            "values":       agg.entries.iter().map(|e| e.value).collect::<Vec<_>>(),
+            "has_value":    agg.entries.iter().map(|e| e.has_value).collect::<Vec<_>>(),
+            "avg_sums":     agg.entries.iter().map(|e| e.avg_sum).collect::<Vec<_>>(),
+            "avg_counts":   agg.entries.iter().map(|e| e.avg_count).collect::<Vec<_>>(),
+            "float_values": agg.entries.iter().map(|e| e.float_value).collect::<Vec<_>>(),
         });
         let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
             message: e.to_string(),
@@ -97,7 +97,7 @@ pub fn restore_window_accumulators(
     let plen = key_prefix.len();
 
     for key_bytes in backend.list_keys(namespace)? {
-        if key_bytes.len() < plen || &key_bytes[..plen] != key_prefix {
+        if key_bytes.get(..plen).is_none_or(|p| p != key_prefix) {
             continue;
         }
         let Some(payload) = backend.get(namespace, &key_bytes)? else {
@@ -109,38 +109,44 @@ pub fn restore_window_accumulators(
                 message: e.to_string(),
             })?;
 
-        let values: Vec<i64> = parsed["values"]
-            .as_array()
+        let values: Vec<i64> = parsed
+            .get("values")
+            .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
             .unwrap_or_default();
-        let has_value: Vec<bool> = parsed["has_value"]
-            .as_array()
+        let has_value: Vec<bool> = parsed
+            .get("has_value")
+            .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_bool()).collect())
             .unwrap_or_default();
-        let avg_sums: Vec<f64> = parsed["avg_sums"]
-            .as_array()
+        let avg_sums: Vec<f64> = parsed
+            .get("avg_sums")
+            .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
             .unwrap_or_default();
-        let avg_counts: Vec<u64> = parsed["avg_counts"]
-            .as_array()
+        let avg_counts: Vec<u64> = parsed
+            .get("avg_counts")
+            .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
             .unwrap_or_default();
-        let float_values: Vec<f64> = parsed["float_values"]
-            .as_array()
+        let float_values: Vec<f64> = parsed
+            .get("float_values")
+            .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
             .unwrap_or_default();
 
         if let Some((key, win_start)) = parse_window_state_key(&key_bytes, key_prefix) {
-            restored.insert(
-                (key, win_start),
-                AggState {
-                    values,
-                    has_value,
-                    avg_sums,
-                    avg_counts,
-                    float_values,
-                },
-            );
+            let n = values.len();
+            let entries = (0..n)
+                .map(|i| AggEntry {
+                    value: values.get(i).copied().unwrap_or(0),
+                    has_value: has_value.get(i).copied().unwrap_or(false),
+                    avg_sum: avg_sums.get(i).copied().unwrap_or(0.0),
+                    avg_count: avg_counts.get(i).copied().unwrap_or(0),
+                    float_value: float_values.get(i).copied().unwrap_or(0.0),
+                })
+                .collect();
+            restored.insert((key, win_start), AggState { entries });
         }
     }
 
@@ -173,9 +179,13 @@ pub fn restore_operator_watermark_ms(
             message: format!("watermark entry too short ({} bytes)", bytes.len()),
         });
     }
-    Ok(Some(i64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ])))
+    let arr: [u8; 8] = bytes
+        .get(..8)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| StateError::CorruptEntry {
+            message: "watermark bytes too short".into(),
+        })?;
+    Ok(Some(i64::from_le_bytes(arr)))
 }
 
 /// Parse a length-prefixed window state key.
@@ -186,38 +196,30 @@ pub fn restore_operator_watermark_ms(
 fn parse_window_state_key(key_bytes: &[u8], prefix: &[u8]) -> Option<(String, i64)> {
     let plen = prefix.len();
     // Must start with the expected prefix
-    if key_bytes.len() < plen || &key_bytes[..plen] != prefix {
+    if key_bytes.get(..plen).is_none_or(|p| p != prefix) {
         return None;
     }
 
-    let rest = &key_bytes[plen..];
+    let rest = key_bytes.get(plen..).unwrap_or(&[]);
 
     // Need at least 4 bytes for key_len + 8 bytes for win_start
     if rest.len() < 12 {
         return None;
     }
 
-    let key_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let key_len_bytes: [u8; 4] = rest.get(..4)?.try_into().ok()?;
+    let key_len = u32::from_le_bytes(key_len_bytes) as usize;
 
     // Check that we have enough bytes for the key and win_start
     if rest.len() < 4 + key_len + 8 {
         return None;
     }
 
-    let key_bytes = &rest[4..4 + key_len];
+    let key_bytes = rest.get(4..4 + key_len)?;
     let key = String::from_utf8(key_bytes.to_vec()).ok()?;
 
-    let win_start_bytes = &rest[4 + key_len..4 + key_len + 8];
-    let win_start = i64::from_le_bytes([
-        win_start_bytes[0],
-        win_start_bytes[1],
-        win_start_bytes[2],
-        win_start_bytes[3],
-        win_start_bytes[4],
-        win_start_bytes[5],
-        win_start_bytes[6],
-        win_start_bytes[7],
-    ]);
+    let win_start_arr: [u8; 8] = rest.get(4 + key_len..4 + key_len + 8)?.try_into().ok()?;
+    let win_start = i64::from_le_bytes(win_start_arr);
 
     Some((key, win_start))
 }

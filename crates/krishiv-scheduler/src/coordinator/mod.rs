@@ -1425,7 +1425,7 @@ impl Coordinator {
                 }
 
                 durations_ms.sort_unstable();
-                let median_ms = durations_ms[durations_ms.len() / 2];
+                let median_ms = durations_ms.get(durations_ms.len() / 2).copied().unwrap_or(0);
                 if median_ms == 0 {
                     continue;
                 }

@@ -101,7 +101,9 @@ impl StaticScheduler {
 
         let mut assignments = Vec::with_capacity(spec.task_count());
         for (idx, task) in spec.stages().iter().flat_map(StageSpec::tasks).enumerate() {
-            let executor = executors[idx % executors.len()];
+            let executor = executors
+                .get(idx % executors.len())
+                .ok_or(SchedulerError::NoExecutors)?;
             assignments.push(TaskAssignment::new(
                 task.task_id().clone(),
                 executor.executor_id().clone(),
@@ -214,10 +216,11 @@ impl SlotAwareScheduler {
                 .enumerate()
                 .max_by_key(|(_, slots)| **slots)
                 .ok_or(SchedulerError::NoExecutors)?;
-            slot_budget[idx] = slot_budget[idx].saturating_sub(1);
+            if let Some(b) = slot_budget.get_mut(idx) { *b = b.saturating_sub(1); }
+            let executor = executors.get(idx).ok_or(SchedulerError::NoExecutors)?;
             assignments.push(TaskAssignment::new(
                 task_id.clone(),
-                executors[idx].executor_id.clone(),
+                executor.executor_id.clone(),
             ));
         }
         Ok(assignments)
@@ -285,7 +288,7 @@ impl LocalityScheduler {
             let same_node = preferred
                 .as_deref()
                 .and_then(|node| node_index.get(node))
-                .and_then(|idxs| idxs.iter().copied().find(|&i| slot_budget[i] > 0));
+                .and_then(|idxs| idxs.iter().copied().find(|&i| slot_budget.get(i).is_some_and(|s| *s > 0)));
             let idx = if let Some(i) = same_node {
                 i
             } else {
@@ -296,10 +299,11 @@ impl LocalityScheduler {
                     .map(|(i, _)| i)
                     .ok_or(SchedulerError::NoExecutors)?
             };
-            slot_budget[idx] = slot_budget[idx].saturating_sub(1);
+            if let Some(b) = slot_budget.get_mut(idx) { *b = b.saturating_sub(1); }
+            let executor = executors.get(idx).ok_or(SchedulerError::NoExecutors)?;
             assignments.push(TaskAssignment::new(
                 task_id.clone(),
-                executors[idx].executor_id.clone(),
+                executor.executor_id.clone(),
             ));
         }
         Ok(assignments)
@@ -403,15 +407,16 @@ impl FairScheduler {
                 .enumerate()
                 .max_by_key(|(_, slots)| **slots)
                 .ok_or(SchedulerError::NoExecutors)?;
-            slot_budget[idx] = slot_budget[idx].saturating_sub(1);
+            if let Some(b) = slot_budget.get_mut(idx) { *b = b.saturating_sub(1); }
             *remaining.entry(chosen.clone()).or_insert(0) = remaining
                 .get(&chosen)
                 .copied()
                 .unwrap_or(0)
                 .saturating_sub(1);
+            let executor = executors.get(idx).ok_or(SchedulerError::NoExecutors)?;
             assignments.push(TaskAssignment::new(
                 task_id.clone(),
-                executors[idx].executor_id.clone(),
+                executor.executor_id.clone(),
             ));
             // Silence unused-import-style warnings on the pool config
             // maps so the fields are surfaced for future use (e.g.,
@@ -492,7 +497,9 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
                         stage.stage_id()
                     ),
                 })?;
-            in_degree[idx] = in_degree[idx].saturating_add(stage.upstream_stage_ids().len());
+            if let Some(d) = in_degree.get_mut(idx) {
+                *d = d.saturating_add(stage.upstream_stage_ids().len());
+            }
         }
         let mut queue: std::collections::VecDeque<usize> = in_degree
             .iter()
@@ -502,11 +509,14 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
         let mut processed = 0usize;
         while let Some(idx) = queue.pop_front() {
             processed += 1;
-            let current_id = spec.stages()[idx].stage_id();
+            let Some(current_stage) = spec.stages().get(idx) else { continue; };
+            let current_id = current_stage.stage_id();
             for (ds_idx, ds_stage) in spec.stages().iter().enumerate() {
-                if ds_stage.upstream_stage_ids().contains(current_id) {
-                    in_degree[ds_idx] = in_degree[ds_idx].saturating_sub(1);
-                    if in_degree[ds_idx] == 0 {
+                if ds_stage.upstream_stage_ids().contains(current_id)
+                    && let Some(d) = in_degree.get_mut(ds_idx)
+                {
+                    *d = d.saturating_sub(1);
+                    if *d == 0 {
                         queue.push_back(ds_idx);
                     }
                 }
@@ -738,12 +748,20 @@ pub(crate) fn topo_sort_plan_nodes(nodes: &[PlanNode]) -> SchedulerResult<Vec<&P
                     message: format!("node '{}' references missing input '{input}'", node.id()),
                 }
             })?;
-            in_degrees[node_index] = in_degrees[node_index].checked_add(1).ok_or_else(|| {
+            let deg = in_degrees.get_mut(node_index).ok_or_else(|| {
                 SchedulerError::InvalidPlan {
-                    message: format!("node '{}' has too many input edges", node.id()),
+                    message: format!("in_degrees index {node_index} out of range"),
                 }
             })?;
-            dependents[input_index].push(node_index);
+            *deg = deg.checked_add(1).ok_or_else(|| SchedulerError::InvalidPlan {
+                message: format!("node '{}' has too many input edges", node.id()),
+            })?;
+            dependents
+                .get_mut(input_index)
+                .ok_or_else(|| SchedulerError::InvalidPlan {
+                    message: format!("dependents index {input_index} out of range"),
+                })?
+                .push(node_index);
         }
     }
     let mut queue = in_degrees
@@ -753,23 +771,27 @@ pub(crate) fn topo_sort_plan_nodes(nodes: &[PlanNode]) -> SchedulerResult<Vec<&P
         .collect::<VecDeque<_>>();
     let mut ordered = Vec::with_capacity(nodes.len());
     while let Some(node_index) = queue.pop_front() {
-        ordered.push(&nodes[node_index]);
-        for &dependent_index in &dependents[node_index] {
+        let node = nodes.get(node_index).ok_or_else(|| SchedulerError::InvalidPlan {
+            message: format!("node index {node_index} out of range"),
+        })?;
+        ordered.push(node);
+        let deps = dependents.get(node_index).ok_or_else(|| SchedulerError::InvalidPlan {
+            message: format!("dependents index {node_index} out of range"),
+        })?;
+        for &dependent_index in deps {
             let in_degree =
                 in_degrees
                     .get_mut(dependent_index)
                     .ok_or_else(|| SchedulerError::InvalidPlan {
                         message: format!(
-                            "topological sort lost in-degree state for node '{}'",
-                            nodes[dependent_index].id()
+                            "topological sort lost in-degree state for node at index {dependent_index}",
                         ),
                     })?;
             *in_degree = in_degree
                 .checked_sub(1)
                 .ok_or_else(|| SchedulerError::InvalidPlan {
                     message: format!(
-                        "topological sort underflowed in-degree for node '{}'",
-                        nodes[dependent_index].id()
+                        "topological sort underflowed in-degree for node at index {dependent_index}",
                     ),
                 })?;
             if *in_degree == 0 {

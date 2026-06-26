@@ -249,7 +249,7 @@ fn encode_batches_ipc(batches: &[arrow::record_batch::RecordBatch]) -> Result<Ve
     if batches.is_empty() {
         return Ok(Vec::new());
     }
-    let schema = batches[0].schema();
+    let schema = batches.first().ok_or_else(|| "empty batches".to_string())?.schema();
     let mut buf = Vec::new();
     let mut writer =
         StreamWriter::try_new(&mut buf, &schema).map_err(|e| format!("ipc writer: {e}"))?;

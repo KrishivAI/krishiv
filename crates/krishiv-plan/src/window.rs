@@ -338,7 +338,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> Result<String, Plan
     let agg = if spec.agg_exprs.is_empty() {
         "agg=count".to_string()
     } else {
-        encode_agg(&spec.agg_exprs[0])
+        spec.agg_exprs.first().map(encode_agg).unwrap_or_default()
     };
 
     let prefix = match spec.window_kind {
@@ -646,7 +646,7 @@ fn is_escaped_colon(payload: &str, idx: usize) -> bool {
     let mut i = idx;
     while i > 0 {
         i -= 1;
-        if payload.as_bytes()[i] == b'\\' {
+        if payload.as_bytes().get(i).is_some_and(|&b| b == b'\\') {
             backslash_count += 1;
         } else {
             break;

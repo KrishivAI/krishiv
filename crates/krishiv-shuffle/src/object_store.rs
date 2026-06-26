@@ -44,13 +44,11 @@ impl ObjectStoreShuffleStore {
     }
 
     fn encode_content_hash(hash: &[u8; 32]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut encoded = String::with_capacity(64);
-        for byte in hash {
-            encoded.push(HEX[(byte >> 4) as usize] as char);
-            encoded.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        encoded
+        hash.iter().fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
     }
 
     fn decode_content_hash(encoded: &[u8]) -> Option<[u8; 32]> {
@@ -73,9 +71,9 @@ impl ObjectStoreShuffleStore {
 
         let mut hash = [0u8; 32];
         for (idx, chunk) in encoded.chunks_exact(2).enumerate() {
-            let high = nibble(chunk[0])?;
-            let low = nibble(chunk[1])?;
-            hash[idx] = (high << 4) | low;
+            let high = nibble(*chunk.first()?)?;
+            let low = nibble(*chunk.get(1)?)?;
+            *hash.get_mut(idx)? = (high << 4) | low;
         }
         Some(hash)
     }

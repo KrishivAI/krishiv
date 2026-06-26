@@ -195,7 +195,9 @@ impl<S: Send + 'static> GroupStateExecutor<S> {
                 groups.push((key_str, Vec::new()));
                 idx
             });
-            groups[group_idx].1.push(row);
+            if let Some(g) = groups.get_mut(group_idx) {
+                g.1.push(row);
+            }
         }
 
         let mut output = Vec::new();

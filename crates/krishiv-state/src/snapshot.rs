@@ -7,12 +7,12 @@ pub fn read_lp_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
     if buf.len() < *pos + 8 {
         return None;
     }
-    let len = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().ok()?) as usize;
+    let len = u64::from_le_bytes(buf.get(*pos..*pos + 8)?.try_into().ok()?) as usize;
     *pos += 8;
     if buf.len() < *pos + len {
         return None;
     }
-    let v = &buf[*pos..*pos + len];
+    let v = buf.get(*pos..*pos + len)?;
     *pos += len;
     Some(v)
 }
@@ -47,7 +47,9 @@ pub fn decode_snapshot_entries(bytes: &[u8]) -> StateResult<Vec<SnapshotEntry>> 
         return Err(corrupt("too short"));
     }
     let version = u32::from_le_bytes(
-        bytes[0..4]
+        bytes
+            .get(..4)
+            .ok_or_else(|| corrupt("failed to read version bytes"))?
             .try_into()
             .map_err(|_| corrupt("failed to read version bytes"))?,
     );
@@ -55,7 +57,9 @@ pub fn decode_snapshot_entries(bytes: &[u8]) -> StateResult<Vec<SnapshotEntry>> 
         return Err(corrupt(&format!("unsupported snapshot version {version}")));
     }
     let count = u64::from_le_bytes(
-        bytes[4..12]
+        bytes
+            .get(4..12)
+            .ok_or_else(|| corrupt("failed to read entry count bytes"))?
             .try_into()
             .map_err(|_| corrupt("failed to read entry count bytes"))?,
     ) as usize;

@@ -7,7 +7,7 @@ use arrow::record_batch::RecordBatch;
 use krishiv_common::MemoryBudget;
 use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
 
-use crate::aggregate::{AggExpr, AggFunction, AggState};
+use crate::aggregate::{AggEntry, AggExpr, AggFunction, AggState};
 use crate::join::extract_agg_key;
 use crate::{ExecError, ExecResult};
 
@@ -133,11 +133,11 @@ impl SessionWindowOperator {
             let payload = serde_json::json!({
                 "session_start_ms": session.session_start_ms,
                 "last_event_time_ms": session.last_event_time_ms,
-                "values": session.agg.values,
-                "has_value": session.agg.has_value,
-                "avg_sums": session.agg.avg_sums,
-                "avg_counts": session.agg.avg_counts,
-                "float_values": session.agg.float_values,
+                "values":       session.agg.entries.iter().map(|e| e.value).collect::<Vec<_>>(),
+                "has_value":    session.agg.entries.iter().map(|e| e.has_value).collect::<Vec<_>>(),
+                "avg_sums":     session.agg.entries.iter().map(|e| e.avg_sum).collect::<Vec<_>>(),
+                "avg_counts":   session.agg.entries.iter().map(|e| e.avg_count).collect::<Vec<_>>(),
+                "float_values": session.agg.entries.iter().map(|e| e.float_value).collect::<Vec<_>>(),
             });
             let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
                 message: e.to_string(),
@@ -175,7 +175,7 @@ impl SessionWindowOperator {
     ) -> StateResult<()> {
         let mut restored = HashMap::new();
         for key_bytes in backend.list_keys(namespace)? {
-            if key_bytes.len() < 4 || &key_bytes[..4] != b"ses:" {
+            if key_bytes.get(..4).is_none_or(|p| p != b"ses:") {
                 continue;
             }
             let Some(payload) = backend.get(namespace, &key_bytes)? else {
@@ -185,51 +185,60 @@ impl SessionWindowOperator {
                 serde_json::from_slice(&payload).map_err(|e| StateError::CorruptEntry {
                     message: e.to_string(),
                 })?;
-            let session_start_ms =
-                parsed["session_start_ms"]
-                    .as_i64()
-                    .ok_or_else(|| StateError::CorruptEntry {
-                        message: "missing or invalid session_start_ms".into(),
-                    })?;
-            let last_event_time_ms =
-                parsed["last_event_time_ms"]
-                    .as_i64()
-                    .ok_or_else(|| StateError::CorruptEntry {
-                        message: "missing or invalid last_event_time_ms".into(),
-                    })?;
-            let values: Vec<i64> = parsed["values"]
-                .as_array()
+            let session_start_ms = parsed
+                .get("session_start_ms")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| StateError::CorruptEntry {
+                    message: "missing or invalid session_start_ms".into(),
+                })?;
+            let last_event_time_ms = parsed
+                .get("last_event_time_ms")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| StateError::CorruptEntry {
+                    message: "missing or invalid last_event_time_ms".into(),
+                })?;
+            let values: Vec<i64> = parsed
+                .get("values")
+                .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
                 .unwrap_or_default();
-            let has_value: Vec<bool> = parsed["has_value"]
-                .as_array()
+            let has_value: Vec<bool> = parsed
+                .get("has_value")
+                .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_bool()).collect())
                 .unwrap_or_default();
-            let avg_sums: Vec<f64> = parsed["avg_sums"]
-                .as_array()
+            let avg_sums: Vec<f64> = parsed
+                .get("avg_sums")
+                .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
                 .unwrap_or_default();
-            let avg_counts: Vec<u64> = parsed["avg_counts"]
-                .as_array()
+            let avg_counts: Vec<u64> = parsed
+                .get("avg_counts")
+                .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
                 .unwrap_or_default();
-            let float_values: Vec<f64> = parsed["float_values"]
-                .as_array()
+            let float_values: Vec<f64> = parsed
+                .get("float_values")
+                .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
                 .unwrap_or_default();
             if let Some(key) = parse_session_state_key(&key_bytes) {
+                let n = values.len();
+                let entries = (0..n)
+                    .map(|i| AggEntry {
+                        value: values.get(i).copied().unwrap_or(0),
+                        has_value: has_value.get(i).copied().unwrap_or(false),
+                        avg_sum: avg_sums.get(i).copied().unwrap_or(0.0),
+                        avg_count: avg_counts.get(i).copied().unwrap_or(0),
+                        float_value: float_values.get(i).copied().unwrap_or(0.0),
+                    })
+                    .collect();
                 restored.insert(
                     key,
                     SessionState {
                         session_start_ms,
                         last_event_time_ms,
-                        agg: AggState {
-                            values,
-                            has_value,
-                            avg_sums,
-                            avg_counts,
-                            float_values,
-                        },
+                        agg: AggState { entries },
                     },
                 );
             }
@@ -335,9 +344,9 @@ impl SessionWindowOperator {
         // to a negative value, making every session appear closed spuriously.
         let closed: Vec<String> = self
             .sessions
-            .keys()
-            .filter(|k| self.sessions[*k].last_event_time_ms.saturating_add(gap) <= watermark_ms)
-            .cloned()
+            .iter()
+            .filter(|(_, v)| v.last_event_time_ms.saturating_add(gap) <= watermark_ms)
+            .map(|(k, _)| k.clone())
             .collect();
         if closed.is_empty() {
             return Ok(vec![]);
@@ -376,16 +385,16 @@ impl SessionWindowOperator {
             let is_float = self.spec.agg_is_float.get(i).copied().unwrap_or(false);
             match agg.function {
                 AggFunction::Avg => {
-                    columns.push(Arc::new(Float64Array::from(vec![state.finalized_avg(i)])));
+                    columns.push(Arc::new(Float64Array::from(vec![state.finalized_avg(i)?])));
                 }
                 _ if is_float => {
                     columns.push(Arc::new(Float64Array::from(vec![
-                        state.finalized_float_value(i, agg),
+                        state.finalized_float_value(i, agg)?,
                     ])));
                 }
                 _ => {
                     columns.push(Arc::new(Int64Array::from(vec![
-                        state.finalized_value(i, agg),
+                        state.finalized_value(i, agg)?,
                     ])));
                 }
             }
@@ -401,7 +410,7 @@ fn parse_session_state_key(bytes: &[u8]) -> Option<String> {
     if !bytes.starts_with(PREFIX) {
         return None;
     }
-    let rest = &bytes[PREFIX.len()..];
+    let rest = bytes.get(PREFIX.len()..)?;
     let key_len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
     let key = std::str::from_utf8(rest.get(4..4 + key_len)?)
         .ok()?

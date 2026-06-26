@@ -9,10 +9,8 @@ pub fn encode_lease_token(token: u64) -> Vec<u8> {
 
 /// Decode a persisted lease token sidecar.
 pub fn decode_lease_token(bytes: &[u8]) -> Option<u64> {
-    let slice = bytes.get(..8)?;
-    Some(u64::from_le_bytes([
-        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-    ]))
+    let arr: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(arr))
 }
 
 /// Validate monotonic lease advancement.

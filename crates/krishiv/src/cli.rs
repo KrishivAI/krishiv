@@ -43,9 +43,10 @@ impl CoordinatorMode {
         let mut url: Option<String> = None;
         let mut i = 0;
         while i < args.len() {
-            match args[i] {
+            let Some(&arg) = args.get(i) else { break; };
+            match arg {
                 "--coordinator" | "-c" if i + 1 < args.len() => {
-                    url = Some(args[i + 1].to_owned());
+                    url = args.get(i + 1).copied().map(str::to_owned);
                     i += 2;
                 }
                 other => {
@@ -350,17 +351,18 @@ fn run_state_inspect(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut storage_path: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i] {
+        let Some(&arg) = args.get(i) else { break; };
+        match arg {
             "--job" if i + 1 < args.len() => {
-                job_id = Some(args[i + 1]);
+                job_id = args.get(i + 1).copied();
                 i += 2;
             }
             "--operator" if i + 1 < args.len() => {
-                operator_id = Some(args[i + 1]);
+                operator_id = args.get(i + 1).copied();
                 i += 2;
             }
             "--storage-path" if i + 1 < args.len() => {
-                storage_path = Some(args[i + 1]);
+                storage_path = args.get(i + 1).copied();
                 i += 2;
             }
             other => {
@@ -570,7 +572,8 @@ fn parse_submit_command(args: &[&str]) -> Result<SubmitCommand, String> {
     let mut launch = false;
     let mut idx = 0;
     while idx < args.len() {
-        match args[idx] {
+        let Some(&arg) = args.get(idx) else { break; };
+        match arg {
             "--job-id" => {
                 idx += 1;
                 job_id = args
@@ -711,9 +714,10 @@ fn run_savepoint_rename(args: &[&str]) -> CliResponse {
     let mut output: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i] {
+        let Some(&arg) = args.get(i) else { break; };
+        match arg {
             "--output" if i + 1 < args.len() => {
-                output = Some(args[i + 1]);
+                output = args.get(i + 1).copied();
                 i += 2;
             }
             other => {
@@ -747,9 +751,10 @@ fn run_savepoint_rename_map(args: &[&str]) -> CliResponse {
     let mut file: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i] {
+        let Some(&arg) = args.get(i) else { break; };
+        match arg {
             "--file" if i + 1 < args.len() => {
-                file = Some(args[i + 1]);
+                file = args.get(i + 1).copied();
                 i += 2;
             }
             other => {
@@ -789,13 +794,14 @@ fn run_savepoint(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut label: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i] {
+        let Some(&arg) = args.get(i) else { break; };
+        match arg {
             "--job" if i + 1 < args.len() => {
-                job_id = Some(args[i + 1]);
+                job_id = args.get(i + 1).copied();
                 i += 2;
             }
             "--label" if i + 1 < args.len() => {
-                label = Some(args[i + 1]);
+                label = args.get(i + 1).copied();
                 i += 2;
             }
             other => {
@@ -883,17 +889,18 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut storage_path: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i] {
+        let Some(&arg) = args.get(i) else { break; };
+        match arg {
             "--job" if i + 1 < args.len() => {
-                job_id = Some(args[i + 1]);
+                job_id = args.get(i + 1).copied();
                 i += 2;
             }
             "--epoch" if i + 1 < args.len() => {
-                epoch = Some(args[i + 1]);
+                epoch = args.get(i + 1).copied();
                 i += 2;
             }
             "--storage-path" if i + 1 < args.len() => {
-                storage_path = Some(args[i + 1]);
+                storage_path = args.get(i + 1).copied();
                 i += 2;
             }
             other => {
@@ -1045,13 +1052,14 @@ fn run_checkpoints_list(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut storage_path: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i] {
+        let Some(&arg) = args.get(i) else { break; };
+        match arg {
             "--job" if i + 1 < args.len() => {
-                job_id = Some(args[i + 1]);
+                job_id = args.get(i + 1).copied();
                 i += 2;
             }
             "--storage-path" if i + 1 < args.len() => {
-                storage_path = Some(args[i + 1]);
+                storage_path = args.get(i + 1).copied();
                 i += 2;
             }
             other => {

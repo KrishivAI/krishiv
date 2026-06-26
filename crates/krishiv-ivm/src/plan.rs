@@ -135,7 +135,7 @@ pub fn partition_key_from_sql(sql: &str) -> Option<String> {
     if stmts.len() != 1 {
         return None;
     }
-    let Statement::Query(query) = &stmts[0] else {
+    let Statement::Query(query) = stmts.first()? else {
         return None;
     };
     let SetExpr::Select(select) = query.body.as_ref() else {
@@ -147,7 +147,7 @@ pub fn partition_key_from_sql(sql: &str) -> Option<String> {
     if exprs.len() != 1 || !modifiers.is_empty() {
         return None;
     }
-    match &exprs[0] {
+    match exprs.first()? {
         SqlExpr::Identifier(ident) => Some(ident.value.clone()),
         SqlExpr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
         _ => None,
@@ -163,7 +163,7 @@ fn partition_key_from_logical(plan: &LogicalPlan) -> Option<String> {
             if agg.group_expr.len() != 1 {
                 return None;
             }
-            expr_col_name(&agg.group_expr[0])
+            expr_col_name(agg.group_expr.first()?)
         }
         _ => None,
     }
@@ -285,7 +285,7 @@ fn source_of_plan(plan: &LogicalPlan) -> Option<String> {
         _ => {
             let inputs = plan.inputs();
             if inputs.len() == 1 {
-                source_of_plan(inputs[0])
+                source_of_plan(inputs.first()?)
             } else {
                 None
             }

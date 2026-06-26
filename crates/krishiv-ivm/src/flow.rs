@@ -393,9 +393,10 @@ impl IncrementalFlow {
         if non_empty.is_empty() {
             return Ok(());
         }
-        let schema = non_empty[0].schema();
+        let first = *non_empty.first().ok_or_else(|| IvmError::execution("empty batch list".to_string()))?;
+        let schema = first.schema();
         let new_snapshot = if non_empty.len() == 1 {
-            (*non_empty[0]).clone()
+            first.clone()
         } else {
             arrow::compute::concat_batches(&schema, non_empty.iter().copied())
                 .map_err(|e| IvmError::execution(e.to_string()))?
@@ -1358,7 +1359,7 @@ async fn execute_view_sql(
         return RecordBatch::try_new(spec.output_schema.clone(), empty_cols)
             .map_err(|e| IvmError::execution(e.to_string()));
     }
-    let combined = arrow::compute::concat_batches(&non_empty[0].schema(), &non_empty)
+    let combined = arrow::compute::concat_batches(&non_empty.first().ok_or_else(|| IvmError::execution("empty batch list".to_string()))?.schema(), &non_empty)
         .map_err(|e| IvmError::execution(e.to_string()))?;
     coerce_to_schema(combined, &spec.output_schema)
 }

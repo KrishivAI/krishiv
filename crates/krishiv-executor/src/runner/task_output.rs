@@ -61,7 +61,7 @@ fn encode_record_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<Vec<u8>>, St
     if batches.is_empty() {
         return Ok(Vec::new());
     }
-    let schema = batches[0].schema();
+    let schema = batches.first().ok_or_else(|| "empty batch list".to_string())?.schema();
     let mut buf = Vec::new();
     {
         let mut writer =

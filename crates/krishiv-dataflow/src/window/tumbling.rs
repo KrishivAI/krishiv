@@ -353,16 +353,16 @@ pub(crate) fn build_window_record_batch(
         let is_float = agg_is_float.get(i).copied().unwrap_or(false);
         match agg.function {
             AggFunction::Avg => {
-                columns.push(Arc::new(Float64Array::from(vec![state.finalized_avg(i)])));
+                columns.push(Arc::new(Float64Array::from(vec![state.finalized_avg(i)?])));
             }
             _ if is_float => {
                 columns.push(Arc::new(Float64Array::from(vec![
-                    state.finalized_float_value(i, agg),
+                    state.finalized_float_value(i, agg)?,
                 ])));
             }
             _ => {
                 columns.push(Arc::new(Int64Array::from(vec![
-                    state.finalized_value(i, agg),
+                    state.finalized_value(i, agg)?,
                 ])));
             }
         }

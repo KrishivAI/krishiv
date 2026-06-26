@@ -80,12 +80,9 @@ impl CoalesceRule {
         // below). Stable sort preserves original order among equal-size partitions.
         let mut order: Vec<usize> = (0..stats.len()).collect();
         order.sort_by_key(|&i| {
-            let s = &stats[i];
-            if s.serialized_bytes > 0 {
-                s.serialized_bytes
-            } else {
-                s.memory_bytes
-            }
+            stats.get(i).map_or(0u128, |s| {
+                u128::from(if s.serialized_bytes > 0 { s.serialized_bytes } else { s.memory_bytes })
+            })
         });
 
         let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -94,7 +91,7 @@ impl CoalesceRule {
         let target_bytes = u128::from(self.target_partition_bytes.max(1));
 
         for i in order {
-            let s = &stats[i];
+            let Some(s) = stats.get(i) else { continue; };
             // Prefer serialized_bytes over memory_bytes for the same reason as
             // AutoPartitionRule: shuffle output is compressed and a better
             // proxy for actual partition cost than peak in-memory footprint.
@@ -182,12 +179,12 @@ impl AqeRule for CoalesceRule {
 
         let label = format!("CoalescePartitions({original_count} → {target_partitions})");
         let existing_coalesce_index = terminal_indexes.first().and_then(|&terminal_index| {
-            let terminal = &plan.nodes()[terminal_index];
+            let terminal = plan.nodes().get(terminal_index)?;
             if matches!(terminal.op(), Some(NodeOp::CoalescePartitions { .. })) {
                 return Some(terminal_index);
             }
             if matches!(terminal.op(), Some(NodeOp::Sink { .. })) && terminal.inputs().len() == 1 {
-                let input_id = &terminal.inputs()[0];
+                let input_id = terminal.inputs().first()?;
                 return plan.nodes().iter().position(|node| {
                     node.id() == input_id
                         && matches!(node.op(), Some(NodeOp::CoalescePartitions { .. }))
@@ -243,8 +240,9 @@ impl AqeRule for CoalesceRule {
         }
         if coalesce_inputs.is_empty()
             && let Some(&terminal_index) = terminal_indexes.first()
+            && let Some(node) = plan.nodes().get(terminal_index)
         {
-            coalesce_inputs.push(plan.nodes()[terminal_index].id().to_string());
+            coalesce_inputs.push(node.id().to_string());
         }
         rewritten.add_node(
             PlanNode::new(coalesce_id, label, plan.kind())

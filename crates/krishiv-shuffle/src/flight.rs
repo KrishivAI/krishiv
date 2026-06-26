@@ -65,10 +65,14 @@ fn parse_ticket(ticket_bytes: &[u8]) -> Result<(String, String, u32), Status> {
             "ticket must be '<job_id>/<stage_id>/<partition>'",
         ));
     }
-    let partition_id = parts[2]
+    let partition_id = parts
+        .get(2)
+        .ok_or_else(|| Status::invalid_argument("ticket missing partition segment"))?
         .parse::<u32>()
         .map_err(|e| Status::invalid_argument(format!("partition id not a u32: {e}")))?;
-    Ok((parts[0].to_owned(), parts[1].to_owned(), partition_id))
+    let job_id = (*parts.first().ok_or_else(|| Status::invalid_argument("ticket missing job_id"))?).to_string();
+    let stage_id = (*parts.get(1).ok_or_else(|| Status::invalid_argument("ticket missing stage_id"))?).to_string();
+    Ok((job_id, stage_id, partition_id))
 }
 
 /// Arrow Flight shuffle service backed by any [`ShuffleStore`] implementation.
@@ -281,7 +285,13 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
                 "FlightDescriptor.path[0] must be the partition ticket '<job>/<stage>/<partition>'",
             ));
         }
-        let (job_id, stage_id, partition) = parse_ticket(descriptor.path[0].as_bytes())?;
+        let (job_id, stage_id, partition) = parse_ticket(
+            descriptor
+                .path
+                .first()
+                .ok_or_else(|| Status::invalid_argument("descriptor.path is empty"))?
+                .as_bytes(),
+        )?;
         // B6: Make lease_token required — reject absent or unparseable tokens.
         let lease_token: u64 = descriptor
             .path

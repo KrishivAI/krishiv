@@ -365,9 +365,11 @@ impl ThresholdSkewRule {
         let n = rows.len();
         let mid = n / 2;
         if n.is_multiple_of(2) {
-            (rows[mid - 1] as f64 + rows[mid] as f64) / 2.0
+            let a = rows.get(mid.saturating_sub(1)).copied().unwrap_or(0);
+            let b = rows.get(mid).copied().unwrap_or(0);
+            (a as f64 + b as f64) / 2.0
         } else {
-            rows[mid] as f64
+            rows.get(mid).copied().unwrap_or(0) as f64
         }
     }
 }

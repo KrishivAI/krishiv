@@ -234,8 +234,14 @@ async fn ess_read_partition(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let start = offsets[partition as usize];
-    let end = offsets[partition as usize + 1];
+    let start = offsets.get(partition as usize).copied().ok_or_else(|| {
+        tracing::error!(partition, "partition index out of range for offsets");
+        StatusCode::BAD_REQUEST
+    })?;
+    let end = offsets.get(partition as usize + 1).copied().ok_or_else(|| {
+        tracing::error!(partition, "partition+1 index out of range for offsets");
+        StatusCode::BAD_REQUEST
+    })?;
 
     if start == end {
         // Empty partition: return an empty body with the correct content type.

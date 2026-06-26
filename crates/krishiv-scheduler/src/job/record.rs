@@ -759,7 +759,13 @@ impl StageRecord {
                 task_id: update.task_id().clone(),
             })?;
 
-        let outcome = self.tasks[task_idx].apply_status_update(&update)?;
+        let outcome = self
+            .tasks
+            .get_mut(task_idx)
+            .ok_or_else(|| SchedulerError::UnknownTask {
+                task_id: update.task_id().clone(),
+            })?
+            .apply_status_update(&update)?;
         if outcome == TaskUpdateOutcome::Duplicate {
             return Ok(outcome);
         }
@@ -768,12 +774,22 @@ impl StageRecord {
             // Try per-task retry first: if this specific task still has attempts remaining,
             // reset only that task to Pending rather than retrying the entire stage
             // (which would reset even succeeded tasks).
-            let task = &mut self.tasks[task_idx];
+            let task = self
+                .tasks
+                .get_mut(task_idx)
+                .ok_or_else(|| SchedulerError::UnknownTask {
+                    task_id: update.task_id().clone(),
+                })?;
             task.failure_count = task.failure_count.saturating_add(1);
             let task_failure_count = task.failure_count;
 
             if task_failure_count < max_task_attempts {
-                let task = &mut self.tasks[task_idx];
+                let task = self
+                    .tasks
+                    .get_mut(task_idx)
+                    .ok_or_else(|| SchedulerError::UnknownTask {
+                        task_id: update.task_id().clone(),
+                    })?;
                 task.state = TaskState::Pending;
                 task.assigned_executor = None;
                 task.launch_in_flight = false;

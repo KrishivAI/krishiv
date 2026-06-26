@@ -730,8 +730,8 @@ fn read_proc_net_bytes() -> Option<(u64, u64)> {
         if parts.len() < 10 {
             continue;
         }
-        let recv: u64 = parts[1].parse().ok()?;
-        let sent: u64 = parts[9].parse().ok()?;
+        let recv: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let sent: u64 = parts.get(9).and_then(|s| s.parse().ok()).unwrap_or(0);
         total_recv = total_recv.saturating_add(recv);
         total_sent = total_sent.saturating_add(sent);
     }

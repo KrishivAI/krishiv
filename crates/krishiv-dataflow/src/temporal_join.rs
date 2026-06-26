@@ -232,13 +232,20 @@ impl TemporalJoinOperator {
         }
 
         // Combine all row columns into full columns.
-        let total_cols = output_columns[0].len();
+        let total_cols = output_columns
+            .first()
+            .map(|r| r.len())
+            .unwrap_or(0);
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(total_cols);
         for col_idx in 0..total_cols {
             let col_arrays: Vec<_> = output_columns
                 .iter()
-                .map(|row| row[col_idx].clone())
-                .collect();
+                .map(|row| {
+                    row.get(col_idx)
+                        .cloned()
+                        .ok_or_else(|| ExecError::Arrow(format!("col {col_idx} out of range")))
+                })
+                .collect::<ExecResult<_>>()?;
             arrays.push(arrow::compute::concat(
                 &col_arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>(),
             )?);

@@ -135,15 +135,15 @@ impl DynamicPartitionPruningRule {
                 continue;
             }
             let keys = match node.partitioning() {
-                Partitioning::Hash { keys, .. } if keys.len() == 1 => keys[0].clone(),
+                Partitioning::Hash { keys, .. } if keys.len() == 1 => keys.first().cloned()?,
                 _ => continue,
             };
             // Two children, both Scan-shaped.
             if node.inputs().len() != 2 {
                 continue;
             }
-            let left_id = &node.inputs()[0];
-            let right_id = &node.inputs()[1];
+            let left_id = node.inputs().first()?;
+            let right_id = node.inputs().get(1)?;
             let left = plan.nodes().iter().find(|n| n.id() == left_id)?;
             let right = plan.nodes().iter().find(|n| n.id() == right_id)?;
             let is_scan = |n: &PlanNode| matches!(n.op(), Some(NodeOp::Scan { .. }));

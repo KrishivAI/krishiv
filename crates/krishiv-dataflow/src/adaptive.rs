@@ -62,7 +62,9 @@ impl HeavyHittersTracker {
 
         // O(1) lookup via index map.
         if let Some(&pos) = self.index.get(&key) {
-            self.counters[pos].1 += 1;
+            if let Some(c) = self.counters.get_mut(pos) {
+                c.1 += 1;
+            }
             // If this key was the current minimum, re-find the minimum
             // since its count has increased above the true minimum.
             if pos == self.min_pos {
@@ -80,7 +82,12 @@ impl HeavyHittersTracker {
         if self.counters.len() < self.capacity {
             let pos = self.counters.len();
             // New entries start with count=1; track min_pos if this is the smallest.
-            if pos == 0 || self.counters[self.min_pos].1 > 1 {
+            if pos == 0
+                || self
+                    .counters
+                    .get(self.min_pos)
+                    .is_some_and(|c| c.1 > 1)
+            {
                 self.min_pos = pos;
             }
             self.counters.push((key.clone(), 1, 0));
@@ -91,11 +98,13 @@ impl HeavyHittersTracker {
         // Replace the minimum-count entry (SpaceSaving eviction rule).
         // Use cached min_pos — O(1) lookup instead of O(n) scan.
         let min_pos = self.min_pos;
-        let min_count = self.counters[min_pos].1;
-        let old_key = self.counters[min_pos].0.clone();
-        self.index.remove(&old_key);
-        self.counters[min_pos] = (key.clone(), min_count + 1, min_count);
-        self.index.insert(key, min_pos);
+        if let Some(entry) = self.counters.get_mut(min_pos) {
+            let min_count = entry.1;
+            let old_key = entry.0.clone();
+            self.index.remove(&old_key);
+            *entry = (key.clone(), min_count + 1, min_count);
+            self.index.insert(key, min_pos);
+        }
 
         // Re-scan for the new minimum after eviction (unavoidable after replacement).
         self.min_pos = self

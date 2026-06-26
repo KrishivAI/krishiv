@@ -118,7 +118,7 @@ impl PartitionedIncrementalFlow {
     /// Feed a delta, routing each row to its shard by the key column.
     pub fn feed(&self, source: &str, delta: DeltaBatch) -> IvmResult<()> {
         if self.shards.len() == 1 {
-            return self.shards[0].feed(source, delta);
+            return self.shards.first().ok_or_else(|| IvmError::execution("no shards".to_string()))?.feed(source, delta);
         }
         // Split the weighted inner batch by the key column using the shared
         // keyed partitioner (`take` preserves the trailing `_weight` column).
@@ -132,7 +132,7 @@ impl PartitionedIncrementalFlow {
                 }
                 let shard_delta = DeltaBatch::from_weighted(batch)
                     .map_err(|e| IvmError::execution(e.to_string()))?;
-                self.shards[shard_idx].feed(source, shard_delta)?;
+                self.shards.get(shard_idx).ok_or_else(|| IvmError::execution(format!("shard {shard_idx} out of range")))?.feed(source, shard_delta)?;
             }
         }
         Ok(())
@@ -167,9 +167,10 @@ impl PartitionedIncrementalFlow {
         if non_empty.is_empty() {
             return Ok(());
         }
-        let schema = non_empty[0].schema();
+        let first = non_empty.first().ok_or_else(|| IvmError::execution("empty".to_string()))?;
+        let schema = first.schema();
         let new_snapshot = if non_empty.len() == 1 {
-            non_empty[0].clone()
+            (*first).clone()
         } else {
             arrow::compute::concat_batches(&schema, non_empty.iter().copied())
                 .map_err(|e| IvmError::execution(e.to_string()))?
@@ -237,7 +238,7 @@ impl PartitionedIncrementalFlow {
         if parts.is_empty() {
             return Ok(None);
         }
-        let schema = parts[0].schema();
+        let schema = parts.first().ok_or_else(|| IvmError::execution("empty parts".to_string()))?.schema();
         let merged = arrow::compute::concat_batches(&schema, &parts)
             .map_err(|e| IvmError::execution(e.to_string()))?;
         Ok(Some(merged))
@@ -418,7 +419,8 @@ fn slice_err() -> IvmError {
 fn read_u32(bytes: &[u8], pos: &mut usize) -> IvmResult<u32> {
     let raw = bytes.get(*pos..*pos + 4).ok_or_else(slice_err)?;
     *pos += 4;
-    Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    let arr: [u8; 4] = raw.try_into().map_err(|_| slice_err())?;
+    Ok(u32::from_le_bytes(arr))
 }
 
 #[cfg(test)]

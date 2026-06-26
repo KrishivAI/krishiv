@@ -321,7 +321,8 @@ fn find_lateness_clause_start(upper: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = 0usize;
     while i + keyword.len() <= bytes.len() {
-        match bytes[i] {
+        let Some(&b) = bytes.get(i) else { break; };
+        match b {
             b'(' => {
                 depth += 1;
                 i += 1;
@@ -330,11 +331,10 @@ fn find_lateness_clause_start(upper: &str) -> Option<usize> {
                 depth = depth.saturating_sub(1);
                 i += 1;
             }
-            _ if depth == 0 && bytes[i..].starts_with(keyword) => {
-                // Ensure it's a word boundary
-                let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            _ if depth == 0 && bytes.get(i..).is_some_and(|s| s.starts_with(keyword)) => {
+                let before_ok = i == 0 || bytes.get(i - 1).is_some_and(|b| !b.is_ascii_alphanumeric());
                 let after = i + keyword.len();
-                let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+                let after_ok = bytes.get(after).is_none_or(|b| !b.is_ascii_alphanumeric());
                 if before_ok && after_ok {
                     return Some(i);
                 }
@@ -370,14 +370,10 @@ fn parse_lateness_clauses(lateness_str: &str) -> SqlResult<Vec<LatenessAnnotatio
         if tokens.len() < 4 {
             break;
         }
-        let col = tokens[0].trim_matches(',').to_string();
+        let col = tokens.first().copied().unwrap_or("").trim_matches(',').to_string();
         // tokens[1] should be INTERVAL (case-insensitive)
-        let interval_str = tokens[2].trim_matches('\'');
-        let unit_str = if tokens.len() >= 4 {
-            tokens[3].trim_matches(',')
-        } else {
-            ""
-        };
+        let interval_str = tokens.get(2).copied().unwrap_or("").trim_matches('\'');
+        let unit_str = tokens.get(3).copied().unwrap_or("").trim_matches(',');
         let n: u64 = interval_str.parse().map_err(|_| SqlError::Unsupported {
             feature: format!("LATENESS INTERVAL value '{interval_str}' is not a valid integer"),
         })?;

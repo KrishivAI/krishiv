@@ -23,19 +23,17 @@ permissions:
 
 jobs:
   # ── 1. Validate release readiness ───────────────────────────────────────────
-  # Python-only validation — no Rust toolchain needed.
   validate:
     name: Validate
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          clean: false
+          python-version: "3.12"
       - name: Extract version metadata
         id: meta
         run: |
@@ -63,17 +61,13 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            runner: self-hosted
+            runner: ubuntu-latest
             extra_sys_deps: musl-tools
           - target: aarch64-apple-darwin
             runner: macos-14
             extra_sys_deps: ""
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-        with:
-          clean: false
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: binary-${{ matrix.target }}
@@ -107,10 +101,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: self-hosted
+          - os: ubuntu-latest
             target: x86_64
             manylinux: auto
-          - os: self-hosted
+          - os: ubuntu-latest
             target: aarch64
             manylinux: auto
           - os: macos-14
@@ -120,16 +114,12 @@ jobs:
             target: x86_64-apple-darwin
             manylinux: "off"
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-        with:
-          clean: false
       - uses: actions/setup-python@v5
         if: runner.os == 'macOS'
         with:
           python-version: "3.11"
-      - name: Install Python (self-hosted)
+      - name: Install Python (Linux)
         if: runner.os != 'macOS'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \
@@ -150,17 +140,12 @@ jobs:
           retention-days: 7
 
   # ── 2c. Docker image (multi-platform via buildx) ─────────────────────────────
-  # Single universal image: mode is selected at runtime via KRISHIV_MODE env var.
   docker:
     name: Docker
     needs: validate
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-        with:
-          clean: false
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -195,13 +180,9 @@ jobs:
   helm:
     name: Helm Chart
     needs: validate
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-        with:
-          clean: false
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.0
@@ -228,17 +209,15 @@ jobs:
           retention-days: 7
 
   # ── 3. Generate SBOM ────────────────────────────────────────────────────────
-  # Python-only — no Rust toolchain needed.
   sbom:
     name: SBOM
     needs: validate
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          clean: false
+          python-version: "3.12"
       - name: Generate SBOM
         run: |
           python3 scripts/generate_sbom.py \
@@ -253,12 +232,10 @@ jobs:
   upload-assets:
     name: Upload Release Assets
     needs: [validate, build-binary, build-wheels, docker, helm, sbom]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/download-artifact@v4
         with:
           pattern: binary-*
@@ -291,15 +268,13 @@ jobs:
     name: Publish PyPI
     needs: [validate, upload-assets]
     if: needs.validate.outputs.is_prerelease == 'false'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     environment:
       name: pypi-publish
       url: https://pypi.org/project/krishiv/
     permissions:
       id-token: write
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
@@ -314,14 +289,10 @@ jobs:
     name: Publish Crates.io
     needs: [validate, upload-assets]
     if: needs.validate.outputs.is_prerelease == 'false'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     environment: crates-publish
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-        with:
-          clean: false
       - uses: ./.github/actions/rust-setup
       - name: Publish crates in topological order
         env:

@@ -144,11 +144,11 @@ fn parse_named_type_list(list: &str, item_kind: &str) -> Result<Vec<(String, Dat
         if parts.len() < 2 {
             return Err(format!("invalid {item_kind} definition: '{item}'"));
         }
-        let name = parts[0].to_string();
+        let name = parts.first().copied().unwrap_or("").to_string();
         if !names.insert(name.to_ascii_lowercase()) {
             return Err(format!("duplicate {item_kind} name '{name}'"));
         }
-        let type_str = parts[1..].join(" ");
+        let type_str = parts.get(1..).unwrap_or(&[]).join(" ");
         let data_type = sql_type_to_arrow(&type_str)?;
         parsed.push((name, data_type));
     }
@@ -403,7 +403,7 @@ impl TableUdf for SqlBodyTableUdf {
                     if batches.is_empty() {
                         return Ok(RecordBatch::new_empty(schema));
                     }
-                    let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)
+                    let batch = arrow::compute::concat_batches(&batches.first().ok_or_else(|| UdfError::Execution { message: "empty batch list".into() })?.schema(), &batches)
                         .map_err(|e| UdfError::Arrow(e.to_string()))?;
                     if !schema_contract_matches(batch.schema().as_ref(), schema.as_ref()) {
                         return Err(UdfError::Execution {
@@ -436,9 +436,10 @@ fn bind_sql_body_args(sql: &str, args: &[ScalarValue]) -> Result<String, UdfErro
     let mut index = 0;
 
     while index < bytes.len() {
-        match bytes[index] {
+        let Some(&byte) = bytes.get(index) else { break; };
+        match byte {
             b'\'' | b'"' | b'`' => {
-                index = copy_quoted_segment(sql, index, bytes[index], &mut output)?;
+                index = copy_quoted_segment(sql, index, byte, &mut output)?;
             }
             b'-' if bytes.get(index + 1) == Some(&b'-') => {
                 let end = sql[index..]
@@ -522,7 +523,8 @@ fn copy_quoted_segment(
     let bytes = sql.as_bytes();
     let mut index = start + 1;
     while index < bytes.len() {
-        if bytes[index] == quote {
+        let Some(&b) = bytes.get(index) else { break; };
+        if b == quote {
             index += 1;
             if bytes.get(index) == Some(&quote) {
                 index += 1;

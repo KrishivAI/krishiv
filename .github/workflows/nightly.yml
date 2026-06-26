@@ -27,17 +27,34 @@ jobs:
   publish-crates:
     name: Publish Crates.io
     needs: []
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     environment: crates-publish
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           ref: main
-          clean: false
       - uses: ./.github/actions/rust-setup
+      - name: Check for changes since last publish
+        id: changes
+        run: |
+          # Fetch tags to compare against last published nightly
+          git fetch --tags
+          LAST_TAG=$(git tag -l 'nightly-*' --sort=-version:refname | head -n1)
+          if [ -z "$LAST_TAG" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "No previous nightly tag found — will publish"
+          else
+            COMMIT_COUNT=$(git rev-list "${LAST_TAG}..HEAD" --count)
+            if [ "$COMMIT_COUNT" -gt 0 ]; then
+              echo "has_changes=true" >> "$GITHUB_OUTPUT"
+              echo "${COMMIT_COUNT} commits since ${LAST_TAG} — will publish"
+            else
+              echo "has_changes=false" >> "$GITHUB_OUTPUT"
+              echo "No commits since ${LAST_TAG} — skipping publish"
+            fi
+          fi
       - name: Generate crate READMEs
+        if: steps.changes.outputs.has_changes == 'true'
         run: |
           cargo install cargo-readme --locked
           CRATES=(
@@ -62,6 +79,7 @@ jobs:
             cargo readme -p "${crate}" > "${dir}/README.md" 2>&1 || true
           done
       - name: Publish crates in topological order
+        if: steps.changes.outputs.has_changes == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -91,12 +109,18 @@ jobs:
             echo "---"
             sleep 30
           done
+      - name: Tag nightly
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          TAG="nightly-$(date +%Y%m%d-%H%M%S)"
+          git tag -a "$TAG" -m "Nightly publish $TAG"
+          git push origin "$TAG"
 
   # ── Docker nightly images ──────────────────────────────────────────────────
   # Temporarily disabled. Re-enable when Docker CI is ready:
   #   docker-nightly:
   #     name: Docker Nightly
-  #     runs-on: self-hosted
+  #     runs-on: ubuntu-latest
   #     steps: ...
 
   # ── Python nightly wheels ────────────────────────────────────────────────────
@@ -107,10 +131,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: self-hosted
+          - os: ubuntu-latest
             target: x86_64
             manylinux: auto
-          - os: self-hosted
+          - os: ubuntu-latest
             target: aarch64
             manylinux: auto
           - os: macos-14
@@ -120,17 +144,14 @@ jobs:
             target: x86_64-apple-darwin
             manylinux: "off"
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
         with:
           ref: main
-          clean: false
       - uses: actions/setup-python@v5
         if: runner.os == 'macOS'
         with:
           python-version: "3.11"
-      - name: Install Python (self-hosted)
+      - name: Install Python (Linux)
         if: runner.os != 'macOS'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \

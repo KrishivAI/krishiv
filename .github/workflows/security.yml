@@ -21,7 +21,7 @@ jobs:
   # ── Trivy filesystem scan → GitHub Security tab ──────────────────────────────
   trivy:
     name: Trivy Scan
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Run Trivy (SARIF)
@@ -42,7 +42,7 @@ jobs:
   # ── Gitleaks: scan full history for accidentally committed secrets ────────────
   secrets:
     name: Secret Scan
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,13 +54,9 @@ jobs:
   # ── cargo audit: weekly advisory check against locked dependency tree ─────────
   audit:
     name: Dependency Audit
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-        with:
-          clean: false
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -68,26 +64,20 @@ jobs:
   # ── cargo deny: license, banned crates, duplicate versions ───────────────────
   deny:
     name: License & Ban Check
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
-        with:
-          clean: false
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # ── SBOM: weekly snapshot for dependency drift tracking ───────────────────────
-  # Python-only — no Rust toolchain needed.
   sbom:
     name: SBOM Snapshot
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          clean: false
+          python-version: "3.12"
       - name: Generate SBOM
         run: python3 scripts/generate_sbom.py --output sbom-$(date +%Y%m%d).json
       - uses: actions/upload-artifact@v4

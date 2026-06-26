@@ -391,22 +391,22 @@ async fn execute_shuffle_write_fragment(
 
     // Parse "hash:<key_column>:<num_partitions>"
     let parts: Vec<&str> = spec.splitn(3, ':').collect();
-    if parts.len() != 3 || parts[0] != "hash" {
+    if parts.len() != 3 || parts.first().copied() != Some("hash") {
         return Err(ExecutorError::InvalidAssignment {
             message: format!(
                 "shuffle-write spec must be 'hash:<key_column>:<num_partitions>', got '{spec}'"
             ),
         });
     }
-    let key_column = parts[1].trim();
+    let key_column = parts.get(1).copied().unwrap_or("").trim();
+    let part2 = parts.get(2).copied().unwrap_or("");
     let num_partitions: u32 =
-        parts[2]
+        part2
             .trim()
             .parse()
             .map_err(|_| ExecutorError::InvalidAssignment {
                 message: format!(
-                    "shuffle-write num_partitions is not a valid u32: '{}'",
-                    parts[2]
+                    "shuffle-write num_partitions is not a valid u32: '{part2}'"
                 ),
             })?;
     if key_column.is_empty() || num_partitions == 0 {
@@ -487,7 +487,9 @@ async fn execute_shuffle_write_fragment(
             })?;
         for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
             if bucket_batch.num_rows() > 0 {
-                partition_batches[bucket_idx].push(bucket_batch);
+                if let Some(v) = partition_batches.get_mut(bucket_idx) {
+                    v.push(bucket_batch);
+                }
             }
         }
     }
@@ -601,8 +603,8 @@ async fn execute_shuffle_write_fragment(
         // T7: patch `size_bytes` in outputs with the real on-disk IPC sizes.
         if let Ok(offsets) = files.read_offsets() {
             for (p, output_entry) in outputs.iter_mut().enumerate() {
-                if p + 1 < offsets.len() {
-                    let real_bytes = offsets[p + 1].saturating_sub(offsets[p]);
+                if let (Some(&off_p), Some(&off_p1)) = (offsets.get(p), offsets.get(p + 1)) {
+                    let real_bytes = off_p1.saturating_sub(off_p);
                     let endpoint = output_entry.flight_endpoint.clone();
                     *output_entry =
                         krishiv_proto::ShufflePartitionOutput::new(p as u32, real_bytes, endpoint);
@@ -692,7 +694,9 @@ async fn execute_inmem_shuffle_write(
                 }
             }
         } else {
-            partition_batches[0].push(batch.clone());
+            if let Some(v) = partition_batches.first_mut() {
+                v.push(batch.clone());
+            }
         }
     }
 

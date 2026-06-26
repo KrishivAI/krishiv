@@ -85,7 +85,8 @@ impl RocksDbMetadataStore {
             for item in iter {
                 let (k, v) = item.map_err(Self::store_err)?;
                 let id = u64::from_le_bytes(
-                    k[..8]
+                    k.get(..8)
+                        .ok_or_else(|| Self::store_err("corrupt event key: too short"))?
                         .try_into()
                         .map_err(|_| Self::store_err("corrupt event key"))?,
                 );

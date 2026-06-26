@@ -75,7 +75,7 @@ fn parse_stream_kafka_partitions(
             });
         }
 
-        let records_str = parts[3].trim();
+        let records_str = parts.get(3).copied().unwrap_or("").trim();
         let mut keys: Vec<String> = Vec::new();
         let mut timestamps: Vec<i64> = Vec::new();
         let mut values: Vec<i64> = Vec::new();
@@ -303,7 +303,7 @@ fn execute_cep_fragment(
                     continue;
                 }
                 let merged =
-                    arrow::compute::concat_batches(&stage_batches[0].schema(), &stage_batches)
+                    arrow::compute::concat_batches(&stage_batches.first().ok_or_else(|| ExecutorError::LocalExecution { message: "empty stage batches".into() })?.schema(), &stage_batches)
                         .map_err(|e| ExecutorError::LocalExecution {
                             message: format!("stream:cep concat match stages: {e}"),
                         })?;
@@ -738,9 +738,11 @@ pub(crate) async fn execute_streaming_fragment(
             .agg_exprs
             .first()
             .is_some_and(|a| a.kind == WindowAggKind::Sum)
-            && plan_spec.agg_exprs[0].input_column.is_empty()
+            && plan_spec.agg_exprs.first().is_some_and(|a| a.input_column.is_empty())
         {
-            plan_spec.agg_exprs[0].input_column = String::from("val");
+            if let Some(agg) = plan_spec.agg_exprs.first_mut() {
+                agg.input_column = String::from("val");
+            }
         }
     }
     // GAP-2: compute the observed event-time watermark from input batches BEFORE

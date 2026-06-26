@@ -87,7 +87,11 @@ impl<B: StateBackend> TtlStateBackend<B> {
         }
         let expires_at_ms =
             i64::from_le_bytes(
-                encoded[..8]
+                encoded
+                    .get(..8)
+                    .ok_or_else(|| StateError::CorruptEntry {
+                        message: "ttl expiry prefix is not 8 bytes".into(),
+                    })?
                     .try_into()
                     .map_err(|_| StateError::CorruptEntry {
                         message: "ttl expiry prefix is not 8 bytes".into(),
@@ -96,7 +100,7 @@ impl<B: StateBackend> TtlStateBackend<B> {
         if now_ms >= expires_at_ms {
             Ok(None)
         } else {
-            Ok(Some(encoded[8..].to_vec()))
+            Ok(Some(encoded.get(8..).unwrap_or(&[]).to_vec()))
         }
     }
 }
@@ -145,12 +149,17 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         for key in all_keys {
             match self.inner.get(namespace, &key)? {
                 Some(encoded) if encoded.len() >= 8 => {
-                    let expires_at_ms =
-                        i64::from_le_bytes(encoded[..8].try_into().map_err(|_| {
-                            StateError::CorruptEntry {
+                    let expires_at_ms = i64::from_le_bytes(
+                        encoded
+                            .get(..8)
+                            .ok_or_else(|| StateError::CorruptEntry {
                                 message: "TTL entry has invalid timestamp bytes".into(),
-                            }
-                        })?);
+                            })?
+                            .try_into()
+                            .map_err(|_| StateError::CorruptEntry {
+                                message: "TTL entry has invalid timestamp bytes".into(),
+                            })?,
+                    );
                     if now_ms < expires_at_ms {
                         live.push(key);
                     }
@@ -193,17 +202,22 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
                 );
                 continue;
             }
-            let expires_at_ms =
-                i64::from_le_bytes(ttl_encoded_value[..8].try_into().map_err(|_| {
-                    StateError::CorruptEntry {
+            let expires_at_ms = i64::from_le_bytes(
+                ttl_encoded_value
+                    .get(..8)
+                    .ok_or_else(|| StateError::CorruptEntry {
                         message: "ttl expiry prefix is not 8 bytes in snapshot".into(),
-                    }
-                })?);
+                    })?
+                    .try_into()
+                    .map_err(|_| StateError::CorruptEntry {
+                        message: "ttl expiry prefix is not 8 bytes in snapshot".into(),
+                    })?,
+            );
             if now_ms >= expires_at_ms {
                 // Skip already-expired entries — they're invisible on read anyway.
                 continue;
             }
-            let raw_value = &ttl_encoded_value[8..];
+            let raw_value = ttl_encoded_value.get(8..).unwrap_or(&[]);
             let ob = op_id.as_bytes();
             let nb = state_name.as_bytes();
             out.extend_from_slice(&(ob.len() as u64).to_le_bytes());
@@ -216,7 +230,9 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
             out.extend_from_slice(raw_value);
             written += 1;
         }
-        out[count_offset..count_offset + 8].copy_from_slice(&written.to_le_bytes());
+        if let Some(s) = out.get_mut(count_offset..count_offset + 8) {
+            s.copy_from_slice(&written.to_le_bytes());
+        }
         Ok(out)
     }
 
@@ -261,7 +277,7 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
                     && encoded.len() >= 8
                 {
                     let expires_at_ms =
-                        i64::from_le_bytes(encoded[..8].try_into().unwrap_or([0u8; 8]));
+                        i64::from_le_bytes(encoded.get(..8).and_then(|s| s.try_into().ok()).unwrap_or([0u8; 8]));
                     if now_ms >= expires_at_ms {
                         keys_to_delete.push((ns.clone(), key.clone()));
                     }

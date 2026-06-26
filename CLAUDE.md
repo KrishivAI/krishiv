@@ -1,19 +1,6 @@
 # Krishiv - Claude Code Instructions
 
-See `AGENTS.md` for the shared project rules. See
-`codex/skills/krishiv-engine/SKILL.md` for the shared Krishiv workflow.
-
-## Common Commands
-
-```bash
-cargo check --workspace
-cargo test --workspace
-cargo test -p krishiv-scheduler --lib
-cargo test -p krishiv-executor --lib
-cargo test -p krishiv-runtime
-cargo clippy --workspace --all-targets
-cargo fmt --check
-```
+See `AGENTS.md` for all project rules, architecture, CI gates, and workflow.
 
 ## Session Start
 
@@ -25,21 +12,11 @@ cargo fmt --check
 
 ## Skill Usage
 
-Claude Code can use the project skill shim at
-`.claude/skills/krishiv-engine/SKILL.md`:
-
 ```text
 /krishiv-engine implement the requested Krishiv task
 ```
 
-The shim points to `codex/skills/krishiv-engine/SKILL.md`, which is the
-canonical skill source for Codex and Claude Code.
-
 ## End Of Session
 
 For substantial work, update `docs/implementation/status.md` with:
-
-- completed work
-- validation run
-- blockers, if any
-- next useful command or task
+completed work, validation, blockers, and the next useful command.

@@ -141,9 +141,7 @@ impl RangeSampler {
                         self.i32_samples.push(v);
                     } else {
                         let j = lcg_rand(&mut self.seed, i + 1);
-                        if j < k {
-                            self.i32_samples[j] = v;
-                        }
+                        if j < k && let Some(s) = self.i32_samples.get_mut(j) { *s = v; }
                     }
                 }
             }
@@ -164,9 +162,7 @@ impl RangeSampler {
                         self.i64_samples.push(v);
                     } else {
                         let j = lcg_rand(&mut self.seed, i + 1);
-                        if j < k {
-                            self.i64_samples[j] = v;
-                        }
+                        if j < k && let Some(s) = self.i64_samples.get_mut(j) { *s = v; }
                     }
                 }
             }
@@ -187,9 +183,7 @@ impl RangeSampler {
                         self.str_samples.push(v);
                     } else {
                         let j = lcg_rand(&mut self.seed, i + 1);
-                        if j < k {
-                            self.str_samples[j] = v;
-                        }
+                        if j < k && let Some(s) = self.str_samples.get_mut(j) { *s = v; }
                     }
                 }
             }
@@ -253,7 +247,7 @@ fn pick_boundaries<T: Clone, F: Fn(T) -> RangeBound>(
     let mut boundaries = Vec::with_capacity(num_boundaries);
     for i in 1..=num_boundaries {
         let idx = (i * n / (num_boundaries + 1)).min(n - 1);
-        boundaries.push(f(sorted[idx].clone()));
+        if let Some(item) = sorted.get(idx) { boundaries.push(f(item.clone())); }
     }
     boundaries
 }
@@ -349,7 +343,7 @@ impl RangePartitioner {
                     } else {
                         self.bucket_for_i32(arr.value(row))
                     };
-                    bucket_indices[bucket].push(row as u32);
+                    if let Some(v) = bucket_indices.get_mut(bucket) { v.push(row as u32); }
                 }
             }
             DataType::Int64 => {
@@ -364,7 +358,7 @@ impl RangePartitioner {
                     } else {
                         self.bucket_for_i64(arr.value(row))
                     };
-                    bucket_indices[bucket].push(row as u32);
+                    if let Some(v) = bucket_indices.get_mut(bucket) { v.push(row as u32); }
                 }
             }
             DataType::Utf8 => {
@@ -379,7 +373,7 @@ impl RangePartitioner {
                     } else {
                         self.bucket_for_str(arr.value(row))
                     };
-                    bucket_indices[bucket].push(row as u32);
+                    if let Some(v) = bucket_indices.get_mut(bucket) { v.push(row as u32); }
                 }
             }
             other => {

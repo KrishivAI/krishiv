@@ -79,13 +79,19 @@ pub(crate) fn validate_plan(
                     node.id()
                 )));
             };
-            indegrees[node_index] = indegrees[node_index].checked_add(1).ok_or_else(|| {
+            let deg = indegrees.get_mut(node_index).ok_or_else(|| {
+                PlanError::Validation(format!("indegrees index {node_index} out of range"))
+            })?;
+            *deg = deg.checked_add(1).ok_or_else(|| {
                 PlanError::Validation(format!(
                     "{plan_type} plan '{name}' node '{}' has too many input edges",
                     node.id()
                 ))
             })?;
-            dependents[input_index].push(node_index);
+            dependents
+                .get_mut(input_index)
+                .ok_or_else(|| PlanError::Validation(format!("dependents index {input_index} out of range")))?
+                .push(node_index);
         }
     }
 
@@ -97,10 +103,13 @@ pub(crate) fn validate_plan(
     let mut visited = 0usize;
     while let Some(index) = ready.pop_front() {
         visited += 1;
-        for &dependent in &dependents[index] {
-            indegrees[dependent] -= 1;
-            if indegrees[dependent] == 0 {
-                ready.push_back(dependent);
+        let deps: Vec<usize> = dependents.get(index).cloned().unwrap_or_default();
+        for dependent in deps {
+            if let Some(d) = indegrees.get_mut(dependent) {
+                *d = d.saturating_sub(1);
+                if *d == 0 {
+                    ready.push_back(dependent);
+                }
             }
         }
     }

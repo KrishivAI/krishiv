@@ -116,13 +116,13 @@ fn find_alias_length(text: &str) -> usize {
     let mut i = 0;
 
     // Skip leading whitespace
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+    while bytes.get(i).is_some_and(|&b| b == b' ' || b == b'\t') {
         i += 1;
     }
 
     // Read alias name
     let name_start = i;
-    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+    while bytes.get(i).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_') {
         i += 1;
     }
 
@@ -131,15 +131,16 @@ fn find_alias_length(text: &str) -> usize {
     }
 
     // Check for parenthesized column list
-    while i < bytes.len() && bytes[i] == b' ' {
+    while bytes.get(i).is_some_and(|&b| b == b' ') {
         i += 1;
     }
-    if i < bytes.len() && bytes[i] == b'(' {
+    if bytes.get(i).is_some_and(|&b| b == b'(') {
         // Find closing paren
         i += 1;
         let mut depth = 1;
         while i < bytes.len() && depth > 0 {
-            match bytes[i] {
+            let Some(&b) = bytes.get(i) else { break; };
+            match b {
                 b'(' => depth += 1,
                 b')' => depth -= 1,
                 _ => {}
@@ -160,17 +161,11 @@ fn find_keyword_boundary(sql: &str, keyword: &str) -> Option<usize> {
         let abs_pos = search_start + pos;
         // Check word boundary before
         let before_ok = abs_pos == 0
-            || sql.as_bytes()[abs_pos - 1] == b' '
-            || sql.as_bytes()[abs_pos - 1] == b','
-            || sql.as_bytes()[abs_pos - 1] == b'\n'
-            || sql.as_bytes()[abs_pos - 1] == b'\t';
+            || sql.as_bytes().get(abs_pos - 1).is_some_and(|&b| b == b' ' || b == b',' || b == b'\n' || b == b'\t');
         // Check word boundary after
         let after_pos = abs_pos + keyword.len();
         let after_ok = after_pos >= sql.len()
-            || sql.as_bytes()[after_pos] == b' '
-            || sql.as_bytes()[after_pos] == b'\n'
-            || sql.as_bytes()[after_pos] == b'\t'
-            || sql.as_bytes()[after_pos] == b'(';
+            || sql.as_bytes().get(after_pos).is_some_and(|&b| b == b' ' || b == b'\n' || b == b'\t' || b == b'(');
 
         if before_ok && after_ok {
             return Some(abs_pos);

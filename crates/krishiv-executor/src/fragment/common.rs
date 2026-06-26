@@ -71,9 +71,9 @@ pub(crate) fn parse_object_parquet_descriptor(
             message: format!("input partition {partition_id} must use {expected}"),
         });
     }
-    let table_name = parts[0].trim();
-    let base_dir = parts[1].trim();
-    let object_path = parts[2].trim();
+    let table_name = parts.first().copied().unwrap_or("").trim();
+    let base_dir = parts.get(1).copied().unwrap_or("").trim();
+    let object_path = parts.get(2).copied().unwrap_or("").trim();
     if table_name.is_empty() || base_dir.is_empty() || object_path.is_empty() {
         return Err(ExecutorError::InvalidAssignment {
             message: format!("input partition {partition_id} has an empty object-parquet field"),

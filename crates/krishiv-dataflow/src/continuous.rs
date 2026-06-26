@@ -346,7 +346,10 @@ impl ContinuousWindowExecutor {
         // that `agg_is_float` reflects the actual aggregate input types instead
         // of hardcoding `false` (which silently truncates Float64 to Int64).
         if self.operator.is_none() && !input_batches.is_empty() {
-            let agg_is_float = infer_agg_is_float(&input_batches[0], &self.agg_exprs)?;
+            let first = input_batches.first().ok_or_else(|| {
+                crate::ExecError::InvalidInput("empty input_batches".into())
+            })?;
+            let agg_is_float = infer_agg_is_float(first, &self.agg_exprs)?;
             let mut op = build_operator(
                 &self.spec,
                 &self.agg_exprs,
@@ -458,7 +461,10 @@ impl ContinuousWindowExecutor {
 
         // Lazy-init operator from first batch's schema (Float64 awareness).
         if self.operator.is_none() {
-            let agg_is_float = infer_agg_is_float(&input_batches[0], &self.agg_exprs)?;
+            let first = input_batches.first().ok_or_else(|| {
+                crate::ExecError::InvalidInput("empty input_batches in lazy-init".into())
+            })?;
+            let agg_is_float = infer_agg_is_float(first, &self.agg_exprs)?;
             let mut op = build_operator(
                 &self.spec,
                 &self.agg_exprs,

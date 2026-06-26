@@ -152,13 +152,9 @@ print(session.sql('SELECT 42 as answer').collect().pretty())
 "
 ```
 
-## Skill Source
+## Skill Files
 
-The repo-local Krishiv skill lives at:
-
-- `codex/skills/krishiv-engine/SKILL.md`
-
-Agent interface configs live alongside it:
-
-- `codex/skills/krishiv-engine/agents/openai.yaml`
-- `codex/skills/krishiv-engine/agents/claude.yaml`
+- `skills/krishiv-engine/SKILL.md` — canonical skill (references this file)
+- `skills/release/SKILL.md` — release orchestration skill
+- `codex/skills/krishiv-engine/SKILL.md` — Codex shim → points to `skills/`
+- `.claude/skills/krishiv-engine/SKILL.md` — Claude Code shim → points to `skills/`

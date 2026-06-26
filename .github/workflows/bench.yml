@@ -15,10 +15,8 @@ env:
 jobs:
   bench:
     name: TPC-H / Nexmark
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE/target" 2>/dev/null; sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" 2>/dev/null || true
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:

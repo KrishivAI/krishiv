@@ -188,8 +188,8 @@ impl SortShuffleWriter {
         for (idx, part) in partitioned.into_iter().enumerate() {
             if part.num_rows() > 0 {
                 let est = estimated_batch_bytes(&part);
-                self.bucket_bytes[idx] += est;
-                self.buckets[idx].push(part);
+                if let Some(b) = self.bucket_bytes.get_mut(idx) { *b += est; }
+                if let Some(b) = self.buckets.get_mut(idx) { b.push(part); }
             }
         }
         // Spill if over budget.
@@ -209,7 +209,7 @@ impl SortShuffleWriter {
             .max_by_key(|&(_, b)| b)
             .map(|(i, _)| i);
         let Some(idx) = largest else { return Ok(()) };
-        if self.buckets[idx].is_empty() {
+        if self.buckets.get(idx).is_none_or(|b| b.is_empty()) {
             return Ok(());
         }
         let seq = self.spill_seq;
@@ -218,10 +218,10 @@ impl SortShuffleWriter {
             .output_dir
             .join(format!("{}_{}_{idx}_spill{seq}.ipc", self.job_id, self.stage_id));
 
-        let batches = std::mem::take(&mut self.buckets[idx]);
-        self.bucket_bytes[idx] = 0;
+        let batches = self.buckets.get_mut(idx).map(std::mem::take).unwrap_or_default();
+        if let Some(b) = self.bucket_bytes.get_mut(idx) { *b = 0; }
 
-        let schema = batches[0].schema();
+        let schema = batches.first().ok_or_else(|| io_err("empty spill batches".to_string()))?.schema();
         let combined = arrow::compute::concat_batches(&schema, batches.iter())
             .map_err(|e| io_err(format!("spill concat failed: {e}")))?;
         let sorted = sort_by_key(&combined, &self.sort_key)?;
@@ -232,7 +232,7 @@ impl SortShuffleWriter {
                 spill_path.display()
             ))
         })?;
-        self.spill_files[idx].push(spill_path);
+        if let Some(f) = self.spill_files.get_mut(idx) { f.push(spill_path); }
         Ok(())
     }
 
@@ -251,7 +251,7 @@ impl SortShuffleWriter {
 
         for (idx, bucket) in self.buckets.iter().enumerate() {
             offsets.push(data_buf.len() as u64);
-            let has_spills = !self.spill_files[idx].is_empty();
+            let has_spills = self.spill_files.get(idx).is_some_and(|f| !f.is_empty());
             if bucket.is_empty() && !has_spills {
                 // Empty partition: write an empty IPC stream so the index
                 // still points to valid (zero-length) data.
@@ -260,11 +260,13 @@ impl SortShuffleWriter {
 
             // Collect all batches: spilled files first, then in-memory.
             let mut all_batches: Vec<RecordBatch> = Vec::new();
-            for spill_path in &self.spill_files[idx] {
-                let mut spilled = read_ipc_file(spill_path)?;
-                all_batches.append(&mut spilled);
-                // Clean up the temp spill file.
-                let _ = std::fs::remove_file(spill_path);
+            if let Some(spills) = self.spill_files.get(idx) {
+                for spill_path in spills {
+                    let mut spilled = read_ipc_file(spill_path)?;
+                    all_batches.append(&mut spilled);
+                    // Clean up the temp spill file.
+                    let _ = std::fs::remove_file(spill_path);
+                }
             }
             for b in bucket {
                 all_batches.push(b.clone());
@@ -275,7 +277,7 @@ impl SortShuffleWriter {
             }
 
             // Concatenate and sort.
-            let schema = all_batches[0].schema();
+            let schema = all_batches.first().ok_or_else(|| io_err("empty batch list".to_string()))?.schema();
             let combined = arrow::compute::concat_batches(&schema, all_batches.iter())
                 .map_err(|e| io_err(format!("concat failed: {e}")))?;
             let sorted = sort_by_key(&combined, &self.sort_key)?;

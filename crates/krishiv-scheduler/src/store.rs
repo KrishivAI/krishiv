@@ -170,12 +170,27 @@ impl ContinuousSnapshot {
                 message: "ContinuousSnapshot decode: buffer too short".into(),
             });
         }
-        let mut watermark_buf = [0u8; 8];
-        watermark_buf.copy_from_slice(&bytes[0..8]);
-        let watermark_ms = i64::from_le_bytes(watermark_buf);
-        let mut len_buf = [0u8; 4];
-        len_buf.copy_from_slice(&bytes[8..12]);
-        let len = u32::from_le_bytes(len_buf) as usize;
+        let watermark_ms = i64::from_le_bytes(
+            bytes
+                .get(..8)
+                .ok_or_else(|| SchedulerError::Store {
+                    message: "ContinuousSnapshot decode: buffer too short for watermark".into(),
+                })?
+                .try_into()
+                .map_err(|_| SchedulerError::Store {
+                    message: "ContinuousSnapshot decode: watermark bytes invalid".into(),
+                })?,
+        );
+        let len_bytes: [u8; 4] = bytes
+            .get(8..12)
+            .ok_or_else(|| SchedulerError::Store {
+                message: "ContinuousSnapshot decode: buffer too short for len".into(),
+            })?
+            .try_into()
+            .map_err(|_| SchedulerError::Store {
+                message: "ContinuousSnapshot decode: len bytes invalid".into(),
+            })?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
         if bytes.len() != 12 + len {
             return Err(SchedulerError::Store {
                 message: format!(
@@ -187,7 +202,7 @@ impl ContinuousSnapshot {
         }
         Ok(Self {
             watermark_ms,
-            snapshot_bytes: bytes[12..].to_vec(),
+            snapshot_bytes: bytes.get(12..).unwrap_or(&[]).to_vec(),
         })
     }
 }

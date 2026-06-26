@@ -186,13 +186,18 @@ impl CepOperator {
             if !key_bytes.starts_with(b"cep:") || key_bytes.len() < 8 {
                 continue;
             }
-            let key_len =
-                u32::from_le_bytes([key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7]])
-                    as usize;
+            let key_len_arr: [u8; 4] = match key_bytes.get(4..8).and_then(|s| s.try_into().ok()) {
+                Some(a) => a,
+                None => continue,
+            };
+            let key_len = u32::from_le_bytes(key_len_arr) as usize;
             if key_bytes.len() < 8 + key_len {
                 continue;
             }
-            let key = key_bytes[8..8 + key_len].to_vec();
+            let key = match key_bytes.get(8..8 + key_len) {
+                Some(s) => s.to_vec(),
+                None => continue,
+            };
             let Some(payload) = backend.get(namespace, &key_bytes)? else {
                 continue;
             };
@@ -205,17 +210,9 @@ impl CepOperator {
         self.states = restored;
         if let Some(epoch_bytes) = backend.get(namespace, b"cep:epoch")?
             && epoch_bytes.len() >= 8
+            && let Some(arr) = epoch_bytes.get(..8).and_then(|s| s.try_into().ok())
         {
-            self.last_barrier_epoch = u64::from_le_bytes([
-                epoch_bytes[0],
-                epoch_bytes[1],
-                epoch_bytes[2],
-                epoch_bytes[3],
-                epoch_bytes[4],
-                epoch_bytes[5],
-                epoch_bytes[6],
-                epoch_bytes[7],
-            ]);
+            self.last_barrier_epoch = u64::from_le_bytes(arr);
         }
         Ok(())
     }

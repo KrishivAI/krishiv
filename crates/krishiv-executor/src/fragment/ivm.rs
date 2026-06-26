@@ -137,10 +137,10 @@ pub async fn execute_ivm_fragment(
             parts.len()
         ));
     }
-    let _job_id = parts[0];
-    let deltas_b64 = parts[1];
-    let specs_b64 = parts[2];
-    let state_b64 = parts[3];
+    let _job_id = parts.first().copied().unwrap_or("");
+    let deltas_b64 = parts.get(1).copied().unwrap_or("");
+    let specs_b64 = parts.get(2).copied().unwrap_or("");
+    let state_b64 = parts.get(3).copied().unwrap_or("");
 
     // Decode payloads.
     let deltas_json = b64

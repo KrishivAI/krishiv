@@ -195,7 +195,9 @@ pub fn redistribute_snapshots(
             match routing_key(&entry.2, routing) {
                 Some(key) => {
                     let task = rescaler.task_for_key_group(key_group_for_key(key)) as usize;
-                    routed[task].push(entry);
+                    routed.get_mut(task).ok_or_else(|| StateError::SnapshotCorrupt {
+                        message: format!("task index {task} out of range"),
+                    })?.push(entry);
                     routed_total += 1;
                 }
                 None => broadcast.push(entry),

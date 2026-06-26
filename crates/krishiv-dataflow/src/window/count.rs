@@ -193,52 +193,50 @@ fn fold_agg_states<'a>(
 ) -> ExecResult<AggState> {
     let mut merged = AggState::new(agg_exprs);
     for contrib in iter {
-        for (i, agg) in agg_exprs.iter().enumerate() {
+        for (m, (c, agg)) in merged
+            .entries
+            .iter_mut()
+            .zip(contrib.entries.iter().zip(agg_exprs.iter()))
+        {
             match agg.function {
                 AggFunction::Count => {
-                    merged.values[i] =
-                        merged.values[i]
-                            .checked_add(contrib.values[i])
-                            .ok_or_else(|| {
-                                ExecError::InvalidInput("count overflow in fold_agg_states".into())
-                            })?;
-                    merged.has_value[i] = true;
+                    m.value = m.value.checked_add(c.value).ok_or_else(|| {
+                        ExecError::InvalidInput("count overflow in fold_agg_states".into())
+                    })?;
+                    m.has_value = true;
                 }
                 AggFunction::Sum => {
-                    merged.values[i] =
-                        merged.values[i]
-                            .checked_add(contrib.values[i])
-                            .ok_or_else(|| {
-                                ExecError::InvalidInput("sum overflow in fold_agg_states".into())
-                            })?;
-                    merged.float_values[i] += contrib.float_values[i];
-                    if contrib.has_value[i] {
-                        merged.has_value[i] = true;
+                    m.value = m.value.checked_add(c.value).ok_or_else(|| {
+                        ExecError::InvalidInput("sum overflow in fold_agg_states".into())
+                    })?;
+                    m.float_value += c.float_value;
+                    if c.has_value {
+                        m.has_value = true;
                     }
                 }
                 AggFunction::Min => {
-                    if contrib.has_value[i] && contrib.values[i] < merged.values[i] {
-                        merged.values[i] = contrib.values[i];
-                        merged.has_value[i] = true;
+                    if c.has_value && c.value < m.value {
+                        m.value = c.value;
+                        m.has_value = true;
                     }
-                    if contrib.has_value[i] && contrib.float_values[i] < merged.float_values[i] {
-                        merged.float_values[i] = contrib.float_values[i];
+                    if c.has_value && c.float_value < m.float_value {
+                        m.float_value = c.float_value;
                     }
                 }
                 AggFunction::Max => {
-                    if contrib.has_value[i] && contrib.values[i] > merged.values[i] {
-                        merged.values[i] = contrib.values[i];
-                        merged.has_value[i] = true;
+                    if c.has_value && c.value > m.value {
+                        m.value = c.value;
+                        m.has_value = true;
                     }
-                    if contrib.has_value[i] && contrib.float_values[i] > merged.float_values[i] {
-                        merged.float_values[i] = contrib.float_values[i];
+                    if c.has_value && c.float_value > m.float_value {
+                        m.float_value = c.float_value;
                     }
                 }
                 AggFunction::Avg => {
-                    merged.avg_sums[i] += contrib.avg_sums[i];
-                    merged.avg_counts[i] += contrib.avg_counts[i];
-                    if contrib.has_value[i] {
-                        merged.has_value[i] = true;
+                    m.avg_sum += c.avg_sum;
+                    m.avg_count += c.avg_count;
+                    if c.has_value {
+                        m.has_value = true;
                     }
                 }
             }

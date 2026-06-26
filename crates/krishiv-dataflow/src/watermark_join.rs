@@ -123,8 +123,9 @@ impl WatermarkWindowJoinOperator {
     /// rebuild them.
     pub fn restore_from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         let val: serde_json::Value = serde_json::from_slice(bytes)?;
-        let spec: WatermarkWindowJoinSpec = serde_json::from_value(val["spec"].clone())?;
-        let watermark_ms: i64 = val["watermark_ms"].as_i64().unwrap_or(i64::MIN);
+        let spec: WatermarkWindowJoinSpec =
+            serde_json::from_value(val.get("spec").cloned().unwrap_or(serde_json::Value::Null))?;
+        let watermark_ms: i64 = val.get("watermark_ms").and_then(|v| v.as_i64()).unwrap_or(i64::MIN);
         let mut op = Self::new(spec);
         op.watermark_ms = watermark_ms;
         Ok(op)

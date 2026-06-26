@@ -122,9 +122,11 @@ impl SkewJoinRule {
         let n = rows.len();
         let mid = n / 2;
         if n.is_multiple_of(2) {
-            (rows[mid - 1] as f64 + rows[mid] as f64) / 2.0
+            let a = rows.get(mid.saturating_sub(1)).copied().unwrap_or(0);
+            let b = rows.get(mid).copied().unwrap_or(0);
+            (a as f64 + b as f64) / 2.0
         } else {
-            rows[mid] as f64
+            rows.get(mid).copied().unwrap_or(0) as f64
         }
     }
 
@@ -181,7 +183,7 @@ impl AqeRule for SkewJoinRule {
         let median = Self::median_rows(stats);
         let effective_factor = hot
             .iter()
-            .map(|&idx| self.salting_factor_for(stats[idx].input_rows, median))
+            .map(|&idx| stats.get(idx).map_or(1, |s| self.salting_factor_for(s.input_rows, median)))
             .max()
             .unwrap_or(self.factor);
 

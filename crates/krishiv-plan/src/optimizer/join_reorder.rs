@@ -63,22 +63,18 @@ impl OptimizerRule for JoinReorderRule {
                 continue;
             }
 
-            let left_rows = row_estimates
-                .get(inputs[0].as_str())
-                .copied()
-                .unwrap_or(u64::MAX);
-            let right_rows = row_estimates
-                .get(inputs[1].as_str())
-                .copied()
-                .unwrap_or(u64::MAX);
+            let left_rows = inputs.first().and_then(|id| row_estimates.get(id.as_str()).copied()).unwrap_or(u64::MAX);
+            let right_rows = inputs.get(1).and_then(|id| row_estimates.get(id.as_str()).copied()).unwrap_or(u64::MAX);
 
             // Swap when the right input is strictly smaller than the left.
             // After the swap the smaller table is on the left, which is the
             // outer/driving side for nested-loop and sort-merge joins, and
             // keeps left-deep join trees in ascending size order so that each
             // successive join operates on the smallest available intermediate.
-            if right_rows < left_rows {
-                let swapped = vec![inputs[1].clone(), inputs[0].clone()];
+            if right_rows < left_rows
+                && let (Some(left), Some(right)) = (inputs.first(), inputs.get(1))
+            {
+                let swapped = vec![right.clone(), left.clone()];
                 new_nodes.push(node.clone().with_inputs(swapped));
                 changed = true;
             } else {
