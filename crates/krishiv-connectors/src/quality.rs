@@ -654,8 +654,8 @@ impl DeadLetterSink {
             let mut error_strings: Vec<Option<&str>> = vec![None; rejected_batch.num_rows()];
             for orig_row in 0..batch.num_rows() {
                 if !accepted_set.contains(&orig_row) {
-                    if rejected_row_cursor < error_strings.len() {
-                        error_strings[rejected_row_cursor] = error_by_row.get(&orig_row).copied();
+                    if let Some(slot) = error_strings.get_mut(rejected_row_cursor) {
+                        *slot = error_by_row.get(&orig_row).copied();
                     }
                     rejected_row_cursor += 1;
                 }

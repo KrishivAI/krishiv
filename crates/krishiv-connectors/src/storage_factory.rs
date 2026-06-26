@@ -121,7 +121,7 @@ impl StorageFactory {
                 .or_else(|| uri.strip_prefix("s3a://"))
                 .unwrap_or(uri);
             let parts: Vec<&str> = stripped.splitn(2, '/').collect();
-            let bucket = parts[0].to_string();
+            let bucket = parts.first().copied().unwrap_or("").to_string();
             let prefix = parts.get(1).map(|s| s.to_string());
             Ok(StorageConfig {
                 bucket: Some(bucket),
@@ -131,7 +131,7 @@ impl StorageFactory {
         } else if uri.starts_with("gs://") {
             let stripped = uri.strip_prefix("gs://").unwrap_or(uri);
             let parts: Vec<&str> = stripped.splitn(2, '/').collect();
-            let bucket = parts[0].to_string();
+            let bucket = parts.first().copied().unwrap_or("").to_string();
             let prefix = parts.get(1).map(|s| s.to_string());
             Ok(StorageConfig {
                 bucket: Some(bucket),
@@ -145,7 +145,7 @@ impl StorageFactory {
                 .or_else(|| uri.strip_prefix("adls://"))
                 .unwrap_or(uri);
             let parts: Vec<&str> = stripped.splitn(2, '/').collect();
-            let bucket = parts[0].to_string();
+            let bucket = parts.first().copied().unwrap_or("").to_string();
             let prefix = parts.get(1).map(|s| s.to_string());
             Ok(StorageConfig {
                 bucket: Some(bucket),

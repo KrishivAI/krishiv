@@ -70,8 +70,14 @@ fn parse_ticket(ticket_bytes: &[u8]) -> Result<(String, String, u32), Status> {
         .ok_or_else(|| Status::invalid_argument("ticket missing partition segment"))?
         .parse::<u32>()
         .map_err(|e| Status::invalid_argument(format!("partition id not a u32: {e}")))?;
-    let job_id = (*parts.first().ok_or_else(|| Status::invalid_argument("ticket missing job_id"))?).to_string();
-    let stage_id = (*parts.get(1).ok_or_else(|| Status::invalid_argument("ticket missing stage_id"))?).to_string();
+    let job_id = (*parts
+        .first()
+        .ok_or_else(|| Status::invalid_argument("ticket missing job_id"))?)
+    .to_string();
+    let stage_id = (*parts
+        .get(1)
+        .ok_or_else(|| Status::invalid_argument("ticket missing stage_id"))?)
+    .to_string();
     Ok((job_id, stage_id, partition_id))
 }
 

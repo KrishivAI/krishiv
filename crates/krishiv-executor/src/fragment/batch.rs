@@ -405,9 +405,7 @@ async fn execute_shuffle_write_fragment(
             .trim()
             .parse()
             .map_err(|_| ExecutorError::InvalidAssignment {
-                message: format!(
-                    "shuffle-write num_partitions is not a valid u32: '{part2}'"
-                ),
+                message: format!("shuffle-write num_partitions is not a valid u32: '{part2}'"),
             })?;
     if key_column.is_empty() || num_partitions == 0 {
         return Err(ExecutorError::InvalidAssignment {

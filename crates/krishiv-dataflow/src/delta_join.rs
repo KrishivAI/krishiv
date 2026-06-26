@@ -147,7 +147,10 @@ impl DeltaJoinOperator {
             Ok(None)
         } else {
             // Concatenate all joined results
-            let schema = results.first().ok_or_else(|| DeltaJoinError::JoinFailed("empty results".into()))?.schema();
+            let schema = results
+                .first()
+                .ok_or_else(|| DeltaJoinError::JoinFailed("empty results".into()))?
+                .schema();
             let batch_refs: Vec<&RecordBatch> = results.iter().collect();
             let concatenated = compute::concat_batches(&schema, batch_refs.into_iter())
                 .map_err(|e| DeltaJoinError::JoinFailed(e.to_string()))?;

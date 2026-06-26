@@ -116,7 +116,11 @@ pub fn validate_sql_identifier(name: &str) -> Result<(), ValidationError> {
     let mut chars = name.chars();
     let first = match chars.next() {
         Some(c) => c,
-        None => return Err(ValidationError { message: "identifier cannot be empty".into() }),
+        None => {
+            return Err(ValidationError {
+                message: "identifier cannot be empty".into(),
+            });
+        }
     };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return Err(ValidationError {

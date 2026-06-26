@@ -128,13 +128,17 @@ impl RocksDbStateBackend {
         if pos + op_len > k.len() {
             return None;
         }
-        let op_id = std::str::from_utf8(k.get(pos..pos + op_len)?).ok()?.to_owned();
+        let op_id = std::str::from_utf8(k.get(pos..pos + op_len)?)
+            .ok()?
+            .to_owned();
         pos += op_len;
         let name_len = read_u64_le(k, &mut pos)? as usize;
         if pos + name_len > k.len() {
             return None;
         }
-        let state_name = std::str::from_utf8(k.get(pos..pos + name_len)?).ok()?.to_owned();
+        let state_name = std::str::from_utf8(k.get(pos..pos + name_len)?)
+            .ok()?
+            .to_owned();
         pos += name_len;
         let raw_key = k.get(pos..).unwrap_or(&[]).to_vec();
         Some((Namespace::new(op_id, state_name), raw_key))
@@ -252,7 +256,9 @@ impl StateBackend for RocksDbStateBackend {
                 count += 1;
             }
         }
-        if let Some(s) = out.get_mut(4..12) { s.copy_from_slice(&count.to_le_bytes()); }
+        if let Some(s) = out.get_mut(4..12) {
+            s.copy_from_slice(&count.to_le_bytes());
+        }
         Ok(out)
     }
 

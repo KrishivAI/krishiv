@@ -767,7 +767,9 @@ pub fn build_batch_from_events(events: &[CdcEvent]) -> Result<RecordBatch, CdcBa
                     }
                 }
             };
-            column_data[col_idx].push(value);
+            if let Some(v) = column_data.get_mut(col_idx) {
+                v.push(value);
+            }
         }
     }
 

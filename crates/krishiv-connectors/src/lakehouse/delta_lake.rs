@@ -225,11 +225,11 @@ impl DeltaObjectStoreReader {
             let v: serde_json::Value =
                 serde_json::from_str(line).map_err(|e| LakehouseError::Io(e.to_string()))?;
             // Delta add action: {"add": {"path": "part-xxx.parquet", ...}}
-            if let Some(path) = v["add"]["path"].as_str() {
+            if let Some(path) = v.get("add").and_then(|a| a.get("path")).and_then(|p| p.as_str()) {
                 add_paths.push(path.to_string());
             }
             // Delta remove action: {"remove": {"path": "part-xxx.parquet", ...}}
-            if let Some(path) = v["remove"]["path"].as_str() {
+            if let Some(path) = v.get("remove").and_then(|r| r.get("path")).and_then(|p| p.as_str()) {
                 remove_paths.push(path.to_string());
             }
         }
@@ -295,11 +295,11 @@ fn concat_batches(batches: &[RecordBatch]) -> LakehouseResult<RecordBatch> {
             arrow::datatypes::Schema::empty(),
         )));
     }
-    let schema = batches[0].schema();
+    let schema = batches.first().ok_or_else(|| LakehouseError::Io("empty batches".to_string()))?.schema();
     let mut columns: Vec<Vec<Arc<dyn Array>>> = vec![Vec::new(); schema.fields().len()];
     for batch in batches {
         for (i, col) in batch.columns().iter().enumerate() {
-            columns[i].push(col.clone());
+            if let Some(v) = columns.get_mut(i) { v.push(col.clone()); }
         }
     }
     let arrays: Vec<Arc<dyn Array>> = columns

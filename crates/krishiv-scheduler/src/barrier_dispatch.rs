@@ -124,7 +124,10 @@ impl Coordinator {
     ) {
         for (task_id, ack) in acks {
             let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
-            let operator_id = match krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str())) {
+            let operator_id = match krishiv_proto::OperatorId::try_new(format!(
+                "op-{}",
+                task_id.as_str()
+            )) {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id; skipping ack");
@@ -177,7 +180,10 @@ impl Coordinator {
         let mut post_commit_jobs = Vec::new();
         for (task_id, ack) in acks {
             let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
-            let operator_id = match krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str())) {
+            let operator_id = match krishiv_proto::OperatorId::try_new(format!(
+                "op-{}",
+                task_id.as_str()
+            )) {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id; skipping ack");
@@ -341,7 +347,10 @@ fn barrier_ack_to_checkpoint_ack(
     let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
     let operator_id = krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
         .map_err(|e| {
-            format!("failed to derive operator_id from task_id '{}': {e}", task_id.as_str())
+            format!(
+                "failed to derive operator_id from task_id '{}': {e}",
+                task_id.as_str()
+            )
         })?;
     Ok(CheckpointAckRequest {
         job_id: job_id.clone(),
@@ -395,7 +404,8 @@ pub async fn drive_barrier_dispatches(
         shared.write().await.mark_barrier_dispatched(&job_id, epoch);
 
         for (task_id, ack) in &acks {
-            let request = match barrier_ack_to_checkpoint_ack(&job_id, epoch, fencing, task_id, ack) {
+            let request = match barrier_ack_to_checkpoint_ack(&job_id, epoch, fencing, task_id, ack)
+            {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(

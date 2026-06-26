@@ -82,12 +82,7 @@ impl HeavyHittersTracker {
         if self.counters.len() < self.capacity {
             let pos = self.counters.len();
             // New entries start with count=1; track min_pos if this is the smallest.
-            if pos == 0
-                || self
-                    .counters
-                    .get(self.min_pos)
-                    .is_some_and(|c| c.1 > 1)
-            {
+            if pos == 0 || self.counters.get(self.min_pos).is_some_and(|c| c.1 > 1) {
                 self.min_pos = pos;
             }
             self.counters.push((key.clone(), 1, 0));

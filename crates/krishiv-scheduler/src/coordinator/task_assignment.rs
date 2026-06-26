@@ -1,4 +1,9 @@
-use super::{Arc, DashMap, ExecutorTaskAssignment, Coordinator, JobId, SchedulerResult, SchedulerError, JobState, TaskId, TaskState, SlotAwareScheduler, JobSpec, JobKind, TASKS_ASSIGNED_TOTAL, AtomicOrdering, TaskStatusResponse, is_in_process_task_endpoint, wire, TaskCancellationRequest, AttemptId, TaskAttemptRef};
+use super::{
+    Arc, AtomicOrdering, AttemptId, Coordinator, DashMap, ExecutorTaskAssignment, JobId, JobKind,
+    JobSpec, JobState, SchedulerError, SchedulerResult, SlotAwareScheduler, TASKS_ASSIGNED_TOTAL,
+    TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState, TaskStatusResponse,
+    is_in_process_task_endpoint, wire,
+};
 
 /// Shared per-endpoint gRPC channel cache.
 ///

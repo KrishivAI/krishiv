@@ -369,7 +369,9 @@ fn validate_manifest_entries(
                     if n == 0 {
                         break;
                     }
-                    if let Some(chunk) = buf.get(..n) { hasher.update(chunk); }
+                    if let Some(chunk) = buf.get(..n) {
+                        hasher.update(chunk);
+                    }
                 }
                 let hash = format!("{:x}", hasher.finalize());
                 if hash != *expected_hex {
@@ -409,7 +411,9 @@ async fn validate_manifest_entries_async(
                     if n == 0 {
                         break;
                     }
-                    if let Some(chunk) = buf.get(..n) { hasher.update(chunk); }
+                    if let Some(chunk) = buf.get(..n) {
+                        hasher.update(chunk);
+                    }
                 }
                 let hash = format!("{:x}", hasher.finalize());
                 if hash != *expected_hex {

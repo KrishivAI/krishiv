@@ -113,7 +113,7 @@ pub async fn iceberg_delete_where(
     }
 
     let total_rows: i64 = all_batches.iter().map(|b| b.num_rows() as i64).sum();
-    let schema = all_batches[0].schema();
+    let schema = all_batches.first().ok_or_else(|| LakehouseError::Iceberg("empty batches".to_string()))?.schema();
 
     // Register as MemTable to run SQL against it.
     let tmp_name = format!("__krishiv_dml_{}", uuid::Uuid::new_v4().simple());
@@ -163,7 +163,7 @@ pub async fn iceberg_update_where(
         return Ok((0, -1));
     }
 
-    let schema = all_batches[0].schema();
+    let schema = all_batches.first().ok_or_else(|| LakehouseError::Iceberg("empty batches".to_string()))?.schema();
     let field_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
 
     let tmp_name = format!("__krishiv_upd_{}", uuid::Uuid::new_v4().simple());
@@ -238,7 +238,7 @@ pub async fn iceberg_merge_into(
 
     let target_name = format!("__krishiv_merge_tgt_{}", uuid::Uuid::new_v4().simple());
     if !target_batches.is_empty() {
-        let schema = target_batches[0].schema();
+        let schema = target_batches.first().ok_or_else(|| LakehouseError::Iceberg("empty target batches".to_string()))?.schema();
         let field_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
 
         let mem = MemTable::try_new(schema.clone(), vec![target_batches])
@@ -246,7 +246,7 @@ pub async fn iceberg_merge_into(
         ctx.register_table(&target_name, Arc::new(mem))
             .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
-        let source_schema = source_batches[0].schema();
+        let source_schema = source_batches.first().ok_or_else(|| LakehouseError::Iceberg("empty source batches".to_string()))?.schema();
         let source_mem = MemTable::try_new(source_schema, vec![source_batches])
             .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
         let source_name = format!("__krishiv_merge_src_{}", uuid::Uuid::new_v4().simple());
@@ -339,7 +339,7 @@ pub async fn overwrite_table_pub(
     }
 
     // Write surviving rows to a local Parquet file (blocking), then read bytes.
-    let arrow_schema = batches[0].schema();
+    let arrow_schema = batches.first().ok_or_else(|| LakehouseError::Iceberg("empty batches".to_string()))?.schema();
     let (file_bytes, file_size, record_count) = task::spawn_blocking({
         let arrow_schema = arrow_schema.clone();
         let batches = batches.clone();

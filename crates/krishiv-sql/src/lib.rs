@@ -318,9 +318,7 @@ pub fn default_parallelism_from_env() -> NonZeroUsize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .and_then(NonZeroUsize::new)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
-        })
+        .unwrap_or_else(|| std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN))
 }
 
 /// Build the DataFusion session config with a configurable parallelism level.
@@ -473,13 +471,8 @@ impl SqlEngine {
                         "memory-limited DataFusion runtime construction failed; \
                          falling back to an unbounded engine"
                     );
-                    Self::build_local(
-                        None,
-                        WindowFnRegistration::Skip,
-                        NonZeroUsize::MIN,
-                        None,
-                    )
-                    .unwrap_or_else(|_| Self::build_absolute_minimal(NonZeroUsize::MIN))
+                    Self::build_local(None, WindowFnRegistration::Skip, NonZeroUsize::MIN, None)
+                        .unwrap_or_else(|_| Self::build_absolute_minimal(NonZeroUsize::MIN))
                 })
             }
         }
@@ -1450,7 +1443,7 @@ impl SqlEngine {
             return Ok(());
         }
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        let schema = batches[0].schema();
+        let schema = batches.first().ok_or_else(|| SqlError::DataFusion { message: "empty batch list".into() })?.schema();
         let mem_table =
             datafusion::datasource::MemTable::try_new(schema, vec![batches]).map_err(|e| {
                 SqlError::DataFusion {
@@ -2052,12 +2045,12 @@ impl SqlEngine {
             match parts.len() {
                 2 => {
                     let (cat, _) = guard.first()?;
-                    (Arc::clone(cat), parts[0], parts[1])
+                    (Arc::clone(cat), *parts.first()?, *parts.get(1)?)
                 }
                 3 => {
-                    let cat_name = parts[0];
+                    let cat_name = parts.first().copied()?;
                     let (cat, _) = guard.iter().find(|(_, n)| n == cat_name)?;
-                    (Arc::clone(cat), parts[1], parts[2])
+                    (Arc::clone(cat), *parts.get(1)?, *parts.get(2)?)
                 }
                 _ => return None,
             }
@@ -2601,7 +2594,11 @@ fn df_plan_to_krishiv_nodes(
         }
 
         DfPlan::Union(union) if union.inputs.len() == 1 => {
-            df_plan_to_krishiv_nodes(&union.inputs[0], table_row_counts, counter)
+            if let Some(input) = union.inputs.first() {
+                df_plan_to_krishiv_nodes(input, table_row_counts, counter)
+            } else {
+                (Vec::new(), String::new())
+            }
         }
         DfPlan::Union(union) => {
             let mut all_nodes = Vec::new();
@@ -2914,7 +2911,8 @@ fn top_level_alias_index(expression: &str) -> Option<usize> {
     let mut candidate = None;
     let mut index = 0usize;
     while index < bytes.len() {
-        match bytes[index] {
+        let Some(&byte) = bytes.get(index) else { break; };
+        match byte {
             b'\'' if !double_quoted => {
                 if single_quoted && bytes.get(index + 1) == Some(&b'\'') {
                     index += 2;
@@ -3191,7 +3189,7 @@ fn lower_public_expression(
     use krishiv_plan::expression::{BinaryOperator, Expr};
 
     Ok(match expression {
-        Expr::Column { path } if path.len() == 1 => datafusion::prelude::col(&path[0]),
+        Expr::Column { path } if path.len() == 1 => datafusion::prelude::col(path.first().map(String::as_str).unwrap_or("")),
         Expr::Column { .. } => parse_dataframe_expression(dataframe, &expression.to_sql())?,
         Expr::Literal { value } => match public_scalar_to_datafusion(value) {
             Some(value) => DataFusionExpr::Literal(value, None),
@@ -3798,21 +3796,21 @@ fn iceberg_table_ident(table_ref: &str) -> SqlResult<iceberg::TableIdent> {
     match parts.len() {
         2 => {
             let ns =
-                iceberg::NamespaceIdent::from_vec(vec![parts[0].to_string()]).map_err(|e| {
+                iceberg::NamespaceIdent::from_vec(vec![parts.first().copied().unwrap_or("").to_string()]).map_err(|e| {
                     SqlError::DataFusion {
                         message: e.to_string(),
                     }
                 })?;
-            Ok(iceberg::TableIdent::new(ns, parts[1].to_string()))
+            Ok(iceberg::TableIdent::new(ns, parts.get(1).copied().unwrap_or("").to_string()))
         }
         3 => {
             let ns =
-                iceberg::NamespaceIdent::from_vec(vec![parts[1].to_string()]).map_err(|e| {
+                iceberg::NamespaceIdent::from_vec(vec![parts.get(1).copied().unwrap_or("").to_string()]).map_err(|e| {
                     SqlError::DataFusion {
                         message: e.to_string(),
                     }
                 })?;
-            Ok(iceberg::TableIdent::new(ns, parts[2].to_string()))
+            Ok(iceberg::TableIdent::new(ns, parts.get(2).copied().unwrap_or("").to_string()))
         }
         _ => Err(SqlError::DataFusion {
             message: format!(

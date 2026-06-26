@@ -85,18 +85,17 @@ impl<B: StateBackend> TtlStateBackend<B> {
                 message: format!("ttl value is too short: {} bytes", encoded.len()),
             });
         }
-        let expires_at_ms =
-            i64::from_le_bytes(
-                encoded
-                    .get(..8)
-                    .ok_or_else(|| StateError::CorruptEntry {
-                        message: "ttl expiry prefix is not 8 bytes".into(),
-                    })?
-                    .try_into()
-                    .map_err(|_| StateError::CorruptEntry {
-                        message: "ttl expiry prefix is not 8 bytes".into(),
-                    })?,
-            );
+        let expires_at_ms = i64::from_le_bytes(
+            encoded
+                .get(..8)
+                .ok_or_else(|| StateError::CorruptEntry {
+                    message: "ttl expiry prefix is not 8 bytes".into(),
+                })?
+                .try_into()
+                .map_err(|_| StateError::CorruptEntry {
+                    message: "ttl expiry prefix is not 8 bytes".into(),
+                })?,
+        );
         if now_ms >= expires_at_ms {
             Ok(None)
         } else {
@@ -276,8 +275,12 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
                 if let Some(encoded) = self.inner.get(ns, key)?
                     && encoded.len() >= 8
                 {
-                    let expires_at_ms =
-                        i64::from_le_bytes(encoded.get(..8).and_then(|s| s.try_into().ok()).unwrap_or([0u8; 8]));
+                    let expires_at_ms = i64::from_le_bytes(
+                        encoded
+                            .get(..8)
+                            .and_then(|s| s.try_into().ok())
+                            .unwrap_or([0u8; 8]),
+                    );
                     if now_ms >= expires_at_ms {
                         keys_to_delete.push((ns.clone(), key.clone()));
                     }

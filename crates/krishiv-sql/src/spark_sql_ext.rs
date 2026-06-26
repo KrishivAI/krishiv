@@ -122,7 +122,10 @@ fn find_alias_length(text: &str) -> usize {
 
     // Read alias name
     let name_start = i;
-    while bytes.get(i).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_') {
+    while bytes
+        .get(i)
+        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    {
         i += 1;
     }
 
@@ -139,7 +142,9 @@ fn find_alias_length(text: &str) -> usize {
         i += 1;
         let mut depth = 1;
         while i < bytes.len() && depth > 0 {
-            let Some(&b) = bytes.get(i) else { break; };
+            let Some(&b) = bytes.get(i) else {
+                break;
+            };
             match b {
                 b'(' => depth += 1,
                 b')' => depth -= 1,
@@ -161,11 +166,17 @@ fn find_keyword_boundary(sql: &str, keyword: &str) -> Option<usize> {
         let abs_pos = search_start + pos;
         // Check word boundary before
         let before_ok = abs_pos == 0
-            || sql.as_bytes().get(abs_pos - 1).is_some_and(|&b| b == b' ' || b == b',' || b == b'\n' || b == b'\t');
+            || sql
+                .as_bytes()
+                .get(abs_pos - 1)
+                .is_some_and(|&b| b == b' ' || b == b',' || b == b'\n' || b == b'\t');
         // Check word boundary after
         let after_pos = abs_pos + keyword.len();
         let after_ok = after_pos >= sql.len()
-            || sql.as_bytes().get(after_pos).is_some_and(|&b| b == b' ' || b == b'\n' || b == b'\t' || b == b'(');
+            || sql
+                .as_bytes()
+                .get(after_pos)
+                .is_some_and(|&b| b == b' ' || b == b'\n' || b == b'\t' || b == b'(');
 
         if before_ok && after_ok {
             return Some(abs_pos);
@@ -314,18 +325,16 @@ fn regex_replace(input: &str, pattern: &str, replacement: &str) -> SqlResult<Str
         let mut result = input.to_string();
         while let Some(pos) = result.to_uppercase().find("EXTENDED") {
             // Check word boundaries
+            let bytes = result.as_bytes();
             let before_ok = pos == 0
-                || result.as_bytes()[pos - 1] == b' '
-                || result.as_bytes()[pos - 1] == b'\t';
+                || bytes.get(pos - 1).is_some_and(|&b| b == b' ' || b == b'\t');
             let after_pos = pos + "EXTENDED".len();
             let after_ok = after_pos >= result.len()
-                || result.as_bytes()[after_pos] == b' '
-                || result.as_bytes()[after_pos] == b'\t'
-                || result.as_bytes()[after_pos] == b'\n';
+                || bytes.get(after_pos).is_some_and(|&b| b == b' ' || b == b'\t' || b == b'\n');
 
             if before_ok && after_ok {
                 // Remove EXTENDED plus trailing space
-                let end = if after_pos < result.len() && result.as_bytes()[after_pos] == b' ' {
+                let end = if bytes.get(after_pos).is_some_and(|&b| b == b' ') {
                     after_pos + 1
                 } else {
                     after_pos

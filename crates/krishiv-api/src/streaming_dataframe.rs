@@ -567,10 +567,11 @@ struct StateBackedDeduplicatingStream {
 impl StateBackedDeduplicatingStream {
     fn new(inner: KrishivStream, columns: Vec<String>) -> Result<Self> {
         let cfg = krishiv_dataflow::dedup_operator::DeduplicationConfig::new(columns);
-        let op = krishiv_dataflow::dedup_operator::DeduplicationOperator::ephemeral(cfg)
-            .map_err(|e| KrishivError::InvalidConfig {
+        let op = krishiv_dataflow::dedup_operator::DeduplicationOperator::ephemeral(cfg).map_err(
+            |e| KrishivError::InvalidConfig {
                 message: format!("state-backed dedup operator failed to construct: {e}"),
-            })?;
+            },
+        )?;
         Ok(Self { inner, op })
     }
 }

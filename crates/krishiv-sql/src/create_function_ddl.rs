@@ -403,8 +403,16 @@ impl TableUdf for SqlBodyTableUdf {
                     if batches.is_empty() {
                         return Ok(RecordBatch::new_empty(schema));
                     }
-                    let batch = arrow::compute::concat_batches(&batches.first().ok_or_else(|| UdfError::Execution { message: "empty batch list".into() })?.schema(), &batches)
-                        .map_err(|e| UdfError::Arrow(e.to_string()))?;
+                    let batch = arrow::compute::concat_batches(
+                        &batches
+                            .first()
+                            .ok_or_else(|| UdfError::Execution {
+                                message: "empty batch list".into(),
+                            })?
+                            .schema(),
+                        &batches,
+                    )
+                    .map_err(|e| UdfError::Arrow(e.to_string()))?;
                     if !schema_contract_matches(batch.schema().as_ref(), schema.as_ref()) {
                         return Err(UdfError::Execution {
                             message: format!(
@@ -436,7 +444,9 @@ fn bind_sql_body_args(sql: &str, args: &[ScalarValue]) -> Result<String, UdfErro
     let mut index = 0;
 
     while index < bytes.len() {
-        let Some(&byte) = bytes.get(index) else { break; };
+        let Some(&byte) = bytes.get(index) else {
+            break;
+        };
         match byte {
             b'\'' | b'"' | b'`' => {
                 index = copy_quoted_segment(sql, index, byte, &mut output)?;
@@ -501,10 +511,10 @@ fn bind_sql_body_args(sql: &str, args: &[ScalarValue]) -> Result<String, UdfErro
             _ => {
                 let ch = sql[index..]
                     .chars()
-            .next()
-            .ok_or_else(|| UdfError::InvalidArgument {
-                message: "unexpected end of SQL string".to_owned(),
-            })?;
+                    .next()
+                    .ok_or_else(|| UdfError::InvalidArgument {
+                        message: "unexpected end of SQL string".to_owned(),
+                    })?;
                 output.push(ch);
                 index += ch.len_utf8();
             }
@@ -523,7 +533,9 @@ fn copy_quoted_segment(
     let bytes = sql.as_bytes();
     let mut index = start + 1;
     while index < bytes.len() {
-        let Some(&b) = bytes.get(index) else { break; };
+        let Some(&b) = bytes.get(index) else {
+            break;
+        };
         if b == quote {
             index += 1;
             if bytes.get(index) == Some(&quote) {
@@ -564,10 +576,10 @@ fn copy_block_comment(sql: &str, start: usize, output: &mut String) -> Result<us
         } else {
             let ch = sql[index..]
                 .chars()
-            .next()
-            .ok_or_else(|| UdfError::InvalidArgument {
-                message: "unexpected end of SQL string".to_owned(),
-            })?;
+                .next()
+                .ok_or_else(|| UdfError::InvalidArgument {
+                    message: "unexpected end of SQL string".to_owned(),
+                })?;
             index += ch.len_utf8();
         }
     }

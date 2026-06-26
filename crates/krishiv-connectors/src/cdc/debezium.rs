@@ -140,16 +140,13 @@ pub fn parse_debezium_envelope_result(
 ) -> Result<CdcEvent, DebeziumParseError> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| DebeziumParseError::InvalidJson(e.to_string()))?;
-    let op_str = v["op"].as_str().ok_or(DebeziumParseError::MissingOp)?;
+    let op_str = v.get("op").and_then(|v| v.as_str()).ok_or(DebeziumParseError::MissingOp)?;
     let op =
         CdcOp::from_debezium(op_str).ok_or_else(|| DebeziumParseError::UnknownOp(op_str.into()))?;
 
-    let source_lsn = v["source"]["lsn"].as_u64();
-    let source_ts_ms = v["source"]["ts_ms"].as_i64();
-    let table = v["source"]["table"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
+    let source_lsn = v.get("source").and_then(|s| s.get("lsn")).and_then(|v| v.as_u64());
+    let source_ts_ms = v.get("source").and_then(|s| s.get("ts_ms")).and_then(|v| v.as_i64());
+    let table = v.get("source").and_then(|s| s.get("table")).and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
     // Build one column per key in the JSON object for before/after payloads.
     // Keys are sorted alphabetically to guarantee a deterministic schema across
@@ -183,8 +180,8 @@ pub fn parse_debezium_envelope_result(
         RecordBatch::try_new(schema, columns).ok()
     };
 
-    let before = make_payload_batch(&v["before"]);
-    let after = make_payload_batch(&v["after"]);
+    let before = make_payload_batch(v.get("before").unwrap_or(&serde_json::Value::Null));
+    let after = make_payload_batch(v.get("after").unwrap_or(&serde_json::Value::Null));
     match &op {
         CdcOp::Insert | CdcOp::Update | CdcOp::SnapshotRead if after.is_none() => {
             return Err(DebeziumParseError::MissingPayload { op: op.clone() });

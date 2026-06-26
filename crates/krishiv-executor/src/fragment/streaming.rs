@@ -302,11 +302,18 @@ fn execute_cep_fragment(
                 if stage_batches.is_empty() {
                     continue;
                 }
-                let merged =
-                    arrow::compute::concat_batches(&stage_batches.first().ok_or_else(|| ExecutorError::LocalExecution { message: "empty stage batches".into() })?.schema(), &stage_batches)
-                        .map_err(|e| ExecutorError::LocalExecution {
-                            message: format!("stream:cep concat match stages: {e}"),
-                        })?;
+                let merged = arrow::compute::concat_batches(
+                    &stage_batches
+                        .first()
+                        .ok_or_else(|| ExecutorError::LocalExecution {
+                            message: "empty stage batches".into(),
+                        })?
+                        .schema(),
+                    &stage_batches,
+                )
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("stream:cep concat match stages: {e}"),
+                })?;
                 matched_batches.push(merged);
             }
         }
@@ -738,7 +745,10 @@ pub(crate) async fn execute_streaming_fragment(
             .agg_exprs
             .first()
             .is_some_and(|a| a.kind == WindowAggKind::Sum)
-            && plan_spec.agg_exprs.first().is_some_and(|a| a.input_column.is_empty())
+            && plan_spec
+                .agg_exprs
+                .first()
+                .is_some_and(|a| a.input_column.is_empty())
         {
             if let Some(agg) = plan_spec.agg_exprs.first_mut() {
                 agg.input_column = String::from("val");

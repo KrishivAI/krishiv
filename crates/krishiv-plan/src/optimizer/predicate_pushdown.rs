@@ -58,18 +58,34 @@ impl OptimizerRule for PredicatePushdownRule {
             let mut scan_indices: Vec<usize> = direct_inputs
                 .iter()
                 .copied()
-                .filter(|&idx| nodes.get(idx).is_some_and(|n| matches!(n.op(), Some(NodeOp::Scan { .. }))))
+                .filter(|&idx| {
+                    nodes
+                        .get(idx)
+                        .is_some_and(|n| matches!(n.op(), Some(NodeOp::Scan { .. })))
+                })
                 .collect();
 
             // Filter-above-Join: descend through join nodes to collect
             // both left and right scan inputs for per-side pushdown.
             for join_idx in direct_inputs.iter().copied().filter(|&idx| {
-                nodes.get(idx).is_some_and(|n| matches!(n.op(), Some(NodeOp::Join { join_type: crate::JoinType::Inner })))
+                nodes.get(idx).is_some_and(|n| {
+                    matches!(
+                        n.op(),
+                        Some(NodeOp::Join {
+                            join_type: crate::JoinType::Inner
+                        })
+                    )
+                })
             }) {
-                let join_inputs: Vec<String> = nodes.get(join_idx).map(|n| n.inputs().to_vec()).unwrap_or_default();
+                let join_inputs: Vec<String> = nodes
+                    .get(join_idx)
+                    .map(|n| n.inputs().to_vec())
+                    .unwrap_or_default();
                 for child_id in &join_inputs {
                     if let Some(&child_idx) = id_to_idx.get(child_id.as_str())
-                        && nodes.get(child_idx).is_some_and(|n| matches!(n.op(), Some(NodeOp::Scan { .. })))
+                        && nodes
+                            .get(child_idx)
+                            .is_some_and(|n| matches!(n.op(), Some(NodeOp::Scan { .. })))
                     {
                         scan_indices.push(child_idx);
                     }
@@ -156,7 +172,10 @@ impl OptimizerRule for PredicatePushdownRule {
                     let mut new_filters = filters.clone();
                     new_filters.extend(pushable.iter().cloned());
                     if let Some(n) = new_nodes.get_mut(*scan_idx) {
-                        *n = n.clone().with_op(NodeOp::Scan { table, filters: new_filters });
+                        *n = n.clone().with_op(NodeOp::Scan {
+                            table,
+                            filters: new_filters,
+                        });
                     }
                 }
             }
@@ -175,7 +194,10 @@ impl OptimizerRule for PredicatePushdownRule {
 
         // Remove filter nodes and rewire downstream node inputs.
         for &idx in to_remove.iter().rev() {
-            let (filter_id, filter_inputs) = new_nodes.get(idx).map(|n| (n.id().to_string(), n.inputs().to_vec())).unwrap_or_default();
+            let (filter_id, filter_inputs) = new_nodes
+                .get(idx)
+                .map(|n| (n.id().to_string(), n.inputs().to_vec()))
+                .unwrap_or_default();
             new_nodes.remove(idx);
 
             for node in &mut new_nodes {
@@ -220,12 +242,16 @@ pub(super) fn extract_column_refs(predicate: &str) -> Vec<String> {
     let mut refs = Vec::new();
     let mut cursor = 0usize;
     while cursor < chars.len() {
-        let Some(&(_, ch)) = chars.get(cursor) else { break; };
+        let Some(&(_, ch)) = chars.get(cursor) else {
+            break;
+        };
         if ch == '\'' {
             cursor += 1;
             while cursor < chars.len() {
                 if chars.get(cursor).is_some_and(|(_, c)| *c == '\'') {
-                    if cursor + 1 < chars.len() && chars.get(cursor + 1).is_some_and(|(_, c)| *c == '\'') {
+                    if cursor + 1 < chars.len()
+                        && chars.get(cursor + 1).is_some_and(|(_, c)| *c == '\'')
+                    {
                         cursor += 2;
                         continue;
                     }
@@ -238,7 +264,9 @@ pub(super) fn extract_column_refs(predicate: &str) -> Vec<String> {
         }
         if ch == '"' || ch == '`' {
             let quote = ch;
-            let start = chars.get(cursor).map_or(predicate.len(), |(o, _)| *o + ch.len_utf8());
+            let start = chars
+                .get(cursor)
+                .map_or(predicate.len(), |(o, _)| *o + ch.len_utf8());
             cursor += 1;
             while cursor < chars.len() && chars.get(cursor).is_none_or(|(_, c)| *c != quote) {
                 cursor += 1;
@@ -256,7 +284,9 @@ pub(super) fn extract_column_refs(predicate: &str) -> Vec<String> {
             let start = chars.get(cursor).map_or(predicate.len(), |(o, _)| *o);
             cursor += 1;
             while cursor < chars.len()
-                && chars.get(cursor).is_some_and(|(_, c)| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                && chars
+                    .get(cursor)
+                    .is_some_and(|(_, c)| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
             {
                 cursor += 1;
             }
@@ -264,7 +294,9 @@ pub(super) fn extract_column_refs(predicate: &str) -> Vec<String> {
                 .get(cursor)
                 .map_or(predicate.len(), |(offset, _)| *offset);
             let token = predicate.get(start..end).unwrap_or("");
-            let next_non_whitespace = chars.get(cursor..).unwrap_or(&[])
+            let next_non_whitespace = chars
+                .get(cursor..)
+                .unwrap_or(&[])
                 .iter()
                 .find_map(|(_, next)| (!next.is_whitespace()).then_some(*next));
             if next_non_whitespace != Some('(')

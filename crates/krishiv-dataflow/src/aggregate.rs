@@ -268,13 +268,12 @@ impl AggState {
                             };
                             match expr.function {
                                 AggFunction::Sum => {
-                                    entry.value =
-                                        entry.value.checked_add(v).ok_or_else(|| {
-                                            ExecError::InvalidInput(format!(
-                                                "sum overflow on column '{}': i64::MAX reached",
-                                                expr.input_column
-                                            ))
-                                        })?;
+                                    entry.value = entry.value.checked_add(v).ok_or_else(|| {
+                                        ExecError::InvalidInput(format!(
+                                            "sum overflow on column '{}': i64::MAX reached",
+                                            expr.input_column
+                                        ))
+                                    })?;
                                 }
                                 AggFunction::Min => {
                                     if !entry.has_value || v < entry.value {
@@ -313,24 +312,34 @@ impl AggState {
     }
 
     pub(crate) fn finalized_value(&self, i: usize, expr: &AggExpr) -> ExecResult<i64> {
-        let e = self.entries.get(i).ok_or_else(|| {
-            ExecError::InvalidInput(format!("agg state index {i} out of range"))
-        })?;
+        let e = self
+            .entries
+            .get(i)
+            .ok_or_else(|| ExecError::InvalidInput(format!("agg state index {i} out of range")))?;
         Ok(match expr.function {
             AggFunction::Min => {
-                if e.has_value { e.value } else { i64::MAX }
+                if e.has_value {
+                    e.value
+                } else {
+                    i64::MAX
+                }
             }
             AggFunction::Max => {
-                if e.has_value { e.value } else { i64::MIN }
+                if e.has_value {
+                    e.value
+                } else {
+                    i64::MIN
+                }
             }
             _ => e.value,
         })
     }
 
     pub(crate) fn finalized_avg(&self, i: usize) -> ExecResult<f64> {
-        let e = self.entries.get(i).ok_or_else(|| {
-            ExecError::InvalidInput(format!("agg state index {i} out of range"))
-        })?;
+        let e = self
+            .entries
+            .get(i)
+            .ok_or_else(|| ExecError::InvalidInput(format!("agg state index {i} out of range")))?;
         Ok(if e.avg_count == 0 {
             f64::NAN
         } else {
@@ -339,15 +348,24 @@ impl AggState {
     }
 
     pub(crate) fn finalized_float_value(&self, i: usize, expr: &AggExpr) -> ExecResult<f64> {
-        let e = self.entries.get(i).ok_or_else(|| {
-            ExecError::InvalidInput(format!("agg state index {i} out of range"))
-        })?;
+        let e = self
+            .entries
+            .get(i)
+            .ok_or_else(|| ExecError::InvalidInput(format!("agg state index {i} out of range")))?;
         Ok(match expr.function {
             AggFunction::Min => {
-                if e.has_value { e.float_value } else { f64::INFINITY }
+                if e.has_value {
+                    e.float_value
+                } else {
+                    f64::INFINITY
+                }
             }
             AggFunction::Max => {
-                if e.has_value { e.float_value } else { f64::NEG_INFINITY }
+                if e.has_value {
+                    e.float_value
+                } else {
+                    f64::NEG_INFINITY
+                }
             }
             _ => e.float_value,
         })
@@ -401,13 +419,11 @@ fn update_agg_state_pre(
                     let v = col.int64_value(row)?;
                     match expr.function {
                         AggFunction::Sum => {
-                            entry.value =
-                                entry.value.checked_add(v).ok_or_else(|| {
-                                    ExecError::InvalidInput(
-                                        "sum overflow in pre-downcast path: i64::MAX reached"
-                                            .into(),
-                                    )
-                                })?;
+                            entry.value = entry.value.checked_add(v).ok_or_else(|| {
+                                ExecError::InvalidInput(
+                                    "sum overflow in pre-downcast path: i64::MAX reached".into(),
+                                )
+                            })?;
                             entry.has_value = true;
                         }
                         AggFunction::Min => {
@@ -525,8 +541,7 @@ impl LocalAggregator {
                 .unwrap_or_else(|| a.len().cmp(&b.len()))
         });
 
-        let mut fields: Vec<Field> =
-            Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
+        let mut fields: Vec<Field> = Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
         for col_name in &self.group_by {
             let schema = batch.schema();
             let f = schema
@@ -538,20 +553,16 @@ impl LocalAggregator {
         let agg_out_dtypes: Vec<DataType> = self
             .agg_exprs
             .iter()
-            .map(|agg| {
-                match agg.function {
-                    AggFunction::Avg => DataType::Float64,
-                    AggFunction::Count => DataType::Int64,
-                    _ => {
-                        batch
-                            .schema()
-                            .field_with_name(&agg.input_column)
-                            .ok()
-                            .map(|f| f.data_type().clone())
-                            .filter(|dt| matches!(dt, DataType::Float64))
-                            .unwrap_or(DataType::Int64)
-                    }
-                }
+            .map(|agg| match agg.function {
+                AggFunction::Avg => DataType::Float64,
+                AggFunction::Count => DataType::Int64,
+                _ => batch
+                    .schema()
+                    .field_with_name(&agg.input_column)
+                    .ok()
+                    .map(|f| f.data_type().clone())
+                    .filter(|dt| matches!(dt, DataType::Float64))
+                    .unwrap_or(DataType::Int64),
             })
             .collect();
         for (agg, dtype) in self.agg_exprs.iter().zip(&agg_out_dtypes) {
@@ -568,8 +579,11 @@ impl LocalAggregator {
         let mut columns: Vec<ArrayRef> =
             Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
 
-        for (gb_pos, (col_idx, col_name)) in
-            gb_indices.iter().copied().zip(self.group_by.iter()).enumerate()
+        for (gb_pos, (col_idx, col_name)) in gb_indices
+            .iter()
+            .copied()
+            .zip(self.group_by.iter())
+            .enumerate()
         {
             let dtype = batch.schema().field(col_idx).data_type().clone();
             match dtype {
@@ -671,9 +685,7 @@ impl LocalAggregator {
             }
         }
 
-        for (agg_pos, (agg, out_dtype)) in
-            self.agg_exprs.iter().zip(&agg_out_dtypes).enumerate()
-        {
+        for (agg_pos, (agg, out_dtype)) in self.agg_exprs.iter().zip(&agg_out_dtypes).enumerate() {
             match (agg.function, out_dtype) {
                 (AggFunction::Avg, _) | (_, DataType::Float64) => {
                     let arr: Float64Array = sorted_entries

@@ -150,7 +150,7 @@ impl CsvSource {
         if self.cursor >= self.batches.len() {
             return Ok(None);
         }
-        let batch = self.batches[self.cursor].clone();
+        let batch = self.batches.get(self.cursor).ok_or_else(|| ConnectorError::Protocol { message: "cursor out of range".into() })?.clone();
         self.cursor += 1;
         Ok(Some(batch))
     }
@@ -269,7 +269,7 @@ impl NdjsonSource {
         if self.cursor >= self.batches.len() {
             return Ok(None);
         }
-        let batch = self.batches[self.cursor].clone();
+        let batch = self.batches.get(self.cursor).ok_or_else(|| ConnectorError::Protocol { message: "cursor out of range".into() })?.clone();
         self.cursor += 1;
         Ok(Some(batch))
     }

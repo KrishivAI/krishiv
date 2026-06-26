@@ -81,7 +81,11 @@ impl CoalesceRule {
         let mut order: Vec<usize> = (0..stats.len()).collect();
         order.sort_by_key(|&i| {
             stats.get(i).map_or(0u128, |s| {
-                u128::from(if s.serialized_bytes > 0 { s.serialized_bytes } else { s.memory_bytes })
+                u128::from(if s.serialized_bytes > 0 {
+                    s.serialized_bytes
+                } else {
+                    s.memory_bytes
+                })
             })
         });
 
@@ -91,7 +95,9 @@ impl CoalesceRule {
         let target_bytes = u128::from(self.target_partition_bytes.max(1));
 
         for i in order {
-            let Some(s) = stats.get(i) else { continue; };
+            let Some(s) = stats.get(i) else {
+                continue;
+            };
             // Prefer serialized_bytes over memory_bytes for the same reason as
             // AutoPartitionRule: shuffle output is compressed and a better
             // proxy for actual partition cost than peak in-memory footprint.

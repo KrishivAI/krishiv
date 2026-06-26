@@ -818,7 +818,7 @@ async fn read_error_body(mut response: Response, operation: &str) -> Vec<u8> {
         };
         let remaining = ERROR_BODY_LIMIT_BYTES - body.len();
         if chunk.len() > remaining {
-            body.extend_from_slice(&chunk[..remaining]);
+            body.extend_from_slice(chunk.get(..remaining).unwrap_or(&chunk));
             body.extend_from_slice(b" [truncated]");
             return body;
         }

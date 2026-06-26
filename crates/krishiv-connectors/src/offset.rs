@@ -91,15 +91,23 @@ impl Offset for MultiFileOffset {
             });
         }
         let file_index = {
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&bytes[0..8]);
+            let raw = bytes.get(..8).ok_or_else(|| ConnectorError::Offset {
+                message: "MultiFileOffset decode: buffer too short for file_index".into(),
+            })?;
+            let arr: [u8; 8] = raw.try_into().map_err(|_| ConnectorError::Offset {
+                message: "MultiFileOffset decode: file_index slice mismatch".into(),
+            })?;
             usize::try_from(u64::from_le_bytes(arr)).map_err(|_| ConnectorError::Offset {
                 message: "MultiFileOffset decode: file_index exceeds usize".into(),
             })?
         };
         let batch_index = {
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&bytes[8..16]);
+            let raw = bytes.get(8..16).ok_or_else(|| ConnectorError::Offset {
+                message: "MultiFileOffset decode: buffer too short for batch_index".into(),
+            })?;
+            let arr: [u8; 8] = raw.try_into().map_err(|_| ConnectorError::Offset {
+                message: "MultiFileOffset decode: batch_index slice mismatch".into(),
+            })?;
             usize::try_from(u64::from_le_bytes(arr)).map_err(|_| ConnectorError::Offset {
                 message: "MultiFileOffset decode: batch_index exceeds usize".into(),
             })?

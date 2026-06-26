@@ -23,8 +23,10 @@ pub fn preprocess_as_of_sql(sql: &str) -> Result<(String, Vec<AsOfTableRef>), St
         return Err("expected a single SQL statement".into());
     }
     let mut refs = Vec::new();
-    process_statement(&mut stmts[0], &mut refs);
-    let clean_sql = stmts[0].to_string();
+    if let Some(stmt) = stmts.first_mut() {
+        process_statement(stmt, &mut refs);
+    }
+    let clean_sql = stmts.first().map(|s| s.to_string()).unwrap_or_default();
     Ok((clean_sql, refs))
 }
 

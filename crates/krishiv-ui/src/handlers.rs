@@ -8,7 +8,15 @@ use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpe
 use krishiv_scheduler::{ExecutorRecord, JobDetailSnapshot, JobSnapshot, StabilityMetrics};
 
 use crate::router::ui_auth_token;
-use crate::views::{Pagination, JobsResponse, JobDetailResponse, ExecutorsResponse, QueuesResponse, NamespaceQuotaView, SubmitTemplate, HealthTemplate, ExecutorView, JobSummaryView, GlobalMetricsView, SystemMetricsView, MetricsTemplate, SqlQueryRequest, SqlQueryResponse, JobCheckpointsResponse, JobsFilter, JobsTemplate, JobTemplate, ExecutorDetailResponse, ExecutorTemplate, CheckpointsTemplate, JobDiagnoseTemplate, JobHistoryListResponse, JobHistoryView, HistoryTemplate, HistoryDetailTemplate, JobDetailView, ResourceUsageView, StageView, TaskView, ConnectorCapabilityView, hex_encode};
+use crate::views::{
+    CheckpointsTemplate, ConnectorCapabilityView, ExecutorDetailResponse, ExecutorTemplate,
+    ExecutorView, ExecutorsResponse, GlobalMetricsView, HealthTemplate, HistoryDetailTemplate,
+    HistoryTemplate, JobCheckpointsResponse, JobDetailResponse, JobDetailView, JobDiagnoseTemplate,
+    JobHistoryListResponse, JobHistoryView, JobSummaryView, JobTemplate, JobsFilter, JobsResponse,
+    JobsTemplate, MetricsTemplate, NamespaceQuotaView, Pagination, QueuesResponse,
+    ResourceUsageView, SqlQueryRequest, SqlQueryResponse, StageView, SubmitTemplate,
+    SystemMetricsView, TaskView, hex_encode,
+};
 use crate::{UiError, UiResult, UiState};
 
 pub(crate) async fn healthz() -> &'static str {
@@ -630,12 +638,7 @@ fn extract_columns_and_rows(
     if batches.is_empty() {
         return (vec![], vec![]);
     }
-    let columns: Vec<String> = batches[0]
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().to_string())
-        .collect();
+    let columns: Vec<String> = batches.first().map(|b| b.schema().fields().iter().map(|f| f.name().to_string()).collect()).unwrap_or_default();
     let mut rows = Vec::new();
     for batch in batches {
         for row_idx in 0..batch.num_rows() {
@@ -656,7 +659,11 @@ fn extract_columns_and_rows(
 }
 
 fn scalar_array_to_json(array: &dyn arrow::array::Array, idx: usize) -> serde_json::Value {
-    use arrow::array::{Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array, Float32Array, Float64Array, BooleanArray, StringArray, LargeStringArray, TimestampSecondArray};
+    use arrow::array::{
+        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeStringArray, StringArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array,
+    };
     use arrow::datatypes::DataType;
     match array.data_type() {
         DataType::Int8 => array

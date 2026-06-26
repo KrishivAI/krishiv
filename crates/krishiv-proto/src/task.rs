@@ -7,7 +7,10 @@ use crate::executor::{
     LlmThrottleCommand, StreamingProgressReport, StreamingTaskState, TaskOutputMetadata,
     TraceContext,
 };
-use crate::ids::{AttemptId, ExecutorId, FencingToken, IdError, JobId, LeaseGeneration, ProtoResult, StageId, TaskId, TransportVersion};
+use crate::ids::{
+    AttemptId, ExecutorId, FencingToken, IdError, JobId, LeaseGeneration, ProtoResult, StageId,
+    TaskId, TransportVersion,
+};
 use crate::io::{ShuffleReadConfig, ShuffleWriteConfig};
 use crate::lifecycle::{ExecutorState, TaskState};
 
@@ -25,7 +28,10 @@ impl KeyGroupRange {
     /// for fallible construction in production paths where inputs are not
     /// statically known to be valid.
     pub fn new(start: u32, end: u32) -> Self {
-        debug_assert!(start <= end, "KeyGroupRange::new: start must not exceed end");
+        debug_assert!(
+            start <= end,
+            "KeyGroupRange::new: start must not exceed end"
+        );
         Self { start, end }
     }
 

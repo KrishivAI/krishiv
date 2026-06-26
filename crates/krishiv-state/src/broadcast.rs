@@ -59,27 +59,37 @@ pub trait BroadcastBackend: Send + Sync + 'static {
 impl<B: StateBackend + Send + 'static> BroadcastBackend for Mutex<B> {
     fn get(&self, ns: &Namespace, key: &[u8]) -> StateResult<Option<Vec<u8>>> {
         self.lock()
-            .map_err(|e| crate::error::StateError::LockPoisoned { message: e.to_string() })?
+            .map_err(|e| crate::error::StateError::LockPoisoned {
+                message: e.to_string(),
+            })?
             .get(ns, key)
     }
     fn put(&self, ns: &Namespace, key: Vec<u8>, value: Vec<u8>) -> StateResult<()> {
         self.lock()
-            .map_err(|e| crate::error::StateError::LockPoisoned { message: e.to_string() })?
+            .map_err(|e| crate::error::StateError::LockPoisoned {
+                message: e.to_string(),
+            })?
             .put(ns, key, value)
     }
     fn delete(&self, ns: &Namespace, key: &[u8]) -> StateResult<()> {
         self.lock()
-            .map_err(|e| crate::error::StateError::LockPoisoned { message: e.to_string() })?
+            .map_err(|e| crate::error::StateError::LockPoisoned {
+                message: e.to_string(),
+            })?
             .delete(ns, key)
     }
     fn clear_namespace(&self, ns: &Namespace) -> StateResult<()> {
         self.lock()
-            .map_err(|e| crate::error::StateError::LockPoisoned { message: e.to_string() })?
+            .map_err(|e| crate::error::StateError::LockPoisoned {
+                message: e.to_string(),
+            })?
             .clear_namespace(ns)
     }
     fn list_keys(&self, ns: &Namespace) -> StateResult<Vec<Vec<u8>>> {
         self.lock()
-            .map_err(|e| crate::error::StateError::LockPoisoned { message: e.to_string() })?
+            .map_err(|e| crate::error::StateError::LockPoisoned {
+                message: e.to_string(),
+            })?
             .list_keys(ns)
     }
 }

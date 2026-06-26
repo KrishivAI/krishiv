@@ -183,7 +183,11 @@ impl AqeRule for SkewJoinRule {
         let median = Self::median_rows(stats);
         let effective_factor = hot
             .iter()
-            .map(|&idx| stats.get(idx).map_or(1, |s| self.salting_factor_for(s.input_rows, median)))
+            .map(|&idx| {
+                stats
+                    .get(idx)
+                    .map_or(1, |s| self.salting_factor_for(s.input_rows, median))
+            })
             .max()
             .unwrap_or(self.factor);
 

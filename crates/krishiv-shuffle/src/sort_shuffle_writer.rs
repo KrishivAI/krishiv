@@ -188,8 +188,12 @@ impl SortShuffleWriter {
         for (idx, part) in partitioned.into_iter().enumerate() {
             if part.num_rows() > 0 {
                 let est = estimated_batch_bytes(&part);
-                if let Some(b) = self.bucket_bytes.get_mut(idx) { *b += est; }
-                if let Some(b) = self.buckets.get_mut(idx) { b.push(part); }
+                if let Some(b) = self.bucket_bytes.get_mut(idx) {
+                    *b += est;
+                }
+                if let Some(b) = self.buckets.get_mut(idx) {
+                    b.push(part);
+                }
             }
         }
         // Spill if over budget.
@@ -214,14 +218,24 @@ impl SortShuffleWriter {
         }
         let seq = self.spill_seq;
         self.spill_seq += 1;
-        let spill_path = self
-            .output_dir
-            .join(format!("{}_{}_{idx}_spill{seq}.ipc", self.job_id, self.stage_id));
+        let spill_path = self.output_dir.join(format!(
+            "{}_{}_{idx}_spill{seq}.ipc",
+            self.job_id, self.stage_id
+        ));
 
-        let batches = self.buckets.get_mut(idx).map(std::mem::take).unwrap_or_default();
-        if let Some(b) = self.bucket_bytes.get_mut(idx) { *b = 0; }
+        let batches = self
+            .buckets
+            .get_mut(idx)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        if let Some(b) = self.bucket_bytes.get_mut(idx) {
+            *b = 0;
+        }
 
-        let schema = batches.first().ok_or_else(|| io_err("empty spill batches".to_string()))?.schema();
+        let schema = batches
+            .first()
+            .ok_or_else(|| io_err("empty spill batches".to_string()))?
+            .schema();
         let combined = arrow::compute::concat_batches(&schema, batches.iter())
             .map_err(|e| io_err(format!("spill concat failed: {e}")))?;
         let sorted = sort_by_key(&combined, &self.sort_key)?;
@@ -232,7 +246,9 @@ impl SortShuffleWriter {
                 spill_path.display()
             ))
         })?;
-        if let Some(f) = self.spill_files.get_mut(idx) { f.push(spill_path); }
+        if let Some(f) = self.spill_files.get_mut(idx) {
+            f.push(spill_path);
+        }
         Ok(())
     }
 
@@ -277,7 +293,10 @@ impl SortShuffleWriter {
             }
 
             // Concatenate and sort.
-            let schema = all_batches.first().ok_or_else(|| io_err("empty batch list".to_string()))?.schema();
+            let schema = all_batches
+                .first()
+                .ok_or_else(|| io_err("empty batch list".to_string()))?
+                .schema();
             let combined = arrow::compute::concat_batches(&schema, all_batches.iter())
                 .map_err(|e| io_err(format!("concat failed: {e}")))?;
             let sorted = sort_by_key(&combined, &self.sort_key)?;
@@ -369,9 +388,7 @@ fn read_ipc_file(path: &std::path::Path) -> ShuffleResult<Vec<RecordBatch>> {
         ))
     })?;
     reader
-        .map(|b| {
-            b.map_err(|e| io_err(format!("IPC read from '{}' failed: {e}", path.display())))
-        })
+        .map(|b| b.map_err(|e| io_err(format!("IPC read from '{}' failed: {e}", path.display()))))
         .collect()
 }
 
@@ -522,10 +539,9 @@ mod tests {
         // Use the builder with an explicit spill threshold of 1 byte so that
         // every push triggers a spill without touching process-global env state.
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = SortShuffleWriter::new_with_spill_threshold(
-            "job3", "stage1", "k", 2, dir.path(), 1,
-        )
-        .unwrap();
+        let mut writer =
+            SortShuffleWriter::new_with_spill_threshold("job3", "stage1", "k", 2, dir.path(), 1)
+                .unwrap();
 
         // Push two batches; each push will trigger a spill due to the tiny threshold.
         writer.push(make_batch(&[4, 2])).unwrap();

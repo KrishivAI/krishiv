@@ -106,7 +106,7 @@ impl HudiSnapshotReader {
                         }
                     }
                     if let Some(idx) = last_base_idx {
-                        for meta in &commit_metadata[idx..] {
+                        for meta in commit_metadata.get(idx..).unwrap_or(&[]) {
                             if let Some(base) = &meta.base_file {
                                 files.push(self.table_path.join(base));
                             } else if let Some(change) = &meta.change_file {

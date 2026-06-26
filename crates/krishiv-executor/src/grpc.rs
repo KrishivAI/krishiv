@@ -316,7 +316,7 @@ fn encode_ipc_batches(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::error::
         return Ok(vec![]);
     }
     use arrow::ipc::writer::StreamWriter;
-    let schema = batches.first().ok_or_else(|| Status::internal("empty batch list"))?.schema();
+    let schema = batches.first().ok_or_else(|| arrow::error::ArrowError::InvalidArgumentError("empty batches".to_string()))?.schema();
     let mut buf = Vec::new();
     let mut writer = StreamWriter::try_new(&mut buf, &schema)?;
     for batch in batches {

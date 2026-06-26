@@ -90,7 +90,9 @@ pub(crate) fn validate_plan(
             })?;
             dependents
                 .get_mut(input_index)
-                .ok_or_else(|| PlanError::Validation(format!("dependents index {input_index} out of range")))?
+                .ok_or_else(|| {
+                    PlanError::Validation(format!("dependents index {input_index} out of range"))
+                })?
                 .push(node_index);
         }
     }

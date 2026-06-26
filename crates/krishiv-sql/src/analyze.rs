@@ -177,9 +177,7 @@ fn string_values(array: &dyn Array) -> Box<dyn Iterator<Item = String> + '_> {
             if array.is_null(i) {
                 None
             } else {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int32Array>()?;
+                let arr = array.as_any().downcast_ref::<arrow::array::Int32Array>()?;
                 Some(arr.value(i).to_string())
             }
         })),
@@ -187,9 +185,7 @@ fn string_values(array: &dyn Array) -> Box<dyn Iterator<Item = String> + '_> {
             if array.is_null(i) {
                 None
             } else {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()?;
+                let arr = array.as_any().downcast_ref::<arrow::array::Int64Array>()?;
                 Some(arr.value(i).to_string())
             }
         })),
@@ -207,9 +203,7 @@ fn string_values(array: &dyn Array) -> Box<dyn Iterator<Item = String> + '_> {
             if array.is_null(i) {
                 None
             } else {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()?;
+                let arr = array.as_any().downcast_ref::<arrow::array::StringArray>()?;
                 Some(arr.value(i).to_string())
             }
         })),

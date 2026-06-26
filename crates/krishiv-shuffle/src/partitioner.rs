@@ -409,9 +409,9 @@ impl SaltedHashPartitioner {
         result.resize_with(total, || RecordBatch::new_empty(schema.clone()));
 
         for salt in &self.salts {
-            let hot = base
-                .get(salt.partition_id as usize)
-                .ok_or_else(|| crate::error::io_err(format!("hot partition {} out of range", salt.partition_id)))?;
+            let hot = base.get(salt.partition_id as usize).ok_or_else(|| {
+                crate::error::io_err(format!("hot partition {} out of range", salt.partition_id))
+            })?;
             if hot.num_rows() == 0 {
                 continue;
             }
@@ -420,15 +420,18 @@ impl SaltedHashPartitioner {
             // Round-robin row assignment across the k sub-partitions.
             let mut per_sub: Vec<Vec<u32>> = vec![Vec::new(); k];
             for row in 0..hot.num_rows() {
-                if let Some(v) = per_sub.get_mut(row % k) { v.push(row as u32); }
+                if let Some(v) = per_sub.get_mut(row % k) {
+                    v.push(row as u32);
+                }
             }
             for (sub_idx, rows) in per_sub.iter().enumerate() {
-                let target = sub_ids
-                    .get(sub_idx)
-                    .copied()
-                    .ok_or_else(|| crate::error::io_err(format!("sub_id index {sub_idx} out of range")))? as usize;
+                let target = sub_ids.get(sub_idx).copied().ok_or_else(|| {
+                    crate::error::io_err(format!("sub_id index {sub_idx} out of range"))
+                })? as usize;
                 if rows.is_empty() {
-                    *result.get_mut(target).ok_or_else(|| crate::error::io_err(format!("result index {target} out of range")))? = RecordBatch::new_empty(schema.clone());
+                    *result.get_mut(target).ok_or_else(|| {
+                        crate::error::io_err(format!("result index {target} out of range"))
+                    })? = RecordBatch::new_empty(schema.clone());
                     continue;
                 }
                 let index_arr = UInt32Array::from_iter_values(rows.iter().copied());
@@ -440,7 +443,9 @@ impl SaltedHashPartitioner {
                             .map_err(|e| crate::error::io_err(e.to_string()))
                     })
                     .collect::<ShuffleResult<_>>()?;
-                *result.get_mut(target).ok_or_else(|| crate::error::io_err(format!("result index {target} out of range")))? = RecordBatch::try_new(schema.clone(), columns)
+                *result.get_mut(target).ok_or_else(|| {
+                    crate::error::io_err(format!("result index {target} out of range"))
+                })? = RecordBatch::try_new(schema.clone(), columns)
                     .map_err(|e| crate::error::io_err(e.to_string()))?;
             }
         }
@@ -483,7 +488,9 @@ fn fill_buckets<F>(
     }
     for row in 0..num_rows {
         let bucket = bucket_fn(row).0 as usize;
-        if let Some(v) = bucket_indices.get_mut(bucket) { v.push(row as u32); }
+        if let Some(v) = bucket_indices.get_mut(bucket) {
+            v.push(row as u32);
+        }
     }
 }
 

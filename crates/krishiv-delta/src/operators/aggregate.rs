@@ -361,7 +361,10 @@ fn build_output_batch(
     // output schema's declared type so downstream operators see correct types.
     let mut cols: Vec<Arc<dyn Array>> = Vec::new();
     for gi in 0..n_group {
-        let vals: Vec<Option<&str>> = group_rows.iter().map(|r| r.get(gi).and_then(|s| s.as_deref())).collect();
+        let vals: Vec<Option<&str>> = group_rows
+            .iter()
+            .map(|r| r.get(gi).and_then(|s| s.as_deref()))
+            .collect();
         let string_col: Arc<dyn Array> = Arc::new(StringArray::from(vals));
         let target = output_schema.field(gi).data_type();
         if target == &DataType::Utf8 || target == &DataType::LargeUtf8 {
@@ -382,7 +385,10 @@ fn build_output_batch(
                 cols.push(Arc::new(vals) as Arc<dyn Array>);
             }
             _ => {
-                let vals: Float64Array = agg_values.iter().map(|row| row.get(ai).copied().flatten()).collect();
+                let vals: Float64Array = agg_values
+                    .iter()
+                    .map(|row| row.get(ai).copied().flatten())
+                    .collect();
                 cols.push(Arc::new(vals) as Arc<dyn Array>);
             }
         }

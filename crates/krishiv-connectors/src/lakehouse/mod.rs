@@ -330,7 +330,7 @@ impl MemoryLakehouseTableState {
             .iter()
             .rposition(|layer| layer.replace_all)
             .unwrap_or(0);
-        eligible[start..]
+        eligible.get(start..).unwrap_or(&[])
             .iter()
             .flat_map(|layer| layer.batches.iter().cloned())
             .collect()
@@ -824,7 +824,10 @@ fn update_mutation_rows(
             batch.schema().field(index).data_type(),
             batch.num_rows(),
         )?;
-        let original_data = columns[index].to_data();
+        let col = columns.get(index).ok_or_else(|| LakehouseError::SchemaConflict {
+            message: format!("column index {index} out of range"),
+        })?;
+        let original_data = col.to_data();
         let replacement_data = replacement.to_data();
         let mut mutable = arrow::array::MutableArrayData::new(
             vec![&original_data, &replacement_data],
@@ -834,7 +837,9 @@ fn update_mutation_rows(
         for (row, matched) in matches.iter().enumerate() {
             mutable.extend(usize::from(*matched), row, row + 1);
         }
-        columns[index] = arrow::array::make_array(mutable.freeze());
+        if let Some(slot) = columns.get_mut(index) {
+            *slot = arrow::array::make_array(mutable.freeze());
+        }
     }
     RecordBatch::try_new(batch.schema(), columns)
         .map_err(|error| LakehouseError::Io(error.to_string()))

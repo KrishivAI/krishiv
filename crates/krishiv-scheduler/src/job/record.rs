@@ -784,12 +784,12 @@ impl StageRecord {
             let task_failure_count = task.failure_count;
 
             if task_failure_count < max_task_attempts {
-                let task = self
-                    .tasks
-                    .get_mut(task_idx)
-                    .ok_or_else(|| SchedulerError::UnknownTask {
-                        task_id: update.task_id().clone(),
-                    })?;
+                let task =
+                    self.tasks
+                        .get_mut(task_idx)
+                        .ok_or_else(|| SchedulerError::UnknownTask {
+                            task_id: update.task_id().clone(),
+                        })?;
                 task.state = TaskState::Pending;
                 task.assigned_executor = None;
                 task.launch_in_flight = false;

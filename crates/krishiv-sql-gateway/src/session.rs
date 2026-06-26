@@ -168,7 +168,8 @@ impl PooledSession<'_> {
     }
 
     pub fn session(&self) -> GatewayResult<&Session> {
-        Ok(self.session
+        Ok(self
+            .session
             .as_ref()
             .ok_or_else(|| GatewayError {
                 sqlstate: INTERNAL_ERROR.to_string(),

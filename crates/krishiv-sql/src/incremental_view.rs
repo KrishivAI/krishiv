@@ -321,7 +321,9 @@ fn find_lateness_clause_start(upper: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = 0usize;
     while i + keyword.len() <= bytes.len() {
-        let Some(&b) = bytes.get(i) else { break; };
+        let Some(&b) = bytes.get(i) else {
+            break;
+        };
         match b {
             b'(' => {
                 depth += 1;
@@ -332,7 +334,8 @@ fn find_lateness_clause_start(upper: &str) -> Option<usize> {
                 i += 1;
             }
             _ if depth == 0 && bytes.get(i..).is_some_and(|s| s.starts_with(keyword)) => {
-                let before_ok = i == 0 || bytes.get(i - 1).is_some_and(|b| !b.is_ascii_alphanumeric());
+                let before_ok =
+                    i == 0 || bytes.get(i - 1).is_some_and(|b| !b.is_ascii_alphanumeric());
                 let after = i + keyword.len();
                 let after_ok = bytes.get(after).is_none_or(|b| !b.is_ascii_alphanumeric());
                 if before_ok && after_ok {
@@ -370,7 +373,12 @@ fn parse_lateness_clauses(lateness_str: &str) -> SqlResult<Vec<LatenessAnnotatio
         if tokens.len() < 4 {
             break;
         }
-        let col = tokens.first().copied().unwrap_or("").trim_matches(',').to_string();
+        let col = tokens
+            .first()
+            .copied()
+            .unwrap_or("")
+            .trim_matches(',')
+            .to_string();
         // tokens[1] should be INTERVAL (case-insensitive)
         let interval_str = tokens.get(2).copied().unwrap_or("").trim_matches('\'');
         let unit_str = tokens.get(3).copied().unwrap_or("").trim_matches(',');

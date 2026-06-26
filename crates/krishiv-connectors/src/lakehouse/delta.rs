@@ -192,7 +192,7 @@ impl RocksDbDeltaStore {
         for item in db.iterator(IteratorMode::Start) {
             let Ok((k, _)) = item else { continue };
             if k.starts_with(prefix) && k.len() == prefix.len() + 8 {
-                let seq = u64::from_le_bytes(k[prefix.len()..].try_into().unwrap_or([0u8; 8]));
+                let seq = k.get(prefix.len()..).and_then(|s| <[u8; 8]>::try_from(s).ok()).map(u64::from_le_bytes).unwrap_or(0);
                 if seq >= max {
                     max = seq + 1;
                 }
@@ -304,7 +304,7 @@ impl DeltaStore for KafkaDeltaStore {
 
 #[cfg(feature = "kafka")]
 mod kafka_delta {
-    use super::{LakehouseError, DeltaStore, RecordBatch, DeltaOp, encode_entry, DeltaEntry};
+    use super::{DeltaEntry, DeltaOp, DeltaStore, LakehouseError, RecordBatch, encode_entry};
     use std::sync::Mutex;
 
     use rdkafka::ClientConfig;

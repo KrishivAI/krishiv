@@ -232,10 +232,7 @@ impl TemporalJoinOperator {
         }
 
         // Combine all row columns into full columns.
-        let total_cols = output_columns
-            .first()
-            .map(|r| r.len())
-            .unwrap_or(0);
+        let total_cols = output_columns.first().map(|r| r.len()).unwrap_or(0);
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(total_cols);
         for col_idx in 0..total_cols {
             let col_arrays: Vec<_> = output_columns

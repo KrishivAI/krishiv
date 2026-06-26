@@ -346,9 +346,9 @@ impl ContinuousWindowExecutor {
         // that `agg_is_float` reflects the actual aggregate input types instead
         // of hardcoding `false` (which silently truncates Float64 to Int64).
         if self.operator.is_none() && !input_batches.is_empty() {
-            let first = input_batches.first().ok_or_else(|| {
-                crate::ExecError::InvalidInput("empty input_batches".into())
-            })?;
+            let first = input_batches
+                .first()
+                .ok_or_else(|| crate::ExecError::InvalidInput("empty input_batches".into()))?;
             let agg_is_float = infer_agg_is_float(first, &self.agg_exprs)?;
             let mut op = build_operator(
                 &self.spec,

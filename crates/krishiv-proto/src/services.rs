@@ -5,8 +5,8 @@ use crate::executor::{DeregisterExecutorRequest, DeregisterExecutorResponse};
 use crate::task::{
     DrainContinuousOutputRequest, DrainContinuousOutputResponse, ExecutorHeartbeatRequest,
     ExecutorHeartbeatResponse, ExecutorTaskAssignment, PushContinuousInputRequest,
-    RegisterExecutorRequest, RegisterExecutorResponse, TaskCancellationRequest,
-    TaskStatusRequest, TaskStatusResponse,
+    RegisterExecutorRequest, RegisterExecutorResponse, TaskCancellationRequest, TaskStatusRequest,
+    TaskStatusResponse,
 };
 
 /// Tonic-shaped coordinator service implemented by the active job coordinator.

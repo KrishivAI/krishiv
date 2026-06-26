@@ -165,17 +165,22 @@ impl StateBackend for InMemoryStateBackend {
         let entry_count = self.data.len() as u64;
         let mut buf = Vec::new();
         buf.write_all(&1u32.to_le_bytes()).map_err(snap_err)?;
-        buf.write_all(&entry_count.to_le_bytes()).map_err(snap_err)?;
+        buf.write_all(&entry_count.to_le_bytes())
+            .map_err(snap_err)?;
         for ((ns, key), value) in &self.data {
             let op_id = ns.operator_id().as_bytes();
             let name = ns.state_name().as_bytes();
-            buf.write_all(&(op_id.len() as u64).to_le_bytes()).map_err(snap_err)?;
+            buf.write_all(&(op_id.len() as u64).to_le_bytes())
+                .map_err(snap_err)?;
             buf.write_all(op_id).map_err(snap_err)?;
-            buf.write_all(&(name.len() as u64).to_le_bytes()).map_err(snap_err)?;
+            buf.write_all(&(name.len() as u64).to_le_bytes())
+                .map_err(snap_err)?;
             buf.write_all(name).map_err(snap_err)?;
-            buf.write_all(&(key.len() as u64).to_le_bytes()).map_err(snap_err)?;
+            buf.write_all(&(key.len() as u64).to_le_bytes())
+                .map_err(snap_err)?;
             buf.write_all(key).map_err(snap_err)?;
-            buf.write_all(&(value.len() as u64).to_le_bytes()).map_err(snap_err)?;
+            buf.write_all(&(value.len() as u64).to_le_bytes())
+                .map_err(snap_err)?;
             buf.write_all(value).map_err(snap_err)?;
         }
         Ok(buf)

@@ -63,8 +63,14 @@ impl OptimizerRule for JoinReorderRule {
                 continue;
             }
 
-            let left_rows = inputs.first().and_then(|id| row_estimates.get(id.as_str()).copied()).unwrap_or(u64::MAX);
-            let right_rows = inputs.get(1).and_then(|id| row_estimates.get(id.as_str()).copied()).unwrap_or(u64::MAX);
+            let left_rows = inputs
+                .first()
+                .and_then(|id| row_estimates.get(id.as_str()).copied())
+                .unwrap_or(u64::MAX);
+            let right_rows = inputs
+                .get(1)
+                .and_then(|id| row_estimates.get(id.as_str()).copied())
+                .unwrap_or(u64::MAX);
 
             // Swap when the right input is strictly smaller than the left.
             // After the swap the smaller table is on the left, which is the

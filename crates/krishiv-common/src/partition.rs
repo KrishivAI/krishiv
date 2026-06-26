@@ -280,9 +280,7 @@ pub fn partition_record_batches_by_key(
                 .push(row_idx);
         }
 
-        for (shard_idx, (shard, indices)) in
-            shards.iter_mut().zip(row_indices).enumerate()
-        {
+        for (shard_idx, (shard, indices)) in shards.iter_mut().zip(row_indices).enumerate() {
             if indices.is_empty() {
                 continue;
             }

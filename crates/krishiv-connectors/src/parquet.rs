@@ -428,7 +428,7 @@ impl ParquetDirectorySource {
         file_index: usize,
         skip: usize,
     ) -> ConnectorResult<ParquetRecordBatchReader> {
-        let path = &files[file_index];
+        let path = files.get(file_index).ok_or_else(|| ConnectorError::Parquet(format!("file_index {file_index} out of range")))?;
         let mut reader = Self::open_reader_at(path)?;
         for seen in 0..skip {
             match reader.next() {
@@ -487,14 +487,15 @@ impl Source for ParquetDirectorySource {
             match reader.next() {
                 Some(Ok(batch)) => {
                     self.batch_index = self.batch_index.saturating_add(1);
-                    let parts = discover_hive_partitions(&self.root, &self.files[self.file_index]);
+                    let file_path = self.files.get(self.file_index).ok_or_else(|| ConnectorError::Parquet(format!("file_index {} out of range", self.file_index)))?;
+                    let parts = discover_hive_partitions(&self.root, file_path);
                     let batch = inject_partition_columns(batch, &parts)?;
                     return Ok(Some(batch));
                 }
                 Some(Err(e)) => {
+                    let file_display = self.files.get(self.file_index).map(|p| p.display().to_string()).unwrap_or_default();
                     return Err(ConnectorError::Parquet(format!(
-                        "error reading batch from '{}': {e}",
-                        self.files[self.file_index].display()
+                        "error reading batch from '{file_display}': {e}"
                     )));
                 }
                 None => {

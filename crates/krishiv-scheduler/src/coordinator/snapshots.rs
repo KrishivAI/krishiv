@@ -1,4 +1,7 @@
-use super::{Coordinator, JobId, SchedulerResult, JobSnapshot, SchedulerError, JobDetailSnapshot, ExecutorRecord, StabilityMetrics, TaskState, JobState, NamespaceQuotaSnapshot, Arc, AdaptiveDecisionLog};
+use super::{
+    AdaptiveDecisionLog, Arc, Coordinator, ExecutorRecord, JobDetailSnapshot, JobId, JobSnapshot,
+    JobState, NamespaceQuotaSnapshot, SchedulerError, SchedulerResult, StabilityMetrics, TaskState,
+};
 
 impl Coordinator {
     /// Snapshot one job.

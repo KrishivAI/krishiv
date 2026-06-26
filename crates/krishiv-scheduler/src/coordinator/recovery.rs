@@ -1,4 +1,8 @@
-use super::{Coordinator, MetadataStore, SchedulerResult, Arc, JobId, JobKind, JobState, CheckpointCoordinator, ExecutorId, TaskState, SchedulerError, CheckpointStorage, open_checkpoint_storage_from_uri};
+use super::{
+    Arc, CheckpointCoordinator, CheckpointStorage, Coordinator, ExecutorId, JobId, JobKind,
+    JobState, MetadataStore, SchedulerError, SchedulerResult, TaskState,
+    open_checkpoint_storage_from_uri,
+};
 use crate::job_coordinator::JobCoordinator;
 
 impl Coordinator {

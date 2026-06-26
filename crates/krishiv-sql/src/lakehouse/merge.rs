@@ -47,7 +47,9 @@ pub struct MergeTargetUnsupportedError {
 pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec<RecordBatch>> {
     let caps = MERGE_RE
         .as_ref()
-        .ok_or_else(|| SqlError::DataFusion { message: "MERGE regex failed to compile".into() })?
+        .ok_or_else(|| SqlError::DataFusion {
+            message: "MERGE regex failed to compile".into(),
+        })?
         .captures(sql)
         .ok_or_else(|| SqlError::Unsupported {
             feature: "MERGE INTO syntax".into(),
@@ -167,7 +169,7 @@ async fn dry_run_merge(
         return Ok(MergeResult::default());
     }
 
-    let source_schema = source_batches[0].schema();
+    let source_schema = source_batches.first().ok_or_else(|| SqlError::DataFusion { message: "empty source batches".into() })?.schema();
     let source_batch =
         concat_batches(&source_schema, &source_batches).map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
@@ -213,7 +215,7 @@ async fn dry_run_merge(
         if existing.is_empty() {
             0
         } else {
-            let existing_schema = existing[0].schema();
+            let existing_schema = existing.first().ok_or_else(|| SqlError::DataFusion { message: "empty existing batches".into() })?.schema();
             let tb =
                 concat_batches(&existing_schema, &existing).map_err(|e| SqlError::DataFusion {
                     message: e.to_string(),

@@ -179,7 +179,12 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while self.pos < self.bytes.len() && self.bytes.get(self.pos).is_some_and(|b| b.is_ascii_whitespace()) {
+        while self.pos < self.bytes.len()
+            && self
+                .bytes
+                .get(self.pos)
+                .is_some_and(|b| b.is_ascii_whitespace())
+        {
             self.pos += 1;
         }
     }
@@ -208,10 +213,19 @@ impl<'a> Parser<'a> {
 
     fn eat_kw(&mut self, kw: &[u8]) -> bool {
         self.skip_ws();
-        if self.bytes.get(self.pos..).is_some_and(|s| s.starts_with(kw)) {
+        if self
+            .bytes
+            .get(self.pos..)
+            .is_some_and(|s| s.starts_with(kw))
+        {
             // Must be followed by whitespace or eof to avoid eating `note` as `not`.
             let after = self.pos + kw.len();
-            if after == self.bytes.len() || self.bytes.get(after).is_none_or(|b| b.is_ascii_whitespace()) {
+            if after == self.bytes.len()
+                || self
+                    .bytes
+                    .get(after)
+                    .is_none_or(|b| b.is_ascii_whitespace())
+            {
                 self.pos = after;
                 return true;
             }
@@ -458,9 +472,13 @@ impl<'a> Parser<'a> {
             if !self.eat(b'\'') {
                 return Err(());
             }
-            let s = std::str::from_utf8(self.bytes.get(start..self.pos.saturating_sub(1)).ok_or(())?)
-                .map_err(|_| ())?
-                .to_string();
+            let s = std::str::from_utf8(
+                self.bytes
+                    .get(start..self.pos.saturating_sub(1))
+                    .ok_or(())?,
+            )
+            .map_err(|_| ())?
+            .to_string();
             return Ok(FoldValue::Str(s));
         }
         // Integer literal.
@@ -473,7 +491,8 @@ impl<'a> Parser<'a> {
             }
         }
         if start < self.pos {
-            let s = std::str::from_utf8(self.bytes.get(start..self.pos).ok_or(())?).map_err(|_| ())?;
+            let s =
+                std::str::from_utf8(self.bytes.get(start..self.pos).ok_or(())?).map_err(|_| ())?;
             return s.parse::<i64>().map(FoldValue::Int).map_err(|_| ());
         }
         // Identifier — could be a column reference or a function call.

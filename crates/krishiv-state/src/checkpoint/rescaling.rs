@@ -195,9 +195,12 @@ pub fn redistribute_snapshots(
             match routing_key(&entry.2, routing) {
                 Some(key) => {
                     let task = rescaler.task_for_key_group(key_group_for_key(key)) as usize;
-                    routed.get_mut(task).ok_or_else(|| StateError::SnapshotCorrupt {
-                        message: format!("task index {task} out of range"),
-                    })?.push(entry);
+                    routed
+                        .get_mut(task)
+                        .ok_or_else(|| StateError::SnapshotCorrupt {
+                            message: format!("task index {task} out of range"),
+                        })?
+                        .push(entry);
                     routed_total += 1;
                 }
                 None => broadcast.push(entry),
@@ -222,15 +225,19 @@ pub fn redistribute_snapshots(
                 if existing.3.len() == 8 && entry.3.len() == 8 {
                     let old_bytes: [u8; 8] = {
                         let mut arr = [0u8; 8];
-                        arr.copy_from_slice(existing.3.get(..8).ok_or_else(|| StateError::SnapshotCorrupt {
-                            message: "watermark value is not 8 bytes".into(),
+                        arr.copy_from_slice(existing.3.get(..8).ok_or_else(|| {
+                            StateError::SnapshotCorrupt {
+                                message: "watermark value is not 8 bytes".into(),
+                            }
                         })?);
                         arr
                     };
                     let new_bytes: [u8; 8] = {
                         let mut arr = [0u8; 8];
-                        arr.copy_from_slice(entry.3.get(..8).ok_or_else(|| StateError::SnapshotCorrupt {
-                            message: "watermark value is not 8 bytes".into(),
+                        arr.copy_from_slice(entry.3.get(..8).ok_or_else(|| {
+                            StateError::SnapshotCorrupt {
+                                message: "watermark value is not 8 bytes".into(),
+                            }
                         })?);
                         arr
                     };

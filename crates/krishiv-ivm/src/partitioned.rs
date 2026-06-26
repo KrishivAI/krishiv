@@ -118,7 +118,11 @@ impl PartitionedIncrementalFlow {
     /// Feed a delta, routing each row to its shard by the key column.
     pub fn feed(&self, source: &str, delta: DeltaBatch) -> IvmResult<()> {
         if self.shards.len() == 1 {
-            return self.shards.first().ok_or_else(|| IvmError::execution("no shards".to_string()))?.feed(source, delta);
+            return self
+                .shards
+                .first()
+                .ok_or_else(|| IvmError::execution("no shards".to_string()))?
+                .feed(source, delta);
         }
         // Split the weighted inner batch by the key column using the shared
         // keyed partitioner (`take` preserves the trailing `_weight` column).
@@ -132,7 +136,10 @@ impl PartitionedIncrementalFlow {
                 }
                 let shard_delta = DeltaBatch::from_weighted(batch)
                     .map_err(|e| IvmError::execution(e.to_string()))?;
-                self.shards.get(shard_idx).ok_or_else(|| IvmError::execution(format!("shard {shard_idx} out of range")))?.feed(source, shard_delta)?;
+                self.shards
+                    .get(shard_idx)
+                    .ok_or_else(|| IvmError::execution(format!("shard {shard_idx} out of range")))?
+                    .feed(source, shard_delta)?;
             }
         }
         Ok(())
@@ -167,7 +174,9 @@ impl PartitionedIncrementalFlow {
         if non_empty.is_empty() {
             return Ok(());
         }
-        let first = non_empty.first().ok_or_else(|| IvmError::execution("empty".to_string()))?;
+        let first = non_empty
+            .first()
+            .ok_or_else(|| IvmError::execution("empty".to_string()))?;
         let schema = first.schema();
         let new_snapshot = if non_empty.len() == 1 {
             (*first).clone()
@@ -238,7 +247,10 @@ impl PartitionedIncrementalFlow {
         if parts.is_empty() {
             return Ok(None);
         }
-        let schema = parts.first().ok_or_else(|| IvmError::execution("empty parts".to_string()))?.schema();
+        let schema = parts
+            .first()
+            .ok_or_else(|| IvmError::execution("empty parts".to_string()))?
+            .schema();
         let merged = arrow::compute::concat_batches(&schema, &parts)
             .map_err(|e| IvmError::execution(e.to_string()))?;
         Ok(Some(merged))

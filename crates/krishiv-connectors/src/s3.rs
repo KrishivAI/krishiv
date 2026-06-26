@@ -318,7 +318,7 @@ impl S3PrefixSource {
         if self.current_stream.is_none() && self.file_index < self.objects.len() {
             let stream = Self::stream_skipped_to(
                 Arc::clone(&self.store),
-                &self.objects[self.file_index],
+                self.objects.get(self.file_index).ok_or_else(|| ConnectorError::Parquet(format!("file_index {} out of range", self.file_index)))?,
                 self.batch_index,
             )
             .await?;
@@ -332,7 +332,7 @@ impl S3PrefixSource {
             return vec![];
         }
         // Convert object path to a local-path-like structure for partition parsing.
-        let obj_path_str = self.objects[self.file_index].location.as_ref();
+        let obj_path_str = self.objects.get(self.file_index).map(|o| o.location.as_ref()).unwrap_or("");
         let prefix_str = self.prefix.as_ref();
         // Strip the prefix and parse key=value segments.
         let relative = obj_path_str
@@ -385,7 +385,7 @@ impl Source for S3PrefixSource {
                 Some(Err(e)) => {
                     return Err(ConnectorError::Parquet(format!(
                         "error reading batch from '{}': {e}",
-                        self.objects[self.file_index].location
+                        self.objects.get(self.file_index).map(|o| o.location.as_ref()).unwrap_or("")
                     )));
                 }
                 None => {

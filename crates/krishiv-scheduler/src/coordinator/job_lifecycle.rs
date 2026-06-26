@@ -1,4 +1,10 @@
-use super::{Coordinator, JobSpec, SchedulerResult, SubmitOutcome, validate_job, SchedulerError, CheckpointCoordinator, JobKind, JobRecord, SlotAwareScheduler, EventLogEvent, Arc, JOBS_SUBMITTED_TOTAL, AtomicOrdering, JobId, JobState, TaskStatusUpdate, TaskUpdateOutcome, TaskState, StageState, ResourceUsage, AttemptId, LogicalPlan, job_spec_from_logical_plan, PhysicalPlan, job_spec_from_physical_plan};
+use super::{
+    Arc, AtomicOrdering, AttemptId, CheckpointCoordinator, Coordinator, EventLogEvent,
+    JOBS_SUBMITTED_TOTAL, JobId, JobKind, JobRecord, JobSpec, JobState, LogicalPlan, PhysicalPlan,
+    ResourceUsage, SchedulerError, SchedulerResult, SlotAwareScheduler, StageState, SubmitOutcome,
+    TaskState, TaskStatusUpdate, TaskUpdateOutcome, job_spec_from_logical_plan,
+    job_spec_from_physical_plan, validate_job,
+};
 
 impl Coordinator {
     #[tracing::instrument(
