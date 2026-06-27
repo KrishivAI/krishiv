@@ -800,6 +800,9 @@ mod operator_tests {
             savepoint_label: None,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
+            unaligned_buffer_refs: Vec::new(),
+            sink_transactions: Vec::new(),
+            streaming_profile: None,
         };
         // Epoch 1 commit succeeds (current token = 1, meta token = 1).
         assert!(validate_fencing_token(&meta_epoch1, coord_a.fencing_token()).is_ok());

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use super::partition::{TASK_FAILURE_MESSAGE_MAX_BYTES, format_failure_message};
 use super::*;
 use crate::ExecutorAssignmentInbox;
+use krishiv_proto::CheckpointAlignment;
 
 #[test]
 fn format_failure_message_basic() {
@@ -200,8 +201,21 @@ fn task_runner_new() {
     let runner = TaskRunner::new(task_id.clone());
     assert_eq!(runner.task_id, task_id);
     assert_eq!(runner.last_acked_epoch, 0);
+    assert!(runner.source_offsets.is_empty());
     assert!(runner.kafka_source_offsets.is_empty());
     assert!(runner.operator_id.starts_with("operator-"));
+}
+
+#[test]
+fn task_runner_with_source_offsets() {
+    let task_id = krishiv_proto::TaskId::try_new("task-1").unwrap();
+    let offset = krishiv_proto::CheckpointSourceOffset {
+        partition_id: krishiv_proto::PartitionId::try_new("source-partition-0").unwrap(),
+        offset: 2,
+        encoded_offset: 2_u64.to_le_bytes().to_vec(),
+    };
+    let runner = TaskRunner::new(task_id).with_source_offsets(vec![offset.clone()]);
+    assert_eq!(runner.source_offsets, vec![offset]);
 }
 
 #[test]
@@ -234,6 +248,7 @@ fn task_runner_handle_checkpoint_stale_epoch() {
         job_id: krishiv_proto::JobId::try_new("job-1").unwrap(),
         epoch: 3,
         fencing_token: krishiv_proto::FencingToken::initial(),
+        alignment: CheckpointAlignment::default(),
     };
     let state = CheckpointStateHandle::from_backend(
         krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
@@ -254,6 +269,7 @@ fn task_runner_handle_checkpoint_new_epoch() {
         job_id: krishiv_proto::JobId::try_new("job-1").unwrap(),
         epoch: 1,
         fencing_token: krishiv_proto::FencingToken::initial(),
+        alignment: CheckpointAlignment::default(),
     };
     let state = CheckpointStateHandle::from_backend(
         krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),

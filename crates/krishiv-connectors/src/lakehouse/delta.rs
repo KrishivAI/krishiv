@@ -192,7 +192,11 @@ impl RocksDbDeltaStore {
         for item in db.iterator(IteratorMode::Start) {
             let Ok((k, _)) = item else { continue };
             if k.starts_with(prefix) && k.len() == prefix.len() + 8 {
-                let seq = k.get(prefix.len()..).and_then(|s| <[u8; 8]>::try_from(s).ok()).map(u64::from_le_bytes).unwrap_or(0);
+                let seq = k
+                    .get(prefix.len()..)
+                    .and_then(|s| <[u8; 8]>::try_from(s).ok())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0);
                 if seq >= max {
                     max = seq + 1;
                 }

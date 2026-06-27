@@ -185,6 +185,10 @@ impl Source for S3Source {
             .with_checkpoint()
     }
 
+    fn source_schema(&self) -> Option<SchemaRef> {
+        self.schema()
+    }
+
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
         let stream = self.ensure_stream().await?;
         match stream.next().await {
@@ -206,6 +210,14 @@ impl Source for S3Source {
         Some(Box::new(ParquetOffset {
             batch_index: self.cursor,
         }))
+    }
+
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        CheckpointSource::encoded_checkpoint_offset(self).map(Some)
+    }
+
+    fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        CheckpointSource::restore_encoded_offset(self, encoded)
     }
 
     /// Reset the cursor to the beginning so the source can be read again.
@@ -318,7 +330,9 @@ impl S3PrefixSource {
         if self.current_stream.is_none() && self.file_index < self.objects.len() {
             let stream = Self::stream_skipped_to(
                 Arc::clone(&self.store),
-                self.objects.get(self.file_index).ok_or_else(|| ConnectorError::Parquet(format!("file_index {} out of range", self.file_index)))?,
+                self.objects.get(self.file_index).ok_or_else(|| {
+                    ConnectorError::Parquet(format!("file_index {} out of range", self.file_index))
+                })?,
                 self.batch_index,
             )
             .await?;
@@ -332,7 +346,11 @@ impl S3PrefixSource {
             return vec![];
         }
         // Convert object path to a local-path-like structure for partition parsing.
-        let obj_path_str = self.objects.get(self.file_index).map(|o| o.location.as_ref()).unwrap_or("");
+        let obj_path_str = self
+            .objects
+            .get(self.file_index)
+            .map(|o| o.location.as_ref())
+            .unwrap_or("");
         let prefix_str = self.prefix.as_ref();
         // Strip the prefix and parse key=value segments.
         let relative = obj_path_str
@@ -385,7 +403,10 @@ impl Source for S3PrefixSource {
                 Some(Err(e)) => {
                     return Err(ConnectorError::Parquet(format!(
                         "error reading batch from '{}': {e}",
-                        self.objects.get(self.file_index).map(|o| o.location.as_ref()).unwrap_or("")
+                        self.objects
+                            .get(self.file_index)
+                            .map(|o| o.location.as_ref())
+                            .unwrap_or("")
                     )));
                 }
                 None => {
@@ -402,6 +423,14 @@ impl Source for S3PrefixSource {
             file_index: self.file_index,
             batch_index: self.batch_index,
         }))
+    }
+
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        CheckpointSource::encoded_checkpoint_offset(self).map(Some)
+    }
+
+    fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        CheckpointSource::restore_encoded_offset(self, encoded)
     }
 
     fn reset(&mut self) {

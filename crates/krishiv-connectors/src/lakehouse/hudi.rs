@@ -1035,14 +1035,19 @@ fn concat_batches(batches: &[RecordBatch]) -> LakehouseResult<RecordBatch> {
             arrow::datatypes::Schema::empty(),
         )));
     }
-    let schema = batches.first().ok_or_else(|| LakehouseError::Io("empty batches".to_string()))?.schema();
+    let schema = batches
+        .first()
+        .ok_or_else(|| LakehouseError::Io("empty batches".to_string()))?
+        .schema();
     for batch in batches.iter().skip(1) {
         ensure_same_schema(schema.clone(), batch.schema())?;
     }
     let mut columns: Vec<Vec<Arc<dyn Array>>> = vec![Vec::new(); schema.fields().len()];
     for batch in batches {
         for (idx, column) in batch.columns().iter().enumerate() {
-            if let Some(v) = columns.get_mut(idx) { v.push(column.clone()); }
+            if let Some(v) = columns.get_mut(idx) {
+                v.push(column.clone());
+            }
         }
     }
     let arrays = columns
@@ -1124,7 +1129,12 @@ fn validate_instant(instant: &str) -> LakehouseResult<()> {
         )));
     }
     let bytes = instant.as_bytes();
-    if !bytes.get(..17).unwrap_or(&[]).iter().all(|b| b.is_ascii_digit()) {
+    if !bytes
+        .get(..17)
+        .unwrap_or(&[])
+        .iter()
+        .all(|b| b.is_ascii_digit())
+    {
         return Err(LakehouseError::Io(format!(
             "invalid Hudi instant '{instant}': first 17 chars must be digits (timestamp prefix)"
         )));
@@ -1135,7 +1145,9 @@ fn validate_instant(instant: &str) -> LakehouseResult<()> {
             "invalid Hudi instant '{instant}': separator at position 17 must be '-' or '_'"
         )));
     }
-    if !bytes.get(18..).unwrap_or(&[])
+    if !bytes
+        .get(18..)
+        .unwrap_or(&[])
         .iter()
         .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     {

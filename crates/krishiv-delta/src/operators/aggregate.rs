@@ -72,49 +72,117 @@ impl Aggregation {
 
 // ── Per-aggregation state ──────────────────────────────────────────────────────
 
+/// Ordered f64 wrapper for MIN/MAX BTreeMap keys.
+///
+/// `f64` does not implement `Ord` (NaN). `total_cmp` is used so NaN sorts
+/// consistently (after all finite values), keeping the BTreeMap invariants valid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OrdF64(f64);
+
+impl Eq for OrdF64 {}
+
+impl PartialOrd for OrdF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl Default for OrdF64 {
+    fn default() -> Self {
+        Self(0.0)
+    }
+}
+
 /// Separate running state for ONE aggregation expression.
 /// A group's full state is `Vec<AggState>` indexed by position in `aggregations`.
+///
+/// `sum` is used by SUM. `avg_sum_i64` + `avg_count_i64` are used by AVG:
+/// for integer-typed input columns they accumulate exactly in i64, emitting
+/// the quotient as f64 only at output time. For float-typed inputs the caller
+/// sets `avg_is_integer = false` and falls back to f64 accumulation in `sum`.
 #[derive(Debug, Default, Clone)]
 struct AggState {
+    /// Weighted sum for SUM aggregations (f64 accumulation).
     sum: f64,
+    /// Row count for COUNT / empty-group detection. Also used as the non-null
+    /// input count for AVG when inputs are float (avg_is_integer == false).
     count: i64,
-    /// For MIN/MAX: multiset of (value_str → cumulative weight).
-    /// Typed per value (not string-sorted) via BTreeMap<f64, i64>.
-    min_max_set: BTreeMap<i64, i64>,
+    /// Integer-precision weighted sum for AVG over integer-typed inputs.
+    avg_sum_i64: i64,
+    /// Non-null input count for AVG (separately tracked from `count` so
+    /// COUNT and AVG can coexist in a multi-aggregation spec).
+    avg_count_i64: i64,
+    /// True when the AVG input is an integer column — use i64 accumulation.
+    avg_is_integer: bool,
+    /// For MIN/MAX: multiset of (value → cumulative weight).
+    /// Uses OrdF64 keys so float columns (e.g. Float64) are ordered correctly.
+    min_max_set: BTreeMap<OrdF64, i64>,
 }
 
 impl AggState {
     fn apply_delta_for_agg(&mut self, agg: &Aggregation, input_val_str: &str, weight: i64) {
         match agg {
             Aggregation::Sum { .. } => {
+                // SQL: null inputs are excluded from SUM.
+                if input_val_str == "NULL" {
+                    return;
+                }
                 let numeric = input_val_str.parse::<f64>().unwrap_or(0.0);
                 self.sum += numeric * weight as f64;
                 self.count += weight;
             }
             Aggregation::Count { .. } => {
+                // COUNT(*) counts every row including those with null values.
                 self.count += weight;
             }
             Aggregation::Avg { .. } => {
-                let numeric = input_val_str.parse::<f64>().unwrap_or(0.0);
-                self.sum += numeric * weight as f64;
+                // SQL: null inputs are excluded from AVG.
+                if input_val_str == "NULL" {
+                    return;
+                }
+                // Integer-typed input: accumulate exactly in i64 to avoid float
+                // drift from many small increments. Detect by successful i64 parse.
+                if let Ok(int_val) = input_val_str.parse::<i64>() {
+                    self.avg_is_integer = true;
+                    self.avg_sum_i64 = self.avg_sum_i64.saturating_add(int_val * weight);
+                    self.avg_count_i64 += weight;
+                } else {
+                    // Float input: fall back to f64 accumulation.
+                    let numeric = input_val_str.parse::<f64>().unwrap_or(0.0);
+                    self.sum += numeric * weight as f64;
+                    self.avg_count_i64 += weight;
+                }
                 self.count += weight;
             }
             Aggregation::Min { .. } => {
-                let numeric = input_val_str.parse::<i64>().unwrap_or(0);
-                let entry = self.min_max_set.entry(numeric).or_insert(0);
+                // SQL: null inputs do not affect MIN.
+                if input_val_str == "NULL" {
+                    return;
+                }
+                let key = OrdF64(input_val_str.parse::<f64>().unwrap_or(0.0));
+                let entry = self.min_max_set.entry(key).or_insert(0);
                 *entry += weight;
                 if *entry == 0 {
-                    self.min_max_set.remove(&numeric);
+                    self.min_max_set.remove(&key);
                 }
-                // Min/Max still tracks count for empty-group detection
                 self.count += weight;
             }
             Aggregation::Max { .. } => {
-                let numeric = input_val_str.parse::<i64>().unwrap_or(0);
-                let entry = self.min_max_set.entry(numeric).or_insert(0);
+                // SQL: null inputs do not affect MAX.
+                if input_val_str == "NULL" {
+                    return;
+                }
+                let key = OrdF64(input_val_str.parse::<f64>().unwrap_or(0.0));
+                let entry = self.min_max_set.entry(key).or_insert(0);
                 *entry += weight;
                 if *entry == 0 {
-                    self.min_max_set.remove(&numeric);
+                    self.min_max_set.remove(&key);
                 }
                 self.count += weight;
             }
@@ -126,14 +194,16 @@ impl AggState {
             Aggregation::Sum { .. } => Some(self.sum),
             Aggregation::Count { .. } => Some(self.count as f64),
             Aggregation::Avg { .. } => {
-                if self.count == 0 {
+                if self.avg_count_i64 == 0 {
                     None
+                } else if self.avg_is_integer {
+                    Some(self.avg_sum_i64 as f64 / self.avg_count_i64 as f64)
                 } else {
-                    Some(self.sum / self.count as f64)
+                    Some(self.sum / self.avg_count_i64 as f64)
                 }
             }
-            Aggregation::Min { .. } => self.min_max_set.keys().next().map(|&v| v as f64),
-            Aggregation::Max { .. } => self.min_max_set.keys().next_back().map(|&v| v as f64),
+            Aggregation::Min { .. } => self.min_max_set.keys().next().map(|k| k.0),
+            Aggregation::Max { .. } => self.min_max_set.keys().next_back().map(|k| k.0),
         }
     }
 }
@@ -407,85 +477,175 @@ fn build_output_batch(
 }
 
 /// Stringify a scalar for use as a group-key hash component.
-/// Returns None for SQL nulls (they hash together as a single null group).
+///
+/// Returns `None` for SQL nulls (they hash together as a single null group).
+/// Returns `None` for unrecognized array types so callers can detect the gap.
+///
+/// Float types use their bit representation (not `to_string`) for a stable,
+/// injective key: `to_string` is not injective across NaN variants and may
+/// not reliably distinguish denormals. Bit-repr is always unique per value.
 fn scalar_to_group_key(arr: &dyn Array, row: usize) -> Option<String> {
-    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::array::{
+        BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
+    if arr.is_null(row) {
+        return None;
+    }
+    // Signed integers
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return if a.is_null(row) {
-            None
-        } else {
-            Some(a.value(row).to_string())
-        };
+        return Some(a.value(row).to_string());
     }
     if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return if a.is_null(row) {
-            None
-        } else {
-            Some(a.value(row).to_string())
-        };
+        return Some(a.value(row).to_string());
     }
+    if let Some(a) = arr.as_any().downcast_ref::<Int16Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int8Array>() {
+        return Some(a.value(row).to_string());
+    }
+    // Unsigned integers
+    if let Some(a) = arr.as_any().downcast_ref::<UInt64Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<UInt32Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<UInt16Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<UInt8Array>() {
+        return Some(a.value(row).to_string());
+    }
+    // Floats: bit-repr for injective, stable keys (to_string varies across NaN
+    // variants and is not guaranteed unique under all rounding modes).
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return if a.is_null(row) {
-            None
-        } else {
-            Some(a.value(row).to_string())
-        };
+        return Some(a.value(row).to_bits().to_string());
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        return if a.is_null(row) {
-            None
-        } else {
-            Some(a.value(row).to_string())
-        };
+        return Some((a.value(row).to_bits() as u64).to_string());
     }
+    // String types
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) {
-            None
-        } else {
-            Some(a.value(row).to_string())
-        };
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
+        return Some(a.value(row).to_string());
+    }
+    // Boolean (store as "0"/"1" for a compact, unambiguous key)
+    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
+        return Some((a.value(row) as u8).to_string());
+    }
+    // Date types (stored as day / ms offsets — stringify the raw integer)
+    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Date64Array>() {
+        return Some(a.value(row).to_string());
+    }
+    // Timestamp types (all stored as i64 epoch ticks, unit is irrelevant for
+    // grouping since the column already carries a fixed unit in its DataType)
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampSecondArray>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return Some(a.value(row).to_string());
     }
     None
 }
 
 /// Stringify a scalar for use as an aggregate input value.
-/// Returns "NULL" for SQL nulls (parsed as 0 by numeric aggregations).
+///
+/// Returns `"NULL"` for SQL nulls. Callers for SUM/AVG/MIN/MAX must check for
+/// this sentinel and skip the row (SQL excludes nulls from these aggregates).
+/// COUNT uses a separate path and does not call this function.
 fn scalar_to_string(arr: &dyn Array, row: usize) -> String {
-    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::array::{
+        BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
+    if arr.is_null(row) {
+        return "NULL".to_string();
+    }
+    // Signed integers
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
+        return a.value(row).to_string();
     }
     if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
+        return a.value(row).to_string();
     }
+    if let Some(a) = arr.as_any().downcast_ref::<Int16Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int8Array>() {
+        return a.value(row).to_string();
+    }
+    // Unsigned integers
+    if let Some(a) = arr.as_any().downcast_ref::<UInt64Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<UInt32Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<UInt16Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<UInt8Array>() {
+        return a.value(row).to_string();
+    }
+    // Floats: use Rust's shortest-round-trip decimal format (Ryu algorithm)
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
+        return a.value(row).to_string();
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
+        return a.value(row).to_string();
     }
+    // String types
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
+        return a.value(row).to_string();
+    }
+    // Boolean
+    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
+        return (a.value(row) as u8).to_string();
+    }
+    // Date / Timestamp — stringify as raw integer epoch ticks
+    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Date64Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampSecondArray>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return a.value(row).to_string();
     }
     "NULL".to_string()
 }
@@ -581,6 +741,134 @@ mod tests {
                 .get(&vec![Some("c1".to_string())])
                 .map(|s| s[0].count),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn min_float_retract_current_min_substitutes_next() {
+        // Insert 3.5, 1.2, 2.7 for key "g". Min = 1.2.
+        // Retract 1.2. Min must become 2.7 (not 0.0, which the old i64 parse would give).
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Float64, false),
+        ]));
+        let mut op = IncrementalAggOp::new(
+            &schema,
+            vec!["k".into()],
+            vec![Aggregation::Min {
+                input_col: "v".into(),
+                output_col: "min_v".into(),
+            }],
+        )
+        .unwrap();
+
+        let insert = DeltaBatch::from_inserts(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["g", "g", "g"])) as Arc<dyn Array>,
+                    Arc::new(Float64Array::from(vec![3.5, 1.2, 2.7])) as Arc<dyn Array>,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        op.apply(insert).unwrap();
+
+        // Current min for "g" should be 1.2
+        let group_key = vec![Some("g".to_string())];
+        let min_val = op
+            .state
+            .get(&group_key)
+            .and_then(|s| s.first())
+            .and_then(|s| s.min_max_set.keys().next())
+            .map(|k| k.0);
+        assert!(
+            (min_val.unwrap_or(f64::NAN) - 1.2).abs() < 1e-9,
+            "min before retraction should be 1.2, got {min_val:?}"
+        );
+
+        // Retract 1.2
+        let retract = DeltaBatch::from_deletes(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["g"])) as Arc<dyn Array>,
+                    Arc::new(Float64Array::from(vec![1.2])) as Arc<dyn Array>,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        op.apply(retract).unwrap();
+
+        // Min should now be 2.7, not 0.0
+        let min_after = op
+            .state
+            .get(&group_key)
+            .and_then(|s| s.first())
+            .and_then(|s| s.min_max_set.keys().next())
+            .map(|k| k.0);
+        assert!(
+            (min_after.unwrap_or(f64::NAN) - 2.7).abs() < 1e-9,
+            "min after retracting 1.2 should be 2.7, got {min_after:?}"
+        );
+    }
+
+    #[test]
+    fn max_float_retract_current_max_substitutes_next() {
+        // Insert 3.5, 1.2, 2.7 for key "g". Max = 3.5.
+        // Retract 3.5. Max must become 2.7.
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Float64, false),
+        ]));
+        let mut op = IncrementalAggOp::new(
+            &schema,
+            vec!["k".into()],
+            vec![Aggregation::Max {
+                input_col: "v".into(),
+                output_col: "max_v".into(),
+            }],
+        )
+        .unwrap();
+
+        let insert = DeltaBatch::from_inserts(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["g", "g", "g"])) as Arc<dyn Array>,
+                    Arc::new(Float64Array::from(vec![3.5, 1.2, 2.7])) as Arc<dyn Array>,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        op.apply(insert).unwrap();
+
+        // Retract 3.5
+        let retract = DeltaBatch::from_deletes(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["g"])) as Arc<dyn Array>,
+                    Arc::new(Float64Array::from(vec![3.5])) as Arc<dyn Array>,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        op.apply(retract).unwrap();
+
+        let max_after = op
+            .state
+            .get(&vec![Some("g".to_string())])
+            .and_then(|s| s.first())
+            .and_then(|s| s.min_max_set.keys().next_back())
+            .map(|k| k.0);
+        assert!(
+            (max_after.unwrap_or(f64::NAN) - 2.7).abs() < 1e-9,
+            "max after retracting 3.5 should be 2.7, got {max_after:?}"
         );
     }
 }

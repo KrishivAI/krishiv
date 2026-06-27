@@ -72,6 +72,8 @@ async fn network_coordinator_service_checkpoint_ack_through_service_boundary() {
         fencing_token: FencingToken::initial(),
         source_offsets: vec![],
         snapshot_path: Some("/checkpoints/epoch-1".to_owned()),
+        unaligned_buffers: Vec::new(),
+        sink_transactions: Vec::new(),
     };
     let result = service
         .checkpoint_ack(tonic::Request::new(req))

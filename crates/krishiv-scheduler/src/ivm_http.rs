@@ -427,6 +427,13 @@ async fn submit_distributed_ivm_step(
         format!("checkpoint_full: {e}")
     })?;
     if state_bytes.len() > MAX_IVM_OFFLOAD_STATE_BYTES {
+        tracing::warn!(
+            job_id = %ivm_job_id,
+            state_bytes = state_bytes.len(),
+            budget_bytes = MAX_IVM_OFFLOAD_STATE_BYTES,
+            "IVM offload skipped: state payload exceeds budget; falling back to central compute. \
+             Increase MAX_IVM_OFFLOAD_STATE_BYTES or reduce view materialization size."
+        );
         flow.re_feed(local_pending).map_err(|e| e.to_string())?;
         return Err(format!(
             "ivm state payload {} bytes exceeds offload budget of {}; central compute",

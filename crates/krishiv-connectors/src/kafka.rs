@@ -45,11 +45,16 @@ impl crate::Offset for KafkaOffset {
             });
         }
         let topic_len = u32::from_le_bytes(
-            bytes.get(..4).ok_or_else(|| ConnectorError::Offset {
-                message: "KafkaOffset decode: slice length mismatch for topic_len".into(),
-            })?.try_into().map_err(|_| ConnectorError::Offset {
-                message: "KafkaOffset decode: slice length mismatch for topic_len".into(),
-            })?) as usize;
+            bytes
+                .get(..4)
+                .ok_or_else(|| ConnectorError::Offset {
+                    message: "KafkaOffset decode: slice length mismatch for topic_len".into(),
+                })?
+                .try_into()
+                .map_err(|_| ConnectorError::Offset {
+                    message: "KafkaOffset decode: slice length mismatch for topic_len".into(),
+                })?,
+        ) as usize;
         let topic_end = 4usize
             .checked_add(topic_len)
             .ok_or_else(|| ConnectorError::Offset {
@@ -68,26 +73,41 @@ impl crate::Offset for KafkaOffset {
                 ),
             });
         }
-        let topic = std::str::from_utf8(bytes.get(4..topic_end).ok_or_else(|| ConnectorError::Offset {
-                message: "KafkaOffset decode: topic slice out of range".into(),
-            })?)
+        let topic =
+            std::str::from_utf8(
+                bytes
+                    .get(4..topic_end)
+                    .ok_or_else(|| ConnectorError::Offset {
+                        message: "KafkaOffset decode: topic slice out of range".into(),
+                    })?,
+            )
             .map_err(|e| ConnectorError::Offset {
                 message: format!("KafkaOffset decode: invalid UTF-8 in topic: {e}"),
             })?
             .to_string();
         let partition = i32::from_le_bytes(
-            bytes.get(topic_end..topic_end + 4).ok_or_else(|| ConnectorError::Offset {
-                message: "KafkaOffset decode: slice length mismatch for partition".into(),
-            })?.try_into().map_err(|_| ConnectorError::Offset {
-                message: "KafkaOffset decode: slice length mismatch for partition".into(),
-            })?);
+            bytes
+                .get(topic_end..topic_end + 4)
+                .ok_or_else(|| ConnectorError::Offset {
+                    message: "KafkaOffset decode: slice length mismatch for partition".into(),
+                })?
+                .try_into()
+                .map_err(|_| ConnectorError::Offset {
+                    message: "KafkaOffset decode: slice length mismatch for partition".into(),
+                })?,
+        );
         let offset_start = topic_end + 4;
         let offset = i64::from_le_bytes(
-            bytes.get(offset_start..offset_start + 8).ok_or_else(|| ConnectorError::Offset {
-                message: "KafkaOffset decode: slice length mismatch for offset".into(),
-            })?.try_into().map_err(|_| ConnectorError::Offset {
-                message: "KafkaOffset decode: slice length mismatch for offset".into(),
-            })?);
+            bytes
+                .get(offset_start..offset_start + 8)
+                .ok_or_else(|| ConnectorError::Offset {
+                    message: "KafkaOffset decode: slice length mismatch for offset".into(),
+                })?
+                .try_into()
+                .map_err(|_| ConnectorError::Offset {
+                    message: "KafkaOffset decode: slice length mismatch for offset".into(),
+                })?,
+        );
         Ok(KafkaOffset {
             topic,
             partition,
@@ -143,11 +163,16 @@ impl crate::Offset for MultiKafkaOffset {
             });
         }
         let count = u32::from_le_bytes(
-            bytes.get(..4).ok_or_else(|| ConnectorError::Offset {
-                message: "MultiKafkaOffset decode: slice length mismatch for count".into(),
-            })?.try_into().map_err(|_| ConnectorError::Offset {
-                message: "MultiKafkaOffset decode: slice length mismatch for count".into(),
-            })?) as usize;
+            bytes
+                .get(..4)
+                .ok_or_else(|| ConnectorError::Offset {
+                    message: "MultiKafkaOffset decode: slice length mismatch for count".into(),
+                })?
+                .try_into()
+                .map_err(|_| ConnectorError::Offset {
+                    message: "MultiKafkaOffset decode: slice length mismatch for count".into(),
+                })?,
+        ) as usize;
         let mut pos = 4usize;
         let mut offsets = Vec::with_capacity(count);
         for i in 0..count {
@@ -159,11 +184,20 @@ impl crate::Offset for MultiKafkaOffset {
                 });
             }
             let item_len = u32::from_le_bytes(
-                bytes.get(pos..pos + 4).ok_or_else(|| ConnectorError::Offset {
-                    message: format!("MultiKafkaOffset decode: slice length mismatch for entry {i} length"),
-                })?.try_into().map_err(|_| ConnectorError::Offset {
-                    message: format!("MultiKafkaOffset decode: slice length mismatch for entry {i} length"),
-                })?) as usize;
+                bytes
+                    .get(pos..pos + 4)
+                    .ok_or_else(|| ConnectorError::Offset {
+                        message: format!(
+                            "MultiKafkaOffset decode: slice length mismatch for entry {i} length"
+                        ),
+                    })?
+                    .try_into()
+                    .map_err(|_| ConnectorError::Offset {
+                        message: format!(
+                            "MultiKafkaOffset decode: slice length mismatch for entry {i} length"
+                        ),
+                    })?,
+            ) as usize;
             pos += 4;
             if pos + item_len > bytes.len() {
                 return Err(ConnectorError::Offset {
@@ -173,8 +207,10 @@ impl crate::Offset for MultiKafkaOffset {
                     ),
                 });
             }
-            let ko = KafkaOffset::decode(bytes.get(pos..pos + item_len).ok_or_else(|| ConnectorError::Offset {
-                message: format!("MultiKafkaOffset decode: entry {i} slice out of range"),
+            let ko = KafkaOffset::decode(bytes.get(pos..pos + item_len).ok_or_else(|| {
+                ConnectorError::Offset {
+                    message: format!("MultiKafkaOffset decode: entry {i} slice out of range"),
+                }
             })?)?;
             pos += item_len;
             offsets.push(ko);
@@ -377,6 +413,14 @@ impl Source for KafkaSource {
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
         self.inner.current_offset()
+    }
+
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        CheckpointSource::encoded_checkpoint_offset(self).map(Some)
+    }
+
+    fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        CheckpointSource::restore_encoded_offset(self, encoded)
     }
 }
 
@@ -646,7 +690,13 @@ impl Source for InMemoryKafkaSource {
         if self.cursor >= self.batches.len() {
             return Ok(None);
         }
-        let batch = self.batches.get(self.cursor).ok_or_else(|| ConnectorError::Offset { message: "batch cursor out of range".into() })?.clone();
+        let batch = self
+            .batches
+            .get(self.cursor)
+            .ok_or_else(|| ConnectorError::Offset {
+                message: "batch cursor out of range".into(),
+            })?
+            .clone();
         let row_count = i64::try_from(batch.num_rows()).map_err(|_| ConnectorError::Offset {
             message: "in-memory Kafka batch row count exceeds i64".into(),
         })?;
@@ -663,6 +713,14 @@ impl Source for InMemoryKafkaSource {
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
         Some(Box::new(self.next_offset()))
+    }
+
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        CheckpointSource::encoded_checkpoint_offset(self).map(Some)
+    }
+
+    fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        CheckpointSource::restore_encoded_offset(self, encoded)
     }
 
     fn reset(&mut self) {
@@ -1146,6 +1204,14 @@ impl Source for RdkafkaKafkaSource {
         } else {
             Some(Box::new(offsets) as Box<dyn std::any::Any + Send>)
         }
+    }
+
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        CheckpointSource::encoded_checkpoint_offset(self).map(Some)
+    }
+
+    fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        CheckpointSource::restore_encoded_offset(self, encoded)
     }
 }
 

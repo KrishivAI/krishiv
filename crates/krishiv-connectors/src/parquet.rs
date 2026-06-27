@@ -302,6 +302,10 @@ impl Source for ParquetSource {
             .with_checkpoint()
     }
 
+    fn source_schema(&self) -> Option<SchemaRef> {
+        self.schema()
+    }
+
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
         let reader = self.ensure_reader()?;
         match reader.next() {
@@ -323,6 +327,14 @@ impl Source for ParquetSource {
         Some(Box::new(ParquetOffset {
             batch_index: self.cursor,
         }))
+    }
+
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        CheckpointSource::encoded_checkpoint_offset(self).map(Some)
+    }
+
+    fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        CheckpointSource::restore_encoded_offset(self, encoded)
     }
 
     fn reset(&mut self) {
@@ -428,7 +440,9 @@ impl ParquetDirectorySource {
         file_index: usize,
         skip: usize,
     ) -> ConnectorResult<ParquetRecordBatchReader> {
-        let path = files.get(file_index).ok_or_else(|| ConnectorError::Parquet(format!("file_index {file_index} out of range")))?;
+        let path = files.get(file_index).ok_or_else(|| {
+            ConnectorError::Parquet(format!("file_index {file_index} out of range"))
+        })?;
         let mut reader = Self::open_reader_at(path)?;
         for seen in 0..skip {
             match reader.next() {
@@ -487,13 +501,22 @@ impl Source for ParquetDirectorySource {
             match reader.next() {
                 Some(Ok(batch)) => {
                     self.batch_index = self.batch_index.saturating_add(1);
-                    let file_path = self.files.get(self.file_index).ok_or_else(|| ConnectorError::Parquet(format!("file_index {} out of range", self.file_index)))?;
+                    let file_path = self.files.get(self.file_index).ok_or_else(|| {
+                        ConnectorError::Parquet(format!(
+                            "file_index {} out of range",
+                            self.file_index
+                        ))
+                    })?;
                     let parts = discover_hive_partitions(&self.root, file_path);
                     let batch = inject_partition_columns(batch, &parts)?;
                     return Ok(Some(batch));
                 }
                 Some(Err(e)) => {
-                    let file_display = self.files.get(self.file_index).map(|p| p.display().to_string()).unwrap_or_default();
+                    let file_display = self
+                        .files
+                        .get(self.file_index)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
                     return Err(ConnectorError::Parquet(format!(
                         "error reading batch from '{file_display}': {e}"
                     )));
@@ -513,6 +536,14 @@ impl Source for ParquetDirectorySource {
             file_index: self.file_index,
             batch_index: self.batch_index,
         }))
+    }
+
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        CheckpointSource::encoded_checkpoint_offset(self).map(Some)
+    }
+
+    fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        CheckpointSource::restore_encoded_offset(self, encoded)
     }
 
     fn reset(&mut self) {

@@ -4,8 +4,8 @@ use dashmap::DashMap;
 use krishiv_common::DurabilityProfile;
 use krishiv_plan::{LogicalPlan, PhysicalPlan};
 use krishiv_proto::{
-    AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorId, CoordinatorState,
-    ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorTaskAssignment,
+    AttemptId, CheckpointAckRequest, CheckpointAckResponse, CheckpointAlignment, CoordinatorId,
+    CoordinatorState, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorTaskAssignment,
     HeartbeatHotKeyReport, InitiateCheckpointCommand, InitiateCheckpointRequest, JobId, JobKind,
     JobSpec, JobState, LeaseGeneration, StageId, StageState, StreamingProgressReport,
     StreamingTaskState, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState,

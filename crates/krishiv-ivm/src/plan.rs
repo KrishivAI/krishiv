@@ -17,7 +17,7 @@
 
 use ahash::AHashMap;
 use arrow::datatypes::SchemaRef;
-use datafusion::logical_expr::{Aggregate, Expr, Join, JoinType, LogicalPlan, Projection};
+use datafusion::logical_expr::{Aggregate, Expr, Join, JoinType, LogicalPlan, Projection, Window};
 use datafusion::prelude::SessionContext;
 
 use krishiv_delta::{
@@ -68,10 +68,36 @@ impl ViewPlan {
         }
     }
 
-    /// GC state older than `watermark_ms` (only meaningful for Join traces).
-    pub fn gc_watermark(&mut self, watermark_ms: i64) -> krishiv_delta::DeltaResult<usize> {
+    /// GC trace state for join operators.
+    ///
+    /// Each `ViewPlan::Join` is GC'd at the minimum watermark of its own two
+    /// sources, not the global minimum across all sources. Using the global
+    /// minimum would prevent GC whenever any slow/unwatermarked source exists.
+    pub fn gc_watermark(
+        &mut self,
+        watermarks: &AHashMap<String, i64>,
+    ) -> krishiv_delta::DeltaResult<usize> {
         match self {
-            ViewPlan::Join { op, .. } => op.gc_traces(watermark_ms),
+            ViewPlan::Join {
+                left_source,
+                right_source,
+                op,
+            } => {
+                let wm_left = watermarks
+                    .get(left_source.as_str())
+                    .copied()
+                    .unwrap_or(i64::MIN);
+                let wm_right = watermarks
+                    .get(right_source.as_str())
+                    .copied()
+                    .unwrap_or(i64::MIN);
+                let wm = wm_left.min(wm_right);
+                if wm > i64::MIN {
+                    op.gc_traces(wm)
+                } else {
+                    Ok(0)
+                }
+            }
             _ => Ok(0),
         }
     }
@@ -182,7 +208,11 @@ fn try_build_from_logical(
             try_build_from_logical(input, output_schema, available_schemas)
         }
         LogicalPlan::Aggregate(agg) => build_agg_plan(agg, output_schema, available_schemas),
-        LogicalPlan::Join(join) => build_join_plan(join, available_schemas),
+        LogicalPlan::Join(join) => {
+            // Only 2-source joins (source_of_plan returns None for multi-way joins
+            // where one side is itself a Join node with 2 inputs).
+            build_join_plan(join, available_schemas)
+        }
         // DISTINCT — the inner plan is the first (and only) input.
         LogicalPlan::Distinct(_) => {
             let inputs = plan.inputs();
@@ -193,6 +223,11 @@ fn try_build_from_logical(
                 op: IncrementalDistinctOp::new(),
             })
         }
+        // Window functions (ROW_NUMBER, RANK, rolling aggregates) cannot be
+        // computed O(Δ) in general. Fall through to DiffBased explicitly.
+        LogicalPlan::Window(Window { .. }) => None,
+        // All other patterns (subqueries, set operations, multi-way joins, etc.)
+        // fall back to DiffBased full SQL re-execution.
         _ => None,
     }
 }
@@ -237,9 +272,12 @@ fn build_join_plan(
     join: &Join,
     available_schemas: &AHashMap<String, SchemaRef>,
 ) -> Option<ViewPlan> {
-    if join.join_type != JoinType::Inner {
-        return None;
-    }
+    let incr_join_type = match join.join_type {
+        JoinType::Inner => IncrJoinType::Inner,
+        JoinType::Left => IncrJoinType::LeftOuter,
+        // RIGHT/FULL OUTER and semi/anti joins are deferred to DiffBased.
+        _ => return None,
+    };
 
     let left_source = source_of_plan(&join.left)?;
     let right_source = source_of_plan(&join.right)?;
@@ -263,7 +301,7 @@ fn build_join_plan(
         right_schema.clone(),
         left_key_cols,
         right_key_cols,
-        IncrJoinType::Inner,
+        incr_join_type,
     )
     .ok()?;
 

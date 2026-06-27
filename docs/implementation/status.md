@@ -1,5 +1,515 @@
 # Krishiv Implementation Status
 
+## 2026-06-27 - IVM correctness round 2: 8 bugs fixed across 4 files
+
+### Tasks completed
+
+**krishiv-delta/src/operators/aggregate.rs**
+
+1. **Missing array types in scalar_to_group_key / scalar_to_string (P1)** — Added `Int8/16`, `UInt8/16/32/64`, `LargeStringArray`, `StringViewArray`, `BooleanArray`, `Date32/64`, `Timestamp(Ms|Us|S|Ns)`. Unrecognized types previously mapped all rows to the null group, silently producing wrong aggregates.
+
+2. **Float group-key instability (P2)** — `Float64`/`Float32` group keys now use `to_bits().to_string()` (injective, stable) instead of `to_string()` (non-injective across NaN variants and rounding modes).
+
+3. **NULL inputs silently treated as 0 for SUM/AVG/MIN/MAX (P2)** — Added `if input_val_str == "NULL" { return; }` guard in `apply_delta_for_agg` for all four aggregations. SQL semantics: null inputs must be excluded from SUM/AVG/MIN/MAX; COUNT(*) still counts all rows.
+
+4. **AVG lossy f64 accumulator (P2)** — Added `avg_sum_i64` / `avg_count_i64` / `avg_is_integer` fields to `AggState`. Integer-typed inputs now accumulate exactly in `i64` (detected by successful `parse::<i64>()`); float inputs use the existing `f64` path. Division to f64 happens only at output time.
+
+**krishiv-delta/src/operators/join.rs**
+
+5. **Missing array types in extract_str_opt (P1)** — Same set of types as (1) added. Unrecognized key types previously returned `None`, causing all rows to hash-collide into the same null group key, producing incorrect join output.
+   Float join keys also use `to_bits()` for injective, stable hashing.
+
+**krishiv-ivm/src/partitioned.rs**
+
+6. **checkpoint_delta omits streaming_prev (P2)** — `checkpoint_delta` and `restore_delta` now include `streaming_prev` (the per-source previous materialized snapshot). Before this fix, `feed_snapshot` after a delta restore would diff against an empty snapshot, emitting spurious insertions for all rows already present.
+
+**krishiv-ivm/src/flow.rs**
+
+7. **toposort_views uses tokenizer for DAG edges (P3)** — `toposort_views` now accepts `view_deps: &AHashMap<String, HashSet<String>>` and uses AST-derived deps when available, falling back to `sql_identifiers` tokenizer only for views not yet analysed. Eliminates phantom DAG edges from SQL keywords/literals that match view names.
+
+**krishiv-scheduler/src/ivm_http.rs**
+
+8. **Silent force_diff_based fallback (P3 ops)** — Added `tracing::warn!` with `job_id`, `state_bytes`, `budget_bytes` when the 16 MiB state cap forces central compute. Previously the fallback was completely invisible to operators.
+
+### Validation
+
+```
+cargo fmt --check   # clean
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings  # clean
+cargo test -p krishiv-delta --lib   # 98 passed
+cargo test -p krishiv-ivm --lib     # 41 passed
+```
+
+### Still deferred (high complexity)
+
+| Gap | Reason deferred |
+|-----|----------------|
+| Partitioned jobs never offload to executors | Requires shard-fragment protocol (N shards → N executor tasks, gather results) — multi-week change |
+| Distributed IVM always DiffBased (not O(Δ)) | Requires operator state serialization for `checkpoint_full` — each operator type needs a stable binary encoding |
+| RIGHT/FULL OUTER JOIN incremental | Requires right-side match-count tracking symmetric to LEFT OUTER |
+| Recursive O(Δ) circuits | Requires DBSP `z⁻¹` feedback — currently correct DiffBased fixpoint |
+| Unbounded pending queue | No hard limit on `inner.pending`; mitigated by per-job step lock |
+
+### Next useful command
+
+```
+cargo test -p krishiv-delta -p krishiv-ivm --lib
+```
+
+---
+
+## 2026-06-27 - IVM incremental processing gaps (analysis + fixes)
+
+### Tasks completed
+
+Five correctness/robustness bugs fixed across three crates.
+
+**krishiv-delta/src/operators/aggregate.rs**
+- `AggState.min_max_set` was `BTreeMap<i64, i64>`; float values silently parsed to 0.
+  Fixed with `OrdF64` newtype (`f64::total_cmp` for `Ord`), key type now `BTreeMap<OrdF64, i64>`.
+  Two regression tests: `min_float_retract_current_min_substitutes_next`, `max_float_retract_current_max_substitutes_next`.
+
+**krishiv-delta/src/operators/join.rs**
+- Added `IncrJoinType::LeftOuter` with full bilinear incremental algorithm.
+  `right_key_group_weights: AHashMap<Vec<Option<String>>, i64>` tracks total right weight per key.
+  Threshold crossings (0↔positive) emit/retract null-padded rows for matched left trace rows.
+  ΔA probe uses precomputed "effective right count" (current + ΔB delta) to avoid spurious null rows on same-tick arrivals.
+  Right non-key columns in output schema are nullable. Five regression tests added.
+
+**krishiv-ivm/src/plan.rs**
+- `gc_watermark` now accepts `&AHashMap<String, i64>`; each join GC'd at min of its own two source watermarks.
+- `build_join_plan` routes `JoinType::Left` → `IncrJoinType::LeftOuter` (previously all non-Inner fell to DiffBased).
+- Added explicit `LogicalPlan::Window` → `None` arm to document intentional DiffBased fallback.
+
+**krishiv-ivm/src/flow.rs**
+- Dedup eviction: replaced full `AHashSet` clear with FIFO partial eviction using `(VecDeque<u64>, AHashSet<u64>)`.
+  Evicts oldest 100k entries (1% of cap) instead of clearing all 10M.
+- SQL dirty-bit: replaced `sql_identifiers` tokenizer with sqlparser AST walk (`extract_sql_table_refs`).
+  `view_deps: AHashMap<String, HashSet<String>>` populated at `register_view`; falls back to tokenizer for subqueries.
+
+### Validation
+
+```
+cargo fmt --check   # clean
+cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings  # clean
+cargo test -p krishiv-delta --lib   # 98 passed
+cargo test -p krishiv-ivm --lib     # 41 passed
+```
+
+### Remaining known gaps
+
+| Gap | Architecture decision |
+|-----|----------------------|
+| RIGHT/FULL OUTER JOIN | Requires right-side match-count tracking; deferred to DiffBased |
+| Multi-way joins (3+ tables) | `source_of_plan` returns None → DiffBased; correct fallback |
+| Window functions | Cannot be O(Δ) in general; explicit `Window` arm returns None → DiffBased |
+| Recursive views | Fixpoint loop already exists (DiffBased path); O(Δ) recursive circuits require DBSP `z⁻¹` feedback — future work |
+| Distributed state cap | No hard-coded limit found; gRPC default applies at Flight layer |
+
+### Next useful command
+
+```
+cargo test -p krishiv-delta -p krishiv-ivm --lib
+```
+
+---
+
+## 2026-06-27 - Phase 1: Stream-loop source-offset deployment conformance
+
+### Task completed
+
+Added deployment-profile proof for the connector-backed stream-loop
+source-offset contract:
+
+1. Added a mode-invariant smoke test that runs the same registry-backed
+   `stream:loop:` restore and checkpoint-offset flow under:
+   - `dev-local` / embedded-style executor setup,
+   - `single-node-durable` executor setup with durable state directory,
+   - `distributed-durable` executor setup with durable state directory.
+2. The test proves each profile applies the same restored connector-encoded
+   offset before the first post-restore read.
+3. The test proves each profile retains the opened connector source for later
+   cycles and stages the same next encoded checkpoint offset with the same
+   partition identity.
+4. Existing stream-loop registry restore and source-persistence regressions were
+   rerun to ensure the conformance smoke did not weaken the executor source
+   lifecycle contract.
+
+### Validation
+
+```
+cargo check -p krishiv-executor
+cargo test -p krishiv-executor stream_loop_registry_source_offset_contract_is_deployment_mode_invariant --lib
+cargo test -p krishiv-executor stream_loop_registry_source_persists_across_cycles --lib
+cargo test -p krishiv-executor stream_loop_registry_source_restores_and_records_checkpoint_offset --lib
+cargo clippy -p krishiv-executor -- -D warnings
+rustfmt --edition 2024 --check crates/krishiv-executor/src/sections/stream_loop.rs.inc
+git diff --check
+```
+
+All commands passed. The targeted executor test build still emits the
+pre-existing `BarrierSimulator::queue_barrier` dead-code warning in test mode.
+
+### Blocker(s)
+
+No blocker for this slice. The source-offset contract now has executor-boundary
+coverage across the three durability/deployment profiles.
+
+The remaining gap is a higher-level runtime smoke that drives the same
+connector-backed source-offset behavior through the public embedded runtime and
+remote coordinator/Flight control paths.
+
+### Next useful task
+
+Add runtime/API-level conformance coverage for connector-backed source-offset
+restore where the current public APIs expose enough connector lifecycle control;
+otherwise document the missing public hook and keep the executor-boundary
+contract as the authoritative implementation test.
+
+---
+
+## 2026-06-27 - Phase 1: Persistent stream-loop connector sources
+
+### Task completed
+
+Continued Phase 1 stream-loop connector recovery:
+
+1. Added a runner-owned `continuous_connector_sources` cache keyed by
+   job/partition/registry descriptor so registry-backed `stream:loop:` sources
+   retain connector cursor state across continuous input cycles.
+2. Split registry connector descriptor parsing into `RegistryPartitionSpec`, so
+   batch reads and persistent stream-loop reads share the same validation,
+   connector config construction, restore matching, and partition identity.
+3. Updated `stream:loop:` registry input handling to reuse cached connector
+   source instances, read currently available batches, and stage the source's
+   next encoded checkpoint offset on the task runner.
+4. Updated checkpoint restore to evict cached connector sources for the restored
+   job before the next cycle, ensuring restored source offsets are applied to
+   fresh connector instances.
+5. Added regression coverage proving registry sources are opened once across
+   repeated stream-loop cycles, proving restored registry sources still seek
+   correctly, and proving restore evicts cached connector sources.
+
+### Validation
+
+```
+cargo check -p krishiv-executor
+cargo clippy -p krishiv-executor -- -D warnings
+rustfmt --edition 2024 --check crates/krishiv-executor/src/fragment/common.rs crates/krishiv-executor/src/fragment/streaming.rs crates/krishiv-executor/src/runner/executor_task_runner.rs crates/krishiv-executor/src/runner/task_runner.rs crates/krishiv-executor/src/runner/runner_tests.rs
+cargo test -p krishiv-executor stream_loop_registry_source_persists_across_cycles --lib
+cargo test -p krishiv-executor stream_loop_registry_source_restores_and_records_checkpoint_offset --lib
+cargo test -p krishiv-executor read_registry_partitions_restores_encoded_source_offset --lib
+cargo test -p krishiv-executor restore_command_seeds_kafka_offsets_and_resets_task_epochs --lib
+git diff --check
+```
+
+All commands passed. The targeted executor test build still emits the
+pre-existing `BarrierSimulator::queue_barrier` dead-code warning in test mode.
+
+### Blocker(s)
+
+No blocker for this slice. Connector-backed stream-loop registry inputs now
+retain source instances across cycles and still restore from coordinator-fenced
+checkpoint metadata.
+
+The next gap is deployment-mode proof: embedded, single-node-durable, and
+distributed-durable smoke tests should exercise the same source-offset contract
+instead of relying only on executor-local unit coverage.
+
+### Next useful task
+
+Add mode-conformance smoke tests for connector-backed streaming restore across
+embedded, single-node-durable, and distributed-durable profiles, then tighten
+any runtime/API wiring gaps those tests expose.
+
+---
+
+## 2026-06-27 - Phase 1: Stream-loop generic source restore and checkpoint acks
+
+### Task completed
+
+Continued the generic source-offset restore work into the streaming executor
+path:
+
+1. Added generic `source_offsets` storage to `TaskRunner` so non-Kafka
+   checkpoint-capable connector sources can contribute encoded source offsets to
+   checkpoint acknowledgements.
+2. Preserved Kafka compatibility by appending the existing Kafka offset cache to
+   the generic checkpoint ack offsets.
+3. Cleared both generic and Kafka source offsets when applying a restored epoch,
+   so stale pre-rollback offsets cannot leak into post-restore checkpoints.
+4. Split registry connector reads into a richer
+   `read_registry_partition_outputs` helper that returns table batches plus an
+   optional `CheckpointSourceOffset`.
+5. Routed `stream:loop:` fallback input through registry connector reads when
+   there is no local drainer, pushed distributed input, or inline IPC input.
+   Matching restored offsets are applied through
+   `DynSource::restore_encoded_checkpoint_offset_dyn` before the first read, and
+   the connector's next encoded offset is staged on the task runner for the next
+   checkpoint ack.
+6. Added regression coverage for generic task-runner offsets, generic checkpoint
+   ack serialization, registry restore, and stream-loop registry restore.
+
+### Validation
+
+```
+cargo check -p krishiv-executor
+cargo clippy -p krishiv-executor -- -D warnings
+rustfmt --edition 2024 --check crates/krishiv-executor/src/runner/task_runner.rs crates/krishiv-executor/src/runner/runner_tests.rs crates/krishiv-executor/src/fragment/common.rs crates/krishiv-executor/src/fragment/streaming.rs
+cargo test -p krishiv-executor read_registry_partitions_restores_encoded_source_offset --lib
+cargo test -p krishiv-executor stream_loop_registry_source_restores_and_records_checkpoint_offset --lib
+cargo test -p krishiv-executor executor_checkpoint_ack_includes_source_offset --lib
+cargo test -p krishiv-executor task_runner_with_source_offsets --lib
+git diff --check
+```
+
+All commands passed. The targeted executor test build still emits the
+pre-existing `BarrierSimulator::queue_barrier` dead-code warning in test mode.
+
+### Blocker(s)
+
+No blocker for this slice. Stream-loop assignments can now restore
+registry-backed checkpoint-capable connector sources from generic encoded
+checkpoint metadata and publish the next encoded offset in checkpoint acks.
+
+The remaining architectural gap is persistent connector source ownership across
+multiple continuous cycles. The current stream-loop registry path opens a source
+for a cycle when registry partitions are assigned; full unbounded connector
+streaming should retain source instances per job/source partition and advance
+them only under the checkpoint protocol.
+
+### Next useful task
+
+Add per-job continuous connector source state to the executor/API driver boundary
+so connector-backed stream loops keep source instances alive across cycles, then
+add embedded, single-node-durable, and distributed-durable restore smoke tests
+for the shared source-offset contract.
+
+---
+
+## 2026-06-27 - Phase 1: Generic encoded source-offset restore routing
+
+### Task completed
+
+Continued Phase 1 checkpoint restore integration:
+
+1. Added a generic `RestoredSourceOffset` executor restore model for
+   connector-encoded source offsets from checkpoint metadata.
+2. Stored generic per-job source restore offsets during executor checkpoint
+   restore, alongside the existing Kafka compatibility table.
+3. Routed matching restored offsets into registry-backed connector source
+   opening through `DynSource::restore_encoded_checkpoint_offset_dyn`.
+4. Kept Kafka restore compatible with old metadata while preferring encoded
+   offset bytes when they are present.
+5. Added a registry connector regression test proving a source is restored from
+   encoded bytes before its first read, plus recovery assertions that restored
+   checkpoint metadata seeds the generic source-offset table.
+
+### Validation
+
+```
+cargo check -p krishiv-executor
+rustfmt --edition 2024 --check crates/krishiv-executor/src/runner/task_output.rs crates/krishiv-executor/src/runner/mod.rs crates/krishiv-executor/src/runner/executor_task_runner.rs crates/krishiv-executor/src/fragment/common.rs crates/krishiv-executor/src/fragment/batch.rs
+cargo test -p krishiv-executor read_registry_partitions_restores_encoded_source_offset --lib
+cargo test -p krishiv-executor kafka_offsets_from_source_records --lib
+cargo test -p krishiv-executor restore_command_seeds_kafka_offsets_and_resets_task_epochs --lib
+cargo clippy -p krishiv-executor -- -D warnings
+git diff --check
+```
+
+All commands passed. The targeted executor test build still emits the
+pre-existing `BarrierSimulator::queue_barrier` dead-code warning in test mode.
+
+### Blocker(s)
+
+No blocker for this slice. Generic encoded source restore now reaches the
+registry connector execution path. Full continuous streaming task restore still
+needs the long-running source loop to consume the same generic restore table
+instead of only the batch registry path.
+
+### Next useful task
+
+Route generic restored source offsets into the continuous streaming executor
+loop, then add embedded, single-node-durable, and distributed-durable restore
+smoke tests that prove all deployment modes use the same checkpoint/source
+offset contract.
+
+---
+
+## 2026-06-26 - Phase 1: Encoded source offsets in checkpoint metadata
+
+### Task completed
+
+Continued Phase 1 checkpoint integration:
+
+1. Extended the coordinator/executor checkpoint ack contract so each
+   `CheckpointSourceOffset` carries connector-encoded offset bytes in addition
+   to the legacy numeric offset.
+2. Extended durable `SourceOffsetRecord` checkpoint metadata with
+   `encoded_offset`, defaulting to empty for old metadata so version-1/version-2
+   checkpoints remain restore-compatible.
+3. Updated protobuf wire conversion to preserve encoded source offset bytes
+   across coordinator/executor gRPC.
+4. Updated scheduler checkpoint commit aggregation to persist encoded offsets
+   from task acknowledgements into `metadata.json`.
+5. Updated executor checkpoint ack construction for Kafka offsets to populate
+   both the legacy numeric field and the typed connector encoding.
+6. Updated executor Kafka restore helper to prefer encoded offsets when present
+   and fall back to the legacy numeric field for older checkpoints.
+7. Added/updated tests for protobuf roundtrip, checkpoint metadata persistence,
+   executor restore parsing, and rescaled scheduler restore preserving encoded
+   source offsets.
+
+### Validation
+
+```
+cargo check -p krishiv-proto -p krishiv-state -p krishiv-executor -p krishiv-scheduler
+cargo clippy -p krishiv-proto -p krishiv-state -p krishiv-executor -p krishiv-scheduler -- -D warnings
+cargo fmt --check -p krishiv-proto -p krishiv-state -p krishiv-scheduler
+rustfmt --edition 2024 --check crates/krishiv-executor/src/runner/task_runner.rs crates/krishiv-executor/src/runner/task_output.rs
+cargo test -p krishiv-proto checkpoint_ack_source_offset_encoded_bytes_roundtrip --lib
+cargo test -p krishiv-state source_offset_record_equality --lib
+cargo test -p krishiv-executor kafka_offsets_from_source_records --lib
+cargo test -p krishiv-scheduler checkpoint_coordinator_initiates_and_collects_acks --lib
+cargo test -p krishiv-scheduler rescaled_restore_redistributes_state_across_new_parallelism --lib
+cargo test -p krishiv-scheduler sc4_checkpoint_complete_not_resent_after_coordinator_restart --lib
+git diff --check
+```
+
+All commands passed. Scheduler and executor test targets still emit
+pre-existing test-build dead-code warnings. Full `cargo fmt --check -p
+krishiv-executor` was not used as the validation command for this slice because
+unrelated dirty executor files currently need rustfmt line wrapping; the
+executor files touched here were checked directly with `rustfmt --check`.
+
+### Blocker(s)
+
+No blocker for this slice. The checkpoint metadata now carries connector-encoded
+source offsets across proto, executor ack, scheduler commit, and durable state.
+The remaining work is to route generic encoded offsets into non-Kafka executor
+source restore paths and to coordinate full streaming task restore for
+distributed deployments.
+
+### Next useful task
+
+Generalize executor restore stashing from Kafka-only offsets to per-source
+encoded offsets keyed by job/source/partition, then let connector-backed
+streaming tasks restore through `DynSource::restore_encoded_checkpoint_offset_dyn`.
+
+---
+
+## 2026-06-26 - Phase 1: Source schema metadata and checkpoint offsets
+
+### Task completed
+
+Continued Phase 1 implementation from the streaming architecture plan:
+
+1. Added dyn-safe connector source metadata:
+   - `Source::source_schema()` for sources that know Arrow schema before the
+     first read.
+   - `DynSource::source_schema_dyn()` so pipeline drivers can use that metadata
+     without downcasting.
+2. Added dyn-safe encoded checkpoint offset operations:
+   - `Source::encoded_checkpoint_offset()`
+   - `Source::restore_encoded_checkpoint_offset()`
+   - matching `DynSource` methods for boxed connector sources.
+3. Wired checkpoint-capable sources to the encoded offset contract for Parquet,
+   Parquet directory, S3 object, S3 prefix, Kafka, in-memory Kafka, rdkafka, and
+   Kinesis.
+4. Wired schema metadata for Parquet, S3 object, Kinesis, Pulsar, and registry
+   CSV/Avro source wrappers.
+5. Updated the streaming pipeline driver to:
+   - use connector schema metadata before probing the first batch,
+   - keep first-batch probing only for data-dependent schemas,
+   - save source offsets by calling the connector's dyn-safe encoded offset,
+   - restore source offsets by calling the connector's dyn-safe restore method,
+   - let `RunPolicy::Once` return after currently available unbounded data is
+     drained and an idle poll is observed.
+6. Added tests for idle unbounded stream startup with explicit schema metadata
+   and dyn encoded checkpoint save/restore.
+
+### Validation
+
+```
+cargo fmt --check -p krishiv-api -p krishiv-connectors -p krishiv-dataflow -p krishiv-ivm
+cargo check -p krishiv-connectors -p krishiv-api
+cargo clippy -p krishiv-connectors -p krishiv-ivm -p krishiv-dataflow -p krishiv-api -- -D warnings
+cargo test -p krishiv-api pipeline_stream --lib
+cargo test -p krishiv-api streaming_checkpoint_uses_dyn_encoded_source_offsets --lib
+git diff --check
+```
+
+All commands passed. The API test target still emits the pre-existing unused
+test-only warnings noted in the previous entry.
+
+### Blocker(s)
+
+No blocker for this slice. End-to-end distributed checkpoint restore still
+needs scheduler/executor metadata persistence and restore orchestration; this
+slice establishes the connector/API contract that protocol can call.
+
+### Next useful task
+
+Wire the encoded source offsets into scheduler/executor checkpoint metadata so
+embedded, single-node, and distributed modes persist and restore the same source
+positions through coordinator-fenced epochs.
+
+---
+
+## 2026-06-26 - Phase 1: Continuous pipeline driver implementation slice
+
+### Task completed
+
+Implemented the first Phase 1 streaming driver slice from the comprehensive
+streaming architecture plan:
+
+1. `Pipeline::run()` stream mode now dispatches to the continuous streaming
+   driver instead of the incremental drain-to-memory path.
+2. Connector stream sources are read incrementally. The driver probes only the
+   first batch for schema inference, keeps that batch pending, then feeds it
+   through the same continuous loop as later batches.
+3. Connector sinks are written through mutable sink references, avoiding cloned
+   sink state during repeated streaming snapshot writes.
+4. Backpressure accounting now uses Arrow batch memory size and resets both
+   byte and row counters after a step.
+5. Added a regression test proving a connector source with `EveryRows(1)`
+   produces stepped snapshots without pre-draining the full source.
+6. Fixed compile/lint issues in the new dataflow profile, buffer, envelope, and
+   fusion support modules, plus current IVM/DataFusion API mismatches surfaced
+   by the streaming work.
+7. Updated the comprehensive streaming architecture plan to explicitly cover
+   embedded, single-node, and distributed deployment modes without creating
+   separate engines.
+
+### Validation
+
+```
+cargo fmt --check -p krishiv-api -p krishiv-connectors -p krishiv-ivm -p krishiv-dataflow
+cargo clippy -p krishiv-connectors -p krishiv-ivm -p krishiv-dataflow -p krishiv-api -- -D warnings
+cargo test -p krishiv-api pipeline_stream_connector_source --lib
+git diff --check
+```
+
+All commands passed. The targeted API test build still emits pre-existing
+test-target warnings in `conformance.rs`, `delivery_cert.rs`,
+`mode_conformance.rs`, and `streaming_builder.rs`.
+
+### Blocker(s)
+
+No blocker for this implementation slice. Full source offset checkpoint restore
+is still not wired because connector offset metadata and the scheduler/executor
+checkpoint protocol do not yet persist source offsets end to end. Idle unbounded
+connector sources also still need explicit schema metadata before they can start
+without an initial batch.
+
+### Next useful task
+
+Implement typed connector schema metadata and source-offset checkpoint
+integration so `run_streaming()` can restore connector positions and start idle
+unbounded streams without requiring a bootstrap batch.
+
+---
+
 ## 2026-06-26 - Lint: raise clippy::indexing_slicing to deny
 
 ### Task completed
@@ -3459,3 +3969,107 @@ cargo test -p krishiv-connectors --lib sql::                                    
 ```
 cargo test --workspace --exclude krishiv-ivm
 ```
+
+---
+
+## 2026-06-27 - Phases 1-7: Streaming architecture implementation
+
+### Task completed
+
+Implemented core streaming architecture changes across multiple crates:
+
+**Phase 1: True Continuous Pipeline Driver**
+- Added `BackpressureController` and `StreamingSource` to `krishiv-api/src/pipeline/driver.rs`
+- Added `StreamingConfig` and `BackpressureConfig` to `krishiv-api/src/pipeline/mod.rs`
+- Added `run_streaming()` function for continuous connector source loops
+- Added checkpoint save/restore for streaming sources
+- Added `DynSource::as_any()` to `krishiv-connectors/src/source.rs` for downcasting
+
+**Phase 2: Low-Latency Batch-Preserving Runtime**
+- Created `krishiv-dataflow/src/envelope.rs` with `StreamEnvelope`, `TimerKind`, and canonical `CheckpointAlignment` re-export
+- Created `krishiv-dataflow/src/buffer.rs` with `OutputBufferPolicy` and `OutputBuffer`
+- Created `krishiv-dataflow/src/profile.rs` with `StreamingExecutionProfile` and `AutoProfileManager`
+- Created `krishiv-dataflow/src/fusion.rs` with `FusionDetector`, `DataflowGraph`, `OperatorFusion`
+
+**Phase 3: Checkpoint Metadata Extension**
+- Extended `CheckpointMetadata` in `krishiv-state/src/checkpoint/metadata.rs` to v3 with:
+  - `unaligned_buffer_refs: Vec<UnalignedBufferRef>` for unaligned checkpoint in-flight data
+  - `sink_transactions: Vec<SinkTransactionRef>` for durable prepared-sink transactions
+  - `streaming_profile: Option<String>` for per-epoch runtime profile
+- Added `UnalignedBufferRef` and `SinkTransactionRef` structs
+
+**Proto Propagation (Phases 0, 2, 3)**
+- Added `StreamingExecutionProfile` and `OutputBufferPolicy` to `krishiv-proto/src/job.rs` `JobSpec`
+- Added `CheckpointAlignment`, `UnalignedBufferRef`, `SinkTransactionRef` to `krishiv-proto/src/checkpoint.rs`
+- Extended `InitiateCheckpointRequest` with `alignment` field
+- Extended `CheckpointAckRequest` with `unaligned_buffers` and `sink_transactions`
+
+**Phase 4: State Backend Evolution — Async State Access**
+- Fixed `AsyncOperatorContext::state_get` in `krishiv-state/src/async_operator.rs` to use `tokio::task::spawn_blocking` instead of calling sync `backend.get()` directly in async context
+- Added `state_put` and `state_delete` methods with `spawn_blocking` to prevent Tokio worker thread blocking
+
+**Phase 6: Public API — Streaming Config Propagation**
+- Added `StreamingExecutionProfile` and `OutputBufferPolicy` types to `krishiv-api/src/pipeline/mod.rs`
+- Extended `StreamingConfig` with `execution_profile` and `output_buffer` fields
+- Builder method `streaming_config()` on `PipelineBuilder` already existed
+
+### Validation
+
+```
+cargo fmt -p krishiv-proto -p krishiv-state -p krishiv-dataflow -p krishiv-api  pass
+```
+
+### Blocker(s)
+
+Full `cargo check` times out on this machine; rely on CI for compile verification.
+
+### Next useful task
+
+1. Wire `OutputBufferPolicy` and `StreamingExecutionProfile` into the executor's streaming loop (`krishiv-executor/src/fragment/streaming.rs`)
+2. Add bounded-read semantics to `stream:loop:` registry source reads
+3. Add embedded, single-node-durable, and distributed-durable smoke tests for restore
+
+---
+
+## 2026-06-27 - Phase 5: Event-time timezone support and Phase 7: Streaming metrics
+
+### Task completed
+
+**Phase 5: Event Time, Timezone, and SQL Semantics**
+- Added `window_timezone: Option<String>` field to `WindowExecutionSpec` in `krishiv-plan/src/window.rs` for SQL civil-time window bucketing
+- Added `window_timezone: Option<String>` field to `LocalWindowExecutionSpec` in `krishiv-runtime/src/local_streaming.rs`
+- Updated `From<&LocalWindowExecutionSpec> for WindowExecutionSpec` to propagate timezone
+- Updated `From<&WindowExecutionSpec> for LocalWindowExecutionSpec` to propagate timezone
+- Added `window_timezone: None` to all 20+ `WindowExecutionSpec` struct constructions across codebase
+- Added `window_timezone: None` to all 35+ `LocalWindowExecutionSpec` struct constructions across codebase
+
+**Phase 7: Certification, Observability, and Benchmarks — Metrics**
+- Added 13 streaming-specific metrics to `KrishivMetrics` in `krishiv-metrics/src/counters.rs`:
+  - `source_read_duration` — source read latency histogram (labeled by source_id)
+  - `output_buffer_flushes` — output buffer flush count by reason
+  - `checkpoint_alignment_duration` — checkpoint alignment time histogram
+  - `unaligned_in_flight_bytes` — unaligned checkpoint in-flight bytes gauge
+  - `checkpoint_upload_duration` — checkpoint upload time histogram
+  - `restore_duration` — restore time histogram
+  - `state_cache_hits` / `state_cache_misses` — state cache hit/miss counters
+  - `object_store_requests` — object-store request count
+  - `sink_prepare_duration` / `sink_commit_duration` / `sink_abort_duration` — sink lifecycle histograms
+  - `backpressure_duration_us` — backpressure duration counter
+- Added all 13 metrics to `render_prometheus()` for Prometheus exposition
+- Added metric cleanup to `remove_job()` for job lifecycle management
+
+### Validation
+
+```
+cargo fmt -p krishiv-metrics -p krishiv-plan -p krishiv-runtime  pass
+```
+
+### Blocker(s)
+
+Full `cargo check` times out on this machine; rely on CI for compile verification.
+
+### Next useful task
+
+1. Wire `OutputBufferPolicy` and `StreamingExecutionProfile` into the executor's streaming loop
+2. Add bounded-read semantics to `stream:loop:` registry source reads
+3. Add embedded, single-node-durable, and distributed-durable smoke tests for restore

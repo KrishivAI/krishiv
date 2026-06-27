@@ -1361,7 +1361,9 @@ Execution statistics:
 
         let result = krishiv_common::async_util::block_on(self.collect_async())?;
         let batches = result.into_batches();
-        let [first, ..] = batches.as_slice() else { return Ok(()); };
+        let [first, ..] = batches.as_slice() else {
+            return Ok(());
+        };
         let schema = first.schema();
         let file = File::create(Path::new(path)).map_err(|e| KrishivError::Runtime {
             message: format!("failed to create parquet file '{path}': {e}"),
@@ -1521,7 +1523,9 @@ Execution statistics:
         use std::fs::File;
         let result = krishiv_common::async_util::block_on(self.collect_async())?;
         let batches = result.into_batches();
-        let [first, ..] = batches.as_slice() else { return Ok(()); };
+        let [first, ..] = batches.as_slice() else {
+            return Ok(());
+        };
         let schema = first.schema();
         let props = build_parquet_writer_props(opts)?;
         let file = File::create(path).map_err(|e| KrishivError::Runtime {

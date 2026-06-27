@@ -201,7 +201,10 @@ pub(crate) fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, Kri
     if batches.is_empty() {
         return Ok(Vec::new());
     }
-    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
     let mut buf = Vec::new();
     {
         let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)

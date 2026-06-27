@@ -71,12 +71,21 @@ pub struct WindowExecutionSpec {
     #[serde(default)]
     pub allowed_lateness_ms: Option<u64>,
     /// Per-source fixed-lag watermark (ms). When non-empty, effective watermark is the
-    /// minimum across all configured sources (R5.2 multi-source reconciliation).
+    /// minimum across all configured sources (R5.2 multi-source watermark reconciliation).
     #[serde(default)]
     pub source_watermark_lags: HashMap<String, u64>,
     /// Column identifying the input source for multi-source watermark propagation.
     #[serde(default)]
     pub source_id_column: Option<String>,
+    /// Optional timezone for SQL civil-time window bucketing (e.g. "America/New_York").
+    ///
+    /// This is only used for SQL window TVFs (`TUMBLE`, `HOP`, `SESSION`) when the
+    /// user specifies `WITH TIMEZONE`. It affects how event timestamps are bucketed
+    /// into civil-time windows (e.g., daily windows in a specific timezone).
+    /// Watermark comparison and checkpoint ordering are always UTC and are NOT
+    /// affected by this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_timezone: Option<String>,
 }
 
 fn default_key_type() -> String {
@@ -107,6 +116,7 @@ impl WindowExecutionSpec {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         }
     }
 }
@@ -160,6 +170,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
         allowed_lateness_ms: None,
         source_watermark_lags: parsed.source_watermark_lags,
         source_id_column: parsed.source_id_column,
+        window_timezone: None,
     };
     validate_window_execution_spec(&spec)?;
     Ok(spec)
@@ -701,6 +712,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse");
@@ -736,6 +748,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some(String::from("source")),
+            window_timezone: None,
         };
 
         let encoded = encode_window_execution_spec(&spec).unwrap();
@@ -800,6 +813,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some("source_id".into()),
+            window_timezone: None,
         };
 
         let fragment = encode_stream_fragment(&spec).unwrap();
@@ -850,6 +864,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse escaped fragment");
@@ -873,6 +888,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse escaped fragment");
@@ -898,6 +914,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags,
             source_id_column: Some("src:col".into()),
+            window_timezone: None,
         };
         let frag = encode_stream_fragment(&spec).unwrap();
         let parsed = parse_stream_fragment(&frag).expect("parse escaped multi-source");
@@ -981,6 +998,7 @@ mod tests {
                         allowed_lateness_ms: None,
                         source_watermark_lags: HashMap::new(),
                         source_id_column: None,
+                        window_timezone: None,
                     },
                 )
         }

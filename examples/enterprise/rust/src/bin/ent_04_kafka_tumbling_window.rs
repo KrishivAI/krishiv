@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
         state_ttl_ms: None,
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
+        window_timezone: None,
     };
 
     let output = execute_windowed_stream(vec![batch], &spec)?;

@@ -10,14 +10,16 @@ extend the existing runtime, state, checkpoint, SQL, and API crates instead of
 creating parallel engines or duplicating abstractions that already exist.
 
 Krishiv should evolve from drain-cycle streaming toward continuous execution by
-preserving the Arrow `RecordBatch` data path and adding low-latency buffering,
-true unbounded source loops, operator fusion, and tighter checkpoint integration.
-Per-record APIs remain useful for user process functions and timers, but
-DataFusion/Arrow relational operators should stay batch-oriented.
+preserving the Arrow `RecordBatch` data path and integrating the low-latency
+buffering, stream-envelope, execution-profile, fusion, source-offset, and
+transactional-sink pieces that already exist. Per-record APIs remain useful for
+user process functions and timers, but DataFusion/Arrow relational operators
+should stay batch-oriented.
 
-Estimated effort for the full program: 22-34 weeks, assuming the existing
-continuous window executor, queue/barrier support, checkpoint storage, and
-prototype disaggregated state backend are reused.
+Estimated effort for the full program: 20-30 weeks, assuming the existing
+continuous window executor, queue/barrier support, checkpoint storage,
+transactional sink registry, low-latency dataflow primitives, and prototype
+disaggregated state backend are reused rather than reimplemented.
 
 ## Source of Truth
 
@@ -26,13 +28,13 @@ The Rust workspace is the source of truth. The relevant current ownership is:
 | Area | Owning crate | Architectural decision |
 |---|---|---|
 | Runtime routing | `krishiv-runtime` | Keep one runtime model across embedded, single-node, and distributed modes. |
-| Public API and pipelines | `krishiv-api` | Add streaming execution policy and true continuous pipeline loops here. |
+| Public API and pipelines | `krishiv-api` | Own public pipeline builders, local API streaming configuration, and embedded driver ergonomics without becoming a second distributed engine. |
 | SQL parsing and DataFusion integration | `krishiv-sql` | Extend existing window TVFs and pipeline DDL rather than inventing a second SQL layer. |
-| Logical/physical plan contracts | `krishiv-plan` | Add typed streaming execution fields and versioned window/time semantics here. |
-| Operators, queues, watermarks, windows | `krishiv-dataflow` | Put low-latency operator runtime, envelopes, output buffers, and chaining here. |
+| Logical/physical plan contracts | `krishiv-plan` | Carry typed streaming execution fields and versioned window/time semantics here. |
+| Operators, queues, watermarks, windows | `krishiv-dataflow` | Own the existing stream envelopes, output buffers, execution profiles, queues, fusion detection, and stateful operators. |
 | Executor task execution | `krishiv-executor` | Integrate continuous task loops, barriers, source offsets, and sink commit phases here. |
 | Scheduler and coordinator fencing | `krishiv-scheduler` | Keep exactly one active coordinator per job and drive fenced checkpoint epochs here. |
-| Typed wire/job contracts | `krishiv-proto` | Add typed execution policy fields; avoid stringly routed config. |
+| Typed wire/job contracts | `krishiv-proto` | Propagate typed execution policy fields; avoid stringly routed config. |
 | State and checkpoint storage | `krishiv-state` | Evolve existing state traits/backends; do not create a separate state engine first. |
 | Connectors and sink capabilities | `krishiv-connectors` | Keep exactly-once claims tied to connector capability and certification matrix. |
 | Python bindings | `krishiv-python` | Expose the Rust API without introducing a divergent pipeline model. |
@@ -48,19 +50,31 @@ future work:
 - Streaming SQL TVF rewrite support for `TUMBLE`, `HOP`, and `SESSION`.
 - `RunPolicy` as a coalescing knob: `Once`, `OnChange`, `EveryRows`, and
   `EveryMs`.
+- `StreamEnvelope`, `OutputBufferPolicy`, `StreamingExecutionProfile`,
+  `AutoProfileManager`, and a first-pass fusion detector in `krishiv-dataflow`.
 - Checkpoint queue primitives with `CheckpointAlignment::{Aligned, Unaligned}`.
 - Async checkpoint storage primitives plus sync compatibility wrappers.
 - RocksDB-backed keyed state, TTL, portable snapshot bytes, savepoints, and
   queryable-state helpers.
-- Prototype DFS-primary disaggregated state backend and async state operator
-  helpers.
+- API-level `run_streaming` connector loops that read incrementally instead of
+  normalizing every stream source to memory first.
+- Executor `stream:loop:` window execution with retained `ContinuousWindowExecutor`
+  state, persistent registry-backed connector source instances, generic encoded
+  source-offset restore, and checkpoint acknowledgements carrying source offsets.
+- Checkpoint metadata with source offsets and operator snapshot references,
+  coordinator fencing validation, checkpoint timeout/abort paths, and
+  executor-side transactional sink pre-commit/commit-through/restore handling.
+- RocksDB incremental SST checkpoint manifests, plus a prototype DFS-primary
+  key-per-file disaggregated state backend and async state operator helpers.
 - ProcessFunction and timer APIs.
 - Published engine and connector contracts that limit exactly-once claims to
   specific source/sink/checkpoint combinations.
 
-The main missing piece is not "add streaming from scratch". It is a true
-continuous runtime path that does not drain connector sources into memory and
-does not require batch-size drain cycles as the latency floor.
+The main missing piece is not "add streaming from scratch". It is an
+executor-owned, envelope-driven continuous source/operator/sink runtime that
+uses the same checkpoint and source-offset contract across embedded,
+single-node, and distributed modes, without treating batch-sized drain cycles as
+the latency floor.
 
 ## Deployment Mode Requirements
 
@@ -99,8 +113,9 @@ queues, barriers, windows, joins, and stateful operators.
 
 Decision:
 
-- Add stream envelopes, low-latency output buffering, and continuous task loops
-  inside `krishiv-dataflow` and `krishiv-executor`.
+- Keep stream envelopes, low-latency output buffering, and continuous task-loop
+  ownership inside `krishiv-dataflow` and `krishiv-executor`; the next work is
+  to integrate the existing primitives into the hot execution path.
 - Revisit a new crate only if the mailbox/runtime surface becomes large enough
   to be shared independently across multiple dataflow runtimes.
 
@@ -114,8 +129,10 @@ aggregation, or SQL execution because Krishiv's internal data model is Arrow
 Decision:
 
 - Use small, time-bounded Arrow batches for low latency.
-- Add `StreamEnvelope` values that carry `RecordBatch`, watermark, barrier,
-  timer, and control messages.
+- Use `StreamEnvelope` values that carry `RecordBatch`, watermark, barrier,
+  timer, and control messages. The current implementation lives in
+  `krishiv-dataflow`; the remaining work is to make the executor runtime consume
+  it directly.
 - Avoid per-row wrappers around DataFusion filter/project operators.
 - Keep row-level callbacks scoped to `ProcessFunction`, timers, and user-defined
   stateful logic.
@@ -160,12 +177,12 @@ the same as a runtime execution profile.
 Decision:
 
 - Keep `RunPolicy` as the API coalescing knob.
-- Add a typed `StreamingExecutionProfile` for runtime behavior:
+- Propagate the existing typed `StreamingExecutionProfile` runtime behavior:
   `LowLatency`, `Throughput`, and `Auto`.
-- Add an `OutputBufferPolicy` with `max_rows`, `max_bytes`, and
+- Propagate the existing `OutputBufferPolicy` with `max_rows`, `max_bytes`, and
   `flush_interval_ms`.
-- Add a `BacklogPolicy` with explicit hysteresis so automatic switching does not
-  oscillate under bursty input.
+- Add or formalize a `BacklogPolicy` with explicit hysteresis so automatic
+  switching does not oscillate under bursty input.
 
 ### Decision 6: Normalize Event Time to UTC
 
@@ -222,13 +239,20 @@ SourceReader
        - abort(epoch) on failed checkpoint
 ```
 
-Stream envelopes should be typed, versioned if serialized, and owned by
-`krishiv-dataflow`:
+Stream envelopes are typed and owned by `krishiv-dataflow`. If they become part
+of a serialized wire path, add a versioned envelope rather than reusing an
+unversioned in-process enum. The current code has both queue-level and
+envelope-level `CheckpointAlignment`; Phase 0 should pick a canonical public
+type or add explicit conversions so the two cannot drift.
 
 ```rust
 pub enum StreamEnvelope {
-    Data(arrow::record_batch::RecordBatch),
-    Watermark { epoch_ms: i64 },
+    Data {
+        batch: arrow::record_batch::RecordBatch,
+        source_id: Option<String>,
+        produced_at_ms: i64,
+    },
+    Watermark { epoch_ms: i64, source_id: String },
     CheckpointBarrier { epoch: u64, alignment: CheckpointAlignment },
     Timer { key: Vec<u8>, fire_time_ms: i64, kind: TimerKind },
     EndOfInput,
@@ -248,9 +272,15 @@ Duration: 1 week
 Deliverables:
 
 - Update this plan to match current crate ownership.
-- Add a short design note for `StreamingExecutionProfile`.
+- Mark existing primitives as implemented, and retarget the remaining work to
+  propagation, integration, and certification.
+- Decide the canonical `CheckpointAlignment` type across `queue`, `envelope`,
+  executor, and any future proto representation.
+- Add a short design note for how `StreamingExecutionProfile` and
+  `OutputBufferPolicy` flow through API, proto, executor, and checkpoint
+  metadata.
 - Add a short design note for checkpoint metadata changes needed by unaligned
-  buffers.
+  buffers and durable prepared-sink transaction references.
 - Ensure any public claims link back to `docs/contracts/engine-semantics.md` and
   `docs/contracts/connectors.md`.
 
@@ -263,16 +293,25 @@ Validation:
 
 Duration: 3-5 weeks
 
-Goal: remove the current "stream mode drains connector sources to memory" limit.
+Goal: retire the remaining drain-cycle semantics while preserving the already
+implemented API-level incremental connector loop and recent executor
+source-offset work.
 
 Work items:
 
-- Add a streaming source loop in `krishiv-api/src/pipeline/driver.rs` that reads
-  connector batches incrementally instead of normalizing all connector input to
-  memory.
-- Define a source trait path for bounded and unbounded reads with backpressure:
-  the source must await downstream capacity.
-- Add cancellation, graceful stop, and terminal error propagation.
+- Add embedded, single-node-durable, and distributed-durable smoke tests proving
+  registry-backed stream sources restore from the same encoded source-offset
+  contract.
+- Clarify source ownership: API-local `run_streaming` may drive embedded
+  pipelines, but distributed streaming sources should be executor-owned and
+  checkpointed through scheduler-fenced epochs.
+- Replace `stream:loop:` registry source "read until `None`" cycles with bounded
+  reads that respect downstream capacity and output-buffer policy.
+- Define the source trait/backpressure path for bounded and unbounded reads:
+  the source must await downstream capacity rather than relying only on polling
+  loops.
+- Add cancellation, graceful stop, and terminal error propagation for long-lived
+  source/operator/sink tasks.
 - Persist source offsets only through the checkpoint protocol for sources that
   support exact restore.
 - Route the same driver through embedded, single-node, and distributed
@@ -284,33 +323,42 @@ Files:
 - `crates/krishiv-api/src/pipeline/driver.rs`
 - `crates/krishiv-connectors/src/*`
 - `crates/krishiv-executor/src/fragment/streaming.rs`
+- `crates/krishiv-executor/src/runner/executor_task_runner.rs`
 - `crates/krishiv-proto/src/job.rs`
 
 Acceptance tests:
 
-- Unbounded test source emits multiple batches without materializing the whole
-  stream.
+- Embedded, single-node-durable, and distributed-durable restore smoke tests use
+  the same source-offset metadata.
+- Unbounded test source emits multiple batches without materializing or draining
+  the whole stream.
 - Backpressure test proves source reads pause when sink/output capacity is full.
 - Cancellation test stops source, operator, and sink tasks without leaked tasks.
 - Rewindable source offset is not externally advanced before checkpoint commit.
-- Embedded and single-node smoke tests exercise the same logical streaming
-  pipeline with different durability defaults.
+- Batch and IVM behavior remain unchanged.
 
 ### Phase 2: Low-Latency Batch-Preserving Dataflow Runtime
 
 Duration: 4-6 weeks
 
-Goal: reduce latency without abandoning Arrow batches.
+Goal: integrate the existing low-latency primitives into the executor/runtime
+hot path without abandoning Arrow batches.
 
 Work items:
 
-- Add `StreamEnvelope` and `OutputBufferPolicy` in `krishiv-dataflow`.
-- Add output buffering by rows, bytes, and elapsed time.
+- Stabilize or re-export the existing `StreamEnvelope`, `OutputBufferPolicy`,
+  and `StreamingExecutionProfile` APIs where other crates need them.
+- Canonicalize or explicitly convert queue and envelope checkpoint-alignment
+  types.
+- Wire output buffering by rows, bytes, and elapsed time into actual streaming
+  emission and sink writes.
 - Add an executor loop that prioritizes barriers/control messages while
   preserving bounded data queues for backpressure.
-- Add operator fusion for forward edges with same parallelism and no shuffle.
-- Add `StreamingExecutionProfile::{LowLatency, Throughput, Auto}`.
-- Add backlog detection with hysteresis:
+- Connect the existing fusion detector to planner/executor decisions for
+  forward edges with same parallelism and no shuffle.
+- Propagate `StreamingExecutionProfile::{LowLatency, Throughput, Auto}` through
+  API, proto/job config, executor, and observability.
+- Complete backlog detection with hysteresis:
   - `Auto` can increase batch size during backlog.
   - `Auto` can lower flush interval after backlog clears.
   - Profile changes must be observable and rate-limited.
@@ -318,6 +366,10 @@ Work items:
 Files:
 
 - `crates/krishiv-dataflow/src/queue.rs`
+- `crates/krishiv-dataflow/src/envelope.rs`
+- `crates/krishiv-dataflow/src/buffer.rs`
+- `crates/krishiv-dataflow/src/profile.rs`
+- `crates/krishiv-dataflow/src/fusion.rs`
 - `crates/krishiv-dataflow/src/continuous.rs`
 - `crates/krishiv-dataflow/src/process_fn.rs`
 - `crates/krishiv-executor/src/fragment/streaming.rs`
@@ -340,17 +392,20 @@ buffers, and sink prepare/commit one coherent protocol.
 
 Work items:
 
+- Preserve existing checkpoint metadata support for source offsets and operator
+  snapshot references.
 - Extend checkpoint metadata to include:
-  - source offsets per source partition
-  - operator snapshot references
   - in-flight buffers for unaligned checkpoints
-  - sink transaction/prepared-commit references
+  - durable sink transaction/prepared-commit references
   - execution profile and buffer policy used for the epoch
 - Wire `CheckpointAlignment::Unaligned` into executor snapshot creation.
 - Add restore logic for in-flight buffers.
 - Fix known lazy-restore failure modes before expanding recovery tests.
-- Add coordinator-side checkpoint timeout and abort handling.
+- Verify existing coordinator-side checkpoint timeout/abort handling also drives
+  sink abort and stale prepared-output cleanup.
 - Add sink prepare/commit/abort tests for every preview exactly-once sink path.
+- Add restart tests proving prepared sink output can be recovered after process
+  loss, not only through an in-memory transaction registry.
 
 Files:
 
@@ -385,7 +440,10 @@ Work items:
   wrapping synchronous calls in futures.
 - For RocksDB, ensure async paths use `spawn_blocking` or a dedicated state I/O
   runtime; do not block Tokio worker threads.
-- Replace the prototype DFS key-per-file layout with an object-store LSM design:
+- Keep the existing RocksDB incremental SST checkpoint path as the local durable
+  state/checkpoint compatibility track.
+- Replace or retire the prototype DFS key-per-file layout with an object-store
+  LSM design:
   - immutable SST files
   - manifest per committed epoch
   - block index and bloom filters
@@ -396,6 +454,8 @@ Work items:
   - tombstones and range delete support
   - garbage collection for unreferenced files
   - format versioning and migration tests
+- Fix the current DFS backend's snapshot identity limitation before using it for
+  recovery claims.
 - Keep current portable snapshot bytes as a compatibility path.
 
 Files:
@@ -403,6 +463,7 @@ Files:
 - `crates/krishiv-state/src/backend.rs`
 - `crates/krishiv-state/src/async_operator.rs`
 - `crates/krishiv-state/src/dfs_backend.rs`
+- `crates/krishiv-state/src/incremental_checkpoint.rs`
 - `crates/krishiv-state/src/checkpoint/*`
 - `crates/krishiv-common/src/*` for durability-profile configuration if needed.
 
@@ -455,8 +516,8 @@ Goal: expose the runtime model without creating a second pipeline API.
 
 Work items:
 
-- Add Rust builder methods for `StreamingExecutionProfile` and
-  `OutputBufferPolicy`.
+- Expose Rust builder methods that map to the existing
+  `StreamingExecutionProfile` and `OutputBufferPolicy` runtime types.
 - Keep `RunPolicy` as the coalescing/advance policy.
 - Add Python methods that map directly to Rust:
   - `pl.execution_profile("low_latency" | "throughput" | "auto", ...)`
@@ -525,13 +586,13 @@ Acceptance criteria:
 
 | Gap | Current state | Target state | Priority |
 |---|---|---|---|
-| True unbounded execution | Stream pipeline currently delegates to incremental run and drains connectors. | Continuous source/operator/sink loop with backpressure and cancellation. | Critical |
-| Latency floor | Drain/coalescing cycle is the main latency knob. | Time-bounded Arrow batches plus output buffering and fused forward operators. | Critical |
-| Checkpoint integration | Queue alignment primitives and checkpoint storage exist, but full protocol integration is incomplete. | One fenced epoch protocol covering barriers, offsets, snapshots, in-flight data, and sinks. | Critical |
+| True unbounded execution | API `run_streaming` reads connector batches incrementally; executor `stream:loop:` still runs bounded cycles over retained state. | Executor-owned continuous source/operator/sink loop with backpressure, cancellation, and mode-invariant semantics. | Critical |
+| Latency floor | Coalescing/drain cycles still dominate the executor path; low-latency primitives exist but are not fully wired. | Time-bounded Arrow batches plus output buffering and fused forward operators in the hot path. | Critical |
+| Checkpoint integration | Source offsets, operator snapshots, fencing, timeout/abort, and transactional sink registry exist; unaligned buffers and durable prepared-sink references are incomplete. | One fenced epoch protocol covering barriers, offsets, snapshots, in-flight data, and durable sink transaction refs. | Critical |
 | Async state | Prototype async helpers can still call sync state methods in async contexts. | Explicit async backend trait or blocking isolation for sync backends. | High |
-| Disaggregated state | Prototype DFS-primary key-file backend. | Manifested object-store LSM with block cache, compaction, GC, and rescaling. | High |
+| Disaggregated state | RocksDB incremental SST checkpointing exists; DFS-primary key-file backend is prototype-grade and has snapshot identity limitations. | Manifested object-store LSM with block cache, compaction, GC, and rescaling, while preserving RocksDB checkpoint compatibility. | High |
 | Timezone correctness | Event time is mostly raw millisecond semantics. | UTC runtime ordering plus timezone-aware SQL bucketing. | Medium |
-| Public config | `RunPolicy` exists but no typed runtime execution profile. | Separate coalescing policy from streaming execution profile. | Medium |
+| Public config | `RunPolicy` exists; typed runtime profile/buffer structs exist in `krishiv-dataflow` but are not propagated through API/proto/executor. | Separate coalescing policy from streaming execution profile across all runtime modes. | Medium |
 | Certification | Preview exactly-once paths exist. | Failure-injection-backed certification per connector combination. | High |
 
 ## Rejected Approaches
@@ -549,14 +610,20 @@ Acceptance criteria:
 
 | File or module | Expected change |
 |---|---|
-| `crates/krishiv-api/src/pipeline/driver.rs` | Replace stream-source drain-to-memory path with true continuous loop. |
-| `crates/krishiv-api/src/pipeline/mod.rs` | Add typed streaming execution profile and output buffer config. |
-| `crates/krishiv-proto/src/job.rs` | Add typed job-level streaming execution policy fields. |
-| `crates/krishiv-dataflow/src/queue.rs` | Integrate stream envelopes and checkpoint alignment into task runtime. |
+| `crates/krishiv-api/src/pipeline/driver.rs` | Keep the API-local incremental connector loop, add cancellation/stop semantics, and align it with executor-owned source/checkpoint contracts. |
+| `crates/krishiv-api/src/pipeline/mod.rs` | Expose typed streaming execution profile and output buffer config. |
+| `crates/krishiv-proto/src/job.rs` | Propagate typed job-level streaming execution policy fields. |
+| `crates/krishiv-dataflow/src/envelope.rs` | Keep the canonical stream envelope and version only if serialized. |
+| `crates/krishiv-dataflow/src/queue.rs` | Canonicalize or convert checkpoint alignment and integrate envelopes into task runtime. |
+| `crates/krishiv-dataflow/src/buffer.rs` | Wire output buffering into actual streaming emission. |
+| `crates/krishiv-dataflow/src/profile.rs` | Feed runtime profile decisions into buffer policy and observability. |
+| `crates/krishiv-dataflow/src/fusion.rs` | Connect fusion detection to planner/executor decisions. |
 | `crates/krishiv-dataflow/src/continuous.rs` | Keep stateful windows; adapt to envelope-driven runtime. |
-| `crates/krishiv-executor/src/fragment/streaming.rs` | Add continuous task loop, barrier handling, source offsets, and sink transactions. |
-| `crates/krishiv-state/src/checkpoint/*` | Extend metadata for offsets, in-flight buffers, sink transactions, and profile config. |
-| `crates/krishiv-state/src/dfs_backend.rs` | Evolve or replace prototype key-file backend with object-store LSM internals. |
+| `crates/krishiv-executor/src/fragment/streaming.rs` | Move from bounded `stream:loop:` cycles toward continuous envelope-driven reads, bounded connector polling, barrier handling, and source-offset staging. |
+| `crates/krishiv-executor/src/runner/executor_task_runner.rs` | Carry runtime policy, checkpoint barriers, transactional sink lifecycle, and restore state across long-lived tasks. |
+| `crates/krishiv-state/src/checkpoint/*` | Extend metadata for in-flight buffers, durable sink transaction refs, and profile config while preserving existing offsets/snapshots. |
+| `crates/krishiv-state/src/dfs_backend.rs` | Retire or replace prototype key-file backend with object-store LSM internals. |
+| `crates/krishiv-state/src/incremental_checkpoint.rs` | Preserve RocksDB SST checkpoint compatibility while object-store state evolves. |
 | `crates/krishiv-state/src/async_operator.rs` | Remove hidden blocking from async state access. |
 | `crates/krishiv-plan/src/window.rs` | Add timezone-aware bucketing config without changing watermark ordering. |
 | `crates/krishiv-sql/src/streaming_tvf.rs` | Extend existing TVF tests and syntax support, do not duplicate window SQL. |
@@ -609,16 +676,21 @@ Initial engineering targets:
 
 ## Immediate Next Steps
 
-1. Implement the true continuous pipeline driver without changing batch or IVM
-   behavior.
-2. Add typed `StreamingExecutionProfile` and `OutputBufferPolicy`.
-3. Wire existing `CheckpointAlignment` into streaming executor checkpoint
-   metadata.
-4. Fix async state access so sync RocksDB work cannot block Tokio worker
-   threads.
-5. Convert the prototype disaggregated backend design into a manifest/SST design
-   document before expanding code.
-6. Add benchmark baselines before claiming latency or recovery improvements.
+1. Add embedded, single-node-durable, and distributed-durable smoke tests for
+   connector-backed streaming restore using encoded source-offset metadata.
+2. Canonicalize `CheckpointAlignment` across dataflow queues, stream envelopes,
+   executor barriers, and future proto fields.
+3. Propagate existing `StreamingExecutionProfile` and `OutputBufferPolicy`
+   through Rust API, proto/job config, executor runtime, and observability.
+4. Bound `stream:loop:` registry-source reads by downstream capacity and output
+   buffer policy, then add cancellation and graceful-stop behavior.
+5. Define checkpoint metadata version changes for unaligned in-flight buffers,
+   durable prepared-sink transaction refs, and per-epoch runtime policy.
+6. Fix async state access so sync RocksDB and DFS/object-store work cannot block
+   Tokio worker threads.
+7. Convert the prototype disaggregated backend into a manifest/SST design note
+   before expanding code, and add benchmark baselines before publishing latency
+   or recovery improvements.
 
 ## References
 

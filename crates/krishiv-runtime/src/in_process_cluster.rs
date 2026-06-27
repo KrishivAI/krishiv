@@ -229,6 +229,7 @@ impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
             allowed_lateness_ms: spec.allowed_lateness_ms,
             source_watermark_lags: spec.source_watermark_lags.clone(),
             source_id_column: spec.source_id_column.clone(),
+            window_timezone: spec.window_timezone.clone(),
         }
     }
 }
@@ -284,6 +285,7 @@ impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
             allowed_lateness_ms: spec.allowed_lateness_ms,
             source_watermark_lags: spec.source_watermark_lags.clone(),
             source_id_column: spec.source_id_column.clone(),
+            window_timezone: spec.window_timezone.clone(),
         }
     }
 }
@@ -338,6 +340,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         }
     }
 
@@ -446,6 +449,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let cluster = InProcessCluster::new().expect("cluster");
         let out = cluster
@@ -499,6 +503,7 @@ mod tests {
             allowed_lateness_ms: Some(1_000),
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let plan = local_spec_to_plan_spec(&local);
         assert_eq!(plan.key_column, "k");
@@ -525,6 +530,7 @@ mod tests {
             allowed_lateness_ms: Some(2_000),
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let local = plan_spec_to_local(&plan);
         assert_eq!(local.key_column, "k");
@@ -556,6 +562,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let plan = local_spec_to_plan_spec(&local);
         assert_eq!(plan.window_kind, krishiv_plan::window::WindowKind::Tumbling);
@@ -578,6 +585,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let plan = local_spec_to_plan_spec(&local);
         assert_eq!(plan.window_kind, krishiv_plan::window::WindowKind::Session);
@@ -600,6 +608,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let local = plan_spec_to_local(&plan);
         assert_eq!(
@@ -625,6 +634,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let local = plan_spec_to_local(&plan);
         assert_eq!(
@@ -649,6 +659,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let local = plan_spec_to_local(&plan);
         assert_eq!(
@@ -673,6 +684,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let local = plan_spec_to_local(&plan);
         assert_eq!(
@@ -695,6 +707,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let fragment = fragment_from_local_spec(&spec).unwrap();
         assert!(fragment.contains("stream:sw"));
@@ -714,6 +727,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let fragment = fragment_from_local_spec(&spec).unwrap();
         assert!(fragment.contains("stream:ses"));

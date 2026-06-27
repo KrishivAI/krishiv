@@ -285,6 +285,10 @@ impl Source for KinesisSource {
             .with_checkpoint()
     }
 
+    fn source_schema(&self) -> Option<SchemaRef> {
+        Some(self.schema().clone())
+    }
+
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
         if let Some(seq) = self.restore_to_sequence.take() {
             self.shard_iterator = self.get_shard_iterator_after(&seq).await?;
@@ -298,6 +302,14 @@ impl Source for KinesisSource {
                 sequence_number: seq.clone(),
             }) as Box<dyn Any + Send>
         })
+    }
+
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        CheckpointSource::encoded_checkpoint_offset(self).map(Some)
+    }
+
+    fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        CheckpointSource::restore_encoded_offset(self, encoded)
     }
 }
 

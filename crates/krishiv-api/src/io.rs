@@ -169,12 +169,10 @@ impl DataFrameReader {
             (Some(FileReadOptions::Csv(options)), "header") => {
                 options.has_header = parse_bool(&key, &value)?;
             }
-            (Some(FileReadOptions::Csv(options)), "delimiter") => {
-                match value.as_bytes() {
-                    [b] => options.delimiter = *b,
-                    _ => return Err(invalid("CSV delimiter must be one byte")),
-                }
-            }
+            (Some(FileReadOptions::Csv(options)), "delimiter") => match value.as_bytes() {
+                [b] => options.delimiter = *b,
+                _ => return Err(invalid("CSV delimiter must be one byte")),
+            },
             (Some(FileReadOptions::Csv(options)), "malformedRecords" | "malformed_records") => {
                 options.malformed_records = parse_malformed_policy(&key, &value)?;
             }

@@ -263,6 +263,10 @@ impl Source for PulsarSource {
         ConnectorCapabilities::new().with_unbounded()
     }
 
+    fn source_schema(&self) -> Option<SchemaRef> {
+        Some(self.schema().clone())
+    }
+
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
         self.next_batch(self.batch_size).await
     }

@@ -44,8 +44,13 @@ use crate::error::{IvmError, IvmResult};
 use crate::plan::{ViewPlan, ViewPlanKind};
 
 /// Maximum number of row hashes retained per source for content-addressed dedup.
-/// When the cap is reached the oldest entries are evicted to bound memory.
 const DEDUP_SEEN_CAPACITY: usize = 10_000_000;
+
+/// Number of oldest entries to evict when the dedup set is full.
+/// Evicts 1% of the cap at a time so bursts only briefly allow re-delivery,
+/// rather than the previous behaviour of clearing the entire set (which
+/// silently re-admitted every previously-seen row).
+const DEDUP_EVICT_BATCH: usize = 100_000;
 
 /// Maximum iterations for recursive view fixpoint computation.
 const MAX_FIXPOINT_ITERS: usize = 100;
@@ -67,9 +72,12 @@ struct IncrementalFlowInner {
     source_snapshots: HashMap<String, RecordBatch>,
 
     // Content-addressed dedup: opt-in per-source insertion row dedup.
-    // Capped at DEDUP_SEEN_CAPACITY entries to prevent unbounded memory growth.
+    // Each entry is (insertion-order FIFO queue, fast-lookup set).
+    // When the set reaches DEDUP_SEEN_CAPACITY the oldest DEDUP_EVICT_BATCH
+    // entries are popped from the queue and removed from the set, so only a
+    // small window of rows is re-admitted rather than the whole history.
     input_dedup_enabled: bool,
-    seen_input_hashes: AHashMap<String, AHashSet<u64>>,
+    seen_input_hashes: AHashMap<String, (VecDeque<u64>, AHashSet<u64>)>,
 
     // Delta checkpoints: accumulate deltas since last checkpoint call.
     delta_checkpoint_enabled: bool,
@@ -98,6 +106,12 @@ struct IncrementalFlowInner {
     // transferable) and always recomputes views via full SQL + diff. Set on
     // the transient executor flow so a remote tick matches central compute.
     force_diff_based: bool,
+
+    // Precise SQL dependency sets per view (populated at register_view time).
+    // Maps view_name → set of lowercased table/view names referenced in FROM/JOIN.
+    // Views absent from this map fall back to the conservative sql_identifiers
+    // tokenizer for dirty-bit detection (see extract_sql_table_refs).
+    view_deps: AHashMap<String, HashSet<String>>,
 }
 
 // ── IncrementalFlow ───────────────────────────────────────────────────────────
@@ -136,6 +150,7 @@ impl IncrementalFlow {
                 source_ordinals: AHashMap::new(),
                 watermark_trackers: AHashMap::new(),
                 force_diff_based: false,
+                view_deps: AHashMap::new(),
             })),
         }
     }
@@ -236,12 +251,22 @@ impl IncrementalFlow {
             let _ = existing.reset_full_output();
             inner.view_plans.remove(&spec.name);
             inner.view_plan_sqls.remove(&spec.name);
+            inner.view_deps.remove(&spec.name);
+        }
+        // Populate precise SQL dep set for fast dirty-bit detection.
+        // Falls back to sql_identifiers at tick time for views where parsing fails
+        // or the SQL contains subqueries (see extract_sql_table_refs).
+        if let Some(deps) = extract_sql_table_refs(&spec.body_sql) {
+            inner.view_deps.insert(spec.name.clone(), deps);
         }
         inner.view_registry.register(spec).map_err(delta_err)
     }
 
     pub fn drop_view(&self, name: &str) -> IvmResult<bool> {
-        let inner = self.inner.lock().map_err(lock_err)?;
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        inner.view_deps.remove(name);
+        inner.view_plans.remove(name);
+        inner.view_plan_sqls.remove(name);
         inner.view_registry.drop_view(name).map_err(delta_err)
     }
 
@@ -314,20 +339,28 @@ impl IncrementalFlow {
 
         // Content-addressed dedup: filter out re-delivered insertion rows.
         let batch = if inner.input_dedup_enabled {
-            let seen = inner
+            let (order, set) = inner
                 .seen_input_hashes
                 .entry(source_name.clone())
                 .or_default();
-            // Evict when capacity is exceeded to prevent unbounded growth.
-            // This may allow a small number of duplicate rows through on the
-            // next tick, which is acceptable for at-least-once semantics.
-            if seen.len() >= DEDUP_SEEN_CAPACITY {
+            // Evict oldest entries when capacity is reached. Evicting a small
+            // batch (1% of capacity) means only those rows can be re-delivered
+            // on the next burst, versus the old full-clear which re-admitted
+            // the entire history.
+            if set.len() >= DEDUP_SEEN_CAPACITY {
                 tracing::warn!(
                     source = %source_name,
                     capacity = DEDUP_SEEN_CAPACITY,
-                    "dedup set capacity reached; clearing to prevent unbounded growth"
+                    evicting = DEDUP_EVICT_BATCH,
+                    "dedup set capacity reached; evicting oldest entries"
                 );
-                seen.clear();
+                for _ in 0..DEDUP_EVICT_BATCH {
+                    if let Some(h) = order.pop_front() {
+                        set.remove(&h);
+                    } else {
+                        break;
+                    }
+                }
             }
             let data = batch.data_batch();
             let weights = batch.weights();
@@ -335,10 +368,11 @@ impl IncrementalFlow {
                 .map(|row| {
                     if weights.value(row) > 0 {
                         let h = hash_row(&data, row);
-                        if seen.contains(&h) {
+                        if set.contains(&h) {
                             Some(false) // already seen
                         } else {
-                            seen.insert(h);
+                            set.insert(h);
+                            order.push_back(h);
                             Some(true)
                         }
                     } else {
@@ -485,6 +519,7 @@ impl IncrementalFlow {
             view_plan_kinds,
             views_needing_plans,
             force_diff_based,
+            view_deps,
         ) = {
             let mut inner = self.inner.lock().map_err(lock_err)?;
             let raw = std::mem::take(&mut inner.pending);
@@ -517,6 +552,8 @@ impl IncrementalFlow {
                 .filter(|n| !inner.view_plans.contains_key(n.as_str()))
                 .cloned()
                 .collect();
+            // Snapshot of precise SQL deps for dirty-bit detection.
+            let deps = inner.view_deps.clone();
             (
                 raw,
                 snapshots,
@@ -525,6 +562,7 @@ impl IncrementalFlow {
                 plan_kinds,
                 needs_plans,
                 force_diff_based,
+                deps,
             )
         };
 
@@ -559,7 +597,7 @@ impl IncrementalFlow {
         }
 
         // ── Phase 4 (no lock): build plans + execute DiffBased SQL ───────────
-        let topo = toposort_views(&view_specs);
+        let topo = toposort_views(&view_specs, &view_deps);
         let spec_map: HashMap<&str, &IncrementalViewSpec> =
             view_specs.iter().map(|s| (s.name.as_str(), s)).collect();
 
@@ -586,9 +624,18 @@ impl IncrementalFlow {
             };
 
             let view_name_lower = view_name.to_lowercase();
-            let is_dirty = sql_identifiers(&spec.body_sql).iter().any(|token| {
-                dirty_sources.contains(token.as_str()) || dirty_views.contains(token.as_str())
-            });
+            let is_dirty = view_deps
+                .get(view_name)
+                .map(|deps| {
+                    deps.iter()
+                        .any(|dep| dirty_sources.contains(dep) || dirty_views.contains(dep))
+                })
+                .unwrap_or_else(|| {
+                    sql_identifiers(&spec.body_sql).iter().any(|token| {
+                        dirty_sources.contains(token.as_str())
+                            || dirty_views.contains(token.as_str())
+                    })
+                });
             if !is_dirty {
                 continue;
             }
@@ -876,7 +923,7 @@ impl IncrementalFlow {
             .collect();
         if !watermarks.is_empty() {
             for plan in inner.view_plans.values_mut() {
-                let _ = plan.gc_watermark(watermarks.values().copied().fold(i64::MAX, i64::min));
+                let _ = plan.gc_watermark(&watermarks);
             }
         }
 
@@ -1401,13 +1448,31 @@ fn coerce_to_schema(
     RecordBatch::try_new(Arc::clone(target), cols).map_err(|e| IvmError::execution(e.to_string()))
 }
 
-fn toposort_views(specs: &[IncrementalViewSpec]) -> Vec<String> {
+/// Compute a topological execution order for `specs`.
+///
+/// Uses `view_deps` (AST-derived precise deps) when a view is present in it,
+/// falling back to the `sql_identifiers` tokenizer only for views whose deps
+/// were not yet computed (e.g. complex SQL that `extract_sql_table_refs` could
+/// not analyse). Using the tokenizer for all views risks phantom edges when a
+/// SQL keyword or string literal matches a view name, which can create false
+/// cycles and corrupt the execution order.
+fn toposort_views(
+    specs: &[IncrementalViewSpec],
+    view_deps: &AHashMap<String, HashSet<String>>,
+) -> Vec<String> {
     let all_names: HashSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
     let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
     let mut in_degree: HashMap<String, usize> = HashMap::new();
     for spec in specs {
         in_degree.entry(spec.name.clone()).or_insert(0);
-        for token in sql_identifiers(&spec.body_sql) {
+        // Use precise AST-derived deps when available; tokenizer as fallback.
+        let deps: Box<dyn Iterator<Item = String>> =
+            if let Some(dep_set) = view_deps.get(&spec.name) {
+                Box::new(dep_set.iter().cloned())
+            } else {
+                Box::new(sql_identifiers(&spec.body_sql).into_iter())
+            };
+        for token in deps {
             if all_names.contains(token.as_str()) && token != spec.name {
                 dependents
                     .entry(token.clone())
@@ -1443,6 +1508,57 @@ fn toposort_views(specs: &[IncrementalViewSpec]) -> Vec<String> {
         .collect();
     order.extend(remaining);
     order
+}
+
+/// Extract the set of table/view names referenced in FROM and JOIN clauses.
+///
+/// Returns `None` when the SQL can't be parsed or contains patterns we can't
+/// safely analyse (subqueries, derived tables). `None` tells the caller to fall
+/// back to the conservative `sql_identifiers` tokenizer so those views are
+/// never silently skipped.
+///
+/// Returns `Some(refs)` for simple `FROM t1 JOIN t2 ON ...` shapes, which
+/// covers the vast majority of IVM view SQL. Using the AST avoids the
+/// false-positive dirty marks produced by `sql_identifiers` when source names
+/// coincide with SQL keywords or aggregate function names (COUNT, SUM, …).
+fn extract_sql_table_refs(sql: &str) -> Option<HashSet<String>> {
+    use sqlparser::ast::{SetExpr, Statement, TableFactor};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let stmt = stmts.into_iter().next()?;
+    let Statement::Query(q) = stmt else {
+        return None;
+    };
+    let SetExpr::Select(select) = q.body.as_ref() else {
+        // UNION/INTERSECT/EXCEPT or other set operations — fall back to tokenizer.
+        return None;
+    };
+
+    let mut refs = HashSet::new();
+    for twj in &select.from {
+        match &twj.relation {
+            TableFactor::Table { name, .. } => {
+                if let Some(ident) = name.0.last().and_then(|part| part.as_ident()) {
+                    refs.insert(ident.value.to_lowercase());
+                }
+            }
+            // Subquery or table function in FROM — can't safely enumerate deps.
+            _ => return None,
+        }
+        for join in &twj.joins {
+            match &join.relation {
+                TableFactor::Table { name, .. } => {
+                    if let Some(ident) = name.0.last().and_then(|part| part.as_ident()) {
+                        refs.insert(ident.value.to_lowercase());
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(refs)
 }
 
 fn sql_identifiers(sql: &str) -> Vec<String> {

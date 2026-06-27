@@ -1443,7 +1443,12 @@ impl SqlEngine {
             return Ok(());
         }
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        let schema = batches.first().ok_or_else(|| SqlError::DataFusion { message: "empty batch list".into() })?.schema();
+        let schema = batches
+            .first()
+            .ok_or_else(|| SqlError::DataFusion {
+                message: "empty batch list".into(),
+            })?
+            .schema();
         let mem_table =
             datafusion::datasource::MemTable::try_new(schema, vec![batches]).map_err(|e| {
                 SqlError::DataFusion {
@@ -2911,7 +2916,9 @@ fn top_level_alias_index(expression: &str) -> Option<usize> {
     let mut candidate = None;
     let mut index = 0usize;
     while index < bytes.len() {
-        let Some(&byte) = bytes.get(index) else { break; };
+        let Some(&byte) = bytes.get(index) else {
+            break;
+        };
         match byte {
             b'\'' if !double_quoted => {
                 if single_quoted && bytes.get(index + 1) == Some(&b'\'') {
@@ -3189,7 +3196,9 @@ fn lower_public_expression(
     use krishiv_plan::expression::{BinaryOperator, Expr};
 
     Ok(match expression {
-        Expr::Column { path } if path.len() == 1 => datafusion::prelude::col(path.first().map(String::as_str).unwrap_or("")),
+        Expr::Column { path } if path.len() == 1 => {
+            datafusion::prelude::col(path.first().map(String::as_str).unwrap_or(""))
+        }
         Expr::Column { .. } => parse_dataframe_expression(dataframe, &expression.to_sql())?,
         Expr::Literal { value } => match public_scalar_to_datafusion(value) {
             Some(value) => DataFusionExpr::Literal(value, None),
@@ -3795,22 +3804,28 @@ fn iceberg_table_ident(table_ref: &str) -> SqlResult<iceberg::TableIdent> {
     let parts: Vec<&str> = table_ref.splitn(3, '.').collect();
     match parts.len() {
         2 => {
-            let ns =
-                iceberg::NamespaceIdent::from_vec(vec![parts.first().copied().unwrap_or("").to_string()]).map_err(|e| {
-                    SqlError::DataFusion {
-                        message: e.to_string(),
-                    }
-                })?;
-            Ok(iceberg::TableIdent::new(ns, parts.get(1).copied().unwrap_or("").to_string()))
+            let ns = iceberg::NamespaceIdent::from_vec(vec![
+                parts.first().copied().unwrap_or("").to_string(),
+            ])
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+            Ok(iceberg::TableIdent::new(
+                ns,
+                parts.get(1).copied().unwrap_or("").to_string(),
+            ))
         }
         3 => {
-            let ns =
-                iceberg::NamespaceIdent::from_vec(vec![parts.get(1).copied().unwrap_or("").to_string()]).map_err(|e| {
-                    SqlError::DataFusion {
-                        message: e.to_string(),
-                    }
-                })?;
-            Ok(iceberg::TableIdent::new(ns, parts.get(2).copied().unwrap_or("").to_string()))
+            let ns = iceberg::NamespaceIdent::from_vec(vec![
+                parts.get(1).copied().unwrap_or("").to_string(),
+            ])
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+            Ok(iceberg::TableIdent::new(
+                ns,
+                parts.get(2).copied().unwrap_or("").to_string(),
+            ))
         }
         _ => Err(SqlError::DataFusion {
             message: format!(

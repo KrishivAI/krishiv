@@ -55,7 +55,7 @@ pub use io::{
 pub use local_fs::LocalFsCheckpointStorage;
 pub use metadata::{
     CheckpointError, CheckpointMetadata, CheckpointResult, IntegrityManifest, OperatorSnapshotRef,
-    SourceOffsetRecord,
+    SinkTransactionRef, SourceOffsetRecord, UnalignedBufferRef,
 };
 pub use paths::{epoch_dir, manifest_path, metadata_path, snapshot_path};
 pub use storage_trait::{CheckpointStorage, run_blocking_on_tokio};

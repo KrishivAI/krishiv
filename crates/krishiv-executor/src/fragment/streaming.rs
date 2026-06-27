@@ -6,7 +6,10 @@ use krishiv_common::MemoryBudget;
 use krishiv_dataflow::ContinuousWindowExecutor;
 use krishiv_plan::udf::ResourceLimits;
 
-use crate::fragment::common::{build_hot_key_reports, task_fragment_body};
+use crate::fragment::common::{
+    build_hot_key_reports, checkpoint_offset_from_dyn_source, parse_registry_partition_specs,
+    task_fragment_body,
+};
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
 use krishiv_dataflow::execute_bounded_window;
@@ -406,7 +409,7 @@ fn execute_window_join_fragment(
 /// Creates or reuses a per-job stateful executor stored in
 /// `runner.loop_executors`.  Drains pending batches via `continuous_drainer`,
 /// passes them through the window operator, and returns emitted window batches.
-fn execute_loop_fragment(
+async fn execute_loop_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
     fragment: &str,
@@ -504,10 +507,16 @@ fn execute_loop_fragment(
         // Distributed path: consume batches that arrived via push_continuous_input gRPC.
         pushed
     } else {
-        crate::fragment::common::read_inline_ipc_partitions(assignment.input_partitions())?
-            .into_iter()
-            .flat_map(|(_, batches)| batches)
-            .collect()
+        let inline_batches: Vec<_> =
+            crate::fragment::common::read_inline_ipc_partitions(assignment.input_partitions())?
+                .into_iter()
+                .flat_map(|(_, batches)| batches)
+                .collect();
+        if !inline_batches.is_empty() {
+            inline_batches
+        } else {
+            read_continuous_registry_sources(runner, assignment, job_id).await?
+        }
     };
 
     // Process through the stateful window executor.
@@ -576,6 +585,95 @@ fn execute_loop_fragment(
         output = output.with_watermark_ms(loop_watermark_ms);
     }
     Ok(output)
+}
+
+async fn read_continuous_registry_sources(
+    runner: &ExecutorTaskRunner,
+    assignment: &ExecutorTaskAssignment,
+    job_id: &str,
+) -> ExecutorResult<Vec<arrow::record_batch::RecordBatch>> {
+    let specs = parse_registry_partition_specs(assignment.input_partitions())?;
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let restored_source_offsets = runner
+        .source_restore_offsets
+        .get(job_id)
+        .map(|entry| entry.clone())
+        .unwrap_or_default();
+    let restored_source_offsets =
+        (!restored_source_offsets.is_empty()).then_some(restored_source_offsets.as_slice());
+    let source_cache = runner.shared_continuous_connector_sources();
+    let mut output_batches = Vec::new();
+    let mut checkpoint_offsets = Vec::new();
+
+    for spec in specs {
+        let source_key = spec.continuous_source_key(job_id);
+        let source_arc = if let Some(entry) = source_cache.get(&source_key) {
+            Arc::clone(entry.value())
+        } else {
+            let mut source = runner
+                .connector_registry
+                .open_source(&spec.connector_config)
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!(
+                        "stream:loop registry source open failed for kind '{}' \
+                         table '{}' partition '{}': {e}",
+                        spec.kind, spec.table_name, spec.partition_id
+                    ),
+                })?;
+            if let Some(restored_offset) = spec.restored_offset(restored_source_offsets) {
+                source
+                    .restore_encoded_checkpoint_offset_dyn(&restored_offset.encoded_offset)
+                    .map_err(|e| ExecutorError::LocalExecution {
+                        message: format!(
+                            "stream:loop registry source restore failed for kind '{}' \
+                             table '{}' partition '{}': {e}",
+                            spec.kind, spec.table_name, spec.partition_id
+                        ),
+                    })?;
+            }
+            let opened = Arc::new(tokio::sync::Mutex::new(source));
+            let entry = source_cache
+                .entry(source_key)
+                .or_insert_with(|| Arc::clone(&opened));
+            Arc::clone(entry.value())
+        };
+
+        let mut source = source_arc.lock().await;
+        while let Some(batch) =
+            source
+                .read_batch_dyn()
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!(
+                        "stream:loop registry source read failed for kind '{}' \
+                         table '{}' partition '{}': {e}",
+                        spec.kind, spec.table_name, spec.partition_id
+                    ),
+                })?
+        {
+            output_batches.push(batch);
+        }
+        if let Some(offset) = checkpoint_offset_from_dyn_source(&spec, source.as_ref())? {
+            checkpoint_offsets.push(offset);
+        }
+    }
+
+    let task_id = assignment.task_id().clone();
+    runner
+        .checkpoint_runners
+        .entry(task_id.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(crate::runner::TaskRunner::new(task_id))))
+        .lock()
+        .map_err(|_| ExecutorError::LocalExecution {
+            message: "stream:loop checkpoint runner lock poisoned".into(),
+        })?
+        .source_offsets = checkpoint_offsets;
+
+    Ok(output_batches)
 }
 
 /// Execute a bounded streaming window fragment (tumbling, sliding, or session).
@@ -687,7 +785,7 @@ pub(crate) async fn execute_streaming_fragment(
     // GAP-6: stream:loop: fragments use a stateful ContinuousWindowExecutor
     // shared across drain cycles via runner.loop_executors.
     if fragment.starts_with(STREAM_LOOP_PREFIX) {
-        return execute_loop_fragment(runner, assignment, fragment);
+        return execute_loop_fragment(runner, assignment, fragment).await;
     }
 
     // ST8: watermark-bounded stream-to-stream join.
@@ -741,8 +839,14 @@ pub(crate) async fn execute_streaming_fragment(
     if !batches.is_empty() {
         plan_spec.key_column = String::from("key");
         plan_spec.event_time_column = String::from("ts");
-        if plan_spec.agg_exprs.first().is_some_and(|a| a.kind == WindowAggKind::Sum)
-            && plan_spec.agg_exprs.first().is_some_and(|a| a.input_column.is_empty())
+        if plan_spec
+            .agg_exprs
+            .first()
+            .is_some_and(|a| a.kind == WindowAggKind::Sum)
+            && plan_spec
+                .agg_exprs
+                .first()
+                .is_some_and(|a| a.input_column.is_empty())
             && let Some(agg) = plan_spec.agg_exprs.first_mut()
         {
             agg.input_column = String::from("val");

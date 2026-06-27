@@ -76,6 +76,8 @@ fn trigger_checkpoint_then_ack_commits_epoch() {
         fencing_token,
         source_offsets: vec![],
         snapshot_path: None,
+        unaligned_buffers: Vec::new(),
+        sink_transactions: Vec::new(),
     };
 
     let response = coordinator.handle_checkpoint_ack(ack);

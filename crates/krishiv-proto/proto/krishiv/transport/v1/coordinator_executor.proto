@@ -418,6 +418,7 @@ enum OutputContractKind {
 message CheckpointSourceOffset {
   string partition_id = 1;
   int64 offset = 2;
+  bytes encoded_offset = 3;
 }
 
 message CheckpointAckRequest {

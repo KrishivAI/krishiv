@@ -10,13 +10,13 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use krishiv_dataflow::adaptive::HeavyHittersTracker;
 use krishiv_proto::{
-    HeartbeatHotKeyReport, InputPartitionDescriptor, JobId, OutputContract,
+    CheckpointSourceOffset, HeartbeatHotKeyReport, InputPartitionDescriptor, JobId, OutputContract,
     OutputContractDescriptor, TaskState, TransportDisposition,
 };
 
 use crate::runner::{
     CONNECTOR_PARQUET_PARTITION_PREFIX, LocalParquetPartition, OBJECT_PARQUET_PARTITION_PREFIX,
-    OBJECT_PARQUET_SINK_PREFIX, REGISTRY_CONNECTOR_PARTITION_PREFIX,
+    OBJECT_PARQUET_SINK_PREFIX, REGISTRY_CONNECTOR_PARTITION_PREFIX, RestoredSourceOffset,
 };
 use crate::{ExecutorError, ExecutorResult};
 
@@ -219,32 +219,49 @@ pub(crate) async fn read_object_parquet_partitions(
     Ok(result)
 }
 
-/// Read input partitions of the form `registry-connector:<kind>:<table_name>:<config_json>`
-/// using a pluggable [`ConnectorRegistry`].
-///
-/// The `config_json` segment is a JSON object whose keys map to
-/// [`ConnectorConfig`][krishiv_connectors::ConnectorConfig] properties.
-/// Example:
-/// ```text
-/// registry-connector:parquet-directory:my_table:{"path":"/data/year=2024","recursive":"true"}
-/// ```
-///
-/// This is the CO5 execution path that allows any registered connector (including
-/// the new `ParquetDirectorySource` and `S3PrefixSource`) to be used as an input
-/// partition source from fragment assignments.
-pub(crate) async fn read_registry_partitions(
-    registry: &krishiv_connectors::ConnectorRegistry,
+#[derive(Debug)]
+pub(crate) struct RegistryPartitionRead {
+    pub table_name: String,
+    pub batches: Vec<arrow::record_batch::RecordBatch>,
+    pub source_offset: Option<CheckpointSourceOffset>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RegistryPartitionSpec {
+    pub partition_id: String,
+    pub raw_descriptor: String,
+    pub kind: String,
+    pub table_name: String,
+    pub connector_config: krishiv_connectors::ConnectorConfig,
+}
+
+impl RegistryPartitionSpec {
+    pub fn continuous_source_key(&self, job_id: &str) -> String {
+        format!("{job_id}|{}|{}", self.partition_id, self.raw_descriptor)
+    }
+
+    pub fn restored_offset<'a>(
+        &self,
+        restored_offsets: Option<&'a [RestoredSourceOffset]>,
+    ) -> Option<&'a RestoredSourceOffset> {
+        restored_offsets
+            .unwrap_or(&[])
+            .iter()
+            .find(|offset| offset.matches_source(&self.partition_id, &self.table_name))
+    }
+}
+
+pub(crate) fn parse_registry_partition_specs(
     partitions: &[krishiv_proto::InputPartition],
-) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
+) -> ExecutorResult<Vec<RegistryPartitionSpec>> {
     use krishiv_connectors::ConnectorConfig;
 
-    let mut result = Vec::new();
+    let mut specs = Vec::new();
     for partition in partitions {
         let desc = partition.description().trim();
         let Some(payload) = desc.strip_prefix(REGISTRY_CONNECTOR_PARTITION_PREFIX) else {
             continue;
         };
-        // Parse `<kind>:<table_name>:<config_json>` from the payload.
         let mut parts = payload.splitn(3, ':');
         let kind_str = parts.next().unwrap_or("").trim();
         let table_name = parts.next().unwrap_or("").trim().to_owned();
@@ -260,8 +277,8 @@ pub(crate) async fn read_registry_partitions(
             });
         }
 
-        let props: std::collections::HashMap<String, String> = serde_json::from_str(config_json)
-            .map_err(|e| ExecutorError::InvalidAssignment {
+        let props: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(config_json).map_err(|e| ExecutorError::InvalidAssignment {
                 message: format!(
                     "registry-connector partition '{}': invalid config JSON '{config_json}': {e}",
                     partition.partition_id()
@@ -272,15 +289,60 @@ pub(crate) async fn read_registry_partitions(
             connector_config = connector_config.with_property(k, v);
         }
 
-        let mut source = registry.open_source(&connector_config).await.map_err(|e| {
-            ExecutorError::LocalExecution {
+        specs.push(RegistryPartitionSpec {
+            partition_id: partition.partition_id().to_owned(),
+            raw_descriptor: desc.to_owned(),
+            kind: kind_str.to_owned(),
+            table_name,
+            connector_config,
+        });
+    }
+    Ok(specs)
+}
+
+/// Read input partitions of the form `registry-connector:<kind>:<table_name>:<config_json>`
+/// using a pluggable [`ConnectorRegistry`], preserving any connector-encoded
+/// checkpoint offset observed after the read.
+///
+/// The `config_json` segment is a JSON object whose keys map to
+/// [`ConnectorConfig`][krishiv_connectors::ConnectorConfig] properties.
+/// Example:
+/// ```text
+/// registry-connector:parquet-directory:my_table:{"path":"/data/year=2024","recursive":"true"}
+/// ```
+///
+/// This is the CO5 execution path that allows any registered connector (including
+/// the new `ParquetDirectorySource` and `S3PrefixSource`) to be used as an input
+/// partition source from fragment assignments.
+pub(crate) async fn read_registry_partition_outputs(
+    registry: &krishiv_connectors::ConnectorRegistry,
+    partitions: &[krishiv_proto::InputPartition],
+    restored_offsets: Option<&[RestoredSourceOffset]>,
+) -> ExecutorResult<Vec<RegistryPartitionRead>> {
+    let mut result = Vec::new();
+    for spec in parse_registry_partition_specs(partitions)? {
+        let mut source = registry
+            .open_source(&spec.connector_config)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
                 message: format!(
-                    "registry-connector open failed for kind '{kind_str}' \
+                    "registry-connector open failed for kind '{}' \
                      (partition '{}'): {e}",
-                    partition.partition_id()
+                    spec.kind, spec.partition_id
                 ),
-            }
-        })?;
+            })?;
+
+        if let Some(restored_offset) = spec.restored_offset(restored_offsets) {
+            source
+                .restore_encoded_checkpoint_offset_dyn(&restored_offset.encoded_offset)
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!(
+                        "registry-connector restore failed for kind '{}' \
+                         table '{}' partition '{}': {e}",
+                        spec.kind, spec.table_name, spec.partition_id
+                    ),
+                })?;
+        }
 
         let mut batches = Vec::new();
         while let Some(batch) =
@@ -288,14 +350,96 @@ pub(crate) async fn read_registry_partitions(
                 .read_batch_dyn()
                 .await
                 .map_err(|e| ExecutorError::LocalExecution {
-                    message: format!("registry-connector read failed for kind '{kind_str}': {e}"),
+                    message: format!(
+                        "registry-connector read failed for kind '{}': {e}",
+                        spec.kind
+                    ),
                 })?
         {
             batches.push(batch);
         }
-        result.push((table_name, batches));
+        let source_offset = checkpoint_offset_from_dyn_source(&spec, source.as_ref())?;
+        result.push(RegistryPartitionRead {
+            table_name: spec.table_name,
+            batches,
+            source_offset,
+        });
     }
     Ok(result)
+}
+
+pub(crate) async fn read_registry_partitions(
+    registry: &krishiv_connectors::ConnectorRegistry,
+    partitions: &[krishiv_proto::InputPartition],
+    restored_offsets: Option<&[RestoredSourceOffset]>,
+) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
+    Ok(
+        read_registry_partition_outputs(registry, partitions, restored_offsets)
+            .await?
+            .into_iter()
+            .map(|read| {
+                let _ = &read.source_offset;
+                (read.table_name, read.batches)
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn checkpoint_offset_from_dyn_source(
+    spec: &RegistryPartitionSpec,
+    source: &dyn krishiv_connectors::DynSource,
+) -> ExecutorResult<Option<CheckpointSourceOffset>> {
+    source
+        .encoded_checkpoint_offset_dyn()
+        .map_err(|e| ExecutorError::LocalExecution {
+            message: format!(
+                "registry-connector checkpoint offset failed for kind '{}' \
+                 table '{}' partition '{}': {e}",
+                spec.kind, spec.table_name, spec.partition_id
+            ),
+        })?
+        .map(|encoded_offset| {
+            Ok::<_, ExecutorError>(CheckpointSourceOffset {
+                partition_id: krishiv_proto::PartitionId::try_new(spec.partition_id.clone())
+                    .map_err(|_| ExecutorError::InvalidAssignment {
+                        message: format!(
+                            "registry-connector partition '{}' has invalid checkpoint id",
+                            spec.partition_id
+                        ),
+                    })?,
+                offset: legacy_offset_from_dyn_source(source),
+                encoded_offset,
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn legacy_offset_from_dyn_source(source: &dyn krishiv_connectors::DynSource) -> i64 {
+    let Some(offset) = source.current_offset_dyn() else {
+        return 0;
+    };
+    let any = offset.as_ref();
+    if let Some(value) = any.downcast_ref::<i64>() {
+        *value
+    } else if let Some(value) = any.downcast_ref::<i32>() {
+        i64::from(*value)
+    } else if let Some(value) = any.downcast_ref::<u64>() {
+        i64::try_from(*value).unwrap_or(i64::MAX)
+    } else if let Some(value) = any.downcast_ref::<u32>() {
+        i64::from(*value)
+    } else if let Some(value) = any.downcast_ref::<usize>() {
+        i64::try_from(*value).unwrap_or(i64::MAX)
+    } else if let Some(value) = any.downcast_ref::<isize>() {
+        i64::try_from(*value).unwrap_or_else(|_| {
+            if value.is_negative() {
+                i64::MIN
+            } else {
+                i64::MAX
+            }
+        })
+    } else {
+        0
+    }
 }
 
 /// Parse the sink contract on `contract` into a [`SinkWriteSpec`].
@@ -816,7 +960,22 @@ pub(crate) fn build_hot_key_reports(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
     use krishiv_common::MemoryBudget;
+    use krishiv_connectors::{
+        ConnectorCapabilities, ConnectorConfig, ConnectorResult, DynSource, Source,
+        registry::{
+            ConnectorDescriptor, ConnectorKind, ConnectorRegistry, ConnectorRole, OpenSourceFuture,
+            SourceDriver,
+        },
+    };
+    use krishiv_proto::InputPartition;
+
+    use crate::runner::RestoredSourceOffset;
 
     #[test]
     fn task_engine_memory_limit_uses_explicit_task_budget() {
@@ -861,6 +1020,132 @@ mod tests {
         // global EXECUTOR_PROCESS_BUDGET, which is unlimited in tests; verify
         // dropping a guard with zero bytes is a no-op and does not panic.
         drop(super::ProcessMemoryReservation { bytes: 0 });
+    }
+
+    #[derive(Clone)]
+    struct RestoringSourceDriver {
+        batches: Arc<Vec<RecordBatch>>,
+    }
+
+    impl SourceDriver for RestoringSourceDriver {
+        fn descriptor(&self) -> ConnectorDescriptor {
+            ConnectorDescriptor::new(
+                ConnectorKind::Csv,
+                ConnectorRole::Source,
+                ConnectorCapabilities::new()
+                    .with_bounded()
+                    .with_rewindable()
+                    .with_checkpoint(),
+            )
+        }
+
+        fn validate(&self, _config: &ConnectorConfig) -> ConnectorResult<()> {
+            Ok(())
+        }
+
+        fn open<'a>(&'a self, _config: &'a ConnectorConfig) -> OpenSourceFuture<'a> {
+            let batches = Arc::clone(&self.batches);
+            Box::pin(async move {
+                Ok(Box::new(RestoringSource {
+                    schema: batches
+                        .first()
+                        .map(|batch| batch.schema())
+                        .unwrap_or_else(|| Arc::new(Schema::empty())),
+                    batches,
+                    cursor: 0,
+                }) as Box<dyn DynSource>)
+            })
+        }
+    }
+
+    struct RestoringSource {
+        schema: SchemaRef,
+        batches: Arc<Vec<RecordBatch>>,
+        cursor: usize,
+    }
+
+    impl Source for RestoringSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable()
+                .with_checkpoint()
+        }
+
+        fn source_schema(&self) -> Option<SchemaRef> {
+            Some(self.schema.clone())
+        }
+
+        async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+            let batch = self.batches.get(self.cursor).cloned();
+            if batch.is_some() {
+                self.cursor = self.cursor.saturating_add(1);
+            }
+            Ok(batch)
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
+            Some(Box::new(self.cursor))
+        }
+
+        fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+            Ok(Some((self.cursor as u64).to_le_bytes().to_vec()))
+        }
+
+        fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+            if encoded.len() != 8 {
+                return Err(krishiv_connectors::ConnectorError::Offset {
+                    message: format!("expected 8 encoded cursor bytes, got {}", encoded.len()),
+                });
+            }
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(encoded);
+            self.cursor = usize::try_from(u64::from_le_bytes(raw)).map_err(|_| {
+                krishiv_connectors::ConnectorError::Offset {
+                    message: "encoded cursor exceeds usize".into(),
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    fn value_batch(value: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_registry_partitions_restores_encoded_source_offset() {
+        let mut registry = ConnectorRegistry::new();
+        registry.register_source(Arc::new(RestoringSourceDriver {
+            batches: Arc::new(vec![value_batch(10), value_batch(20)]),
+        }));
+        let partition =
+            InputPartition::new("orders-partition-0", "registry-connector:csv:orders:{}");
+        let restored = RestoredSourceOffset {
+            partition_id: "orders-partition-0".into(),
+            source_id: Some("orders".into()),
+            legacy_offset: 1,
+            encoded_offset: 1_u64.to_le_bytes().to_vec(),
+        };
+
+        let tables = super::read_registry_partitions(&registry, &[partition], Some(&[restored]))
+            .await
+            .expect("registry partition read");
+
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].0, "orders");
+        assert_eq!(tables[0].1.len(), 1);
+        let values = tables[0].1[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 20);
     }
 
     // ── Phase 2.3 distributed write commit protocol ─────────────────────────

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
+use krishiv_connectors::Offset;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointSourceOffset, InitiateCheckpointRequest, TaskId,
 };
@@ -22,7 +23,12 @@ pub struct TaskRunner {
     pub operator_id: String,
     /// Task identifier.
     pub task_id: TaskId,
-    /// Per-partition Kafka source offsets for checkpoint. Empty for non-Kafka tasks.
+    /// Generic connector source offsets for checkpoint. Empty for tasks whose
+    /// sources do not expose checkpoint-capable encoded offsets.
+    pub source_offsets: Vec<CheckpointSourceOffset>,
+    /// Per-partition Kafka source offsets for checkpoint. Retained as a
+    /// compatibility path while Kafka source execution still owns typed Kafka
+    /// offsets directly.
     pub kafka_source_offsets: Vec<krishiv_connectors::kafka::KafkaOffset>,
 }
 
@@ -34,8 +40,15 @@ impl TaskRunner {
             last_acked_epoch: 0,
             operator_id,
             task_id,
+            source_offsets: Vec::new(),
             kafka_source_offsets: Vec::new(),
         }
+    }
+
+    /// Set generic connector source offsets for checkpoint.
+    pub fn with_source_offsets(mut self, offsets: Vec<CheckpointSourceOffset>) -> Self {
+        self.source_offsets = offsets;
+        self
     }
 
     /// Set the per-partition Kafka source offsets (for Kafka source tasks).
@@ -74,6 +87,8 @@ impl TaskRunner {
                 fencing_token: req.fencing_token,
                 source_offsets: vec![],
                 snapshot_path: None,
+                unaligned_buffers: Vec::new(),
+                sink_transactions: Vec::new(),
             });
         }
 
@@ -140,8 +155,12 @@ impl TaskRunner {
             None
         };
 
-        // Build source offsets — one entry per assigned Kafka partition.
-        let source_offsets: Vec<CheckpointSourceOffset> = self
+        // Build source offsets. Generic connector offsets are already in the
+        // checkpoint wire shape; Kafka offsets are appended through the legacy
+        // compatibility cache until Kafka source execution moves fully to the
+        // generic path.
+        let mut source_offsets = self.source_offsets.clone();
+        let kafka_source_offsets: Vec<CheckpointSourceOffset> = self
             .kafka_source_offsets
             .iter()
             .map(|ko| {
@@ -157,9 +176,11 @@ impl TaskRunner {
                         ),
                     })?,
                     offset: ko.offset,
+                    encoded_offset: ko.encode(),
                 })
             })
             .collect::<Result<Vec<_>, ExecutorError>>()?;
+        source_offsets.extend(kafka_source_offsets);
 
         self.last_acked_epoch = req.epoch;
 
@@ -178,6 +199,8 @@ impl TaskRunner {
             fencing_token: req.fencing_token,
             source_offsets,
             snapshot_path: snap_path,
+            unaligned_buffers: Vec::new(),
+            sink_transactions: Vec::new(),
         })
     }
 
@@ -186,11 +209,12 @@ impl TaskRunner {
     /// After a global rollback the coordinator resumes epochs from
     /// `restored_epoch + 1`; seeding `last_acked_epoch` here makes the runner
     /// reject any straggler barrier for a pre-rollback epoch as stale.
-    /// `kafka_source_offsets` is cleared — the rewound source re-populates it
-    /// on its first post-restore read, and the authoritative restored offsets
-    /// flow through the runner-level Kafka restore table.
+    /// Source offsets are cleared — the rewound source re-populates them on
+    /// its first post-restore read, and the authoritative restored offsets flow
+    /// through the runner-level source restore tables.
     pub fn apply_restored_epoch(&mut self, restored_epoch: u64) {
         self.last_acked_epoch = restored_epoch;
+        self.source_offsets.clear();
         self.kafka_source_offsets.clear();
     }
 }

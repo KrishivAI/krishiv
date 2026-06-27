@@ -4,21 +4,24 @@
 //! **Invariant:** this module only orchestrates existing Tier-1 methods. It must
 //! never reimplement incremental/streaming execution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
+use krishiv_common::async_util::unix_now_ms;
 use krishiv_delta::DeltaBatch;
 use krishiv_ivm::IncrementalViewSpec;
 
-use super::{BackpressureConfig, Egress, Expectation, Ingest, OnViolation, Pipeline, StreamingConfig, ViewDef};
+use super::{
+    BackpressureConfig, Egress, Expectation, Ingest, OnViolation, Pipeline, StreamingConfig,
+    ViewDef,
+};
 use crate::compute::FeedableJob;
 use crate::{IvmJob, KrishivError, Result};
 
-use krishiv_connectors::checkpoint::CheckpointSource;
 use krishiv_connectors::DynSource;
 
 /// How the driver advances the logical clock — the *coalescing* knob, never a
@@ -83,11 +86,11 @@ impl BackpressureController {
     }
 
     /// Record that a batch was produced.
-    pub fn record_batch(&mut self, num_rows: usize) {
+    pub fn record_batch(&mut self, batch: &RecordBatch) {
+        let num_rows = batch.num_rows();
         self.current_rows += num_rows;
         self.rows_since_step += num_rows;
-        // Approximate bytes (would need actual batch size in production)
-        self.current_bytes += num_rows * 100; // rough estimate
+        self.current_bytes += batch.get_array_memory_size();
     }
 
     /// Mark source as exhausted.
@@ -104,6 +107,7 @@ impl BackpressureController {
     pub fn reset_after_step(&mut self) {
         self.current_bytes = 0;
         self.current_rows = 0;
+        self.rows_since_step = 0;
     }
 }
 
@@ -115,6 +119,8 @@ pub struct StreamingSource {
     pub source: Box<dyn DynSource>,
     /// Current checkpoint offset (if checkpoint source).
     pub offset: Option<Vec<u8>>,
+    /// Batches read during schema/bootstrap probing but not yet fed.
+    pub pending_batches: VecDeque<RecordBatch>,
     /// Backpressure controller.
     pub backpressure: BackpressureController,
 }
@@ -138,34 +144,33 @@ pub async fn save_streaming_checkpoint(
     let mut source_offsets = std::collections::HashMap::new();
 
     for src in sources {
-        if let Some(offset) = &src.offset {
-            source_offsets.insert(src.name.clone(), offset.clone());
+        if let Some(offset) = src.source.encoded_checkpoint_offset_dyn().map_err(rt)? {
+            source_offsets.insert(src.name.clone(), offset);
         }
     }
 
     Ok(StreamingCheckpoint {
         checkpoint_id: checkpoint_id.to_string(),
         source_offsets,
-        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        timestamp_ms: unix_now_ms(),
     })
 }
 
 /// Restore streaming sources from checkpoint.
+///
+/// The connector validates that the encoded bytes belong to the source and name
+/// a valid read boundary.
+#[allow(dead_code)]
 pub async fn restore_streaming_checkpoint(
     sources: &mut [StreamingSource],
     checkpoint: &StreamingCheckpoint,
 ) -> Result<()> {
     for src in sources.iter_mut() {
         if let Some(offset) = checkpoint.source_offsets.get(&src.name) {
-            // Try to downcast to CheckpointSource and restore offset
-            if src
-                .source
-                .as_any()
-                .downcast_ref::<Box<dyn CheckpointSource>>()
-                .is_some()
-            {
-                src.offset = Some(offset.clone());
-            }
+            src.source
+                .restore_encoded_checkpoint_offset_dyn(offset)
+                .map_err(rt)?;
+            src.offset = Some(offset.clone());
         }
     }
     Ok(())
@@ -254,7 +259,8 @@ pub(super) async fn run_incremental(pipeline: Pipeline, policy: RunPolicy) -> Re
     job.step().await?;
 
     // 5. Write each view's current snapshot to its sinks (applying expectations).
-    write_snapshots(&job, sinks, &expectations).await
+    let mut sinks = sinks;
+    write_snapshots(&job, &mut sinks, &expectations).await
 }
 
 /// Drain a bounded connector source to in-memory batches, replacing any
@@ -293,12 +299,12 @@ async fn maybe_step(job: &IvmJob, policy: RunPolicy, rows_since_step: &mut usize
 
 async fn write_snapshots(
     job: &IvmJob,
-    sinks: Vec<(String, Egress)>,
+    sinks: &mut [(String, Egress)],
     expectations: &[Expectation],
 ) -> Result<()> {
-    for (view, mut egress) in sinks {
-        if let Some(snapshot) = job.snapshot(&view).await? {
-            let snapshot = apply_expectations(&view, snapshot, expectations).await?;
+    for (view, egress) in sinks.iter_mut() {
+        if let Some(snapshot) = job.snapshot(view).await? {
+            let snapshot = apply_expectations(view, snapshot, expectations).await?;
             if snapshot.num_rows() > 0 {
                 egress.write(snapshot).await?;
             }
@@ -366,7 +372,13 @@ async fn apply_expectations(
                 current = if kept.is_empty() {
                     RecordBatch::new_empty(schema)
                 } else {
-                    arrow::compute::concat_batches(&kept.first().map(|b| b.schema()).unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty())), &kept).map_err(rt)?
+                    arrow::compute::concat_batches(
+                        &kept.first().map(|b| b.schema()).unwrap_or_else(|| {
+                            std::sync::Arc::new(arrow::datatypes::Schema::empty())
+                        }),
+                        &kept,
+                    )
+                    .map_err(rt)?
                 };
             }
         }
@@ -380,7 +392,7 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
     let Pipeline {
         sources,
         views,
-        sinks,
+        mut sinks,
         expectations,
         ..
     } = pipeline;
@@ -420,8 +432,8 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
     }
 
     // Write each view's result to its sinks (applying expectations).
-    for (view, mut egress) in sinks {
-        if let Some(batches) = outputs.get(&view) {
+    for (view, egress) in sinks.iter_mut() {
+        if let Some(batches) = outputs.get(view.as_str()) {
             let schema = batches
                 .first()
                 .map(|b| b.schema())
@@ -431,7 +443,7 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
             } else {
                 arrow::compute::concat_batches(&schema, batches).map_err(rt)?
             };
-            let checked = apply_expectations(&view, combined, &expectations).await?;
+            let checked = apply_expectations(view, combined, &expectations).await?;
             if checked.num_rows() > 0 {
                 egress.write(checked).await?;
             }
@@ -446,10 +458,17 @@ pub(super) async fn run_batch(pipeline: Pipeline) -> Result<()> {
 /// Streaming pipeline: an unbounded/append-only record source feeding an
 /// incremental view. Shares the incremental engine with `Ivm` — the difference
 /// is intent (records are append-only inserts rather than CDC changes). Bounded
-/// connector sources are drained up front; for true unbounded sources the
-/// driver processes all currently-available batches per the advance policy.
+/// connector sources are read incrementally; for true unbounded sources the
+/// driver processes batches as they become available per the advance policy.
 pub(super) async fn run_stream(pipeline: Pipeline, policy: RunPolicy) -> Result<()> {
-    run_incremental(pipeline, policy).await
+    run_streaming(
+        pipeline,
+        StreamingConfig {
+            run_policy: policy,
+            ..StreamingConfig::default()
+        },
+    )
+    .await
 }
 
 /// True continuous streaming pipeline driver.
@@ -463,13 +482,69 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
         name,
         sources,
         views,
-        sinks,
+        mut sinks,
         expectations,
         ..
     } = pipeline;
 
-    // 1. Register views (same as incremental path)
-    let mut schemas: std::collections::HashMap<String, SchemaRef> = std::collections::HashMap::new();
+    // 1. Prepare source schemas. Connectors that expose schema metadata can
+    // start even when no data is currently available. Data-dependent connectors
+    // are probed for the first batch only; that batch is kept pending and fed
+    // after view registration.
+    let mut schemas: HashMap<String, SchemaRef> = HashMap::new();
+    let mut streaming_sources: Vec<StreamingSource> = Vec::new();
+    let mut memory_sources: Vec<(String, Ingest)> = Vec::new();
+    for (sname, ingest) in sources {
+        match ingest {
+            Ingest::Connector(mut src) => {
+                let capabilities = src.capabilities();
+                capabilities.validate().map_err(rt)?;
+                let mut pending_batches = VecDeque::new();
+
+                if let Some(schema) = src.source_schema_dyn() {
+                    schemas.insert(sname.clone(), schema);
+                } else {
+                    match src.read_batch_dyn().await.map_err(rt)? {
+                        Some(batch) => {
+                            schemas.insert(sname.clone(), batch.schema());
+                            pending_batches.push_back(batch);
+                        }
+                        None if capabilities.is_bounded() => {
+                            return Err(rt(format!(
+                                "connector source '{sname}' produced no batches; schema inference \
+                                 for empty connector sources requires explicit connector schema \
+                                 metadata"
+                            )));
+                        }
+                        None => {
+                            return Err(rt(format!(
+                                "connector source '{sname}' did not produce an initial batch; \
+                                 schema inference for idle unbounded connector sources requires \
+                                 explicit connector schema metadata"
+                            )));
+                        }
+                    }
+                }
+
+                let streaming_src = StreamingSource {
+                    name: sname,
+                    source: src,
+                    offset: None,
+                    pending_batches,
+                    backpressure: BackpressureController::new(config.backpressure.clone()),
+                };
+                streaming_sources.push(streaming_src);
+            }
+            other => {
+                if let Some(schema) = ingest_schema(&other) {
+                    schemas.insert(sname.clone(), schema);
+                }
+                memory_sources.push((sname, other));
+            }
+        }
+    }
+
+    // 2. Register views once source schemas are known.
     let job = session.ivm(&name).await?;
     for v in &views {
         let out_schema = infer_view_schema(&schemas, &v.sql).await?;
@@ -485,29 +560,9 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
         .await?;
     }
 
-    // 2. Create streaming sources with backpressure
-    let mut streaming_sources: Vec<StreamingSource> = Vec::new();
-    let mut memory_sources: Vec<(String, Ingest)> = Vec::new();
-
-    for (sname, ingest) in sources {
-        match ingest {
-            Ingest::Connector(src) => {
-                let streaming_src = StreamingSource {
-                    name: sname,
-                    source: src,
-                    offset: None,
-                    backpressure: BackpressureController::new(config.backpressure.clone()),
-                };
-                streaming_sources.push(streaming_src);
-            }
-            other => {
-                // Memory/CDC sources still use incremental path
-                memory_sources.push((sname, other));
-            }
-        }
-    }
-
-    // 3. Feed memory sources first (if any)
+    // 3. Feed in-memory sources first. They share the same IVM job and are
+    // stepped with connector input below, so mixed memory+connector pipelines
+    // still produce one coherent snapshot.
     let mut rows_since_step = 0usize;
     for (sname, ingest) in memory_sources {
         match ingest {
@@ -520,7 +575,6 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
                     let delta = DeltaBatch::from_inserts(b).map_err(rt)?;
                     job.feed(&sname, &delta).await?;
                     rows_since_step += n;
-                    maybe_step(&job, config.run_policy, &mut rows_since_step).await?;
                 }
             }
             Ingest::Cdc(changes) => {
@@ -529,7 +583,6 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
                         let n = delta.num_rows();
                         job.feed(&sname, &delta).await?;
                         rows_since_step += n;
-                        maybe_step(&job, config.run_policy, &mut rows_since_step).await?;
                     }
                 }
             }
@@ -539,32 +592,43 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
 
     // 4. Run continuous loop with backpressure
     let mut last_step = std::time::Instant::now();
+    let mut last_checkpoint = std::time::Instant::now();
     let mut running = true;
     let mut checkpoint_counter = 0u64;
 
     while running {
+        let mut made_progress = false;
+        let mut saw_idle_unbounded = false;
+
         // Read from streaming sources with backpressure
         for src in &mut streaming_sources {
-            if src.backpressure.is_available() {
-                match src.source.read_batch_dyn().await.map_err(rt)? {
-                    Some(batch) => {
-                        // Feed batch to job
-                        let delta = DeltaBatch::from_inserts(batch.clone()).map_err(rt)?;
-                        job.feed(&src.name, &delta).await?;
+            let can_read =
+                matches!(config.run_policy, RunPolicy::Once) || src.backpressure.is_available();
+            if can_read {
+                let next_batch = if let Some(batch) = src.pending_batches.pop_front() {
+                    Some(batch)
+                } else {
+                    src.source.read_batch_dyn().await.map_err(rt)?
+                };
 
-                        // Update offset if checkpoint source
-                        let offset = src
-                            .source
-                            .as_any()
-                            .downcast_ref::<Box<dyn CheckpointSource>>();
-                        if offset.is_some() {
-                            // Store the current offset for checkpointing
-                            // In production, this would read from the checkpoint source
-                            src.offset = Some(vec![]); // Placeholder
+                match next_batch {
+                    Some(batch) => {
+                        if batch.num_rows() == 0 {
+                            continue;
                         }
 
+                        // Feed batch to job
+                        let delta = DeltaBatch::from_inserts(batch).map_err(rt)?;
+                        let batch = delta.data_batch().clone();
+                        job.feed(&src.name, &delta).await?;
+
+                        // Update offset tracking for checkpoint
+                        // The actual offset is managed by the connector internally
+                        // We just track that data was read successfully
+
                         // Apply backpressure
-                        src.backpressure.record_batch(batch.num_rows());
+                        src.backpressure.record_batch(&batch);
+                        made_progress = true;
                     }
                     None if src.source.capabilities().is_bounded() => {
                         // Bounded source exhausted
@@ -573,6 +637,7 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
                     None => {
                         // Unbounded source returned None (temporary)
                         // This is normal for sources waiting for data
+                        saw_idle_unbounded = true;
                     }
                 }
             }
@@ -580,13 +645,22 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
 
         // Step job based on run policy
         let elapsed = last_step.elapsed();
+        let rows_ready = rows_since_step
+            + streaming_sources
+                .iter()
+                .map(|s| s.backpressure.rows_since_step)
+                .sum::<usize>();
+        let backpressure_full = rows_ready > 0
+            && streaming_sources
+                .iter()
+                .any(|s| !s.backpressure.is_available() && !s.backpressure.is_exhausted());
         let should_step = match config.run_policy {
             RunPolicy::Once => false,
-            RunPolicy::OnChange => true,
-            RunPolicy::EveryRows(n) => streaming_sources
-                .iter()
-                .any(|s| s.backpressure.rows_since_step >= n),
-            RunPolicy::EveryMs(ms) => elapsed.as_millis() >= ms as u128,
+            RunPolicy::OnChange => made_progress,
+            RunPolicy::EveryRows(n) => rows_ready >= n.max(1) || backpressure_full,
+            RunPolicy::EveryMs(ms) => {
+                rows_ready > 0 && (elapsed.as_millis() >= ms as u128 || backpressure_full)
+            }
         };
 
         if should_step {
@@ -594,38 +668,65 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
             last_step = std::time::Instant::now();
 
             // Write snapshots to sinks
-            write_snapshots(&job, sinks.clone(), &expectations).await?;
+            write_snapshots(&job, &mut sinks, &expectations).await?;
 
             // Reset row counters
+            rows_since_step = 0;
             for src in &mut streaming_sources {
                 src.backpressure.reset_after_step();
             }
 
             // Checkpoint if configured
-            if let Some(interval_ms) = config.checkpoint_interval_ms {
-                checkpoint_counter += elapsed.as_millis() as u64;
-                if checkpoint_counter >= interval_ms {
-                    let checkpoint =
-                        save_streaming_checkpoint(&streaming_sources, &format!("cp-{}", checkpoint_counter)).await?;
-                    tracing::debug!(
-                        "Saved checkpoint {} with {} source offsets",
-                        checkpoint.checkpoint_id,
-                        checkpoint.source_offsets.len()
-                    );
-                    checkpoint_counter = 0;
-                }
+            if let Some(interval_ms) = config.checkpoint_interval_ms
+                && last_checkpoint.elapsed().as_millis() >= interval_ms as u128
+            {
+                checkpoint_counter = checkpoint_counter.saturating_add(1);
+                let checkpoint = save_streaming_checkpoint(
+                    &streaming_sources,
+                    &format!("cp-{}", checkpoint_counter),
+                )
+                .await?;
+                tracing::debug!(
+                    timestamp_ms = checkpoint.timestamp_ms,
+                    "Saved checkpoint {} with {} source offsets",
+                    checkpoint.checkpoint_id,
+                    checkpoint.source_offsets.len()
+                );
+                last_checkpoint = std::time::Instant::now();
             }
         }
 
-        // Check if all bounded sources are exhausted
-        running = streaming_sources.iter().any(|s| {
-            !s.source.capabilities().is_bounded() || !s.backpressure.is_exhausted()
-        });
+        // Check if all bounded sources are exhausted. In `Once` mode, unbounded
+        // sources are treated as drained once every currently-available batch
+        // has been read and a poll returns idle.
+        running =
+            if matches!(config.run_policy, RunPolicy::Once) && saw_idle_unbounded && !made_progress
+            {
+                false
+            } else {
+                streaming_sources.iter().any(|s| {
+                    !s.source.capabilities().is_bounded()
+                        || !s.backpressure.is_exhausted()
+                        || !s.pending_batches.is_empty()
+                })
+            };
+
+        if running && !made_progress && !should_step {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
-    // Final flush
-    job.step().await?;
-    write_snapshots(&job, sinks, &expectations).await
+    // Final flush for rows not covered by a policy-triggered step.
+    let rows_ready = rows_since_step
+        + streaming_sources
+            .iter()
+            .map(|s| s.backpressure.rows_since_step)
+            .sum::<usize>();
+    if rows_ready > 0 {
+        job.step().await?;
+        write_snapshots(&job, &mut sinks, &expectations).await?;
+    }
+    Ok(())
 }
 
 // ── Schema inference ──────────────────────────────────────────────────────────
@@ -773,4 +874,190 @@ fn detect_view_cycles(
         visit(&v.name.to_lowercase(), &deps, &mut visited, &mut stack)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use krishiv_connectors::{
+        CheckpointSource, ConnectorCapabilities, ConnectorError, ConnectorResult, Offset, Source,
+    };
+
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CursorOffset(usize);
+
+    impl Offset for CursorOffset {
+        fn encode(&self) -> Vec<u8> {
+            (self.0 as u64).to_le_bytes().to_vec()
+        }
+
+        fn decode(bytes: &[u8]) -> ConnectorResult<Self> {
+            if bytes.len() != 8 {
+                return Err(ConnectorError::Offset {
+                    message: format!("CursorOffset decode: expected 8 bytes, got {}", bytes.len()),
+                });
+            }
+            let raw = bytes.get(..8).ok_or_else(|| ConnectorError::Offset {
+                message: "CursorOffset decode: missing offset bytes".into(),
+            })?;
+            let arr: [u8; 8] = raw.try_into().map_err(|_| ConnectorError::Offset {
+                message: "CursorOffset decode: slice length mismatch".into(),
+            })?;
+            Ok(Self(usize::try_from(u64::from_le_bytes(arr)).map_err(
+                |_| ConnectorError::Offset {
+                    message: "CursorOffset decode: value exceeds usize".into(),
+                },
+            )?))
+        }
+    }
+
+    struct OffsetSource {
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        cursor: usize,
+    }
+
+    impl Source for OffsetSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable()
+                .with_checkpoint()
+        }
+
+        fn source_schema(&self) -> Option<SchemaRef> {
+            Some(self.schema.clone())
+        }
+
+        async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+            let batch = self.batches.get(self.cursor).cloned();
+            if batch.is_some() {
+                self.cursor = self.cursor.saturating_add(1);
+            }
+            Ok(batch)
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+            Some(Box::new(CursorOffset(self.cursor)))
+        }
+
+        fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+            CheckpointSource::encoded_checkpoint_offset(self).map(Some)
+        }
+
+        fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+            CheckpointSource::restore_encoded_offset(self, encoded)
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
+    impl CheckpointSource for OffsetSource {
+        type Offset = CursorOffset;
+
+        fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset> {
+            Ok(CursorOffset(self.cursor))
+        }
+
+        fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()> {
+            if offset.0 > self.batches.len() {
+                return Err(ConnectorError::Offset {
+                    message: format!("cursor {} out of range", offset.0),
+                });
+            }
+            self.cursor = offset.0;
+            Ok(())
+        }
+    }
+
+    fn batch(value: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn streaming_checkpoint_uses_dyn_encoded_source_offsets() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let source = OffsetSource {
+            schema,
+            batches: vec![batch(10), batch(20)],
+            cursor: 0,
+        };
+        let mut sources = vec![StreamingSource {
+            name: "numbers".to_string(),
+            source: Box::new(source),
+            offset: None,
+            pending_batches: VecDeque::new(),
+            backpressure: BackpressureController::new(BackpressureConfig::default()),
+        }];
+
+        let first = sources[0]
+            .source
+            .read_batch_dyn()
+            .await
+            .expect("first read")
+            .expect("first batch");
+        assert_eq!(first.num_rows(), 1);
+
+        let checkpoint = save_streaming_checkpoint(&sources, "cp-1")
+            .await
+            .expect("checkpoint");
+        assert_eq!(
+            checkpoint.source_offsets.get("numbers"),
+            Some(&CursorOffset(1).encode())
+        );
+
+        let second = sources[0]
+            .source
+            .read_batch_dyn()
+            .await
+            .expect("second read")
+            .expect("second batch");
+        assert_eq!(
+            second
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            20
+        );
+
+        restore_streaming_checkpoint(&mut sources, &checkpoint)
+            .await
+            .expect("restore");
+
+        let replayed = sources[0]
+            .source
+            .read_batch_dyn()
+            .await
+            .expect("replay read")
+            .expect("replayed batch");
+        assert_eq!(
+            replayed
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            20
+        );
+    }
 }

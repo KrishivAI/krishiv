@@ -50,6 +50,75 @@ impl Default for BackpressureConfig {
     }
 }
 
+/// Runtime execution profile for streaming jobs.
+///
+/// Determines batch sizing, flush intervals, and backpressure behavior
+/// to optimize for either latency or throughput.
+#[derive(Debug, Clone)]
+pub enum StreamingExecutionProfile {
+    /// Optimize for low latency (p99 < 100ms).
+    LowLatency {
+        /// Maximum rows per batch.
+        max_rows: usize,
+        /// Maximum bytes per batch.
+        max_bytes: usize,
+        /// Flush interval in milliseconds.
+        flush_interval_ms: u64,
+    },
+    /// Optimize for throughput (rows/sec).
+    Throughput {
+        /// Maximum rows per batch.
+        max_rows: usize,
+        /// Maximum bytes per batch.
+        max_bytes: usize,
+        /// Flush interval in milliseconds.
+        flush_interval_ms: u64,
+    },
+    /// Auto-switch based on backlog with hysteresis.
+    Auto {
+        /// Backlog threshold in bytes to switch to throughput mode.
+        backlog_threshold_bytes: usize,
+        /// Hysteresis factor (0.0–1.0) to prevent oscillation.
+        hysteresis: f64,
+        /// Minimum interval between profile switches in milliseconds.
+        min_switch_interval_ms: u64,
+    },
+}
+
+impl Default for StreamingExecutionProfile {
+    fn default() -> Self {
+        Self::LowLatency {
+            max_rows: 10_000,
+            max_bytes: 1024 * 1024, // 1MB
+            flush_interval_ms: 100,
+        }
+    }
+}
+
+/// Output buffer policy for controlling flush behavior in streaming emission.
+#[derive(Debug, Clone)]
+pub struct OutputBufferPolicy {
+    /// Maximum rows before flush.
+    pub max_rows: Option<usize>,
+    /// Maximum bytes before flush.
+    pub max_bytes: Option<u64>,
+    /// Maximum time (ms) before flush.
+    pub flush_interval_ms: Option<u64>,
+    /// If true, flush on any condition; if false, flush on all conditions.
+    pub flush_on_any: bool,
+}
+
+impl Default for OutputBufferPolicy {
+    fn default() -> Self {
+        Self {
+            max_rows: Some(10_000),
+            max_bytes: Some(1024 * 1024), // 1MB
+            flush_interval_ms: Some(100),
+            flush_on_any: true,
+        }
+    }
+}
+
 /// Configuration for streaming execution.
 #[derive(Debug, Clone)]
 pub struct StreamingConfig {
@@ -59,6 +128,10 @@ pub struct StreamingConfig {
     pub backpressure: BackpressureConfig,
     /// Checkpoint interval in milliseconds. `None` disables checkpointing.
     pub checkpoint_interval_ms: Option<u64>,
+    /// Streaming execution profile for runtime behavior.
+    pub execution_profile: StreamingExecutionProfile,
+    /// Output buffer policy for streaming emission.
+    pub output_buffer: OutputBufferPolicy,
 }
 
 impl Default for StreamingConfig {
@@ -67,6 +140,8 @@ impl Default for StreamingConfig {
             run_policy: RunPolicy::EveryMs(100),
             backpressure: BackpressureConfig::default(),
             checkpoint_interval_ms: None,
+            execution_profile: StreamingExecutionProfile::default(),
+            output_buffer: OutputBufferPolicy::default(),
         }
     }
 }
@@ -157,12 +232,21 @@ impl PipelineBuilder {
             sinks: Vec::new(),
             expectations: Vec::new(),
             flows: Vec::new(),
+            streaming_config: None,
         }
     }
 
     /// Force the execution mode instead of inferring it from the source kind.
     pub fn mode(mut self, mode: PipelineMode) -> Self {
         self.mode = Some(mode);
+        self
+    }
+
+    /// Set the streaming execution configuration.
+    ///
+    /// This is only used when the pipeline runs in Stream mode.
+    pub fn streaming_config(mut self, config: StreamingConfig) -> Self {
+        self.streaming_config = Some(config);
         self
     }
 
@@ -289,6 +373,7 @@ impl PipelineBuilder {
             views,
             sinks: self.sinks,
             expectations: self.expectations,
+            streaming_config: self.streaming_config,
         }
     }
 
@@ -335,7 +420,13 @@ impl Pipeline {
         match self.mode {
             PipelineMode::Ivm => driver::run_incremental(self, policy).await,
             PipelineMode::Batch => driver::run_batch(self).await,
-            PipelineMode::Stream => driver::run_stream(self, policy).await,
+            PipelineMode::Stream => {
+                if let Some(config) = self.streaming_config.clone() {
+                    driver::run_streaming(self, config).await
+                } else {
+                    driver::run_stream(self, policy).await
+                }
+            }
         }
     }
 

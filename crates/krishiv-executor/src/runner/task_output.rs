@@ -571,6 +571,55 @@ pub struct RestoredJobCheckpoint {
     pub snapshots: Vec<Vec<u8>>,
 }
 
+/// Connector-encoded source offset restored from checkpoint metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredSourceOffset {
+    /// Checkpoint partition/source identifier as stored in metadata.
+    pub partition_id: String,
+    /// Best-effort source identifier derived from the partition id.
+    pub source_id: Option<String>,
+    /// Legacy numeric offset retained for compatibility/status.
+    pub legacy_offset: i64,
+    /// Connector-encoded exact offset bytes.
+    pub encoded_offset: Vec<u8>,
+}
+
+impl RestoredSourceOffset {
+    fn from_record(record: &krishiv_state::checkpoint::SourceOffsetRecord) -> Option<Self> {
+        if record.encoded_offset.is_empty() {
+            return None;
+        }
+        let source_id = record
+            .partition_id
+            .rsplit_once('-')
+            .map(|(source, _)| source.to_owned())
+            .filter(|source| !source.is_empty());
+        Some(Self {
+            partition_id: record.partition_id.clone(),
+            source_id,
+            legacy_offset: record.offset,
+            encoded_offset: record.encoded_offset.clone(),
+        })
+    }
+
+    /// Return true when this offset belongs to the connector source being opened.
+    pub fn matches_source(&self, partition_id: &str, table_name: &str) -> bool {
+        self.partition_id == partition_id
+            || self.partition_id == table_name
+            || self.source_id.as_deref() == Some(table_name)
+    }
+}
+
+/// Extract generic connector-encoded source offsets from checkpoint metadata.
+pub fn restored_source_offsets_from_records(
+    records: &[krishiv_state::checkpoint::SourceOffsetRecord],
+) -> Vec<RestoredSourceOffset> {
+    records
+        .iter()
+        .filter_map(RestoredSourceOffset::from_record)
+        .collect()
+}
+
 /// Apply restored snapshot bytes to a state handle: the first non-empty
 /// snapshot replaces the state, the rest merge additively.  With no snapshots
 /// the state is cleared — the job had no state at the restored checkpoint.
@@ -600,6 +649,8 @@ pub(crate) fn apply_snapshots_to_state(
 pub fn kafka_offsets_from_source_records(
     records: &[krishiv_state::checkpoint::SourceOffsetRecord],
 ) -> Vec<krishiv_connectors::kafka::KafkaOffset> {
+    use krishiv_connectors::Offset;
+
     let mut offsets = Vec::new();
     for record in records {
         let Some(rest) = record.partition_id.strip_prefix("kafka-") else {
@@ -614,11 +665,18 @@ pub fn kafka_offsets_from_source_records(
         if topic.is_empty() {
             continue;
         }
-        offsets.push(krishiv_connectors::kafka::KafkaOffset {
+        let fallback = krishiv_connectors::kafka::KafkaOffset {
             topic: topic.to_owned(),
             partition,
             offset: record.offset,
-        });
+        };
+        let offset = if record.encoded_offset.is_empty() {
+            fallback
+        } else {
+            krishiv_connectors::kafka::KafkaOffset::decode(&record.encoded_offset)
+                .unwrap_or(fallback)
+        };
+        offsets.push(offset);
     }
     offsets.sort_by(|a, b| (&a.topic, a.partition).cmp(&(&b.topic, b.partition)));
     offsets

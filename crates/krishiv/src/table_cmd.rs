@@ -84,7 +84,9 @@ fn parse_table_read(args: &[&str]) -> Result<TableReadCommand, String> {
     let mut limit = None;
     let mut idx = 0;
     while idx < args.len() {
-        let Some(&arg) = args.get(idx) else { break; };
+        let Some(&arg) = args.get(idx) else {
+            break;
+        };
         match arg {
             "--path" => {
                 idx += 1;

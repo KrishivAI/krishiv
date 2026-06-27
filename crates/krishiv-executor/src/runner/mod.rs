@@ -12,7 +12,8 @@ mod runner_tests;
 pub use executor_task_runner::ExecutorTaskRunner;
 pub use task_output::{
     CheckpointStateHandle, ExecutorTaskOutput, ExecutorTaskOutputKind, ExecutorTaskRunReport,
-    RestoredJobCheckpoint, ShuffleContext, kafka_offsets_from_source_records,
+    RestoredJobCheckpoint, RestoredSourceOffset, ShuffleContext, kafka_offsets_from_source_records,
+    restored_source_offsets_from_records,
 };
 pub use task_runner::{
     ContinuousJobDrainer, SharedProgressCallback, StreamingProgressCallback,

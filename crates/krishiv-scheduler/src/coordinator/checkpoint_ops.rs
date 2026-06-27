@@ -709,6 +709,9 @@ impl Coordinator {
             savepoint_label: None,
             iceberg_snapshot_id: source.iceberg_snapshot_id,
             kafka_offsets: source.kafka_offsets.clone(),
+            unaligned_buffer_refs: Vec::new(),
+            sink_transactions: Vec::new(),
+            streaming_profile: None,
         };
         let meta_json = serde_json::to_vec_pretty(&metadata)
             .map_err(|e| invalid(format!("rescale metadata serialize: {e}")))?;
@@ -800,6 +803,7 @@ impl Coordinator {
             job_id: job_id.clone(),
             epoch,
             fencing_token,
+            alignment: CheckpointAlignment::default(),
         }])
     }
 

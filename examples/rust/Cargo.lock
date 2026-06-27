@@ -3759,6 +3759,7 @@ dependencies = [
  "async-stream",
  "dashmap",
  "futures",
+ "indexmap 2.14.0",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-metrics",
@@ -3797,6 +3798,7 @@ dependencies = [
  "constant_time_eq 0.3.1",
  "dashmap",
  "futures",
+ "indexmap 2.14.0",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-dataflow",
@@ -3808,6 +3810,7 @@ dependencies = [
  "krishiv-sql",
  "krishiv-state",
  "object_store 0.13.2",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -4021,6 +4024,7 @@ dependencies = [
  "futures",
  "indexmap 2.14.0",
  "krishiv-common",
+ "krishiv-metrics",
  "lz4_flex 0.11.6",
  "object_store 0.13.2",
  "parquet 58.3.0",
@@ -4047,6 +4051,7 @@ dependencies = [
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-plan",
+ "object_store 0.13.2",
  "regex",
  "reqwest 0.13.4",
  "serde",
@@ -4078,6 +4083,7 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
+ "uuid",
 ]
 
 [[package]]

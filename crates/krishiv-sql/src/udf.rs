@@ -198,7 +198,8 @@ impl Accumulator for KrishivAggregateAccumulator {
         let batch = RecordBatch::try_new_with_options(
             Arc::new(schema.clone()),
             values.to_vec(),
-            &RecordBatchOptions::new().with_row_count(Some(values.first().map(|v| v.len()).unwrap_or(0))),
+            &RecordBatchOptions::new()
+                .with_row_count(Some(values.first().map(|v| v.len()).unwrap_or(0))),
         )
         .map_err(|e| DataFusionError::External(e.to_string().into()))?;
         self.udf
@@ -210,7 +211,9 @@ impl Accumulator for KrishivAggregateAccumulator {
         if states.is_empty() {
             return Ok(());
         }
-        let array = states.first().ok_or_else(|| DataFusionError::Internal("empty states".to_string()))?
+        let array = states
+            .first()
+            .ok_or_else(|| DataFusionError::Internal("empty states".to_string()))?
             .as_any()
             .downcast_ref::<arrow::array::BinaryArray>()
             .ok_or_else(|| {

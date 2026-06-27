@@ -152,6 +152,7 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
         state_ttl_ms,
         source_watermark_lags,
         source_id_column,
+        window_timezone: None,
     })
 }
 

@@ -331,18 +331,24 @@ impl CheckpointCoordinator {
             }
         };
 
-        let mut offset_map: HashMap<String, i64> = HashMap::new();
+        let mut offset_map: HashMap<String, (i64, Vec<u8>)> = HashMap::new();
         for ack in self.pending_acks.values() {
             for so in &ack.source_offsets {
-                offset_map.insert(so.partition_id.as_str().to_owned(), so.offset);
+                offset_map.insert(
+                    so.partition_id.as_str().to_owned(),
+                    (so.offset, so.encoded_offset.clone()),
+                );
             }
         }
         let source_offsets: Vec<SourceOffsetRecord> = offset_map
             .into_iter()
-            .map(|(partition_id, offset)| SourceOffsetRecord {
-                partition_id,
-                offset,
-            })
+            .map(
+                |(partition_id, (offset, encoded_offset))| SourceOffsetRecord {
+                    partition_id,
+                    offset,
+                    encoded_offset,
+                },
+            )
             .collect();
 
         let operator_snapshots: Vec<OperatorSnapshotRef> = self
@@ -372,6 +378,9 @@ impl CheckpointCoordinator {
             savepoint_label,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
+            unaligned_buffer_refs: Vec::new(),
+            sink_transactions: Vec::new(),
+            streaming_profile: None,
         };
 
         // Validate fencing token before committing to storage.
@@ -537,18 +546,24 @@ impl CheckpointCoordinator {
         };
 
         // Collect source offsets — last write wins per partition_id.
-        let mut offset_map: HashMap<String, i64> = HashMap::new();
+        let mut offset_map: HashMap<String, (i64, Vec<u8>)> = HashMap::new();
         for ack in self.pending_acks.values() {
             for so in &ack.source_offsets {
-                offset_map.insert(so.partition_id.as_str().to_owned(), so.offset);
+                offset_map.insert(
+                    so.partition_id.as_str().to_owned(),
+                    (so.offset, so.encoded_offset.clone()),
+                );
             }
         }
         let source_offsets: Vec<SourceOffsetRecord> = offset_map
             .into_iter()
-            .map(|(partition_id, offset)| SourceOffsetRecord {
-                partition_id,
-                offset,
-            })
+            .map(
+                |(partition_id, (offset, encoded_offset))| SourceOffsetRecord {
+                    partition_id,
+                    offset,
+                    encoded_offset,
+                },
+            )
             .collect();
 
         // Collect operator snapshots from acks that have snapshot_path.
@@ -579,6 +594,9 @@ impl CheckpointCoordinator {
             savepoint_label,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
+            unaligned_buffer_refs: Vec::new(),
+            sink_transactions: Vec::new(),
+            streaming_profile: None,
         };
 
         // Validate fencing token before committing to storage.
@@ -793,8 +811,11 @@ mod tests {
             source_offsets: vec![CheckpointSourceOffset {
                 partition_id: PartitionId::try_new("p0").unwrap(),
                 offset: 1,
+                encoded_offset: 1_i64.to_le_bytes().to_vec(),
             }],
             snapshot_path: None,
+            unaligned_buffers: Vec::new(),
+            sink_transactions: Vec::new(),
         }
     }
 

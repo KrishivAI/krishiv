@@ -3,6 +3,15 @@
 /// Build a streaming job with a checkpoint coordinator and `task_count`
 /// Running tasks on one executor.  Returns the assignments for ack
 /// construction.
+fn encoded_kafka_offset(topic: &str, partition: i32, offset: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + topic.len() + 4 + 8);
+    out.extend_from_slice(&(topic.len() as u32).to_le_bytes());
+    out.extend_from_slice(topic.as_bytes());
+    out.extend_from_slice(&partition.to_le_bytes());
+    out.extend_from_slice(&offset.to_le_bytes());
+    out
+}
+
 fn streaming_checkpoint_job(
     coord_name: &str,
     exec_name: &str,
@@ -99,8 +108,11 @@ fn commit_one_epoch(
                 ))
                 .unwrap(),
                 offset: 42,
+                encoded_offset: encoded_kafka_offset("events", 0, 42),
             }],
             snapshot_path: Some(snap_path),
+            unaligned_buffers: Vec::new(),
+            sink_transactions: Vec::new(),
         };
         coordinator.handle_checkpoint_ack(ack);
     }
@@ -328,6 +340,8 @@ fn savepoint_epoch_is_preserved_in_durable_savepoints_area() {
             &operator,
             task,
         )),
+        unaligned_buffers: Vec::new(),
+        sink_transactions: Vec::new(),
     };
     assert_eq!(
         coordinator.handle_checkpoint_ack(ack),
@@ -399,6 +413,8 @@ fn stop_with_savepoint_cancels_job_after_durable_preserve() {
             &operator,
             task,
         )),
+        unaligned_buffers: Vec::new(),
+        sink_transactions: Vec::new(),
     };
     assert_eq!(
         coordinator.handle_checkpoint_ack(ack),
@@ -460,6 +476,7 @@ fn rescaled_restore_redistributes_state_across_new_parallelism() {
         source_offsets: vec![krishiv_state::checkpoint::SourceOffsetRecord {
             partition_id: "kafka-events-0".into(),
             offset: 99,
+            encoded_offset: encoded_kafka_offset("events", 0, 99),
         }],
         operator_snapshots: vec![krishiv_state::checkpoint::OperatorSnapshotRef {
             operator_id: "operator-old-task".into(),
@@ -499,6 +516,10 @@ fn rescaled_restore_redistributes_state_across_new_parallelism() {
     );
     // Source offsets carry over unchanged.
     assert_eq!(restored.source_offsets[0].offset, 99);
+    assert_eq!(
+        restored.source_offsets[0].encoded_offset,
+        encoded_kafka_offset("events", 0, 99)
+    );
     // The rescaled epoch is sealed and valid.
     assert!(krishiv_state::checkpoint::validate_epoch(&storage, job_id.as_str(), 2).unwrap());
     // Every original key survived exactly once across the new snapshots.

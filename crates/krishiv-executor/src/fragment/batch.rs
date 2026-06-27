@@ -17,7 +17,8 @@ use super::common::{
     write_object_parquet_sink_for_task,
 };
 use crate::runner::{
-    ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, SHUFFLE_WRITE_PREFIX,
+    ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, RestoredSourceOffset,
+    SHUFFLE_WRITE_PREFIX,
 };
 
 /// Register all input partitions from an assignment onto a SQL engine.
@@ -28,6 +29,7 @@ async fn load_input_tables(
     engine: &Arc<krishiv_sql::SqlEngine>,
     assignment: &krishiv_proto::ExecutorTaskAssignment,
     registry: Option<&krishiv_connectors::ConnectorRegistry>,
+    restored_source_offsets: Option<&[RestoredSourceOffset]>,
 ) -> crate::ExecutorResult<()> {
     for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
         engine
@@ -69,7 +71,8 @@ async fn load_input_tables(
     }
     if let Some(reg) = registry {
         for (table_name, batches) in
-            read_registry_partitions(reg, assignment.input_partitions()).await?
+            read_registry_partitions(reg, assignment.input_partitions(), restored_source_offsets)
+                .await?
         {
             engine
                 .register_record_batches(&table_name, batches)
@@ -102,6 +105,13 @@ pub(crate) async fn execute_batch_fragment(
         crate::fragment::common::reserve_task_engine_memory(&memory_budget);
     let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     let fragment = fragment_body.as_str();
+    let restored_source_offsets = runner
+        .source_restore_offsets
+        .get(assignment.job_id().as_str())
+        .map(|entry| entry.clone())
+        .unwrap_or_default();
+    let restored_source_offsets =
+        (!restored_source_offsets.is_empty()).then_some(restored_source_offsets.as_slice());
     if fragment.is_empty() {
         return Err(ExecutorError::InvalidAssignment {
             message: String::from("plan fragment description cannot be empty"),
@@ -140,6 +150,7 @@ pub(crate) async fn execute_batch_fragment(
                 udf_limits.clone(),
                 engine_memory_limit,
                 Some(runner.connector_registry.as_ref()),
+                restored_source_offsets,
             )
             .await;
         } else {
@@ -161,6 +172,7 @@ pub(crate) async fn execute_batch_fragment(
                 udf_limits.clone(),
                 engine_memory_limit,
                 Some(runner.connector_registry.as_ref()),
+                restored_source_offsets,
             )
             .await;
         } else {
@@ -231,6 +243,7 @@ pub(crate) async fn execute_batch_fragment(
         for (table_name, batches) in read_registry_partitions(
             runner.connector_registry.as_ref(),
             assignment.input_partitions(),
+            restored_source_offsets,
         )
         .await?
         {
@@ -386,6 +399,7 @@ async fn execute_shuffle_write_fragment(
     udf_limits: ResourceLimits,
     engine_memory_limit: Option<usize>,
     registry: Option<&krishiv_connectors::ConnectorRegistry>,
+    restored_source_offsets: Option<&[RestoredSourceOffset]>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
@@ -437,7 +451,13 @@ async fn execute_shuffle_write_fragment(
         krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
             .with_udf_limits(udf_limits),
     );
-    load_input_tables(&limited_engine, assignment, registry).await?;
+    load_input_tables(
+        &limited_engine,
+        assignment,
+        registry,
+        restored_source_offsets,
+    )
+    .await?;
 
     let dataframe = limited_engine
         .sql(query)
@@ -484,7 +504,9 @@ async fn execute_shuffle_write_fragment(
                 message: format!("hash partition failed: {e}"),
             })?;
         for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
-            if bucket_batch.num_rows() > 0 && let Some(v) = partition_batches.get_mut(bucket_idx) {
+            if bucket_batch.num_rows() > 0
+                && let Some(v) = partition_batches.get_mut(bucket_idx)
+            {
                 v.push(bucket_batch);
             }
         }
@@ -627,6 +649,7 @@ async fn execute_inmem_shuffle_write(
     udf_limits: ResourceLimits,
     engine_memory_limit: Option<usize>,
     registry: Option<&krishiv_connectors::ConnectorRegistry>,
+    restored_source_offsets: Option<&[RestoredSourceOffset]>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
@@ -637,7 +660,13 @@ async fn execute_inmem_shuffle_write(
             .with_udf_limits(udf_limits),
     );
     let batches = if let Some(query) = sql_query_from_fragment(&fragment_body) {
-        load_input_tables(&limited_engine, assignment, registry).await?;
+        load_input_tables(
+            &limited_engine,
+            assignment,
+            registry,
+            restored_source_offsets,
+        )
+        .await?;
         let dataframe =
             limited_engine
                 .sql(query)
@@ -685,7 +714,9 @@ async fn execute_inmem_shuffle_write(
                         message: format!("hash partition failed: {e}"),
                     })?;
             for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
-                if bucket_batch.num_rows() > 0 && let Some(v) = partition_batches.get_mut(bucket_idx) {
+                if bucket_batch.num_rows() > 0
+                    && let Some(v) = partition_batches.get_mut(bucket_idx)
+                {
                     v.push(bucket_batch);
                 }
             }

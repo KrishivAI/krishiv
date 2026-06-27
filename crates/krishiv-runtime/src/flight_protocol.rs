@@ -119,7 +119,10 @@ pub(crate) fn parquet_file_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<S
         return Ok(String::new());
     }
 
-    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
     let mut buf = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut buf, &schema)
@@ -494,10 +497,10 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
-
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let sql = encode_continuous_register("job-abc", &local).unwrap();
         let (directives, _) = parse_sql(&sql);
@@ -567,10 +570,10 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
-
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let batch = test_batch();
         let sql = encode_bounded_window("events", &local, &[batch]).unwrap();
@@ -927,10 +930,10 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
-
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let sql = encode_bounded_window("topic", &local, &[]).unwrap();
         let (directives, _) = parse_sql(&sql);

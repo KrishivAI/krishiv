@@ -780,15 +780,19 @@ mod proto_tests {
 mod wire_fuzz {
     use crate::wire::v1;
     use crate::wire::{
-        checkpoint_ack_request_from_wire, checkpoint_ack_response_from_wire,
-        deregister_executor_request_from_wire, deregister_executor_response_from_wire,
-        drain_continuous_output_request_from_wire, drain_continuous_output_response_from_wire,
-        executor_heartbeat_request_from_wire, executor_heartbeat_response_from_wire,
-        executor_task_assignment_from_wire, push_continuous_input_request_from_wire,
-        register_executor_request_from_wire, register_executor_response_from_wire,
-        restore_job_request_from_wire, task_cancellation_request_from_wire,
-        task_status_request_from_wire, task_status_response_from_wire,
-        trigger_savepoint_request_from_wire,
+        checkpoint_ack_request_from_wire, checkpoint_ack_request_to_wire,
+        checkpoint_ack_response_from_wire, deregister_executor_request_from_wire,
+        deregister_executor_response_from_wire, drain_continuous_output_request_from_wire,
+        drain_continuous_output_response_from_wire, executor_heartbeat_request_from_wire,
+        executor_heartbeat_response_from_wire, executor_task_assignment_from_wire,
+        push_continuous_input_request_from_wire, register_executor_request_from_wire,
+        register_executor_response_from_wire, restore_job_request_from_wire,
+        task_cancellation_request_from_wire, task_status_request_from_wire,
+        task_status_response_from_wire, trigger_savepoint_request_from_wire,
+    };
+    use crate::{
+        CheckpointAckRequest, CheckpointSourceOffset, FencingToken, JobId, OperatorId, PartitionId,
+        TaskId,
     };
     use proptest::prelude::*;
 
@@ -800,6 +804,31 @@ mod wire_fuzz {
         prop::option::of(
             (0u32..=5, 0u32..=5).prop_map(|(major, minor)| v1::TransportVersion { major, minor }),
         )
+    }
+
+    #[test]
+    fn checkpoint_ack_source_offset_encoded_bytes_roundtrip() {
+        let encoded_offset = vec![1, 2, 3, 4, 5];
+        let request = CheckpointAckRequest {
+            job_id: JobId::try_new("job-encoded").unwrap(),
+            operator_id: OperatorId::try_new("operator-encoded").unwrap(),
+            task_id: TaskId::try_new("task-encoded").unwrap(),
+            epoch: 7,
+            fencing_token: FencingToken::initial(),
+            source_offsets: vec![CheckpointSourceOffset {
+                partition_id: PartitionId::try_new("source-0").unwrap(),
+                offset: 42,
+                encoded_offset: encoded_offset.clone(),
+            }],
+            snapshot_path: Some("job-encoded/checkpoints/000/state.bin".into()),
+            unaligned_buffers: Vec::new(),
+            sink_transactions: Vec::new(),
+        };
+
+        let wire = checkpoint_ack_request_to_wire(request.clone());
+        assert_eq!(wire.source_offsets[0].encoded_offset, encoded_offset);
+        let restored = checkpoint_ack_request_from_wire(wire).unwrap();
+        assert_eq!(restored, request);
     }
 
     fn arb_descriptor() -> impl Strategy<Value = Option<v1::ExecutorDescriptor>> {

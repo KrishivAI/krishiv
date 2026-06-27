@@ -22,6 +22,7 @@ fn sample_metadata_for_job(job_id: &str, epoch: u64) -> CheckpointMetadata {
         source_offsets: vec![SourceOffsetRecord {
             partition_id: "partition-0".to_owned(),
             offset: 42,
+            encoded_offset: 42_i64.to_le_bytes().to_vec(),
         }],
         operator_snapshots: vec![OperatorSnapshotRef {
             operator_id: "op-0".to_owned(),
@@ -32,6 +33,9 @@ fn sample_metadata_for_job(job_id: &str, epoch: u64) -> CheckpointMetadata {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
+        unaligned_buffer_refs: Vec::new(),
+        sink_transactions: Vec::new(),
+        streaming_profile: None,
     }
 }
 
@@ -537,10 +541,12 @@ fn write_read_epoch_metadata_roundtrip_with_all_fields() {
             SourceOffsetRecord {
                 partition_id: "p-0".to_owned(),
                 offset: 100,
+                encoded_offset: 100_i64.to_le_bytes().to_vec(),
             },
             SourceOffsetRecord {
                 partition_id: "p-1".to_owned(),
                 offset: 200,
+                encoded_offset: 200_i64.to_le_bytes().to_vec(),
             },
         ],
         operator_snapshots: vec![
@@ -564,6 +570,9 @@ fn write_read_epoch_metadata_roundtrip_with_all_fields() {
             m.insert("topic-b".to_owned(), 600i64);
             m
         }),
+        unaligned_buffer_refs: Vec::new(),
+        sink_transactions: Vec::new(),
+        streaming_profile: None,
     };
     write_epoch_metadata(&s, "job-full", 42, &meta).unwrap();
     let read_back = read_epoch_metadata(&s, "job-full", 42).unwrap();
@@ -1458,14 +1467,17 @@ fn source_offset_record_equality() {
     let a = SourceOffsetRecord {
         partition_id: "p-0".into(),
         offset: 10,
+        encoded_offset: 10_i64.to_le_bytes().to_vec(),
     };
     let b = SourceOffsetRecord {
         partition_id: "p-0".into(),
         offset: 10,
+        encoded_offset: 10_i64.to_le_bytes().to_vec(),
     };
     let c = SourceOffsetRecord {
         partition_id: "p-1".into(),
         offset: 10,
+        encoded_offset: 10_i64.to_le_bytes().to_vec(),
     };
     assert_eq!(a, b);
     assert_ne!(a, c);
@@ -1827,6 +1839,9 @@ fn savepoint_and_later_checkpoints_coexist() {
             savepoint_label: None,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
+            unaligned_buffer_refs: Vec::new(),
+            sink_transactions: Vec::new(),
+            streaming_profile: None,
         };
         write_epoch_metadata(&s, "j-sp", *epoch, &meta).unwrap();
         let mut m = IntegrityManifest::new();

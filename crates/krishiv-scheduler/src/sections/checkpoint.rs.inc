@@ -17,8 +17,11 @@ fn make_ack(
             partition_id: krishiv_proto::PartitionId::try_new(format!("partition-{task_id}"))
                 .unwrap(),
             offset: 100,
+            encoded_offset: 100_i64.to_le_bytes().to_vec(),
         }],
         snapshot_path,
+        unaligned_buffers: Vec::new(),
+        sink_transactions: Vec::new(),
     }
 }
 
@@ -91,6 +94,12 @@ fn checkpoint_coordinator_initiates_and_collects_acks() {
     assert_eq!(meta.epoch, 1);
     assert_eq!(meta.job_id, "job-ck-1");
     assert!(!meta.is_savepoint);
+    assert_eq!(meta.source_offsets.len(), 2);
+    assert!(
+        meta.source_offsets
+            .iter()
+            .all(|offset| offset.encoded_offset == 100_i64.to_le_bytes().to_vec())
+    );
 
     // Verify manifest exists and epoch validates.
     assert!(
@@ -704,4 +713,3 @@ fn stall_detection_respects_progress_updates() {
         "task with recent progress must NOT be flagged as stalled"
     );
 }
-

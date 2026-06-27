@@ -23,6 +23,10 @@ pub struct JobSpec {
     cpu_limit_nanos: Option<u64>,
     /// Memory reservation in bytes for admission control.
     memory_limit_bytes: Option<u64>,
+    /// Streaming execution profile for runtime behavior.
+    streaming_profile: Option<StreamingExecutionProfile>,
+    /// Output buffer policy for streaming emission.
+    output_buffer: Option<OutputBufferPolicy>,
 }
 
 impl JobSpec {
@@ -39,6 +43,8 @@ impl JobSpec {
             namespace_id: None,
             cpu_limit_nanos: None,
             memory_limit_bytes: None,
+            streaming_profile: None,
+            output_buffer: None,
         }
     }
 
@@ -82,6 +88,20 @@ impl JobSpec {
     #[must_use]
     pub fn with_memory_limit_bytes(mut self, bytes: u64) -> Self {
         self.memory_limit_bytes = Some(bytes);
+        self
+    }
+
+    /// Set the streaming execution profile for runtime behavior.
+    #[must_use]
+    pub fn with_streaming_profile(mut self, profile: StreamingExecutionProfile) -> Self {
+        self.streaming_profile = Some(profile);
+        self
+    }
+
+    /// Set the output buffer policy for streaming emission.
+    #[must_use]
+    pub fn with_output_buffer(mut self, buffer: OutputBufferPolicy) -> Self {
+        self.output_buffer = Some(buffer);
         self
     }
 
@@ -138,6 +158,16 @@ impl JobSpec {
     /// Memory reservation in bytes, if set.
     pub fn memory_limit_bytes(&self) -> Option<u64> {
         self.memory_limit_bytes
+    }
+
+    /// Streaming execution profile, if set.
+    pub fn streaming_profile(&self) -> Option<&StreamingExecutionProfile> {
+        self.streaming_profile.as_ref()
+    }
+
+    /// Output buffer policy, if set.
+    pub fn output_buffer(&self) -> Option<&OutputBufferPolicy> {
+        self.output_buffer.as_ref()
     }
 }
 
@@ -289,5 +319,101 @@ impl StageSpec {
     /// Expected shuffle output partition count, if declared at submission time.
     pub fn output_partition_count(&self) -> Option<u32> {
         self.output_partition_count
+    }
+}
+
+// ── Streaming execution profile ───────────────────────────────────────────────
+
+/// Runtime execution profile for streaming jobs.
+///
+/// Determines batch sizing, flush intervals, and backpressure behavior
+/// to optimize for either latency or throughput.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamingExecutionProfile {
+    /// Optimize for low latency (p99 < 100ms).
+    LowLatency {
+        /// Maximum rows per batch.
+        max_rows: usize,
+        /// Maximum bytes per batch.
+        max_bytes: usize,
+        /// Flush interval in milliseconds.
+        flush_interval_ms: u64,
+    },
+    /// Optimize for throughput (rows/sec).
+    Throughput {
+        /// Maximum rows per batch.
+        max_rows: usize,
+        /// Maximum bytes per batch.
+        max_bytes: usize,
+        /// Flush interval in milliseconds.
+        flush_interval_ms: u64,
+    },
+    /// Auto-switch based on backlog with hysteresis.
+    Auto {
+        /// Backlog threshold in bytes to switch to throughput mode.
+        backlog_threshold_bytes: usize,
+        /// Hysteresis factor (0.0–1.0) to prevent oscillation.
+        hysteresis: f64,
+        /// Minimum interval between profile switches in milliseconds.
+        min_switch_interval_ms: u64,
+    },
+}
+
+impl Default for StreamingExecutionProfile {
+    fn default() -> Self {
+        Self::LowLatency {
+            max_rows: 10_000,
+            max_bytes: 1024 * 1024, // 1 MB
+            flush_interval_ms: 100,
+        }
+    }
+}
+
+/// Output buffer policy for controlling flush behavior in streaming emission.
+///
+/// Determines when buffered data should be flushed based on row count,
+/// byte size, or time intervals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputBufferPolicy {
+    /// Maximum rows before flush.
+    pub max_rows: Option<usize>,
+    /// Maximum bytes before flush.
+    pub max_bytes: Option<u64>,
+    /// Maximum time (ms) before flush.
+    pub flush_interval_ms: Option<u64>,
+    /// If true, flush on any condition; if false, flush on all conditions.
+    pub flush_on_any: bool,
+}
+
+impl Default for OutputBufferPolicy {
+    fn default() -> Self {
+        Self {
+            max_rows: Some(10_000),
+            max_bytes: Some(1024 * 1024), // 1 MB
+            flush_interval_ms: Some(100),
+            flush_on_any: true,
+        }
+    }
+}
+
+impl OutputBufferPolicy {
+    /// Create a low-latency policy (flush quickly).
+    pub fn low_latency() -> Self {
+        Self {
+            max_rows: Some(1_000),
+            max_bytes: Some(64 * 1024), // 64 KB
+            flush_interval_ms: Some(10),
+            flush_on_any: true,
+        }
+    }
+
+    /// Create a throughput policy (batch aggressively).
+    pub fn throughput() -> Self {
+        Self {
+            max_rows: Some(100_000),
+            max_bytes: Some(10 * 1024 * 1024), // 10 MB
+            flush_interval_ms: Some(1_000),
+            flush_on_any: true,
+        }
     }
 }

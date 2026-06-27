@@ -638,7 +638,16 @@ fn extract_columns_and_rows(
     if batches.is_empty() {
         return (vec![], vec![]);
     }
-    let columns: Vec<String> = batches.first().map(|b| b.schema().fields().iter().map(|f| f.name().to_string()).collect()).unwrap_or_default();
+    let columns: Vec<String> = batches
+        .first()
+        .map(|b| {
+            b.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut rows = Vec::new();
     for batch in batches {
         for row_idx in 0..batch.num_rows() {

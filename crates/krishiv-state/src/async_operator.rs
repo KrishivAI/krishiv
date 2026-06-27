@@ -104,12 +104,19 @@ impl AsyncOperatorContext {
     /// Launch a non-blocking state get operation.
     ///
     /// Returns a `StateFuture<Option<Vec<u8>>>` that resolves when the value is available.
+    /// Uses `spawn_blocking` to avoid blocking Tokio worker threads for sync backends
+    /// like RocksDB.
     pub fn state_get(&self, key: &[u8]) -> StateFuture<Option<Vec<u8>>> {
         let backend = self.backend.clone();
         let ns = self.namespace.clone();
         let key = key.to_vec();
         StateFuture::new(async move {
-            let result = backend.get(&ns, &key)?;
+            let result = tokio::task::spawn_blocking(move || backend.get(&ns, &key))
+                .await
+                .map_err(|e| crate::error::StateError::BackendUnavailable {
+                    message: format!("spawn_blocking join error: {e}"),
+                    source: None,
+                })??;
             Ok(result)
         })
     }

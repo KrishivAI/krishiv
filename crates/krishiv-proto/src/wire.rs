@@ -1540,6 +1540,7 @@ pub fn checkpoint_ack_request_to_wire(value: CheckpointAckRequest) -> v1::Checkp
             .map(|o| v1::CheckpointSourceOffset {
                 partition_id: o.partition_id.as_str().to_owned(),
                 offset: o.offset,
+                encoded_offset: o.encoded_offset,
             })
             .collect(),
         snapshot_path: value.snapshot_path.unwrap_or_default(),
@@ -1562,6 +1563,7 @@ pub fn checkpoint_ack_request_from_wire(
             Ok(CheckpointSourceOffset {
                 partition_id,
                 offset: o.offset,
+                encoded_offset: o.encoded_offset,
             })
         })
         .collect::<WireResult<Vec<_>>>()?;
@@ -1578,6 +1580,8 @@ pub fn checkpoint_ack_request_from_wire(
         fencing_token,
         source_offsets,
         snapshot_path,
+        unaligned_buffers: Vec::new(),
+        sink_transactions: Vec::new(),
     })
 }
 

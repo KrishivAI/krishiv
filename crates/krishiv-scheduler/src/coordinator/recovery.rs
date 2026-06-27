@@ -398,10 +398,10 @@ impl Coordinator {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
-    use crate::{InMemoryMetadataStore, checkpoint::CheckpointCoordinator};
+    use crate::{InMemoryMetadataStore, JobRecord, checkpoint::CheckpointCoordinator};
     use krishiv_proto::{
-        CheckpointAckRequest, CheckpointSourceOffset, ExecutorDescriptor, JobKind, JobSpec,
-        OperatorId, PartitionId, TaskId,
+        CheckpointAckRequest, CheckpointSourceOffset, CoordinatorId, ExecutorDescriptor, JobKind,
+        JobSpec, OperatorId, PartitionId, TaskId,
     };
     use krishiv_state::checkpoint::{LocalFsCheckpointStorage, write_operator_snapshot};
     use std::sync::Arc;
@@ -443,8 +443,11 @@ mod recovery_tests {
                 source_offsets: vec![CheckpointSourceOffset {
                     partition_id: PartitionId::try_new("p0").unwrap(),
                     offset: 1,
+                    encoded_offset: 1_i64.to_le_bytes().to_vec(),
                 }],
                 snapshot_path: None,
+                unaligned_buffers: Vec::new(),
+                sink_transactions: Vec::new(),
             };
             assert!(coord.receive_ack(ack).unwrap());
         }

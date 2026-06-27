@@ -247,6 +247,7 @@ async fn main() -> Result<()> {
         state_ttl_ms:          None,
         source_watermark_lags: HashMap::new(),
         source_id_column:      None,
+        window_timezone:       None,
     };
 
     let window_out = execute_windowed_stream(all_batches, &spec)?;

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_proto::{
-    CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
+    CheckpointAckRequest, CheckpointAckResponse, CheckpointAlignment, CoordinatorExecutorService,
     ExecutorTaskAssignment, FencingToken, InitiateCheckpointRequest, JobId,
     MissingShufflePartition, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskState,
     TaskStatusRequest, TaskStatusResponse,
@@ -26,12 +26,16 @@ use super::partition::{
 };
 use super::task_output::{
     CheckpointStateHandle, ExecutorTaskOutput, ExecutorTaskRunReport, RestoredJobCheckpoint,
-    ShuffleContext, apply_snapshots_to_state, kafka_offsets_from_source_records,
+    RestoredSourceOffset, ShuffleContext, apply_snapshots_to_state,
+    kafka_offsets_from_source_records, restored_source_offsets_from_records,
 };
 use super::task_runner::{
     ContinuousJobDrainer, NoOpProgressCallback, SharedProgressCallback, StreamingProgressSnapshot,
     TaskRunner,
 };
+
+pub(crate) type SharedContinuousConnectorSources =
+    Arc<DashMap<String, Arc<tokio::sync::Mutex<Box<dyn krishiv_connectors::DynSource>>>>>;
 
 /// Minimal R3.1 stage-local task runner skeleton.
 #[derive(Clone)]
@@ -64,6 +68,12 @@ pub struct ExecutorTaskRunner {
     /// them (as a fallback when `continuous_drainer` is absent) so the same executor
     /// state is shared with the network path.
     pub(crate) continuous_inputs: Arc<DashMap<String, Vec<RecordBatch>>>,
+    /// Per-job/partition connector sources for `stream:loop:` registry inputs.
+    ///
+    /// These source instances retain connector-owned cursor state across
+    /// continuous input cycles. Restore evicts entries for the job so the next
+    /// cycle opens a fresh source and applies the restored checkpoint offset.
+    pub(crate) continuous_connector_sources: SharedContinuousConnectorSources,
     /// Per-job `StreamingPartitionAdvisor` instances (EMA-based bucket advisor).
     ///
     /// Keyed by job-id string. Accumulates the EMA of observed input-batch byte
@@ -134,6 +144,10 @@ pub struct ExecutorTaskRunner {
     /// construction to seek the broker consumer to the checkpointed position.
     pub kafka_restore_offsets: Arc<DashMap<String, Vec<krishiv_connectors::kafka::KafkaOffset>>>,
 
+    /// Generic connector-encoded source offsets per job, consumed by connector
+    /// source construction before the first restored read.
+    pub source_restore_offsets: Arc<DashMap<String, Vec<RestoredSourceOffset>>>,
+
     /// Transactional-sink registry driven by the checkpoint lifecycle:
     /// `pre_commit` at the barrier, `commit_through` on completion
     /// notifications, `restore_to` on restore directives.
@@ -200,6 +214,7 @@ impl ExecutorTaskRunner {
             continuous_drainer: None,
             loop_executors: Arc::new(DashMap::new()),
             continuous_inputs: Arc::new(DashMap::new()),
+            continuous_connector_sources: Arc::new(DashMap::new()),
             streaming_advisors: Arc::new(DashMap::new()),
             live_lease: crate::grpc_client::SharedLeaseGeneration::new(
                 krishiv_proto::LeaseGeneration::initial(),
@@ -217,6 +232,7 @@ impl ExecutorTaskRunner {
             own_executor_id: None,
             pending_restores: Arc::new(DashMap::new()),
             kafka_restore_offsets: Arc::new(DashMap::new()),
+            source_restore_offsets: Arc::new(DashMap::new()),
             transaction_log: crate::transactions::TwoPhaseSinkRegistry::new(),
             connector_registry: Arc::new(krishiv_connectors::registry::default_registry()),
             queryable_state: None,
@@ -279,6 +295,11 @@ impl ExecutorTaskRunner {
         Arc::clone(&self.continuous_inputs)
     }
 
+    /// Shared connector source cache for long-lived stream-loop registry inputs.
+    pub(crate) fn shared_continuous_connector_sources(&self) -> SharedContinuousConnectorSources {
+        Arc::clone(&self.continuous_connector_sources)
+    }
+
     /// Replace the loop executor map with a pre-allocated shared instance.
     ///
     /// Use this builder method in the executor CLI to ensure the gRPC service
@@ -300,6 +321,23 @@ impl ExecutorTaskRunner {
     ) -> Self {
         self.continuous_inputs = inputs;
         self
+    }
+
+    fn clear_continuous_connector_sources_for_job(&self, job_id: &str) {
+        let prefix = format!("{job_id}|");
+        let keys: Vec<String> = self
+            .continuous_connector_sources
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .key()
+                    .starts_with(&prefix)
+                    .then(|| entry.key().clone())
+            })
+            .collect();
+        for key in keys {
+            self.continuous_connector_sources.remove(&key);
+        }
     }
 
     /// Access the registered-parquet cache (keyed by `"table_name:path"`).
@@ -1116,8 +1154,17 @@ impl ExecutorTaskRunner {
             );
         }
 
-        // Source offsets: stash restored Kafka positions for the pipelines to
-        // seek at (re)construction.
+        // Source offsets: stash generic connector-encoded offsets for any
+        // connector source and keep the existing Kafka compatibility cache.
+        let source_offsets = restored_source_offsets_from_records(&metadata.source_offsets);
+        if source_offsets.is_empty() {
+            self.source_restore_offsets.remove(job_id);
+        } else {
+            self.source_restore_offsets
+                .insert(job_id.to_owned(), source_offsets);
+        }
+        self.clear_continuous_connector_sources_for_job(job_id);
+
         let kafka_offsets = kafka_offsets_from_source_records(&metadata.source_offsets);
         if kafka_offsets.is_empty() {
             self.kafka_restore_offsets.remove(job_id);
@@ -1295,6 +1342,7 @@ impl ExecutorTaskRunner {
                 job_id,
                 epoch: barrier.epoch,
                 fencing_token,
+                alignment: CheckpointAlignment::default(),
             };
 
             let s_clone = Arc::clone(&storage);

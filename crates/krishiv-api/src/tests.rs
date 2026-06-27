@@ -691,6 +691,7 @@ async fn continuous_stream_job_poll_drains_via_coordinator() {
         allowed_lateness_ms: None,
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
+        window_timezone: None,
     };
     session.submit_stream_job("events", spec).expect("submit");
     let schema = Arc::new(Schema::new(vec![
@@ -735,6 +736,7 @@ async fn continuous_job_id_takes_precedence_over_unbounded_table_name() {
         allowed_lateness_ms: None,
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
+        window_timezone: None,
     };
     session
         .submit_stream_job("shared-name", spec)
@@ -778,6 +780,7 @@ fn duplicate_continuous_job_registration_is_rejected() {
         allowed_lateness_ms: None,
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
+        window_timezone: None,
     };
     session
         .submit_stream_job("duplicate-job", spec.clone())
@@ -1580,6 +1583,36 @@ impl krishiv_connectors::Source for VecSource {
     }
 }
 
+/// Connector source with explicit schema metadata; used for idle stream startup.
+struct SchemaVecSource {
+    batches: std::collections::VecDeque<RecordBatch>,
+    schema: arrow::datatypes::SchemaRef,
+    bounded: bool,
+}
+
+impl krishiv_connectors::Source for SchemaVecSource {
+    fn capabilities(&self) -> krishiv_connectors::ConnectorCapabilities {
+        let capabilities = krishiv_connectors::ConnectorCapabilities::new();
+        if self.bounded {
+            capabilities.with_bounded()
+        } else {
+            capabilities.with_unbounded()
+        }
+    }
+
+    fn source_schema(&self) -> Option<arrow::datatypes::SchemaRef> {
+        Some(self.schema.clone())
+    }
+
+    async fn read_batch(&mut self) -> krishiv_connectors::ConnectorResult<Option<RecordBatch>> {
+        Ok(self.batches.pop_front())
+    }
+
+    fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
+}
+
 /// An in-memory connector sink (collects written batches).
 struct VecSink {
     out: std::sync::Arc<std::sync::Mutex<Vec<RecordBatch>>>,
@@ -1596,6 +1629,45 @@ impl krishiv_connectors::Sink for VecSink {
     async fn flush(&mut self) -> krishiv_connectors::ConnectorResult<()> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn pipeline_stream_idle_unbounded_connector_uses_schema_metadata() {
+    use crate::pipeline::{Egress, Ingest};
+    use crate::{PipelineMode, RunPolicy};
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("amount", DataType::Int64, false),
+    ]));
+    let src = SchemaVecSource {
+        batches: VecDeque::new(),
+        schema,
+        bounded: false,
+    };
+    let collected: Arc<std::sync::Mutex<Vec<RecordBatch>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = VecSink {
+        out: collected.clone(),
+    };
+
+    let session = Session::builder().build().unwrap();
+    let run = session
+        .pipeline("idle_schema_stream")
+        .mode(PipelineMode::Stream)
+        .source("orders", Ingest::Connector(Box::new(src)))
+        .view("revenue", "SELECT SUM(amount) AS total FROM orders", true)
+        .sink("revenue", Egress::Connector(Box::new(sink)))
+        .run(RunPolicy::Once);
+
+    tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .expect("RunPolicy::Once should return after an idle unbounded poll")
+        .expect("schema metadata should allow planning before the first batch");
+
+    assert!(collected.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1648,6 +1720,64 @@ async fn pipeline_stream_connector_source_to_connector_sink() {
         .expect("SUM is Float64")
         .value(0);
     assert_eq!(total, 150.0);
+}
+
+#[tokio::test]
+async fn pipeline_stream_connector_source_steps_without_pre_draining() {
+    use crate::RunPolicy;
+    use crate::pipeline::{Egress, Ingest};
+    use std::collections::VecDeque;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn order(id: i64, amount: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(Int64Array::from(vec![amount])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn total(batch: &RecordBatch) -> f64 {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("SUM is Float64")
+            .value(0)
+    }
+
+    let src = VecSource {
+        batches: VecDeque::from(vec![order(1, 100), order(2, 50)]),
+    };
+    let collected: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let sink = VecSink {
+        out: collected.clone(),
+    };
+
+    let session = Session::builder().build().unwrap();
+    session
+        .pipeline("conn_incremental")
+        .source("orders", Ingest::Connector(Box::new(src)))
+        .view("revenue", "SELECT SUM(amount) AS total FROM orders", true)
+        .sink("revenue", Egress::Connector(Box::new(sink)))
+        .run(RunPolicy::EveryRows(1))
+        .await
+        .unwrap();
+
+    let out = collected.lock().unwrap();
+    assert_eq!(
+        out.len(),
+        2,
+        "stream connector should publish after each coalesced step, not only after source exhaustion"
+    );
+    assert_eq!(total(&out[0]), 100.0);
+    assert_eq!(total(&out[1]), 150.0);
 }
 
 #[test]

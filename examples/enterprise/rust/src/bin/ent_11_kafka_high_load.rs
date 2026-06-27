@@ -222,6 +222,7 @@ async fn consume_and_window(
         state_ttl_ms:          None,
         source_watermark_lags: HashMap::new(),
         source_id_column:      None,
+        window_timezone:       None,
     };
 
     let mut consumed_rows  = 0usize;

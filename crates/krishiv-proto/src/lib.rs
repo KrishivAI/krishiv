@@ -30,7 +30,8 @@ pub mod wire;
 mod tests;
 
 pub use checkpoint::{
-    CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset, InitiateCheckpointRequest,
+    CheckpointAckRequest, CheckpointAckResponse, CheckpointAlignment, CheckpointSourceOffset,
+    InitiateCheckpointRequest, SinkTransactionRef, UnalignedBufferRef,
 };
 pub use executor::{
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat,
@@ -45,7 +46,7 @@ pub use ids::{
 pub use io::{
     ConnectorCapabilityFlags, ResourceProfile, ShuffleReadConfig, ShuffleWriteConfig, TaskSpec,
 };
-pub use job::{JobSpec, StageKind, StageSpec};
+pub use job::{JobSpec, OutputBufferPolicy, StageKind, StageSpec, StreamingExecutionProfile};
 pub use lifecycle::{CoordinatorState, ExecutorState, JobKind, JobState, StageState, TaskState};
 pub use management::CoordinatorManagementService;
 pub use management::{

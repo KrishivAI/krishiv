@@ -4,8 +4,10 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
+use arrow::datatypes::SchemaRef;
+
 use crate::capabilities::ConnectorCapabilities;
-use crate::error::ConnectorResult;
+use crate::error::{ConnectorError, ConnectorResult};
 use crate::offset::Offset;
 
 // ---------------------------------------------------------------------------
@@ -19,6 +21,16 @@ pub trait Source {
     /// Return the capabilities this source supports.
     fn capabilities(&self) -> ConnectorCapabilities;
 
+    /// Return the source's Arrow schema when it is known before the first read.
+    ///
+    /// Sources backed by files, registries, or fixed message envelopes should
+    /// return a schema here so streaming pipelines can register views before any
+    /// data arrives. Sources whose schema is data-dependent may return `None`;
+    /// those callers must probe the first batch before planning.
+    fn source_schema(&self) -> Option<SchemaRef> {
+        None
+    }
+
     /// Pull the next batch from the source.
     ///
     /// Returns `Ok(None)` when the source is exhausted (bounded sources only).
@@ -31,6 +43,31 @@ pub trait Source {
     /// The returned value is connector-specific and should be downcast by the
     /// caller if it needs the concrete offset type.
     fn current_offset(&self) -> Option<Box<dyn Any + Send>>;
+
+    /// Encode the exact next read position for checkpoint metadata.
+    ///
+    /// Connectors that advertise checkpoint capability must override this and
+    /// return `Some(bytes)`. Non-checkpoint-capable sources return `None`.
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        if self.capabilities().is_checkpoint_capable() {
+            return Err(ConnectorError::Unsupported {
+                message: "checkpoint-capable source does not expose encoded checkpoint offsets"
+                    .into(),
+            });
+        }
+        Ok(None)
+    }
+
+    /// Restore the source to an encoded checkpoint offset.
+    ///
+    /// Connectors that advertise checkpoint capability must override this and
+    /// validate that the offset belongs to this source and names a valid read
+    /// boundary.
+    fn restore_encoded_checkpoint_offset(&mut self, _encoded: &[u8]) -> ConnectorResult<()> {
+        Err(ConnectorError::Unsupported {
+            message: "source does not support encoded checkpoint offset restore".into(),
+        })
+    }
 
     /// Rewind the source to its initial position.
     ///
@@ -94,6 +131,8 @@ pub trait CheckpointSource: Source {
 pub trait DynSource: Send {
     fn capabilities(&self) -> ConnectorCapabilities;
 
+    fn source_schema_dyn(&self) -> Option<SchemaRef>;
+
     fn read_batch_dyn(
         &mut self,
     ) -> Pin<
@@ -106,15 +145,23 @@ pub trait DynSource: Send {
 
     fn current_offset_dyn(&self) -> Option<Box<dyn Any + Send>>;
 
+    fn encoded_checkpoint_offset_dyn(&self) -> ConnectorResult<Option<Vec<u8>>>;
+
+    fn restore_encoded_checkpoint_offset_dyn(&mut self, encoded: &[u8]) -> ConnectorResult<()>;
+
     fn reset_dyn(&mut self);
 
     /// Downcast to `&dyn Any` for type-specific operations.
     fn as_any(&self) -> &dyn Any;
 }
 
-impl<T: Source + Send> DynSource for T {
+impl<T: Source + Send + 'static> DynSource for T {
     fn capabilities(&self) -> ConnectorCapabilities {
         self.capabilities()
+    }
+
+    fn source_schema_dyn(&self) -> Option<SchemaRef> {
+        self.source_schema()
     }
 
     fn read_batch_dyn(
@@ -131,6 +178,14 @@ impl<T: Source + Send> DynSource for T {
 
     fn current_offset_dyn(&self) -> Option<Box<dyn Any + Send>> {
         self.current_offset()
+    }
+
+    fn encoded_checkpoint_offset_dyn(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        self.encoded_checkpoint_offset()
+    }
+
+    fn restore_encoded_checkpoint_offset_dyn(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        self.restore_encoded_checkpoint_offset(encoded)
     }
 
     fn reset_dyn(&mut self) {

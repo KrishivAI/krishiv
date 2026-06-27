@@ -349,7 +349,12 @@ impl PartitionedIncrementalFlow {
         Ok(())
     }
 
-    /// Delta checkpoint: every shard's accumulated deltas, shard-count framed.
+    /// Delta checkpoint: every shard's accumulated deltas + `streaming_prev`, shard-count framed.
+    ///
+    /// `streaming_prev` is included so that after `restore_delta` the next
+    /// `feed_snapshot` diffs against the correct previous snapshot rather than
+    /// an empty one (which would emit spurious insertions for all rows already
+    /// present in the materialized view).
     pub fn checkpoint_delta(&self) -> IvmResult<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.shards.len() as u32).to_le_bytes());
@@ -358,6 +363,7 @@ impl PartitionedIncrementalFlow {
             out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             out.extend_from_slice(&bytes);
         }
+        self.write_streaming_prev(&mut out)?;
         Ok(out)
     }
 
@@ -377,6 +383,8 @@ impl PartitionedIncrementalFlow {
             pos += len;
             shard.restore_delta(chunk)?;
         }
+        // Restore streaming_prev so feed_snapshot diffs against the correct baseline.
+        self.read_streaming_prev(bytes, &mut pos)?;
         Ok(())
     }
 

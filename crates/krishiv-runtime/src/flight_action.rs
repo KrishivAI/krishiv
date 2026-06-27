@@ -279,7 +279,10 @@ pub fn encode_batches(batches: &[RecordBatch]) -> RuntimeResult<String> {
     if batches.is_empty() {
         return Ok(String::new());
     }
-    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
     let mut buffer = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut buffer, &schema)
@@ -644,6 +647,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
             job_id: "sliding-job".into(),
@@ -681,6 +685,7 @@ mod tests {
             allowed_lateness_ms: None,
             source_watermark_lags: std::collections::HashMap::new(),
             source_id_column: None,
+            window_timezone: None,
         };
         let batch = test_batch();
         let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {

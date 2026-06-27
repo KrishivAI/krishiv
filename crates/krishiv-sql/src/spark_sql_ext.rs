@@ -326,11 +326,13 @@ fn regex_replace(input: &str, pattern: &str, replacement: &str) -> SqlResult<Str
         while let Some(pos) = result.to_uppercase().find("EXTENDED") {
             // Check word boundaries
             let bytes = result.as_bytes();
-            let before_ok = pos == 0
-                || bytes.get(pos - 1).is_some_and(|&b| b == b' ' || b == b'\t');
+            let before_ok =
+                pos == 0 || bytes.get(pos - 1).is_some_and(|&b| b == b' ' || b == b'\t');
             let after_pos = pos + "EXTENDED".len();
             let after_ok = after_pos >= result.len()
-                || bytes.get(after_pos).is_some_and(|&b| b == b' ' || b == b'\t' || b == b'\n');
+                || bytes
+                    .get(after_pos)
+                    .is_some_and(|&b| b == b' ' || b == b'\t' || b == b'\n');
 
             if before_ok && after_ok {
                 // Remove EXTENDED plus trailing space

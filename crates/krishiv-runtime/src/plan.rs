@@ -105,6 +105,7 @@ pub fn streaming_spec_from_plan(
         allowed_lateness_ms: None,
         source_watermark_lags,
         source_id_column,
+        window_timezone: None,
     })
 }
 

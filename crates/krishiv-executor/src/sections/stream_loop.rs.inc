@@ -11,7 +11,8 @@ async fn stream_loop_emits_window_via_continuous_executor() {
     let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(
         vec!["a", "a"],
         vec![100_i64, 12_000_i64],
-    ).unwrap();
+    )
+    .unwrap();
 
     let drainer = OneShotDrainer::new(vec![batch]);
     let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
@@ -109,7 +110,8 @@ async fn stream_loop_without_drainer_processes_inline_input() {
     let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(
         vec!["a", "a"],
         vec![100_i64, 12_000_i64],
-    ).unwrap();
+    )
+    .unwrap();
     let assignment = make_loop_assignment_with_batches(&fragment, &[batch]);
     let output = runner
         .execute_streaming_fragment(&assignment)
@@ -122,10 +124,514 @@ async fn stream_loop_without_drainer_processes_inline_input() {
 }
 
 #[tokio::test]
+async fn stream_loop_registry_source_restores_and_records_checkpoint_offset() {
+    use std::sync::Arc;
+
+    use arrow::datatypes::Schema;
+    use krishiv_connectors::{
+        ConnectorCapabilities, ConnectorConfig, ConnectorResult, DynSource, Source,
+        registry::{
+            ConnectorDescriptor, ConnectorKind, ConnectorRegistry, ConnectorRole, OpenSourceFuture,
+            SourceDriver,
+        },
+    };
+
+    #[derive(Clone)]
+    struct RestoringSourceDriver {
+        batches: Arc<Vec<RecordBatch>>,
+    }
+
+    impl SourceDriver for RestoringSourceDriver {
+        fn descriptor(&self) -> ConnectorDescriptor {
+            ConnectorDescriptor::new(
+                ConnectorKind::Csv,
+                ConnectorRole::Source,
+                ConnectorCapabilities::new()
+                    .with_bounded()
+                    .with_rewindable()
+                    .with_checkpoint(),
+            )
+        }
+
+        fn validate(&self, _config: &ConnectorConfig) -> ConnectorResult<()> {
+            Ok(())
+        }
+
+        fn open<'a>(&'a self, _config: &'a ConnectorConfig) -> OpenSourceFuture<'a> {
+            let batches = Arc::clone(&self.batches);
+            Box::pin(async move {
+                Ok(Box::new(RestoringSource {
+                    schema: batches
+                        .first()
+                        .map(|batch| batch.schema())
+                        .unwrap_or_else(|| Arc::new(Schema::empty())),
+                    batches,
+                    cursor: 0,
+                }) as Box<dyn DynSource>)
+            })
+        }
+    }
+
+    struct RestoringSource {
+        schema: arrow::datatypes::SchemaRef,
+        batches: Arc<Vec<RecordBatch>>,
+        cursor: usize,
+    }
+
+    impl Source for RestoringSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable()
+                .with_checkpoint()
+        }
+
+        fn source_schema(&self) -> Option<arrow::datatypes::SchemaRef> {
+            Some(self.schema.clone())
+        }
+
+        async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+            let batch = self.batches.get(self.cursor).cloned();
+            if batch.is_some() {
+                self.cursor = self.cursor.saturating_add(1);
+            }
+            Ok(batch)
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
+            Some(Box::new(self.cursor))
+        }
+
+        fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+            Ok(Some((self.cursor as u64).to_le_bytes().to_vec()))
+        }
+
+        fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+            if encoded.len() != 8 {
+                return Err(krishiv_connectors::ConnectorError::Offset {
+                    message: format!("expected 8 encoded cursor bytes, got {}", encoded.len()),
+                });
+            }
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(encoded);
+            self.cursor = usize::try_from(u64::from_le_bytes(raw)).map_err(|_| {
+                krishiv_connectors::ConnectorError::Offset {
+                    message: "encoded cursor exceeds usize".into(),
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    let first =
+        krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![100_i64]).unwrap();
+    let second =
+        krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![12_000_i64]).unwrap();
+    let mut registry = ConnectorRegistry::new();
+    registry.register_source(Arc::new(RestoringSourceDriver {
+        batches: Arc::new(vec![first, second]),
+    }));
+
+    let job = "registry-restore-job";
+    let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
+    let fragment = format!("stream:loop:{job}|{window_spec}");
+    let runner =
+        ExecutorTaskRunner::new(ExecutorAssignmentInbox::new()).with_connector_registry(registry);
+    runner.source_restore_offsets.insert(
+        job.to_owned(),
+        vec![crate::runner::RestoredSourceOffset {
+            partition_id: "events-partition-0".into(),
+            source_id: Some("events".into()),
+            legacy_offset: 1,
+            encoded_offset: 1_u64.to_le_bytes().to_vec(),
+        }],
+    );
+    let assignment =
+        make_loop_assignment(&fragment).with_input_partitions(vec![InputPartition::new(
+            "events-partition-0",
+            "registry-connector:csv:events:{}",
+        )]);
+
+    let output = runner
+        .execute_streaming_fragment(&assignment)
+        .await
+        .expect("registry stream loop restore");
+
+    assert_eq!(
+        output.row_count(),
+        0,
+        "restored source starts at the second event; the first window must not close"
+    );
+    let task_id = TaskId::try_new("task-1").unwrap();
+    let checkpoint_runner = runner.checkpoint_runners.get(&task_id).unwrap();
+    let checkpoint_runner = checkpoint_runner.lock().unwrap();
+    assert_eq!(checkpoint_runner.source_offsets.len(), 1);
+    assert_eq!(
+        checkpoint_runner.source_offsets[0].partition_id.as_str(),
+        "events-partition-0"
+    );
+    assert_eq!(checkpoint_runner.source_offsets[0].offset, 2);
+    assert_eq!(
+        checkpoint_runner.source_offsets[0].encoded_offset,
+        2_u64.to_le_bytes().to_vec()
+    );
+}
+
+#[tokio::test]
+async fn stream_loop_registry_source_persists_across_cycles() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use arrow::datatypes::Schema;
+    use krishiv_connectors::{
+        ConnectorCapabilities, ConnectorConfig, ConnectorResult, DynSource, Source,
+        registry::{
+            ConnectorDescriptor, ConnectorKind, ConnectorRegistry, ConnectorRole, OpenSourceFuture,
+            SourceDriver,
+        },
+    };
+
+    #[derive(Clone)]
+    struct OneBatchPerCycleDriver {
+        batches: Arc<Vec<RecordBatch>>,
+        open_count: Arc<AtomicUsize>,
+    }
+
+    impl SourceDriver for OneBatchPerCycleDriver {
+        fn descriptor(&self) -> ConnectorDescriptor {
+            ConnectorDescriptor::new(
+                ConnectorKind::Csv,
+                ConnectorRole::Source,
+                ConnectorCapabilities::new()
+                    .with_bounded()
+                    .with_rewindable()
+                    .with_checkpoint(),
+            )
+        }
+
+        fn validate(&self, _config: &ConnectorConfig) -> ConnectorResult<()> {
+            Ok(())
+        }
+
+        fn open<'a>(&'a self, _config: &'a ConnectorConfig) -> OpenSourceFuture<'a> {
+            let batches = Arc::clone(&self.batches);
+            let open_count = Arc::clone(&self.open_count);
+            Box::pin(async move {
+                open_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(OneBatchPerCycleSource {
+                    schema: batches
+                        .first()
+                        .map(|batch| batch.schema())
+                        .unwrap_or_else(|| Arc::new(Schema::empty())),
+                    batches,
+                    cursor: 0,
+                    yielded_before_idle: false,
+                }) as Box<dyn DynSource>)
+            })
+        }
+    }
+
+    struct OneBatchPerCycleSource {
+        schema: arrow::datatypes::SchemaRef,
+        batches: Arc<Vec<RecordBatch>>,
+        cursor: usize,
+        yielded_before_idle: bool,
+    }
+
+    impl Source for OneBatchPerCycleSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable()
+                .with_checkpoint()
+        }
+
+        fn source_schema(&self) -> Option<arrow::datatypes::SchemaRef> {
+            Some(self.schema.clone())
+        }
+
+        async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+            if self.yielded_before_idle {
+                self.yielded_before_idle = false;
+                return Ok(None);
+            }
+            let batch = self.batches.get(self.cursor).cloned();
+            if batch.is_some() {
+                self.cursor = self.cursor.saturating_add(1);
+                self.yielded_before_idle = true;
+            }
+            Ok(batch)
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
+            Some(Box::new(self.cursor))
+        }
+
+        fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+            Ok(Some((self.cursor as u64).to_le_bytes().to_vec()))
+        }
+
+        fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+            if encoded.len() != 8 {
+                return Err(krishiv_connectors::ConnectorError::Offset {
+                    message: format!("expected 8 encoded cursor bytes, got {}", encoded.len()),
+                });
+            }
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(encoded);
+            self.cursor = usize::try_from(u64::from_le_bytes(raw)).map_err(|_| {
+                krishiv_connectors::ConnectorError::Offset {
+                    message: "encoded cursor exceeds usize".into(),
+                }
+            })?;
+            self.yielded_before_idle = false;
+            Ok(())
+        }
+    }
+
+    let first =
+        krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![100_i64]).unwrap();
+    let second =
+        krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![12_000_i64]).unwrap();
+    let open_count = Arc::new(AtomicUsize::new(0));
+    let mut registry = ConnectorRegistry::new();
+    registry.register_source(Arc::new(OneBatchPerCycleDriver {
+        batches: Arc::new(vec![first, second]),
+        open_count: Arc::clone(&open_count),
+    }));
+
+    let job = "registry-persistent-job";
+    let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
+    let fragment = format!("stream:loop:{job}|{window_spec}");
+    let runner =
+        ExecutorTaskRunner::new(ExecutorAssignmentInbox::new()).with_connector_registry(registry);
+    let assignment =
+        make_loop_assignment(&fragment).with_input_partitions(vec![InputPartition::new(
+            "events-partition-0",
+            "registry-connector:csv:events:{}",
+        )]);
+
+    let first_cycle = runner
+        .execute_streaming_fragment(&assignment)
+        .await
+        .expect("first registry stream loop cycle");
+    assert_eq!(first_cycle.row_count(), 0);
+
+    let second_cycle = runner
+        .execute_streaming_fragment(&assignment)
+        .await
+        .expect("second registry stream loop cycle");
+    assert!(
+        second_cycle.row_count() > 0,
+        "second cycle must continue the same source cursor and close the first window"
+    );
+    assert_eq!(
+        open_count.load(Ordering::SeqCst),
+        1,
+        "stream-loop registry source must be retained across cycles"
+    );
+
+    let task_id = TaskId::try_new("task-1").unwrap();
+    let checkpoint_runner = runner.checkpoint_runners.get(&task_id).unwrap();
+    let checkpoint_runner = checkpoint_runner.lock().unwrap();
+    assert_eq!(
+        checkpoint_runner.source_offsets[0].encoded_offset,
+        2_u64.to_le_bytes().to_vec()
+    );
+}
+
+#[tokio::test]
+async fn stream_loop_registry_source_offset_contract_is_deployment_mode_invariant() {
+    use std::sync::Arc;
+
+    use arrow::datatypes::Schema;
+    use krishiv_connectors::{
+        ConnectorCapabilities, ConnectorConfig, ConnectorResult, DynSource, Source,
+        registry::{
+            ConnectorDescriptor, ConnectorKind, ConnectorRegistry, ConnectorRole, OpenSourceFuture,
+            SourceDriver,
+        },
+    };
+
+    #[derive(Clone)]
+    struct ModeSourceDriver {
+        batches: Arc<Vec<RecordBatch>>,
+    }
+
+    impl SourceDriver for ModeSourceDriver {
+        fn descriptor(&self) -> ConnectorDescriptor {
+            ConnectorDescriptor::new(
+                ConnectorKind::Csv,
+                ConnectorRole::Source,
+                ConnectorCapabilities::new()
+                    .with_bounded()
+                    .with_rewindable()
+                    .with_checkpoint(),
+            )
+        }
+
+        fn validate(&self, _config: &ConnectorConfig) -> ConnectorResult<()> {
+            Ok(())
+        }
+
+        fn open<'a>(&'a self, _config: &'a ConnectorConfig) -> OpenSourceFuture<'a> {
+            let batches = Arc::clone(&self.batches);
+            Box::pin(async move {
+                Ok(Box::new(ModeSource {
+                    schema: batches
+                        .first()
+                        .map(|batch| batch.schema())
+                        .unwrap_or_else(|| Arc::new(Schema::empty())),
+                    batches,
+                    cursor: 0,
+                }) as Box<dyn DynSource>)
+            })
+        }
+    }
+
+    struct ModeSource {
+        schema: arrow::datatypes::SchemaRef,
+        batches: Arc<Vec<RecordBatch>>,
+        cursor: usize,
+    }
+
+    impl Source for ModeSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable()
+                .with_checkpoint()
+        }
+
+        fn source_schema(&self) -> Option<arrow::datatypes::SchemaRef> {
+            Some(self.schema.clone())
+        }
+
+        async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+            let batch = self.batches.get(self.cursor).cloned();
+            if batch.is_some() {
+                self.cursor = self.cursor.saturating_add(1);
+            }
+            Ok(batch)
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
+            Some(Box::new(self.cursor))
+        }
+
+        fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+            Ok(Some((self.cursor as u64).to_le_bytes().to_vec()))
+        }
+
+        fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+            if encoded.len() != 8 {
+                return Err(krishiv_connectors::ConnectorError::Offset {
+                    message: format!("expected 8 encoded cursor bytes, got {}", encoded.len()),
+                });
+            }
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(encoded);
+            self.cursor = usize::try_from(u64::from_le_bytes(raw)).map_err(|_| {
+                krishiv_connectors::ConnectorError::Offset {
+                    message: "encoded cursor exceeds usize".into(),
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    let profiles = [
+        krishiv_common::DurabilityProfile::DevLocal,
+        krishiv_common::DurabilityProfile::SingleNodeDurable,
+        krishiv_common::DurabilityProfile::DistributedDurable,
+    ];
+
+    for profile in profiles {
+        let first = krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![100_i64])
+            .unwrap();
+        let second =
+            krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![12_000_i64])
+                .unwrap();
+        let mut registry = ConnectorRegistry::new();
+        registry.register_source(Arc::new(ModeSourceDriver {
+            batches: Arc::new(vec![first, second]),
+        }));
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
+            .with_connector_registry(registry);
+        if profile != krishiv_common::DurabilityProfile::DevLocal {
+            runner = runner.with_state_dir(state_dir.path().join(profile.as_str()));
+        }
+
+        let job = format!("mode-{}", profile.as_str());
+        let partition_id = format!("events-{}-0", profile.as_str());
+        let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
+        let fragment = format!("stream:loop:{job}|{window_spec}");
+        runner.source_restore_offsets.insert(
+            job.clone(),
+            vec![crate::runner::RestoredSourceOffset {
+                partition_id: partition_id.clone(),
+                source_id: Some("events".into()),
+                legacy_offset: 1,
+                encoded_offset: 1_u64.to_le_bytes().to_vec(),
+            }],
+        );
+        let assignment =
+            make_loop_assignment(&fragment).with_input_partitions(vec![InputPartition::new(
+                partition_id.clone(),
+                "registry-connector:csv:events:{}",
+            )]);
+
+        let output = runner
+            .execute_streaming_fragment(&assignment)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{profile} registry stream-loop restore failed: {error}")
+            });
+
+        assert_eq!(
+            output.row_count(),
+            0,
+            "{profile} must restore the connector cursor before the first post-restore read"
+        );
+        assert_eq!(
+            runner.continuous_connector_sources.len(),
+            1,
+            "{profile} must retain the opened connector source for later cycles"
+        );
+        let checkpoint_runner = runner
+            .checkpoint_runners
+            .get(&TaskId::try_new("task-1").unwrap())
+            .unwrap();
+        let checkpoint_runner = checkpoint_runner.lock().unwrap();
+        assert_eq!(
+            checkpoint_runner.source_offsets.len(),
+            1,
+            "{profile} must stage exactly one source offset"
+        );
+        assert_eq!(
+            checkpoint_runner.source_offsets[0].partition_id.as_str(),
+            partition_id,
+            "{profile} must preserve partition identity in checkpoint metadata"
+        );
+        assert_eq!(checkpoint_runner.source_offsets[0].offset, 2);
+        assert_eq!(
+            checkpoint_runner.source_offsets[0].encoded_offset,
+            2_u64.to_le_bytes().to_vec(),
+            "{profile} must stage the next encoded connector offset"
+        );
+    }
+}
+
+#[tokio::test]
 async fn legacy_stream_continuous_fragment_is_rejected() {
     let fragment = "stream:continuous:legacy-job";
     let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-    let batch = krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![100_i64]).unwrap();
+    let batch =
+        krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["a"], vec![100_i64]).unwrap();
     let assignment = make_loop_assignment_with_batches(fragment, &[batch]);
 
     let error = runner
@@ -187,4 +693,3 @@ fn source_throttle_table_shared_across_runner_clones() {
     clone.source_throttle_limits.check_and_log("src-kafka-1");
     clone.source_throttle_limits.check_and_log("src-kafka-99");
 }
-

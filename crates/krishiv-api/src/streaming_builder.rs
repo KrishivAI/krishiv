@@ -979,6 +979,7 @@ mod output_mode_compat_tests {
                             allowed_lateness_ms: None,
                             source_watermark_lags: Default::default(),
                             source_id_column: None,
+                            window_timezone: None,
                         }),
                     }),
             )

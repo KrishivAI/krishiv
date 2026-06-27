@@ -141,7 +141,11 @@ pub fn version_at_timestamp(root: &Path, timestamp_ms: i64) -> LakehouseResult<O
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if let Some(ts) = val.get("commitInfo").and_then(|c| c.get("timestamp")).and_then(|t| t.as_i64()) {
+            if let Some(ts) = val
+                .get("commitInfo")
+                .and_then(|c| c.get("timestamp"))
+                .and_then(|t| t.as_i64())
+            {
                 if ts <= timestamp_ms {
                     best = Some(best.map_or(v, |m| m.max(v)));
                 }
@@ -167,7 +171,10 @@ fn compute_add_stats(batches: &[RecordBatch]) -> serde_json::Value {
     if batches.is_empty() {
         return json!({"numRecords": 0, "minValues": {}, "maxValues": {}});
     }
-    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
     let num_records: usize = batches.iter().map(|b| b.num_rows()).sum();
     let fmt_opts = FormatOptions::default();
 
@@ -370,7 +377,12 @@ fn existing_table_schema(root: &Path) -> LakehouseResult<Option<SchemaRef>> {
         Ok(f) if !f.is_empty() => f,
         _ => return Ok(None),
     };
-    let f = File::open(files.first().ok_or_else(|| LakehouseError::Io("empty file list".to_string()))?).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let f = File::open(
+        files
+            .first()
+            .ok_or_else(|| LakehouseError::Io("empty file list".to_string()))?,
+    )
+    .map_err(|e| LakehouseError::Io(e.to_string()))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(f)
         .map_err(|e| LakehouseError::Io(e.to_string()))?;
     Ok(Some(reader.schema().clone()))
@@ -402,7 +414,10 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
 
     // ── Schema enforcement (T19): reject append if schemas are incompatible ──
     if !overwrite && let Some(existing) = existing_table_schema(root)? {
-        let incoming = batches.first().ok_or_else(|| LakehouseError::Io("empty batches on schema check".to_string()))?.schema();
+        let incoming = batches
+            .first()
+            .ok_or_else(|| LakehouseError::Io("empty batches on schema check".to_string()))?
+            .schema();
         if existing.as_ref() != incoming.as_ref() {
             return Err(LakehouseError::Io(format!(
                 "schema mismatch on append: existing={existing:?}, incoming={incoming:?}"
@@ -418,7 +433,10 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
     let is_new_table = version == 0;
     let file_name = format!("part-{version:05}.parquet");
     let file_path = root.join(&file_name);
-    let schema = batches.first().ok_or_else(|| LakehouseError::Io("empty batches".to_string()))?.schema();
+    let schema = batches
+        .first()
+        .ok_or_else(|| LakehouseError::Io("empty batches".to_string()))?
+        .schema();
     let f = File::create(&file_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
     let mut writer = ArrowWriter::try_new(f, schema.clone(), None)
         .map_err(|e| LakehouseError::Io(e.to_string()))?;

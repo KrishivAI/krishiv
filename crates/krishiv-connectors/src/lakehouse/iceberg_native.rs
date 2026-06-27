@@ -426,7 +426,10 @@ pub mod native {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| LakehouseError::Io(e.to_string()))?;
         }
-        let schema = batches.first().ok_or_else(|| LakehouseError::Io("empty batches".to_string()))?.schema();
+        let schema = batches
+            .first()
+            .ok_or_else(|| LakehouseError::Io("empty batches".to_string()))?
+            .schema();
         let file = fs::File::create(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
         let mut writer = ArrowWriter::try_new(file, schema, None)
             .map_err(|e| LakehouseError::Io(e.to_string()))?;

@@ -4,7 +4,10 @@ mod phase3_recovery {
     use super::*;
     use std::sync::Mutex;
 
-    use krishiv_connectors::{EpochTransactionLog, LocalParquetTwoPhaseCommitSink};
+    use krishiv_connectors::{
+        ConnectorCapabilities, ConnectorResult, EpochTransactionLog, LocalParquetTwoPhaseCommitSink,
+        Offset, Source,
+    };
     use krishiv_proto::{CheckpointCompleteCommand, RestoreFromCheckpointCommand};
     use krishiv_state::checkpoint::{
         CheckpointMetadata, CheckpointStorage, IntegrityManifest, LocalFsCheckpointStorage,
@@ -92,6 +95,7 @@ mod phase3_recovery {
             .map(|so| SourceOffsetRecord {
                 partition_id: so.partition_id.as_str().to_owned(),
                 offset: so.offset,
+                encoded_offset: so.encoded_offset.clone(),
             })
             .collect();
         let metadata = CheckpointMetadata {
@@ -166,14 +170,27 @@ mod phase3_recovery {
             SourceOffsetRecord {
                 partition_id: "kafka-orders-eu-west-3".into(),
                 offset: 17,
+                encoded_offset: krishiv_connectors::kafka::KafkaOffset {
+                    topic: "orders-eu-west".into(),
+                    partition: 3,
+                    offset: 17,
+                }
+                .encode(),
             },
             SourceOffsetRecord {
                 partition_id: "kafka-events-0".into(),
                 offset: 5,
+                encoded_offset: krishiv_connectors::kafka::KafkaOffset {
+                    topic: "events".into(),
+                    partition: 0,
+                    offset: 5,
+                }
+                .encode(),
             },
             SourceOffsetRecord {
                 partition_id: "not-kafka".into(),
                 offset: 99,
+                encoded_offset: 99_i64.to_le_bytes().to_vec(),
             },
         ];
         let offsets = kafka_offsets_from_source_records(&records);
@@ -223,6 +240,7 @@ mod phase3_recovery {
                     job_id: JobId::try_new(job).unwrap(),
                     epoch: 1,
                     fencing_token: FencingToken::initial(),
+                    alignment: CheckpointAlignment::default(),
                 },
                 fallback,
                 Arc::clone(&storage),
@@ -307,6 +325,7 @@ mod phase3_recovery {
                     job_id: JobId::try_new(job).unwrap(),
                     epoch: 1,
                     fencing_token: FencingToken::initial(),
+                    alignment: CheckpointAlignment::default(),
                 },
                 CheckpointStateHandle::from_backend(
                     krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
@@ -384,6 +403,12 @@ mod phase3_recovery {
         runner
             .checkpoint_runners
             .insert(task_id.clone(), Arc::new(Mutex::new(stale)));
+        runner.continuous_connector_sources.insert(
+            format!("{job}|events-partition-0|registry-connector:csv:events:{{}}"),
+            Arc::new(tokio::sync::Mutex::new(
+                Box::new(EmptyCheckpointSource) as Box<dyn krishiv_connectors::DynSource>
+            )),
+        );
 
         // Seal epoch 2 with Kafka offsets and no operator snapshots.
         let ack = CheckpointAckRequest {
@@ -395,8 +420,16 @@ mod phase3_recovery {
             source_offsets: vec![krishiv_proto::CheckpointSourceOffset {
                 partition_id: krishiv_proto::PartitionId::try_new("kafka-events-1").unwrap(),
                 offset: 77,
+                encoded_offset: krishiv_connectors::kafka::KafkaOffset {
+                    topic: "events".into(),
+                    partition: 1,
+                    offset: 77,
+                }
+                .encode(),
             }],
             snapshot_path: None,
+            unaligned_buffers: Vec::new(),
+            sink_transactions: Vec::new(),
         };
         seal_epoch_from_acks(storage.as_ref(), job, 2, &[ack]);
 
@@ -406,12 +439,29 @@ mod phase3_recovery {
         runner
             .restore_job_from_checkpoint(&restore_command(job, 2), &fallback, storage.as_ref())
             .unwrap();
+        assert!(
+            runner.continuous_connector_sources.is_empty(),
+            "restore must evict cached continuous connector sources so restored offsets apply"
+        );
 
         let restored = runner.kafka_restore_offsets.get(job).unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].topic, "events");
         assert_eq!(restored[0].partition, 1);
         assert_eq!(restored[0].offset, 77);
+
+        let generic_restored = runner.source_restore_offsets.get(job).unwrap();
+        assert_eq!(generic_restored.len(), 1);
+        assert_eq!(generic_restored[0].partition_id, "kafka-events-1");
+        assert_eq!(
+            generic_restored[0].encoded_offset,
+            krishiv_connectors::kafka::KafkaOffset {
+                topic: "events".into(),
+                partition: 1,
+                offset: 77,
+            }
+            .encode()
+        );
 
         let task_runner_arc = runner.checkpoint_runners.get(&task_id).unwrap();
         assert_eq!(
@@ -420,6 +470,33 @@ mod phase3_recovery {
             "task epoch must reset to the restored epoch so pre-rollback \
              barriers are rejected as stale"
         );
+    }
+
+    struct EmptyCheckpointSource;
+
+    impl Source for EmptyCheckpointSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable()
+                .with_checkpoint()
+        }
+
+        async fn read_batch(&mut self) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
+            Ok(None)
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
+            Some(Box::new(0_usize))
+        }
+
+        fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+            Ok(Some(0_u64.to_le_bytes().to_vec()))
+        }
+
+        fn restore_encoded_checkpoint_offset(&mut self, _encoded: &[u8]) -> ConnectorResult<()> {
+            Ok(())
+        }
     }
 
     /// Barrier pre-commits transactional sinks before acking; the
@@ -451,6 +528,7 @@ mod phase3_recovery {
                     job_id: JobId::try_new(job).unwrap(),
                     epoch: 1,
                     fencing_token: FencingToken::initial(),
+                    alignment: CheckpointAlignment::default(),
                 },
                 CheckpointStateHandle::from_backend(
                     krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
@@ -530,6 +608,8 @@ mod phase3_recovery {
             fencing_token: FencingToken::initial(),
             source_offsets: vec![],
             snapshot_path: None,
+            unaligned_buffers: Vec::new(),
+            sink_transactions: Vec::new(),
         };
         seal_epoch_from_acks(storage.as_ref(), job, 1, &[ack]);
 
@@ -647,11 +727,12 @@ mod phase3_recovery {
             let coordinator = P3RecordingCoordinator::default();
             runner
                 .initiate_checkpoint_for_job(
-                    &InitiateCheckpointRequest {
-                        job_id: JobId::try_new(job).unwrap(),
-                        epoch,
-                        fencing_token: FencingToken::initial(),
-                    },
+                &InitiateCheckpointRequest {
+                    job_id: JobId::try_new(job).unwrap(),
+                    epoch: 1,
+                    fencing_token: FencingToken::initial(),
+                    alignment: CheckpointAlignment::default(),
+                },
                     CheckpointStateHandle::from_backend(
                         krishiv_state::RocksDbStateBackend::ephemeral().unwrap(),
                     ),

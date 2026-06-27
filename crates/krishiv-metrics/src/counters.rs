@@ -143,6 +143,33 @@ pub struct KrishivMetrics {
     grpc_call_duration: dashmap::DashMap<String, KrishivHistogram>,
     /// Latency histogram for checkpoint commit phases (labeled by phase).
     checkpoint_commit_duration: dashmap::DashMap<String, KrishivHistogram>,
+    // ── Streaming metrics (Phase 7) ─────────────────────────────────────────
+    /// Source read latency histogram (labeled by source_id).
+    source_read_duration: dashmap::DashMap<String, KrishivHistogram>,
+    /// Output buffer flush reason counter (labeled by reason: "rows"|"bytes"|"time").
+    output_buffer_flushes: dashmap::DashMap<String, AtomicU64>,
+    /// Checkpoint alignment time histogram (labeled by alignment mode).
+    checkpoint_alignment_duration: dashmap::DashMap<String, KrishivHistogram>,
+    /// Unaligned in-flight bytes gauge (labeled by job_id).
+    unaligned_in_flight_bytes: dashmap::DashMap<String, AtomicU64>,
+    /// Checkpoint upload time histogram (labeled by job_id).
+    checkpoint_upload_duration: dashmap::DashMap<String, KrishivHistogram>,
+    /// Restore time histogram (labeled by job_id).
+    restore_duration: dashmap::DashMap<String, KrishivHistogram>,
+    /// State cache hit counter (labeled by job_id).
+    state_cache_hits: dashmap::DashMap<String, AtomicU64>,
+    /// State cache miss counter (labeled by job_id).
+    state_cache_misses: dashmap::DashMap<String, AtomicU64>,
+    /// Object-store request count (labeled by operation: "get"|"put"|"delete"|"list").
+    object_store_requests: dashmap::DashMap<String, AtomicU64>,
+    /// Sink prepare duration histogram (labeled by sink_id).
+    sink_prepare_duration: dashmap::DashMap<String, KrishivHistogram>,
+    /// Sink commit duration histogram (labeled by sink_id).
+    sink_commit_duration: dashmap::DashMap<String, KrishivHistogram>,
+    /// Sink abort duration histogram (labeled by sink_id).
+    sink_abort_duration: dashmap::DashMap<String, KrishivHistogram>,
+    /// Backpressure duration in microseconds (labeled by job_id).
+    backpressure_duration_us: dashmap::DashMap<String, AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -531,6 +558,20 @@ impl KrishivMetrics {
         self.streaming_rows.retain(|k, _| !k.starts_with(&prefix));
         self.operator_memory_bytes
             .retain(|k, _| !k.starts_with(&prefix));
+        // Streaming metrics cleanup
+        self.unaligned_in_flight_bytes.remove(job_id);
+        self.state_cache_hits.remove(job_id);
+        self.state_cache_misses.remove(job_id);
+        self.backpressure_duration_us.remove(job_id);
+        self.checkpoint_upload_duration.remove(job_id);
+        self.restore_duration.remove(job_id);
+        self.source_read_duration.remove(job_id);
+        self.checkpoint_alignment_duration.remove(job_id);
+        self.output_buffer_flushes.clear();
+        self.sink_prepare_duration.clear();
+        self.sink_commit_duration.clear();
+        self.sink_abort_duration.clear();
+        self.object_store_requests.clear();
     }
 
     // Duration observation histograms
@@ -549,6 +590,112 @@ impl KrishivMetrics {
             .entry(phase.to_string())
             .or_default()
             .observe(duration_secs);
+    }
+
+    // ── Streaming metrics (Phase 7) ─────────────────────────────────────────
+
+    /// Record source read latency in seconds.
+    pub fn observe_source_read_duration(&self, source_id: &str, duration_secs: f64) {
+        self.source_read_duration
+            .entry(source_id.to_string())
+            .or_default()
+            .observe(duration_secs);
+    }
+
+    /// Record an output buffer flush with a reason.
+    pub fn inc_output_buffer_flush(&self, reason: &str) {
+        self.output_buffer_flushes
+            .entry(reason.to_string())
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record checkpoint alignment time in seconds.
+    pub fn observe_checkpoint_alignment_duration(&self, alignment: &str, duration_secs: f64) {
+        self.checkpoint_alignment_duration
+            .entry(alignment.to_string())
+            .or_default()
+            .observe(duration_secs);
+    }
+
+    /// Set unaligned in-flight bytes for a job.
+    pub fn set_unaligned_in_flight_bytes(&self, job_id: &str, bytes: u64) {
+        self.unaligned_in_flight_bytes
+            .entry(job_id.to_string())
+            .or_default()
+            .store(bytes, Ordering::Relaxed);
+    }
+
+    /// Record checkpoint upload duration in seconds.
+    pub fn observe_checkpoint_upload_duration(&self, job_id: &str, duration_secs: f64) {
+        self.checkpoint_upload_duration
+            .entry(job_id.to_string())
+            .or_default()
+            .observe(duration_secs);
+    }
+
+    /// Record restore duration in seconds.
+    pub fn observe_restore_duration(&self, job_id: &str, duration_secs: f64) {
+        self.restore_duration
+            .entry(job_id.to_string())
+            .or_default()
+            .observe(duration_secs);
+    }
+
+    /// Increment state cache hit count.
+    pub fn inc_state_cache_hit(&self, job_id: &str) {
+        self.state_cache_hits
+            .entry(job_id.to_string())
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment state cache miss count.
+    pub fn inc_state_cache_miss(&self, job_id: &str) {
+        self.state_cache_misses
+            .entry(job_id.to_string())
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment object-store request count.
+    pub fn inc_object_store_request(&self, operation: &str) {
+        self.object_store_requests
+            .entry(operation.to_string())
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record sink prepare duration in seconds.
+    pub fn observe_sink_prepare_duration(&self, sink_id: &str, duration_secs: f64) {
+        self.sink_prepare_duration
+            .entry(sink_id.to_string())
+            .or_default()
+            .observe(duration_secs);
+    }
+
+    /// Record sink commit duration in seconds.
+    pub fn observe_sink_commit_duration(&self, sink_id: &str, duration_secs: f64) {
+        self.sink_commit_duration
+            .entry(sink_id.to_string())
+            .or_default()
+            .observe(duration_secs);
+    }
+
+    /// Record sink abort duration in seconds.
+    pub fn observe_sink_abort_duration(&self, sink_id: &str, duration_secs: f64) {
+        self.sink_abort_duration
+            .entry(sink_id.to_string())
+            .or_default()
+            .observe(duration_secs);
+    }
+
+    /// Add backpressure duration in microseconds.
+    pub fn add_backpressure_duration_us(&self, job_id: &str, us: u64) {
+        self.backpressure_duration_us
+            .entry(job_id.to_string())
+            .or_default()
+            .fetch_add(us, Ordering::Relaxed);
     }
 
     // Prometheus rendering
@@ -1048,6 +1195,182 @@ impl KrishivMetrics {
             "phase",
             &self.checkpoint_commit_duration,
         )?;
+
+        // ── Streaming metrics (Phase 7) ───────────────────────────────────
+
+        render_histogram(
+            &mut out,
+            "krishiv_source_read_duration_seconds",
+            "Source read latency in seconds",
+            "source_id",
+            &self.source_read_duration,
+        )?;
+
+        let flush_entries: BTreeMap<String, u64> = self
+            .output_buffer_flushes
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        if !flush_entries.is_empty() {
+            writeln!(
+                out,
+                "# HELP krishiv_output_buffer_flushes_total Output buffer flush count by reason"
+            )?;
+            writeln!(out, "# TYPE krishiv_output_buffer_flushes_total counter")?;
+            for (reason, count) in &flush_entries {
+                writeln!(
+                    out,
+                    "krishiv_output_buffer_flushes_total{{reason=\"{}\"}} {count}",
+                    escape_label_value(reason)
+                )?;
+            }
+        }
+
+        render_histogram(
+            &mut out,
+            "krishiv_checkpoint_alignment_duration_seconds",
+            "Checkpoint alignment time in seconds",
+            "alignment",
+            &self.checkpoint_alignment_duration,
+        )?;
+
+        let unaligned_entries: BTreeMap<String, u64> = self
+            .unaligned_in_flight_bytes
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        if !unaligned_entries.is_empty() {
+            writeln!(
+                out,
+                "# HELP krishiv_unaligned_in_flight_bytes Unaligned checkpoint in-flight bytes"
+            )?;
+            writeln!(out, "# TYPE krishiv_unaligned_in_flight_bytes gauge")?;
+            for (job, bytes) in &unaligned_entries {
+                writeln!(
+                    out,
+                    "krishiv_unaligned_in_flight_bytes{{job_id=\"{}\"}} {bytes}",
+                    escape_label_value(job)
+                )?;
+            }
+        }
+
+        render_histogram(
+            &mut out,
+            "krishiv_checkpoint_upload_duration_seconds",
+            "Checkpoint upload duration in seconds",
+            "job_id",
+            &self.checkpoint_upload_duration,
+        )?;
+
+        render_histogram(
+            &mut out,
+            "krishiv_restore_duration_seconds",
+            "Restore duration in seconds",
+            "job_id",
+            &self.restore_duration,
+        )?;
+
+        let cache_hits: BTreeMap<String, u64> = self
+            .state_cache_hits
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        if !cache_hits.is_empty() {
+            writeln!(
+                out,
+                "# HELP krishiv_state_cache_hits_total State cache hit count"
+            )?;
+            writeln!(out, "# TYPE krishiv_state_cache_hits_total counter")?;
+            for (job, count) in &cache_hits {
+                writeln!(
+                    out,
+                    "krishiv_state_cache_hits_total{{job_id=\"{}\"}} {count}",
+                    escape_label_value(job)
+                )?;
+            }
+        }
+
+        let cache_misses: BTreeMap<String, u64> = self
+            .state_cache_misses
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        if !cache_misses.is_empty() {
+            writeln!(
+                out,
+                "# HELP krishiv_state_cache_misses_total State cache miss count"
+            )?;
+            writeln!(out, "# TYPE krishiv_state_cache_misses_total counter")?;
+            for (job, count) in &cache_misses {
+                writeln!(
+                    out,
+                    "krishiv_state_cache_misses_total{{job_id=\"{}\"}} {count}",
+                    escape_label_value(job)
+                )?;
+            }
+        }
+
+        let os_entries: BTreeMap<String, u64> = self
+            .object_store_requests
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        if !os_entries.is_empty() {
+            writeln!(
+                out,
+                "# HELP krishiv_object_store_requests_total Object store request count"
+            )?;
+            writeln!(out, "# TYPE krishiv_object_store_requests_total counter")?;
+            for (op, count) in &os_entries {
+                writeln!(
+                    out,
+                    "krishiv_object_store_requests_total{{operation=\"{}\"}} {count}",
+                    escape_label_value(op)
+                )?;
+            }
+        }
+
+        render_histogram(
+            &mut out,
+            "krishiv_sink_prepare_duration_seconds",
+            "Sink prepare duration in seconds",
+            "sink_id",
+            &self.sink_prepare_duration,
+        )?;
+        render_histogram(
+            &mut out,
+            "krishiv_sink_commit_duration_seconds",
+            "Sink commit duration in seconds",
+            "sink_id",
+            &self.sink_commit_duration,
+        )?;
+        render_histogram(
+            &mut out,
+            "krishiv_sink_abort_duration_seconds",
+            "Sink abort duration in seconds",
+            "sink_id",
+            &self.sink_abort_duration,
+        )?;
+
+        let bp_entries: BTreeMap<String, u64> = self
+            .backpressure_duration_us
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        if !bp_entries.is_empty() {
+            writeln!(
+                out,
+                "# HELP krishiv_backpressure_duration_us_total Backpressure duration in microseconds"
+            )?;
+            writeln!(out, "# TYPE krishiv_backpressure_duration_us_total counter")?;
+            for (job, us) in &bp_entries {
+                writeln!(
+                    out,
+                    "krishiv_backpressure_duration_us_total{{job_id=\"{}\"}} {us}",
+                    escape_label_value(job)
+                )?;
+            }
+        }
 
         Ok(out)
     }

@@ -43,11 +43,13 @@ fn make_tumble_start() -> datafusion::logical_expr::ScalarUDF {
         DataType::Int64,
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
-            let a0 = args.first().ok_or_else(|| DataFusionError::Internal("tumble_start: missing arg 0".into()))?;
-            let a1 = args.get(1).ok_or_else(|| DataFusionError::Internal("tumble_start: missing arg 1".into()))?;
-            apply2(a0, a1, |t, s| {
-                if s != 0 { t - t.rem_euclid(s) } else { t }
-            })
+            let a0 = args
+                .first()
+                .ok_or_else(|| DataFusionError::Internal("tumble_start: missing arg 0".into()))?;
+            let a1 = args
+                .get(1)
+                .ok_or_else(|| DataFusionError::Internal("tumble_start: missing arg 1".into()))?;
+            apply2(a0, a1, |t, s| if s != 0 { t - t.rem_euclid(s) } else { t })
         }),
     )
 }
@@ -62,11 +64,19 @@ fn make_tumble_end() -> datafusion::logical_expr::ScalarUDF {
         DataType::Int64,
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
-            let a0 = args.first().ok_or_else(|| DataFusionError::Internal("tumble_end: missing arg 0".into()))?;
-            let a1 = args.get(1).ok_or_else(|| DataFusionError::Internal("tumble_end: missing arg 1".into()))?;
-            apply2(a0, a1, |t, s| {
-                if s != 0 { t - t.rem_euclid(s) + s } else { t }
-            })
+            let a0 = args
+                .first()
+                .ok_or_else(|| DataFusionError::Internal("tumble_end: missing arg 0".into()))?;
+            let a1 = args
+                .get(1)
+                .ok_or_else(|| DataFusionError::Internal("tumble_end: missing arg 1".into()))?;
+            apply2(
+                a0,
+                a1,
+                |t, s| {
+                    if s != 0 { t - t.rem_euclid(s) + s } else { t }
+                },
+            )
         }),
     )
 }
@@ -82,12 +92,23 @@ fn make_hop_start() -> datafusion::logical_expr::ScalarUDF {
         DataType::Int64,
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
-            let a0 = args.first().ok_or_else(|| DataFusionError::Internal("hop_start: missing arg 0".into()))?;
-            let a1 = args.get(1).ok_or_else(|| DataFusionError::Internal("hop_start: missing arg 1".into()))?;
-            let a2 = args.get(2).ok_or_else(|| DataFusionError::Internal("hop_start: missing arg 2".into()))?;
-            apply3(a0, a1, a2, |t, sl, _sz| {
-                if sl != 0 { t - t.rem_euclid(sl) } else { t }
-            })
+            let a0 = args
+                .first()
+                .ok_or_else(|| DataFusionError::Internal("hop_start: missing arg 0".into()))?;
+            let a1 = args
+                .get(1)
+                .ok_or_else(|| DataFusionError::Internal("hop_start: missing arg 1".into()))?;
+            let a2 = args
+                .get(2)
+                .ok_or_else(|| DataFusionError::Internal("hop_start: missing arg 2".into()))?;
+            apply3(
+                a0,
+                a1,
+                a2,
+                |t, sl, _sz| {
+                    if sl != 0 { t - t.rem_euclid(sl) } else { t }
+                },
+            )
         }),
     )
 }
@@ -102,9 +123,15 @@ fn make_hop_end() -> datafusion::logical_expr::ScalarUDF {
         DataType::Int64,
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
-            let a0 = args.first().ok_or_else(|| DataFusionError::Internal("hop_end: missing arg 0".into()))?;
-            let a1 = args.get(1).ok_or_else(|| DataFusionError::Internal("hop_end: missing arg 1".into()))?;
-            let a2 = args.get(2).ok_or_else(|| DataFusionError::Internal("hop_end: missing arg 2".into()))?;
+            let a0 = args
+                .first()
+                .ok_or_else(|| DataFusionError::Internal("hop_end: missing arg 0".into()))?;
+            let a1 = args
+                .get(1)
+                .ok_or_else(|| DataFusionError::Internal("hop_end: missing arg 1".into()))?;
+            let a2 = args
+                .get(2)
+                .ok_or_else(|| DataFusionError::Internal("hop_end: missing arg 2".into()))?;
             apply3(a0, a1, a2, |t, sl, sz| {
                 if sl != 0 {
                     t - t.rem_euclid(sl) + sz
@@ -132,8 +159,12 @@ fn make_session_start() -> datafusion::logical_expr::ScalarUDF {
         DataType::Int64,
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
-            let a0 = args.first().ok_or_else(|| DataFusionError::Internal("session_start: missing arg 0".into()))?;
-            let a1 = args.get(1).ok_or_else(|| DataFusionError::Internal("session_start: missing arg 1".into()))?;
+            let a0 = args
+                .first()
+                .ok_or_else(|| DataFusionError::Internal("session_start: missing arg 0".into()))?;
+            let a1 = args
+                .get(1)
+                .ok_or_else(|| DataFusionError::Internal("session_start: missing arg 1".into()))?;
             // Return the event timestamp as the provisional session start.
             apply2(a0, a1, |t, _gap| t)
         }),
@@ -151,8 +182,12 @@ fn make_session_end() -> datafusion::logical_expr::ScalarUDF {
         DataType::Int64,
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
-            let a0 = args.first().ok_or_else(|| DataFusionError::Internal("session_end: missing arg 0".into()))?;
-            let a1 = args.get(1).ok_or_else(|| DataFusionError::Internal("session_end: missing arg 1".into()))?;
+            let a0 = args
+                .first()
+                .ok_or_else(|| DataFusionError::Internal("session_end: missing arg 0".into()))?;
+            let a1 = args
+                .get(1)
+                .ok_or_else(|| DataFusionError::Internal("session_end: missing arg 1".into()))?;
             apply2(a0, a1, |t, gap| t + gap)
         }),
     )
@@ -162,7 +197,9 @@ fn make_session_end() -> datafusion::logical_expr::ScalarUDF {
 
 fn cast_to_int64_array(args: &[ColumnarValue], idx: usize) -> Result<Int64Array, DataFusionError> {
     use datafusion::scalar::ScalarValue;
-    match args.get(idx).ok_or_else(|| DataFusionError::Internal(format!("window function: missing argument {idx}")))? {
+    match args.get(idx).ok_or_else(|| {
+        DataFusionError::Internal(format!("window function: missing argument {idx}"))
+    })? {
         ColumnarValue::Array(arr) => {
             let typed = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                 DataFusionError::Internal(format!(
@@ -382,7 +419,11 @@ mod tests {
             .collect()
             .await
             .unwrap();
-        let starts = result.first().expect("empty result").column(0).as_primitive::<Int64Type>();
+        let starts = result
+            .first()
+            .expect("empty result")
+            .column(0)
+            .as_primitive::<Int64Type>();
         assert_eq!(starts.value(0), 60000);
         assert_eq!(starts.value(1), 120000);
     }

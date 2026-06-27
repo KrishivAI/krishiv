@@ -307,6 +307,7 @@ async fn streaming_job_lifecycle_never_succeeds_while_running() {
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
         allowed_lateness_ms: None,
+        window_timezone: None,
     };
 
     // submit_stream_job returns the job name; it does not register in session.jobs()
@@ -363,6 +364,7 @@ async fn stream_state_maintained_across_drain_cycles() {
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
         allowed_lateness_ms: None,
+        window_timezone: None,
     };
 
     session

@@ -26,6 +26,10 @@ impl Source for CsvFileSource {
         self.inner.capabilities()
     }
 
+    fn source_schema(&self) -> Option<arrow::datatypes::SchemaRef> {
+        Some(self.inner.schema().clone())
+    }
+
     async fn read_batch(&mut self) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
         self.inner.read_batch()
     }

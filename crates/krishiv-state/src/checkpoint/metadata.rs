@@ -36,7 +36,9 @@ pub type CheckpointResult<T> = Result<T, CheckpointError>;
 /// Versioned checkpoint metadata record written to `metadata.json`.
 ///
 /// Versions 1 and 2 are restore-compatible. Version 2 adds coordinator identity;
-/// restore rejects versions outside the published compatibility window.
+/// version 3 adds unaligned buffer refs, durable sink transactions, and per-epoch
+/// runtime profile. Restore rejects versions outside the published compatibility
+/// window.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CheckpointMetadata {
     /// Format version. New checkpoints use [`CheckpointMetadata::VERSION`].
@@ -71,13 +73,31 @@ pub struct CheckpointMetadata {
     pub iceberg_snapshot_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kafka_offsets: Option<std::collections::BTreeMap<String, i64>>,
+    /// In-flight buffer references for unaligned checkpoints (v3+).
+    ///
+    /// Each entry describes a buffer of post-barrier records that was captured
+    /// during an unaligned checkpoint and must be replayed on restore.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unaligned_buffer_refs: Vec<UnalignedBufferRef>,
+    /// Durable prepared-sink transaction references (v3+).
+    ///
+    /// Each entry records a sink that prepared a write during this epoch.
+    /// On restore, these are re-committed or aborted depending on whether the
+    /// epoch was successfully committed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sink_transactions: Vec<SinkTransactionRef>,
+    /// Streaming execution profile used for this epoch (v3+).
+    ///
+    /// Recorded so that restore can verify the runtime was configured consistently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming_profile: Option<String>,
 }
 
 impl CheckpointMetadata {
     /// Oldest metadata format accepted for restore.
     pub const MIN_SUPPORTED_VERSION: u32 = 1;
     /// Current metadata format written by the engine.
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
 
     /// Validate that this metadata can be used for restore.
     pub fn validate(&self) -> CheckpointResult<()> {
@@ -94,7 +114,11 @@ impl CheckpointMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceOffsetRecord {
     pub partition_id: String,
+    /// Legacy numeric offset retained for existing metadata and status tools.
     pub offset: i64,
+    /// Connector-encoded exact offset bytes for restore.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encoded_offset: Vec<u8>,
 }
 
 /// Reference to the state snapshot file for one operator instance.
@@ -104,6 +128,43 @@ pub struct OperatorSnapshotRef {
     pub task_id: String,
     /// Path to `state.bin` relative to the checkpoint storage base directory.
     pub snapshot_path: String,
+}
+
+/// Reference to an in-flight buffer captured during an unaligned checkpoint.
+///
+/// When a checkpoint barrier overtakes in-flight data (unaligned mode),
+/// the post-barrier records are buffered and their reference is stored in
+/// checkpoint metadata. On restore, these buffers must be replayed before
+/// the operator processes new data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnalignedBufferRef {
+    /// Operator that owns this buffer.
+    pub operator_id: String,
+    /// Input channel index that received the buffered records.
+    pub channel_index: u32,
+    /// Number of records in the buffer.
+    pub record_count: u64,
+    /// Path to the serialized buffer data relative to the checkpoint base.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub buffer_path: String,
+}
+
+/// Reference to a durable prepared-sink transaction.
+///
+/// When a two-phase sink prepares a write during an epoch, the prepare record
+/// is durably stored so that the transaction can be committed or aborted
+/// depending on whether the checkpoint epoch is successfully committed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SinkTransactionRef {
+    /// Sink identifier.
+    pub sink_id: String,
+    /// Epoch in which the sink was prepared.
+    pub epoch: u64,
+    /// Path to the prepared transaction data relative to the checkpoint base.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prepare_path: String,
+    /// Whether this transaction has been committed.
+    pub committed: bool,
 }
 
 // ── IntegrityManifest ─────────────────────────────────────────────────────────
