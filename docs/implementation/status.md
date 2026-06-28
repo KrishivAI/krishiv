@@ -1,5 +1,42 @@
 # Krishiv Implementation Status
 
+## 2026-06-28 - Feature-flag hygiene + runtime/deployment optimization
+
+Optimized the Cargo feature graph and per-deployment runtime, and added a guard
+that prevents the class of rot it surfaced.
+
+- **Lean embedded build**: `krishiv-sql` no longer enables Iceberg by default
+  (`default = []`) and its `krishiv-connectors` dep dropped the hard-coded
+  `iceberg` (kept `kafka` + `s3`). The heavy Iceberg tree is now opt-in via the
+  `iceberg` / `iceberg-datafusion` features and the `krishiv` binary's `iceberg`
+  preset. Verified: embedded tree went from **4 → 0** iceberg crates; `full`
+  keeps all 4; both compile.
+- **Inline-IPC cap** (`KRISHIV_INLINE_IPC_MAX_BYTES`, default 64 MiB): caps a
+  single inlined parquet table so an oversized base64 blob can't silently exceed
+  the gRPC/HTTP max-message limit; over-cap → actionable error / path-based
+  fallback. Embedded placement confirmed serialization-free.
+- **`krishiv doctor`**: read-only command that resolves the effective deployment
+  config (mode, coordinator, durability, shuffle, resources, transport) and
+  flags misconfigurations — tames the ~100 `KRISHIV_*` env surface.
+- **Feature guard** (`just lint-features`, cargo-hack `--each-feature`) + CI job
+  `feature-guard`. Scoped to the supported surface via `--exclude-features`.
+- **Docs**: `docs/feature-graph.md` (leaf flags → forwarders → presets, the
+  Iceberg-lean rule, and the quarantine table).
+
+### Bugs fixed (pre-existing dep-API rot, surfaced by the feature guard)
+- `krishiv-sql` `iceberg-datafusion` DML interception rotted against
+  **sqlparser 0.61** (`FromTable` became an enum; `Statement::Delete`/`Update`
+  became newtype variants) + an unused import. Fixed; this path is now guarded.
+
+### Quarantined (known-broken optional features, tracked — not in any preset)
+Excluded from the guard via `--exclude-features`; see
+`docs/feature-graph.md` → "Quarantined features" for per-feature root causes.
+- connectors: `pulsar-source`, `cassandra`, `elasticsearch`, `vortex`, `cloud`
+- sql: `postgres-catalog`, `rest-catalog`, `unity-catalog`, `glue-catalog`
+
+These are dependency-API migrations (pulsar, scylla, elasticsearch, object_store
+0.13, iceberg IO traits, iceberg-catalog-rest) — each its own follow-up.
+
 ## 2026-06-28 - S1–S2: CSV + JSON job connectors (matrix breadth)
 
 Expanded the job source/sink connectors beyond `parquet` to `csv` and `json`

@@ -58,6 +58,21 @@ jobs:
       - uses: taiki-e/install-action@just
       - run: just check-${{ matrix.mode }}
 
+  # ── Per-feature compilation guard ────────────────────────────────────────────
+  feature-guard:
+    name: Feature guard (cargo-hack)
+    runs-on: ubuntu-latest
+    needs: [fmt-lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: feature-guard
+          extra-apt: protobuf-compiler
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: taiki-e/install-action@just
+      - run: just lint-features
+
   # ── Rust workspace tests ─────────────────────────────────────────────────────
   test:
     name: Tests

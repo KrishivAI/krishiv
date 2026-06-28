@@ -220,16 +220,8 @@ impl AggState {
                             let v = Self::numeric_value(col, row, &expr.input_column)?;
                             match expr.function {
                                 AggFunction::Sum => entry.float_value += v,
-                                AggFunction::Min => {
-                                    if v < entry.float_value {
-                                        entry.float_value = v;
-                                    }
-                                }
-                                AggFunction::Max => {
-                                    if v > entry.float_value {
-                                        entry.float_value = v;
-                                    }
-                                }
+                                AggFunction::Min if v < entry.float_value => entry.float_value = v,
+                                AggFunction::Max if v > entry.float_value => entry.float_value = v,
                                 _ => {}
                             }
                             entry.has_value = true;
@@ -402,16 +394,8 @@ fn update_agg_state_pre(
                     let v = col.float64_value(row)?;
                     match expr.function {
                         AggFunction::Sum => entry.float_value += v,
-                        AggFunction::Min => {
-                            if v < entry.float_value {
-                                entry.float_value = v;
-                            }
-                        }
-                        AggFunction::Max => {
-                            if v > entry.float_value {
-                                entry.float_value = v;
-                            }
-                        }
+                        AggFunction::Min if v < entry.float_value => entry.float_value = v,
+                        AggFunction::Max if v > entry.float_value => entry.float_value = v,
                         _ => {}
                     }
                     entry.has_value = true;

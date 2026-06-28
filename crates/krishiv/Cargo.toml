@@ -51,7 +51,9 @@ shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
 kafka = ["krishiv-connectors/kafka"]
 state = ["krishiv-connectors/state"]
-iceberg = ["krishiv-connectors/iceberg"]
+# krishiv-sql no longer enables Iceberg by default, so the binary's iceberg
+# preset must re-enable it on the SQL layer to keep full/k8s builds unchanged.
+iceberg = ["krishiv-connectors/iceberg", "krishiv-sql/iceberg"]
 delta = ["krishiv-connectors/delta"]
 
 [dependencies]

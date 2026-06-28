@@ -93,16 +93,58 @@ pub fn encode_batch_sql(query: &str, tables: &[BatchSqlTable]) -> String {
     parts.join("\n")
 }
 
+/// Default cap on a single inlined parquet table (64 MiB on disk).
+///
+/// Inlined IPC travels inside one gRPC/HTTP message; an oversized blob silently
+/// blows past the transport's max-message limit and fails cryptically. Capping
+/// the on-disk parquet size keeps inline shipping to dimension-sized tables and
+/// turns "too big to inline" into an actionable error / path-based fallback.
+const DEFAULT_INLINE_IPC_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Effective inline-IPC cap, overridable via `KRISHIV_INLINE_IPC_MAX_BYTES`.
+pub(crate) fn inline_ipc_max_bytes() -> u64 {
+    std::env::var("KRISHIV_INLINE_IPC_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_INLINE_IPC_MAX_BYTES)
+}
+
 /// Read a local parquet file and return base64-encoded Arrow IPC bytes.
 ///
 /// Shared by the Flight SQL comment protocol and the coordinator HTTP submit
 /// path — both need to inline parquet data before sending to the remote server.
+///
+/// Tables whose on-disk size exceeds the inline cap return an error so callers
+/// can fall back to path-based shipping (shared filesystem) instead of building
+/// a transport-busting message; see [`parquet_file_to_ipc_b64_capped`].
 pub(crate) fn parquet_file_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<String> {
+    parquet_file_to_ipc_b64_capped(path, inline_ipc_max_bytes())
+}
+
+/// [`parquet_file_to_ipc_b64`] with an explicit size cap (bytes) for testing and
+/// callers that want a non-default limit.
+pub(crate) fn parquet_file_to_ipc_b64_capped(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> RuntimeResult<String> {
     use arrow::ipc::writer::StreamWriter;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let file = std::fs::File::open(path)
         .map_err(|e| RuntimeError::transport(format!("open '{}': {e}", path.display())))?;
+    let on_disk = file
+        .metadata()
+        .map(|m| m.len())
+        .map_err(|e| RuntimeError::transport(format!("stat '{}': {e}", path.display())))?;
+    if on_disk > max_bytes {
+        return Err(RuntimeError::transport(format!(
+            "parquet table '{}' is {on_disk} bytes, over the inline-IPC cap of {max_bytes} \
+             (KRISHIV_INLINE_IPC_MAX_BYTES); ship it via a shared filesystem (path-based) \
+             or raise the cap",
+            path.display()
+        )));
+    }
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| {
             RuntimeError::transport(format!("parquet reader for '{}': {e}", path.display()))
@@ -977,5 +1019,39 @@ mod tests {
         let sql = "/* krishiv-continuous-drain */ SELECT 1";
         let (directives, _) = parse_sql(sql);
         assert!(directives.is_empty());
+    }
+
+    fn write_parquet(batch: &RecordBatch) -> (tempfile::TempDir, PathBuf) {
+        use parquet::arrow::ArrowWriter;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.parquet");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn inline_ipc_under_cap_encodes_and_over_cap_errors() {
+        let (_dir, path) = write_parquet(&test_batch());
+
+        // A generous cap inlines the table.
+        let encoded =
+            parquet_file_to_ipc_b64_capped(&path, 64 * 1024 * 1024).expect("under cap inlines");
+        assert!(!encoded.is_empty(), "small table should inline");
+
+        // A 1-byte cap rejects it with an actionable error, so callers fall back
+        // to path-based shipping instead of building a transport-busting message.
+        let err = parquet_file_to_ipc_b64_capped(&path, 1)
+            .expect_err("over cap must error, not inline a giant blob");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inline-IPC cap") && msg.contains("KRISHIV_INLINE_IPC_MAX_BYTES"),
+            "error must name the cap knob: {msg}"
+        );
+
+        // Default cap is the documented 64 MiB.
+        assert_eq!(DEFAULT_INLINE_IPC_MAX_BYTES, 64 * 1024 * 1024);
     }
 }

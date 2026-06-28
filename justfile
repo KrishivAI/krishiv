@@ -237,6 +237,22 @@ lint:
         --exclude krishiv-chaos \
         -- -D warnings
 
+# Verify each optional feature compiles on its own — catches forwarding-flag
+# rot and "doesn't build with --no-default-features" breakage in the crates
+# that own the feature graph. Installs cargo-hack on demand.
+#
+# Quarantined features (pre-existing dependency-API rot in optional, non-preset
+# integrations; tracked in docs/feature-graph.md → "Quarantined features"):
+#   connectors: pulsar-source, cassandra, elasticsearch, vortex, cloud
+#   sql:        postgres-catalog, rest-catalog, unity-catalog, glue-catalog
+lint-features:
+    @command -v cargo-hack >/dev/null 2>&1 || {{ cargo }} install cargo-hack --locked
+    {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-connectors \
+        --exclude-features pulsar-source,cassandra,elasticsearch,vortex,cloud
+    {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-sql \
+        --exclude-features postgres-catalog,rest-catalog,unity-catalog,glue-catalog
+    @echo "✓ per-feature builds clean (quarantined features: see docs/feature-graph.md)"
+
 # Format then lint in one shot
 tidy: fmt lint
 

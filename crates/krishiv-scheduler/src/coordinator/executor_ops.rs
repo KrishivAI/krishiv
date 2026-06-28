@@ -674,8 +674,8 @@ impl Coordinator {
     fn maybe_request_workers(&mut self) {
         let total_pending: usize = self
             .job_coordinators
-            .iter()
-            .filter_map(|(_, jc)| {
+            .values()
+            .filter_map(|jc| {
                 let state = jc.read_record().state();
                 if state.is_terminal() || state == JobState::Queued {
                     return None;

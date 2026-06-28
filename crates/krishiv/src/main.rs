@@ -3,6 +3,7 @@
 mod cli;
 mod cluster_cmd;
 mod daemon_cmd;
+mod doctor_cmd;
 mod ivm_cmd;
 mod local_cluster;
 mod pipeline_cmd;

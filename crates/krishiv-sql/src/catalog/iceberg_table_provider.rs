@@ -18,7 +18,6 @@ pub mod iceberg_scan {
     };
     use datafusion::error::{DataFusionError, Result as DfResult};
     use datafusion::execution::SessionStateBuilder;
-    use datafusion::prelude::SessionContext;
     use futures::TryStreamExt;
     use iceberg::table::Table;
 

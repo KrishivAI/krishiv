@@ -124,6 +124,9 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
             CliResponse::ok(crate::stream_cmd::stream_help())
         }
         ["ivm"] | ["ivm", "--help"] | ["ivm", "-h"] => CliResponse::ok(crate::ivm_cmd::ivm_help()),
+        ["doctor", "--help"] | ["doctor", "-h"] | ["help", "doctor"] => {
+            CliResponse::ok(crate::doctor_cmd::doctor_help().to_string())
+        }
         ["table"] | ["table", "--help"] | ["table", "-h"] => {
             CliResponse::ok(crate::table_cmd::table_help())
         }
@@ -179,6 +182,7 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["explain", rest @ ..] => run_explain(rest),
         ["stream", rest @ ..] => crate::stream_cmd::run_stream(rest, &coordinator_mode),
         ["ivm", rest @ ..] => crate::ivm_cmd::run_ivm(rest, &coordinator_mode),
+        ["doctor", rest @ ..] => crate::doctor_cmd::run_doctor(rest, &coordinator_mode),
         ["table", rest @ ..] => crate::table_cmd::run_table(rest),
         ["submit", rest @ ..] => run_submit(rest),
         ["jobs", rest @ ..] => run_jobs(rest),
@@ -205,7 +209,9 @@ pub fn main_help() -> String {
            sql          Run SQL (--local, --remote, --api-key)\n\
            explain      Show logical/physical plan information\n\
            stream       Continuous streaming jobs (submit, push, poll)\n\
+           ivm          Incremental view maintenance (delta-batch) jobs\n\
            table        Read parquet, delta, or hudi tables\n\
+           doctor       Print the effective deployment configuration\n\
            submit       Submit a distributed job to the R2 local scheduler\n\
            jobs         List local jobs for this process\n\
            state        Inspect streaming operator state metadata (R5.2)\n\

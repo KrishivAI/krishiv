@@ -3871,7 +3871,7 @@ fn parse_call_duration(s: &str) -> SqlResult<chrono::Duration> {
 /// A missing WHERE clause is returned as `"TRUE"` (delete all rows).
 #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
 fn parse_dml_delete(stmt: &str) -> Option<(String, String)> {
-    use datafusion::sql::sqlparser::ast::{Statement, TableFactor};
+    use datafusion::sql::sqlparser::ast::{FromTable, Statement, TableFactor};
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
 
@@ -3882,8 +3882,12 @@ fn parse_dml_delete(stmt: &str) -> Option<(String, String)> {
     let Statement::Delete(delete) = stmts.remove(0) else {
         return None;
     };
-    // The first FROM table is the deletion target.
-    let first_from = delete.from.into_iter().next()?;
+    // `Delete::from` is a `FromTable` enum (sqlparser ≥0.54); both arms carry the
+    // table list. The first FROM table is the deletion target.
+    let tables = match delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    let first_from = tables.into_iter().next()?;
     let table_name = match first_from.relation {
         TableFactor::Table { name, .. } => name.to_string(),
         _ => return None,
@@ -3919,24 +3923,20 @@ fn parse_dml_update(stmt: &str) -> Option<ParsedUpdate> {
     if stmts.len() != 1 {
         return None;
     }
-    let Statement::Update {
-        table,
-        assignments,
-        selection,
-        ..
-    } = stmts.remove(0)
-    else {
+    // `Statement::Update` wraps an `Update` struct (sqlparser ≥0.55).
+    let Statement::Update(update) = stmts.remove(0) else {
         return None;
     };
-    let table_name = match table.relation {
+    let table_name = match update.table.relation {
         TableFactor::Table { name, .. } => name.to_string(),
         _ => return None,
     };
     // Convert AST assignments to (column_name, expression_string) pairs.
-    let parsed_assignments: Vec<(String, String)> = assignments
+    let parsed_assignments: Vec<(String, String)> = update
+        .assignments
         .into_iter()
         .map(|a| {
-            // `target` may be `AssignmentTarget::ColumnName(ObjectName)` in 0.61.
+            // `target` is `AssignmentTarget::ColumnName(ObjectName)` in 0.61.
             let col = a.target.to_string();
             let val = a.value.to_string();
             (col, val)
@@ -3948,7 +3948,7 @@ fn parse_dml_update(stmt: &str) -> Option<ParsedUpdate> {
     Some(ParsedUpdate {
         table_ref: table_name,
         assignments: parsed_assignments,
-        predicate: selection.map(|e| e.to_string()),
+        predicate: update.selection.map(|e| e.to_string()),
     })
 }
 
