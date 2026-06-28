@@ -61,6 +61,11 @@ impl DataflowGraph {
         self.nodes.keys()
     }
 
+    /// Get all edges in insertion order (deterministic).
+    pub fn edges(&self) -> &[(NodeId, NodeId)] {
+        &self.edges
+    }
+
     /// Get the successor of a node (if any).
     pub fn successor(&self, node: &NodeId) -> Option<&NodeId> {
         self.edges
@@ -96,14 +101,14 @@ impl FusionDetector {
     pub fn detect_fusions(&self) -> Vec<OperatorFusion> {
         let mut fusions = Vec::new();
 
-        for node in self.graph.nodes() {
-            // Check if node can be fused with successor
-            if let Some(successor) = self.graph.successor(node)
-                && self.can_fuse(node, successor)
-            {
+        // Iterate edges (insertion-ordered) rather than nodes (HashMap order) so
+        // the detected fusions are deterministic and reproducible. Each forward
+        // edge whose endpoints are compatible is a fusion candidate.
+        for (source, sink) in self.graph.edges() {
+            if self.can_fuse(source, sink) {
                 fusions.push(OperatorFusion {
-                    source: node.clone(),
-                    sink: successor.clone(),
+                    source: source.clone(),
+                    sink: sink.clone(),
                 });
             }
         }

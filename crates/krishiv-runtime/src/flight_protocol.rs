@@ -333,6 +333,7 @@ pub fn catalog_to_batch_tables(catalog: &HashMap<String, PathBuf>) -> Vec<BatchS
         .map(|(table, path)| BatchSqlTable {
             table_name: table.clone(),
             path: path.clone(),
+            ..Default::default()
         })
         .collect()
 }
@@ -390,6 +391,7 @@ mod tests {
             &[BatchSqlTable {
                 table_name: "t".into(),
                 path: PathBuf::from("/data/t.parquet"),
+                ..Default::default()
             }],
         );
         let (directives, query) = parse_sql(&sql);
@@ -412,10 +414,12 @@ mod tests {
                 BatchSqlTable {
                     table_name: "t1".into(),
                     path: PathBuf::from("/data/t1.parquet"),
+                    ..Default::default()
                 },
                 BatchSqlTable {
                     table_name: "t2".into(),
                     path: PathBuf::from("/data/t2.parquet"),
+                    ..Default::default()
                 },
             ],
         );
@@ -431,6 +435,7 @@ mod tests {
             &[BatchSqlTable {
                 table_name: "t".into(),
                 path: PathBuf::from("/my data/my table.parquet"),
+                ..Default::default()
             }],
         );
         let (directives, _) = parse_sql(&sql);

@@ -18,7 +18,13 @@ use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 
+use crate::barrier_align::{BarrierAligner, BarrierEvent};
 use crate::interval_join::{IntervalJoinSpec, PerKeyIntervalJoin};
+
+/// The left input's index for the join's [`BarrierAligner`].
+pub const JOIN_LEFT_INPUT: usize = 0;
+/// The right input's index for the join's [`BarrierAligner`].
+pub const JOIN_RIGHT_INPUT: usize = 1;
 
 // ── Spec ──────────────────────────────────────────────────────────────────────
 
@@ -61,6 +67,12 @@ pub struct WatermarkWindowJoinOperator {
     spec: WatermarkWindowJoinSpec,
     join: PerKeyIntervalJoin,
     watermark_ms: i64,
+    /// Two-input checkpoint-barrier alignment (left = 0, right = 1).
+    aligner: BarrierAligner,
+    /// Post-barrier batches held on a blocked side until the epoch aligns; they
+    /// belong to the next epoch and are replayed after the snapshot.
+    left_buffer: Vec<RecordBatch>,
+    right_buffer: Vec<RecordBatch>,
 }
 
 impl WatermarkWindowJoinOperator {
@@ -75,20 +87,69 @@ impl WatermarkWindowJoinOperator {
             spec,
             join: PerKeyIntervalJoin::new(interval),
             watermark_ms: i64::MIN,
+            aligner: BarrierAligner::new(2),
+            left_buffer: Vec::new(),
+            right_buffer: Vec::new(),
         }
     }
 
     /// Process a batch from the left stream.
     ///
     /// Each row is matched against the right-side buffer for the same key.
-    /// Returns joined `RecordBatch` rows (left columns ∥ right columns).
+    /// Returns joined `RecordBatch` rows (left columns ∥ right columns). While
+    /// the left input is barrier-blocked (it has delivered an epoch's barrier the
+    /// right input has not yet matched), the batch is held for replay after the
+    /// snapshot rather than folded into the in-progress epoch.
     pub fn process_left(&mut self, batch: &RecordBatch) -> Vec<RecordBatch> {
+        if self.aligner.is_blocked(JOIN_LEFT_INPUT) {
+            self.left_buffer.push(batch.clone());
+            return Vec::new();
+        }
         self.process_side(batch, &self.spec.left_key_column.clone(), true)
     }
 
     /// Process a batch from the right stream.
     pub fn process_right(&mut self, batch: &RecordBatch) -> Vec<RecordBatch> {
+        if self.aligner.is_blocked(JOIN_RIGHT_INPUT) {
+            self.right_buffer.push(batch.clone());
+            return Vec::new();
+        }
         self.process_side(batch, &self.spec.right_key_column.clone(), false)
+    }
+
+    /// Record the checkpoint barrier for `epoch` on the **left** input.
+    ///
+    /// Returns [`BarrierEvent::Aligned`] once the right input has also delivered
+    /// the epoch's barrier — the operator should snapshot then, and replay any
+    /// buffered input via [`take_realigned_input`](Self::take_realigned_input).
+    pub fn record_left_barrier(&mut self, epoch: u64) -> BarrierEvent {
+        self.aligner.record_barrier(epoch, JOIN_LEFT_INPUT)
+    }
+
+    /// Record the checkpoint barrier for `epoch` on the **right** input.
+    pub fn record_right_barrier(&mut self, epoch: u64) -> BarrierEvent {
+        self.aligner.record_barrier(epoch, JOIN_RIGHT_INPUT)
+    }
+
+    /// Whether the left input is currently barrier-blocked (buffering for the
+    /// next epoch).
+    pub fn is_left_blocked(&self) -> bool {
+        self.aligner.is_blocked(JOIN_LEFT_INPUT)
+    }
+
+    /// Whether the right input is currently barrier-blocked.
+    pub fn is_right_blocked(&self) -> bool {
+        self.aligner.is_blocked(JOIN_RIGHT_INPUT)
+    }
+
+    /// Drain the `(left, right)` batches buffered during alignment so the caller
+    /// can replay them into the post-snapshot epoch. Call after an
+    /// [`BarrierEvent::Aligned`] and the snapshot.
+    pub fn take_realigned_input(&mut self) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
+        (
+            std::mem::take(&mut self.left_buffer),
+            std::mem::take(&mut self.right_buffer),
+        )
     }
 
     /// Advance the watermark.  State older than `watermark_ms − window_ms` is
@@ -298,6 +359,45 @@ mod tests {
         assert_eq!(out.len(), 1, "right event within 500ms should match left");
         // Joined batch must have columns from both sides (id, ts, val from left + id, ts, val from right = 6 cols).
         assert_eq!(out[0].num_columns(), 6);
+    }
+
+    #[test]
+    fn barrier_alignment_buffers_blocked_side_until_aligned() {
+        use crate::barrier_align::BarrierEvent;
+        let mut op = WatermarkWindowJoinOperator::new(make_spec(500));
+
+        // Left delivers the epoch-1 barrier first → it blocks; right still flows.
+        assert_eq!(op.record_left_barrier(1), BarrierEvent::Blocked);
+        assert!(op.is_left_blocked());
+        assert!(!op.is_right_blocked());
+
+        // A left batch arriving after its barrier is held for the next epoch,
+        // not folded into the in-progress (about-to-snapshot) one.
+        let held = op.process_left(&batch_with_key_and_ts("k", 1000, 1));
+        assert!(
+            held.is_empty(),
+            "post-barrier left input is buffered, not joined"
+        );
+        let r = op.process_right(&batch_with_key_and_ts("k", 1100, 2));
+        assert!(r.is_empty(), "no left state this epoch — it was buffered");
+
+        // Right delivers its barrier → the epoch aligns: snapshot now.
+        assert_eq!(op.record_right_barrier(1), BarrierEvent::Aligned);
+        assert!(!op.is_left_blocked() && !op.is_right_blocked());
+
+        // The buffered left batch is handed back for replay into the next epoch.
+        let (left_replay, right_replay) = op.take_realigned_input();
+        assert_eq!(left_replay.len(), 1, "the held left batch is replayed");
+        assert!(right_replay.is_empty());
+
+        // Replaying the held left event now joins against the right event that
+        // was processed (unblocked) during alignment — proving no data was lost.
+        let joined = op.process_left(&left_replay[0]);
+        assert_eq!(
+            joined.len(),
+            1,
+            "replayed left matches the right event from the aligned epoch"
+        );
     }
 
     #[test]

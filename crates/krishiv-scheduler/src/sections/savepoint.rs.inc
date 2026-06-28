@@ -95,6 +95,9 @@ fn write_scheduler_restore_epoch(
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
+        unaligned_buffer_refs: Vec::new(),
+        sink_transactions: Vec::new(),
+        streaming_profile: None,
     };
     write_scheduler_restore_metadata(storage, job_id, epoch, &meta);
 }
@@ -145,6 +148,9 @@ fn coordinator_restore_rejects_hash_mismatched_epoch() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
+        unaligned_buffer_refs: Vec::new(),
+        sink_transactions: Vec::new(),
+        streaming_profile: None,
     };
     storage
         .write_bytes(
@@ -180,6 +186,9 @@ fn coordinator_restore_rejects_metadata_identity_mismatch() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
+        unaligned_buffer_refs: Vec::new(),
+        sink_transactions: Vec::new(),
+        streaming_profile: None,
     };
     write_scheduler_restore_metadata(&storage, job_id.as_str(), 1, &mismatched);
 
@@ -211,6 +220,9 @@ fn coordinator_restore_rejects_incompatible_metadata_version() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
+        unaligned_buffer_refs: Vec::new(),
+        sink_transactions: Vec::new(),
+        streaming_profile: None,
     };
     write_scheduler_restore_metadata(&storage, job_id.as_str(), 1, &incompatible);
 
@@ -255,6 +267,9 @@ fn restore_activation_does_not_prune_when_metadata_identity_is_invalid() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
+        unaligned_buffer_refs: Vec::new(),
+        sink_transactions: Vec::new(),
+        streaming_profile: None,
     };
     write_scheduler_restore_metadata(&storage, job_id.as_str(), 1, &mismatched);
     write_scheduler_restore_epoch(&storage, job_id.as_str(), 2, 1);

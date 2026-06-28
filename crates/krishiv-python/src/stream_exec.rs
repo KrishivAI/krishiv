@@ -150,6 +150,7 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
         window_size_ms: window.size_ms,
         agg_exprs,
         state_ttl_ms,
+        allowed_lateness_ms: None,
         source_watermark_lags,
         source_id_column,
         window_timezone: None,

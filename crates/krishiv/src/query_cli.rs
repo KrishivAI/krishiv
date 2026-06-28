@@ -30,6 +30,9 @@ pub struct QueryCommand {
     pub api_key: Option<String>,
     #[allow(dead_code)] // parsed; wired to session timeout in a follow-up
     pub timeout_secs: Option<u64>,
+    /// Remote coordinator (Flight) URL from the global `-c/--coordinator` flag.
+    /// Takes precedence over `KRISHIV_COORDINATOR`; `None` ⇒ env fallback.
+    pub coordinator_url: Option<String>,
 }
 
 pub fn sql_help() -> String {
@@ -161,22 +164,27 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
         execution,
         api_key,
         timeout_secs,
+        coordinator_url: None,
     })
 }
 
 pub fn build_session(command: &QueryCommand) -> Result<Session, String> {
     let mut builder = Session::builder().with_execution_mode(command.mode);
+    // The explicit `-c/--coordinator` flag wins over the `KRISHIV_COORDINATOR` env var.
+    let coordinator = command
+        .coordinator_url
+        .clone()
+        .or_else(|| std::env::var("KRISHIV_COORDINATOR").ok())
+        .filter(|url| !url.trim().is_empty());
     if command.mode == ExecutionMode::SingleNode
-        && let Ok(url) = std::env::var("KRISHIV_COORDINATOR")
-        && !url.trim().is_empty()
+        && let Some(url) = coordinator.clone()
     {
         builder = builder.with_local_cluster(url);
     }
     if (command.mode == ExecutionMode::Distributed || command.execution == QueryExecution::Remote)
-        && let Ok(url) = std::env::var("KRISHIV_COORDINATOR")
-        && !url.trim().is_empty()
+        && let Some(url) = coordinator.clone()
     {
-        builder = builder.with_coordinator(url.clone());
+        builder = builder.with_coordinator(url);
         if command.execution == QueryExecution::Remote {
             builder = builder.with_remote_execution(true);
         }

@@ -29,6 +29,7 @@ pub struct SessionBuilder {
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
     coordinator_url: Option<String>,
+    coordinator_http_url: Option<String>,
     local_cluster_grpc: Option<String>,
     state_ttl: Option<StateTtlConfig>,
     target_parallelism: Option<std::num::NonZeroUsize>,
@@ -84,6 +85,7 @@ impl Default for SessionBuilder {
             auth: None,
             policy: None,
             coordinator_url: None,
+            coordinator_http_url: None,
             local_cluster_grpc: None,
             state_ttl: None,
             target_parallelism: None,
@@ -313,6 +315,19 @@ impl SessionBuilder {
         self
     }
 
+    /// Configure the coordinator's **HTTP** base URL (e.g. `"http://coordinator:2002"`).
+    ///
+    /// This is where management endpoints live — notably distributed incremental
+    /// view maintenance (`/api/v1/ivm/*`). It is a *different* port from the Arrow
+    /// Flight data endpoint set by [`with_coordinator`](Self::with_coordinator).
+    /// When unset, [`Session::ivm`](Session::ivm) falls back to the Flight URL for
+    /// backward compatibility with single-port/local setups.
+    #[must_use]
+    pub fn with_coordinator_http(mut self, url: impl Into<String>) -> Self {
+        self.coordinator_http_url = Some(url.into());
+        self
+    }
+
     /// Connect a [`ExecutionMode::SingleNode`] session to a local cluster without
     /// switching to distributed mode (Spark-like `local[*]` client).
     #[must_use]
@@ -522,6 +537,7 @@ impl SessionBuilder {
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: self.coordinator_url,
+            coordinator_http_url: self.coordinator_http_url,
             coordinator_grpc_url: self.local_cluster_grpc,
             state_ttl: self.state_ttl,
             memory_streams: Arc::new(DashMap::new()),
@@ -548,6 +564,7 @@ pub struct Session {
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
     pub(crate) coordinator_url: Option<String>,
+    pub(crate) coordinator_http_url: Option<String>,
     coordinator_grpc_url: Option<String>,
     state_ttl: Option<StateTtlConfig>,
     memory_streams: Arc<DashMap<String, Vec<RecordBatch>>>,
@@ -1371,6 +1388,169 @@ impl Session {
 
     // ── Unified compute entry points ──────────────────────────────────────────
 
+    /// Submit a [`CompiledJob`](crate::CompiledJob) to its engine — the single
+    /// unified entry point behind the three engines.
+    ///
+    /// Every front-end (SQL, Python, Rust) compiles to one `CompiledJob` and
+    /// reaches the engines the same way: this dispatches by the job's explicit
+    /// [`EngineKind`](crate::EngineKind) through [`run_job`](crate::run_job),
+    /// with placement-provided sources and sinks. Engine selection is the job's,
+    /// never the API surface's.
+    ///
+    /// Embedded placement is wired today: sources and sinks bind to the real
+    /// `parquet` file connectors (see
+    /// [`connector_runtime`](crate::connector_runtime)). Single-node and
+    /// distributed placement return a typed [`KrishivError::Unsupported`] — those
+    /// providers are the Phase 2 increment.
+    pub async fn submit(&self, job: crate::CompiledJob) -> Result<crate::JobHandle> {
+        match self.mode {
+            ExecutionMode::Embedded => {
+                // The incremental engine emits retractions; its connector sink
+                // consolidates them into the net table (append-only file sinks
+                // cannot apply a delete). Batch/streaming emit insert-only output.
+                let runtime = if job.engine == crate::EngineKind::Incremental {
+                    crate::connector_runtime::embedded_consolidating_runtime()
+                } else {
+                    crate::connector_runtime::embedded_connector_runtime()
+                };
+                crate::run_job(job, runtime)
+                    .await
+                    .map_err(KrishivError::from)
+            }
+            // Batch at single-node / distributed runs through this session's real
+            // `ExecutionRuntime` (in-process cluster or remote coordinator) via a
+            // placement-injected query executor — the engine code is unchanged.
+            ExecutionMode::SingleNode | ExecutionMode::Distributed
+                if job.engine == crate::EngineKind::Batch =>
+            {
+                let placement = match self.mode {
+                    ExecutionMode::SingleNode => krishiv_engine_core::Placement::SingleNode,
+                    _ => krishiv_engine_core::Placement::Distributed,
+                };
+                let runtime = crate::connector_runtime::runtime_backed_engine_runtime(
+                    placement,
+                    Arc::clone(&self.runtime),
+                );
+                crate::run_job(job, runtime)
+                    .await
+                    .map_err(KrishivError::from)
+            }
+            // Stateful engines (incremental / streaming) at single-node run
+            // in-process over connector-backed sources/sinks, but with durable
+            // (on-disk) checkpoints so operator state and source offsets survive a
+            // restart — the single-node daemon's defining difference from embedded.
+            ExecutionMode::SingleNode => {
+                // Incremental output consolidates retractions into the net table;
+                // streaming output is insert-only.
+                let consolidate = job.engine == crate::EngineKind::Incremental;
+                let runtime = crate::connector_runtime::durable_engine_runtime(
+                    krishiv_engine_core::Placement::SingleNode,
+                    self.checkpoint_dir(),
+                    consolidate,
+                )
+                .map_err(KrishivError::from)?;
+                crate::run_job(job, runtime)
+                    .await
+                    .map_err(KrishivError::from)
+            }
+            // Distributed *streaming*: drain the bounded source locally and run the
+            // window on the remote coordinator's executors through the continuous
+            // seam (register → push → drain), then write the closed windows to the
+            // sink. The windowed compute runs on executors; only I/O is local.
+            ExecutionMode::Distributed if job.engine == crate::EngineKind::Streaming => {
+                crate::connector_runtime::run_streaming_job_via_runtime(&self.runtime, &job)
+                    .await
+                    .map_err(KrishivError::from)
+            }
+            // Distributed *incremental*: maintain the view on the remote coordinator
+            // through a mode-aware `IvmJob` (the same one `Session::ivm` returns) —
+            // drain the bounded CDC source locally, feed/step the view on the
+            // cluster, and write its net snapshot to the sink.
+            ExecutionMode::Distributed if job.engine == crate::EngineKind::Incremental => {
+                let ivm = self.ivm(&job.name).await?;
+                crate::connector_runtime::run_incremental_job_via_ivm(&ivm, &job).await
+            }
+            // All three engines are routed above for distributed placement; this
+            // defensive arm covers any future `EngineKind`.
+            ExecutionMode::Distributed => Err(KrishivError::unsupported(format!(
+                "submit() does not yet route the distributed {} engine",
+                job.engine
+            ))),
+        }
+    }
+
+    /// Resolve the directory durable single-node checkpoints are written to.
+    ///
+    /// Precedence: the `checkpoint_dir` session property, then the
+    /// `KRISHIV_CHECKPOINT_DIR` environment variable, then a stable per-host
+    /// default under the system temp directory. Files are keyed by job id, so one
+    /// directory safely holds every job's latest checkpoint.
+    fn checkpoint_dir(&self) -> PathBuf {
+        if let Some(dir) = self.get_config("checkpoint_dir") {
+            return PathBuf::from(dir);
+        }
+        if let Ok(dir) = std::env::var("KRISHIV_CHECKPOINT_DIR") {
+            return PathBuf::from(dir);
+        }
+        std::env::temp_dir().join("krishiv-checkpoints")
+    }
+
+    /// Compile a SQL pipeline script to a [`CompiledJob`](crate::CompiledJob)
+    /// and [`submit`](Self::submit) it — the SQL front-end's unified entry.
+    ///
+    /// The script is a sequence of `CREATE SOURCE` / `CREATE SINK` statements
+    /// (see [`compile_sql_job`](crate::compile_sql_job)); the engine is inferred
+    /// from the declared connectors and whether the transform is windowed, then
+    /// dispatched the same way as every other front-end. Example:
+    ///
+    /// ```sql
+    /// CREATE SOURCE orders FROM parquet(path='/in.parquet');
+    /// CREATE SOURCE summary AS SELECT k, SUM(v) AS total FROM orders GROUP BY k;
+    /// CREATE SINK out FROM summary INTO parquet(path='/out.parquet');
+    /// ```
+    pub async fn submit_sql(&self, sql: &str) -> Result<crate::JobHandle> {
+        let job = crate::sql_job::compile_sql_job(sql)?;
+        self.submit(job).await
+    }
+
+    /// Submit a continuous, unbounded **streaming** job and return a stoppable
+    /// [`RunningJob`](crate::RunningJob).
+    ///
+    /// Unlike [`submit`](Self::submit) — which drains a bounded source once and
+    /// returns — this keeps draining the job's source on a background task,
+    /// emitting closed windows and checkpointing periodically, until
+    /// [`RunningJob::stop`](crate::RunningJob::stop) is called. Embedded
+    /// placement is wired today; single-node and distributed continuous
+    /// streaming is the cluster follow-up.
+    pub fn submit_streaming(&self, job: crate::CompiledJob) -> Result<crate::RunningJob> {
+        match self.mode {
+            ExecutionMode::Embedded => {
+                let runtime = crate::connector_runtime::embedded_connector_runtime();
+                crate::spawn_streaming_job(job, runtime).map_err(KrishivError::from)
+            }
+            // Single-node: run the continuous loop in-process but checkpoint
+            // durably to disk, so a restart resumes from the persisted state.
+            ExecutionMode::SingleNode => {
+                // Streaming output is insert-only: no changelog consolidation.
+                let runtime = crate::connector_runtime::durable_engine_runtime(
+                    krishiv_engine_core::Placement::SingleNode,
+                    self.checkpoint_dir(),
+                    false,
+                )
+                .map_err(KrishivError::from)?;
+                crate::spawn_streaming_job(job, runtime).map_err(KrishivError::from)
+            }
+            // Distributed continuous streaming is owned by the dedicated
+            // continuous-stream API, which routes to the remote coordinator.
+            ExecutionMode::Distributed => Err(KrishivError::unsupported(
+                "distributed continuous streaming is reached through Session::stream(name, spec) \
+                 with push_stream_job_input/poll_stream_job, which route to the remote \
+                 coordinator; submit_streaming() runs the in-process continuous loop \
+                 (embedded / single-node).",
+            )),
+        }
+    }
+
     /// Run a one-shot batch SQL query, returning a [`DataFrame`].
     ///
     /// This is an alias for [`sql`](Self::sql) that names the execution mode at
@@ -1388,7 +1568,7 @@ impl Session {
     pub async fn ivm(&self, name: &str) -> Result<crate::IvmJob> {
         match self.mode {
             ExecutionMode::Distributed => {
-                let url = self.coordinator_url.as_deref().ok_or_else(|| {
+                let url = self.ivm_http_url().ok_or_else(|| {
                     KrishivError::unsupported(
                         "distributed IVM requires a coordinator URL; call with_coordinator()",
                     )
@@ -1399,6 +1579,15 @@ impl Session {
                 crate::IvmJob::embedded(&self.ivm_registry, name)
             }
         }
+    }
+
+    /// Resolve the coordinator **HTTP** base for management endpoints (IVM lives
+    /// at `/api/v1/ivm/*`). Prefer the explicit HTTP URL; fall back to the Flight
+    /// URL for single-port/local setups where they coincide.
+    pub(crate) fn ivm_http_url(&self) -> Option<&str> {
+        self.coordinator_http_url
+            .as_deref()
+            .or(self.coordinator_url.as_deref())
     }
 
     /// Submit a continuous windowed streaming job and return a [`StreamJob`]
@@ -1995,6 +2184,31 @@ fn collect_pipeline_view_deps(
         ordered.push(view.to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod coordinator_url_tests {
+    use super::*;
+
+    #[test]
+    fn ivm_http_url_prefers_explicit_http_then_falls_back_to_flight() {
+        // Distributed IVM management lives on the coordinator HTTP port, which is
+        // distinct from the Flight data port. When set explicitly, it wins.
+        let s = SessionBuilder::new()
+            .with_coordinator("http://coord:2003")
+            .with_coordinator_http("http://coord:2002")
+            .build()
+            .expect("session builds");
+        assert_eq!(s.ivm_http_url(), Some("http://coord:2002"));
+
+        // Without an explicit HTTP URL, fall back to the Flight URL (single-port
+        // / local setups where they coincide).
+        let s = SessionBuilder::new()
+            .with_coordinator("http://coord:2003")
+            .build()
+            .expect("session builds");
+        assert_eq!(s.ivm_http_url(), Some("http://coord:2003"));
+    }
 }
 
 #[cfg(test)]

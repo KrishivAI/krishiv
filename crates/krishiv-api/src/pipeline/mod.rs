@@ -6,8 +6,14 @@
 //! logic** — the moment it reimplements `feed`/`step`, the unification we built
 //! is lost. The driver only calls existing Tier-1 methods.
 //!
-//! There is **no trigger stage**: boundedness ends a batch pipeline, the
-//! watermark drives streaming emit, and change-events drive IVM. The optional
+//! There is **no trigger stage**: boundedness ends a batch pipeline, unbounded
+//! appends drive continuous incremental maintenance, and change-events drive
+//! IVM. A declarative pipeline runs on the **incremental** engine
+//! ([`EngineKind::Incremental`](krishiv_engine_core::EngineKind)) for both its
+//! `Stream` and `Ivm` modes — it is not the event-time, watermark-driven
+//! dataflow engine. True Flink-style windowed streaming
+//! ([`EngineKind::Streaming`](krishiv_engine_core::EngineKind)) is reached
+//! through [`Session::stream`](crate::Session::stream). The optional
 //! [`RunPolicy`] only controls *coalescing* (how many input records per `step`),
 //! never *whether* to compute.
 //!
@@ -25,6 +31,7 @@ mod connector_factory;
 mod driver;
 mod sink;
 mod source;
+mod spine;
 
 pub(crate) use connector_factory::{build_sink, build_source};
 
@@ -148,20 +155,42 @@ impl Default for StreamingConfig {
 
 use std::sync::Arc;
 
+use krishiv_engine_core::EngineKind;
+
 use crate::{Result, Session};
 
 /// Which execution model a pipeline runs under.
 ///
 /// Inferred from the source kind unless set explicitly: CDC ⇒ `Ivm`,
 /// unbounded records ⇒ `Stream`, bounded records ⇒ `Batch`.
+///
+/// `Stream` and `Ivm` both run on the **incremental** engine
+/// ([`EngineKind::Incremental`]); see [`PipelineMode::engine_kind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineMode {
     /// Bounded input, run to completion once.
     Batch,
-    /// Unbounded input, watermark-driven.
+    /// Unbounded append-only input, maintained continuously by the incremental
+    /// engine. (This is *not* the event-time, watermark-driven dataflow engine —
+    /// that is [`EngineKind::Streaming`], reached via
+    /// [`Session::stream`](crate::Session::stream).)
     Stream,
     /// Change-driven incremental view maintenance.
     Ivm,
+}
+
+impl PipelineMode {
+    /// The engine-core [`EngineKind`] this pipeline mode runs on.
+    ///
+    /// `Batch` ⇒ [`EngineKind::Batch`]; both `Stream` and `Ivm` ⇒
+    /// [`EngineKind::Incremental`] — a declarative pipeline never lowers to the
+    /// event-time streaming engine.
+    pub fn engine_kind(self) -> EngineKind {
+        match self {
+            Self::Batch => EngineKind::Batch,
+            Self::Stream | Self::Ivm => EngineKind::Incremental,
+        }
+    }
 }
 
 /// A view (transformation) declared on a pipeline.
@@ -399,6 +428,12 @@ impl Pipeline {
         self.mode
     }
 
+    /// The engine-core [`EngineKind`] this pipeline runs on — the shared
+    /// vocabulary with the SQL/Python/Rust front-ends.
+    pub fn engine_kind(&self) -> EngineKind {
+        self.mode.engine_kind()
+    }
+
     /// Validate the pipeline without executing it (a "dry run", à la Spark SDP).
     ///
     /// Checks that every sink references a declared view, that each view's SQL
@@ -417,6 +452,13 @@ impl Pipeline {
     /// A named pipeline's IVM job persists across runs, so repeated runs feed new
     /// input **incrementally**. Use [`refresh`](Self::refresh) to reset first.
     pub async fn run(self, policy: RunPolicy) -> Result<()> {
+        // A single-view batch pipeline lowers onto the engine-core spine and runs
+        // through the same `run_job` dispatch as every other front-end; richer
+        // shapes (multi-view DAGs, expectations, the IVM/stream loop) stay on the
+        // driver.
+        if spine::is_spine_lowerable(&self) {
+            return spine::run_on_spine(self).await;
+        }
         match self.mode {
             PipelineMode::Ivm => driver::run_incremental(self, policy).await,
             PipelineMode::Batch => driver::run_batch(self).await,

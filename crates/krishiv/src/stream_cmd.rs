@@ -11,7 +11,7 @@ use krishiv_api::{
 use krishiv_common::async_util::block_on;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::cli::CliResponse;
+use crate::cli::{CliResponse, CoordinatorMode};
 
 pub fn stream_help() -> String {
     String::from(
@@ -42,15 +42,15 @@ pub fn stream_help() -> String {
     )
 }
 
-pub fn run_stream(args: &[&str]) -> CliResponse {
+pub fn run_stream(args: &[&str], coordinator: &CoordinatorMode) -> CliResponse {
     match args {
         [] | ["--help"] | ["-h"] => CliResponse::ok(format!("{}\n", stream_help())),
         ["submit", "--help"] | ["submit", "-h"] => {
             CliResponse::ok(format!("{}\n", stream_submit_help()))
         }
-        ["submit", rest @ ..] => run_stream_submit(rest),
-        ["push", rest @ ..] => run_stream_push(rest),
-        ["poll", rest @ ..] => run_stream_poll(rest),
+        ["submit", rest @ ..] => run_stream_submit(rest, coordinator),
+        ["push", rest @ ..] => run_stream_push(rest, coordinator),
+        ["poll", rest @ ..] => run_stream_poll(rest, coordinator),
         [unknown, ..] => CliResponse::err(
             format!("unknown stream subcommand: {unknown}\n\n{}", stream_help()),
             2,
@@ -64,18 +64,20 @@ fn stream_submit_help() -> &'static str {
      Usage: krishiv stream submit --job-id <ID> [OPTIONS]\n"
 }
 
-fn run_stream_submit(args: &[&str]) -> CliResponse {
+fn run_stream_submit(args: &[&str], coordinator: &CoordinatorMode) -> CliResponse {
     let spec = match parse_stream_submit(args) {
         Ok(s) => s,
         Err(e) => return CliResponse::err(format!("{e}\n\n{}", stream_submit_help()), 2),
     };
-    let session = match stream_session() {
+    let session = match stream_session(coordinator) {
         Ok(s) => s,
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),
     };
-    eprintln!(
-        "[local-mode] Stream job running in-process — state will be lost when this process exits."
-    );
+    if matches!(coordinator, CoordinatorMode::Local) {
+        eprintln!(
+            "[local-mode] Stream job running in-process — state will be lost when this process exits."
+        );
+    }
     match session.submit_stream_job(&spec.job_id, spec.window_spec) {
         Ok(id) => CliResponse::ok(format!(
             "Submitted continuous stream job {id} (window: {})\n",
@@ -85,7 +87,7 @@ fn run_stream_submit(args: &[&str]) -> CliResponse {
     }
 }
 
-fn run_stream_push(args: &[&str]) -> CliResponse {
+fn run_stream_push(args: &[&str], coordinator: &CoordinatorMode) -> CliResponse {
     let (job_id, path) = match parse_job_and_parquet(args) {
         Ok(v) => v,
         Err(e) => return CliResponse::err(format!("{e}\n\n{}", stream_help()), 2),
@@ -94,7 +96,7 @@ fn run_stream_push(args: &[&str]) -> CliResponse {
         Ok(b) => b,
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),
     };
-    let session = match stream_session() {
+    let session = match stream_session(coordinator) {
         Ok(s) => s,
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),
     };
@@ -107,12 +109,12 @@ fn run_stream_push(args: &[&str]) -> CliResponse {
     }
 }
 
-fn run_stream_poll(args: &[&str]) -> CliResponse {
+fn run_stream_poll(args: &[&str], coordinator: &CoordinatorMode) -> CliResponse {
     let job_id = match parse_job_id_only(args) {
         Ok(id) => id,
         Err(e) => return CliResponse::err(format!("{e}\n\n{}", stream_help()), 2),
     };
-    let session = match stream_session() {
+    let session = match stream_session(coordinator) {
         Ok(s) => s,
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),
     };
@@ -310,7 +312,19 @@ fn shared_stream_cluster() -> Arc<InProcessCluster> {
     }))
 }
 
-fn stream_session() -> Result<Session, krishiv_api::KrishivError> {
+/// Build the session the stream commands run against.
+///
+/// With a remote coordinator (the global `-c/--coordinator` flag or
+/// `KRISHIV_COORDINATOR`) the job is registered, fed, and drained on that
+/// coordinator's executors — durable across separate CLI invocations. Otherwise
+/// it runs in a per-process in-process cluster (state lost on exit).
+fn stream_session(coordinator: &CoordinatorMode) -> Result<Session, krishiv_api::KrishivError> {
+    if let CoordinatorMode::Remote(url) = coordinator {
+        return SessionBuilder::new()
+            .with_coordinator(url.clone())
+            .with_remote_execution(true)
+            .build();
+    }
     SessionBuilder::new()
         .with_in_process_cluster(shared_stream_cluster())
         .build()

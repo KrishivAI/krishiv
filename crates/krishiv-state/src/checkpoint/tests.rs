@@ -1574,7 +1574,7 @@ fn metadata_optional_fields_present_when_some() {
 #[test]
 fn metadata_version_window_is_published() {
     assert_eq!(CheckpointMetadata::MIN_SUPPORTED_VERSION, 1);
-    assert_eq!(CheckpointMetadata::VERSION, 2);
+    assert_eq!(CheckpointMetadata::VERSION, 3);
     let mut legacy = sample_metadata(1);
     legacy.version = 1;
     assert!(legacy.validate().is_ok());

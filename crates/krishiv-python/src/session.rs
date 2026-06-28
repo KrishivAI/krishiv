@@ -399,6 +399,59 @@ impl PySession {
         Ok(PyQueryHandle::new(handle))
     }
 
+    /// Submit a SQL pipeline script (``CREATE SOURCE`` / ``CREATE SINK``) through
+    /// the unified engine spine and return an :class:`EngineJobHandle`.
+    ///
+    /// The engine (batch / incremental / streaming) is inferred from the declared
+    /// connectors and whether the transform is windowed — the Python surface does
+    /// not pick the engine, exactly as the Rust and SQL front-ends do not. This
+    /// is the Python entry point to ``Session::submit_sql``::
+    ///
+    ///     handle = session.submit_sql(
+    ///         "CREATE SOURCE orders FROM parquet(path='/in.parquet');"
+    ///         "CREATE SINK out FROM orders INTO parquet(path='/out.parquet');"
+    ///     )
+    ///     print(handle.status)  # "completed"
+    pub fn submit_sql(
+        &self,
+        py: Python<'_>,
+        sql: String,
+    ) -> PyResult<crate::engine_job::PyEngineJobHandle> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            block_on_async(inner.submit_sql(&sql))
+                .map(crate::engine_job::PyEngineJobHandle::from_handle)
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Submit a continuous, unbounded **streaming** SQL pipeline and return a
+    /// stoppable :class:`RunningJob`.
+    ///
+    /// The script's windowed transform infers the streaming engine; the job
+    /// keeps draining its source on a background task — emitting closed windows
+    /// and checkpointing — until ``handle.stop()`` is called. This is the Python
+    /// entry point to ``Session::submit_streaming``::
+    ///
+    ///     handle = session.submit_streaming_sql(script)
+    ///     ...                      # job runs continuously
+    ///     status = handle.stop()   # "completed"
+    pub fn submit_streaming_sql(
+        &self,
+        py: Python<'_>,
+        sql: String,
+    ) -> PyResult<crate::engine_job::PyRunningJob> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            block_on_async(async move {
+                let job = krishiv_api::compile_sql_job(&sql)?;
+                inner.submit_streaming(job)
+            })
+            .map(crate::engine_job::PyRunningJob::from_running)
+            .map_err(map_krishiv_error)
+        })
+    }
+
     pub fn read_parquet(&self, py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
         let inner = self.inner.clone();
         py.detach(move || {
@@ -505,10 +558,12 @@ impl PySession {
         &self,
         py: Python<'_>,
         name: String,
-        df: PyDataFrame,
+        df: &PyDataFrame,
     ) -> PyResult<()> {
+        let inner_df = df.inner.clone();
         let batches = py.detach(|| {
-            krishiv_common::async_util::block_on(df.inner.collect_async())
+            krishiv_common::async_util::block_on(inner_df.collect_async())
+                .map(|result| result.into_batches())
                 .map_err(map_krishiv_error)
         })?;
         let inner = self.inner.clone();
@@ -657,17 +712,19 @@ impl PySession {
         })
     }
 
-    /// Execute SQL async with a timeout.
-    pub async fn sql_with_timeout_async(
+    /// Compatibility entry point for SQL execution with a timeout.
+    ///
+    /// Like [`sql_async`](Self::sql_async), this is a blocking native method that
+    /// the public Python package wraps in a coroutine, rather than a PyO3 native
+    /// `async fn` (whose future would have to be `Send`). It runs the query
+    /// off-GIL via [`sql_with_timeout`](Self::sql_with_timeout).
+    pub fn sql_with_timeout_async(
         &self,
+        py: Python<'_>,
         query: String,
         timeout_ms: u64,
     ) -> PyResult<PyDataFrame> {
-        self.inner
-            .sql_with_timeout_async(&query, timeout_ms)
-            .await
-            .map(|df| PyDataFrame { inner: df })
-            .map_err(map_krishiv_error)
+        self.sql_with_timeout(py, query, timeout_ms)
     }
 
     /// Create an :class:`OperationRegistry` tied to this session for operation-level cancellation.

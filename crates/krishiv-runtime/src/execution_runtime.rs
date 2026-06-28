@@ -284,6 +284,39 @@ fn tables_to_batch_sql(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> 
         .map(|t| BatchSqlTable {
             table_name: t.table_name.clone(),
             path: t.path.clone(),
+            ipc_b64: String::new(),
+        })
+        .collect()
+}
+
+/// Like [`tables_to_batch_sql`], but also reads each table's parquet file into
+/// base64 Arrow-IPC and ships it in-band.
+///
+/// Used by the distributed remote path: executors run in separate pods and do
+/// not share the client's filesystem, so the table data must travel with the
+/// request. If a file cannot be read (e.g. it lives on a filesystem the
+/// coordinator *does* share), the entry degrades to path-based resolution.
+fn tables_to_batch_sql_inline(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> {
+    tables
+        .iter()
+        .map(|t| {
+            let ipc_b64 = match crate::flight_protocol::parquet_file_to_ipc_b64(&t.path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        table = %t.table_name,
+                        path = %t.path.display(),
+                        error = %e,
+                        "could not inline parquet table; falling back to path-based resolution"
+                    );
+                    String::new()
+                }
+            };
+            BatchSqlTable {
+                table_name: t.table_name.clone(),
+                path: t.path.clone(),
+                ipc_b64,
+            }
         })
         .collect()
 }
@@ -612,8 +645,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
 
         Box::pin(async move {
             // Build the typed action; clone tables into the action body so we
-            // still have them for the SQL-comment fallback path below.
-            let batch_tables = tables_to_batch_sql(tables);
+            // still have them for the SQL-comment fallback path below. Inline the
+            // parquet data so executors in other pods need no shared filesystem.
+            let batch_tables = tables_to_batch_sql_inline(tables);
             let action = KrishivFlightAction::BatchSql(BatchSqlBody {
                 query: query.to_owned(),
                 tables: batch_tables.clone(),
@@ -649,7 +683,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         // write would silently degrade to an uncommitted path.
         let action = KrishivFlightAction::BatchSqlSink(BatchSqlSinkBody {
             query: query.to_owned(),
-            tables: tables_to_batch_sql(tables),
+            tables: tables_to_batch_sql_inline(tables),
             sink_contract: sink_contract.to_owned(),
         });
         block_on(async { self.pool.do_action(&action).await.map(|_| ()) })
@@ -841,11 +875,67 @@ mod tests {
 
     use super::{
         BatchTableRegistration, ClusterEndpoints, ExecutionPlacement, InProcessExecutionRuntime,
-        RuntimeMode, build_execution_runtime,
+        RuntimeMode, build_execution_runtime, tables_to_batch_sql, tables_to_batch_sql_inline,
     };
     use crate::ExecutionRuntime;
     use crate::InProcessCluster;
     use krishiv_plan::{ExecutionKind, PhysicalPlan};
+
+    #[test]
+    fn inline_batch_tables_ship_parquet_data_in_band() {
+        // The distributed remote path must inline each parquet table as Arrow IPC
+        // so executors in other pods need no shared filesystem. Path-only shipping
+        // (tables_to_batch_sql) leaves ipc_b64 empty; the inline variant fills it
+        // with bytes that decode back to the original rows.
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let regs = vec![BatchTableRegistration::new("t", path.clone())];
+
+        // Path-only: no data travels with the request.
+        let path_only = tables_to_batch_sql(&regs);
+        assert_eq!(path_only.len(), 1);
+        assert!(
+            path_only[0].ipc_b64.is_empty(),
+            "path-based shipping carries no inline data"
+        );
+
+        // Inline: the parquet is read and shipped as IPC.
+        let inline = tables_to_batch_sql_inline(&regs);
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].table_name, "t");
+        assert!(
+            !inline[0].ipc_b64.is_empty(),
+            "inline shipping must embed the parquet data as IPC"
+        );
+
+        // The inlined bytes decode back to the original three rows.
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(inline[0].ipc_b64.as_bytes())
+            .unwrap();
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+        let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(rows, 3, "decoded inline IPC must hold all original rows");
+    }
 
     #[test]
     fn distributed_runtime_preserves_flight_and_grpc_urls() {

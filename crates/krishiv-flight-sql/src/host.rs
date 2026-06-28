@@ -137,6 +137,7 @@ impl FlightExecutionHost {
             .map(|entry| krishiv_runtime::in_process::BatchSqlTable {
                 table_name: entry.key().clone(),
                 path: entry.value().clone(),
+                ..Default::default()
             })
             .collect()
     }

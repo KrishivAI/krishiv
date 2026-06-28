@@ -156,10 +156,30 @@ impl ExecutorRegistry {
 
     /// Advance the deterministic heartbeat clock.
     pub fn advance_clock(&mut self, ticks: u64) -> Vec<ExecutorId> {
+        // `HashSet::new()` does not allocate until first insertion, so delegating
+        // with an empty protected set is free on this hot path.
+        self.advance_clock_excluding(ticks, &std::collections::HashSet::new())
+    }
+
+    /// Advance the heartbeat clock, but never evict an executor whose id is in
+    /// `protected`.
+    ///
+    /// Recovery uses this to give streaming executors owning running tasks the
+    /// re-attach grace window instead of tearing them down immediately (P1.23):
+    /// the clock still advances, so a protected executor is evicted on a later
+    /// grace-aware tick if it never re-registers.
+    pub fn advance_clock_excluding(
+        &mut self,
+        ticks: u64,
+        protected: &std::collections::HashSet<ExecutorId>,
+    ) -> Vec<ExecutorId> {
         self.current_tick = self.current_tick.saturating_add(ticks);
         let mut lost = Vec::new();
 
         for executor in self.executors.values_mut() {
+            if protected.contains(executor.executor_id()) {
+                continue;
+            }
             if executor.state().can_accept_work()
                 && self
                     .current_tick

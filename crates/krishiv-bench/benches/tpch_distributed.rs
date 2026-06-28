@@ -66,6 +66,7 @@ fn bench_distributed_query(
                     .map(|table| BatchSqlTable {
                         table_name: (*table).to_string(),
                         path: PathBuf::from(format!("{dir}/{table}.parquet")),
+                        ..Default::default()
                     })
                     .collect();
                 let _ = cluster.collect_batch_sql(query, &registrations, false);

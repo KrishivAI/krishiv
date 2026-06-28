@@ -922,7 +922,7 @@ impl krishiv_plan::udf::CoGroupUdf for PythonCoGroupMapUdf {
                 })?;
 
             // Expect a list of RecordBatches back.
-            let py_list = result.downcast_bound::<PyList>(py).map_err(|_| {
+            let py_list = result.bind(py).cast::<PyList>().map_err(|_| {
                 krishiv_plan::udf::UdfError::Execution {
                     message: "co_group callable must return a list[pyarrow.RecordBatch]".into(),
                 }
@@ -1023,7 +1023,7 @@ impl krishiv_plan::udf::MapPandasIterUdf for PythonMapPandasIterUdf {
                 }
             })?;
 
-            let py_list = result.downcast_bound::<PyList>(py).map_err(|_| {
+            let py_list = result.bind(py).cast::<PyList>().map_err(|_| {
                 krishiv_plan::udf::UdfError::Execution {
                     message: "map_pandas_iter callable must return a list[pyarrow.RecordBatch]"
                         .into(),

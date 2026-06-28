@@ -3,6 +3,7 @@
 mod cli;
 mod cluster_cmd;
 mod daemon_cmd;
+mod ivm_cmd;
 mod local_cluster;
 mod pipeline_cmd;
 mod process_util;

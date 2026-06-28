@@ -123,6 +123,7 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["stream"] | ["stream", "--help"] | ["stream", "-h"] => {
             CliResponse::ok(crate::stream_cmd::stream_help())
         }
+        ["ivm"] | ["ivm", "--help"] | ["ivm", "-h"] => CliResponse::ok(crate::ivm_cmd::ivm_help()),
         ["table"] | ["table", "--help"] | ["table", "-h"] => {
             CliResponse::ok(crate::table_cmd::table_help())
         }
@@ -174,9 +175,10 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
             ),
             2,
         ),
-        ["sql", rest @ ..] => run_sql(rest),
+        ["sql", rest @ ..] => run_sql(rest, &coordinator_mode),
         ["explain", rest @ ..] => run_explain(rest),
-        ["stream", rest @ ..] => crate::stream_cmd::run_stream(rest),
+        ["stream", rest @ ..] => crate::stream_cmd::run_stream(rest, &coordinator_mode),
+        ["ivm", rest @ ..] => crate::ivm_cmd::run_ivm(rest, &coordinator_mode),
         ["table", rest @ ..] => crate::table_cmd::run_table(rest),
         ["submit", rest @ ..] => run_submit(rest),
         ["jobs", rest @ ..] => run_jobs(rest),
@@ -255,13 +257,16 @@ pub fn jobs_help() -> String {
     )
 }
 
-fn run_sql(args: &[&str]) -> CliResponse {
-    let command = match crate::query_cli::parse_query_command(args) {
+fn run_sql(args: &[&str], coordinator: &CoordinatorMode) -> CliResponse {
+    let mut command = match crate::query_cli::parse_query_command(args) {
         Ok(command) => command,
         Err(message) => {
             return CliResponse::err(format!("{message}\n\n{}", crate::query_cli::sql_help()), 2);
         }
     };
+    if let CoordinatorMode::Remote(url) = coordinator {
+        command.coordinator_url = Some(url.clone());
+    }
     crate::query_cli::run_sql(&command)
 }
 
@@ -1514,6 +1519,28 @@ mod tests {
                 || combined.contains("Coordinator")
                 || combined.contains("remote coordinator error"),
             "expected coordinator URL or remote error in output, got: {combined:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_sql_remote_honors_coordinator_flag() {
+        // Regression: the global `-c/--coordinator` flag must reach the `sql`
+        // subcommand. With no server at coord:7070 the remote query fails, but it
+        // must fail on the connection — NOT with the "execute_remote requires
+        // SessionBuilder::with_coordinator(...)" error that means the flag was
+        // dropped and no coordinator was wired at all.
+        let response = dispatch(&[
+            "--coordinator",
+            "http://coord:7070",
+            "sql",
+            "--remote",
+            "--query",
+            "select 1",
+        ]);
+        let combined = format!("{} {}", response.stdout, response.stderr);
+        assert!(
+            !combined.contains("requires SessionBuilder::with_coordinator"),
+            "global -c flag was not threaded into `sql --remote`: {combined:?}"
         );
     }
 

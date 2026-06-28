@@ -157,10 +157,12 @@ async fn cluster_register_tables_join_query() {
         BatchSqlTable {
             table_name: "users".into(),
             path: users_path,
+            ..Default::default()
         },
         BatchSqlTable {
             table_name: "orders".into(),
             path: orders_path,
+            ..Default::default()
         },
     ];
 
@@ -350,6 +352,7 @@ async fn distributed_batch_plan_execute_verify() {
     let tables = vec![BatchSqlTable {
         table_name: "batch_table".into(),
         path: parquet_path,
+        ..Default::default()
     }];
 
     let result = cluster

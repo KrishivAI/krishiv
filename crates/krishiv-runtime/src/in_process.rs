@@ -46,10 +46,19 @@ fn next_cluster_suffix() -> u64 {
 }
 
 /// Parquet table registration forwarded to executor SQL tasks.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// `path` is the client-local file path; it is sufficient on a single host where
+/// the executor shares the filesystem. For multi-node clusters the client also
+/// inlines the table as base64 Arrow-IPC in `ipc_b64`, so executors on other
+/// pods receive the data in-band without any shared filesystem.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct BatchSqlTable {
     pub table_name: String,
     pub path: PathBuf,
+    /// Base64-encoded Arrow IPC stream for the table, or empty for path-based
+    /// (shared-filesystem) resolution. Populated by the distributed remote path.
+    #[serde(default)]
+    pub ipc_b64: String,
 }
 
 struct RegistryDrainer(Arc<ContinuousStreamRegistry>);
@@ -949,6 +958,7 @@ mod tests {
         let tables = vec![BatchSqlTable {
             table_name: "nonexistent".into(),
             path: PathBuf::from("/no/such/file.parquet"),
+            ipc_b64: String::new(),
         }];
         // This may fail because file doesn't exist but the routing path is tested
         let result = runtime.execute_batch_sql("SELECT 1", &tables, false);

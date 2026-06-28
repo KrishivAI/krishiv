@@ -912,15 +912,6 @@ fn validate_output_mode_compatibility(
     }
 }
 
-/// Return a `format` value stored in `options` (e.g. `kafka`, `parquet`).
-#[cfg(test)]
-fn format_name_from_options(options: &std::collections::HashMap<String, String>) -> Option<&str> {
-    options
-        .get("format")
-        .map(String::as_str)
-        .or_else(|| options.get("sink").map(String::as_str))
-}
-
 #[cfg(test)]
 mod output_mode_compat_tests {
     use super::*;

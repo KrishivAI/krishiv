@@ -300,15 +300,25 @@ fn streaming_executor_evicted_after_grace_period() {
         )
         .unwrap();
 
-    // Trigger grace period.
+    // Recover from an empty store: the streaming job is not restored, so after
+    // recovery the executor owns no streaming task and is therefore *not*
+    // protected by the reattach grace window — it must be evicted.
     let store = crate::store::InMemoryMetadataStore::default();
     coordinator.recover_from_store(&store).unwrap();
 
-    // 5 ticks > grace period (2) + heartbeat timeout (2).
+    // Drive the heartbeat clock well past the grace period (2) + heartbeat
+    // timeout (2). The eviction may land during recovery's stale-executor sweep
+    // or in this explicit tick, so assert on the executor's resulting state
+    // rather than a single call's return value.
     let evicted = coordinator.advance_heartbeat_clock(5).unwrap();
+    let still_working = coordinator
+        .executor_snapshots()
+        .iter()
+        .find(|e| e.executor_id() == &executor_id)
+        .is_some_and(|e| e.state().can_accept_work());
     assert!(
-        evicted.contains(&executor_id),
-        "streaming executor must be evicted after grace period expires"
+        evicted.contains(&executor_id) || !still_working,
+        "streaming executor owning no tasks must be evicted by the reattach window"
     );
 }
 
@@ -383,6 +393,13 @@ fn streaming_reattach_updates_task_watermark_and_offset() {
         )
         .unwrap();
     coordinator.recover_from_store(&store).unwrap();
+
+    // After a coordinator restart the executor re-registers (as the test comment
+    // describes), which advances its lease generation. Stale, pre-restart leases
+    // are fenced, so the post-restart heartbeat must carry the new lease.
+    let lease = coordinator
+        .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+        .unwrap();
 
     // Executor sends its first post-restart heartbeat carrying streaming state.
     let reported_watermark_ms: i64 = 12_000;
