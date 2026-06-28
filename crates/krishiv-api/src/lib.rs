@@ -7,7 +7,9 @@
 pub mod blocking;
 pub mod catalog;
 pub mod compute;
+pub mod connector_runtime;
 pub mod dataframe;
+pub mod engines;
 pub mod error;
 pub mod expression;
 pub mod incremental_flow;
@@ -19,6 +21,7 @@ pub mod prepared;
 pub mod process;
 pub mod query;
 pub mod session;
+pub mod sql_job;
 pub mod stream;
 pub mod streaming_builder;
 pub mod streaming_dataframe;
@@ -44,6 +47,16 @@ pub use catalog::{
 pub use compute::{
     Checkpointable, EmbeddedStreamJob, FeedableJob, IvmJob, Job, JobKind, StepReport, StreamJob,
 };
+pub use connector_runtime::{
+    ConnectorSinkProvider, ConnectorSourceProvider, DebeziumCdcSourceProvider,
+    RuntimeQueryExecutor, durable_engine_runtime, embedded_connector_runtime,
+    embedded_consolidating_runtime, runtime_backed_engine_runtime,
+};
+pub use engines::{
+    BatchEngine, IncrementalEngine, RunningJob, StreamingEngine, run_job, spawn_streaming_job,
+};
+// The shared engine vocabulary — the same `EngineKind`/`CompiledJob` are used by
+// the SQL, Python, and Rust front-ends so engine selection never forks per API.
 pub use dataframe::{
     Boundedness, DataFrame, ExecutionResult, ExplainMode, GroupedDataFrame, GroupingSpec, JoinType,
     PivotValue, QueryExecutionStats,
@@ -63,6 +76,13 @@ pub use krishiv_connectors::{
     DatabaseIoOptions, FileLayout, FileSortDirection, KafkaIoOptions, SchemaEvolutionMode,
     SortField, WriteDistribution, WriteMode,
 };
+pub use krishiv_engine_core::{
+    ChangelogBatch, CompiledJob, ComputeEngine, DeliveryContract, EngineError, EngineKind,
+    EngineRuntime, JobHandle, Placement, QueryExecutor, RowKind, SinkSpec, SourceSpec, StatePolicy,
+};
+// Note: `krishiv_engine_core::JobStatus` is intentionally not re-exported at the
+// crate root — `krishiv_runtime::JobStatus` already occupies that name. Engine
+// job status is reached via [`JobHandle::status`].
 pub use pipeline::{
     CdcChange, Egress, Expectation, Ingest, OnViolation, Pipeline, PipelineBuilder, PipelineMode,
     RunPolicy, ViewDef,
@@ -71,6 +91,7 @@ pub use prepared::PreparedStatement;
 pub use process::{apply_async_io, apply_process_function};
 pub use query::{QueryCompletion, QueryHandle, QueryId, QueryProgress, QueryStatus};
 pub use session::{Session, SessionBuilder};
+pub use sql_job::compile_sql_job;
 pub use stream::{KeyedStream, Stream};
 pub use streaming_builder::{
     DataStreamReader, DataStreamWriter, ForeachBatchFn, KafkaTransactionalConfig,

@@ -216,17 +216,17 @@ fn local_agg_empty_group_min_max_avg_semantics() {
     let state = AggState::new(&exprs);
     // No updates → empty group.
     assert_eq!(
-        state.finalized_value(0, &exprs[0]),
+        state.finalized_value(0, &exprs[0]).unwrap(),
         i64::MAX,
         "Min on empty group should be i64::MAX"
     );
     assert_eq!(
-        state.finalized_value(1, &exprs[1]),
+        state.finalized_value(1, &exprs[1]).unwrap(),
         i64::MIN,
         "Max on empty group should be i64::MIN"
     );
     assert!(
-        state.finalized_avg(2).is_nan(),
+        state.finalized_avg(2).unwrap().is_nan(),
         "Avg on empty group should be NaN"
     );
 }

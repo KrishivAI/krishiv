@@ -163,6 +163,9 @@ fn checkpoint_coordinator_recover_finds_latest_epoch() {
             savepoint_label: None,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
+            unaligned_buffer_refs: Vec::new(),
+            sink_transactions: Vec::new(),
+            streaming_profile: None,
         };
         write_epoch_metadata(storage.as_ref(), "job-ck-recover", epoch, &meta).unwrap();
         let meta_json = serde_json::to_vec_pretty(&meta).unwrap();

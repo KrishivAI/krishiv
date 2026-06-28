@@ -111,6 +111,9 @@ mod phase3_recovery {
             savepoint_label: None,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
+            unaligned_buffer_refs: Vec::new(),
+            sink_transactions: Vec::new(),
+            streaming_profile: None,
         };
         let mut manifest = IntegrityManifest::new();
         manifest.insert_bytes(
@@ -729,7 +732,7 @@ mod phase3_recovery {
                 .initiate_checkpoint_for_job(
                 &InitiateCheckpointRequest {
                     job_id: JobId::try_new(job).unwrap(),
-                    epoch: 1,
+                    epoch,
                     fencing_token: FencingToken::initial(),
                     alignment: CheckpointAlignment::default(),
                 },

@@ -377,6 +377,7 @@ mod tests {
         let tables = vec![BatchSqlTable {
             table_name: "t".into(),
             path: PathBuf::from("/nonexistent.parquet"),
+            ..Default::default()
         }];
         let result = cluster.collect_batch_sql("SELECT 1", &tables, false);
         // May fail because file doesn't exist, but the routing works

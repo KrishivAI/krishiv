@@ -584,6 +584,91 @@ pub fn execute_window_join(
     Ok(out)
 }
 
+/// A typed event in a **barrier-aligned** join input stream.
+#[derive(Debug, Clone)]
+pub enum JoinStreamEvent {
+    /// A batch on the left input.
+    Left(RecordBatch),
+    /// A batch on the right input.
+    Right(RecordBatch),
+    /// The checkpoint barrier for `epoch` on the left input.
+    LeftBarrier(u64),
+    /// The checkpoint barrier for `epoch` on the right input.
+    RightBarrier(u64),
+    /// Advance the event-time watermark.
+    Watermark(i64),
+}
+
+/// The output of a barrier-aligned join run.
+#[derive(Debug, Default)]
+pub struct AlignedJoinOutput {
+    /// Joined rows emitted across all epochs (left cols ∥ right cols).
+    pub joined: Vec<RecordBatch>,
+    /// `(epoch, snapshot_bytes)` captured at each aligned checkpoint, in order.
+    pub snapshots: Vec<(u64, Vec<u8>)>,
+}
+
+/// Drive a windowed join continuously, taking a consistent snapshot each time a
+/// checkpoint barrier **aligns** across both inputs (Chandy–Lamport).
+///
+/// This is the multi-input counterpart of the single-operator continuous loop:
+/// the [`WatermarkWindowJoinOperator`]'s [`BarrierAligner`](crate::BarrierAligner)
+/// blocks the input that delivered a barrier first — buffering its post-barrier
+/// batches — until the other input's barrier arrives. On alignment the operator
+/// is snapshotted and the buffered batches are replayed into the next epoch, so
+/// no input is dropped or double-counted across the checkpoint boundary.
+pub fn execute_window_join_aligned(
+    spec: crate::watermark_join::WatermarkWindowJoinSpec,
+    events: impl IntoIterator<Item = JoinStreamEvent>,
+    final_watermark_ms: i64,
+) -> ExecResult<AlignedJoinOutput> {
+    use crate::BarrierEvent;
+    use crate::watermark_join::WatermarkWindowJoinOperator;
+
+    let mut op = WatermarkWindowJoinOperator::new(spec);
+    let mut out = AlignedJoinOutput::default();
+    for ev in events {
+        match ev {
+            JoinStreamEvent::Left(b) => out.joined.extend(op.process_left(&b)),
+            JoinStreamEvent::Right(b) => out.joined.extend(op.process_right(&b)),
+            JoinStreamEvent::Watermark(w) => op.advance_watermark(w),
+            JoinStreamEvent::LeftBarrier(epoch) => {
+                if op.record_left_barrier(epoch) == BarrierEvent::Aligned {
+                    snapshot_and_replay_join(&mut op, epoch, &mut out)?;
+                }
+            }
+            JoinStreamEvent::RightBarrier(epoch) => {
+                if op.record_right_barrier(epoch) == BarrierEvent::Aligned {
+                    snapshot_and_replay_join(&mut op, epoch, &mut out)?;
+                }
+            }
+        }
+    }
+    op.advance_watermark(final_watermark_ms);
+    Ok(out)
+}
+
+/// On an aligned epoch: snapshot the operator, then replay the inputs buffered
+/// while it was barrier-blocked into the post-snapshot epoch.
+fn snapshot_and_replay_join(
+    op: &mut crate::watermark_join::WatermarkWindowJoinOperator,
+    epoch: u64,
+    out: &mut AlignedJoinOutput,
+) -> ExecResult<()> {
+    let bytes = op
+        .snapshot_bytes()
+        .map_err(|e| ExecError::InvalidInput(format!("join checkpoint snapshot: {e}")))?;
+    out.snapshots.push((epoch, bytes));
+    let (left, right) = op.take_realigned_input();
+    for b in &left {
+        out.joined.extend(op.process_left(b));
+    }
+    for b in &right {
+        out.joined.extend(op.process_right(b));
+    }
+    Ok(())
+}
+
 /// Bridge enum matching the runtime local window kind (avoids circular deps).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalWindowKindBridge {
@@ -654,5 +739,70 @@ mod tests {
         .unwrap();
         let out = execute_bounded_window(vec![batch], &spec, None).expect("execute");
         assert!(!out.is_empty());
+    }
+
+    fn join_batch(id: &str, ts: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![id])) as _,
+                Arc::new(Int64Array::from(vec![ts])) as _,
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn aligned_join_snapshots_on_alignment_and_replays_without_loss() {
+        use crate::watermark_join::WatermarkWindowJoinSpec;
+        let spec = WatermarkWindowJoinSpec {
+            time_column: "ts".into(),
+            left_key_column: "id".into(),
+            right_key_column: "id".into(),
+            window_ms: 500,
+        };
+        // left k@1000; left barrier ep1 → left blocks; left k@1100 is buffered;
+        // right k@1200 (matches the in-epoch left k@1000); right barrier ep1 →
+        // aligns → snapshot + replay the buffered left k@1100 (matches right k@1200).
+        let events = vec![
+            JoinStreamEvent::Left(join_batch("k", 1000)),
+            JoinStreamEvent::LeftBarrier(1),
+            JoinStreamEvent::Left(join_batch("k", 1100)),
+            JoinStreamEvent::Right(join_batch("k", 1200)),
+            JoinStreamEvent::RightBarrier(1),
+        ];
+        let out = execute_window_join_aligned(spec, events, i64::MAX).expect("aligned join");
+
+        assert_eq!(out.snapshots.len(), 1, "exactly one aligned checkpoint");
+        assert_eq!(out.snapshots[0].0, 1, "the snapshot carries epoch 1");
+        assert!(!out.snapshots[0].1.is_empty(), "snapshot bytes captured");
+        let joined_rows: usize = out.joined.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            joined_rows, 2,
+            "both the in-epoch match and the replayed match are emitted"
+        );
+    }
+
+    #[test]
+    fn aligned_join_with_no_barriers_matches_one_shot() {
+        use crate::watermark_join::WatermarkWindowJoinSpec;
+        let spec = WatermarkWindowJoinSpec {
+            time_column: "ts".into(),
+            left_key_column: "id".into(),
+            right_key_column: "id".into(),
+            window_ms: 500,
+        };
+        let events = vec![
+            JoinStreamEvent::Left(join_batch("k", 1000)),
+            JoinStreamEvent::Right(join_batch("k", 1200)),
+        ];
+        let out = execute_window_join_aligned(spec, events, i64::MAX).expect("aligned join");
+        assert!(out.snapshots.is_empty(), "no barriers ⇒ no checkpoints");
+        let joined_rows: usize = out.joined.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(joined_rows, 1, "the single match is emitted");
     }
 }

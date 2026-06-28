@@ -12,6 +12,7 @@ pub mod arrow_fast;
 mod batch;
 mod blocking_session;
 mod dataframe;
+mod engine_job;
 mod errors;
 mod expression;
 mod incremental;
@@ -45,6 +46,7 @@ mod vector_sinks;
 pub use agg::PyAggExpr;
 pub use batch::PyBatch;
 pub use dataframe::{PyDataFrame, PyGroupedDataFrame};
+pub use engine_job::{PyEngineJobHandle, PyRunningJob};
 pub use errors::{
     AuthorizationError, CheckpointError, ConnectorError, KrishivError, ModeError, QueryError,
     SchemaError, UdfError,
@@ -109,6 +111,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<dataframe::PyGroupedDataFrame>()?;
     m.add_class::<dataframe::PyDataFrameStream>()?;
     m.add_class::<query_handle::PyQueryHandle>()?;
+    m.add_class::<engine_job::PyEngineJobHandle>()?;
+    m.add_class::<engine_job::PyRunningJob>()?;
     m.add_class::<stream::PyStream>()?;
     m.add_class::<stream::PyKeyedStream>()?;
     m.add_class::<stream::PyWindowedStream>()?;

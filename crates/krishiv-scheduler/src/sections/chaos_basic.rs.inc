@@ -172,6 +172,9 @@ fn chaos_4_corrupt_checkpoint_fallback_to_prior_valid_epoch() {
             savepoint_label: None,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
+            unaligned_buffer_refs: Vec::new(),
+            sink_transactions: Vec::new(),
+            streaming_profile: None,
         };
         let storage_dyn: &dyn CheckpointStorage = storage;
         write_epoch_metadata(storage_dyn, job_id, epoch, &meta).unwrap();

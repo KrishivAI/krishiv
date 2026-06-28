@@ -487,6 +487,9 @@ fn rescaled_restore_redistributes_state_across_new_parallelism() {
         savepoint_label: None,
         iceberg_snapshot_id: None,
         kafka_offsets: None,
+        unaligned_buffer_refs: Vec::new(),
+        sink_transactions: Vec::new(),
+        streaming_profile: None,
     };
     let mut manifest = IntegrityManifest::new();
     manifest.insert_bytes("metadata.json", &serde_json::to_vec_pretty(&meta).unwrap());

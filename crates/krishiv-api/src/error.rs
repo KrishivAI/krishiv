@@ -35,6 +35,20 @@ impl From<krishiv_runtime::RuntimeError> for KrishivError {
     }
 }
 
+impl From<krishiv_engine_core::EngineError> for KrishivError {
+    fn from(value: krishiv_engine_core::EngineError) -> Self {
+        use krishiv_engine_core::EngineError as E;
+        let message = value.to_string();
+        match value {
+            E::Unsupported { .. } => Self::Unsupported { feature: message },
+            E::InvalidJob(_) => Self::InvalidConfig { message },
+            E::Source(_) | E::Sink(_) | E::State(_) | E::Checkpoint(_) | E::Runtime(_) => {
+                Self::Runtime { message }
+            }
+        }
+    }
+}
+
 impl From<krishiv_sql::SqlError> for KrishivError {
     fn from(value: krishiv_sql::SqlError) -> Self {
         match value {

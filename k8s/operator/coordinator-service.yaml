@@ -9,6 +9,10 @@ metadata:
     app.kubernetes.io/part-of: krishiv
 spec:
   type: ClusterIP
+  # Executors register through this Service, but the coordinator's /readyz is
+  # gated on having ≥1 registered executor — so the address must be published
+  # before the pod is Ready, otherwise the cluster deadlocks on bootstrap.
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: krishiv
     app.kubernetes.io/component: operator

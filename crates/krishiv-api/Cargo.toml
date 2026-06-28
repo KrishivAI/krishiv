@@ -23,6 +23,7 @@ krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse", 
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-delta = { path = "../krishiv-delta" }
 krishiv-ivm = { path = "../krishiv-ivm" }
+krishiv-engine-core = { path = "../krishiv-engine-core" }
 datafusion = { workspace = true }
 # iceberg feature deps — pulled in only when local-catalog or iceberg-datafusion are requested
 iceberg = { workspace = true, optional = true }

@@ -13,6 +13,11 @@ spec:
   - port: 2003
     name: flight
   clusterIP: None
+  # The coordinator's /readyz is gated on having ≥1 registered executor, but
+  # executors register *through this Service* — so it must publish the
+  # coordinator's address before it is Ready, or the cluster deadlocks
+  # (executors can't reach a not-ready coordinator to register).
+  publishNotReadyAddresses: true
   selector:
     app: krishiv-coordinator
 ---

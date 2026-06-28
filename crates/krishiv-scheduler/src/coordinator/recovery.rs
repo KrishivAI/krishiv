@@ -184,10 +184,24 @@ impl Coordinator {
         // first heartbeat tick instead of persisting as stale endpoints for
         // `heartbeat_timeout_ticks` (15+ seconds).  Live executors will
         // re-register within seconds and reset their heartbeat tick.
+        //
+        // P1.23: but streaming executors that own running tasks must NOT be torn
+        // down here — the re-attach grace window (set up just below) exists to
+        // give them time to re-register. Protect them from this immediate sweep;
+        // they are still evicted later by a grace-aware tick if they never come
+        // back.
+        let protected_streaming: std::collections::HashSet<ExecutorId> = self
+            .exec
+            .executors
+            .list()
+            .into_iter()
+            .map(|record| record.executor_id().clone())
+            .filter(|id| self.executor_has_streaming_running_tasks(id))
+            .collect();
         let stale_ids = self
             .exec
             .executors
-            .advance_clock(self.config.heartbeat_timeout_ticks());
+            .advance_clock_excluding(self.config.heartbeat_timeout_ticks(), &protected_streaming);
         if !stale_ids.is_empty() {
             tracing::info!(
                 count = stale_ids.len(),

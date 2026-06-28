@@ -49,6 +49,7 @@ pub mod unnest_sql;
 
 pub mod streaming;
 pub mod streaming_tvf;
+pub mod streaming_window_plan;
 mod udf;
 mod window_functions;
 

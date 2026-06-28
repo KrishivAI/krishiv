@@ -1031,7 +1031,10 @@ impl KrishivFlightSqlService {
                     .iter()
                     .map(|t| BatchSqlInlineTable {
                         table_name: t.table_name.clone(),
-                        ipc_b64: String::new(), // path-based: coordinator will resolve via catalog
+                        // The distributed client inlines parquet data as IPC so
+                        // executors need no shared filesystem; empty falls back to
+                        // catalog/path resolution (single-node / InProcess backend).
+                        ipc_b64: t.ipc_b64.clone(),
                     })
                     .collect();
                 let batches = if body.is_streaming {
@@ -1064,7 +1067,7 @@ impl KrishivFlightSqlService {
                     .iter()
                     .map(|t| BatchSqlInlineTable {
                         table_name: t.table_name.clone(),
-                        ipc_b64: String::new(), // path-based: resolved via catalog
+                        ipc_b64: t.ipc_b64.clone(),
                     })
                     .collect();
                 self.host

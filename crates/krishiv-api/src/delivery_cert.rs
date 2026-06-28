@@ -13,7 +13,7 @@ mod delivery_cert_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::session::{Session, SessionBuilder};
+    use crate::session::Session;
     use crate::types::ExecutionMode;
 
     fn embedded_session() -> Session {

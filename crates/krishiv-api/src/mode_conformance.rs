@@ -12,7 +12,7 @@ mod mode_conformance_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::session::{Session, SessionBuilder};
+    use crate::session::Session;
     use crate::types::ExecutionMode;
 
     fn make_batch(vals: &[i64]) -> RecordBatch {
