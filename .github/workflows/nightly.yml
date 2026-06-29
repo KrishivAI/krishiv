@@ -115,6 +115,9 @@ jobs:
       - name: Tag nightly
         if: steps.changes.outputs.has_changes == 'true'
         run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           TAG="nightly-$(date +%Y%m%d-%H%M%S)"
           git tag -a "$TAG" -m "Nightly publish $TAG"
           git push origin "$TAG"
@@ -149,6 +152,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -200,15 +205,27 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \
             python3-pip python3-venv python3-dev
+      - name: Install protobuf (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
       - uses: PyO3/maturin-action@v1
         env:
           RUSTC_WRAPPER: ""
+          CXXFLAGS: "-include cstdint"
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           command: build
           args: --release --out dist/ --find-interpreter
           working-directory: crates/krishiv-python
+          before-script-linux: |
+            # Install protobuf compiler inside the manylinux container.
+            # krishiv-proto uses prost-build which requires protoc at build time.
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y protobuf-compiler
+            elif command -v yum >/dev/null 2>&1; then
+              yum install -y protobuf-compiler
+            fi
       - uses: actions/upload-artifact@v4
         with:
           name: nightly-wheels-${{ matrix.os }}-${{ matrix.target }}-${{ github.run_id }}
