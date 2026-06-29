@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% include "auth_meta.html" %}
+    <title>{% block title %}Krishiv{% endblock %}</title>
+    <base href="/ui/">
+    <link rel="stylesheet" href="/ui/assets/krishiv.css?v=2">
+    <script src="/ui/assets/krishiv-auth.js?v=2" defer></script>
+    <script src="/ui/assets/krishiv-live.js?v=2" defer></script>
+    {% block head_extra %}{% endblock %}
+  </head>
+  <body>
+    <div class="app-shell">
+      {% include "sidebar.html" %}
+      <div class="sidebar-overlay" data-sidebar-overlay></div>
+      <div class="topbar">
+        <div class="topbar-left">
+          <button type="button" class="topbar-btn mobile-menu-btn" data-mobile-menu aria-label="Open navigation">
+            &#9776;
+          </button>
+          <h1 class="topbar-title">{% block topbar_title %}Krishiv{% endblock %}</h1>
+        </div>
+        <div class="topbar-right">
+          <div class="topbar-search">
+            <input type="search" placeholder="Search..." aria-label="Global search">
+          </div>
+          <a href="/api/v1/openapi.json" target="_blank" rel="noopener" class="topbar-btn" title="API documentation">
+            &#8599;
+          </a>
+          <button type="button" class="topbar-btn" data-theme-toggle title="Toggle theme">&#9789;</button>
+        </div>
+      </div>
+      <main class="content">
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+    {% block body_end %}{% endblock %}
+  </body>
+</html>

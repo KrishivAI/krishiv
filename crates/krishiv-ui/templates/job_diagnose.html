@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}{{ job_id }} · Diagnose · Krishiv{% endblock %}
+{% block nav_jobs %}active{% endblock %}
+{% block topbar_title %}Diagnose: {{ job_id }}{% endblock %}
+{% block content %}
+
+<nav class="breadcrumbs" aria-label="Breadcrumb">
+  <a href="/ui">Jobs</a>
+  <span class="crumb-sep">/</span>
+  <a href="/ui/jobs/{{ job_id }}">{{ job_id }}</a>
+  <span class="crumb-sep">/</span>
+  <span class="crumb-current">Diagnose</span>
+</nav>
+
+<div class="panel">
+  <div class="panel-header">
+    <h2>Observability Report</h2>
+  </div>
+  <div class="panel-body">
+    <pre class="code-block">{{ report_json }}</pre>
+  </div>
+</div>
+{% endblock %}

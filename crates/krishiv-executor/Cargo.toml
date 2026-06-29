@@ -1,0 +1,61 @@
+[package]
+name = "krishiv-executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description.workspace = true
+
+[features]
+kafka = ["krishiv-connectors/kafka"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+arrow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+constant_time_eq = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+indexmap = { workspace = true }
+twox-hash = { workspace = true }
+krishiv-common = { path = "../krishiv-common" }
+krishiv-ivm = { path = "../krishiv-ivm" }
+krishiv-metrics = { path = "../krishiv-metrics" }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
+krishiv-dataflow = { path = "../krishiv-dataflow" }
+krishiv-plan = { path = "../krishiv-plan" }
+krishiv-proto = { path = "../krishiv-proto" }
+krishiv-shuffle = { path = "../krishiv-shuffle" }
+krishiv-sql = { path = "../krishiv-sql" }
+krishiv-state = { path = "../krishiv-state" }
+object_store = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["time", "signal", "sync"] }
+tokio-stream.workspace = true
+tonic.workspace = true
+thiserror = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+arrow.workspace = true
+krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-shuffle = { path = "../krishiv-shuffle" }
+parquet.workspace = true
+tempfile.workspace = true
+
+[[bin]]
+name = "krishiv-executor"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

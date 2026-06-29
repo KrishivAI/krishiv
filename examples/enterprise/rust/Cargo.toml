@@ -1,0 +1,49 @@
+[package]
+name = "krishiv-enterprise-examples"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace]
+
+[dependencies]
+arrow        = { version = "58.3.0", features = ["prettyprint"] }
+parquet      = "58.3.0"
+object_store = "0.13.2"
+tokio        = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+serde_json   = "1"
+tempfile     = "3"
+anyhow       = "1"
+
+# Main user-facing crate (re-exports Session, AggExpr, LocalWindowExecutionSpec, etc.)
+krishiv = { path = "../../../crates/krishiv" }
+
+# Connector implementations
+krishiv-connectors = { path = "../../../crates/krishiv-connectors", features = [
+    "kafka",      # InMemoryKafkaSource + InMemoryKafkaOffsetCommitter
+    "two-phase",  # EpochTransactionLog + LocalParquetTwoPhaseCommitSink
+    "lakehouse",  # CdcToLakehousePipeline, write_delta, DeltaWriteMode
+    "delta",      # write_delta local delta backend
+] }
+
+# Windowed aggregation: LocalWindowExecutionSpec, LocalWindowKind, execute_windowed_stream
+krishiv-runtime = { path = "../../../crates/krishiv-runtime" }
+
+# CEP: Pattern, CompiledPattern, PartitionedCepMatcher
+krishiv-plan = { path = "../../../crates/krishiv-plan" }
+
+# Direct rdkafka access for high-load Kafka examples (ent_11+)
+rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
+
+# ent_13: PostgreSQL sink
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+
+# ent_14 / ent_17: HTTP client for ClickHouse + Flink REST API
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# ent_16: checkpoint serialisation
+serde = { version = "1", features = ["derive"] }
+
+# timing / metrics
+instant = "0.1"

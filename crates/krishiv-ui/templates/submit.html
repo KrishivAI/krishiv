@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}SQL Console · Krishiv{% endblock %}
+{% block nav_sql %}active{% endblock %}
+{% block head_extra %}<script src="assets/krishiv-sql.js" defer></script>{% endblock %}
+{% block topbar_title %}SQL Console{% endblock %}
+{% block content %}
+
+<div class="sql-editor">
+  <form class="sql-form">
+    <textarea name="query" rows="8" placeholder="SELECT * FROM ...">SELECT 1 AS col</textarea>
+    <div class="sql-toolbar">
+      <button type="submit" class="btn btn-primary">Run Query</button>
+      <span id="spinner" class="sql-spinner" style="display: none;">Running&hellip;</span>
+    </div>
+  </form>
+</div>
+
+<div id="results" style="margin-top: 20px;">
+  <div class="empty-state">
+    <div class="empty-icon">&#9000;</div>
+    <div class="empty-title">No results yet</div>
+    <p class="empty-desc">Submit a query to see results here.</p>
+  </div>
+</div>
+
+<template id="result-template">
+  <div class="panel">
+    <div class="panel-body-compact">
+      <div class="table-container">
+        <table>
+          <thead><tr></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <p class="refresh-note" style="margin-top: 8px;"></p>
+</template>
+{% endblock %}

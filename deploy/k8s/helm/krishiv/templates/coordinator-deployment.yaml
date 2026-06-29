@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "krishiv.fullname" . }}-coordinator
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "krishiv.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  replicas: {{ .Values.coordinator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "krishiv.coordinatorSelectorLabels" . | nindent 6 }}
+  strategy:
+    # Only one active coordinator at a time (per-job leader election via Lease API).
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "krishiv.coordinatorSelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "krishiv.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: coordinator
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krishiv"]
+          args:
+            - {{ .Values.coordinator.command | quote }}
+            - "--grpc-addr"
+            - "0.0.0.0:{{ .Values.coordinator.port }}"
+            - "--http-addr"
+            - "0.0.0.0:{{ .Values.coordinator.httpPort }}"
+            {{- if .Values.coordinator.flight.enabled }}
+            - "--flight-addr"
+            - "0.0.0.0:{{ .Values.coordinator.flight.port }}"
+            {{- end }}
+            - "--durability-profile"
+            - {{ .Values.coordinator.durabilityProfile | quote }}
+            {{- if .Values.coordinator.metadataBackend }}
+            - "--metadata-backend"
+            - {{ .Values.coordinator.metadataBackend | quote }}
+            {{- end }}
+            {{- if .Values.coordinator.leaderBackend }}
+            - "--leader-backend"
+            - {{ .Values.coordinator.leaderBackend | quote }}
+            {{- end }}
+            {{- if .Values.coordinator.etcdEndpoints }}
+            - "--etcd-endpoints"
+            - {{ .Values.coordinator.etcdEndpoints | quote }}
+            {{- end }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.coordinator.port }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.coordinator.httpPort }}
+              protocol: TCP
+            {{- if .Values.coordinator.flight.enabled }}
+            - name: flight
+              containerPort: {{ .Values.coordinator.flight.port }}
+              protocol: TCP
+            {{- end }}
+          env:
+            - name: KRISHIV_SERVICE_NAME
+              value: {{ .Values.observability.serviceName | quote }}
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.coordinatorAuth.secretName | quote }}
+                  key: {{ .Values.coordinatorAuth.secretKey | quote }}
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.coordinatorAuth.secretName | quote }}
+                  key: {{ .Values.coordinatorAuth.rotationSecretKey | quote }}
+                  optional: true
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN_FILE
+              value: {{ printf "%s/token" .Values.coordinatorAuth.mountPath | quote }}
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS_FILE
+              value: {{ printf "%s/tokens" .Values.coordinatorAuth.mountPath | quote }}
+            - name: KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS
+              value: {{ .Values.coordinatorAuth.reloadIntervalSeconds | quote }}
+            - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.executorTaskAuth.secretName | quote }}
+                  key: {{ .Values.executorTaskAuth.secretKey | quote }}
+            {{- if .Values.observability.otlpEndpoint }}
+            - name: KRISHIV_OTLP_ENDPOINT
+              value: {{ .Values.observability.otlpEndpoint | quote }}
+            {{- end }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: coordinator-auth
+              mountPath: {{ .Values.coordinatorAuth.mountPath | quote }}
+              readOnly: true
+          resources:
+            {{- toYaml .Values.coordinator.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: coordinator-auth
+          secret:
+            secretName: {{ .Values.coordinatorAuth.secretName | quote }}

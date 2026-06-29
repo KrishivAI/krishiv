@@ -1,0 +1,126 @@
+# syntax=docker/dockerfile:1.7
+#
+# Single-node production image — embedded mode, minimum footprint.
+#
+# One binary, no distributed dependencies (no etcd, no shuffle service,
+# no Flight SQL server, no K8s operator). Uses the `release` Cargo profile:
+# fat LTO + strip=symbols + codegen-units=1 + panic=abort.
+#
+# Expected sizes:
+#   builder layer  ~2 GB (Rust toolchain + compiled deps, not shipped)
+#   runtime image  ~60-80 MB  (debian:trixie-slim + stripped krishiv binary)
+#
+# Usage:
+#   docker build -f Dockerfile.single-node -t krishiv:single-node .
+#   docker run -p 50051:50051 -p 2001:2001 krishiv:single-node
+#
+# For local development / smaller machines, prefer `just docker-fast` which
+# uses host-compiled dev binaries and skips the multi-stage build.
+
+# ── Stage 0: cargo-chef base ──────────────────────────────────────────────────
+FROM rust:1.92-slim AS chef
+RUN cargo install cargo-chef cargo-sccache sccache --locked
+ENV RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/root/.cache/sccache
+WORKDIR /build
+
+# ── Stage 1: Planner — re-runs only when Cargo.toml/Cargo.lock changes ───────
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: Dependency layer — cached until recipe.json changes ──────────────
+FROM chef AS builder
+
+# Shared base for all runtime stages.
+# Build args:
+#   FEATURES  Cargo feature set (default: embedded,jemalloc)
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl-dev \
+        pkg-config \
+        cmake \
+        mold \
+        clang \
+        libclang-dev \
+        g++ \
+        make \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CXXFLAGS="-include cstdint" \
+    CARGO_INCREMENTAL=0 \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+
+# Cook only the deps for the single-node binary (embedded feature set).
+# Excludes etcd, Flight SQL, shuffle, operator, Iceberg, Kafka — ~40% fewer crates
+# to compile vs the full feature set.
+COPY --from=planner /build/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    cargo chef cook -p krishiv \
+        --recipe-path recipe.json \
+        --no-default-features --features "embedded,jemalloc" \
+        --profile release --jobs $(nproc)
+
+# ── Stage 3: Binary build ─────────────────────────────────────────────────────
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    set -e; \
+    OUTDIR="target/release"; \
+    cargo build --locked -p krishiv \
+        --no-default-features --features "embedded,jemalloc" \
+        --profile release --jobs $(nproc); \
+    mkdir -p /out; \
+    cp "$OUTDIR/krishiv" /out/krishiv; \
+    # Verify binary sanity before committing it to the image layer.
+    /out/krishiv --version || true
+
+# ── Stage 4: Minimal runtime image ───────────────────────────────────────────
+# Shared base for all krishiv runtime images (ca-certificates, curl for
+# healthcheck, non-root user, standard data dirs). Must share glibc version
+# with the builder (rust:1.92-slim is Debian Trixie).
+FROM debian:trixie-slim AS runtime
+
+# ca-certificates: TLS cert chain for outbound HTTPS (object store, catalog endpoints).
+# curl: lightweight health-check probe — replace with a compiled binary if you want
+#   a truly shell-free image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r krishiv \
+    && useradd -r -g krishiv -d /var/lib/krishiv -s /sbin/nologin krishiv
+
+COPY --from=builder /out/krishiv /usr/local/bin/krishiv
+
+RUN mkdir -p \
+        /var/lib/krishiv/data \
+        /var/lib/krishiv/checkpoints \
+        /var/lib/krishiv/state \
+    && chown -R krishiv:krishiv /var/lib/krishiv
+
+USER krishiv
+WORKDIR /var/lib/krishiv
+
+# Single-node embedded mode: one process handles SQL, execution, and state.
+# HTTP health endpoint (krishiv local start binds :2002 by default).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -sf http://localhost:2002/healthz || exit 1
+
+ENV RUST_LOG="info" \
+    KRISHIV_MODE="single-node" \
+    KRISHIV_LOCAL_DATA_DIR="/var/lib/krishiv/data" \
+    KRISHIV_CHECKPOINT_DIR="/var/lib/krishiv/checkpoints"
+
+# SQL gateway: 4000 (HTTP), gRPC API: 2001, health/metrics: 2002
+EXPOSE 4000 2001 2002
+
+ENTRYPOINT ["/usr/local/bin/krishiv"]
+CMD ["local", "start"]

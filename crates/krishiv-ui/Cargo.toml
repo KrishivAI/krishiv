@@ -1,0 +1,31 @@
+[package]
+name = "krishiv-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+
+[dependencies]
+askama.workspace = true
+axum.workspace = true
+constant_time_eq = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+futures.workspace = true
+krishiv-common = { path = "../krishiv-common" }
+krishiv-proto = { path = "../krishiv-proto" }
+krishiv-metrics = { path = "../krishiv-metrics" }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-sql = { path = "../krishiv-sql" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

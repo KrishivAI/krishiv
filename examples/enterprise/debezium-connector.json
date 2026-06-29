@@ -1,0 +1,25 @@
+{
+  "name": "krishiv-postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "krishiv",
+    "database.password": "krishiv",
+    "database.dbname": "enterprise",
+    "database.server.name": "pgserver",
+    "table.include.list": "public.orders,public.products",
+    "plugin.name": "pgoutput",
+    "publication.name": "krishiv_pub",
+    "slot.name": "krishiv_slot",
+    "topic.prefix": "pgserver",
+    "transforms": "unwrap",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.unwrap.add.fields": "op,source.ts_ms,source.lsn",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}

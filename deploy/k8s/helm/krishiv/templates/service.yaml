@@ -1,0 +1,66 @@
+---
+# Coordinator gRPC service — used by executors and CLI clients.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "krishiv.fullname" . }}-coordinator
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "krishiv.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  selector:
+    {{- include "krishiv.coordinatorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.coordinator.port }}
+      targetPort: grpc
+      protocol: TCP
+    - name: http
+      port: {{ .Values.coordinator.httpPort }}
+      targetPort: http
+      protocol: TCP
+    {{- if .Values.coordinator.flight.enabled }}
+    - name: flight
+      port: {{ .Values.coordinator.flight.port }}
+      targetPort: flight
+      protocol: TCP
+    {{- end }}
+  type: ClusterIP
+  # Executors register through this Service, but the coordinator's /readyz is
+  # gated on having ≥1 registered executor — so the address must be published
+  # before the pod is Ready, otherwise the cluster deadlocks on bootstrap.
+  publishNotReadyAddresses: true
+---
+# Executor gRPC service — used by the coordinator to push task assignments.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "krishiv.fullname" . }}-executor
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "krishiv.labels" . | nindent 4 }}
+    app.kubernetes.io/component: executor
+spec:
+  selector:
+    {{- include "krishiv.executorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.executor.port }}
+      targetPort: grpc
+      protocol: TCP
+    - name: barrier
+      port: {{ .Values.executor.barrierPort }}
+      targetPort: barrier
+      protocol: TCP
+    - name: shuffle-flight
+      port: {{ .Values.executor.shuffleFlightPort }}
+      targetPort: shuffle-flight
+      protocol: TCP
+    - name: http
+      port: {{ .Values.executor.httpPort }}
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP
+  # Use headless service so each executor pod is individually addressable.
+  clusterIP: None

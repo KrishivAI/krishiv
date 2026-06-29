@@ -1,0 +1,17 @@
+[package]
+name = "krishiv-sql-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Separately versioned SQL gateway facade for JDBC/ODBC-compatible clients"
+
+[dependencies]
+krishiv-api = { path = "../krishiv-api" }
+krishiv-sql = { path = "../krishiv-sql" }
+
+[lints]
+workspace = true

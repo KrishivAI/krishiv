@@ -1,0 +1,323 @@
+//! In-process coordinator ↔ executor transport (ADR-12.4).
+
+use std::sync::{Arc, Mutex};
+
+use krishiv_proto::{
+    CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
+    DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorHeartbeatRequest,
+    ExecutorHeartbeatResponse, RegisterExecutorRequest, RegisterExecutorResponse,
+    TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
+};
+use tokio::sync::RwLock;
+
+use crate::coordinator_sharded::{CheckpointInner, ExecutorInner};
+use crate::{Coordinator, SchedulerError, TaskUpdateOutcome, status_from_scheduler_error};
+
+/// Task endpoint marker: assignments are delivered via [`ExecutorAssignmentInbox`]
+/// instead of gRPC (`push_assignments_in_process` in `krishiv-runtime`).
+pub const IN_PROCESS_TASK_ENDPOINT: &str = "inprocess://local";
+
+/// Returns true when `endpoint` should use inbox delivery.
+pub fn is_in_process_task_endpoint(endpoint: &str) -> bool {
+    endpoint.starts_with("inprocess://")
+}
+
+/// Bridges executor RPCs to an in-memory [`Coordinator`] (no tonic server required).
+///
+/// Lock sharding: dedicated inner locks for executor registry and checkpoint
+/// state so that hot-path operations (heartbeat, checkpoint ack) do not contend
+/// with full coordinator state access.
+#[derive(Clone)]
+pub struct InProcessCoordinatorBridge {
+    coordinator: Arc<Mutex<Coordinator>>,
+    /// Dedicated lock for executor registry state.
+    pub(crate) executor_inner: Arc<RwLock<ExecutorInner>>,
+    /// Dedicated lock for checkpoint coordinator state.
+    pub(crate) checkpoint_inner: Arc<RwLock<CheckpointInner>>,
+}
+
+impl InProcessCoordinatorBridge {
+    /// Wrap a coordinator with sharded inner locks for direct method calls
+    /// from the executor runner.
+    pub fn new(
+        coordinator: Arc<Mutex<Coordinator>>,
+        executor_inner: Arc<RwLock<ExecutorInner>>,
+        checkpoint_inner: Arc<RwLock<CheckpointInner>>,
+    ) -> Self {
+        Self {
+            coordinator,
+            executor_inner,
+            checkpoint_inner,
+        }
+    }
+}
+
+impl Drop for InProcessCoordinatorBridge {
+    fn drop(&mut self) {
+        if let Ok(coord) = self.coordinator.lock() {
+            let running: usize = coord
+                .job_snapshots()
+                .iter()
+                .map(|j| j.assigned_task_count())
+                .sum();
+            if running > 0 {
+                tracing::warn!(
+                    running_tasks = running,
+                    "InProcessCoordinatorBridge dropped with in-flight tasks; \
+                     tasks will not receive further status updates"
+                );
+            }
+        }
+    }
+}
+
+fn lock_coord(
+    coordinator: &Arc<Mutex<Coordinator>>,
+) -> Result<std::sync::MutexGuard<'_, Coordinator>, tonic::Status> {
+    coordinator
+        .lock()
+        .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))
+}
+
+#[tonic::async_trait]
+impl CoordinatorExecutorService for InProcessCoordinatorBridge {
+    async fn register_executor(
+        &self,
+        request: tonic::Request<RegisterExecutorRequest>,
+    ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let mut coordinator = lock_coord(&self.coordinator)?;
+        let lease = coordinator
+            .register_executor(request.descriptor().clone())
+            .map_err(status_from_scheduler_error)?;
+        Ok(tonic::Response::new(RegisterExecutorResponse::new(
+            request.descriptor().executor_id().clone(),
+            lease,
+            TransportDisposition::Accepted,
+        )))
+    }
+
+    async fn deregister_executor(
+        &self,
+        request: tonic::Request<DeregisterExecutorRequest>,
+    ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let mut coordinator = lock_coord(&self.coordinator)?;
+        let lease = coordinator
+            .deregister_executor(request.executor_id(), request.lease_generation())
+            .map_err(status_from_scheduler_error)?;
+        Ok(tonic::Response::new(DeregisterExecutorResponse::new(
+            request.executor_id().clone(),
+            lease,
+            TransportDisposition::Accepted,
+        )))
+    }
+
+    async fn executor_heartbeat(
+        &self,
+        request: tonic::Request<ExecutorHeartbeatRequest>,
+    ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let running_tasks: Vec<_> = request
+            .running_attempts()
+            .iter()
+            .map(|a| a.task_id().clone())
+            .collect();
+
+        // Fast path: update the executor registry via the sharded inner lock.
+        let registry_heartbeat = crate::coordinator::executor_heartbeat_from_request(&request);
+
+        {
+            let coordinator = lock_coord(&self.coordinator)?;
+            coordinator
+                .ensure_active()
+                .map_err(status_from_scheduler_error)?;
+        }
+
+        let lease_generation = {
+            // Snapshot executor state while holding the async write guard, then
+            // drop it before acquiring the sync Mutex — holding both simultaneously
+            // risks deadlock (async T1 blocks on Mutex while sync T2 blocks on RwLock).
+            let (lg, snap) = {
+                let mut inner = self.executor_inner.write().await;
+                let lg = inner
+                    .handle_heartbeat(registry_heartbeat)
+                    .map_err(status_from_scheduler_error)?;
+                (lg, (inner.executors.clone(), inner.state, inner.recovering))
+                // async write guard drops here
+            };
+            let mut coord = lock_coord(&self.coordinator)?;
+            coord.exec.executors = snap.0;
+            coord.exec.state = snap.1;
+            coord.exec.recovering = snap.2;
+            lg
+        };
+
+        // Full coordinator heartbeat for hot-keys, streaming progress, checkpoints,
+        // and queued throttle commands from task-status updates.
+        let full_heartbeat = crate::coordinator::executor_heartbeat_from_request(&request)
+            .with_lease_generation(lease_generation)
+            .with_running_tasks(running_tasks);
+
+        let response = {
+            let mut coordinator = lock_coord(&self.coordinator)?;
+            match coordinator.executor_heartbeat(full_heartbeat) {
+                Ok(effects) => {
+                    crate::coordinator::executor_heartbeat_response_from_effects(effects)
+                }
+                Err(SchedulerError::UnknownExecutor { .. }) => ExecutorHeartbeatResponse::new(
+                    request.lease_generation(),
+                    TransportDisposition::UnknownExecutor,
+                )
+                .with_message("executor is not registered"),
+                Err(SchedulerError::StaleExecutorLease { expected, .. }) => {
+                    ExecutorHeartbeatResponse::new(expected, TransportDisposition::StaleLease)
+                        .with_message("executor lease generation is stale")
+                }
+                Err(error) => return Err(status_from_scheduler_error(error)),
+            }
+        };
+
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn task_status(
+        &self,
+        request: tonic::Request<TaskStatusRequest>,
+    ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+        let request = request.into_inner();
+        if !TransportVersion::CURRENT.is_compatible_with(request.version()) {
+            return Err(tonic::Status::invalid_argument(format!(
+                "unsupported coordinator/executor transport version {}; current version is {}",
+                request.version(),
+                TransportVersion::CURRENT
+            )));
+        }
+        let mut update = krishiv_proto::TaskStatusUpdate::new(
+            request.job_id().clone(),
+            request.stage_id().clone(),
+            request.task_id().clone(),
+            request.executor_id().clone(),
+            request.state(),
+            request.attempt_id().as_u32(),
+        )
+        .with_lease_generation(request.lease_generation());
+        if let Some(message) = request.message() {
+            update = update.with_message(message);
+        }
+        if let Some(meta) = request.output_metadata() {
+            update = update.with_output_metadata(meta.clone());
+        }
+        if !request.missing_shuffle_partitions().is_empty() {
+            update = update
+                .with_missing_shuffle_partitions(request.missing_shuffle_partitions().to_vec());
+        }
+        // Phase 1: apply update and collect deferred sink work under the lock.
+        let (response, sink_work) = {
+            let mut coordinator = lock_coord(&self.coordinator)?;
+            let response = match coordinator.apply_task_update(update) {
+                Ok(TaskUpdateOutcome::Applied) => {
+                    TaskStatusResponse::new(TransportDisposition::Accepted)
+                }
+                Ok(TaskUpdateOutcome::Duplicate) => {
+                    TaskStatusResponse::new(TransportDisposition::Duplicate)
+                }
+                Err(SchedulerError::UnknownJob { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::UnknownJob)
+                }
+                Err(SchedulerError::UnknownTask { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::UnknownTask)
+                }
+                Err(SchedulerError::UnknownExecutor { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::UnknownExecutor)
+                }
+                Err(SchedulerError::StaleExecutorLease { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::StaleLease)
+                }
+                Err(SchedulerError::StaleTaskAttempt { .. }) => {
+                    TaskStatusResponse::new(TransportDisposition::StaleAttempt)
+                }
+                Err(error) => return Err(status_from_scheduler_error(error)),
+            };
+            let sink_work = coordinator.take_pending_sink_finalize();
+            (response, sink_work)
+            // sync lock released here
+        };
+
+        // Phase 2: run blocking filesystem I/O outside the sync lock.
+        // `block_in_place` lets Tokio move other tasks off this thread while we block.
+        if !sink_work.is_empty() {
+            tokio::task::block_in_place(|| {
+                for work in sink_work {
+                    let job_id = work.job_id.clone();
+                    let publish_ok = work.execute();
+                    if !publish_ok && let Ok(mut coordinator) = lock_coord(&self.coordinator) {
+                        coordinator.mark_sink_publish_failed(&job_id);
+                    }
+                }
+            });
+        }
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn checkpoint_ack(
+        &self,
+        request: tonic::Request<CheckpointAckRequest>,
+    ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let job_id = request.job_id.clone();
+        let ack_epoch = request.epoch;
+
+        {
+            let coordinator = lock_coord(&self.coordinator)?;
+            coordinator
+                .ensure_active()
+                .map_err(status_from_scheduler_error)?;
+        }
+
+        // Phase 1: extract commit data under the lock (in-memory only, no I/O).
+        let (response, pending_commit, require_finalize) = {
+            let mut inner = self.checkpoint_inner.write().await;
+            let (response, commit) = inner.handle_ack(request).await;
+            let require_finalize = commit.is_some();
+            (response, commit, require_finalize)
+        };
+
+        // Phase 2: perform async storage I/O outside the lock.
+        if let Some(commit) = pending_commit {
+            crate::checkpoint::CheckpointCoordinator::commit_storage(commit)
+                .await
+                .map_err(|e| tonic::Status::internal(format!("checkpoint commit failed: {e}")))?;
+        }
+
+        // Phase 3: finalize and sync inner → outer coordinator.
+        // Clone inner state while holding the async lock, then drop the guard
+        // before acquiring the sync Mutex (prevents L1 deadlock: T1 holds async
+        // write guard and blocks on Mutex; T2 holds Mutex and waits for RwLock).
+        let (inner_snap, finalize_result) = {
+            let mut inner = self.checkpoint_inner.write().await;
+            let result = if require_finalize {
+                inner.finalize_ack(&job_id, ack_epoch)
+            } else {
+                Ok(())
+            };
+            (inner.clone(), result)
+            // async write guard drops here
+        };
+        {
+            // Sync inner → outer coordinator to avoid dual-state drift (G3).
+            // All 7 checkpoint-control fields are mirrored back.
+            let mut coord = lock_coord(&self.coordinator)?;
+            coord.apply_checkpoint_inner_sync(&inner_snap);
+            if require_finalize {
+                finalize_result.map_err(|e| {
+                    tonic::Status::internal(format!("checkpoint finalize failed: {e}"))
+                })?;
+                // Post-commit: preserve savepoint epochs and drive
+                // stop-with-savepoint, mirroring the gRPC ack path.
+                coord.on_checkpoint_epoch_committed(&job_id, ack_epoch);
+            }
+        }
+        Ok(tonic::Response::new(response))
+    }
+}

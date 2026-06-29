@@ -1,0 +1,289 @@
+//! Long-running daemon subcommands (`krishiv coordinator`, `krishiv executor`, …).
+
+use krishiv_common::async_util::block_on;
+use krishiv_scheduler::{
+    CoordinatorSidecarFn, SharedCoordinator, coordinator_daemon_help, job_coordinator_daemon_help,
+    parse_coordinator_daemon_config, parse_job_coordinator_daemon_config, run_clusterd_daemon,
+    run_job_coordinator_daemon, run_standalone_coordinator,
+};
+
+use crate::cli::CliResponse;
+
+/// If `args` starts with a daemon subcommand, run it and return `Some(exit_code)`.
+pub fn try_run_daemon(args: &[String]) -> Option<i32> {
+    let sub = args.first()?.as_str();
+    match sub {
+        "coordinator" | "clusterd" | "executor" | "job-coordinator" | "flight-server"
+        | "shuffle-svc" => {}
+        _ => return None,
+    }
+    let rest: Vec<String> = args.iter().skip(1).cloned().collect();
+    let code = match sub {
+        "coordinator" => run_coordinator(&rest),
+        "clusterd" => run_clusterd(&rest),
+        "executor" => run_executor(&rest),
+        "job-coordinator" => run_job_coordinator(&rest),
+        "flight-server" => run_flight_server(&rest),
+        "shuffle-svc" => run_shuffle_svc(&rest),
+        other => {
+            tracing::error!(subcommand = %other, "unexpected daemon subcommand after validation");
+            2
+        }
+    };
+    Some(code)
+}
+
+fn run_coordinator(args: &[String]) -> i32 {
+    match parse_coordinator_daemon_config(args.iter().cloned()) {
+        Ok(config) if config.help => {
+            print!("{}", coordinator_daemon_help());
+            0
+        }
+        Ok(config) => {
+            let factory = build_ui_http_factory();
+            let mut sidecars: Vec<CoordinatorSidecarFn> = Vec::new();
+            if let Some(sidecar) = build_flight_sidecar(&config) {
+                sidecars.push(sidecar);
+            }
+            match block_on(run_standalone_coordinator(config, factory, sidecars)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e}");
+                    2
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    }
+}
+
+fn run_clusterd(args: &[String]) -> i32 {
+    match parse_coordinator_daemon_config(args.iter().cloned()) {
+        Ok(config) if config.help => {
+            print!("{}", coordinator_daemon_help());
+            0
+        }
+        Ok(config) => {
+            let factory = build_ui_http_factory();
+            let mut sidecars: Vec<CoordinatorSidecarFn> = Vec::new();
+            if let Some(sidecar) = build_flight_sidecar(&config) {
+                sidecars.push(sidecar);
+            }
+            match block_on(run_clusterd_daemon(config, factory, sidecars)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e}");
+                    2
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    }
+}
+
+fn build_ui_http_factory() -> Option<Box<dyn FnOnce(SharedCoordinator) -> axum::Router<()> + Send>>
+{
+    Some(Box::new(|shared: SharedCoordinator| {
+        let engine = krishiv_sql::SqlEngine::new();
+        let ui_state = krishiv_ui::UiState::from_shared_coordinator(shared).with_sql_engine(engine);
+        krishiv_ui::embedded_router(ui_state)
+    }))
+}
+
+/// Build a Flight SQL sidecar factory when `config.flight_addr` is set.
+///
+/// The returned factory is passed to `spawn_coordinator_sidecars` and binds the
+/// Flight SQL server co-located with the coordinator — no HTTP proxy hop.
+#[cfg(feature = "flight-sql")]
+fn build_flight_sidecar(
+    config: &krishiv_scheduler::CoordinatorDaemonConfig,
+) -> Option<CoordinatorSidecarFn> {
+    let addr = config.flight_addr?;
+    Some(Box::new(move |coordinator: SharedCoordinator| {
+        Box::pin(async move {
+            use krishiv_flight_sql::{FlightExecutionHost, run_flight_server_with_host};
+            let host = FlightExecutionHost::with_coordinator(coordinator);
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(
+                        addr = %addr,
+                        error = %e,
+                        "Failed to bind co-located Flight SQL address"
+                    );
+                    return;
+                }
+            };
+            tracing::info!(addr = %addr, "Krishiv Flight SQL co-located with coordinator");
+            if let Err(e) = run_flight_server_with_host(host, listener).await {
+                tracing::error!(
+                    error = %e,
+                    "Co-located Flight SQL server terminated unexpectedly"
+                );
+            }
+        })
+    }))
+}
+
+/// When flight-sql feature is disabled, no sidecar is built.
+#[cfg(not(feature = "flight-sql"))]
+fn build_flight_sidecar(
+    _config: &krishiv_scheduler::CoordinatorDaemonConfig,
+) -> Option<CoordinatorSidecarFn> {
+    None
+}
+
+fn run_job_coordinator(args: &[String]) -> i32 {
+    match parse_job_coordinator_daemon_config(args.iter().cloned()) {
+        Ok(config) if config.help => {
+            print!("{}", job_coordinator_daemon_help());
+            0
+        }
+        Ok(config) => match block_on(run_job_coordinator_daemon(config)) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{e}");
+                2
+            }
+        },
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    }
+}
+
+fn run_executor(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{}", krishiv_executor::cli::executor_cli_help());
+        return 0;
+    }
+    match block_on(krishiv_executor::cli::run_executor_cli(
+        args.iter().cloned(),
+    )) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    }
+}
+
+fn run_flight_server(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{}", flight_server_help());
+        return 0;
+    }
+    #[cfg(not(feature = "flight-sql"))]
+    {
+        eprintln!("flight-server support requires building krishiv with feature `flight-sql`");
+        return 2;
+    }
+    #[cfg(feature = "flight-sql")]
+    match block_on(krishiv_flight_sql::run_flight_server_from_env()) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    }
+}
+
+fn run_shuffle_svc(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{}", shuffle_svc_help());
+        return 0;
+    }
+    #[cfg(not(feature = "shuffle"))]
+    {
+        eprintln!("shuffle-svc support requires building krishiv with feature `shuffle`");
+        return 2;
+    }
+    #[cfg(feature = "shuffle")]
+    match block_on(krishiv_shuffle::shuffle_svc::run_shuffle_svc_from_env()) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    }
+}
+
+pub fn daemons_help() -> String {
+    let mut help = String::from(
+        "Krishiv daemon processes (also available as legacy binary names).\n\
+         \n\
+         Usage:\n\
+           krishiv coordinator [OPTIONS]     Active coordinator (was krishiv-coordinator)\n\
+           krishiv clusterd [OPTIONS]        Cluster control plane (was krishiv-clusterd)\n\
+           krishiv job-coordinator [OPTS]    Per-job coordinator (was krishiv-job-coordinator)\n\
+           krishiv executor [OPTIONS]        Data-plane worker (was krishiv-executor)\n",
+    );
+    #[cfg(feature = "flight-sql")]
+    help.push_str(
+        "           krishiv flight-server             Arrow Flight SQL (was krishiv-flight-server)\n",
+    );
+    #[cfg(not(feature = "flight-sql"))]
+    help.push_str(
+        "           krishiv flight-server             Arrow Flight SQL [disabled; build with feature `flight-sql`]\n",
+    );
+    #[cfg(feature = "shuffle")]
+    help.push_str("           krishiv shuffle-svc               Optional shuffle HTTP service\n");
+    #[cfg(not(feature = "shuffle"))]
+    help.push_str(
+        "           krishiv shuffle-svc               Optional shuffle HTTP service [disabled; build with feature `shuffle`]\n",
+    );
+    help.push_str(
+        "\n\
+         Legacy binaries remain install aliases; prefer `krishiv <subcommand>`.\n",
+    );
+    help
+}
+
+fn flight_server_help() -> &'static str {
+    "Arrow Flight SQL server.\n\
+     \n\
+     Usage: krishiv flight-server\n\
+     Env: KRISHIV_FLIGHT_ADDR (default 127.0.0.1:2003)\n"
+}
+
+fn shuffle_svc_help() -> &'static str {
+    "Shuffle partition HTTP service.\n\
+     \n\
+     Usage: krishiv shuffle-svc\n\
+     Env: KRISHIV_SHUFFLE_DIR, KRISHIV_SHUFFLE_ADDR (default 0.0.0.0:2004)\n"
+}
+
+/// CLI help snippet for main help (daemon section).
+pub fn daemon_help_section() -> String {
+    let mut help = String::from(
+        "  coordinator       Run active coordinator (distributed control plane)\n\
+         clusterd          Run cluster control plane daemon (CCP)\n\
+         job-coordinator   Run per-job coordinator (JCP)\n\
+         executor          Run data-plane executor worker\n",
+    );
+    #[cfg(feature = "flight-sql")]
+    help.push_str("  flight-server     Run Arrow Flight SQL endpoint\n");
+    #[cfg(not(feature = "flight-sql"))]
+    help.push_str(
+        "  flight-server     Arrow Flight SQL endpoint [disabled; build with feature `flight-sql`]\n",
+    );
+    #[cfg(feature = "shuffle")]
+    help.push_str("  shuffle-svc       Run optional shuffle HTTP service\n");
+    #[cfg(not(feature = "shuffle"))]
+    help.push_str(
+        "  shuffle-svc       Optional shuffle HTTP service [disabled; build with feature `shuffle`]\n",
+    );
+    help
+}
+
+/// Dispatch `help daemons` output.
+pub fn help_daemons() -> CliResponse {
+    CliResponse::ok(format!("{}\n", daemons_help()))
+}

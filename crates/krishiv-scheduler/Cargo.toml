@@ -1,0 +1,72 @@
+[package]
+name = "krishiv-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description.workspace = true
+
+[features]
+etcd = ["dep:etcd-client"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+krishiv-common = { path = "../krishiv-common" }
+krishiv-ivm = { path = "../krishiv-ivm" }
+uuid = { workspace = true }
+arrow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+hex.workspace = true
+futures = { workspace = true }
+krishiv-state = { path = "../krishiv-state" }
+krishiv-metrics = { path = "../krishiv-metrics" }
+krishiv-plan = { path = "../krishiv-plan" }
+krishiv-proto = { path = "../krishiv-proto" }
+krishiv-shuffle = { path = "../krishiv-shuffle" }
+constant_time_eq = { workspace = true }
+rocksdb = { workspace = true }
+tempfile = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "sync", "signal"] }
+tokio-stream.workspace = true
+tonic.workspace = true
+tower = { workspace = true }
+tracing.workspace = true
+async-trait.workspace = true
+dashmap = { workspace = true }
+indexmap = { workspace = true }
+etcd-client = { version = "0.19", optional = true }
+thiserror = { workspace = true }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+arrow = { workspace = true }
+krishiv-connectors = { path = "../krishiv-connectors" }
+tempfile = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "krishiv-coordinator"
+path = "src/bin/krishiv_coordinator.rs"
+
+[[bin]]
+name = "krishiv-clusterd"
+path = "src/bin/krishiv_clusterd.rs"
+required-features = ["etcd"]
+
+[[bin]]
+name = "krishiv-job-coordinator"
+path = "src/bin/krishiv_job_coordinator.rs"
+
+[lints]
+workspace = true

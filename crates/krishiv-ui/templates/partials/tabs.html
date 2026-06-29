@@ -1,0 +1,10 @@
+<div class="tabs" role="tablist">
+  {% for tab in tabs %}
+  <a href="{{ tab.url }}"
+     class="tab {% if tab.active %}active{% endif %}"
+     role="tab"
+     aria-selected="{% if tab.active %}true{% else %}false{% endif %}">
+    {{ tab.label }}
+  </a>
+  {% endfor %}
+</div>

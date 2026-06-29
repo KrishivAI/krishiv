@@ -1,0 +1,75 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: krishiv-controller
+  labels:
+    app.kubernetes.io/name: krishiv
+    app.kubernetes.io/component: control-plane
+    app.kubernetes.io/part-of: krishiv
+rules:
+  - apiGroups:
+      - krishiv.io
+    resources:
+      - krishivjobs
+      - krishivjobs/status
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - services
+      - events
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: krishiv-controller
+  labels:
+    app.kubernetes.io/name: krishiv
+    app.kubernetes.io/component: control-plane
+    app.kubernetes.io/part-of: krishiv
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: krishiv-controller
+subjects:
+  - kind: ServiceAccount
+    name: krishiv-controller
+    namespace: krishiv-system

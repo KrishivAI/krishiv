@@ -1,0 +1,15 @@
+{% if items.len() == 0 %}
+<div class="empty-state">
+  <div class="empty-icon">{{ icon | default(value = "&#9744;") }}</div>
+  <div class="empty-title">{{ title }}</div>
+  <p class="empty-desc">{{ description }}</p>
+  {% if primary_action %}
+  <div class="empty-actions">
+    {{ primary_action }}
+    {% if secondary_action %}
+      {{ secondary_action }}
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}

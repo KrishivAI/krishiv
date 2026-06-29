@@ -1,0 +1,23 @@
+[package]
+name = "krishiv-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description.workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+arrow = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+chaos = []
+
+[lints]
+workspace = true

@@ -1,0 +1,222 @@
+{% extends "base.html" %}
+{% block title %}{{ job.summary.job_id }} · Krishiv{% endblock %}
+{% block nav_jobs %}active{% endblock %}
+{% block topbar_title %}Job: {{ job.summary.job_id }}{% endblock %}
+{% block content %}
+
+<nav class="breadcrumbs" aria-label="Breadcrumb">
+  <a href="/ui">Jobs</a>
+  <span class="crumb-sep">/</span>
+  <span class="crumb-current">{{ job.summary.job_id }}</span>
+  <span class="crumb-sep">/</span>
+  <a href="/ui/jobs/{{ job.summary.job_id }}/checkpoints">Checkpoints</a>
+  <span class="crumb-sep">/</span>
+  <a href="/ui/jobs/{{ job.summary.job_id }}/diagnose">Diagnose</a>
+</nav>
+
+<div id="live-region" data-live-interval="15000">
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">Stages</div>
+      <div class="stat-value">{{ job.summary.stage_count }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Tasks</div>
+      <div class="stat-value">{{ job.summary.task_count }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Running</div>
+      <div class="stat-value success">{{ job.summary.running_task_count }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Failed</div>
+      <div class="stat-value {% if job.summary.failed_task_count > 0 %}error{% endif %}">{{ job.summary.failed_task_count }}</div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom: 24px;">
+    <div class="panel-header">
+      <h2>Stage DAG</h2>
+    </div>
+    <div class="panel-body">
+      <div class="dag">
+        {% for stage in job.stages %}
+        <div class="dag-stage">
+          <div class="dag-stage-head">
+            {% if stage.state == "running" %}
+              <span class="badge badge-success">{{ stage.state }}</span>
+            {% elif stage.state == "active" %}
+              <span class="badge badge-success">{{ stage.state }}</span>
+            {% elif stage.state == "failed" %}
+              <span class="badge badge-error">{{ stage.state }}</span>
+            {% else %}
+              <span class="badge badge-neutral">{{ stage.state }}</span>
+            {% endif %}
+            <span class="dag-stage-name">{{ stage.stage_id }}</span>
+          </div>
+          <div class="dag-stage-info">{{ stage.task_count }} tasks &middot; {{ stage.retry_count }} retries{% if stage.shuffle_bytes_written > 0 %} &middot; {{ stage.shuffle_bytes_written / 1048576 }} MB shuffle{% endif %}</div>
+        </div>
+        {% if !loop.last %}<div class="dag-arrow">&rarr;</div>{% endif %}
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom: 24px;">
+    <div class="panel-header">
+      <h2>Stages</h2>
+    </div>
+    <div class="panel-body-compact">
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Stage</th>
+              <th>State</th>
+              <th>Retries</th>
+              <th>Tasks</th>
+              <th>Shuffle</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for stage in job.stages %}
+            <tr>
+              <td class="td-mono">{{ stage.stage_id }}</td>
+              <td>
+                {% if stage.state == "running" %}
+                  <span class="badge badge-success">{{ stage.state }}</span>
+                {% elif stage.state == "active" %}
+                  <span class="badge badge-success">{{ stage.state }}</span>
+                {% elif stage.state == "failed" %}
+                  <span class="badge badge-error">{{ stage.state }}</span>
+                {% else %}
+                  <span class="badge badge-neutral">{{ stage.state }}</span>
+                {% endif %}
+              </td>
+              <td class="td-mono">{{ stage.retry_count }}</td>
+              <td class="td-mono">{{ stage.task_count }}</td>
+              <td class="td-mono">
+                {% if stage.shuffle_bytes_written > 0 %}
+                  {{ stage.shuffle_bytes_written / 1048576 }} MB
+                  {% if stage.shuffle_partitions_available > 0 %}
+                    <span style="color: var(--text-soft);">({{ stage.shuffle_partitions_available }} parts)</span>
+                  {% endif %}
+                {% else %}
+                  &mdash;
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom: 24px;">
+    <div class="panel-header">
+      <h2>Tasks</h2>
+    </div>
+    <div class="panel-body-compact">
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Task</th>
+              <th>Stage</th>
+              <th>State</th>
+              <th>Executor</th>
+              <th>Attempt</th>
+              <th>Failures</th>
+              <th>Watermark</th>
+              <th>Offset</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for stage in job.stages %}
+            {% for task in stage.tasks %}
+            <tr>
+              <td class="td-mono">{{ task.task_id }}</td>
+              <td class="td-mono">{{ stage.stage_id }}</td>
+              <td>
+                {% if task.state == "running" %}
+                  <span class="badge badge-success">{{ task.state }}</span>
+                {% elif task.state == "active" %}
+                  <span class="badge badge-success">{{ task.state }}</span>
+                {% elif task.state == "failed" %}
+                  <span class="badge badge-error">{{ task.state }}</span>
+                {% else %}
+                  <span class="badge badge-neutral">{{ task.state }}</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if task.assigned_executor != "-" %}
+                <a href="/ui/executors/{{ task.assigned_executor }}">{{ task.assigned_executor }}</a>
+                {% else %}&mdash;{% endif %}
+              </td>
+              <td class="td-mono">{{ task.attempt }}</td>
+              <td class="td-mono">{% if task.failure_count > 0 %}<strong style="color: var(--error);">{{ task.failure_count }}</strong>{% else %}{{ task.failure_count }}{% endif %}</td>
+              <td class="td-mono">{{ task.last_watermark_display }}</td>
+              <td class="td-mono">{{ task.last_source_offset_display }}</td>
+            </tr>
+            {% if !task.failure_reason_display.is_empty() %}
+            <tr>
+              <td colspan="8" style="padding: 0 14px 8px;">
+                <div class="failure-detail" title="{{ task.failure_reason_display }}">&#x2715; {{ task.failure_reason_display }}</div>
+              </td>
+            </tr>
+            {% endif %}
+            {% endfor %}
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Executors</h2>
+    </div>
+    <div class="panel-body-compact">
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Executor</th>
+              <th>State</th>
+              <th>Slots</th>
+              <th>Host</th>
+              <th>Memory</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for executor in executors %}
+            <tr>
+              <td><a href="/ui/executors/{{ executor.executor_id }}">{{ executor.executor_id }}</a></td>
+              <td>
+                {% if executor.state == "healthy" %}
+                  <span class="badge badge-success">{{ executor.state }}</span>
+                {% elif executor.state == "active" %}
+                  <span class="badge badge-success">{{ executor.state }}</span>
+                {% elif executor.state == "lost" %}
+                  <span class="badge badge-error">{{ executor.state }}</span>
+                {% else %}
+                  <span class="badge badge-neutral">{{ executor.state }}</span>
+                {% endif %}
+              </td>
+              <td class="td-mono">{{ executor.slots }}</td>
+              <td>{{ executor.host }}</td>
+              <td class="td-mono">{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB / {{ executor.memory_limit_bytes.unwrap_or(0) / 1048576 }} MB{% else %}&mdash;{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <span class="refresh-note" hidden>refreshing</span>
+</div>
+{% endblock %}

@@ -1,0 +1,50 @@
+<aside class="sidebar" data-sidebar>
+  <div class="sidebar-brand">
+    <div class="brand-mark">K</div>
+    <span class="brand-name">Krishiv</span>
+  </div>
+
+  <nav class="sidebar-nav" aria-label="Main navigation">
+    <div class="nav-group">
+      <span class="nav-group-label">Overview</span>
+      <a href="/ui" class="nav-item {% block nav_home %}{% endblock %}">
+        <span class="nav-icon">&#9632;</span>
+        Home
+      </a>
+      <a href="/ui/history" class="nav-item {% block nav_history %}{% endblock %}">
+        <span class="nav-icon">&#9716;</span>
+        History
+      </a>
+    </div>
+
+    <div class="nav-group">
+      <span class="nav-group-label">Compute</span>
+      <a href="/ui" class="nav-item {% block nav_jobs %}{% endblock %}">
+        <span class="nav-icon">&#9881;</span>
+        Jobs
+      </a>
+      <a href="/ui/submit" class="nav-item {% block nav_sql %}{% endblock %}">
+        <span class="nav-icon">&#9000;</span>
+        SQL Console
+      </a>
+    </div>
+
+    <div class="nav-group">
+      <span class="nav-group-label">Infrastructure</span>
+      <a href="/ui/health" class="nav-item {% block nav_health %}{% endblock %}">
+        <span class="nav-icon">&#9829;</span>
+        Health
+      </a>
+      <a href="/ui/metrics" class="nav-item {% block nav_metrics %}{% endblock %}">
+        <span class="nav-icon">&#9776;</span>
+        Metrics
+      </a>
+    </div>
+  </nav>
+
+  <div class="sidebar-footer">
+    <a href="/api/v1/openapi.json" target="_blank" rel="noopener">
+      <span>&#8599;</span> API Docs
+    </a>
+  </div>
+</aside>

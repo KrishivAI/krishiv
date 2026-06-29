@@ -1,0 +1,76 @@
+# ── Build cache (optional, high-impact on CI and branch switching) ─────────────
+# sccache caches rustc invocations across builds and branches.
+# Install:  cargo binstall sccache   OR   cargo install sccache
+# Enable:   export RUSTC_WRAPPER=sccache   (add to your shell profile / CI env)
+# Stats:    sccache --show-stats
+#
+# [build]
+# rustc-wrapper = "sccache"
+
+# ── Linker selection ───────────────────────────────────────────────────────────
+# mold is 5-10x faster than GNU ld and 2-5x faster than lld on large link steps.
+# Install: apt install mold (Ubuntu 22+) | brew install mold (macOS)
+# The Linux targets below default to mold. If mold is not installed, fall back by
+# replacing "-fuse-ld=mold" with "-fuse-ld=lld" in the target sections below.
+# lld fallback install: apt install lld
+#
+# target-cpu=native is intentionally NOT set here: it breaks Docker builds and
+# cross-compilation silently (the binary won't run on any machine but the builder).
+# Set it per-profile in Cargo.toml or via RUSTFLAGS if you need native tuning
+# for a specific local benchmark.
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# aarch64 Linux (Graviton, Ampere, cloud ARM VMs)
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# musl targets for portable release binaries (k8s image, bare-metal releases).
+# No special linker flags — uses musl's built-in static linker.
+[target.x86_64-unknown-linux-musl]
+rustflags = []
+
+[target.aarch64-unknown-linux-musl]
+rustflags = []
+
+# Apple Silicon — ld64 is already fast; no linker override needed.
+# For further speedup install zld: brew install zld
+# then set: rustflags = ["-C", "link-arg=-fuse-ld=zld"]
+[target.aarch64-apple-darwin]
+rustflags = []
+
+[target.x86_64-apple-darwin]
+rustflags = []
+
+# ── Environment ───────────────────────────────────────────────────────────────
+# GCC 15 dropped the implicit <cstdint> transitive-include that older GCC/RocksDB
+# relied on. Force-including it fixes librocksdb-sys and any other C++ dep that
+# uses uint{8,16,32,64}_t without a direct <cstdint> include.
+[env]
+CXXFLAGS = "-include cstdint"
+
+# ── Cargo aliases (execution-mode shortcuts) ──────────────────────────────────
+# Usage: cargo <alias>  e.g. `cargo check-k8s`
+[alias]
+check-embedded    = "check -p krishiv --no-default-features --features embedded"
+check-single-node = "check -p krishiv --no-default-features --features single-node"
+check-distributed = "check -p krishiv --no-default-features --features bare-metal"
+check-k8s         = ["check", "-p", "krishiv", "-p", "krishiv-operator",
+                     "--no-default-features", "--features", "k8s"]
+
+build-single-node = ["build", "-p", "krishiv",
+                     "--no-default-features", "--features", "single-node",
+                     "--profile", "release"]
+build-distributed = ["build", "-p", "krishiv",
+                     "--no-default-features", "--features", "bare-metal",
+                     "--profile", "release"]
+build-k8s         = ["build", "-p", "krishiv", "-p", "krishiv-operator",
+                     "--no-default-features", "--features", "k8s",
+                     "--profile", "release"]
+
+test-sql          = "test -p krishiv-sql --lib"
+test-connectors   = "test -p krishiv-connectors --lib"
+test-scheduler    = "test -p krishiv-scheduler --lib"
+test-runtime      = "test -p krishiv-runtime --lib"
+test-operator     = "test -p krishiv-operator --lib"

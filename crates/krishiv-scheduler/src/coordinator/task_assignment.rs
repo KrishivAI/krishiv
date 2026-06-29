@@ -1,0 +1,1067 @@
+use super::{
+    Arc, AtomicOrdering, AttemptId, Coordinator, DashMap, ExecutorTaskAssignment, JobId, JobKind,
+    JobSpec, JobState, SchedulerError, SchedulerResult, SlotAwareScheduler, TASKS_ASSIGNED_TOTAL,
+    TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState, TaskStatusResponse,
+    is_in_process_task_endpoint, wire,
+};
+
+/// Shared per-endpoint gRPC channel cache.
+///
+/// Each value is an `Arc<OnceCell<Channel>>` so concurrent callers for the same
+/// endpoint coalesce onto a single connect (#43/#44).
+pub(crate) type ExecutorChannelMap =
+    Arc<DashMap<String, Arc<tokio::sync::OnceCell<tonic::transport::Channel>>>>;
+
+/// Env var for overriding the max concurrent task-assignment gRPC calls.
+///
+/// Default: 128. Raise for large clusters (> 100 executors) where the default
+/// caps assignment throughput. Lower in memory-constrained environments.
+const MAX_CONCURRENT_ASSIGNMENT_RPCS_ENV: &str = "KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS";
+
+/// Returns the effective concurrent-assignment RPC limit.
+pub(crate) fn max_concurrent_assignment_rpcs() -> usize {
+    std::env::var(MAX_CONCURRENT_ASSIGNMENT_RPCS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_ASSIGNMENT_RPCS)
+}
+
+/// Constant used in the few places that need it at compile time (e.g. semaphore
+/// construction with a literal). Callers that need a runtime value should call
+/// `max_concurrent_assignment_rpcs()` instead.
+pub(crate) const DEFAULT_MAX_CONCURRENT_ASSIGNMENT_RPCS: usize = 128;
+
+const MAX_ASSIGNMENT_DELIVERY_ATTEMPTS: usize = 3;
+const ASSIGNMENT_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";
+
+fn configured_executor_task_bearer_token() -> Option<String> {
+    std::env::var(EXECUTOR_TASK_BEARER_TOKEN_ENV)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+pub(crate) fn inject_executor_task_request_context(
+    req: tonic::Request<()>,
+) -> Result<tonic::Request<()>, tonic::Status> {
+    let mut req = krishiv_metrics::grpc::inject_trace_context(req)?;
+    if let Some(token) = configured_executor_task_bearer_token() {
+        let header = format!("Bearer {token}");
+        let value = tonic::metadata::MetadataValue::try_from(header.as_str()).map_err(|_| {
+            tonic::Status::internal(format!(
+                "{EXECUTOR_TASK_BEARER_TOKEN_ENV} contains characters that are invalid for gRPC metadata"
+            ))
+        })?;
+        req.metadata_mut().insert("authorization", value);
+    }
+    Ok(req)
+}
+
+pub(crate) fn round_robin_assignment_targets(
+    targets: Vec<(String, ExecutorTaskAssignment)>,
+) -> Vec<(String, ExecutorTaskAssignment)> {
+    let total = targets.len();
+    let mut by_endpoint: std::collections::BTreeMap<
+        String,
+        std::collections::VecDeque<ExecutorTaskAssignment>,
+    > = std::collections::BTreeMap::new();
+    for (endpoint, assignment) in targets {
+        by_endpoint
+            .entry(endpoint)
+            .or_default()
+            .push_back(assignment);
+    }
+
+    let mut queues: Vec<_> = by_endpoint.into_iter().collect();
+    let mut ordered = Vec::with_capacity(total);
+    while ordered.len() < total {
+        let mut progressed = false;
+        for (endpoint, queue) in &mut queues {
+            if let Some(assignment) = queue.pop_front() {
+                ordered.push((endpoint.clone(), assignment));
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    ordered
+}
+
+pub(crate) async fn collect_bounded_assignment_futures<T, E, Fut, It>(
+    futures: It,
+) -> Result<Vec<T>, E>
+where
+    Fut: std::future::Future<Output = Result<T, E>>,
+    It: IntoIterator<Item = Fut>,
+{
+    use futures::StreamExt;
+
+    let mut stream =
+        futures::stream::iter(futures).buffer_unordered(max_concurrent_assignment_rpcs());
+    let mut responses = Vec::new();
+    let mut first_err = None;
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(v) => responses.push(v),
+            Err(e) if first_err.is_none() => first_err = Some(e),
+            Err(_) => {}
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok(responses)
+}
+
+fn is_retryable_assignment_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+    )
+}
+
+async fn assignment_retry_backoff(attempt_idx: usize) {
+    let backoff_ms = 100u64.saturating_mul(1u64 << attempt_idx.min(4));
+    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+}
+
+impl Coordinator {
+    /// Re-assign all `Pending` tasks in a job to available executors.
+    ///
+    /// Called after a stage retry (P1.24) to move tasks from `Pending` back to
+    /// `Assigned` so `launch_assigned_tasks` can launch them.
+    ///
+    /// SC10: each stage's `ResourceProfile` is used to filter the executor pool
+    /// before placement so that tasks with a large memory requirement are only
+    /// placed on executors that have enough headroom.
+    pub fn assign_pending_tasks(&mut self, job_id: &JobId) -> SchedulerResult<usize> {
+        self.ensure_active()?;
+
+        // Fast-path: if NO executor is schedulable at all, bail early.
+        if self
+            .exec
+            .executors
+            .schedulable_executor_placements()
+            .is_empty()
+        {
+            return Err(SchedulerError::NoExecutors);
+        }
+        {
+            let job = self.find_job(job_id)?;
+            if job.state() == JobState::Queued {
+                return Ok(0);
+            }
+        }
+
+        // SC10: collect (stage_index, pending_task_ids, resource_profile) tuples
+        // so we can filter executors per-stage.
+        let stage_work: Vec<(Vec<TaskId>, Option<krishiv_proto::ResourceProfile>)> = {
+            let job = self.find_job(job_id)?;
+            job.stages
+                .iter()
+                .map(|s| {
+                    let pending: Vec<TaskId> = s
+                        .tasks()
+                        .iter()
+                        .filter(|t| t.state() == TaskState::Pending)
+                        .map(|t| t.task_id().clone())
+                        .collect();
+                    let profile = s.spec.resource_profile().cloned();
+                    (pending, profile)
+                })
+                .collect()
+        };
+
+        let mut total = 0usize;
+        for (pending_task_ids, profile) in stage_work {
+            if pending_task_ids.is_empty() {
+                continue;
+            }
+            // SC10: use profile-filtered executor pool for this stage.
+            let executors = self
+                .exec
+                .executors
+                .schedulable_placements_for_profile(profile.as_ref());
+            if executors.is_empty() {
+                // No executor satisfies this stage's resource requirements yet;
+                // leave the tasks Pending for the next dispatch tick.
+                continue;
+            }
+            let assignments =
+                SlotAwareScheduler::place_task_ids_with_load(&pending_task_ids, &executors)?;
+            let mut job = self.find_job_mut(job_id)?;
+            for task_id in &pending_task_ids {
+                if let Some(assignment) = assignments.iter().find(|a| a.task_id() == task_id) {
+                    job.apply_assignments(vec![assignment.clone()]);
+                    total += 1;
+                }
+            }
+        }
+
+        if total > 0 {
+            self.persist_job_record(
+                job_id,
+                krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile),
+            )?;
+        }
+        Ok(total)
+    }
+
+    /// Launch all assigned tasks for a job.
+    pub fn launch_assigned_tasks(&mut self, job_id: &JobId) -> SchedulerResult<usize> {
+        self.launch_assigned_task_assignments(job_id)
+            .map(|assignments| assignments.len())
+    }
+
+    /// Register batch SQL tables for a job.
+    pub fn register_batch_sql_tables(
+        &mut self,
+        job_id: JobId,
+        tables: Vec<crate::batch_sql::BatchSqlTable>,
+    ) {
+        self.batch_sql_job_tables.insert(job_id, tables);
+    }
+
+    /// Register inline input partitions for a batch-sql or bounded-window job.
+    pub fn register_job_input_partitions(
+        &mut self,
+        job_id: JobId,
+        partitions: Vec<krishiv_proto::InputPartition>,
+    ) {
+        self.job_input_partitions.insert(job_id, partitions);
+    }
+
+    /// Atomically submit a job with an exact task-to-input mapping.
+    pub(crate) fn submit_job_with_task_input_partitions(
+        &mut self,
+        job_spec: JobSpec,
+        partitions: std::collections::HashMap<TaskId, Vec<krishiv_proto::InputPartition>>,
+    ) -> SchedulerResult<()> {
+        let job_id = job_spec.job_id().clone();
+        if partitions.is_empty() {
+            return Err(SchedulerError::InvalidJob {
+                message: format!("job {job_id} has no task-scoped input partitions"),
+            });
+        }
+
+        let expected_task_ids: std::collections::HashSet<TaskId> = job_spec
+            .stages()
+            .iter()
+            .flat_map(|stage| stage.tasks())
+            .map(|task| task.task_id().clone())
+            .collect();
+        let actual_task_ids: std::collections::HashSet<TaskId> =
+            partitions.keys().cloned().collect();
+        if actual_task_ids != expected_task_ids {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "job {job_id} task-scoped input mapping does not exactly match its tasks"
+                ),
+            });
+        }
+        if let Some(task_id) = partitions
+            .iter()
+            .find_map(|(task_id, inputs)| inputs.is_empty().then_some(task_id))
+        {
+            return Err(SchedulerError::InvalidJob {
+                message: format!("task {task_id} has no input partitions"),
+            });
+        }
+
+        self.submit_job(job_spec)?;
+        self.job_task_input_partitions.insert(job_id, partitions);
+        Ok(())
+    }
+
+    /// Fence and prepare one input cycle for a registered continuous job.
+    ///
+    /// Continuous cycles reuse the task's assigned executor and retained
+    /// `stream:loop` operator state. Only one cycle may be assigned or running
+    /// for a job at a time.
+    pub(crate) fn prepare_continuous_input_cycle(
+        &mut self,
+        job_id: &JobId,
+        partitions: Vec<krishiv_proto::InputPartition>,
+    ) -> SchedulerResult<()> {
+        self.ensure_active()?;
+        if self.continuous_input_cycles.contains(job_id) {
+            return Err(SchedulerError::InvalidJob {
+                message: format!("continuous job {job_id} already has an input cycle in flight"),
+            });
+        }
+        if self
+            .job_inline_results
+            .get(job_id)
+            .is_some_and(|results| !results.is_empty())
+        {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "continuous job {job_id} has undrained output; drain it before pushing more input"
+                ),
+            });
+        }
+
+        let profile = self.durability_profile;
+        {
+            let mut job = self.find_job_mut(job_id)?;
+            if job.spec.kind() != JobKind::Streaming {
+                return Err(SchedulerError::InvalidJob {
+                    message: format!("job {job_id} is not a streaming job"),
+                });
+            }
+
+            let mut continuous_task_count = 0usize;
+            for stage in &mut job.stages {
+                for task in stage.tasks_mut() {
+                    let body =
+                        krishiv_plan::task_body_for_profile(task.spec.description(), profile)
+                            .map_err(|error| SchedulerError::InvalidJob {
+                                message: error.to_string(),
+                            })?;
+                    if !body.starts_with("stream:loop:") {
+                        continue;
+                    }
+                    continuous_task_count = continuous_task_count.saturating_add(1);
+                    if task.assigned_executor.is_none() || task.launch_in_flight {
+                        return Err(SchedulerError::InvalidJob {
+                            message: format!(
+                                "continuous job {job_id} is not idle and ready for input"
+                            ),
+                        });
+                    }
+                    match task.state {
+                        TaskState::Running | TaskState::Succeeded => {
+                            task.state = TaskState::Assigned;
+                        }
+                        TaskState::Assigned => {}
+                        _ => {
+                            return Err(SchedulerError::InvalidJob {
+                                message: format!(
+                                    "continuous job {job_id} is not idle and ready for input"
+                                ),
+                            });
+                        }
+                    }
+                    task.output_metadata = None;
+                    task.assigned_at_ms = None;
+                    task.last_progress_ms = None;
+                }
+                stage.refresh_state();
+            }
+            if continuous_task_count != 1 {
+                return Err(SchedulerError::InvalidJob {
+                    message: format!(
+                        "continuous job {job_id} must contain exactly one stream:loop task; \
+                         found {continuous_task_count}"
+                    ),
+                });
+            }
+            job.refresh_state();
+        }
+
+        self.job_input_partitions.insert(job_id.clone(), partitions);
+        self.continuous_input_cycles.insert(job_id.clone());
+        self.exec.notify.notify_waiters();
+        Ok(())
+    }
+
+    /// Roll back a cycle that could not be delivered to its executor.
+    pub(crate) fn abort_continuous_input_cycle(&mut self, job_id: &JobId) {
+        self.continuous_input_cycles.remove(job_id);
+        self.job_input_partitions.remove(job_id);
+        let Some(mut job) = self
+            .job_coordinators
+            .get(job_id)
+            .map(|coordinator| coordinator.write_record())
+        else {
+            return;
+        };
+        for stage in &mut job.stages {
+            for task in stage.tasks_mut() {
+                if task.state == TaskState::Assigned {
+                    task.state = TaskState::Succeeded;
+                    task.launch_in_flight = false;
+                    task.assigned_at_ms = None;
+                    task.last_progress_ms = None;
+                }
+            }
+            stage.refresh_state();
+        }
+        job.state = JobState::Running;
+    }
+
+    /// Complete a cycle while keeping the logical job active and the task
+    /// terminal for idempotent status retries.
+    pub(crate) fn complete_continuous_input_cycle(&mut self, job_id: &JobId, task_id: &TaskId) {
+        self.continuous_input_cycles.remove(job_id);
+        self.job_input_partitions.remove(job_id);
+        let Some(mut job) = self
+            .job_coordinators
+            .get(job_id)
+            .map(|coordinator| coordinator.write_record())
+        else {
+            return;
+        };
+        let completed = job
+            .stages
+            .iter()
+            .flat_map(|stage| stage.tasks())
+            .any(|task| task.task_id() == task_id && task.state == TaskState::Succeeded);
+        if completed {
+            // Keep the task terminal for idempotent terminal-status retries,
+            // but keep the logical continuous job active and ready for the
+            // next coordinator-fenced input cycle.
+            job.state = JobState::Running;
+        }
+    }
+
+    pub(crate) fn is_continuous_cycle_task(&self, job_id: &JobId, task_id: &TaskId) -> bool {
+        let profile = self.durability_profile;
+        self.job_coordinators
+            .get(job_id)
+            .map(|coordinator| coordinator.read_record())
+            .and_then(|job| {
+                job.stages
+                    .iter()
+                    .flat_map(|stage| stage.tasks())
+                    .find(|task| task.task_id() == task_id)
+                    .map(|task| {
+                        krishiv_plan::task_body_for_profile(task.spec.description(), profile)
+                            .is_ok_and(|body| body.starts_with("stream:loop:"))
+                    })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Launch all assigned tasks for a job and return executor transport assignments.
+    pub fn launch_assigned_task_assignments(
+        &mut self,
+        job_id: &JobId,
+    ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
+        tracing::debug!(
+            job_id = %job_id,
+            "launching assigned task assignments (JCP delegation and Notify will be used in two-tier model)"
+        );
+        self.ensure_active()?;
+
+        let assignment_start = std::time::Instant::now();
+
+        // SC11: cascade circuit breaker — pause all new assignments when many
+        // executors have failed in a short window (cluster instability).
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        if self.cascade_breaker_open(now_ms) {
+            tracing::debug!(
+                job_id = %job_id,
+                "SC11: cascade breaker open — skipping task launch"
+            );
+            return Ok(Vec::new());
+        }
+
+        // PRR Parallel Execution - Circuit Breaker (IMM-1):
+        // Filter out executors that have crossed the failure threshold before
+        // even attempting to launch tasks to them.
+        let failure_threshold = self.config.circuit_breaker_failure_threshold();
+        let bad_executors: std::collections::HashSet<_> = self
+            .exec
+            .executors
+            .executors_over_failure_threshold(failure_threshold)
+            .into_iter()
+            .collect();
+
+        let mut executor_leases = self.exec.executors.assignment_leases();
+        if !bad_executors.is_empty() {
+            executor_leases.retain(|(eid, _)| !bad_executors.contains(eid));
+            tracing::warn!(
+                job_id = %job_id,
+                bad_executor_count = bad_executors.len(),
+                "circuit breaker: filtered bad executors from launch candidates"
+            );
+        }
+
+        let batch_tables = self.batch_sql_job_tables.get(job_id).cloned();
+        let window_parts = self.job_input_partitions.get(job_id).cloned();
+        let task_window_parts = self.job_task_input_partitions.remove(job_id);
+        // Check whether the coordinator has recorded a hot-key skew override
+        // for this job. If so, pass it to the assignment builder so shuffle-write
+        // tasks launch with the corrected partition count. Consume the entry so
+        // the override is a one-shot: subsequent batches resume normal partitioning.
+        let skew_override = self.skew_repartition_overrides.remove(job_id);
+        let assignment_result = match self.find_job_mut(job_id) {
+            Ok(mut job) => job.launch_assigned_task_assignments(
+                &executor_leases,
+                batch_tables.as_deref(),
+                window_parts.as_deref(),
+                task_window_parts.as_ref(),
+                skew_override,
+            ),
+            Err(error) => Err(error),
+        };
+        if let Some(parts) = task_window_parts {
+            self.job_task_input_partitions.insert(job_id.clone(), parts);
+        }
+        let assignments = assignment_result?;
+        if !assignments.is_empty() {
+            self.persist_job_record(
+                job_id,
+                krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile),
+            )?;
+        }
+        // GAP-OB-01: Increment tasks_assigned counter.
+        TASKS_ASSIGNED_TOTAL.fetch_add(assignments.len() as u64, AtomicOrdering::Relaxed);
+        // Record task assignment latency for the avg-assignment-duration metric.
+        let elapsed_ms = assignment_start.elapsed().as_millis() as u64;
+        crate::metrics::record_task_assignment_duration_ms(elapsed_ms);
+        Ok(assignments)
+    }
+
+    /// Resolve executor task endpoints for launched assignments.
+    pub fn resolve_assignment_targets(
+        &self,
+        assignments: Vec<ExecutorTaskAssignment>,
+    ) -> SchedulerResult<Vec<(String, ExecutorTaskAssignment)>> {
+        tracing::debug!(
+            assignment_count = assignments.len(),
+            "resolving assignment targets for delivery"
+        );
+
+        for a in &assignments {
+            tracing::trace!(task_id = %a.task_id(), executor = %a.executor_id(), "resolving single assignment target");
+        }
+
+        let mut targets = Vec::with_capacity(assignments.len());
+        for assignment in assignments {
+            let endpoint = self
+                .exec
+                .executors
+                .find_executor(assignment.executor_id())?
+                .descriptor()
+                .task_endpoint()
+                .ok_or_else(|| SchedulerError::InvalidJob {
+                    message: format!(
+                        "executor {} has no task endpoint for assignment push",
+                        assignment.executor_id()
+                    ),
+                })?
+                .to_owned();
+            targets.push((endpoint, assignment));
+        }
+        Ok(targets)
+    }
+
+    /// Push pre-resolved assignments to executor task endpoints.
+    pub async fn deliver_assignment_targets(
+        &self,
+        targets: Vec<(String, ExecutorTaskAssignment)>,
+    ) -> SchedulerResult<Vec<(ExecutorTaskAssignment, TaskStatusResponse)>> {
+        let channels = self.executor_channels.clone();
+        Self::deliver_assignment_targets_with_channels(channels, targets).await
+    }
+
+    pub(crate) async fn deliver_assignment_targets_with_channels(
+        channels: ExecutorChannelMap,
+        targets: Vec<(String, ExecutorTaskAssignment)>,
+    ) -> SchedulerResult<Vec<(ExecutorTaskAssignment, TaskStatusResponse)>> {
+        // Inbox-backed in-process targets do not have a gRPC endpoint: they are
+        // delivered directly via `InProcessCoordinatorBridge` (see F4 / the
+        // `inprocess://` sentinel).  Logging would create noise; the in-process
+        // path pushes to the inbox before reaching this function.
+        let (in_process, remote): (Vec<_>, Vec<_>) = targets
+            .into_iter()
+            .partition(|(endpoint, _)| is_in_process_task_endpoint(endpoint));
+        if !in_process.is_empty() {
+            tracing::debug!(
+                count = in_process.len(),
+                "skipping gRPC dispatch for in-process task endpoints"
+            );
+        }
+
+        let futures =
+            round_robin_assignment_targets(remote)
+                .into_iter()
+                .map(|(endpoint, assignment)| {
+                    let channels = Arc::clone(&channels);
+                    async move {
+                        Self::deliver_assignment_target_with_retries(
+                            &channels, endpoint, assignment,
+                        )
+                        .await
+                    }
+                });
+
+        collect_bounded_assignment_futures(futures).await
+    }
+
+    async fn deliver_assignment_target_with_retries(
+        channels: &ExecutorChannelMap,
+        endpoint: String,
+        assignment: ExecutorTaskAssignment,
+    ) -> SchedulerResult<(ExecutorTaskAssignment, TaskStatusResponse)> {
+        for attempt_idx in 0..MAX_ASSIGNMENT_DELIVERY_ATTEMPTS {
+            let final_attempt = attempt_idx + 1 == MAX_ASSIGNMENT_DELIVERY_ATTEMPTS;
+            let channel = match Self::get_or_connect_channel_on_map(channels, &endpoint).await {
+                Ok(channel) => channel,
+                Err(error) => {
+                    if final_attempt {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        task_id = %assignment.task_id(),
+                        attempt = attempt_idx + 1,
+                        error = %error,
+                        "assignment channel connect failed; retrying"
+                    );
+                    assignment_retry_backoff(attempt_idx).await;
+                    continue;
+                }
+            };
+
+            let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+                channel,
+                inject_executor_task_request_context
+                    as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+            );
+            let wire_assignment = wire::executor_task_assignment_to_wire(assignment.clone())
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("wire encode for {endpoint}: {e}"),
+                })?;
+            let response = tokio::time::timeout(
+                ASSIGNMENT_DELIVERY_TIMEOUT,
+                client.assign_task(wire_assignment),
+            )
+            .await;
+
+            match response {
+                Ok(Ok(response)) => {
+                    let response = response.into_inner();
+                    return wire::task_status_response_from_wire(response)
+                        .map(|decoded| (assignment, decoded))
+                        .map_err(|error| SchedulerError::Transport {
+                            message: format!("wire decode from {endpoint}: {error}"),
+                        });
+                }
+                Ok(Err(status)) if is_retryable_assignment_status(&status) && !final_attempt => {
+                    channels.remove(&endpoint);
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        task_id = %assignment.task_id(),
+                        attempt = attempt_idx + 1,
+                        code = ?status.code(),
+                        error = %status,
+                        "assign_task rpc failed transiently; retrying"
+                    );
+                    assignment_retry_backoff(attempt_idx).await;
+                }
+                Ok(Err(status)) => {
+                    return Err(SchedulerError::Transport {
+                        message: format!("assign_task to {endpoint}: {status}"),
+                    });
+                }
+                Err(_elapsed) if !final_attempt => {
+                    channels.remove(&endpoint);
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        task_id = %assignment.task_id(),
+                        attempt = attempt_idx + 1,
+                        "assign_task rpc timed out; retrying"
+                    );
+                    assignment_retry_backoff(attempt_idx).await;
+                }
+                Err(_elapsed) => {
+                    return Err(SchedulerError::Transport {
+                        message: format!(
+                            "assign_task to {endpoint} timed out after {}s",
+                            ASSIGNMENT_DELIVERY_TIMEOUT.as_secs()
+                        ),
+                    });
+                }
+            }
+        }
+
+        Err(SchedulerError::Transport {
+            message: format!("assign_task to {endpoint}: retry loop exhausted"),
+        })
+    }
+
+    /// Launch assigned tasks and push them to executor-owned task endpoints.
+    ///
+    /// # Lock safety (GAP-4)
+    ///
+    /// This method takes `&mut self` for the sync prepare phase
+    /// (`launch_assigned_task_assignments` + `resolve_assignment_targets`), then
+    /// clones the channel map and calls the **static** `deliver_assignment_targets_with_channels`
+    /// so `self` is NOT borrowed during the async network I/O.
+    ///
+    /// **Important**: If you call this through a `SharedCoordinator.write()` guard the write
+    /// lock is still held for the duration of the await, because the borrow lives for the
+    /// entire async function body.  For the production dispatch path use
+    /// `JobCoordinator::spawn_job_orchestration_loops`, which explicitly drops the write guard
+    /// before awaiting.  This method is intended for tests and CLI tools where no shared lock
+    /// is involved.
+    pub async fn push_assigned_task_assignments(
+        &mut self,
+        job_id: &JobId,
+    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
+        let assignments = self.launch_assigned_task_assignments(job_id)?;
+        let targets = match self.resolve_assignment_targets(assignments) {
+            Ok(targets) => targets,
+            Err(error) => {
+                self.clear_launch_in_flight_for_job(job_id);
+                return Err(error);
+            }
+        };
+        // GAP-4: Clone the channel map BEFORE the await point. Because
+        // `deliver_assignment_targets_with_channels` is a static method that owns
+        // `channels`, `self` is not borrowed across the network I/O yield points.
+        // Callers that hold a `SharedCoordinator.write()` guard should prefer the
+        // `JobCoordinator` pattern (acquire lock → collect targets → drop lock → deliver).
+        let channels = self.executor_channels.clone();
+        let responses =
+            match Self::deliver_assignment_targets_with_channels(channels, targets).await {
+                Ok(responses) => responses,
+                Err(error) => {
+                    self.clear_launch_in_flight_for_job(job_id);
+                    return Err(error);
+                }
+            };
+        self.apply_assignment_dispatch_responses(job_id, &responses);
+        Ok(responses
+            .into_iter()
+            .map(|(_, response)| response)
+            .collect())
+    }
+
+    /// Cancel a job and push `CancelTask` RPCs to all executors owning running tasks.
+    ///
+    /// Partial RPC failures are logged but are not fatal for R3.1 — the
+    /// scheduler-side cancel is always applied.
+    pub async fn push_cancel_job(&mut self, job_id: &JobId) -> SchedulerResult<()> {
+        // Collect (endpoint, TaskCancellationRequest) for each running task.
+        let mut targets: Vec<(String, TaskCancellationRequest)> = Vec::new();
+        {
+            let job = self.find_job(job_id)?;
+            for stage in job.stages() {
+                for task in stage.tasks() {
+                    if task.state() == TaskState::Running
+                        && let Some(executor_id) = task.assigned_executor()
+                        && let Ok(record) = self.exec.executors.find_executor(executor_id)
+                        && let Some(endpoint) = record.descriptor().task_endpoint()
+                    {
+                        let attempt_id = AttemptId::try_new(task.attempt()).map_err(|e| {
+                            SchedulerError::InvalidJob {
+                                message: e.to_string(),
+                            }
+                        })?;
+                        let req = TaskCancellationRequest::new(TaskAttemptRef::new(
+                            job_id.clone(),
+                            stage.stage_id().clone(),
+                            task.task_id().clone(),
+                            attempt_id,
+                        ))
+                        .with_reason("job cancelled");
+                        targets.push((endpoint.to_owned(), req));
+                    }
+                }
+            }
+        }
+
+        // Cancel the job in scheduler state first.
+        self.cancel_job(job_id)?;
+
+        // Push cancel RPCs — partial failures are non-fatal.  Re-use the
+        // executor channel cache so we do not pay a TCP+TLS handshake per
+        // cancel target (F2).  Drive them concurrently.
+        let channels = self.executor_channels.clone();
+        let mut futures = futures::stream::FuturesUnordered::new();
+        for (endpoint, req) in targets {
+            if is_in_process_task_endpoint(&endpoint) {
+                tracing::debug!(endpoint = %endpoint, "skipping cancel for in-process executor");
+                continue;
+            }
+            let channels = channels.clone();
+            futures.push(async move {
+                let channel = match Self::get_or_connect_channel_on_map(&channels, &endpoint).await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        tracing::warn!(endpoint = %endpoint, error = %err, "push_cancel_job: connect failed");
+                        return;
+                    }
+                };
+                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+                    channel,
+                    inject_executor_task_request_context
+                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                );
+                if let Err(err) = client
+                    .cancel_task(wire::task_cancellation_request_to_wire(req))
+                    .await
+                {
+                    tracing::warn!(endpoint = %endpoint, error = %err, "push_cancel_job: cancel_task rpc failed");
+                }
+            });
+        }
+        use futures::stream::StreamExt;
+        while futures.next().await.is_some() {}
+        Ok(())
+    }
+
+    pub(crate) fn clear_launch_in_flight_for_job(&mut self, job_id: &JobId) {
+        let changed = {
+            let Some(mut job) = self
+                .job_coordinators
+                .get(job_id)
+                .map(|jc| jc.write_record())
+            else {
+                return;
+            };
+            let mut changed = false;
+            for stage in &mut job.stages {
+                for task in stage.tasks_mut() {
+                    if task.state() == TaskState::Assigned && task.launch_in_flight() {
+                        task.clear_launch_in_flight();
+                        changed = true;
+                    }
+                }
+                stage.refresh_state();
+            }
+            job.refresh_state();
+            changed
+        };
+        if changed
+            && let Err(error) = self.persist_job_record(
+                job_id,
+                krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile),
+            )
+        {
+            tracing::warn!(job_id = %job_id, error = %error, "failed to persist cleared launch state");
+        }
+    }
+
+    fn clear_launch_in_flight_for_task(&mut self, job_id: &JobId, task_id: &TaskId) {
+        let changed = {
+            let Some(mut job) = self
+                .job_coordinators
+                .get(job_id)
+                .map(|jc| jc.write_record())
+            else {
+                return;
+            };
+            let mut changed = false;
+            for stage in &mut job.stages {
+                let mut stage_changed = false;
+                for task in stage.tasks_mut() {
+                    if task.task_id() == task_id
+                        && task.state() == TaskState::Assigned
+                        && task.launch_in_flight()
+                    {
+                        task.clear_launch_in_flight();
+                        changed = true;
+                        stage_changed = true;
+                        break;
+                    }
+                }
+                if stage_changed {
+                    stage.refresh_state();
+                }
+            }
+            job.refresh_state();
+            changed
+        };
+        if changed
+            && let Err(error) = self.persist_job_record(
+                job_id,
+                krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile),
+            )
+        {
+            tracing::warn!(job_id = %job_id, task_id = %task_id, error = %error, "failed to persist cleared task launch state");
+        }
+    }
+
+    pub(crate) fn apply_assignment_dispatch_responses(
+        &mut self,
+        job_id: &JobId,
+        responses: &[(ExecutorTaskAssignment, TaskStatusResponse)],
+    ) -> usize {
+        tracing::debug!(
+            job_id = %job_id,
+            response_count = responses.len(),
+            "applying launch dispatch responses (JCP delegation may influence future retries)"
+        );
+
+        for (assignment, response) in responses {
+            tracing::trace!(
+                job_id = %job_id,
+                task_id = %assignment.task_id(),
+                disposition = ?response.disposition(),
+                "individual launch response"
+            );
+        }
+
+        let mut accepted = 0usize;
+        for (assignment, response) in responses {
+            match response.disposition() {
+                krishiv_proto::TransportDisposition::Accepted
+                | krishiv_proto::TransportDisposition::Duplicate => {
+                    accepted = accepted.saturating_add(1);
+                }
+                _ => self.clear_launch_in_flight_for_task(job_id, assignment.task_id()),
+            }
+        }
+        accepted
+    }
+
+    /// P1.2: Get or create a cached gRPC channel for the given executor endpoint.
+    ///
+    /// On a cache hit, clones the existing `Channel` (pointer-only cost).
+    /// On a miss, establishes a new TCP+TLS connection and stores it for reuse.
+    ///
+    /// #43/#44: concurrent callers for the *same* endpoint must not each open a
+    /// connection.  The map lock is taken only to get-or-insert a per-endpoint
+    /// `Arc<OnceCell>` (no I/O under the lock).  `get_or_try_init` on the owned
+    /// cell then guarantees exactly one task runs the connect while the rest
+    /// await its result.  Because the connect runs on the owned cell and not
+    /// under the map lock, a slow handshake never blocks lookups for other
+    /// endpoints (M6); a failed init leaves the cell empty so the next caller
+    /// retries the connect.
+    pub(crate) async fn get_or_connect_channel_on_map(
+        channels: &ExecutorChannelMap,
+        endpoint: &str,
+    ) -> SchedulerResult<tonic::transport::Channel> {
+        // Get-or-insert the per-endpoint cell, holding the shard lock only long
+        // enough to clone the Arc out.
+        let cell = channels
+            .entry(endpoint.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone();
+
+        // Connect (if needed) on the owned cell with no map lock held.
+        let channel = cell
+            .get_or_try_init(|| async {
+                let parsed = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+                    .map_err(|e| SchedulerError::InvalidJob {
+                        message: e.to_string(),
+                    })?;
+                parsed
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                    .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+                    .keep_alive_timeout(std::time::Duration::from_secs(20))
+                    .keep_alive_while_idle(true)
+                    .connect()
+                    .await
+                    .map_err(|e| SchedulerError::ExecutorUnavailable {
+                        endpoint: endpoint.to_string(),
+                        reason: e.to_string(),
+                    })
+            })
+            .await?;
+        Ok(channel.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use krishiv_proto::{
+        AttemptId, ExecutorId, JobId, LeaseGeneration, OutputContract, OutputContractKind,
+        PlanFragment, StageId, TaskAttemptRef, TaskId,
+    };
+
+    use super::*;
+
+    fn test_assignment(task_id: &str, executor_id: &str) -> ExecutorTaskAssignment {
+        ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-fair").unwrap(),
+                StageId::try_new("stage-fair").unwrap(),
+                TaskId::try_new(task_id).unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new(executor_id).unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        )
+    }
+
+    #[tokio::test]
+    async fn bounded_assignment_collector_limits_concurrency() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let limit = max_concurrent_assignment_rpcs();
+        let futures = (0..(limit + 8)).map(|_| {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, SchedulerError>(())
+            }
+        });
+
+        let responses = collect_bounded_assignment_futures(futures).await.unwrap();
+
+        assert_eq!(responses.len(), limit + 8);
+        assert!(
+            max_active.load(Ordering::SeqCst) <= limit,
+            "assignment dispatch must not exceed the configured concurrency cap"
+        );
+    }
+
+    #[test]
+    fn round_robin_assignment_targets_interleaves_executor_endpoints() {
+        let targets = vec![
+            (
+                "http://exec-a".to_owned(),
+                test_assignment("task-a1", "exec-a"),
+            ),
+            (
+                "http://exec-a".to_owned(),
+                test_assignment("task-a2", "exec-a"),
+            ),
+            (
+                "http://exec-a".to_owned(),
+                test_assignment("task-a3", "exec-a"),
+            ),
+            (
+                "http://exec-b".to_owned(),
+                test_assignment("task-b1", "exec-b"),
+            ),
+            (
+                "http://exec-c".to_owned(),
+                test_assignment("task-c1", "exec-c"),
+            ),
+            (
+                "http://exec-c".to_owned(),
+                test_assignment("task-c2", "exec-c"),
+            ),
+        ];
+
+        let ordered = round_robin_assignment_targets(targets);
+        let endpoint_order: Vec<_> = ordered
+            .iter()
+            .map(|(endpoint, _)| endpoint.as_str())
+            .collect();
+
+        assert_eq!(
+            endpoint_order,
+            vec![
+                "http://exec-a",
+                "http://exec-b",
+                "http://exec-c",
+                "http://exec-a",
+                "http://exec-c",
+                "http://exec-a",
+            ]
+        );
+    }
+}

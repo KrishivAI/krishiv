@@ -1,0 +1,8 @@
+<div class="filter-bar">
+  {% for chip in chips %}
+  <a href="{{ chip.url }}"
+     class="filter-chip {% if chip.active %}active{% endif %}">
+    {{ chip.label }}
+  </a>
+  {% endfor %}
+</div>

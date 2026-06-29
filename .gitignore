@@ -1,0 +1,44 @@
+# Rust build artifacts
+/target/
+.tmp/
+tmp/
+**/target/
+**/.fastembed_cache/
+/.DS_Store
+/.claude/worktrees/
+**/krishiv*.so
+/dist/docker/
+/vendor/
+
+
+
+# Python build artifacts
+crates/krishiv-python/.venv/
+crates/krishiv-python/dist/
+**/__pycache__/
+*.pyc
+
+.krishiv/local/*.json
+.antigravitycli/
+
+# Root-level log artifacts from daemon / test runs.
+# Prevents accidental inclusion during autonomous git add -A waves.
+# These are never committed source of truth.
+*.log
+coordinator.log
+executor.log
+flight.log
+scheduler.log
+*.db
+
+# Data directories
+tpch_sf1/
+tpch_sf10/
+
+# Untracked dev / scratch artifacts left at the repo root
+build.log
+op.log
+operator.log
+stream_bench.log
+store_head.rs
+.stream_bench

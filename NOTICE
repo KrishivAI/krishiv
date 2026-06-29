@@ -1,0 +1,117 @@
+Krishiv
+Copyright 2024-2026 Krishiv AI, Inc.
+
+This product includes software developed at Krishiv AI (https://krishiv.ai).
+
+---
+
+This product includes the following third-party software components,
+each of which is subject to its own license terms as indicated below.
+
+For the full text of each license see:
+  - Apache-2.0:   https://www.apache.org/licenses/LICENSE-2.0
+  - MIT:          https://opensource.org/licenses/MIT
+  - BSD-2-Clause: https://opensource.org/licenses/BSD-2-Clause
+  - BSD-3-Clause: https://opensource.org/licenses/BSD-3-Clause
+  - ISC:          https://opensource.org/licenses/ISC
+  - MPL-2.0:      https://www.mozilla.org/en-US/MPL/2.0/
+  - Zlib:         https://opensource.org/licenses/Zlib
+  - CC0-1.0:      https://creativecommons.org/publicdomain/zero/1.0/
+
+---
+
+Apache-licensed components (Apache-2.0):
+
+  apache-avro        https://github.com/apache/avro
+  arrow / arrow-*    https://github.com/apache/arrow-rs
+  backon              https://github.com/Xuanwo/backon
+  datafusion / datafusion-*  https://github.com/apache/datafusion
+  iceberg / iceberg-*  https://github.com/apache/iceberg-rust
+  opentelemetry / opentelemetry-*  https://github.com/open-telemetry/opentelemetry-rust
+  parquet             https://github.com/apache/arrow-rs
+  prost / prost-*     https://github.com/tokio-rs/prost
+  rocksdb             https://github.com/rust-rocksdb/rust-rocksdb
+  sqlparser           https://github.com/sqlparser-rs/sqlparser-rs
+  tonic / tonic-*     https://github.com/hyperium/tonic
+  aws-lc-rs           https://github.com/aws/aws-lc-rs
+  aws-lc-sys          https://github.com/aws/aws-lc-rs
+
+Apache-2.0 OR MIT dual-licensed components:
+
+  ahash               https://github.com/tkaitchuck/ahash
+  anyhow              https://github.com/dtolnay/anyhow
+  async-trait         https://github.com/dtolnay/async-trait
+  axum / axum-core    https://github.com/tokio-rs/axum
+  base64              https://github.com/marshallpierce/rust-base64
+  bitflags            https://github.com/bitflags/bitflags
+  bytes               https://github.com/tokio-rs/bytes
+  chrono              https://github.com/chronotope/chrono
+  clap                https://github.com/clap-rs/clap
+  dashmap             https://github.com/xacrimon/dashmap
+  futures             https://github.com/rust-lang/futures-rs
+  hashbrown           https://github.com/rust-lang/hashbrown
+  hyper               https://github.com/hyperium/hyper
+  indexmap            https://github.com/indexmap-rs/indexmap
+  jsonwebtoken        https://github.com/Keats/jsonwebtoken
+  pyo3                https://github.com/PyO3/pyo3
+  pyo3-async-runtimes https://github.com/awestlake87/pyo3-asyncio
+  rand                https://github.com/rust-random/rand
+  regex               https://github.com/rust-lang/regex
+  reqwest             https://github.com/seanmonstar/reqwest
+  serde               https://github.com/serde-rs/serde
+  serde_json          https://github.com/serde-rs/json
+  thiserror           https://github.com/dtolnay/thiserror
+  tokio               https://github.com/tokio-rs/tokio
+  tokio-stream        https://github.com/tokio-rs/tokio
+  tower               https://github.com/tower-rs/tower
+  tracing             https://github.com/tokio-rs/tracing
+  url                 https://github.com/servo/rust-url
+  uuid                https://github.com/uuid-rs/uuid
+
+MIT-licensed components:
+
+  assert-json-diff   https://github.com/davidpdrsn/assert-json-diff
+  async-stream       https://github.com/tokio-rs/async-stream
+  atoi               https://github.com/pacman82/atoi-rs
+  axum               https://github.com/tokio-rs/axum
+  lru                https://github.com/jeromefroe/lru-rs
+  mockito            https://github.com/lipanski/mockito
+  nom                https://github.com/rust-bakery/nom
+  ordered-float      https://github.com/reem/rust-ordered-float
+  pulldown-cmark     https://github.com/pulldown-cmark/pulldown-cmark
+  quick-xml          https://github.com/tafia/quick-xml
+  rdkafka / rdkafka-sys  https://github.com/fede1024/rust-rdkafka
+  schemars           https://github.com/GREsau/schemars
+  strum              https://github.com/Peternator7/strum
+
+BSD-3-Clause-licensed components:
+
+  bindgen            https://github.com/rust-lang/rust-bindgen
+  brotli             https://github.com/dropbox/rust-brotli
+
+ISC-licensed components:
+
+  rustls             https://github.com/rustls/rustls
+
+MPL-2.0-licensed components (file-level copyleft; modifications to these
+files must remain MPL-2.0):
+
+  (none directly — MPL-2.0 crates are transitive dependencies only)
+
+Other permissive licenses:
+
+  adler32   (Zlib)        https://github.com/remram44/adler32-rs
+  arrayref  (BSD-2-Clause)  https://github.com/droundy/arrayref
+  bzip2     (Apache-2.0 OR MIT)  https://github.com/trifectatechfoundation/bzip2-rs
+  cc        (Apache-2.0 OR MIT)  https://github.com/rust-lang/cc-rs
+  flatbuffers (Apache-2.0)   https://github.com/google/flatbuffers
+  lz4_flex  (MIT)          https://github.com/PSeitz/lz4_flex
+  zstd      (MIT)          https://github.com/gyscos/zstd-rs
+
+---
+
+This NOTICE file is provided for informational purposes in accordance with
+the Apache License, Version 2.0. The full dependency list including all
+transitive dependencies and their exact licenses can be generated with:
+
+  cargo install cargo-license && cargo license

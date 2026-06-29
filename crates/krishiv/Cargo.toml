@@ -1,0 +1,99 @@
+[package]
+name = "krishiv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Krishiv — hybrid batch and streaming compute engine"
+keywords = ["sql", "streaming", "arrow", "datafusion", "compute"]
+categories = ["database", "data-structures"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "krishiv"
+path = "src/main.rs"
+
+[features]
+# Features gate OPTIONAL DEPENDENCY FAMILIES, not code paths.
+# Execution mode (embedded / single-node / distributed) is always selected at
+# runtime via SessionBuilder or KRISHIV_MODE env var — no recompile needed.
+#
+# What features DO control:
+#   embedded    → no extra deps (baseline API surface, always compiles)
+#   single-node → pulls in Flight SQL server, shuffle service, Redb metadata
+#   distributed → pulls in Flight SQL server, shuffle service, etcd metadata
+#   k8s         → distributed + Kubernetes operator CRD + reconciler
+#
+# Design intent: keep binary surface predictable. A `--features embedded` build
+# still compiles all three runtime backends (EmbeddedBackend, SingleNodeBackend,
+# DistributedBackend) but omits Flight SQL, shuffle, etcd, and operator deps that
+# would never be activated in a pure in-process deployment.
+default = ["local"]
+
+# Build presets
+minimal = []
+local   = ["embedded", "single-node", "jemalloc"]
+full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "jemalloc"]
+
+# Deployment capability surfaces (gate optional dep families)
+embedded    = []                                                 # baseline; no optional deps
+single-node = ["flight-sql", "shuffle"]                        # local daemon + RocksDB metadata
+distributed = ["flight-sql", "shuffle", "etcd"]                 # remote cluster + etcd metadata
+bare-metal  = ["distributed"]                                    # alias: process-managed cluster
+cluster     = ["distributed"]                                    # alias: distributed
+k8s         = ["distributed", "dep:krishiv-operator", "krishiv-operator/k8s"]
+
+# Optional dependency families
+flight-sql = ["dep:krishiv-flight-sql"]
+shuffle = ["dep:krishiv-shuffle"]
+etcd = ["krishiv-scheduler/etcd"]
+kafka = ["krishiv-connectors/kafka"]
+state = ["krishiv-connectors/state"]
+# krishiv-sql no longer enables Iceberg by default, so the binary's iceberg
+# preset must re-enable it on the SQL layer to keep full/k8s builds unchanged.
+iceberg = ["krishiv-connectors/iceberg", "krishiv-sql/iceberg"]
+delta = ["krishiv-connectors/delta"]
+# jemalloc: replace the system allocator with jemalloc for lower contention and
+# smaller RSS on multi-threaded workloads. Enabled in all non-minimal presets.
+# Disable for WASM or environments where jemalloc fails to link.
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+krishiv-common = { path = "../krishiv-common" }
+krishiv-api = { path = "../krishiv-api" }
+krishiv-plan = { path = "../krishiv-plan" }
+krishiv-state = { path = "../krishiv-state" }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
+krishiv-metrics = { path = "../krishiv-metrics" }
+krishiv-operator = { path = "../krishiv-operator", optional = true, default-features = false }
+krishiv-ui = { path = "../krishiv-ui" }
+krishiv-proto = { path = "../krishiv-proto" }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-executor = { path = "../krishiv-executor" }
+krishiv-flight-sql = { path = "../krishiv-flight-sql", optional = true }
+krishiv-shuffle = { path = "../krishiv-shuffle", optional = true }
+krishiv-sql = { path = "../krishiv-sql" }
+arrow = { workspace = true }
+axum = { workspace = true }
+dotenvy = "0.15"
+libc = "0.2"
+tokio = { workspace = true }
+tonic = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parquet = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+arrow = { workspace = true }
+krishiv-runtime = { path = "../krishiv-runtime" }
+krishiv-plan = { path = "../krishiv-plan" }
+parquet = { workspace = true }
+tempfile = { workspace = true }
+

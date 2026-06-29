@@ -1,0 +1,22 @@
+<div class="panel">
+  {% if title %}
+  <div class="panel-header">
+    <h2>{{ title }}</h2>
+    {% if action %}
+    <span class="panel-action">{{ action }}</span>
+    {% endif %}
+  </div>
+  {% endif %}
+  <div class="panel-body-compact">
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>{% for col in columns %}<th>{{ col }}</th>{% endfor %}</tr>
+        </thead>
+        <tbody>
+          {{ body }}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>

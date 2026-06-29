@@ -1,0 +1,121 @@
+# syntax=docker/dockerfile:1.7
+#
+# Multi-stage Dockerfile with cargo-chef for layer-cached dependency builds.
+# Dependencies compile in a separate layer; source-only changes skip that layer entirely.
+#
+# Build args:
+#   FEATURES  Cargo feature set (default: k8s)
+#             embedded | single-node | bare-metal | k8s | full
+#
+# Usage:
+#   docker build -f Dockerfile.build -t localhost/krishiv:local .
+#   docker build --build-arg FEATURES=full -f Dockerfile.build -t krishiv:latest .
+
+# ── Stage 0: cargo-chef base (shared between planner and builder) ─────────────
+FROM rust:1.92-slim AS chef
+RUN cargo install cargo-chef cargo-sccache sccache --locked
+ENV RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/root/.cache/sccache
+WORKDIR /build
+
+# ── Stage 1: Planner — reads manifests, emits recipe.json ─────────────────────
+# Re-runs only when Cargo.toml or Cargo.lock changes.
+# cargo chef prepare captures the full workspace dep graph; the cook step
+# below scopes to only the packages we actually build (-p krishiv etc.),
+# so krishiv-python/pyo3 and other dev-only crate deps are never compiled.
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: Builder ──────────────────────────────────────────────────────────
+FROM chef AS builder
+
+ARG FEATURES=full
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl-dev \
+        pkg-config \
+        cmake \
+        mold \
+        clang \
+        libclang-dev \
+        g++ \
+        make \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CXXFLAGS="-include cstdint" \
+    CARGO_INCREMENTAL=0 \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+
+# Cook dependencies — cached as long as recipe.json (= Cargo.toml/Cargo.lock) is unchanged.
+# A source-only change hits this layer from cache and skips straight to the build below.
+# Package selection mirrors the final cargo build step below so cached dep layers match.
+#
+# Feature → extra packages:
+#   distributed/k8s → executor + scheduler bins + shuffle + flight-sql (+ operator for k8s)
+#   embedded/single-node → krishiv only
+#
+# RUSTFLAGS in CARGO_TARGET_*_RUSTFLAGS select `mold` as the linker. The env is
+# read by cargo when spawning rustc; the linker arg propagates to the final link
+# step. This is the documented way to set a custom linker per-target without
+# touching the project's `.cargo/config.toml`.
+COPY --from=planner /build/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    set -e; \
+    PKGS="-p krishiv"; \
+    case "$FEATURES" in \
+        *distributed*|*k8s*|*bare-metal*|*cluster*|*full*) \
+            PKGS="$PKGS -p krishiv-executor -p krishiv-scheduler -p krishiv-shuffle -p krishiv-flight-sql" ;; \
+    esac; \
+    case "$FEATURES" in *k8s*|*full*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
+    cargo chef cook $PKGS \
+        --recipe-path recipe.json \
+        --no-default-features --features "$FEATURES" \
+        --profile release --jobs $(nproc)
+
+# Copy source and build binaries (dep compilation above is already cached).
+# --locked ensures the build uses exactly the versions in Cargo.lock.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    set -e; \
+    PKGS="-p krishiv"; \
+    case "$FEATURES" in \
+        *distributed*|*k8s*|*bare-metal*|*cluster*|*full*) \
+            PKGS="$PKGS -p krishiv-executor -p krishiv-scheduler -p krishiv-shuffle -p krishiv-flight-sql" ;; \
+    esac; \
+    case "$FEATURES" in *k8s*|*full*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
+    OUTDIR="target/release"; \
+    cargo build --locked $PKGS \
+        --no-default-features --features "$FEATURES" \
+        --profile release --jobs $(nproc); \
+    mkdir -p /out; \
+    cp "$OUTDIR/krishiv" /out/krishiv; \
+    # Copy distributed daemon binaries when the feature set includes them.
+    for BIN in krishiv-executor krishiv-coordinator krishiv-clusterd \
+                krishiv-job-coordinator krishiv-shuffle-svc krishiv-flight-server; do \
+        [ -f "$OUTDIR/$BIN" ] && cp "$OUTDIR/$BIN" "/out/$BIN" || true; \
+    done; \
+    # krishiv-operator: only present for k8s/full builds.
+    if [ -f "$OUTDIR/krishiv-operator" ]; then \
+        cp "$OUTDIR/krishiv-operator" /out/krishiv-operator; \
+    fi
+
+# ── Stage 3: Runtime ──────────────────────────────────────────────────────────
+# Must match the glibc version of the builder (rust:1.92-slim is Debian Trixie).
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/ /usr/local/bin/
+
+ENTRYPOINT ["/usr/local/bin/krishiv"]

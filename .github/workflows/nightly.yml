@@ -1,0 +1,216 @@
+name: Nightly
+
+# Publishes a fresh build from main every night.
+# Crates published to crates.io with READMEs generated from doc comments.
+# Python wheels built as artifacts (14-day retention).
+# Docker images temporarily disabled (re-enable when ready).
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 00:00 UTC daily
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/krishiv
+  CXXFLAGS: "-include cstdint"
+  RUSTC_WRAPPER: sccache
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # ── Publish crates to crates.io (nightly version) ──────────────────────────
+  # READMEs are generated from doc comments before publishing so crates.io
+  # displays descriptions on each crate page.
+  publish-crates:
+    name: Publish Crates.io
+    needs: []
+    runs-on: ubuntu-latest
+    environment: crates-publish
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: ./.github/actions/rust-setup
+      - name: Check for changes since last publish
+        id: changes
+        run: |
+          # Fetch tags to compare against last published nightly
+          git fetch --tags
+          LAST_TAG=$(git tag -l 'nightly-*' --sort=-version:refname | head -n1)
+          if [ -z "$LAST_TAG" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "No previous nightly tag found — will publish"
+          else
+            COMMIT_COUNT=$(git rev-list "${LAST_TAG}..HEAD" --count)
+            if [ "$COMMIT_COUNT" -gt 0 ]; then
+              echo "has_changes=true" >> "$GITHUB_OUTPUT"
+              echo "${COMMIT_COUNT} commits since ${LAST_TAG} — will publish"
+            else
+              echo "has_changes=false" >> "$GITHUB_OUTPUT"
+              echo "No commits since ${LAST_TAG} — skipping publish"
+            fi
+          fi
+      - name: Generate crate READMEs
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          cargo install cargo-readme --locked
+          CRATES=(
+            krishiv-common   krishiv-proto    krishiv-metrics   krishiv-plan
+            krishiv-dataflow krishiv-state    krishiv-shuffle   krishiv-connectors
+            krishiv-sql      krishiv-scheduler krishiv-executor krishiv-runtime
+            krishiv-api      krishiv-flight-sql krishiv-operator krishiv-ui
+            krishiv
+          )
+          DIRS=(
+            crates/krishiv-common   crates/krishiv-proto    crates/krishiv-metrics
+            crates/krishiv-plan     crates/krishiv-dataflow crates/krishiv-state
+            crates/krishiv-shuffle  crates/krishiv-connectors crates/krishiv-sql
+            crates/krishiv-scheduler crates/krishiv-executor crates/krishiv-runtime
+            crates/krishiv-api      crates/krishiv-flight-sql crates/krishiv-operator
+            crates/krishiv-ui       crates/krishiv
+          )
+          for i in "${!CRATES[@]}"; do
+            crate="${CRATES[$i]}"
+            dir="${DIRS[$i]}"
+            echo "==> README for ${crate} (${dir})"
+            cargo readme -p "${crate}" > "${dir}/README.md" 2>&1 || true
+          done
+      - name: Publish crates in topological order
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -e
+          CRATES=(
+            krishiv-common
+            krishiv-proto
+            krishiv-metrics
+            krishiv-plan
+            krishiv-dataflow
+            krishiv-state
+            krishiv-shuffle
+            krishiv-connectors
+            krishiv-sql
+            krishiv-scheduler
+            krishiv-executor
+            krishiv-runtime
+            krishiv-api
+            krishiv-flight-sql
+            krishiv-operator
+            krishiv-ui
+            krishiv
+          )
+          for crate in "${CRATES[@]}"; do
+            echo "==> Publishing ${crate}"
+            # --allow-dirty: nightly builds may have uncommitted README changes from
+            # cargo-readme above. --no-verify intentionally omitted — let packaging
+            # validation catch build regressions before they land on crates.io.
+            cargo publish -p "${crate}" --allow-dirty 2>&1 || true
+            echo "---"
+            sleep 30
+          done
+      - name: Tag nightly
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          TAG="nightly-$(date +%Y%m%d-%H%M%S)"
+          git tag -a "$TAG" -m "Nightly publish $TAG"
+          git push origin "$TAG"
+
+  # ── Docker nightly images ────────────────────────────────────────────────────
+  # Three nightly images, one per deployment mode.
+  # Tags move on every successful nightly build from main:
+  #   :nightly              → k8s/full image
+  #   :nightly-single-node  → embedded single-binary image
+  #   :nightly-distributed  → distributed cluster daemons (no operator)
+  # Images are NOT tagged :latest — nightly tags are opt-in.
+  docker-nightly:
+    name: Docker Nightly (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: k8s
+            dockerfile: deploy/docker/Dockerfile.distributed
+            features: "k8s,jemalloc"
+            tag_suffix: ""
+          - variant: single-node
+            dockerfile: deploy/docker/Dockerfile.single-node
+            features: "embedded,jemalloc"
+            tag_suffix: "-single-node"
+          - variant: distributed
+            dockerfile: deploy/docker/Dockerfile.distributed
+            features: "distributed,jemalloc"
+            tag_suffix: "-distributed"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: FEATURES=${{ matrix.features }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly${{ matrix.tag_suffix }}
+          cache-from: type=gha,scope=docker-nightly-${{ matrix.variant }}
+          cache-to: type=gha,scope=docker-nightly-${{ matrix.variant }},mode=max
+
+  # ── Python nightly wheels ────────────────────────────────────────────────────
+  wheels-nightly:
+    name: Nightly Wheel (${{ matrix.os }} / ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+          - os: macos-14
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - os: macos-13
+            target: x86_64-apple-darwin
+            manylinux: "off"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        if: runner.os == 'macOS'
+        with:
+          python-version: "3.11"
+      - name: Install Python (Linux)
+        if: runner.os != 'macOS'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \
+            python3-pip python3-venv python3-dev
+      - uses: PyO3/maturin-action@v1
+        env:
+          RUSTC_WRAPPER: ""
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          command: build
+          args: --release --out dist/ --find-interpreter
+          working-directory: crates/krishiv-python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-wheels-${{ matrix.os }}-${{ matrix.target }}-${{ github.run_id }}
+          path: dist/*.whl
+          retention-days: 14

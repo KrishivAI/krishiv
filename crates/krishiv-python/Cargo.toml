@@ -1,0 +1,57 @@
+[package]
+name = "krishiv-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "krishiv_python"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+krishiv-api = { path = "../krishiv-api" }
+krishiv-delta = { path = "../krishiv-delta" }
+krishiv-ivm = { path = "../krishiv-ivm" }
+krishiv-runtime = { path = "../krishiv-runtime" }
+krishiv-common = { path = "../krishiv-common" }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse", "schema-registry", "iceberg", "hudi", "vector-sinks"] }
+krishiv-dataflow = { path = "../krishiv-dataflow" }
+krishiv-sql = { path = "../krishiv-sql" }
+krishiv-state = { path = "../krishiv-state" }
+krishiv-metrics = { path = "../krishiv-metrics" }
+krishiv-plan = { path = "../krishiv-plan" }
+arrow = { workspace = true }
+parquet = { workspace = true }
+pyo3 = { workspace = true }
+# B-1 fix: turn `sql_async` into a real Python awaitable (not a blocking
+# method dressed up as one). `pyo3-async-runtimes` bridges the Rust async runtime
+# (tokio, the only one we ship) to Python's asyncio event loop.
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+tokio = { workspace = true }
+futures.workspace = true
+jsonwebtoken.workspace = true
+serde_json.workspace = true
+constant_time_eq.workspace = true
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+kafka = ["krishiv-connectors/kafka", "krishiv-api/kafka"]
+iceberg = ["krishiv-connectors/iceberg"]
+kinesis = ["krishiv-connectors/kinesis"]
+pulsar = ["krishiv-connectors/pulsar-source"]
+cassandra = ["krishiv-connectors/cassandra"]
+elasticsearch = ["krishiv-connectors/elasticsearch"]
+hbase = ["krishiv-connectors/hbase"]
+ai = ["krishiv-connectors/vector-sinks"]
+vector-sinks = ["ai", "krishiv-connectors/vector-sinks"]
+qdrant = ["vector-sinks", "krishiv-connectors/qdrant"]
+pgvector = ["vector-sinks", "krishiv-connectors/pgvector"]
+
+[lints]
+workspace = true

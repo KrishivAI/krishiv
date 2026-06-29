@@ -1,0 +1,205 @@
+schema_version = 1
+
+[policy]
+canonical_relational_type = "DataFrame"
+rust_execution = "async-first"
+python_execution = "sync-convenience-and-asyncio"
+sql_protocol = "flight-sql-first"
+
+[[phases]]
+id = "A"
+name = "Inventory and stability labels"
+status = "implemented"
+exit_criteria = "Public inventories and parity metadata are validated in CI."
+
+[[phases]]
+id = "B"
+name = "Expression and type AST"
+status = "implemented"
+exit_criteria = "Rust, Python, and SQL lower equivalent expressions to one versioned AST."
+
+[[phases]]
+id = "C"
+name = "Canonical DataFrame and catalog"
+status = "implemented"
+exit_criteria = "One DataFrame identity and cross-language relational conformance."
+
+[[phases]]
+id = "D"
+name = "I/O, connectors, and Iceberg"
+status = "implemented"
+exit_criteria = "Typed options and certified distributed atomic commits."
+
+[[phases]]
+id = "E"
+name = "Query lifecycle and async correctness"
+status = "implemented"
+exit_criteria = "One QueryHandle path with cancellation, progress, timeout, and true awaitables."
+
+[[phases]]
+id = "F"
+name = "Structured streaming"
+status = "implemented"
+exit_criteria = "Unified bounded/unbounded relational source-to-sink API."
+
+[[phases]]
+id = "G"
+name = "Stateful process API"
+status = "implemented"
+exit_criteria = "Typed process functions, state, timers, side outputs, and rescaling restore."
+
+[[phases]]
+id = "H"
+name = "SQL and gateway completeness"
+status = "implemented"
+exit_criteria = "Published grammar, complete Iceberg DML, prepared statements, and operation control."
+
+[[phases]]
+id = "I"
+name = "1.0 stability gate"
+status = "implemented"
+exit_criteria = "Compatibility, parity, semantics, modes, durability, packaging, and performance gates pass."
+
+[[capabilities]]
+id = "api.inventory"
+phase = "A"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
+owner = "repository"
+
+[[capabilities]]
+id = "api.single-dataframe-identity"
+phase = "A"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "not_applicable"
+owner = "krishiv-api"
+
+[[capabilities]]
+id = "expr.structured-ast"
+phase = "B"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
+owner = "krishiv-api"
+
+[[capabilities]]
+id = "dataframe.relational-core"
+phase = "C"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
+owner = "krishiv-api"
+
+[[capabilities]]
+id = "catalog.namespaces-tables-functions"
+phase = "C"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
+owner = "krishiv-sql"
+
+[[capabilities]]
+id = "io.typed-reader-writer"
+phase = "D"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
+owner = "krishiv-connectors"
+
+[[capabilities]]
+id = "lakehouse.iceberg-atomic-dml"
+phase = "D"
+stability = "experimental"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
+owner = "krishiv-connectors"
+
+[[capabilities]]
+id = "query.lifecycle"
+phase = "E"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "not_applicable"
+owner = "krishiv-runtime"
+
+[[capabilities]]
+id = "python.true-asyncio"
+phase = "E"
+stability = "preview"
+rust = "not_applicable"
+python = "implemented"
+sql = "not_applicable"
+owner = "krishiv-python"
+
+[[capabilities]]
+id = "streaming.relational-source-sink"
+phase = "F"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "partial"
+owner = "krishiv-api"
+
+[[capabilities]]
+id = "streaming.process-state-timers"
+phase = "G"
+stability = "experimental"
+rust = "implemented"
+python = "implemented"
+sql = "not_applicable"
+owner = "krishiv-dataflow"
+
+[[capabilities]]
+id = "sql.gateway-and-dml"
+phase = "H"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
+owner = "krishiv-sql"
+
+[[capabilities]]
+id = "release.api-1.0"
+phase = "I"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
+owner = "repository"
+
+[[capabilities]]
+id = "api.item-metadata"
+phase = "A"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
+owner = "repository"
+
+[[capabilities]]
+id = "api.change-classification"
+phase = "A"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "implemented"
+owner = "repository"
+
+[[capabilities]]
+id = "api.generated-reports-stubs"
+phase = "A"
+stability = "preview"
+rust = "implemented"
+python = "implemented"
+sql = "not_applicable"
+owner = "repository"

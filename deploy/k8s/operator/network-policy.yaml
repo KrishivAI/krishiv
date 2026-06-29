@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: krishiv-coordinator-grpc
+  namespace: krishiv-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: operator
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: krishiv-system
+      ports:
+        - protocol: TCP
+          port: 2001
+        - protocol: TCP
+          port: 2002

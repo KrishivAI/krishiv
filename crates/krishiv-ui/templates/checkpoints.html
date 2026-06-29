@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Checkpoints · {{ job_id }} · Krishiv{% endblock %}
+{% block nav_jobs %}active{% endblock %}
+{% block topbar_title %}Checkpoints: {{ job_id }}{% endblock %}
+{% block content %}
+
+<nav class="breadcrumbs" aria-label="Breadcrumb">
+  <a href="/ui">Jobs</a>
+  <span class="crumb-sep">/</span>
+  <a href="/ui/jobs/{{ job_id }}">{{ job_id }}</a>
+  <span class="crumb-sep">/</span>
+  <span class="crumb-current">Checkpoints</span>
+</nav>
+
+{% if epochs.len() == 0 %}
+<div class="empty-state">
+  <div class="empty-icon">&#9716;</div>
+  <div class="empty-title">No checkpoints</div>
+  <p class="empty-desc">No checkpoint epochs exist for this job yet.</p>
+</div>
+{% else %}
+
+<div class="panel" style="margin-bottom: 24px;">
+  <div class="panel-header">
+    <h2>Epoch Timeline</h2>
+  </div>
+  <div class="panel-body">
+    <div class="ckpt-timeline">
+      {% for epoch in epochs %}
+      <div class="ckpt-node">
+        <div class="ckpt-dot{% if self.is_latest(epoch) %} latest{% endif %}"></div>
+        <span class="ckpt-label">Epoch {{ epoch }}</span>
+        {% if self.is_latest(epoch) %}
+        <span class="badge badge-gold">latest</span>
+        {% endif %}
+      </div>
+      {% if !loop.last %}<div class="ckpt-line"></div>{% endif %}
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-header">
+    <h2>All Epochs</h2>
+  </div>
+  <div class="panel-body-compact">
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>Epoch</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for epoch in epochs %}
+          <tr>
+            <td class="td-mono">{{ epoch }}</td>
+            <td>
+              {% if self.is_latest(epoch) %}
+                <span class="badge badge-success">committed</span>
+              {% else %}
+                <span class="badge badge-neutral">historical</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

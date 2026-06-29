@@ -1,0 +1,202 @@
+[workspace]
+members = [
+    "crates/krishiv",
+    "crates/krishiv-ivm",
+    "crates/krishiv-api",
+    "crates/krishiv-common",
+    "crates/krishiv-connectors",
+    "crates/krishiv-dataflow",
+    "crates/krishiv-delta",
+    "crates/krishiv-engine-core",
+    "crates/krishiv-executor",
+    "crates/krishiv-plan",
+    "crates/krishiv-proto",
+    "crates/krishiv-operator",
+    "crates/krishiv-runtime",
+    "crates/krishiv-scheduler",
+    "crates/krishiv-shuffle",
+    "crates/krishiv-sql",
+    "crates/krishiv-state",
+    "crates/krishiv-ui",
+    "crates/krishiv-python",
+    "crates/krishiv-flight-sql",
+    "crates/krishiv-sql-gateway",
+    "crates/krishiv-metrics",
+    "crates/krishiv-bench",
+    "crates/krishiv-chaos",
+]
+default-members = [
+    "crates/krishiv",
+    "crates/krishiv-ivm",
+    "crates/krishiv-api",
+    "crates/krishiv-common",
+    "crates/krishiv-connectors",
+    "crates/krishiv-dataflow",
+    "crates/krishiv-delta",
+    "crates/krishiv-engine-core",
+    "crates/krishiv-executor",
+    "crates/krishiv-plan",
+    "crates/krishiv-proto",
+    "crates/krishiv-operator",
+    "crates/krishiv-runtime",
+    "crates/krishiv-scheduler",
+    "crates/krishiv-shuffle",
+    "crates/krishiv-sql",
+    "crates/krishiv-state",
+    "crates/krishiv-ui",
+    "crates/krishiv-python",
+    "crates/krishiv-flight-sql",
+    "crates/krishiv-sql-gateway",
+    "crates/krishiv-metrics",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Krishiv — hybrid batch and streaming compute engine"
+documentation = "https://docs.rs/krishiv/latest/krishiv/"
+homepage = "https://krishiv.ai"
+repository = "https://github.com/KrishivAI/krishiv"
+keywords = ["arrow", "datafusion", "streaming", "sql", "dataflow"]
+categories = ["database", "data-structures", "asynchronous"]
+
+[workspace.dependencies]
+arrow = { version = "58.3.0", features = ["prettyprint", "ipc_compression", "csv", "json"] }
+arrow-flight = { version = "58.3.0", features = ["flight-sql-experimental"] }
+pyo3 = { version = "0.29.0", features = ["experimental-async"] }
+iceberg = "0.9.1"
+iceberg-catalog-rest = "0.9.1"
+iceberg-datafusion = "0.9.1"
+async-trait = "0.1"
+bytes = "1"
+object_store = "0.13.2"
+askama = "0.16.0"
+axum = "0.8.9"
+datafusion = "53.1.0"
+futures = "0.3"
+k8s-openapi = { version = "0.27.1", features = ["v1_31"] }
+kube = { version = "3.1.0", features = ["runtime"] }
+parquet = "58.3.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+prost = "0.14.4"
+prost-build = "0.14.4"
+protoc-bin-vendored = "3.2.0"
+tokio = { version = "1.52.3", features = ["fs", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1.18", features = ["net"] }
+tonic = { version = "0.14.6", features = ["transport", "tls-ring"] }
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tower = "0.5.3"
+http = "1"
+jsonwebtoken = "9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-opentelemetry = "0.33.0"
+opentelemetry = { version = "0.32.0", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32.0", features = ["trace"] }
+opentelemetry-stdout = { version = "0.32.0", features = ["trace"] }
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
+rocksdb = { version = "0.24.0", features = ["multi-threaded-cf"] }
+mockito = "1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "blocking"] }
+webpki-root-certs = "1.0"
+uuid = { version = "1", features = ["v4"] }
+lz4_flex = "0.11"
+twox-hash = "2.1"
+zstd = "0.13"
+thiserror = "1"
+ahash = "0.8"
+dashmap = "6.1"
+krishiv-delta = { path = "crates/krishiv-delta" }
+qdrant-client = "1.16"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+
+base64 = "0.22.1"
+constant_time_eq = "0.3"
+indexmap = "2"
+hex = "0.4"
+apache-avro = "0.17"
+chrono = { version = "0.4", features = ["serde"] }
+proptest = "1"
+regex = "1"
+sqlparser = "0.62.0"
+url = "2"
+urlencoding = "2.1"
+wiremock = "0.6"
+sysinfo = "0.35"
+vortex = { version = "0.75.0", features = ["files", "tokio"] }
+# Production allocator for server binaries. Reduces allocator contention 2-4x
+# on multi-threaded workloads and cuts peak RSS 10-20% vs the system allocator.
+# unprefixed_malloc_on_supported_platforms replaces malloc/free globally so
+# native extensions (DataFusion C++ code paths) also benefit.
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Deny unwrap/expect/panic workspace-wide. All violations have been
+# resolved with proper error handling; new code must not regress.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+# Runtime-panic equivalents — same risk class as panic/unwrap.
+todo = "deny"
+unimplemented = "deny"
+
+# Debug artifacts must not survive commit.
+dbg_macro = "deny"
+
+# Daemon process must use tracing, not stdout/stderr.
+print_stdout = "deny"
+print_stderr = "deny"
+
+# Readability: wildcard imports obscure symbol origins.
+wildcard_imports = "deny"
+
+# OOB indexing panics at runtime — use .get() with error handling.
+indexing_slicing = "deny"
+
+# Async correctness: holding a lock/refcell borrow across .await risks
+# deadlock or panic on the executor thread.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+
+
+[profile.dev]
+opt-level = 0
+debug = 0
+incremental = true
+split-debuginfo = "unpacked"
+
+# dev: non-optimized, fastest possible compile. opt-level 0 for every
+# crate (including workspace code). Debug=0 keeps artifacts small.
+# Trade-off: tests of our own code and of datafusion/arrow/parquet run
+# ~10-100x slower than opt-level 3. Use this for fast iteration only.
+# Use the `release` profile for benchmarks and CI build verification.
+[profile.dev.package."*"]
+opt-level = 0
+debug = 0
+
+# release: highly optimized for production / CI. Whole-program fat LTO
+# performs cross-crate inlining on the datafusion → arrow → krishiv hot
+# path. codegen-units=1 unlocks inlining across module boundaries.
+# panic=abort removes all unwinding infrastructure (~5% size reduction,
+# minor speed boost). strip="symbols" gives the smallest binary.
+#
+# Compile cost: 3-5x longer than `dev`. Acceptable for CI jobs (where
+# correctness > wall-clock) and release builds. Do NOT use for local
+# iteration; use the default `dev` profile instead.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

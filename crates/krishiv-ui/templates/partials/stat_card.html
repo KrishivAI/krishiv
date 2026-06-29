@@ -1,0 +1,7 @@
+<div class="stat-card">
+  <div class="stat-label">{{ label }}</div>
+  <div class="stat-value {% if variant %}{{ variant }}{% endif %}">{{ value }}</div>
+  {% if subtitle %}
+  <div class="stat-change">{{ subtitle }}</div>
+  {% endif %}
+</div>

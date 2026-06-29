@@ -1,0 +1,41 @@
+[package]
+name = "krishiv-operator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The operator is a deployment surface; cluster builds keep both k8s and UI
+# enabled by default.
+default = ["cluster"]
+cluster = ["k8s", "ui"]
+k8s = ["dep:k8s-openapi", "dep:kube"]
+ui = ["dep:krishiv-ui"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+async-trait.workspace = true
+futures.workspace = true
+thiserror = { workspace = true }
+k8s-openapi = { workspace = true, optional = true }
+krishiv-state = { path = "../krishiv-state" }
+krishiv-common = { path = "../krishiv-common" }
+krishiv-proto = { path = "../krishiv-proto" }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
+axum = { workspace = true }
+krishiv-ui = { path = "../krishiv-ui", optional = true }
+kube = { workspace = true, optional = true }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "sync"] }
+tracing = { workspace = true }

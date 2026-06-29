@@ -1,0 +1,111 @@
+# syntax=docker/dockerfile:1.7
+#
+# Minimal production Docker image for Krishiv.
+#
+# Uses the pre-built binaries from Dockerfile.build and copies them into
+# a minimal runtime image. This image is ~50MB vs ~200MB for the full
+# builder-based image.
+#
+# Build prerequisites:
+#   just build-k8s          # or: cargo build --release --features k8s
+#   just stage              # copies binaries to dist/docker/
+#
+# Usage:
+#   docker build -f Dockerfile.prod -t krishiv:prod .
+#   docker build --build-arg BASE_IMAGE=debian:trixie-slim \
+#       -f Dockerfile.prod -t krishiv:prod .
+
+ARG BASE_IMAGE=debian:trixie-slim
+
+# ── Stage 1: Build binaries (reuse Dockerfile.build logic) ────────────────────
+# This stage is optional — if binaries are already built, use Dockerfile.fast.
+# For CI, we build from source to ensure reproducibility.
+FROM rust:1.92-slim AS builder
+
+ARG FEATURES=full
+
+RUN cargo install cargo-sccache sccache --locked && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        libssl-dev \
+        pkg-config \
+        cmake \
+        mold \
+        clang \
+        libclang-dev \
+        g++ \
+        make \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# RUSTFLAGS in CARGO_TARGET_*_RUSTFLAGS select `mold` as the linker. The env is
+# read by cargo when spawning rustc; the linker arg propagates to the final link
+# step. This is the documented way to set a custom linker per-target without
+# touching the project's `.cargo/config.toml`.
+ENV CXXFLAGS="-include cstdint" \
+    CARGO_INCREMENTAL=0 \
+    RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/root/.cache/sccache \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    set -e; \
+    PKGS="-p krishiv"; \
+    case "$FEATURES" in \
+        *distributed*|*k8s*|*bare-metal*|*cluster*|*full*) \
+            PKGS="$PKGS -p krishiv-executor -p krishiv-scheduler -p krishiv-shuffle -p krishiv-flight-sql" ;; \
+    esac; \
+    case "$FEATURES" in *k8s*|*full*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
+    OUTDIR="target/release"; \
+    cargo build --locked $PKGS \
+        --no-default-features --features "$FEATURES" \
+        --profile release --jobs $(nproc); \
+    mkdir -p /out; \
+    cp "$OUTDIR/krishiv" /out/krishiv; \
+    for BIN in krishiv-executor krishiv-coordinator krishiv-clusterd \
+                krishiv-job-coordinator krishiv-shuffle-svc krishiv-flight-server \
+                krishiv-operator; do \
+        [ -f "$OUTDIR/$BIN" ] && cp "$OUTDIR/$BIN" "/out/$BIN" || true; \
+    done
+
+# ── Stage 2: Minimal runtime ──────────────────────────────────────────────────
+# Strip debug symbols and copy only the binaries + CA certs.
+FROM ${BASE_IMAGE} AS runtime
+
+# Install only the minimal runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r krishiv && useradd -r -g krishiv krishiv
+
+# Copy all staged binaries. For embedded/single-node builds only krishiv is present;
+# for distributed/k8s builds the executor, coordinator, shuffle, and flight binaries
+# are also copied. The runtime image handles any combination gracefully.
+COPY --from=builder --chown=root:root /out/ /usr/local/bin/
+
+# Create data directories
+RUN mkdir -p /var/lib/krishiv/data /var/lib/krishiv/checkpoints /var/lib/krishiv/logs \
+    && chown -R krishiv:krishiv /var/lib/krishiv
+
+USER krishiv
+WORKDIR /var/lib/krishiv
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf http://localhost:50051/healthz || exit 1
+
+ENV RUST_LOG="info" \
+    KRISHIV_LOCAL_DATA_DIR="/var/lib/krishiv/data"
+
+EXPOSE 50051
+
+ENTRYPOINT ["/usr/local/bin/krishiv"]
+CMD ["local", "start"]

@@ -1,0 +1,59 @@
+name: Benchmarks
+
+# Only run on main branch pushes and manual dispatch — not on every PR —
+# to avoid burning runner minutes on benchmark noise.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CXXFLAGS: "-include cstdint"
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  bench:
+    name: TPC-H / Nexmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: bench
+      - uses: taiki-e/install-action@just
+
+      - name: Restore main baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: bench-baseline-main-
+          restore-keys: bench-baseline-main-
+
+      - name: Record benchmark environment
+        run: |
+          python3 scripts/benchmark_manifest.py \
+            --suite criterion \
+            --command "just bench" \
+            --output benchmark-manifest.json
+
+      - name: Run benchmarks
+        run: |
+          mkdir -p .tmp
+          just bench | tee bench-output.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.sha }}
+          path: |
+            bench-output.txt
+            benchmark-manifest.json
+          retention-days: 90
+
+      - name: Save main baseline
+        run: just bench-save main
+
+      - uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: bench-baseline-main-${{ github.sha }}

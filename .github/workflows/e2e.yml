@@ -1,0 +1,89 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    paths:
+      - "crates/krishiv-operator/**"
+      - "crates/krishiv-scheduler/**"
+      - "crates/krishiv-executor/**"
+      - ".github/workflows/e2e.yml"
+
+env:
+  CXXFLAGS: "-include cstdint"
+  # sccache shares object files across this job's `cargo build --release` and
+  # `cargo test --release` calls (both compile the same crates). With the new
+  # fat-LTO release profile the first compile takes ~15-20 min; sccache cuts
+  # the test step down to ~2-3 min on cold cache. Matches the env used by
+  # ci.yml / bench.yml / nightly.yml / release.yml.
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  # ── Kubernetes failover test via kind ────────────────────────────────────────
+  kind-e2e:
+    name: Kubernetes E2E
+    runs-on: ubuntu-latest
+    # 180 min covers: rust-setup (1-2 min cold) + sccache cold compile of
+    # krishiv-operator + krishiv-scheduler in --release mode (15-20 min cold,
+    # ~3-5 min warm) + `kind create cluster` (1-2 min) + the failover test
+    # (5-10 min) + buffer. Was 30 min before the fat-LTO profile change.
+    # 180 min gives a 3× headroom over the expected cold path for the new
+    # fat-LTO release profile; also handles flaky kind cluster bring-up.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: kind-e2e
+          extra-apt: protobuf-compiler
+      - name: Install kind
+        run: |
+          curl -sSLo ./kind https://kind.sigs.k8s.io/dl/v0.23.0/krishiv-linux-amd64
+          chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+      - name: Install kubectl
+        run: |
+          curl -sSLo ./kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+          chmod +x ./kubectl && sudo mv ./kubectl /usr/local/bin/kubectl
+      - run: kind create cluster --name krishiv-e2e --wait 60s
+      - run: cargo build -p krishiv-operator -p krishiv-scheduler --release
+      - name: Run failover integration test
+        env:
+          KRISHIV_E2E_KIND_CLUSTER: "true"
+          KUBECONFIG: ${{ env.HOME }}/.kube/config
+        run: cargo test -p krishiv-operator failover_stale_coordinator --release -- --nocapture
+      - name: Collect kind logs on failure
+        if: failure()
+        run: |
+          kind export logs ./kind-logs --name krishiv-e2e
+          tar -czf kind-logs.tar.gz ./kind-logs
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: kind-logs
+          path: kind-logs.tar.gz
+      - if: always()
+        run: kind delete cluster --name krishiv-e2e
+
+  # ── Bare-metal distributed cluster smoke tests ───────────────────────────────
+  bare-metal-e2e:
+    name: Bare-Metal E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: bare-metal-e2e
+          extra-apt: protobuf-compiler
+      - name: Build cluster binaries
+        run: |
+          cargo build -p krishiv-scheduler --bin krishiv-clusterd --features etcd
+          cargo build -p krishiv-executor
+      - name: Distributed scheduler integration tests
+        run: cargo test -p krishiv-scheduler --test distributed_e2e
+      - name: Distributed scheduler barrier tests
+        run: cargo test -p krishiv-scheduler --lib barrier
+      - name: Verify systemd service units present
+        run: |
+          test -f deploy/systemd/krishiv-clusterd.service
+          test -f deploy/systemd/krishiv-executor@.service

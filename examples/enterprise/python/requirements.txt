@@ -1,0 +1,13 @@
+# Enterprise example dependencies
+# Install with: pip install -r python/requirements.txt
+
+krishiv>=0.1.0               # core Krishiv Python bindings
+confluent-kafka>=2.4.0       # Kafka source/sink (librdkafka based)
+boto3>=1.34.0                # Kinesis + S3 (LocalStack compatible)
+elasticsearch>=8.13.0        # Elasticsearch sink
+cassandra-driver>=3.29.0     # Cassandra sink
+pyarrow>=16.0.0              # Arrow in-process
+pandas>=2.2.0                # DataFrame display helpers
+polars>=0.20.0               # alternative DataFrame display
+delta-spark>=3.2.0           # Delta Lake reads (Spark-based fallback)
+deltalake>=0.17.0            # Delta Lake reads/writes (pure Python)

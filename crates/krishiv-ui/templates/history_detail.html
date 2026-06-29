@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}{{ record.job_id }} · History · Krishiv{% endblock %}
+{% block nav_history %}active{% endblock %}
+{% block topbar_title %}History: {{ record.job_id }}{% endblock %}
+{% block content %}
+
+<nav class="breadcrumbs" aria-label="Breadcrumb">
+  <a href="/ui/history">History</a>
+  <span class="crumb-sep">/</span>
+  <span class="crumb-current">{{ record.job_id }}</span>
+</nav>
+
+<div class="stats-grid">
+  <div class="stat-card">
+    <div class="stat-label">Kind</div>
+    <div class="stat-value">{{ record.job_kind }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Final State</div>
+    <div class="stat-value">
+      {% if record.final_state == "succeeded" %}
+        <span class="badge badge-success">{{ record.final_state }}</span>
+      {% elif record.final_state == "committed" %}
+        <span class="badge badge-success">{{ record.final_state }}</span>
+      {% elif record.final_state == "failed" %}
+        <span class="badge badge-error">{{ record.final_state }}</span>
+      {% else %}
+        <span class="badge badge-neutral">{{ record.final_state }}</span>
+      {% endif %}
+    </div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Stages</div>
+    <div class="stat-value">{{ record.stage_count }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Tasks</div>
+    <div class="stat-value">{{ record.task_count }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Succeeded</div>
+    <div class="stat-value success">{{ record.succeeded_task_count }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Failed</div>
+    <div class="stat-value {% if record.failed_task_count > 0 %}error{% endif %}">{{ record.failed_task_count }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">CPU (ms)</div>
+    <div class="stat-value">{{ record.cpu_nanos / 1000000 }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Memory Peak</div>
+    <div class="stat-value">{{ record.memory_peak_task_bytes / 1048576 }} MB</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Priority</div>
+    <div class="stat-value">{{ record.priority }}</div>
+  </div>
+  {% if record.namespace_id.is_some() %}
+  <div class="stat-card">
+    <div class="stat-label">Namespace</div>
+    <div class="stat-value">{{ record.namespace_id.as_ref().unwrap() }}</div>
+  </div>
+  {% endif %}
+  <div class="stat-card">
+    <div class="stat-label">Completed At (ms)</div>
+    <div class="stat-value">{{ record.completed_at_ms }}</div>
+  </div>
+</div>
+{% endblock %}

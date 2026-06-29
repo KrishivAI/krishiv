@@ -1,0 +1,21 @@
+# KEDA ScaledObject for Krishiv executor pool (WS-10.6).
+# Requires KEDA installed in the cluster and a metrics source (Kafka lag or custom external scaler).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: krishiv-executor-pool
+  namespace: krishiv-system
+spec:
+  scaleTargetRef:
+    name: krishiv-executor-pool
+  minReplicaCount: 1
+  maxReplicaCount: 32
+  pollingInterval: 15
+  cooldownPeriod: 120
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka.krishiv-system.svc:9092
+        consumerGroup: krishiv-streaming
+        topic: events
+        lagThreshold: "1000"

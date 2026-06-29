@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "krishiv.fullname" . }}-executor
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "krishiv.labels" . | nindent 4 }}
+    app.kubernetes.io/component: executor
+spec:
+  replicas: {{ .Values.executor.replicas }}
+  selector:
+    matchLabels:
+      {{- include "krishiv.executorSelectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "krishiv.executorSelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "krishiv.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: executor
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krishiv"]
+          args:
+            - "executor"
+            - "--coordinator"
+            - "http://{{ include "krishiv.fullname" . }}-coordinator:{{ .Values.coordinator.port }}"
+            - "--connect"
+            - "--task-grpc-addr"
+            - "0.0.0.0:{{ .Values.executor.port }}"
+            - "--barrier-grpc-addr"
+            - "0.0.0.0:{{ .Values.executor.barrierPort }}"
+            - "--http-addr"
+            - "0.0.0.0:{{ .Values.executor.httpPort }}"
+            - "--shuffle-flight-addr"
+            - "0.0.0.0:{{ .Values.executor.shuffleFlightPort }}"
+            - "--durability-profile"
+            - {{ .Values.executor.durabilityProfile | quote }}
+            {{- if .Values.executor.shuffleDir }}
+            - "--shuffle-dir"
+            - {{ .Values.executor.shuffleDir | quote }}
+            {{- end }}
+            {{- if .Values.executor.shuffleUri }}
+            - "--shuffle-uri"
+            - {{ .Values.executor.shuffleUri | quote }}
+            {{- end }}
+            {{- if .Values.executor.stateDir }}
+            - "--state-dir"
+            - {{ .Values.executor.stateDir | quote }}
+            {{- end }}
+            {{- if .Values.executor.checkpointUri }}
+            - "--checkpoint-uri"
+            - {{ .Values.executor.checkpointUri | quote }}
+            {{- end }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.executor.port }}
+              protocol: TCP
+            - name: barrier
+              containerPort: {{ .Values.executor.barrierPort }}
+              protocol: TCP
+            - name: shuffle-flight
+              containerPort: {{ .Values.executor.shuffleFlightPort }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.executor.httpPort }}
+              protocol: TCP
+          env:
+            - name: KRISHIV_SERVICE_NAME
+              value: {{ .Values.observability.serviceName | quote }}
+            - name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH
+              value: "true"
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.coordinatorAuth.secretName | quote }}
+                  key: {{ .Values.coordinatorAuth.secretKey | quote }}
+            - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.executorTaskAuth.secretName | quote }}
+                  key: {{ .Values.executorTaskAuth.secretKey | quote }}
+            {{- if .Values.observability.otlpEndpoint }}
+            - name: KRISHIV_OTLP_ENDPOINT
+              value: {{ .Values.observability.otlpEndpoint | quote }}
+            {{- end }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KRISHIV_EXECUTOR_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            {{- toYaml .Values.executor.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30

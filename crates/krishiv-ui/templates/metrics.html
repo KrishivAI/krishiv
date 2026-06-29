@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block title %}Metrics · Krishiv{% endblock %}
+{% block nav_metrics %}active{% endblock %}
+{% block topbar_title %}Metrics{% endblock %}
+{% block content %}
+<div id="live-region" data-live-interval="15000">
+
+  <div class="panel" style="margin-bottom: 24px;">
+    <div class="panel-header">
+      <h2>Scheduler</h2>
+    </div>
+    <div class="panel-body">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Jobs Submitted</div>
+          <div class="stat-value">{{ scheduler.jobs_submitted_total }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Tasks Assigned</div>
+          <div class="stat-value">{{ scheduler.tasks_assigned_total }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Checkpoint Epochs</div>
+          <div class="stat-value">{{ scheduler.checkpoint_epochs_total }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Current Epoch</div>
+          <div class="stat-value gold">{{ scheduler.checkpoint_epoch_gauge }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom: 24px;">
+    <div class="panel-header">
+      <h2>Coordinator</h2>
+    </div>
+    <div class="panel-body">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Running Tasks</div>
+          <div class="stat-value success">{{ stability.running_task_count() }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Task Retries</div>
+          <div class="stat-value {% if stability.retry_count() > 0 %}warning{% endif %}">{{ stability.retry_count() }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Failed Assignments</div>
+          <div class="stat-value {% if stability.failed_assignments() > 0 %}error{% endif %}">{{ stability.failed_assignments() }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Shuffle Bytes Written</div>
+          <div class="stat-value">{{ stability.shuffle_bytes_written }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Jobs</div>
+          <div class="stat-value gold">{{ jobs_count }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Executors</div>
+          <div class="stat-value">{{ executors_count }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {% if scheduler.tasks_assigned_total > 0 %}
+  <div class="panel" style="margin-bottom: 24px;">
+    <div class="panel-header">
+      <h2>Averages</h2>
+    </div>
+    <div class="panel-body">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Avg Assignment Duration</div>
+          <div class="stat-value">{{ avg_duration_ms }} ms</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Global Runtime</h2>
+    </div>
+    <div class="panel-body">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Tasks Submitted</div>
+          <div class="stat-value">{{ global.tasks_submitted }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Tasks Succeeded</div>
+          <div class="stat-value success">{{ global.tasks_succeeded }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Tasks Failed</div>
+          <div class="stat-value {% if global.tasks_failed > 0 %}error{% endif %}">{{ global.tasks_failed }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Executor Lost</div>
+          <div class="stat-value {% if global.executor_lost > 0 %}warning{% endif %}">{{ global.executor_lost }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Shuffle Written</div>
+          <div class="stat-value">{{ global.shuffle_bytes_written }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Job Queue Depth</div>
+          <div class="stat-value gold">{{ global.job_queue_depth }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Spill Bytes</div>
+          <div class="stat-value {% if global.spill_bytes_total > 0 %}warning{% endif %}">{{ global.spill_bytes_total }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Spill Files</div>
+          <div class="stat-value">{{ global.spill_files_total }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Watermark Jobs</div>
+          <div class="stat-value">{{ global.watermark_entry_count }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">State Jobs</div>
+          <div class="stat-value">{{ global.state_key_entry_count }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <h2>System Resources</h2>
+    </div>
+    <div class="panel-body">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Process Memory (RSS)</div>
+          <div class="stat-value gold">{{ (system.process_memory_bytes / 1048576) }} MB</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Process CPU</div>
+          <div class="stat-value">{{ system.process_cpu_usage_x100 / 100 }}%</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Virtual Memory</div>
+          <div class="stat-value">{{ (system.process_virtual_memory_bytes / 1048576) }} MB</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Threads</div>
+          <div class="stat-value">{{ system.process_thread_count }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">System Total Memory</div>
+          <div class="stat-value">{{ (system.system_total_memory_bytes / 1048576) }} MB</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">System Available Memory</div>
+          <div class="stat-value success">{{ (system.system_available_memory_bytes / 1048576) }} MB</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">System CPU Usage</div>
+          <div class="stat-value">{{ system.system_cpu_usage_x100 / 100 }}%</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <span class="refresh-note" hidden>refreshing</span>
+</div>
+{% endblock %}

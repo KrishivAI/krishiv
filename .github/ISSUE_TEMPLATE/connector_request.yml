@@ -1,0 +1,33 @@
+name: Connector proposal
+description: Propose a new source, sink, or lakehouse integration
+title: "connector: "
+labels: ["connector", "needs-triage"]
+body:
+  - type: input
+    id: system
+    attributes:
+      label: External system and versions
+    validations:
+      required: true
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Direction
+      multiple: true
+      options: [Bounded source, Streaming source, Sink, Transactional sink, Catalog/lakehouse]
+    validations:
+      required: true
+  - type: textarea
+    id: capabilities
+    attributes:
+      label: Capabilities and recovery semantics
+      description: Describe replayable offsets, transactions, idempotence, schema evolution, and pushdowns.
+    validations:
+      required: true
+  - type: textarea
+    id: certification
+    attributes:
+      label: Test and certification plan
+      description: Follow docs/connector-sdk.md; new connectors begin experimental.
+    validations:
+      required: true

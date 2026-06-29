@@ -1,0 +1,52 @@
+# cargo deny configuration — https://embarkstudios.github.io/cargo-deny/
+# Run locally: cargo deny check
+# CI: EmbarkStudios/cargo-deny-action runs this automatically.
+
+# ── Licenses ─────────────────────────────────────────────────────────────────
+[licenses]
+# Allowlist of SPDX identifiers we accept.  Anything else fails the check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+# Minimum confidence for license text detection (0.0–1.0).
+confidence-threshold = 0.8
+
+# ── Banned / duplicate crates ─────────────────────────────────────────────────
+[bans]
+# Warn (not deny) on duplicate versions — large workspaces commonly carry a few.
+# Tighten to "deny" once the workspace is clean.
+multiple-versions = "warn"
+# Disallow wildcard version requirements (* or =*).
+wildcards = "deny"
+# Crates that must never appear in the dependency tree.
+deny = [
+    # openssl-sys pulls in the system OpenSSL; we use rustls everywhere.
+    { name = "openssl-sys" },
+    # Banned in favour of sha2 / ring (already in our dep tree).
+    { name = "md5" },
+    { name = "md-5" },
+]
+
+# ── Advisory database (RustSec) ───────────────────────────────────────────────
+# cargo-deny checks the advisory DB in addition to cargo-audit in CI.
+# Use `cargo deny check advisories` to test locally.
+[advisories]
+# Ignore specific advisory IDs only after reviewing them.
+ignore = []
+
+# ── Allowed crate sources ─────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

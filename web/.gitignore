@@ -1,0 +1,7 @@
+.next/
+.source/
+.open-next/
+.wrangler/
+node_modules/
+out/
+*.tsbuildinfo
