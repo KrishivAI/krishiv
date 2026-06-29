@@ -54,7 +54,14 @@ jobs:
           tar -xzf gitleaks.tar.gz gitleaks
           sudo mv gitleaks /usr/local/bin/gitleaks
       - name: Run gitleaks
-        run: gitleaks detect --source . --log-opts "HEAD~50..HEAD" --redact
+        run: |
+          DEPTH=$(git rev-list --count HEAD)
+          LOOK_BACK=$(( DEPTH < 50 ? DEPTH - 1 : 50 ))
+          if [ "$LOOK_BACK" -gt 0 ]; then
+            gitleaks detect --source . --log-opts "HEAD~${LOOK_BACK}..HEAD" --redact
+          else
+            gitleaks detect --source . --no-git --redact
+          fi
 
   # ── cargo audit: weekly advisory check against locked dependency tree ─────────
   audit:

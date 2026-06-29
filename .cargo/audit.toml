@@ -1,0 +1,12 @@
+# cargo audit configuration — https://docs.rs/cargo-audit
+# Mirrors the [advisories].ignore list in deny.toml for the rustsec/audit-check CI step.
+[advisories]
+ignore = [
+    # Marvin Attack on `rsa` — no patch available; pulled in by optional kinesis feature.
+    "RUSTSEC-2023-0071",
+    # rustls-webpki 0.101.7 advisories — from aws-smithy-http-client (optional kinesis feature).
+    # aws-sdk-kinesis 1.x pins rustls 0.21; upgrade tracked in deps backlog.
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0098",
+]

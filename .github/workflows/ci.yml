@@ -101,13 +101,20 @@ jobs:
           cache: pip
           cache-dependency-path: crates/krishiv-python/python/requirements*.txt
       - name: Install Python deps
-        run: pip3 install "maturin>=1.7,<2.0" pytest pytest-asyncio pyarrow pandas
+        run: |
+          python3 -m venv /tmp/krishiv-venv
+          . /tmp/krishiv-venv/bin/activate
+          pip install "maturin>=1.7,<2.0" pytest pytest-asyncio pyarrow pandas
       - name: Build and install krishiv-python
         working-directory: crates/krishiv-python
-        run: maturin develop --release
+        run: |
+          . /tmp/krishiv-venv/bin/activate
+          maturin develop --release
       - name: Pytest
         working-directory: crates/krishiv-python
-        run: pytest python/tests/ -q
+        run: |
+          . /tmp/krishiv-venv/bin/activate
+          pytest python/tests/ -q
 
   # ── Project hygiene (API surface, links, release metadata) ───────────────────
   hygiene:
