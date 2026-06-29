@@ -18,6 +18,12 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    # 0BSD: used by enum-iterator (transitive from qdrant-client)
+    "0BSD",
+    # CDLA-Permissive-2.0: used by webpki-root-certs / webpki-roots
+    "CDLA-Permissive-2.0",
+    # bzip2-1.0.6: used by libbz2-rs-sys (transitive from parquet compression)
+    "bzip2-1.0.6",
 ]
 # Minimum confidence for license text detection (0.0–1.0).
 confidence-threshold = 0.8
@@ -35,6 +41,11 @@ deny = [
     { name = "openssl-sys" },
     # Banned in favour of sha2 / ring (already in our dep tree).
     { name = "md5" },
+]
+# Allowed exceptions for banned-by-policy but unavoidable transitive deps.
+skip = [
+    # md-5 is pulled in by iceberg-datafusion → datafusion-functions as a
+    # non-cryptographic checksum utility; no direct use of MD5 by this project.
     { name = "md-5" },
 ]
 
@@ -43,7 +54,18 @@ deny = [
 # Use `cargo deny check advisories` to test locally.
 [advisories]
 # Ignore specific advisory IDs only after reviewing them.
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack on `rsa` crate — no patch available.
+    # `rsa` is pulled in by aws-sdk-kinesis (optional `kinesis` feature only).
+    # We don't expose RSA operations to external callers.
+    { id = "RUSTSEC-2023-0071" },
+    # RUSTSEC-2026-0104/0099/0098: rustls-webpki 0.101.7 advisories.
+    # Brought in by aws-smithy-http-client via the optional `kinesis` feature.
+    # aws-sdk-kinesis 1.x pins rustls 0.21; upgrade tracked in deps backlog.
+    { id = "RUSTSEC-2026-0104" },
+    { id = "RUSTSEC-2026-0099" },
+    { id = "RUSTSEC-2026-0098" },
+]
 
 # ── Allowed crate sources ─────────────────────────────────────────────────────
 [sources]
