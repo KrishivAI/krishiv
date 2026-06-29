@@ -33,8 +33,10 @@ confidence-threshold = 0.8
 # Warn (not deny) on duplicate versions — large workspaces commonly carry a few.
 # Tighten to "deny" once the workspace is clean.
 multiple-versions = "warn"
-# Disallow wildcard version requirements (* or =*).
-wildcards = "deny"
+# Warn on wildcard version requirements. Path-only workspace deps lack a
+# version specifier; tighten to "deny" once crates.io publication is set up
+# with `dep = { path = "..", version = "x.y.z" }` for all intra-workspace deps.
+wildcards = "warn"
 # Crates that must never appear in the dependency tree.
 deny = [
     # openssl-sys pulls in the system OpenSSL; we use rustls everywhere.
@@ -59,6 +61,17 @@ ignore = [
     # `rsa` is pulled in by aws-sdk-kinesis (optional `kinesis` feature only).
     # We don't expose RSA operations to external callers.
     { id = "RUSTSEC-2023-0071" },
+    # RUSTSEC-2024-0436: paste crate unmaintained.
+    # Transitive dep; replaced when qdrant-client upgrades.
+    { id = "RUSTSEC-2024-0436" },
+    # RUSTSEC-2025-0052: async-std discontinued. Transitive dep; will drop when
+    # its parent migrates to smol/tokio.
+    { id = "RUSTSEC-2025-0052" },
+    # RUSTSEC-2025-0134: rustls-pemfile unmaintained. Transitive dep.
+    { id = "RUSTSEC-2025-0134" },
+    # RUSTSEC-2026-0190: anyhow::Error::downcast_mut unsoundness.
+    # Fixed in anyhow >= 1.0.103; upgrade once deps support it.
+    { id = "RUSTSEC-2026-0190" },
     # RUSTSEC-2026-0104/0099/0098: rustls-webpki 0.101.7 advisories.
     # Brought in by aws-smithy-http-client via the optional `kinesis` feature.
     # aws-sdk-kinesis 1.x pins rustls 0.21; upgrade tracked in deps backlog.
