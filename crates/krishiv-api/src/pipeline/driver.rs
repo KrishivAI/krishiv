@@ -137,7 +137,7 @@ pub struct StreamingCheckpoint {
 }
 
 /// Save checkpoint state for streaming sources.
-pub async fn save_streaming_checkpoint(
+pub fn save_streaming_checkpoint(
     sources: &[StreamingSource],
     checkpoint_id: &str,
 ) -> Result<StreamingCheckpoint> {
@@ -161,7 +161,7 @@ pub async fn save_streaming_checkpoint(
 /// The connector validates that the encoded bytes belong to the source and name
 /// a valid read boundary.
 #[cfg(test)]
-pub async fn restore_streaming_checkpoint(
+pub fn restore_streaming_checkpoint(
     sources: &mut [StreamingSource],
     checkpoint: &StreamingCheckpoint,
 ) -> Result<()> {
@@ -822,8 +822,7 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
                 let checkpoint = save_streaming_checkpoint(
                     &streaming_sources,
                     &format!("cp-{}", checkpoint_counter),
-                )
-                .await?;
+                )?;
                 tracing::debug!(
                     timestamp_ms = checkpoint.timestamp_ms,
                     "Saved checkpoint {} with {} source offsets",
@@ -1154,7 +1153,6 @@ mod tests {
         assert_eq!(first.num_rows(), 1);
 
         let checkpoint = save_streaming_checkpoint(&sources, "cp-1")
-            .await
             .expect("checkpoint");
         assert_eq!(
             checkpoint.source_offsets.get("numbers"),
@@ -1178,7 +1176,6 @@ mod tests {
         );
 
         restore_streaming_checkpoint(&mut sources, &checkpoint)
-            .await
             .expect("restore");
 
         let replayed = sources[0]
