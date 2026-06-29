@@ -38,7 +38,7 @@
 
 # ── Stage 0: cargo-chef base ──────────────────────────────────────────────────
 FROM rust:1.92-slim AS chef
-RUN cargo install cargo-chef cargo-sccache sccache --locked
+RUN cargo install cargo-chef sccache --locked
 ENV RUSTC_WRAPPER=sccache \
     SCCACHE_DIR=/root/.cache/sccache
 WORKDIR /build

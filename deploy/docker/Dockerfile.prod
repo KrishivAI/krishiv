@@ -24,7 +24,7 @@ FROM rust:1.92-slim AS builder
 
 ARG FEATURES=full
 
-RUN cargo install cargo-sccache sccache --locked && \
+RUN cargo install sccache --locked && \
     apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         pkg-config \
