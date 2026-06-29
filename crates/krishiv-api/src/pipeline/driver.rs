@@ -1152,8 +1152,7 @@ mod tests {
             .expect("first batch");
         assert_eq!(first.num_rows(), 1);
 
-        let checkpoint = save_streaming_checkpoint(&sources, "cp-1")
-            .expect("checkpoint");
+        let checkpoint = save_streaming_checkpoint(&sources, "cp-1").expect("checkpoint");
         assert_eq!(
             checkpoint.source_offsets.get("numbers"),
             Some(&CursorOffset(1).encode())
@@ -1175,8 +1174,7 @@ mod tests {
             20
         );
 
-        restore_streaming_checkpoint(&mut sources, &checkpoint)
-            .expect("restore");
+        restore_streaming_checkpoint(&mut sources, &checkpoint).expect("restore");
 
         let replayed = sources[0]
             .source

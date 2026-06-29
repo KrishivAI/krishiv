@@ -257,8 +257,8 @@ crates/krishiv-api/src/pipeline/driver.rs::fn::mark_exhausted::pub fn mark_exhau
 crates/krishiv-api/src/pipeline/driver.rs::fn::new::pub fn new(config: BackpressureConfig) -> Self
 crates/krishiv-api/src/pipeline/driver.rs::fn::record_batch::pub fn record_batch(&mut self, batch: &RecordBatch)
 crates/krishiv-api/src/pipeline/driver.rs::fn::reset_after_step::pub fn reset_after_step(&mut self)
-crates/krishiv-api/src/pipeline/driver.rs::fn::restore_streaming_checkpoint::#[cfg(test)] pub async fn restore_streaming_checkpoint(
-crates/krishiv-api/src/pipeline/driver.rs::fn::save_streaming_checkpoint::pub async fn save_streaming_checkpoint(
+crates/krishiv-api/src/pipeline/driver.rs::fn::restore_streaming_checkpoint::#[cfg(test)] pub fn restore_streaming_checkpoint(
+crates/krishiv-api/src/pipeline/driver.rs::fn::save_streaming_checkpoint::pub fn save_streaming_checkpoint(
 crates/krishiv-api/src/pipeline/driver.rs::struct::BackpressureController::pub struct BackpressureController
 crates/krishiv-api/src/pipeline/driver.rs::struct::StreamingCheckpoint::#[derive(Debug, Clone)] pub struct StreamingCheckpoint
 crates/krishiv-api/src/pipeline/driver.rs::struct::StreamingSource::pub struct StreamingSource

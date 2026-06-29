@@ -2593,21 +2593,21 @@
     {
       "deprecated": false,
       "documentation": "crates/krishiv-api/src/pipeline/driver.rs#L163",
-      "id": "crates/krishiv-api/src/pipeline/driver.rs::fn::restore_streaming_checkpoint::#[cfg(test)] pub async fn restore_streaming_checkpoint(",
+      "id": "crates/krishiv-api/src/pipeline/driver.rs::fn::restore_streaming_checkpoint::#[cfg(test)] pub fn restore_streaming_checkpoint(",
       "kind": "fn",
       "name": "restore_streaming_checkpoint",
       "replacement": null,
-      "signature": "#[cfg(test)] pub async fn restore_streaming_checkpoint(",
+      "signature": "#[cfg(test)] pub fn restore_streaming_checkpoint(",
       "stability": "preview"
     },
     {
       "deprecated": false,
       "documentation": "crates/krishiv-api/src/pipeline/driver.rs#L140",
-      "id": "crates/krishiv-api/src/pipeline/driver.rs::fn::save_streaming_checkpoint::pub async fn save_streaming_checkpoint(",
+      "id": "crates/krishiv-api/src/pipeline/driver.rs::fn::save_streaming_checkpoint::pub fn save_streaming_checkpoint(",
       "kind": "fn",
       "name": "save_streaming_checkpoint",
       "replacement": null,
-      "signature": "pub async fn save_streaming_checkpoint(",
+      "signature": "pub fn save_streaming_checkpoint(",
       "stability": "preview"
     },
     {
