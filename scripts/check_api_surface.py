@@ -16,7 +16,7 @@ VALID_STABILITY = {"stable", "preview", "experimental", "internal"}
 PYCLASS_RE = re.compile(r'#\[pyclass(?:\(([^]]*)\))?\]\s*\npub struct\s+(\w+)', re.MULTILINE)
 PYCLASS_NAME_RE = re.compile(r'name\s*=\s*"([^"]+)"')
 PYMETHOD_RE = re.compile(
-    r'^\s*(?:pub\s+)?(?P<async>async\s+)?fn\s+(?P<name>[A-Za-z_]\w*)\s*\((?P<args>[^)]*)\)',
+    r'^\s*(?:pub\s+)?(?P<async>async\s+)?fn\s+(?P<name>[A-Za-z_]\w*)(?:<[^>]*>)?\s*\((?P<args>[^)]*)\)',
     re.MULTILINE,
 )
 PUBLIC_SIGNATURE_RE = re.compile(

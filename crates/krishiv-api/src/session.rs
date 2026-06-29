@@ -1666,9 +1666,10 @@ impl Session {
                 // The conversion is lossless — both are the same windowed-
                 // aggregation spec represented at different layers.
                 let plan_spec = spec.to_plan_spec();
-                let remote =
-                    block_on(krishiv_runtime::RemoteStreamingJob::create(url, &plan_spec, &name))
-                        .map_err(KrishivError::from)?;
+                let remote = block_on(krishiv_runtime::RemoteStreamingJob::create(
+                    url, &plan_spec, &name,
+                ))
+                .map_err(KrishivError::from)?;
                 Ok(crate::StreamJob::Remote(remote))
             }
             ExecutionMode::Embedded | ExecutionMode::SingleNode => {

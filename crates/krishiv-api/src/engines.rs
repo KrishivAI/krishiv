@@ -446,7 +446,7 @@ impl ComputeEngine for IncrementalEngine {
                                    name: &str,
                                    changelog: &ChangelogBatch,
                                    writers: &mut Vec<Box<dyn SinkWriter>>|
-         -> EngineResult<()> {
+               -> EngineResult<()> {
             if changelog.num_rows() == 0 {
                 return Ok(());
             }
@@ -644,10 +644,7 @@ impl ComputeEngine for StreamingEngine {
         // them) and emits their final aggregate. The watermark of the
         // checkpoint that follows remains at whatever the source reported, so
         // restore is consistent.
-        let final_flush = setup
-            .executor
-            .tick(i64::MAX)
-            .map_err(exec_err)?;
+        let final_flush = setup.executor.tick(i64::MAX).map_err(exec_err)?;
         if !final_flush.is_empty() {
             emit_to_writers(&mut writers, &final_flush).await?;
         }

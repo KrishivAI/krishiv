@@ -9,8 +9,8 @@ cargo := "cargo +" + rust_toolchain
 #   sccache:  cargo binstall sccache   (caches across branches and CI runs)
 #   nextest:  cargo binstall nextest   (parallel test runner, ~2x faster)
 #   mold:     apt install mold         (5-10x faster linker than lld)
-sccache_env  := if `which sccache 2>/dev/null` != "" { "RUSTC_WRAPPER=sccache" } else { "" }
-cargo_test   := if `which cargo-nextest 2>/dev/null` != "" { cargo + " nextest run" } else { cargo + " test" }
+sccache_env  := if `which sccache 2>/dev/null || true` != "" { "RUSTC_WRAPPER=sccache" } else { "" }
+cargo_test   := if `which cargo-nextest 2>/dev/null || true` != "" { cargo + " nextest run" } else { cargo + " test" }
 
 # Target triple for portable release binaries (k8s / bare-metal)
 target := env_var_or_default("TARGET", "x86_64-unknown-linux-musl")
