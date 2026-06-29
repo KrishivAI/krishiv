@@ -39,11 +39,16 @@ multiple-versions = "warn"
 wildcards = "warn"
 # Crates that must never appear in the dependency tree.
 deny = [
-    # openssl-sys pulls in the system OpenSSL; we use rustls everywhere.
-    { name = "openssl-sys" },
     # Banned in favour of sha2 / ring (already in our dep tree).
     { name = "md5" },
 ]
+# Note: openssl-sys is NOT banned here. The optional `pulsar-source` connector
+# (krishiv-connectors/pulsar feature) depends on `pulsar 6.8.0` which
+# hard-codes native-tls (no rustls alternative available in that version).
+# All first-party TLS — coordinator gRPC, executor gRPC, HTTP API — uses
+# rustls via tonic-tls-ring. OpenSSL is only linked when the pulsar feature
+# is explicitly enabled.
+#
 # Allowed exceptions for banned-by-policy but unavoidable transitive deps.
 skip = [
     # md-5 is pulled in by iceberg-datafusion → datafusion-functions as a
