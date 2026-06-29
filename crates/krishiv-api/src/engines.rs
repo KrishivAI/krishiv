@@ -123,6 +123,7 @@ async fn drain_source(
 /// [`SourceReader::next_changelog`]; CDC connectors surface true deletes and
 /// updates. The incremental engine drains through this so a delete in the
 /// source becomes a retraction in the maintained view.
+#[allow(dead_code)]
 async fn drain_changelog_source(
     rt: &EngineRuntime,
     spec: &krishiv_engine_core::SourceSpec,
@@ -406,7 +407,9 @@ impl ComputeEngine for IncrementalEngine {
                 "incremental engine needs at least one source".into(),
             ));
         }
-        let first_source = &job.sources[0];
+        let first_source = job.sources.first().ok_or_else(|| {
+            EngineError::InvalidJob("incremental engine needs at least one source".into())
+        })?;
         let mut first_reader = rt.sources.open(first_source).await?;
         let first_batch = first_reader.next_changelog().await?.ok_or_else(|| {
             EngineError::Source(format!(
@@ -478,7 +481,7 @@ impl ComputeEngine for IncrementalEngine {
         }
 
         // Drive every other source to EOF with the same streaming path.
-        for spec in &job.sources[1..] {
+        for spec in job.sources.get(1..).unwrap_or(&[]) {
             let mut reader = rt.sources.open(spec).await?;
             while let Some(changelog) = reader.next_changelog().await? {
                 if let Some(first) = source_schemas.iter_mut().find(|(n, _)| n == &spec.name) {
@@ -1263,12 +1266,12 @@ async fn run_streaming_continuous(
     // Await any in-flight background checkpoint and advance epoch if it
     // succeeded, so the final synchronous checkpoint carries the next
     // epoch in the gapless sequence.
-    if let Some((handle, epoch)) = bg_checkpoint.take() {
-        if matches!(handle.await, Ok(true)) {
-            setup.next_epoch = epoch.saturating_add(1);
-        }
-        // If it failed, next_epoch stays at `epoch` and the final synchronous
-        // checkpoint retries that epoch — no gap is introduced.
+    // If the background checkpoint failed, next_epoch stays at `epoch` and
+    // the final synchronous checkpoint retries that epoch — no gap is introduced.
+    if let Some((handle, epoch)) = bg_checkpoint.take()
+        && matches!(handle.await, Ok(true))
+    {
+        setup.next_epoch = epoch.saturating_add(1);
     }
     for writer in &mut writers {
         writer.flush().await?;
