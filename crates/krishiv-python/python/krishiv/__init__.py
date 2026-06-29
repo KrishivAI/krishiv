@@ -79,13 +79,13 @@ async def connect_async(url: str) -> Session:
     return Session.connect(url)
 
 
-_native_session_sql_async = Session.sql_async
+_native_session_sql = Session.sql
 
 
 async def _session_sql_async(self, query: str):
     """Plan SQL from async code (runs on a thread pool)."""
     loop = _asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _native_session_sql_async, self, query)
+    return await loop.run_in_executor(None, _native_session_sql, self, query)
 
 
 _native_dataframe_collect_async = DataFrame.collect_async

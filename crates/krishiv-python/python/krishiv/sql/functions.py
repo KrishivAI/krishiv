@@ -222,8 +222,6 @@ def try_cast(column: ColumnLike, data_type: str) -> Column:
 
 
 __all__ = [
-    "ColumnLike",
-    "ColumnOrName",
     "abs",
     "asc",
     "avg",
