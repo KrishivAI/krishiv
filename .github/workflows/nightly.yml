@@ -19,7 +19,6 @@ env:
 permissions:
   contents: write
   packages: write
-  workflows: write
 
 jobs:
   # ── Publish crates to crates.io (nightly version) ──────────────────────────
@@ -153,10 +152,16 @@ jobs:
           done
       - name: Tag nightly
         if: steps.changes.outputs.has_changes == 'true'
+        # GITHUB_TOKEN cannot push tags that point to commits modifying
+        # .github/workflows/ — GitHub blocks it without a PAT with 'workflow'
+        # scope. Use continue-on-error so a tag push failure does not fail
+        # the overall publish job. Set GH_WORKFLOW_PAT secret to fix this.
+        continue-on-error: true
         run: |
+          TOKEN="${{ secrets.GH_WORKFLOW_PAT || secrets.GITHUB_TOKEN }}"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
           TAG="nightly-$(date +%Y%m%d-%H%M%S)"
           git tag -a "$TAG" -m "Nightly publish $TAG"
           git push origin "$TAG"
