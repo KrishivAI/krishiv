@@ -301,24 +301,42 @@ jobs:
 
   # ── Docker Hub repository description ────────────────────────────────────────
   # Pushes the project README.md as the Docker Hub repository description so
-  # the Docker Hub page shows documentation. Runs independently of image builds.
+  # the Docker Hub page shows documentation. Runs after image manifests so the
+  # repository already exists on Docker Hub. Uses curl directly because the
+  # Docker Hub API auth flow differs from the registry auth used by docker push.
   dockerhub-description:
     name: Docker Hub README
+    needs: docker-nightly-merge
     runs-on: ubuntu-latest
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
-      - uses: peter-evans/dockerhub-description@v4
+      - name: Update Docker Hub repository description
         if: env.DOCKERHUB_USERNAME != ''
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ secrets.DOCKERHUB_USERNAME }}/krishiv
-          readme-filepath: ./README.md
-          short-description: "Krishiv — hybrid batch and streaming compute engine"
+        continue-on-error: true
+        run: |
+          set -e
+          # Acquire JWT token from Docker Hub API
+          LOGIN_RESP=$(curl -sf -X POST "https://hub.docker.com/v2/users/login/" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}")
+          JWT=$(echo "$LOGIN_RESP" | jq -r '.token // empty')
+          if [ -z "$JWT" ]; then
+            echo "WARNING: could not acquire Docker Hub JWT token — skipping README update"
+            exit 0
+          fi
+          # Push README as full description
+          README_JSON=$(jq -Rs '.' < README.md)
+          HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" -X PATCH \
+            "https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/krishiv/" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: JWT ${JWT}" \
+            -d "{\"description\":\"Krishiv — hybrid batch and streaming compute engine\",\"full_description\":${README_JSON}}")
+          echo "Docker Hub description updated (HTTP ${HTTP_CODE})"
 
   # ── Python nightly wheels ────────────────────────────────────────────────────
   wheels-nightly:
