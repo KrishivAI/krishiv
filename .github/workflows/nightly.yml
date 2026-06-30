@@ -229,10 +229,6 @@ jobs:
           # When cross-compiling to x86_64-apple-darwin on an ARM host, Rust
           # defaults to macOS 10.7 deployment target; rocksdb needs >= 10.13.
           MACOSX_DEPLOYMENT_TARGET: "10.15"
-          # fat LTO with all deps (rocksdb, arrow, kafka, aws-lc) OOMs the 16 GB
-          # arm64 runner at the final LTO merge step. thin LTO fits comfortably and
-          # is still a significant optimisation over no LTO.
-          CARGO_PROFILE_RELEASE_LTO: thin
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
