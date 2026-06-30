@@ -73,10 +73,10 @@ jobs:
             crates/krishiv-ui       crates/krishiv
           )
           for i in "${!CRATES[@]}"; do
-            crate="${CRATES[$i]}"
             dir="${DIRS[$i]}"
-            echo "==> README for ${crate} (${dir})"
-            cargo readme -p "${crate}" > "${dir}/README.md" 2>&1 || true
+            echo "==> README for ${dir}"
+            # cargo-readme must run from within the crate directory; it has no -p flag
+            (cd "${dir}" && cargo readme > README.md) || true
           done
       - name: Stamp nightly version
         if: steps.changes.outputs.has_changes == 'true'
