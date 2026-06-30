@@ -60,6 +60,7 @@ description = "Krishiv — hybrid batch and streaming compute engine"
 documentation = "https://docs.rs/krishiv/latest/krishiv/"
 homepage = "https://krishiv.ai"
 repository = "https://github.com/KrishivAI/krishiv"
+readme = "README.md"
 keywords = ["arrow", "datafusion", "streaming", "sql", "dataflow"]
 categories = ["database", "data-structures", "asynchronous"]
 

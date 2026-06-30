@@ -92,7 +92,7 @@ jobs:
         if: steps.changes.outputs.has_changes == 'true'
         run: |
           set -e
-          STAMP="$(date +%Y%m%d)"
+          STAMP="$(date +%Y%m%d%H%M)"
           NIGHTLY_VER="0.1.0-nightly.${STAMP}"
           echo "Stamping version ${NIGHTLY_VER}"
           # 1. Patch [workspace.package] version in root Cargo.toml (standalone line)
@@ -298,6 +298,27 @@ jobs:
             docker buildx imagetools create \
               -t "${DOCKERHUB_USERNAME}/krishiv:${TAG}" ${DIGESTS}
           fi
+
+  # ── Docker Hub repository description ────────────────────────────────────────
+  # Pushes the project README.md as the Docker Hub repository description so
+  # the Docker Hub page shows documentation. Runs independently of image builds.
+  dockerhub-description:
+    name: Docker Hub README
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: peter-evans/dockerhub-description@v4
+        if: env.DOCKERHUB_USERNAME != ''
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/krishiv
+          readme-filepath: ./README.md
+          short-description: "Krishiv — hybrid batch and streaming compute engine"
 
   # ── Python nightly wheels ────────────────────────────────────────────────────
   wheels-nightly:

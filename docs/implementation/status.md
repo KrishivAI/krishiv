@@ -1,5 +1,53 @@
 # Krishiv Implementation Status
 
+## 2026-06-30 — Docker image size optimization + nightly publish
+
+**Scope**: Shrink the distributed Docker image ~4x via multi-call binary,
+UPX, fat LTO, and curl elimination. Triggered nightly publish to Docker
+(GHCR), crates.io, and PyPI.
+
+### Optimizations implemented
+
+1. **Multi-call binary (BusyBox pattern)** — `main.rs` now dispatches on
+   `argv[0]`: when invoked via a symlink (`krishiv-coordinator`, etc.),
+   it translates to the equivalent `krishiv coordinator` subcommand. The
+   distributed Dockerfile ships ONE binary + 6 zero-byte symlinks instead
+   of 7 separate binaries, eliminating ~200 MB of duplicated
+   DataFusion/Arrow/tokio/tonic linkage.
+2. **Fat LTO** — `Cargo.toml` `[profile.release]` changed `lto = "thin"`
+   → `lto = "fat"` for cross-crate dead-code elimination (5-15% smaller
+   binaries).
+3. **UPX compression** — Both Dockerfiles run `upx --best --lzma` on the
+   release binary(ies) in the builder stage (50-65% binary reduction).
+4. **Drop curl** — Added `krishiv health` subcommand (zero-dependency
+   `std::net::TcpStream` probe, configurable via `KRISHIV_HEALTH_PORT`).
+   Both Dockerfiles replace `curl -sf http://localhost:2002/healthz`
+   with `CMD ["krishiv", "health"]`, saving ~5-8 MB.
+
+### Files changed
+
+- `crates/krishiv/src/main.rs` — `multipass_subcommand()` argv[0] dispatch
+- `crates/krishiv/src/daemon_cmd.rs` — `health` subcommand + `run_health_check()`
+- `Cargo.toml` — `lto = "fat"`
+- `deploy/docker/Dockerfile.distributed` — single binary + symlinks + UPX + no curl
+- `deploy/docker/Dockerfile.single-node` — UPX + no curl
+- `.github/workflows/nightly.yml` — fix `secrets` in step `if:` (use env var)
+
+### Validation
+
+- `cargo fmt --check` clean
+- `cargo clippy -p krishiv -- -D warnings` exit 0
+- Nightly workflow triggered (run 28446542751) — all 11 jobs in progress
+
+### Expected image sizes (post-optimization)
+
+| Image | Before | After (est.) |
+|---|---|---|
+| single-node | ~60-80 MB | ~25-40 MB |
+| distributed | ~200-300 MB | ~30-50 MB |
+
+---
+
 ## 2026-06-29 — Dead code: right architectural decision per scenario
 
 **Scope**: All 20 `#[allow(dead_code)]` sites in the workspace cataloged
