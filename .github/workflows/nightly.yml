@@ -274,5 +274,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: nightly-wheels-${{ matrix.os }}-${{ matrix.target }}-${{ github.run_id }}
-          path: dist/*.whl
+          path: crates/krishiv-python/dist/*.whl
           retention-days: 14
