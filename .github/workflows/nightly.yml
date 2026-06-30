@@ -226,13 +226,13 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
           CXXFLAGS: "-include cstdint"
-          # .cargo/config.toml sets -fuse-ld=mold for Linux targets; mold is not
-          # present in the manylinux container, so we clear the rustflags here.
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
           # When cross-compiling to x86_64-apple-darwin on an ARM host, Rust
           # defaults to macOS 10.7 deployment target; rocksdb needs >= 10.13.
           MACOSX_DEPLOYMENT_TARGET: "10.15"
+          # fat LTO with all deps (rocksdb, arrow, kafka, aws-lc) OOMs the 16 GB
+          # arm64 runner at the final LTO merge step. thin LTO fits comfortably and
+          # is still a significant optimisation over no LTO.
+          CARGO_PROFILE_RELEASE_LTO: thin
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
@@ -246,6 +246,15 @@ jobs:
             #   cmake              — aws-lc-sys and rocksdb-sys build C/C++ sources via cmake
             #   protobuf-compiler  — prost-build (krishiv-proto) needs protoc at build time
             dnf install -y clang clang-libs cmake protobuf-compiler || true
+            # Install mold — the fast linker. mold is not in AlmaLinux 8 repos so we
+            # download the statically-linked binary from the upstream release.
+            if ! command -v mold >/dev/null 2>&1; then
+              MOLD_VER="2.34.1"
+              ARCH="$(uname -m)"
+              curl -sSL \
+                "https://github.com/rui314/mold/releases/download/v${MOLD_VER}/mold-${MOLD_VER}-${ARCH}-linux.tar.gz" | \
+                tar xz -C /usr/local --strip-components=1
+            fi
             # Binary fallback for protoc if the package manager didn't provide it.
             if ! command -v protoc >/dev/null 2>&1; then
               PROTOC_VER="28.3"
