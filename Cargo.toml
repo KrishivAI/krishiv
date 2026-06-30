@@ -185,20 +185,22 @@ split-debuginfo = "unpacked"
 opt-level = 0
 debug = 0
 
-# release: highly optimized for production / CI. Whole-program fat LTO
-# performs cross-crate inlining on the datafusion → arrow → krishiv hot
-# path and eliminates dead code across crate boundaries, yielding 5-15%
-# smaller binaries vs thin LTO. codegen-units=1 unlocks inlining across
-# module boundaries. panic=abort removes all unwinding infrastructure
-# (~5% size reduction, minor speed boost). strip="symbols" gives the
-# smallest binary.
+# release: highly optimized for production / CI. Thin LTO performs
+# cross-crate inlining on the datafusion → arrow → krishiv hot path
+# without the peak RAM of fat LTO (fat LTO OOMs on arm64 Docker builds).
+# codegen-units=1 unlocks inlining across module boundaries.
+# panic=abort removes all unwinding infrastructure (~5% size reduction,
+# minor speed boost). strip="symbols" gives the smallest binary.
+# UPX compression in the Dockerfiles provides the bulk of the size
+# reduction (50-65%), making fat LTO's marginal 5-15% not worth the
+# OOM risk.
 #
 # Compile cost: 3-5x longer than `dev`. Acceptable for CI jobs (where
 # correctness > wall-clock) and release builds. Do NOT use for local
 # iteration; use the default `dev` profile instead.
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
