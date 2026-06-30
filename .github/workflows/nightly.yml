@@ -182,10 +182,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
-            manylinux: auto
+            manylinux: manylinux_2_28
           - os: ubuntu-latest
             target: aarch64
-            manylinux: auto
+            manylinux: manylinux_2_28
           - os: macos-14
             target: aarch64-apple-darwin
             manylinux: "off"
@@ -219,22 +219,20 @@ jobs:
           args: --release --out dist/ --find-interpreter
           working-directory: crates/krishiv-python
           before-script-linux: |
-            # Install build dependencies inside the manylinux container:
-            #   protobuf-compiler — prost-build (krishiv-proto) needs protoc.
-            #   clang / clang-devel — rocksdb-sys uses bindgen which needs libclang.
-            if command -v dnf >/dev/null 2>&1; then
-              dnf install -y clang clang-devel protobuf-compiler || true
-            elif command -v yum >/dev/null 2>&1; then
-              yum install -y clang clang-devel protobuf-compiler || true
-            fi
-            # Binary fallback for protoc if package manager didn't provide it.
+            # manylinux_2_28 = AlmaLinux 8; install build deps:
+            #   clang / clang-libs — rocksdb-sys uses clang-sys/bindgen (needs libclang >= 4.0;
+            #                        AlmaLinux 8 ships LLVM/clang 12 via AppStream)
+            #   cmake              — aws-lc-sys and rocksdb-sys build C/C++ sources via cmake
+            #   protobuf-compiler  — prost-build (krishiv-proto) needs protoc at build time
+            dnf install -y clang clang-libs cmake protobuf-compiler || true
+            # Binary fallback for protoc if the package manager didn't provide it.
             if ! command -v protoc >/dev/null 2>&1; then
               PROTOC_VER="28.3"
               ARCH="$(uname -m)"
               curl -sSL \
                 "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VER}/protoc-${PROTOC_VER}-linux-${ARCH}.zip" \
                 -o /tmp/protoc.zip
-              python3 -c "import zipfile,os; z=zipfile.ZipFile('/tmp/protoc.zip'); z.extract('bin/protoc','/tmp/protoc')"
+              python3 -c "import zipfile; zipfile.ZipFile('/tmp/protoc.zip').extract('bin/protoc','/tmp/protoc')"
               mv /tmp/protoc/bin/protoc /usr/local/bin/protoc
               chmod +x /usr/local/bin/protoc
             fi
