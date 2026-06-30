@@ -144,9 +144,11 @@ jobs:
           for crate in "${CRATES[@]}"; do
             echo "==> Publishing ${crate}"
             # --allow-dirty: nightly builds may have uncommitted README changes from
-            # cargo-readme above. --no-verify intentionally omitted — let packaging
-            # validation catch build regressions before they land on crates.io.
-            cargo publish -p "${crate}" --allow-dirty 2>&1 || true
+            # cargo-readme above. --no-verify: skip the "compile from crates.io" check.
+            # Some crates (krishiv-runtime, krishiv-api) have circular dev-dependencies
+            # through krishiv-flight-sql that make verification impossible; CI already
+            # validates builds before publish.
+            cargo publish -p "${crate}" --allow-dirty --no-verify 2>&1 || true
             echo "---"
             sleep 30
           done
