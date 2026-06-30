@@ -234,7 +234,7 @@ jobs:
               curl -sSL \
                 "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VER}/protoc-${PROTOC_VER}-linux-${ARCH}.zip" \
                 -o /tmp/protoc.zip
-              unzip -q /tmp/protoc.zip bin/protoc -d /tmp/protoc
+              python3 -c "import zipfile,os; z=zipfile.ZipFile('/tmp/protoc.zip'); z.extract('bin/protoc','/tmp/protoc')"
               mv /tmp/protoc/bin/protoc /usr/local/bin/protoc
               chmod +x /usr/local/bin/protoc
             fi
