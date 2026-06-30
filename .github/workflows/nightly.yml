@@ -78,6 +78,20 @@ jobs:
             echo "==> README for ${crate} (${dir})"
             cargo readme -p "${crate}" > "${dir}/README.md" 2>&1 || true
           done
+      - name: Stamp nightly version
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          set -e
+          STAMP="$(date +%Y%m%d)"
+          NIGHTLY_VER="0.1.0-nightly.${STAMP}"
+          echo "Stamping version ${NIGHTLY_VER}"
+          # Patch [workspace.package] version in root Cargo.toml
+          sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" Cargo.toml
+          # Patch all path dep version constraints in crate Cargo.tomls
+          find crates -name 'Cargo.toml' -exec \
+            sed -i "s/version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/g" {} \;
+          # Regenerate Cargo.lock with the new version
+          cargo generate-lockfile
       - name: Publish crates in topological order
         if: steps.changes.outputs.has_changes == 'true'
         env:
