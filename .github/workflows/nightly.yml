@@ -167,38 +167,108 @@ jobs:
           git push origin "$TAG"
 
   # ── Docker nightly images ────────────────────────────────────────────────────
-  # Three nightly images, one per deployment mode.
-  # Tags move on every successful nightly build from main:
+  # Multi-arch strategy: build each arch on its native runner (no QEMU),
+  # push digest-only to GHCR, then merge into a multi-arch manifest.
+  # Tags on final manifest:
   #   :nightly              → k8s/full image
   #   :nightly-single-node  → embedded single-binary image
   #   :nightly-distributed  → distributed cluster daemons (no operator)
-  # Images are NOT tagged :latest — nightly tags are opt-in.
-  docker-nightly:
-    name: Docker Nightly (${{ matrix.variant }})
-    runs-on: ubuntu-latest
+  docker-nightly-build:
+    name: Docker Nightly build (${{ matrix.variant }} / ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - variant: k8s
+            arch: amd64
+            runner: ubuntu-latest
+            dockerfile: deploy/docker/Dockerfile.distributed
+            features: "k8s,jemalloc"
+            tag_suffix: ""
+          - variant: k8s
+            arch: arm64
+            runner: ubuntu-24.04-arm
             dockerfile: deploy/docker/Dockerfile.distributed
             features: "k8s,jemalloc"
             tag_suffix: ""
           - variant: single-node
+            arch: amd64
+            runner: ubuntu-latest
+            dockerfile: deploy/docker/Dockerfile.single-node
+            features: "embedded,jemalloc"
+            tag_suffix: "-single-node"
+          - variant: single-node
+            arch: arm64
+            runner: ubuntu-24.04-arm
             dockerfile: deploy/docker/Dockerfile.single-node
             features: "embedded,jemalloc"
             tag_suffix: "-single-node"
           - variant: distributed
+            arch: amd64
+            runner: ubuntu-latest
             dockerfile: deploy/docker/Dockerfile.distributed
             features: "distributed,jemalloc"
             tag_suffix: "-distributed"
+          - variant: distributed
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            dockerfile: deploy/docker/Dockerfile.distributed
+            features: "distributed,jemalloc"
+            tag_suffix: "-distributed"
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
       - name: Lowercase image name
         run: echo "IMAGE_NAME=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          build-args: FEATURES=${{ matrix.features }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true
+          cache-from: type=gha,scope=docker-nightly-${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=docker-nightly-${{ matrix.variant }}-${{ matrix.arch }},mode=max
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" > /tmp/digests/${{ matrix.variant }}-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.variant }}-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.variant }}-${{ matrix.arch }}
+          retention-days: 1
+
+  docker-nightly-merge:
+    name: Docker Nightly manifest (${{ matrix.variant }})
+    needs: docker-nightly-build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: k8s
+            tag_suffix: ""
+          - variant: single-node
+            tag_suffix: "-single-node"
+          - variant: distributed
+            tag_suffix: "-distributed"
+    steps:
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -206,37 +276,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/login-action@v3
-        if: secrets.DOCKERHUB_USERNAME != ''
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and push (GHCR + Docker Hub)
-        uses: docker/build-push-action@v6
-        if: secrets.DOCKERHUB_USERNAME != ''
+      - uses: actions/download-artifact@v4
         with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64
-          push: true
-          build-args: FEATURES=${{ matrix.features }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly${{ matrix.tag_suffix }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/krishiv:nightly${{ matrix.tag_suffix }}
-          cache-from: type=gha,scope=docker-nightly-${{ matrix.variant }}
-          cache-to: type=gha,scope=docker-nightly-${{ matrix.variant }},mode=max
-      - name: Build and push (GHCR only)
-        uses: docker/build-push-action@v6
-        if: secrets.DOCKERHUB_USERNAME == ''
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64
-          push: true
-          build-args: FEATURES=${{ matrix.features }}
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly${{ matrix.tag_suffix }}
-          cache-from: type=gha,scope=docker-nightly-${{ matrix.variant }}
-          cache-to: type=gha,scope=docker-nightly-${{ matrix.variant }},mode=max
+          pattern: digest-${{ matrix.variant }}-*
+          merge-multiple: true
+          path: /tmp/digests
+      - name: Create and push multi-arch manifest
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          TAG="nightly${{ matrix.tag_suffix }}"
+          DIGESTS=$(cat /tmp/digests/${{ matrix.variant }}-* | sed 's|^|'"${IMAGE}@"'|')
+          docker buildx imagetools create -t "${IMAGE}:${TAG}" ${DIGESTS}
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            docker buildx imagetools create \
+              -t "${{ secrets.DOCKERHUB_USERNAME }}/krishiv:${TAG}" ${DIGESTS}
+          fi
 
   # ── Python nightly wheels ────────────────────────────────────────────────────
   wheels-nightly:
