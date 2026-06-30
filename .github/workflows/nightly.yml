@@ -58,20 +58,30 @@ jobs:
         if: steps.changes.outputs.has_changes == 'true'
         run: |
           cargo install cargo-readme --locked
+          # Topological order: leaves first, roots last.
+          # krishiv-bench and krishiv-chaos have publish=false and are excluded.
           CRATES=(
-            krishiv-common   krishiv-proto    krishiv-metrics   krishiv-plan
-            krishiv-dataflow krishiv-state    krishiv-shuffle   krishiv-connectors
-            krishiv-sql      krishiv-scheduler krishiv-executor krishiv-runtime
-            krishiv-api      krishiv-flight-sql krishiv-operator krishiv-ui
+            krishiv-common krishiv-proto krishiv-metrics krishiv-delta
+            krishiv-engine-core krishiv-ivm krishiv-plan krishiv-state krishiv-shuffle
+            krishiv-connectors
+            krishiv-dataflow krishiv-sql krishiv-scheduler
+            krishiv-executor krishiv-ui
+            krishiv-runtime krishiv-operator
+            krishiv-api
+            krishiv-flight-sql
             krishiv
           )
           DIRS=(
             crates/krishiv-common   crates/krishiv-proto    crates/krishiv-metrics
-            crates/krishiv-plan     crates/krishiv-dataflow crates/krishiv-state
-            crates/krishiv-shuffle  crates/krishiv-connectors crates/krishiv-sql
-            crates/krishiv-scheduler crates/krishiv-executor crates/krishiv-runtime
-            crates/krishiv-api      crates/krishiv-flight-sql crates/krishiv-operator
-            crates/krishiv-ui       crates/krishiv
+            crates/krishiv-delta    crates/krishiv-engine-core crates/krishiv-ivm
+            crates/krishiv-plan     crates/krishiv-state    crates/krishiv-shuffle
+            crates/krishiv-connectors
+            crates/krishiv-dataflow crates/krishiv-sql      crates/krishiv-scheduler
+            crates/krishiv-executor crates/krishiv-ui
+            crates/krishiv-runtime  crates/krishiv-operator
+            crates/krishiv-api
+            crates/krishiv-flight-sql
+            crates/krishiv
           )
           for i in "${!CRATES[@]}"; do
             dir="${DIRS[$i]}"
@@ -108,23 +118,28 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -e
+          # Topological order — each crate's deps are published before it.
+          # krishiv-bench/chaos have publish=false and are omitted.
           CRATES=(
             krishiv-common
             krishiv-proto
             krishiv-metrics
+            krishiv-delta
+            krishiv-engine-core
+            krishiv-ivm
             krishiv-plan
-            krishiv-dataflow
             krishiv-state
             krishiv-shuffle
             krishiv-connectors
+            krishiv-dataflow
             krishiv-sql
             krishiv-scheduler
             krishiv-executor
+            krishiv-ui
             krishiv-runtime
+            krishiv-operator
             krishiv-api
             krishiv-flight-sql
-            krishiv-operator
-            krishiv-ui
             krishiv
           )
           for crate in "${CRATES[@]}"; do
