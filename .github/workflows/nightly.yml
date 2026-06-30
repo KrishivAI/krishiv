@@ -219,12 +219,24 @@ jobs:
           args: --release --out dist/ --find-interpreter
           working-directory: crates/krishiv-python
           before-script-linux: |
-            # Install protobuf compiler inside the manylinux container.
-            # krishiv-proto uses prost-build which requires protoc at build time.
+            # Install build dependencies inside the manylinux container:
+            #   protobuf-compiler — prost-build (krishiv-proto) needs protoc.
+            #   clang / clang-devel — rocksdb-sys uses bindgen which needs libclang.
             if command -v dnf >/dev/null 2>&1; then
-              dnf install -y protobuf-compiler
+              dnf install -y clang clang-devel protobuf-compiler || true
             elif command -v yum >/dev/null 2>&1; then
-              yum install -y protobuf-compiler
+              yum install -y clang clang-devel protobuf-compiler || true
+            fi
+            # Binary fallback for protoc if package manager didn't provide it.
+            if ! command -v protoc >/dev/null 2>&1; then
+              PROTOC_VER="28.3"
+              ARCH="$(uname -m)"
+              curl -sSL \
+                "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VER}/protoc-${PROTOC_VER}-linux-${ARCH}.zip" \
+                -o /tmp/protoc.zip
+              unzip -q /tmp/protoc.zip bin/protoc -d /tmp/protoc
+              mv /tmp/protoc/bin/protoc /usr/local/bin/protoc
+              chmod +x /usr/local/bin/protoc
             fi
       - uses: actions/upload-artifact@v4
         with:
