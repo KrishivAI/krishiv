@@ -12,17 +12,17 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-krishiv-api = { path = "../krishiv-api" }
-krishiv-delta = { path = "../krishiv-delta" }
-krishiv-ivm = { path = "../krishiv-ivm" }
-krishiv-runtime = { path = "../krishiv-runtime" }
-krishiv-common = { path = "../krishiv-common" }
-krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse", "schema-registry", "iceberg", "hudi", "vector-sinks"] }
-krishiv-dataflow = { path = "../krishiv-dataflow" }
-krishiv-sql = { path = "../krishiv-sql" }
-krishiv-state = { path = "../krishiv-state" }
-krishiv-metrics = { path = "../krishiv-metrics" }
-krishiv-plan = { path = "../krishiv-plan" }
+krishiv-api = { path = "../krishiv-api", version = "0.1.0" }
+krishiv-delta = { path = "../krishiv-delta", version = "0.1.0" }
+krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
+krishiv-runtime = { path = "../krishiv-runtime", version = "0.1.0" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["kafka", "lakehouse", "schema-registry", "iceberg", "hudi", "vector-sinks"] }
+krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
+krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
+krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.0" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
 arrow = { workspace = true }
 parquet = { workspace = true }
 pyo3 = { workspace = true }

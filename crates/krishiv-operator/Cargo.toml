@@ -27,12 +27,12 @@ async-trait.workspace = true
 futures.workspace = true
 thiserror = { workspace = true }
 k8s-openapi = { workspace = true, optional = true }
-krishiv-state = { path = "../krishiv-state" }
-krishiv-common = { path = "../krishiv-common" }
-krishiv-proto = { path = "../krishiv-proto" }
-krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
+krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }
 axum = { workspace = true }
-krishiv-ui = { path = "../krishiv-ui", optional = true }
+krishiv-ui = { path = "../krishiv-ui", version = "0.1.0", optional = true }
 kube = { workspace = true, optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
 serde.workspace = true

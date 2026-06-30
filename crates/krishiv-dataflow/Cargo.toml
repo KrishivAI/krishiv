@@ -16,11 +16,11 @@ dashmap = { workspace = true }
 indexmap = { workspace = true }
 smallvec = "1"
 thiserror = { workspace = true }
-krishiv-common = { path = "../krishiv-common" }
-krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
-krishiv-metrics = { path = "../krishiv-metrics" }
-krishiv-plan = { path = "../krishiv-plan" }
-krishiv-state = { path = "../krishiv-state" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse"] }
+krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.0" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
+krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }

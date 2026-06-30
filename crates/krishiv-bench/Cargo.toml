@@ -28,10 +28,10 @@ harness = false
 
 [dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
-krishiv-sql = { path = "../krishiv-sql" }
-krishiv-api = { path = "../krishiv-api" }
-krishiv-runtime = { path = "../krishiv-runtime" }
-krishiv-engine-core = { path = "../krishiv-engine-core" }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
+krishiv-api = { path = "../krishiv-api", version = "0.1.0" }
+krishiv-runtime = { path = "../krishiv-runtime", version = "0.1.0" }
+krishiv-engine-core = { path = "../krishiv-engine-core", version = "0.1.0" }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 parquet = { workspace = true }

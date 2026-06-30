@@ -23,16 +23,16 @@ dashmap = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
 twox-hash = { workspace = true }
-krishiv-common = { path = "../krishiv-common" }
-krishiv-ivm = { path = "../krishiv-ivm" }
-krishiv-metrics = { path = "../krishiv-metrics" }
-krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
-krishiv-dataflow = { path = "../krishiv-dataflow" }
-krishiv-plan = { path = "../krishiv-plan" }
-krishiv-proto = { path = "../krishiv-proto" }
-krishiv-shuffle = { path = "../krishiv-shuffle" }
-krishiv-sql = { path = "../krishiv-sql" }
-krishiv-state = { path = "../krishiv-state" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
+krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
+krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.0" }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse"] }
+krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
+krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.0" }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
+krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
 object_store = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -45,8 +45,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 arrow.workspace = true
-krishiv-scheduler = { path = "../krishiv-scheduler" }
-krishiv-shuffle = { path = "../krishiv-shuffle" }
+krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }
+krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.0" }
 parquet.workspace = true
 tempfile.workspace = true
 

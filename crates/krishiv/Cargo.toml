@@ -65,20 +65,20 @@ jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
-krishiv-common = { path = "../krishiv-common" }
-krishiv-api = { path = "../krishiv-api" }
-krishiv-plan = { path = "../krishiv-plan" }
-krishiv-state = { path = "../krishiv-state" }
-krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
-krishiv-metrics = { path = "../krishiv-metrics" }
-krishiv-operator = { path = "../krishiv-operator", optional = true, default-features = false }
-krishiv-ui = { path = "../krishiv-ui" }
-krishiv-proto = { path = "../krishiv-proto" }
-krishiv-scheduler = { path = "../krishiv-scheduler" }
-krishiv-executor = { path = "../krishiv-executor" }
-krishiv-flight-sql = { path = "../krishiv-flight-sql", optional = true }
-krishiv-shuffle = { path = "../krishiv-shuffle", optional = true }
-krishiv-sql = { path = "../krishiv-sql" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
+krishiv-api = { path = "../krishiv-api", version = "0.1.0" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
+krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse"] }
+krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.0" }
+krishiv-operator = { path = "../krishiv-operator", version = "0.1.0", optional = true, default-features = false }
+krishiv-ui = { path = "../krishiv-ui", version = "0.1.0" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
+krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }
+krishiv-executor = { path = "../krishiv-executor", version = "0.1.0" }
+krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.0", optional = true }
+krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.0", optional = true }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 arrow = { workspace = true }
 axum = { workspace = true }
 dotenvy = "0.15"
@@ -92,8 +92,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
-krishiv-runtime = { path = "../krishiv-runtime" }
-krishiv-plan = { path = "../krishiv-plan" }
+krishiv-runtime = { path = "../krishiv-runtime", version = "0.1.0" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
 parquet = { workspace = true }
 tempfile = { workspace = true }
 

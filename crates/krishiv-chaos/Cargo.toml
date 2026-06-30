@@ -9,13 +9,13 @@ description = "Cross-crate chaos and fault-injection integration tests"
 
 [dependencies]
 arrow = { workspace = true }
-krishiv-common = { path = "../krishiv-common", features = ["chaos"] }
-krishiv-connectors = { path = "../krishiv-connectors" }
-krishiv-operator = { path = "../krishiv-operator" }
-krishiv-plan = { path = "../krishiv-plan" }
-krishiv-proto = { path = "../krishiv-proto" }
-krishiv-scheduler = { path = "../krishiv-scheduler" }
-krishiv-state = { path = "../krishiv-state" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.0", features = ["chaos"] }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0" }
+krishiv-operator = { path = "../krishiv-operator", version = "0.1.0" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
+krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }
+krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[test]]

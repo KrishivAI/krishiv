@@ -27,8 +27,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-krishiv-common = { path = "../krishiv-common" }
-krishiv-proto = { path = "../krishiv-proto" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
 
 [dev-dependencies]
 proptest = { workspace = true }

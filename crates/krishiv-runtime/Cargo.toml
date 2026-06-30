@@ -11,14 +11,14 @@ description.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
-krishiv-plan = { path = "../krishiv-plan" }
-krishiv-dataflow = { path = "../krishiv-dataflow" }
-krishiv-executor = { path = "../krishiv-executor" }
-krishiv-scheduler = { path = "../krishiv-scheduler" }
-krishiv-proto = { path = "../krishiv-proto" }
-krishiv-common = { path = "../krishiv-common" }
-krishiv-ivm = { path = "../krishiv-ivm" }
-krishiv-sql = { path = "../krishiv-sql" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
+krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
+krishiv-executor = { path = "../krishiv-executor", version = "0.1.0" }
+krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
+krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 dashmap = { workspace = true }
 datafusion = { workspace = true }
 reqwest = { workspace = true }
@@ -34,14 +34,14 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 parquet = { workspace = true }
 webpki-root-certs = { workspace = true }
-krishiv-connectors = { path = "../krishiv-connectors", features = ["vector-sinks"], optional = true }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["vector-sinks"], optional = true }
 
 [features]
 kafka = []
 vector-sinks = ["dep:krishiv-connectors"]
 
 [dev-dependencies]
-krishiv-flight-sql = { path = "../krishiv-flight-sql" }
+krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.0" }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 

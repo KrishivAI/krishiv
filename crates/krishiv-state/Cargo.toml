@@ -16,7 +16,7 @@ path = "src/lib.rs"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
-krishiv-common = { path = "../krishiv-common" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
 object_store = { workspace = true, features = ["aws", "fs"] }
 rocksdb = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
