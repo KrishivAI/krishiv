@@ -85,11 +85,20 @@ jobs:
           STAMP="$(date +%Y%m%d)"
           NIGHTLY_VER="0.1.0-nightly.${STAMP}"
           echo "Stamping version ${NIGHTLY_VER}"
-          # Patch [workspace.package] version in root Cargo.toml
+          # 1. Patch [workspace.package] version in root Cargo.toml (standalone line)
           sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" Cargo.toml
-          # Patch all path dep version constraints in crate Cargo.tomls
-          find crates -name 'Cargo.toml' -exec \
-            sed -i "s/version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/g" {} \;
+          # 2. Per-crate Cargo.tomls: patch the crate's own [package] version, then
+          #    patch internal dep version constraints with an EXACT ("=") prefix so
+          #    cargo cannot substitute the already-published 0.1.0 stable release
+          #    during `cargo publish --verify`. Without "=", semver resolves
+          #    "^0.1.0-nightly.YYYYMMDD" to "0.1.0" (non-pre-release wins), which
+          #    then fails to compile against the nightly-only API additions.
+          find crates -name 'Cargo.toml' | while read f; do
+            # Own package version (line that starts with "version =")
+            sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" "$f"
+            # Internal dep constraints (inline tables: krishiv-* = { ..., version = "0.1.0" })
+            sed -i -E "s/(krishiv-[a-z-]+ = \{[^}]*version = )\"0\.1\.0\"/\1\"=${NIGHTLY_VER}\"/g" "$f"
+          done
           # Regenerate Cargo.lock with the new version
           cargo generate-lockfile
       - name: Publish crates in topological order
