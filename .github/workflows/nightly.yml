@@ -266,6 +266,8 @@ jobs:
             tag_suffix: "-single-node"
           - variant: distributed
             tag_suffix: "-distributed"
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - name: Lowercase image name
         run: echo "IMAGE_NAME=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
@@ -276,7 +278,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/login-action@v3
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        if: env.DOCKERHUB_USERNAME != ''
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -292,9 +294,9 @@ jobs:
           TAG="nightly${{ matrix.tag_suffix }}"
           DIGESTS=$(cat /tmp/digests/${{ matrix.variant }}-* | sed 's|^|'"${IMAGE}@"'|')
           docker buildx imagetools create -t "${IMAGE}:${TAG}" ${DIGESTS}
-          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+          if [ -n "${DOCKERHUB_USERNAME}" ]; then
             docker buildx imagetools create \
-              -t "${{ secrets.DOCKERHUB_USERNAME }}/krishiv:${TAG}" ${DIGESTS}
+              -t "${DOCKERHUB_USERNAME}/krishiv:${TAG}" ${DIGESTS}
           fi
 
   # ── Python nightly wheels ────────────────────────────────────────────────────
