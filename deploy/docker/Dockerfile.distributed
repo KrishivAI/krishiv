@@ -1,10 +1,14 @@
 # syntax=docker/dockerfile:1.7
 #
-# Distributed-mode production image — all cluster daemon binaries in one image.
+# Distributed-mode production image — single multi-call binary.
 #
-# Ships: krishiv, krishiv-executor, krishiv-coordinator, krishiv-clusterd,
-#        krishiv-job-coordinator, krishiv-shuffle-svc, krishiv-flight-server.
-#        Also ships krishiv-operator when FEATURES contains "k8s".
+# Ships ONE `krishiv` binary that contains all daemon subcommands
+# (coordinator, executor, clusterd, job-coordinator, shuffle-svc,
+# flight-server). Daemon entrypoints are zero-byte symlinks that dispatch
+# via argv[0] (BusyBox pattern) — see multipass_subcommand() in main.rs.
+# This eliminates 6 redundant binaries that each statically linked the full
+# DataFusion/Arrow/tokio/tonic stack (~200 MB saved).
+# Also ships krishiv-operator when FEATURES contains "k8s".
 #
 # At deploy time each container type sets its own ENTRYPOINT/CMD:
 #
@@ -62,6 +66,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         g++ \
         make \
         protobuf-compiler \
+        upx-ucl \
     && rm -rf /var/lib/apt/lists/*
 
 # RUSTFLAGS in CARGO_TARGET_*_RUSTFLAGS select `mold` as the linker. The env is
@@ -73,69 +78,68 @@ ENV CXXFLAGS="-include cstdint" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 
-# Compute the full package list for this feature set and use it for both the
-# chef cook (dep caching) and the final cargo build steps so the cached dep
-# layer exactly matches the build.
-#
-# Packages compiled per mode:
-#   distributed  → all daemon binaries (no K8s operator)
-#   k8s          → all daemon binaries + krishiv-operator
+# Cook only the deps for the packages we build. The `krishiv` binary already
+# contains all daemon subcommands (coordinator, executor, clusterd, …) when
+# built with the distributed feature set, so we skip compiling the 6 standalone
+# daemon binaries — their lib code is pulled in transitively by `-p krishiv`.
+# Only krishiv-operator needs a separate -p flag (it has its own binary target).
 COPY --from=planner /build/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     set -e; \
-    PKGS="-p krishiv -p krishiv-executor -p krishiv-scheduler -p krishiv-shuffle -p krishiv-flight-sql"; \
+    PKGS="-p krishiv"; \
     case "$FEATURES" in *k8s*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
     cargo chef cook $PKGS \
         --recipe-path recipe.json \
         --no-default-features --features "$FEATURES" \
         --profile release --jobs $(nproc)
 
-# ── Stage 3: Binary build ─────────────────────────────────────────────────────
+# ── Stage 3: Binary build + UPX compress ──────────────────────────────────────
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     set -e; \
-    PKGS="-p krishiv -p krishiv-executor -p krishiv-scheduler -p krishiv-shuffle -p krishiv-flight-sql"; \
+    PKGS="-p krishiv"; \
     case "$FEATURES" in *k8s*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
     OUTDIR="target/release"; \
     cargo build --locked $PKGS \
         --no-default-features --features "$FEATURES" \
         --profile release --jobs $(nproc); \
     mkdir -p /out/bin; \
-    # Core CLI + embedded daemon
-    cp "$OUTDIR/krishiv"                  /out/bin/krishiv; \
-    # Distributed cluster daemons (all shipped in krishiv-executor crate bin + krishiv-scheduler bins)
-    cp "$OUTDIR/krishiv-executor"         /out/bin/krishiv-executor; \
-    cp "$OUTDIR/krishiv-coordinator"      /out/bin/krishiv-coordinator; \
-    cp "$OUTDIR/krishiv-clusterd"         /out/bin/krishiv-clusterd; \
-    cp "$OUTDIR/krishiv-job-coordinator"  /out/bin/krishiv-job-coordinator; \
-    cp "$OUTDIR/krishiv-shuffle-svc"      /out/bin/krishiv-shuffle-svc; \
-    cp "$OUTDIR/krishiv-flight-server"    /out/bin/krishiv-flight-server; \
-    # K8s operator — only present when FEATURES contains "k8s"
+    cp "$OUTDIR/krishiv" /out/bin/krishiv; \
     if [ -f "$OUTDIR/krishiv-operator" ]; then \
         cp "$OUTDIR/krishiv-operator" /out/bin/krishiv-operator; \
     fi; \
-    # Sanity checks
     /out/bin/krishiv --version || true; \
-    /out/bin/krishiv-executor --version 2>/dev/null || true
+    # UPX compress — 50-65% size reduction on stripped release binaries.
+    # Startup cost ~50ms (in-place decompression); negligible for daemons.
+    upx --best --lzma /out/bin/krishiv; \
+    if [ -f /out/bin/krishiv-operator ]; then \
+        upx --best --lzma /out/bin/krishiv-operator; \
+    fi
 
 # ── Stage 4: Runtime image ────────────────────────────────────────────────────
-# Shared base (see Dockerfile.single-node for the full set of install steps).
-# All krishiv runtime images should `FROM runtime-base` and just copy binaries.
 FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r krishiv \
     && useradd -r -g krishiv -d /var/lib/krishiv -s /sbin/nologin krishiv
 
-# Copy all binaries. Each container type overrides ENTRYPOINT/CMD at deploy time.
-# Symlink to /usr/local/bin so the shell path works even in debug sessions.
+# Copy the single multi-call binary (+ optional operator).
 COPY --from=builder /out/bin/ /usr/local/bin/
+
+# Create zero-byte symlinks for each daemon entrypoint. The `krishiv` binary
+# detects argv[0] via multipass_subcommand() and dispatches to the matching
+# subcommand. Symlinks cost nothing on disk and preserve deploy-time
+# ENTRYPOINT ergonomics (e.g. --entrypoint krishiv-executor).
+RUN cd /usr/local/bin \
+ && for b in krishiv-executor krishiv-coordinator krishiv-clusterd \
+             krishiv-job-coordinator krishiv-shuffle-svc krishiv-flight-server; do \
+        ln -sf krishiv "$b"; \
+    done
 
 RUN mkdir -p \
         /var/lib/krishiv/data \
@@ -147,13 +151,10 @@ RUN mkdir -p \
 USER krishiv
 WORKDIR /var/lib/krishiv
 
-# Default entrypoint is the coordinator — override per container type.
-# Executor pods:       --entrypoint krishiv-executor
-# Shuffle svc pods:    --entrypoint krishiv-shuffle-svc
-# Flight SQL pods:     --entrypoint krishiv-flight-server
-# K8s operator pods:   --entrypoint krishiv-operator
+# Health check via the built-in TCP probe — no curl dependency needed.
+# Override the port with KRISHIV_HEALTH_PORT if needed.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -sf http://localhost:2002/healthz || exit 1
+    CMD ["krishiv", "health"]
 
 ENV RUST_LOG="info" \
     KRISHIV_MODE="distributed" \

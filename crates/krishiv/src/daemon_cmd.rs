@@ -14,7 +14,7 @@ pub fn try_run_daemon(args: &[String]) -> Option<i32> {
     let sub = args.first()?.as_str();
     match sub {
         "coordinator" | "clusterd" | "executor" | "job-coordinator" | "flight-server"
-        | "shuffle-svc" => {}
+        | "shuffle-svc" | "health" => {}
         _ => return None,
     }
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
@@ -25,6 +25,7 @@ pub fn try_run_daemon(args: &[String]) -> Option<i32> {
         "job-coordinator" => run_job_coordinator(&rest),
         "flight-server" => run_flight_server(&rest),
         "shuffle-svc" => run_shuffle_svc(&rest),
+        "health" => run_health_check(),
         other => {
             tracing::error!(subcommand = %other, "unexpected daemon subcommand after validation");
             2
@@ -211,6 +212,31 @@ fn run_shuffle_svc(args: &[String]) -> i32 {
         Err(e) => {
             eprintln!("{e}");
             2
+        }
+    }
+}
+
+/// Lightweight TCP health probe used by Docker HEALTHCHECK.
+///
+/// Replaces the `curl` dependency (~5-8 MB) with a zero-dependency `std::net`
+/// connect check. The port defaults to 2002 (the health/metrics HTTP listener)
+/// and can be overridden via `KRISHIV_HEALTH_PORT`.
+fn run_health_check() -> i32 {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let port: u16 = std::env::var("KRISHIV_HEALTH_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2002);
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .unwrap_or_else(|_| "127.0.0.1:2002".parse().expect("hardcoded fallback"));
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("health check failed ({addr}): {e}");
+            1
         }
     }
 }

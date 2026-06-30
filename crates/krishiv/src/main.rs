@@ -23,6 +23,7 @@ mod stream_cmd;
 mod table_cmd;
 
 use std::env;
+use std::path::Path;
 use std::process;
 
 fn main() {
@@ -45,7 +46,16 @@ fn main() {
         krishiv_metrics::MetricsHandle::noop()
     });
 
-    let args: Vec<String> = env::args().skip(1).collect();
+    // Multi-call binary dispatch (BusyBox pattern): when invoked via a
+    // symlink (krishiv-coordinator, krishiv-executor, …), translate argv[0]
+    // into the equivalent subcommand. This lets a single `krishiv` binary
+    // serve all daemon entrypoints, eliminating 6 redundant binaries that
+    // would each statically link the full DataFusion/Arrow/tokio/tonic stack.
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    if let Some(sub) = multipass_subcommand() {
+        args.insert(0, sub.to_string());
+    }
+
     if let Some(code) = daemon_cmd::try_run_daemon(&args) {
         process::exit(code);
     }
@@ -59,4 +69,23 @@ fn main() {
         eprint!("{}", response.stderr);
     }
     process::exit(response.exit_code);
+}
+
+/// Detect symlink invocation and return the equivalent `krishiv` subcommand.
+///
+/// Enables the multi-call binary pattern: deploy-time symlinks like
+/// `krishiv-coordinator → krishiv` cause the binary to dispatch as
+/// `krishiv coordinator` with zero runtime overhead.
+fn multipass_subcommand() -> Option<&'static str> {
+    let prog = env::args().next()?;
+    let name = Path::new(&prog).file_name()?.to_str()?;
+    match name {
+        "krishiv-coordinator" => Some("coordinator"),
+        "krishiv-clusterd" => Some("clusterd"),
+        "krishiv-executor" => Some("executor"),
+        "krishiv-job-coordinator" => Some("job-coordinator"),
+        "krishiv-flight-server" => Some("flight-server"),
+        "krishiv-shuffle-svc" => Some("shuffle-svc"),
+        _ => None,
+    }
 }

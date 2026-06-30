@@ -8,7 +8,7 @@
 #
 # Expected sizes:
 #   builder layer  ~2 GB (Rust toolchain + compiled deps, not shipped)
-#   runtime image  ~60-80 MB  (debian:trixie-slim + stripped krishiv binary)
+#   runtime image  ~25-40 MB (debian:trixie-slim + UPX-compressed krishiv binary)
 #
 # Usage:
 #   docker build -f Dockerfile.single-node -t krishiv:single-node .
@@ -45,6 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         g++ \
         make \
         protobuf-compiler \
+        upx-ucl \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CXXFLAGS="-include cstdint" \
@@ -76,7 +77,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     mkdir -p /out; \
     cp "$OUTDIR/krishiv" /out/krishiv; \
     # Verify binary sanity before committing it to the image layer.
-    /out/krishiv --version || true
+    /out/krishiv --version || true; \
+    # UPX compress — 50-65% size reduction on stripped release binaries.
+    upx --best --lzma /out/krishiv
 
 # ── Stage 4: Minimal runtime image ───────────────────────────────────────────
 # Shared base for all krishiv runtime images (ca-certificates, curl for
@@ -85,11 +88,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM debian:trixie-slim AS runtime
 
 # ca-certificates: TLS cert chain for outbound HTTPS (object store, catalog endpoints).
-# curl: lightweight health-check probe — replace with a compiled binary if you want
-#   a truly shell-free image.
+# No curl — the built-in `krishiv health` subcommand (TCP probe) replaces it,
+# saving ~5-8 MB.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r krishiv \
     && useradd -r -g krishiv -d /var/lib/krishiv -s /sbin/nologin krishiv
@@ -106,9 +108,9 @@ USER krishiv
 WORKDIR /var/lib/krishiv
 
 # Single-node embedded mode: one process handles SQL, execution, and state.
-# HTTP health endpoint (krishiv local start binds :2002 by default).
+# Health check via the built-in TCP probe — no curl dependency needed.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -sf http://localhost:2002/healthz || exit 1
+    CMD ["krishiv", "health"]
 
 ENV RUST_LOG="info" \
     KRISHIV_MODE="single-node" \

@@ -187,16 +187,18 @@ debug = 0
 
 # release: highly optimized for production / CI. Whole-program fat LTO
 # performs cross-crate inlining on the datafusion → arrow → krishiv hot
-# path. codegen-units=1 unlocks inlining across module boundaries.
-# panic=abort removes all unwinding infrastructure (~5% size reduction,
-# minor speed boost). strip="symbols" gives the smallest binary.
+# path and eliminates dead code across crate boundaries, yielding 5-15%
+# smaller binaries vs thin LTO. codegen-units=1 unlocks inlining across
+# module boundaries. panic=abort removes all unwinding infrastructure
+# (~5% size reduction, minor speed boost). strip="symbols" gives the
+# smallest binary.
 #
 # Compile cost: 3-5x longer than `dev`. Acceptable for CI jobs (where
 # correctness > wall-clock) and release builds. Do NOT use for local
 # iteration; use the default `dev` profile instead.
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
