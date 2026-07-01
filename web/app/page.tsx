@@ -80,11 +80,9 @@ function Hero() {
       <div className="hero-new-inner">
         <div className="hero-new-copy">
           <div className="hero-badge">Rust-native Unified Compute Engine</div>
-          <h1>One compute engine for batch, streaming, and AI&nbsp;pipelines</h1>
+          <h1>One Rust engine for batch SQL and streaming pipelines</h1>
           <p className="hero-lead">
-            Krishiv unifies batch SQL, streaming pipelines, and incremental processing
-            under one Apache Arrow / DataFusion runtime. Write once in SQL, Rust, or Python.
-            Run anywhere from embedded to distributed.
+            Krishiv runs batch, streaming, and incremental workloads on one Apache Arrow / DataFusion runtime. Write SQL, Rust, or Python and deploy from embedded to distributed.
           </p>
           <div className="hero-actions">
             <Link className="btn btn-primary" href="/docs/latest/getting-started">

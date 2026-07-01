@@ -1,5 +1,30 @@
 # Krishiv Implementation Status
 
+## 2026-07-01 — Landing page mobile responsiveness polish
+
+**Scope**: Krishiv.ai marketing landing page and shared diagram styling for small screens.
+
+### Completed
+
+- Reworked landing hero copy hierarchy so the headline communicates the product before the visualization on mobile.
+- Reduced mobile header, hamburger, CTA, section, card, and accent weight while preserving the premium dark theme.
+- Added mobile-specific diagram behavior so architecture and docs diagrams remain readable on 360px-wide screens via consistent padded scroll cards instead of tiny scaled labels.
+
+### Validation
+
+- `npm run typecheck --prefix web` passed.
+- `npm run build --prefix web` passed with the existing static-export header warning.
+
+### Blockers
+
+- Workspace clippy is blocked in this container before crate analysis because the configured mold linker cannot find `ld`.
+
+### Next command
+
+`npm run dev --prefix web -- --hostname 127.0.0.1 --port 3000` and inspect `/` plus `/architecture` at 360px and 430px viewport widths.
+
+---
+
 ## 2026-07-01 — Full audit remediation: 24 HIGH · 37 MEDIUM · 32 LOW · 22 ARCH · 26 PERF
 
 **Scope**: Cross-codebase audit → batch / delta-batch / streaming × embedded / single-node / distributed × SQL / Flight-SQL / REST / Rust / Python. 141 findings triaged into 10 batches, all addressed in this session.
