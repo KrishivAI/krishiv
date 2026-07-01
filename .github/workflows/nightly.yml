@@ -361,23 +361,22 @@ jobs:
           ref: main
       - name: Stamp nightly version
         # Wheels run in parallel with publish-crates, so we need to stamp
-        # the version independently here. Must use the same NIGHTLY_VER
-        # format (YYYYMMDDHHMM) as the publish-crates job.
+        # independently. For wheels, we use PEP 440 version format
+        # (0.1.0aYYYYMMDDHHMM) because maturin reads Cargo.toml and requires
+        # a valid Python version. The crates job uses semver format.
         run: |
           set -e
           STAMP="$(date +%Y%m%d%H%M)"
-          NIGHTLY_VER="0.1.0-nightly.${STAMP}"
-          echo "Stamping version ${NIGHTLY_VER}"
-          sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" Cargo.toml
+          PEP440_VER="0.1.0a${STAMP}"
+          echo "Stamping version ${PEP440_VER}"
+          sed -i "s/^version = \"0\.1\.0\"/version = \"${PEP440_VER}\"/" Cargo.toml
           find crates -name 'Cargo.toml' | while read f; do
-            sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" "$f"
-            sed -i -E "s/(krishiv-[a-z-]+ = \{[^}]*version = )\"0\.1\.0\"/\1\"=${NIGHTLY_VER}\"/g" "$f"
+            sed -i "s/^version = \"0\.1\.0\"/version = \"${PEP440_VER}\"/" "$f"
+            sed -i -E "s/(krishiv-[a-z-]+ = \{[^}]*version = )\"0\.1\.0\"/\1\"=${PEP440_VER}\"/g" "$f"
           done
           cargo generate-lockfile
-          # PEP 440 version for pyproject.toml (maturin/PyPI).
-          # Cargo uses semver (0.1.0-nightly.YYYYMMDDHHMM) but PyPI requires
-          # PEP 440 (0.1.0aYYYYMMDDHHMM = alpha pre-release).
-          sed -i "s/^version = \"0\.1\.0\"/version = \"0.1.0a${STAMP}\"/" crates/krishiv-python/pyproject.toml
+          # Also stamp pyproject.toml with the same PEP 440 version.
+          sed -i "s/^version = \"0\.1\.0\"/version = \"${PEP440_VER}\"/" crates/krishiv-python/pyproject.toml
       - uses: actions/setup-python@v5
         if: runner.os == 'macOS'
         with:
