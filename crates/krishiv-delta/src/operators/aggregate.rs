@@ -284,6 +284,21 @@ impl IncrementalAggOp {
         &self.output_schema
     }
 
+    /// Evict aggregate groups whose event time is below `watermark`.
+    ///
+    /// Note: the current data model does not carry a per-group event time on
+    /// `IncrementalAggOp::state` (groups are keyed by value, not by a typed
+    /// timestamp). Until that schema is added, the operator is a no-op here.
+    /// The interface exists so the `ViewPlan::Aggregate` arm of
+    /// `gc_watermark` is reached; the eviction is wired to no-op pending
+    /// schema work. A long-running incremental aggregate over an unbounded
+    /// source should add a `TUMBLE/HOP/SESSION` window or filter on
+    /// `event_time_col` in the view body so the SQL engine can prune older
+    /// partitions.
+    pub fn gc_watermark(&mut self, _watermark: i64) -> crate::DeltaResult<usize> {
+        Ok(0)
+    }
+
     /// Apply one tick of incremental aggregation.
     ///
     /// For each row in `delta`:

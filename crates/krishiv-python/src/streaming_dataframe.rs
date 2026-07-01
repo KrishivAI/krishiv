@@ -97,12 +97,14 @@ impl PyStreamingDataFrame {
 }
 
 #[pyfunction]
-#[pyo3(signature = (left, right, left_time_col, right_time_col, lower_bound_ms, upper_bound_ms))]
+#[pyo3(signature = (left, right, left_time_col, right_time_col, left_key_col, right_key_col, lower_bound_ms, upper_bound_ms))]
 pub fn interval_join(
     left: Vec<crate::batch::PyBatch>,
     right: Vec<crate::batch::PyBatch>,
     left_time_col: String,
     right_time_col: String,
+    left_key_col: String,
+    right_key_col: String,
     lower_bound_ms: i64,
     upper_bound_ms: i64,
 ) -> PyResult<Vec<(crate::batch::PyBatch, crate::batch::PyBatch)>> {
@@ -116,6 +118,8 @@ pub fn interval_join(
         &right_batches,
         &left_time_col,
         &right_time_col,
+        &left_key_col,
+        &right_key_col,
         lower_bound_ms,
         upper_bound_ms,
     )
@@ -215,12 +219,14 @@ pub fn temporal_join(
 }
 
 #[pyfunction]
-#[pyo3(signature = (left, right, left_time_col, right_time_col, lower_bound_ms, upper_bound_ms))]
+#[pyo3(signature = (left, right, left_time_col, right_time_col, left_key_col, right_key_col, lower_bound_ms, upper_bound_ms))]
 pub fn stream_stream_join(
     left: Vec<crate::batch::PyBatch>,
     right: Vec<crate::batch::PyBatch>,
     left_time_col: String,
     right_time_col: String,
+    left_key_col: String,
+    right_key_col: String,
     lower_bound_ms: i64,
     upper_bound_ms: i64,
 ) -> PyResult<Vec<(crate::batch::PyBatch, crate::batch::PyBatch)>> {
@@ -234,6 +240,8 @@ pub fn stream_stream_join(
         &right_batches,
         &left_time_col,
         &right_time_col,
+        &left_key_col,
+        &right_key_col,
         lower_bound_ms,
         upper_bound_ms,
     )

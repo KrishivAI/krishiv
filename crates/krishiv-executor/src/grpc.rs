@@ -479,14 +479,20 @@ pub fn executor_task_grpc_server(
 /// `ExecutorTaskRunner::shared_loop_executors()` / `shared_continuous_inputs()`
 /// are shared here so that distributed `push_continuous_input` / `drain_continuous_output`
 /// RPCs operate on the same state as `execute_loop_fragment`.
+///
+/// H-19 (audit): callers that wired auth via the builder API had their
+/// explicit token silently dropped because this constructor always
+/// rebuilt auth from the process environment. The new `auth` parameter
+/// takes precedence; pass `None` to keep the env-based default.
 pub fn executor_task_grpc_server_with_continuous(
     inbox: ExecutorAssignmentInbox,
     loop_executors: SharedLoopExecutors,
     continuous_inputs: SharedContinuousInputs,
+    auth: Option<ExecutorTaskAuthConfig>,
 ) -> wire::v1::executor_task_server::ExecutorTaskServer<ExecutorTaskGrpcService> {
     let inner =
         ExecutorTaskInboxService::new_with_continuous(inbox, loop_executors, continuous_inputs);
-    let auth = ExecutorTaskAuthConfig::from_env();
+    let auth = auth.unwrap_or_else(ExecutorTaskAuthConfig::from_env);
     let auth_misconfiguration = (auth.require_auth() && !auth.has_bearer_token()).then(|| {
         format!(
             "{REQUIRE_EXECUTOR_TASK_AUTH_ENV}=true requires non-empty \

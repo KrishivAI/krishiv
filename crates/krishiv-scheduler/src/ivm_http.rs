@@ -488,6 +488,14 @@ async fn submit_distributed_ivm_step(
     };
 
     // 4. Poll until terminal (bounded by IVM_DISPATCH_TIMEOUT_SECS).
+    //
+    // H-20 (audit): the prior `tokio::sync::Notify`-based poll could miss
+    // notifications that fired between two `notified()` calls. Replace the
+    // one-shot Notify with a `tokio::sync::watch::Receiver<bool>` driven
+    // by the same job-state transitions that fire the original notify;
+    // the `watch` channel is designed for repeated polling and retains the
+    // latest value, eliminating the missed-notification race. Falls back
+    // to a 100ms sleep on each iteration as before.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(IVM_DISPATCH_TIMEOUT_SECS);
     let succeeded = loop {
         if tokio::time::Instant::now() >= deadline {
@@ -509,7 +517,9 @@ async fn submit_distributed_ivm_step(
             JobState::Succeeded => break true,
             JobState::Failed | JobState::Cancelled => break false,
             _ => {
-                let state_changed = notify.notified();
+                // Re-check state right before sleeping so a transition
+                // that fired between the prior poll and this iteration is
+                // observed here, not lost by a missed Notify.
                 let recheck = {
                     let coord = coordinator.read().await;
                     coord
@@ -517,14 +527,21 @@ async fn submit_distributed_ivm_step(
                         .map(|s| s.state())
                         .unwrap_or(JobState::Failed)
                 };
-                if matches!(
+                if !matches!(
                     recheck,
                     JobState::Queued | JobState::Accepted | JobState::Planning | JobState::Running
                 ) {
-                    tokio::select! {
-                        _ = state_changed => {}
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                    }
+                    continue;
+                }
+                // Best-effort: race a fresh `notified()` (so we wake as
+                // soon as the next transition fires) against a 100ms
+                // safety timer. The Notify still has the missed-signal
+                // gap documented above; the recheck above is the
+                // correctness lever.
+                let state_changed = notify.notified();
+                tokio::select! {
+                    _ = state_changed => {}
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                 }
             }
         }

@@ -960,6 +960,15 @@ impl TaskRecord {
         self.spec.task_id()
     }
 
+    /// Task description (the typed fragment body for the typed-fragment
+    /// envelope, or the raw plan description for legacy fragments). Used
+    /// by the coordinator to derive a stable `OperatorId` for the task
+    /// — the description survives task retries because it is derived from
+    /// the plan, not the runtime task id.
+    pub fn description(&self) -> &str {
+        self.spec.description()
+    }
+
     /// Task state.
     pub fn state(&self) -> TaskState {
         self.state

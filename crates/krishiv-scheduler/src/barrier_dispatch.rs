@@ -13,6 +13,7 @@ use krishiv_proto::{
 use crate::barrier_client::inject_barrier;
 use crate::barrier_tracker::CheckpointBarrierTracker;
 use crate::heartbeat::ExecutorRecord;
+use crate::job::JobRecord;
 use crate::{Coordinator, SchedulerResult};
 
 fn barrier_channels() -> &'static DashMap<String, tonic::transport::Channel> {
@@ -77,8 +78,16 @@ impl Coordinator {
             };
             for stage in &job.stages {
                 for task in stage.tasks() {
-                    if task.state() != krishiv_proto::TaskState::Running {
-                        continue;
+                    // Include `Assigned` tasks, not only `Running`. The first
+                    // checkpoint of a fresh job would otherwise produce an
+                    // empty dispatch plan (tasks start in `Assigned` and only
+                    // reach `Running` after the first assignment is acked),
+                    // causing the checkpointer to time out. The executor-side
+                    // `SharedBarrierAckRegistry` buffers barriers that arrive
+                    // before the task runs and acks them when it does.
+                    match task.state() {
+                        krishiv_proto::TaskState::Running | krishiv_proto::TaskState::Assigned => {}
+                        _ => continue,
                     }
                     let Some(executor_id) = task.assigned_executor() else {
                         continue;
@@ -124,14 +133,32 @@ impl Coordinator {
     ) {
         for (task_id, ack) in acks {
             let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
-            let operator_id = match krishiv_proto::OperatorId::try_new(format!(
-                "op-{}",
-                task_id.as_str()
-            )) {
+            // The task's fragment body (when present) carries a stable
+            // operator identity: a hash of the typed fragment body survives
+            // task retries because the body itself is derived from the
+            // plan, not from the runtime task id. Falling back to
+            // `op-{task_id}` violates the engine-semantics contract that
+            // operator ids be deterministic (a checkpoint written under
+            // `op-task-0` would be unrestorable when the operator reschedules
+            // as `op-task-1`). Look up the description for this task; if
+            // it carries a typed fragment, hash the body; otherwise log a
+            // one-time warning and use the legacy `op-{task_id}` form.
+            let operator_id = match stable_operator_id_for_task_id(
+                self.job_coordinators
+                    .get(job_id)
+                    .map(|jc| jc.read_record().clone()),
+                task_id,
+            ) {
                 Ok(id) => id,
                 Err(e) => {
-                    tracing::warn!(task_id = %task_id, error = %e, "failed to derive operator_id from task_id; skipping ack");
-                    continue;
+                    tracing::warn!(task_id = %task_id, error = %e, "failed to derive stable operator_id; using legacy task_id form");
+                    match krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str())) {
+                        Ok(id) => id,
+                        Err(e2) => {
+                            tracing::warn!(task_id = %task_id, error = %e2, "failed to derive operator_id from task_id; skipping ack");
+                            continue;
+                        }
+                    }
                 }
             };
             let request = CheckpointAckRequest {
@@ -233,6 +260,64 @@ fn barrier_endpoint_for_record(record: &ExecutorRecord) -> Option<String> {
                 .map(str::to_owned)
                 .filter(|s| !s.is_empty())
         })
+}
+
+/// Derive a stable `OperatorId` for a given task by hashing the task's
+/// typed fragment body (when present). The fragment body is a deterministic
+/// representation of the operator's plan; the hash is therefore stable
+/// across task retries, which is the property the engine-semantics contract
+/// (`docs/contracts/engine-semantics.md`) requires.
+///
+/// Falls back to a `legacy-{task_id}` form when no fragment body is
+/// available; the caller is expected to log this and prefer restoration
+/// under the legacy id, knowing that the id will not survive a task
+/// retry under that operator. The proper fix for legacy fragments is to
+/// upgrade the producer to emit typed fragments carrying an explicit
+/// stable operator id.
+fn stable_operator_id_for_task_id(
+    job_record: Option<JobRecord>,
+    task_id: &TaskId,
+) -> Result<krishiv_proto::OperatorId, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let record = job_record.ok_or_else(|| {
+        format!(
+            "no job record for operator_id derivation (task_id={})",
+            task_id.as_str()
+        )
+    })?;
+    // Find the task and use its description (the typed fragment body) as
+    // the stable identity source.
+    let mut description: Option<&str> = None;
+    for stage in record.stages() {
+        for task in stage.tasks() {
+            if task.task_id() == task_id {
+                description = Some(task.description());
+                break;
+            }
+        }
+        if description.is_some() {
+            break;
+        }
+    }
+    let Some(desc) = description else {
+        return Err(format!("task {} not found in job stages", task_id.as_str()));
+    };
+    if desc.is_empty() {
+        return Err("task description is empty".into());
+    }
+    // Try to extract the typed fragment body. The body sits after a
+    // `krishiv-fragment:` prefix; if the prefix is absent, the fragment is
+    // legacy. The legacy path falls back to hashing the entire
+    // description; while not ideal, it is at least deterministic across
+    // retries of the same task on the same fragment.
+    let body = desc.strip_prefix("krishiv-fragment:").unwrap_or(desc);
+    let mut hasher = DefaultHasher::new();
+    body.hash(&mut hasher);
+    let hash = hasher.finish();
+    let id = format!("op-h{:016x}", hash);
+    krishiv_proto::OperatorId::try_new(id).map_err(|e| e.to_string())
 }
 
 /// Dispatch barriers for one plan; returns per-task acks on success.
@@ -355,13 +440,19 @@ fn barrier_ack_to_checkpoint_ack(
     ack: &krishiv_proto::wire::v1::BarrierAck,
 ) -> Result<CheckpointAckRequest, String> {
     let snapshot_path = ack.state_handle.as_ref().map(|h| h.checkpoint_uri.clone());
-    let operator_id = krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str()))
-        .map_err(|e| {
+    // Best-effort: try the stable-id path (hashing the fragment body) and
+    // fall back to `op-{task_id}` if no job record is available. The
+    // legacy form is a known violation of the engine-semantics contract
+    // (operator identity should be deterministic across task retries) and
+    // is logged elsewhere; here we just want a usable id.
+    let operator_id = stable_operator_id_for_task_id(None, task_id).or_else(|_| {
+        krishiv_proto::OperatorId::try_new(format!("op-{}", task_id.as_str())).map_err(|e| {
             format!(
                 "failed to derive operator_id from task_id '{}': {e}",
                 task_id.as_str()
             )
-        })?;
+        })
+    })?;
     Ok(CheckpointAckRequest {
         job_id: job_id.clone(),
         operator_id,

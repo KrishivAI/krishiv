@@ -102,6 +102,26 @@ impl FeedableJob for IvmJob {
                     active_views: summary.active_views,
                     total_output_rows: summary.total_output_rows,
                     tick: j.tick()?,
+                    degraded_views: summary.degraded_views,
+                    errored_views: summary
+                        .errored_views
+                        .into_iter()
+                        .map(|e| super::job::ViewError {
+                            view: e.view,
+                            kind: match e.kind {
+                                krishiv_ivm::ViewErrorKind::OperatorApply => {
+                                    super::job::ViewErrorKind::OperatorApply
+                                }
+                                krishiv_ivm::ViewErrorKind::ViewSql => {
+                                    super::job::ViewErrorKind::ViewSql
+                                }
+                                krishiv_ivm::ViewErrorKind::Publish => {
+                                    super::job::ViewErrorKind::Publish
+                                }
+                            },
+                            message: e.message,
+                        })
+                        .collect(),
                 }
             }
             Self::Remote(j) => {
@@ -110,6 +130,8 @@ impl FeedableJob for IvmJob {
                     active_views: s.active_views,
                     total_output_rows: s.total_output_rows,
                     tick: s.tick,
+                    degraded_views: Vec::new(),
+                    errored_views: Vec::new(),
                 }
             }
         })

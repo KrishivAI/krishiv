@@ -805,6 +805,12 @@ impl FlightSqlService for KrishivFlightSqlService {
 
     async fn list_custom_actions(&self) -> Option<Vec<Result<arrow_flight::ActionType, Status>>> {
         use krishiv_runtime::flight_action::{action_type as at, tags};
+        // H-24 (audit): the prior list omitted REGISTER_KAFKA_SOURCE,
+        // CANCEL_OPERATION, and GET_OPERATION_PROGRESS, even though the
+        // service handles them. Standards-compliant Flight-SQL clients
+        // discover server actions via `list_actions`; clients that rely
+        // on that discoverability could not find these three. We now
+        // advertise all eleven.
         Some(
             [
                 tags::REGISTER_PARQUET,
@@ -816,6 +822,9 @@ impl FlightSqlService for KrishivFlightSqlService {
                 tags::EXECUTE_PLAN,
                 tags::BATCH_SQL,
                 tags::BATCH_SQL_SINK,
+                tags::REGISTER_KAFKA_SOURCE,
+                tags::CANCEL_OPERATION,
+                tags::GET_OPERATION_PROGRESS,
             ]
             .iter()
             .map(|tag| {

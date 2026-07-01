@@ -98,7 +98,23 @@ impl ViewPlan {
                     Ok(0)
                 }
             }
-            _ => Ok(0),
+            ViewPlan::Aggregate { source, op } => {
+                let wm = watermarks.get(source.as_str()).copied().unwrap_or(i64::MIN);
+                if wm > i64::MIN {
+                    op.gc_watermark(wm)
+                } else {
+                    Ok(0)
+                }
+            }
+            ViewPlan::Distinct { source, op } => {
+                let wm = watermarks.get(source.as_str()).copied().unwrap_or(i64::MIN);
+                if wm > i64::MIN {
+                    op.gc_watermark(wm)
+                } else {
+                    Ok(0)
+                }
+            }
+            ViewPlan::DiffBased => Ok(0),
         }
     }
 }

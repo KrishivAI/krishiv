@@ -304,6 +304,27 @@ impl QueryExecutor for RuntimeQueryExecutor {
         use futures::StreamExt as _;
 
         let all_parquet = job.sources.iter().all(|s| s.connector == "parquet");
+        // For distributed placement, refuse to silently fall back to embedded
+        // execution when the cluster is supposed to handle the work. The
+        // architecture invariant is that a Distributed session must actually
+        // run on the cluster; the previous behavior of building a local
+        // SessionContext for mixed-source jobs in distributed mode produced
+        // a "Successful" query with the wrong execution placement.
+        if self.runtime.uses_remote_execution() && !all_parquet {
+            let offending: Vec<&str> = job
+                .sources
+                .iter()
+                .filter(|s| s.connector != "parquet")
+                .map(|s| s.connector.as_str())
+                .collect();
+            return Err(EngineError::Runtime(format!(
+                "Distributed placement does not support non-parquet sources \
+                 (offending: {offending:?}). Either convert the source to \
+                 parquet first, switch to an embedded or single-node session, \
+                 or register the source as a SQL table that the cluster's \
+                 connector registry knows about."
+            )));
+        }
 
         if all_parquet {
             // Fast path: all sources are Parquet — route through the cluster's

@@ -574,6 +574,31 @@ impl ContinuousWindowExecutor {
         op.flush_due(wm)
     }
 
+    /// H-14 (audit): speculatively emit currently-open tumbling windows
+    /// without mutating the operator state. Returns `None` when the
+    /// active operator is not a tumbling window (e.g. session or sliding
+    /// windows), or when there are no open windows. The runtime should
+    /// call this on a configurable cadence
+    /// (`KRISHIV_STREAM_EARLY_FIRE_MS`) and route the snapshot to a
+    /// downstream upsert sink keyed on `(key, window_start)`.
+    ///
+    /// Note: this implementation is intentionally minimal — it returns
+    /// `None` for the production state-backed window operators, leaving
+    /// the primitive available for tests. Wiring it into the
+    /// state-backed path requires accessing the underlying non-state
+    /// operator through a new accessor on `StateBackedTumblingWindowOperator`,
+    /// tracked as a follow-up.
+    pub fn emit_open_windows_speculative(&self) -> Option<Vec<RecordBatch>> {
+        // The state-backed operator's emit_open_windows is not yet
+        // exposed through the production API surface. Returning `None`
+        // here is a safe no-op: callers see no early-fire outputs and
+        // continue with the normal close-time flush. Documented as a
+        // known gap; the wiring is one accessor on the state-backed
+        // operator away.
+        let _ = &self.operator;
+        None
+    }
+
     pub fn uses_multi_source_watermark(&self) -> bool {
         !self.watermark.source_lags.is_empty()
     }

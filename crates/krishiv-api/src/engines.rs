@@ -690,6 +690,24 @@ fn idle_tick_interval() -> std::time::Duration {
         .unwrap_or(500);
     std::time::Duration::from_millis(ms)
 }
+
+/// Interval (milliseconds) between speculative early-fire emissions of
+/// currently-open tumbling windows. Set `KRISHIV_STREAM_EARLY_FIRE_MS=0`
+/// to disable. Default 0 (disabled) — early-fire is opt-in because the
+/// speculative outputs require a downstream upsert sink keyed on
+/// `(key, window_start)`. H-14 (audit): the primitive was tested in
+/// isolation but never wired into the continuous loop; this wires it.
+fn early_fire_interval() -> Option<std::time::Duration> {
+    let ms = std::env::var("KRISHIV_STREAM_EARLY_FIRE_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(ms))
+    }
+}
 /// Safety floor for the source-notify wake path: when the source implements
 /// [`SourceReader::data_notify`], the loop awaits the notify with a 50 µs
 /// timer race so a lost wakeup does not stall detection indefinitely. 50 µs is
@@ -1144,6 +1162,12 @@ async fn run_streaming_continuous(
     // of source-idle time so session windows whose gap has elapsed can close.
     let idle_tick_period = idle_tick_interval();
     let mut last_idle_tick = std::time::Instant::now();
+    // H-14 (audit): speculative early-fire wiring. When enabled, the
+    // continuous loop periodically emits a snapshot of every open
+    // tumbling window so downstream upsert sinks can see a result before
+    // the window closes. Off by default.
+    let early_fire_period = early_fire_interval();
+    let mut last_early_fire = std::time::Instant::now();
 
     loop {
         if *stop_rx.borrow() {
@@ -1166,6 +1190,20 @@ async fn run_streaming_continuous(
                     emit_to_writers(&mut writers, &idle_outputs).await?;
                 }
                 last_idle_tick = std::time::Instant::now();
+            }
+            // H-14 (audit): speculative early-fire of currently-open
+            // tumbling windows. Emits a non-mutating snapshot of every
+            // open window's current aggregate so a downstream upsert sink
+            // keyed on `(key, window_start)` can deliver a result before
+            // the window closes. Disabled by default; enabled via
+            // `KRISHIV_STREAM_EARLY_FIRE_MS`.
+            if let Some(period) = early_fire_period
+                && last_early_fire.elapsed() >= period
+                && let Some(snapshot) = setup.executor.emit_open_windows_speculative()
+                && !snapshot.is_empty()
+            {
+                emit_to_writers(&mut writers, &snapshot).await?;
+                last_early_fire = std::time::Instant::now();
             }
             // Source idle. Wait for either the source's notify, a stop
             // signal, or the safety floor (handles lost wakeups). After

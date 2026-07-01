@@ -268,6 +268,17 @@ impl DataFrame {
         self
     }
 
+    /// L-7 / P-24 (audit): centralized policy for "should this DataFrame
+    /// be routed to the remote runtime?" A DataFrame executes locally
+    /// when the runtime is non-remote (embedded / single-node) or when
+    /// `force_local` is set (delta / hudi integrations whose plan is
+    /// bound to the local catalog). Previously this expression was
+    /// repeated at 5+ call sites; a single source of truth makes
+    /// future changes (e.g. a new local-only DataFrame type) one-line.
+    pub(crate) fn is_locally_evaluated(&self) -> bool {
+        !self.runtime.uses_remote_execution() || self.force_local
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_sql_dataframe(
         mode: ExecutionMode,
@@ -371,7 +382,7 @@ Execution statistics:
 
     /// Collect local SQL results with engine execution statistics.
     pub fn collect_with_stats(&self) -> Result<(QueryResult, QueryExecutionStats)> {
-        if self.runtime.uses_remote_execution() && !self.force_local {
+        if !self.is_locally_evaluated() {
             return Err(KrishivError::unsupported(
                 "remote collect_with_stats requires coordinator query-metrics transport",
             ));
@@ -523,7 +534,7 @@ Execution statistics:
             )));
         }
 
-        let uses_remote = self.runtime.uses_remote_execution() && !self.force_local;
+        let uses_remote = !self.is_locally_evaluated();
 
         let result = if uses_remote {
             if let Some(query) = self.sql_query.as_deref() {
@@ -578,7 +589,7 @@ Execution statistics:
             return Ok(Box::pin(stream));
         }
 
-        let uses_remote = self.runtime.uses_remote_execution() && !self.force_local;
+        let uses_remote = !self.is_locally_evaluated();
 
         let result = if uses_remote {
             if let Some(query) = self.sql_query.as_deref() {
@@ -1219,8 +1230,7 @@ Execution statistics:
         mode: krishiv_common::write_commit::WriteMode,
         partition_by: &[String],
     ) -> Result<Option<()>> {
-        if !(self.runtime.uses_remote_execution() && !self.force_local && self.sql_query.is_some())
-        {
+        if !(self.is_locally_evaluated() && self.sql_query.is_some()) {
             return Ok(None);
         }
         match self.run_sink_write(path, mode, partition_by)? {
