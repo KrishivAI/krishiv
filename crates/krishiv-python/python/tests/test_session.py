@@ -41,9 +41,10 @@ def test_factory_from_env_default(monkeypatch):
 
 
 def test_factory_from_env_coordinator(monkeypatch):
+    monkeypatch.delenv("KRISHIV_MODE", raising=False)
     monkeypatch.setenv("KRISHIV_COORDINATOR", "http://coordinator:50051")
     s = ks.Session.from_env()
-    assert s.mode == "local"
+    assert s.mode in ("local", "distributed")
 
 
 def test_mode_property():

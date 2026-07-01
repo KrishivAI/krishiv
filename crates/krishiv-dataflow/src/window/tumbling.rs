@@ -433,7 +433,7 @@ pub(crate) fn build_window_record_batch(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn key_type_to_arrow_data_type(key_type: &str) -> DataType {
+pub(crate) fn key_type_to_arrow_data_type(key_type: &str) -> DataType {
     match key_type {
         "int32" => DataType::Int32,
         "int64" => DataType::Int64,
@@ -443,7 +443,7 @@ fn key_type_to_arrow_data_type(key_type: &str) -> DataType {
     }
 }
 
-fn key_value_to_typed_array(
+pub(crate) fn key_value_to_typed_array(
     key_type: &str,
     key_value: &str,
 ) -> Result<Arc<dyn arrow::array::Array>, ExecError> {

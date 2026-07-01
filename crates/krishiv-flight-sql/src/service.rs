@@ -649,7 +649,11 @@ impl FlightSqlService for KrishivFlightSqlService {
         match EndTransaction::try_from(query.action)
             .map_err(|_| Status::invalid_argument("invalid EndTransaction action"))?
         {
-            EndTransaction::Commit | EndTransaction::Rollback => Ok(()),
+            EndTransaction::Commit => Ok(()),
+            EndTransaction::Rollback => {
+                tracing::warn!("Flight SQL Rollback is a no-op: no transactional storage backend");
+                Ok(())
+            }
             EndTransaction::Unspecified => Err(Status::invalid_argument(
                 "EndTransaction action must be Commit or Rollback",
             )),

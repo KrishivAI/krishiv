@@ -40,9 +40,12 @@ impl InMemorySourceProvider {
 
     /// Preload `batches` for source `name`.
     pub fn insert(&self, name: impl Into<String>, batches: Vec<RecordBatch>) {
-        if let Ok(mut g) = self.data.lock() {
-            g.insert(name.into(), batches);
-        }
+        #[allow(clippy::expect_used, reason = "poisoned mutex = impossible invariant")]
+        let mut g = self
+            .data
+            .lock()
+            .expect("InMemorySourceProvider mutex poisoned");
+        g.insert(name.into(), batches);
     }
 }
 

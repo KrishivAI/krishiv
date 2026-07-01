@@ -729,8 +729,6 @@ impl CheckpointCoordinator {
                              any in-flight acks from the old generation will be rejected"
                         );
                     }
-                    self.fencing_token =
-                        FencingToken::try_new(meta.fencing_token).unwrap_or(self.fencing_token);
                 }
                 self.current_epoch = epoch;
                 self.state = CheckpointCoordinatorState::Committed { epoch };
@@ -748,19 +746,16 @@ impl CheckpointCoordinator {
                 if let Some(meta) =
                     read_epoch_metadata_async(self.storage.as_ref(), self.job_id.as_str(), epoch)
                         .await?
+                    && meta.fencing_token != self.fencing_token.as_u64()
                 {
-                    if meta.fencing_token != self.fencing_token.as_u64() {
-                        tracing::warn!(
-                            job_id = %self.job_id,
-                            recovered_epoch = epoch,
-                            stored_fencing_token = meta.fencing_token,
-                            current_fencing_token = self.fencing_token.as_u64(),
-                            "coordinator recovered epoch committed by a previous generation; \
-                             any in-flight acks from the old generation will be rejected"
-                        );
-                    }
-                    self.fencing_token =
-                        FencingToken::try_new(meta.fencing_token).unwrap_or(self.fencing_token);
+                    tracing::warn!(
+                        job_id = %self.job_id,
+                        recovered_epoch = epoch,
+                        stored_fencing_token = meta.fencing_token,
+                        current_fencing_token = self.fencing_token.as_u64(),
+                        "coordinator recovered epoch committed by a previous generation; \
+                         any in-flight acks from the old generation will be rejected"
+                    );
                 }
                 self.current_epoch = epoch;
                 self.state = CheckpointCoordinatorState::Committed { epoch };

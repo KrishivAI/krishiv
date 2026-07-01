@@ -24,6 +24,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, SortField};
 use async_trait::async_trait;
+use tracing::warn;
 
 use crate::changelog::ChangelogBatch;
 use crate::error::{EngineError, EngineResult};
@@ -58,6 +59,18 @@ impl SinkProvider for ConsolidatingSinkProvider {
 /// Threshold above which [`ConsolidatingSinkWriter`] emits a warning about
 /// unmatched retractions accumulating in memory.
 const UNMATCHED_RETRACTION_WARN_THRESHOLD: usize = 10_000;
+
+/// Maximum weight value accepted in a single flush call. Weights beyond this
+/// are clamped to prevent OOM from degenerate input (e.g. 10M duplicate inserts
+/// for the same row). The operational assumption is that no real workload
+/// legitimately needs >1M identical copies of the same row.
+const MAX_FLUSH_WEIGHT: i64 = 1_000_000;
+
+/// Maximum number of unmatched (negative-weight) entries retained before
+/// eviction. Beyond this, the oldest unmatched entries are discarded to
+/// bound memory usage. A matching Insert that arrives after eviction will
+/// be treated as a new row (Insert-only), which is a safe degradation.
+const MAX_UNMATCHED_RETRACTIONS: usize = 100_000;
 
 struct ConsolidatingSinkWriter {
     inner: Box<dyn SinkWriter>,
@@ -106,10 +119,28 @@ impl SinkWriter for ConsolidatingSinkWriter {
             return self.inner.flush().await;
         };
 
-        // Materialize every live row, repeated by its (positive) multiplicity.
+        // Evict oldest unmatched retractions beyond the memory bound.
+        let unmatched_count = self.rows.values().filter(|(_, w)| *w < 0).count();
+        if unmatched_count > MAX_UNMATCHED_RETRACTIONS {
+            let to_evict = unmatched_count - MAX_UNMATCHED_RETRACTIONS;
+            let mut evicted = 0usize;
+            self.rows.retain(|_, (_, w)| {
+                if *w >= 0 || evicted >= to_evict {
+                    true
+                } else {
+                    evicted += 1;
+                    false
+                }
+            });
+            warn!(
+                evicted = evicted,
+                remaining_unmatched = MAX_UNMATCHED_RETRACTIONS,
+                "evicted oldest unmatched retractions to bound memory"
+            );
+        }
         let unmatched = self.rows.values().filter(|(_, w)| *w < 0).count();
         if unmatched >= UNMATCHED_RETRACTION_WARN_THRESHOLD {
-            tracing::warn!(
+            warn!(
                 unmatched_retractions = unmatched,
                 "consolidating sink has {} unmatched retractions in memory; \
                  Delete events arrived for rows never inserted. \
@@ -117,12 +148,23 @@ impl SinkWriter for ConsolidatingSinkWriter {
                 unmatched
             );
         }
+
+        // Materialize live rows, clamped to MAX_FLUSH_WEIGHT per row to
+        // prevent OOM from degenerate input.
         let mut slices: Vec<RecordBatch> = Vec::new();
         for (row, weight) in self.rows.values() {
             if *weight <= 0 {
                 continue;
             }
-            for _ in 0..*weight {
+            let clamped = (*weight).min(MAX_FLUSH_WEIGHT);
+            if clamped != *weight {
+                warn!(
+                    original_weight = *weight,
+                    clamped_weight = clamped,
+                    "clamped row weight to MAX_FLUSH_WEIGHT in consolidating sink flush"
+                );
+            }
+            for _ in 0..clamped {
                 slices.push(row.clone());
             }
         }

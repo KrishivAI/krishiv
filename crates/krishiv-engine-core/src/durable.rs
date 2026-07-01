@@ -11,6 +11,7 @@
 //! runs on the blocking pool, off the async reactor.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use krishiv_proto::JobId;
@@ -27,6 +28,10 @@ use crate::runtime::{CheckpointPayload, CheckpointService};
 pub struct DurableCheckpointService {
     dir: PathBuf,
 }
+
+/// Monotonically increasing counter used to uniquify temp file names within
+/// the same process and nanosecond.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl DurableCheckpointService {
     /// Create a durable checkpoint service rooted at `dir`, creating the
@@ -60,12 +65,13 @@ impl CheckpointService for DurableCheckpointService {
         // `checkpoint::ephemeral` storage. (Job ownership is fenced to one
         // coordinator, so this is defense-in-depth against a lingering process.)
         let unique = format!(
-            "{}.{}",
+            "{}.{}.{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         let tmp_path = self.dir.join(format!("{}.ckpt.tmp.{unique}", job.as_str()));
         let dir = self.dir.clone();

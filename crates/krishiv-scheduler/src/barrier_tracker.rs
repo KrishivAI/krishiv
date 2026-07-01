@@ -1,7 +1,8 @@
 //! Coordinator-side barrier acknowledgment tracking (R16 S1.4).
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use krishiv_proto::wire::v1::BarrierAck;
 

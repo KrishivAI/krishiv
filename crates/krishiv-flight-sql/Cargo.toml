@@ -26,6 +26,7 @@ krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 dashmap = { workspace = true }
 lru = "0.18"
 sha2 = { workspace = true }
+hex.workspace = true
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }

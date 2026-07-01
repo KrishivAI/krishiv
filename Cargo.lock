@@ -5731,6 +5731,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "hex",
  "krishiv-api",
  "krishiv-common",
  "krishiv-plan",

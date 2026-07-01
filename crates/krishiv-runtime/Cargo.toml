@@ -40,6 +40,7 @@ krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", featur
 [features]
 kafka = []
 vector-sinks = ["dep:krishiv-connectors"]
+__disabled_flight_test = []
 
 [dev-dependencies]
 tokio = { workspace = true }

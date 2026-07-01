@@ -156,6 +156,36 @@ fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {
     }
 }
 
+/// Returns `true` when a coordinator URL points at the local host, so the
+/// session can default to `SingleNode` placement (the local-daemon case) when
+/// `KRISHIV_MODE` is unset. Anything else is treated as `Distributed` to
+/// satisfy the architecture invariant that remote cluster URLs are never
+/// silently routed through the single-node path.
+fn is_loopback_coordinator_url(url: &str) -> bool {
+    // Extract the host portion between `://` and the next `/` (or end).
+    let after_scheme = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => return false,
+    };
+    let host = match after_scheme.find('/') {
+        Some(i) => &after_scheme[..i],
+        None => after_scheme,
+    };
+    // Strip userinfo (`user@host`) and port (`:port`).
+    let host_no_user = host.rsplit('@').next().unwrap_or(host);
+    let host_only = match host_no_user.rfind(':') {
+        // IPv6 addresses use `:` as the separator; if the remaining
+        // substring contains '%' (zone) or matches an IPv6 pattern, leave
+        // it alone. For the loopback checks below, only `localhost`,
+        // `127.0.0.1`, and `[::1]` are loopback; we treat any host with
+        // a non-loopback IPv6 address as non-loopback.
+        Some(i) if !host_no_user.starts_with('[') => &host_no_user[..i],
+        _ => host_no_user,
+    };
+    let host_only = host_only.trim_matches(|c| c == '[' || c == ']');
+    matches!(host_only, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
+}
+
 impl SessionBuilder {
     /// Create a session builder.
     pub fn new() -> Self {
@@ -185,9 +215,22 @@ impl SessionBuilder {
 
         match mode_raw.trim().to_ascii_lowercase().as_str() {
             // No mode: infer from coordinator URL presence.
+            // A loopback URL defaults to SingleNode (the local daemon case).
+            // A non-loopback URL must be treated as Distributed, not as
+            // SingleNode, to satisfy the architecture invariant that
+            // RemoteClusterRequired placement is selected for any
+            // non-loopback coordinator. This prevents the silent
+            // placement-drift bug where a production cluster is contacted
+            // via the SingleNode path.
             "" => {
                 if let Some(url) = coordinator_url {
-                    builder = builder.with_local_cluster(url);
+                    if is_loopback_coordinator_url(&url) {
+                        builder = builder.with_local_cluster(url);
+                    } else {
+                        builder = builder
+                            .with_coordinator(url)
+                            .with_deployment_target(DeploymentTarget::BareMetal);
+                    }
                 }
             }
             "embedded" => {}
@@ -1172,33 +1215,58 @@ impl Session {
     pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         let query = query.as_ref().to_owned();
 
+        // Intercept START / REFRESH PIPELINE first so the policy check
+        // can include the resolved source/sink tables of the pipeline.
+        // (Otherwise a policy-deny rule on a source table could be
+        // bypassed by referencing the table from a `START PIPELINE`.)
+        use krishiv_sql::pipeline_ddl::PipelineStatement;
+        let pipeline = krishiv_sql::pipeline_ddl::parse_pipeline_statement(&query)
+            .map_err(KrishivError::from)?;
+
         // Enforce table-access policy on every SQL entry point.
         if let Some(policy) = &self.policy {
-            match krishiv_sql::referenced_table_names(&query) {
-                Ok(tables) => {
-                    for table in &tables {
-                        if !policy.check_table_access(table) {
-                            return Err(KrishivError::AccessDenied {
-                                reason: format!("access denied to table: {table}"),
-                            });
-                        }
-                    }
-                }
+            let mut tables: Vec<String> = match krishiv_sql::referenced_table_names(&query) {
+                Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(error = %e, query = %query, "failed to extract table references for policy check");
                     return Err(KrishivError::AccessDenied {
                         reason: format!("access denied: could not verify query policy ({e})"),
                     });
                 }
+            };
+            // For pipeline statements, also enforce policy on the resolved
+            // view + sink names registered in the pipeline registry.
+            if let Some(stmt) = &pipeline {
+                match stmt {
+                    PipelineStatement::StartPipeline { sink }
+                    | PipelineStatement::RefreshPipeline { sink, .. } => {
+                        if let Some(view) = self
+                            .sql_engine
+                            .pipeline_registry()
+                            .view_for_sink(sink)
+                            .map_err(KrishivError::from)?
+                        {
+                            tables.push(view);
+                        }
+                        tables.push(sink.clone());
+                    }
+                    PipelineStatement::DropSink { name }
+                    | PipelineStatement::DropSource { name } => {
+                        tables.push(name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            for table in &tables {
+                if !policy.check_table_access(table) {
+                    return Err(KrishivError::AccessDenied {
+                        reason: format!("access denied to table: {table}"),
+                    });
+                }
             }
         }
 
-        // Intercept START / REFRESH PIPELINE — the SqlEngine handles CREATE/DROP
-        // SOURCE/SINK, but execution needs the api pipeline layer.
-        use krishiv_sql::pipeline_ddl::PipelineStatement;
-        match krishiv_sql::pipeline_ddl::parse_pipeline_statement(&query)
-            .map_err(KrishivError::from)?
-        {
+        match pipeline {
             Some(PipelineStatement::StartPipeline { sink }) => {
                 return self.run_sql_pipeline(&sink).await;
             }

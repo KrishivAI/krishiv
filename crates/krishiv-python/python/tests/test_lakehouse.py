@@ -28,6 +28,12 @@ def test_read_delta_nonexistent_path():
         pass
 
 
+def test_read_delta_distributed_mode_is_explicitly_local_only():
+    session = ks.Session.connect("http://localhost:50051")
+    with pytest.raises(RuntimeError, match="read_delta is local-only"):
+        ks.read_delta(session, "/tmp/delta-table")
+
+
 def test_write_delta_roundtrip(tmp_path):
     session = _make_session()
     df = _make_df(session)
@@ -58,6 +64,12 @@ def test_read_hudi_nonexistent_path():
     session = _make_session()
     with pytest.raises((ks.ConnectorError, RuntimeError, ValueError)):
         ks.read_hudi(session, "/nonexistent/hudi/table")
+
+
+def test_read_hudi_distributed_mode_is_explicitly_local_only():
+    session = ks.Session.connect("http://localhost:50051")
+    with pytest.raises(RuntimeError, match="read_hudi is local-only"):
+        ks.read_hudi(session, "/tmp/hudi-table")
 
 
 def test_write_hudi_append(tmp_path):

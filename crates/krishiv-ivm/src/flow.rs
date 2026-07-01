@@ -61,6 +61,32 @@ const MAX_FIXPOINT_ITERS: usize = 100;
 pub struct StepSummary {
     pub total_output_rows: usize,
     pub active_views: usize,
+    /// View names that emitted a non-Apply output (degraded to DiffBased) during
+    /// this step. Useful for surfacing join-type degradations to operators.
+    pub degraded_views: Vec<String>,
+    /// View names whose incremental operator or SQL execution returned an
+    /// error and were silently skipped. The error message is the same string
+    /// the operator logged. Step did not panic; subsequent ticks re-evaluate.
+    pub errored_views: Vec<ViewError>,
+}
+
+/// One incremental view's failure during a step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewError {
+    pub view: String,
+    pub kind: ViewErrorKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewErrorKind {
+    /// The incremental operator (`apply`) returned an error (trace capacity,
+    /// schema mismatch, type coercion, etc.).
+    OperatorApply,
+    /// The view's SQL body failed to execute (column not found, type mismatch).
+    ViewSql,
+    /// The view's published output failed (downstream backpressure, etc.).
+    Publish,
 }
 
 // ── IncrementalFlowInner ──────────────────────────────────────────────────────
@@ -499,6 +525,8 @@ impl IncrementalFlow {
         Ok(StepSummary {
             total_output_rows,
             active_views,
+            degraded_views: Vec::new(),
+            errored_views: Vec::new(),
         })
     }
 
@@ -622,6 +650,10 @@ impl IncrementalFlow {
         // view_full_outputs: pre-populated with prev snapshots for clean views.
         // DiffBased dirty views add their SQL result here during this phase.
         let mut view_full_outputs: HashMap<String, RecordBatch> = view_prev_snapshots;
+        // Capture view-SQL execution errors from the lock-free Phase 3
+        // execution path so they can be surfaced in the StepSummary
+        // returned by Phase 5+6 (which holds the lock).
+        let mut pre_lock_view_errors: Vec<ViewError> = Vec::new();
         let mut dirty_views: HashSet<String> = HashSet::new();
         // Newly built plans to insert in Phase 5: (name, plan, body_sql)
         let mut new_plans: Vec<(String, ViewPlan, String)> = Vec::new();
@@ -775,6 +807,11 @@ impl IncrementalFlow {
                                 error = %e,
                                 "view SQL execution failed; using empty batch"
                             );
+                            pre_lock_view_errors.push(ViewError {
+                                view: view_name.clone(),
+                                kind: ViewErrorKind::ViewSql,
+                                message: e.to_string(),
+                            });
                             make_empty_batch!(spec)
                         }
                     };
@@ -790,6 +827,8 @@ impl IncrementalFlow {
         inner.tick += 1;
         let mut total_output_rows = 0usize;
         let mut active_views = 0usize;
+        let mut errored_views: Vec<ViewError> = pre_lock_view_errors;
+        let mut degraded_views: Vec<String> = Vec::new();
 
         // Provenance: pre-compute weight-aware input hashes when enabled.
         // Each row is hashed with its weight encoded so rows that differ only
@@ -842,6 +881,12 @@ impl IncrementalFlow {
                     .map(|p| p.kind())
                     .unwrap_or(ViewPlanKind::DiffBased)
             };
+            // Record views that ended up on the O(state) DiffBased path
+            // (forced or because the only cached plan was DiffBased). This
+            // surfaces the join-type degradation noted in the IVM plan code.
+            if matches!(plan_kind, ViewPlanKind::DiffBased) {
+                degraded_views.push(view_name.clone());
+            }
 
             let output_delta = if plan_kind == ViewPlanKind::Incremental {
                 // O(Δ) path: apply stateful operator.
@@ -854,7 +899,19 @@ impl IncrementalFlow {
                         };
                         match op.apply(delta) {
                             Ok(d) => d,
-                            Err(_) => continue,
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view aggregate apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
                         }
                     }
                     Some(ViewPlan::Join {
@@ -869,7 +926,19 @@ impl IncrementalFlow {
                         }
                         match op.apply(left, right) {
                             Ok(d) => d,
-                            Err(_) => continue,
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view join apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
                         }
                     }
                     Some(ViewPlan::Distinct { source, op }) => {
@@ -880,7 +949,19 @@ impl IncrementalFlow {
                         };
                         match op.apply(delta) {
                             Ok(d) => d,
-                            Err(_) => continue,
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view distinct apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
                         }
                     }
                     _ => continue,
@@ -893,7 +974,19 @@ impl IncrementalFlow {
                 };
                 match view.diff_and_update(new_full) {
                     Ok(d) => d,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            view = %view_name,
+                            error = %e,
+                            "incremental view diff_and_update failed; skipping view"
+                        );
+                        errored_views.push(ViewError {
+                            view: view_name.clone(),
+                            kind: ViewErrorKind::ViewSql,
+                            message: e.to_string(),
+                        });
+                        continue;
+                    }
                 }
             };
 
@@ -926,6 +1019,11 @@ impl IncrementalFlow {
                     is_materialized = view.spec.is_materialized,
                     "publish_output failed"
                 );
+                errored_views.push(ViewError {
+                    view: view_name.clone(),
+                    kind: ViewErrorKind::Publish,
+                    message: e.to_string(),
+                });
             }
         }
 
@@ -944,6 +1042,8 @@ impl IncrementalFlow {
         Ok(StepSummary {
             total_output_rows,
             active_views,
+            degraded_views,
+            errored_views,
         })
     }
 
@@ -1128,6 +1228,8 @@ impl IncrementalFlow {
         Ok(StepSummary {
             total_output_rows,
             active_views,
+            degraded_views: Vec::new(),
+            errored_views: Vec::new(),
         })
     }
 

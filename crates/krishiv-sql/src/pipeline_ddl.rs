@@ -138,6 +138,17 @@ impl PipelineRegistry {
             .cloned())
     }
 
+    /// View name backing the given sink, if the sink is registered.
+    /// Returns `None` for unknown sinks.
+    pub fn view_for_sink(&self, name: &str) -> SqlResult<Option<String>> {
+        Ok(self
+            .sinks
+            .read()
+            .map_err(|_| poisoned())?
+            .get(name)
+            .map(|spec| spec.view.clone()))
+    }
+
     /// Names of all declared sinks.
     pub fn sink_names(&self) -> SqlResult<Vec<String>> {
         Ok(self

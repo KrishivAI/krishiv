@@ -72,6 +72,7 @@ from .krishiv import windows
 from . import functions
 
 import asyncio as _asyncio
+import inspect as _inspect
 
 
 async def connect_async(url: str) -> Session:
@@ -83,18 +84,16 @@ _native_session_sql = Session.sql
 
 
 async def _session_sql_async(self, query: str):
-    """Plan SQL from async code (runs on a thread pool)."""
-    loop = _asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _native_session_sql, self, query)
+    """Plan SQL from async code and return a lazy DataFrame."""
+    return _native_session_sql(self, query)
 
 
-_native_dataframe_collect_async = DataFrame.collect_async
+_native_dataframe_collect = DataFrame.collect
 
 
 async def _dataframe_collect_async(self):
-    """Collect a DataFrame from async code (runs on a thread pool)."""
-    loop = _asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _native_dataframe_collect_async, self)
+    """Collect a DataFrame from async code."""
+    return _native_dataframe_collect(self)
 
 
 _native_dataframe_execute_stream_async = DataFrame.execute_stream_async
@@ -116,10 +115,16 @@ async def _streaming_dataframe_execute_stream_async(self):
 
 
 _native_query_handle_collect = QueryHandle.collect
+_native_query_handle_collect_async = getattr(QueryHandle, "collect_async", None)
 
 
 async def _query_handle_collect_async(self):
     """Await a submitted query handle (runs on a thread pool)."""
+    if _native_query_handle_collect_async is not None:
+        result = _native_query_handle_collect_async(self)
+        if _inspect.isawaitable(result):
+            return await result
+        return result
     loop = _asyncio.get_running_loop()
     return await loop.run_in_executor(None, _native_query_handle_collect, self)
 
@@ -129,6 +134,26 @@ DataFrame.collect_async = _dataframe_collect_async
 DataFrame.execute_stream_async = _dataframe_execute_stream_async
 StreamingDataFrame.execute_stream_async = _streaming_dataframe_execute_stream_async
 QueryHandle.collect_async = _query_handle_collect_async
+
+
+def _session_is_embedded(self) -> bool:
+    """Return True when this session runs in-process embedded mode."""
+    return self.mode == "embedded"
+
+
+def _session_is_single_node(self) -> bool:
+    """Return True when this session routes to a single-node daemon."""
+    return self.mode == "local"
+
+
+def _session_is_distributed(self) -> bool:
+    """Return True when this session routes to a distributed coordinator."""
+    return self.mode == "distributed"
+
+
+Session.is_embedded = _session_is_embedded
+Session.is_single_node = _session_is_single_node
+Session.is_distributed = _session_is_distributed
 
 
 def _register_arrow_stream(self, job_name: str, async_gen):

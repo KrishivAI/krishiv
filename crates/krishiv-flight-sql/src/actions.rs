@@ -1,4 +1,13 @@
-use arrow::datatypes::Schema;
+use arrow::array::{
+    BinaryArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array,
+    DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
+    DurationSecondArray, FixedSizeBinaryArray, IntervalDayTimeArray, IntervalMonthDayNanoArray,
+    IntervalYearMonthArray, LargeBinaryArray, LargeStringArray, StringViewArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
+};
+use arrow::datatypes::{IntervalUnit, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use tonic::Status;
 
@@ -153,10 +162,175 @@ pub(crate) fn substitute_sql_params(sql: &str, batch: &RecordBatch) -> String {
                 .unwrap_or_else(|| "NULL".to_string()),
             DataType::LargeUtf8 => array
                 .as_any()
-                .downcast_ref::<arrow::array::LargeStringArray>()
+                .downcast_ref::<LargeStringArray>()
                 .map(|a| format!("'{}'", a.value(row).replace('\'', "''")))
                 .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Utf8View => array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .map(|a| format!("'{}'", a.value(row).replace('\'', "''")))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Date32 => array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .map(|a| format!("DATE '{}'", a.value(row)))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Date64 => array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .map(|a| format!("DATE '{}'", a.value(row)))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Time32(TimeUnit::Second) => array
+                .as_any()
+                .downcast_ref::<Time32SecondArray>()
+                .map(|a| format!("TIME '{}'", a.value(row)))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Time32(TimeUnit::Millisecond) => array
+                .as_any()
+                .downcast_ref::<Time32MillisecondArray>()
+                .map(|a| format!("TIME '{}'", a.value(row)))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Time64(TimeUnit::Microsecond) => array
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .map(|a| format!("TIME '{}'", a.value(row)))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Time64(TimeUnit::Nanosecond) => array
+                .as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .map(|a| format!("TIME '{}'", a.value(row)))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Timestamp(TimeUnit::Second, tz) => {
+                format_timestamp_literal(array, row, tz, TimeUnit::Second)
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+                format_timestamp_literal(array, row, tz, TimeUnit::Millisecond)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+                format_timestamp_literal(array, row, tz, TimeUnit::Microsecond)
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                format_timestamp_literal(array, row, tz, TimeUnit::Nanosecond)
+            }
+            DataType::Duration(TimeUnit::Second) => array
+                .as_any()
+                .downcast_ref::<DurationSecondArray>()
+                .map(|a| format!("INTERVAL '{}' SECOND", a.value(row)))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Duration(TimeUnit::Millisecond) => array
+                .as_any()
+                .downcast_ref::<DurationMillisecondArray>()
+                .map(|a| format!("INTERVAL '{}' MILLISECOND", a.value(row)))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Duration(TimeUnit::Microsecond) => array
+                .as_any()
+                .downcast_ref::<DurationMicrosecondArray>()
+                .map(|a| format!("INTERVAL '{}' MICROSECOND", a.value(row)))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Duration(TimeUnit::Nanosecond) => array
+                .as_any()
+                .downcast_ref::<DurationNanosecondArray>()
+                .map(|a| format!("INTERVAL '{}' NANOSECOND", a.value(row)))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Decimal128(precision, scale) => array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .map(|a| {
+                    let val = a.value_as_string(row);
+                    format!("CAST({val} AS DECIMAL({precision},{scale}))")
+                })
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Decimal256(precision, scale) => array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .map(|a| {
+                    let val = a.value_as_string(row);
+                    format!("CAST({val} AS DECIMAL({precision},{scale}))")
+                })
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Binary => array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .map(|a| format!("X'{}'", hex::encode(a.value(row))))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::LargeBinary => array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .map(|a| format!("X'{}'", hex::encode(a.value(row))))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::FixedSizeBinary(_) => array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .map(|a| format!("X'{}'", hex::encode(a.value(row))))
+                .unwrap_or_else(|| "NULL".to_string()),
+            DataType::Interval(IntervalUnit::YearMonth) => {
+                match array.as_any().downcast_ref::<IntervalYearMonthArray>() {
+                    Some(a) => {
+                        let months = a.value(row);
+                        format!("INTERVAL '{months}' MONTH")
+                    }
+                    None => "NULL".to_string(),
+                }
+            }
+            DataType::Interval(IntervalUnit::DayTime) => {
+                match array.as_any().downcast_ref::<IntervalDayTimeArray>() {
+                    Some(a) => {
+                        let val = a.value(row);
+                        let days = val.days;
+                        let ms = val.milliseconds;
+                        format!("INTERVAL '{days} {ms}' DAY TO MILLISECOND")
+                    }
+                    None => "NULL".to_string(),
+                }
+            }
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                match array.as_any().downcast_ref::<IntervalMonthDayNanoArray>() {
+                    Some(a) => {
+                        let val = a.value(row);
+                        format!(
+                            "INTERVAL '{} {} {}' MONTH DAY NANOSECOND",
+                            val.months, val.days, val.nanoseconds
+                        )
+                    }
+                    None => "NULL".to_string(),
+                }
+            }
+            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+                "NULL".to_string()
+            }
+            DataType::Struct(_) => "NULL".to_string(),
+            DataType::Map(_, _) => "NULL".to_string(),
             _ => "NULL".to_string(),
+        }
+    }
+
+    fn format_timestamp_literal(
+        array: &dyn arrow::array::Array,
+        row: usize,
+        _tz: &Option<std::sync::Arc<str>>,
+        unit: TimeUnit,
+    ) -> String {
+        let val = match unit {
+            TimeUnit::Second => array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .map(|a| a.value(row).to_string()),
+            TimeUnit::Millisecond => array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .map(|a| a.value(row).to_string()),
+            TimeUnit::Microsecond => array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .map(|a| a.value(row).to_string()),
+            TimeUnit::Nanosecond => array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .map(|a| a.value(row).to_string()),
+        };
+        match val {
+            Some(v) => format!("TIMESTAMP '{v}'"),
+            None => "NULL".to_string(),
         }
     }
 

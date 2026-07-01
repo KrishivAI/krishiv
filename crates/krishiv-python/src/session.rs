@@ -264,6 +264,35 @@ impl PySession {
         )
     }
 
+    /// Create a session connected to a single-node local daemon.
+    ///
+    /// This is distinct from :py:meth:`local`, which is an alias for embedded
+    /// in-process execution. Use this when a local Flight SQL daemon is already
+    /// running and should own the data-plane work.
+    #[classmethod]
+    #[pyo3(signature = (url, *, grpc_url = None, target_parallelism = None, shuffle_partitions = None, state_ttl_ms = None))]
+    pub fn single_node(
+        _cls: &Bound<'_, PyType>,
+        url: String,
+        grpc_url: Option<String>,
+        target_parallelism: Option<usize>,
+        shuffle_partitions: Option<u32>,
+        state_ttl_ms: Option<u64>,
+    ) -> PyResult<Self> {
+        let mut builder = krishiv_api::SessionBuilder::new()
+            .with_local_cluster(url)
+            .with_remote_execution(true);
+        if let Some(g) = grpc_url {
+            builder = builder.with_coordinator_grpc(g);
+        }
+        build_session_with_opts(
+            builder,
+            target_parallelism,
+            shuffle_partitions,
+            state_ttl_ms,
+        )
+    }
+
     /// Create a session connected to a remote coordinator.
     ///
     /// All SQL queries are routed to the remote coordinator. Use
@@ -571,7 +600,12 @@ impl PySession {
     ) -> PyResult<()> {
         let inner_df = df.inner.clone();
         let batches = py.detach(|| {
-            krishiv_common::async_util::block_on(inner_df.collect_async())
+            // Use crate::session::block_on_async, NOT krishiv_common::async_util::block_on.
+            // The latter routes through `block_in_place` and panics when called from a
+            // `spawn_blocking` worker (e.g. when invoked from a Python UDF callback
+            // chain). `block_on_async` always delegates to crate::RUNTIME, which is
+            // safe in all contexts.
+            block_on_async(inner_df.collect_async())
                 .map(|result| result.into_batches())
                 .map_err(map_krishiv_error)
         })?;
@@ -1226,9 +1260,13 @@ impl PySession {
     /// ``stream_name`` — Kinesis stream name.
     /// ``shard_id``    — shard to consume from (e.g. ``"shardId-000000000000"``).
     ///
-    /// The registered table exposes the Kinesis message schema:
-    /// ``stream_name``, ``shard_id``, ``sequence_number``, ``partition_key``,
-    /// ``arrival_timestamp_ms``, and ``data`` columns.
+    /// The registered table exposes the Kinesis record schema:
+    /// ``sequence_number``, ``partition_key``, ``data``, and
+    /// ``arrival_timestamp_ms`` columns.
+    ///
+    /// Spawns a background task on the Python crate's Tokio runtime that
+    /// continuously polls the shard and pushes batches into the registered
+    /// streaming table. Use ``session.close_unbounded_input(name)`` to stop it.
     ///
     /// Requires the ``kinesis`` feature (``pip install krishiv[kinesis]``).
     #[pyo3(signature = (name, region, stream_name, shard_id))]
@@ -1249,15 +1287,76 @@ impl PySession {
         }
         #[cfg(feature = "kinesis")]
         {
-            use krishiv_connectors::kinesis::kinesis_arrow_schema;
-            let _ = (region, stream_name, shard_id);
+            use krishiv_connectors::kinesis::{
+                KinesisConfig, KinesisSource, ShardPosition, kinesis_arrow_schema,
+            };
+            use std::sync::Arc;
+
+            let shard_id_owned = if shard_id.is_empty() {
+                "shardId-000000000000".to_owned()
+            } else {
+                shard_id
+            };
+            let cfg = KinesisConfig {
+                stream_name: stream_name.clone(),
+                region: region.clone(),
+                shard_id: shard_id_owned.clone(),
+                start: ShardPosition::TrimHorizon,
+                batch_size: 500,
+            };
             let arrow_schema = kinesis_arrow_schema();
             let inner = self.inner.clone();
-            py.detach(move || {
-                inner
-                    .register_unbounded(&name, arrow_schema)
-                    .map_err(map_krishiv_error)
-            })
+            let name_for_session = name.clone();
+            let name_for_task = name.clone();
+            let stream_label = format!("{stream_name}/{shard_id_owned}");
+
+            let input: Arc<krishiv_sql::ContinuousTableInput> = py
+                .allow_threads(|| {
+                    py.detach(move || inner.register_unbounded(&name_for_session, arrow_schema))
+                })
+                .map_err(map_krishiv_error)?;
+
+            let input_clone = Arc::clone(&input);
+            crate::RUNTIME.spawn(async move {
+                match KinesisSource::new(cfg).await {
+                    Ok(mut src) => loop {
+                        match src.next_batch().await {
+                            Ok(Some(batch)) => {
+                                if let Err(e) = input_clone.push(batch).await {
+                                    tracing::warn!(
+                                        task = %name_for_task,
+                                        error = %e,
+                                        "kinesis consumer: failed to push batch; stopping"
+                                    );
+                                    break;
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    task = %name_for_task,
+                                    "kinesis consumer: shard iterator exhausted"
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    task = %name_for_task,
+                                    error = %e,
+                                    "kinesis consumer: GetRecords failed; stopping"
+                                );
+                                break;
+                            }
+                        }
+                    },
+                    Err(e) => tracing::warn!(
+                        task = %name_for_task,
+                        stream = %stream_label,
+                        error = %e,
+                        "kinesis consumer: failed to create KinesisSource; task not started"
+                    ),
+                }
+            });
+            Ok(())
         }
     }
 
@@ -1268,6 +1367,10 @@ impl PySession {
     ///
     /// The registered table exposes the Pulsar message schema:
     /// ``topic``, ``partition_key``, ``publish_time_ms``, and ``data`` columns.
+    ///
+    /// Spawns a background task on the Python crate's Tokio runtime that
+    /// continuously consumes messages and pushes batches into the registered
+    /// streaming table. Use ``session.close_unbounded_input(name)`` to stop it.
     ///
     /// Requires the ``pulsar`` feature (``pip install krishiv[pulsar]``).
     #[pyo3(signature = (name, broker_url, topic))]
@@ -1287,15 +1390,76 @@ impl PySession {
         }
         #[cfg(feature = "pulsar")]
         {
-            use krishiv_connectors::pulsar_connector::pulsar_arrow_schema;
-            let _ = (broker_url, topic);
+            use krishiv_connectors::pulsar_connector::{
+                PulsarConfig, PulsarSource, pulsar_arrow_schema,
+            };
+            use std::sync::Arc;
+
+            let cfg = PulsarConfig::new(broker_url.clone(), topic.clone());
             let arrow_schema = pulsar_arrow_schema();
             let inner = self.inner.clone();
-            py.detach(move || {
-                inner
-                    .register_unbounded(&name, arrow_schema)
-                    .map_err(map_krishiv_error)
-            })
+            let name_for_session = name.clone();
+            let name_for_task = name.clone();
+
+            let input: Arc<krishiv_sql::ContinuousTableInput> = py
+                .allow_threads(|| {
+                    py.detach(move || inner.register_unbounded(&name_for_session, arrow_schema))
+                })
+                .map_err(map_krishiv_error)?;
+
+            let input_clone = Arc::clone(&input);
+            crate::RUNTIME.spawn(async move {
+                match PulsarSource::connect(cfg).await {
+                    Ok(mut src) => {
+                        let mut message_count: usize = 0;
+                        loop {
+                            match src.next_batch(100).await {
+                                Ok(Some(batch)) => {
+                                    let n = batch.num_rows();
+                                    if let Err(e) = input_clone.push(batch).await {
+                                        tracing::warn!(
+                                            task = %name_for_task,
+                                            error = %e,
+                                            "pulsar consumer: failed to push batch; stopping"
+                                        );
+                                        break;
+                                    }
+                                    message_count += n;
+                                    if message_count % 10_000 == 0 {
+                                        tracing::debug!(
+                                            task = %name_for_task,
+                                            consumed = message_count,
+                                            "pulsar consumer progress"
+                                        );
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::debug!(
+                                        task = %name_for_task,
+                                        "pulsar consumer: end of topic"
+                                    );
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        task = %name_for_task,
+                                        error = %e,
+                                        "pulsar consumer: next_batch failed; stopping"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        task = %name_for_task,
+                        topic = %topic,
+                        error = %e,
+                        "pulsar consumer: failed to connect; task not started"
+                    ),
+                }
+            });
+            Ok(())
         }
     }
 }

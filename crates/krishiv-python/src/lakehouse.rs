@@ -6,6 +6,19 @@ use pyo3::prelude::*;
 use crate::batch::PyBatch;
 use crate::{PyDataFrame, PySession, RUNTIME};
 
+fn reject_distributed_lakehouse(session: &PySession, operation: &str) -> PyResult<()> {
+    if matches!(
+        session.inner.mode(),
+        krishiv_api::ExecutionMode::Distributed
+    ) {
+        return Err(PyRuntimeError::new_err(format!(
+            "{operation} is local-only in this release; use an embedded or single-node session, \
+             or register the table through a distributed Iceberg/catalog path"
+        )));
+    }
+    Ok(())
+}
+
 #[pyfunction]
 #[pyo3(signature = (session, path, version=None))]
 pub fn read_delta(
@@ -13,6 +26,7 @@ pub fn read_delta(
     path: String,
     version: Option<i64>,
 ) -> PyResult<PyDataFrame> {
+    reject_distributed_lakehouse(session, "read_delta")?;
     RUNTIME
         .block_on(session.inner.read_delta_async(path, version))
         .map(|df| PyDataFrame { inner: df })
@@ -60,6 +74,7 @@ pub fn read_hudi(
     query_type: &str,
     begin_instant: Option<String>,
 ) -> PyResult<PyDataFrame> {
+    reject_distributed_lakehouse(session, "read_hudi")?;
     let qt = match query_type.to_lowercase().as_str() {
         "incremental" => krishiv_connectors::lakehouse::HudiQueryType::Incremental,
         _ => krishiv_connectors::lakehouse::HudiQueryType::Snapshot,
@@ -108,6 +123,7 @@ pub fn write_hudi_append(
     path: String,
     dataframe: &PyDataFrame,
 ) -> PyResult<PyHudiWriteResult> {
+    reject_distributed_lakehouse(session, "write_hudi_append")?;
     RUNTIME
         .block_on(
             session
@@ -125,6 +141,7 @@ pub fn write_hudi_upsert(
     key_column: String,
     dataframe: &PyDataFrame,
 ) -> PyResult<PyHudiWriteResult> {
+    reject_distributed_lakehouse(session, "write_hudi_upsert")?;
     RUNTIME
         .block_on(
             session

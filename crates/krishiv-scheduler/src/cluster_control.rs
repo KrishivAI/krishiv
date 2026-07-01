@@ -221,23 +221,18 @@ impl ClusterControlPlane {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(renew_interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_fencing_token = self.fencing_token();
+        self.shared.sync_leader_fencing_token(last_fencing_token);
         loop {
             interval.tick().await;
-            if self.leader.try_acquire().await {
-                let token = self.fencing_token();
-                self.shared.sync_leader_fencing_token(token);
-                self.shared.sync_checkpoint_fencing_tokens(token).await;
-                if let Err(e) = self.promote_to_active().await {
-                    tracing::error!(error = %e, "failed to promote to active");
-                }
-                if orchestration_handles.is_none() {
-                    orchestration_handles = Some(self.spawn_orchestration_loops());
-                }
-            } else if self.leader.is_leader() {
+            if self.leader.is_leader() {
                 if self.leader.renew().await {
                     let token = self.fencing_token();
-                    self.shared.sync_leader_fencing_token(token);
-                    self.shared.sync_checkpoint_fencing_tokens(token).await;
+                    if token != last_fencing_token {
+                        self.shared.sync_leader_fencing_token(token);
+                        self.shared.sync_checkpoint_fencing_tokens(token).await;
+                        last_fencing_token = token;
+                    }
                 } else {
                     if let Err(e) = self.demote_to_standby().await {
                         tracing::error!(error = %e, "failed to demote to standby");
@@ -245,6 +240,18 @@ impl ClusterControlPlane {
                     if let Some(handles) = orchestration_handles.take() {
                         handles.shutdown().await;
                     }
+                    last_fencing_token = 0;
+                }
+            } else if self.leader.try_acquire().await {
+                let token = self.fencing_token();
+                self.shared.sync_leader_fencing_token(token);
+                self.shared.sync_checkpoint_fencing_tokens(token).await;
+                last_fencing_token = token;
+                if let Err(e) = self.promote_to_active().await {
+                    tracing::error!(error = %e, "failed to promote to active");
+                }
+                if orchestration_handles.is_none() {
+                    orchestration_handles = Some(self.spawn_orchestration_loops());
                 }
             } else {
                 if let Err(e) = self.demote_to_standby().await {

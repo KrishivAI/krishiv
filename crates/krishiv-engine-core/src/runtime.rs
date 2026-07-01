@@ -314,16 +314,26 @@ pub fn encode_batch_ipc(batch: &RecordBatch) -> EngineResult<Vec<u8>> {
 }
 
 /// Decode Arrow IPC stream bytes produced by [`encode_batch_ipc`] back into a
-/// single `RecordBatch`. Errors if the stream carries no batch.
+/// single `RecordBatch`. Errors if the stream carries no batch or more than one.
 pub fn decode_batch_ipc(bytes: &[u8]) -> EngineResult<RecordBatch> {
-    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
-        .map_err(|e| crate::error::EngineError::Runtime(format!("ipc reader init: {e}")))?;
-    let mut last = None;
-    for batch in reader {
-        last =
-            Some(batch.map_err(|e| crate::error::EngineError::Runtime(format!("ipc read: {e}")))?);
+    let mut reader =
+        arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+            .map_err(|e| crate::error::EngineError::Runtime(format!("ipc reader init: {e}")))?;
+    let batch = match reader.next() {
+        Some(Ok(b)) => b,
+        Some(Err(e)) => return Err(crate::error::EngineError::Runtime(format!("ipc read: {e}"))),
+        None => {
+            return Err(crate::error::EngineError::Runtime(
+                "ipc stream contained no batch".into(),
+            ));
+        }
+    };
+    if reader.next().is_some() {
+        return Err(crate::error::EngineError::Runtime(
+            "ipc stream contained more than one batch; decode_batch_ipc expects exactly one".into(),
+        ));
     }
-    last.ok_or_else(|| crate::error::EngineError::Runtime("ipc stream contained no batch".into()))
+    Ok(batch)
 }
 
 /// A stream of [`RecordBatch`]es from a [`QueryExecutor`].

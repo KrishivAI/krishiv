@@ -23,13 +23,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, Float64Array, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::aggregate::{AggExpr, AggFunction, AggState};
 use crate::join::extract_agg_key;
-use crate::window::tumbling::{
-    WindowRecordBatchInput, build_window_output_schema, build_window_record_batch,
-};
 use crate::{ExecError, ExecResult};
 
 /// Specification for a count-based window operator.
@@ -85,7 +84,7 @@ impl CountWindowOperator {
                 "count window slide must be > 0 and ≤ size".into(),
             ));
         }
-        let schema = build_window_output_schema(
+        let schema = build_count_window_output_schema(
             &spec.key_column,
             &spec.key_column_type,
             &spec.agg_exprs,
@@ -143,16 +142,16 @@ impl CountWindowOperator {
                         .map(|c| &c.agg),
                     &self.spec.agg_exprs,
                 )?;
-                output.push(build_window_record_batch(WindowRecordBatchInput {
-                    schema: &self.output_schema,
-                    key_type: &self.spec.key_column_type,
-                    key_value: &key_str,
-                    window_start_ms: window_start as i64,
-                    window_end_ms: window_end as i64,
-                    agg_exprs: &self.spec.agg_exprs,
-                    state: &merged,
-                    agg_is_float: &self.spec.agg_is_float,
-                })?);
+                output.push(build_count_window_record_batch(
+                    &self.output_schema,
+                    &self.spec.key_column_type,
+                    &key_str,
+                    window_start,
+                    window_end,
+                    &self.spec.agg_exprs,
+                    &merged,
+                    &self.spec.agg_is_float,
+                )?);
                 // Slide: drop the first `slide` rows from the front.
                 for _ in 0..self.spec.slide {
                     state.buf.pop_front();
@@ -174,16 +173,16 @@ impl CountWindowOperator {
             let window_start = state.window_start_row;
             let window_end = window_start.saturating_add(state.buf.len() as u64);
             let merged = fold_agg_states(state.buf.iter().map(|c| &c.agg), &self.spec.agg_exprs)?;
-            output.push(build_window_record_batch(WindowRecordBatchInput {
-                schema: &self.output_schema,
-                key_type: &self.spec.key_column_type,
-                key_value: key_str,
-                window_start_ms: window_start as i64,
-                window_end_ms: window_end as i64,
-                agg_exprs: &self.spec.agg_exprs,
-                state: &merged,
-                agg_is_float: &self.spec.agg_is_float,
-            })?);
+            output.push(build_count_window_record_batch(
+                &self.output_schema,
+                &self.spec.key_column_type,
+                key_str,
+                window_start,
+                window_end,
+                &self.spec.agg_exprs,
+                &merged,
+                &self.spec.agg_is_float,
+            )?);
         }
         self.key_states.clear();
         Ok(output)
@@ -248,6 +247,75 @@ fn fold_agg_states<'a>(
         }
     }
     Ok(merged)
+}
+
+/// Build the output schema for a count window operator.
+/// Uses `window_start_row` / `window_end_row` to distinguish from
+/// time-based window types that use `window_start_ms` / `window_end_ms`.
+pub(crate) fn build_count_window_output_schema(
+    key_column: &str,
+    key_type: &str,
+    agg_exprs: &[AggExpr],
+    agg_is_float: &[bool],
+) -> Arc<Schema> {
+    let key_dtype = crate::window::tumbling::key_type_to_arrow_data_type(key_type);
+    let mut fields = vec![
+        Field::new(key_column, key_dtype, false),
+        Field::new("window_start_row", DataType::Int64, false),
+        Field::new("window_end_row", DataType::Int64, false),
+    ];
+    for (i, agg) in agg_exprs.iter().enumerate() {
+        let dtype = match agg.function {
+            AggFunction::Avg | AggFunction::Stddev => DataType::Float64,
+            _ if agg_is_float.get(i).copied().unwrap_or(false) => DataType::Float64,
+            _ => DataType::Int64,
+        };
+        fields.push(Field::new(&agg.output_column, dtype, false));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+/// Build a single-row `RecordBatch` for a count window output.
+#[allow(clippy::too_many_arguments)]
+fn build_count_window_record_batch(
+    schema: &Arc<Schema>,
+    key_type: &str,
+    key_value: &str,
+    window_start_row: u64,
+    window_end_row: u64,
+    agg_exprs: &[AggExpr],
+    state: &AggState,
+    agg_is_float: &[bool],
+) -> ExecResult<RecordBatch> {
+    let key_array = crate::window::tumbling::key_value_to_typed_array(key_type, key_value)?;
+    let start = Arc::new(Int64Array::from(vec![window_start_row as i64])) as ArrayRef;
+    let end = Arc::new(Int64Array::from(vec![window_end_row as i64])) as ArrayRef;
+    let mut columns: Vec<ArrayRef> = vec![key_array, start, end];
+    for (i, agg) in agg_exprs.iter().enumerate() {
+        let is_float = agg_is_float.get(i).copied().unwrap_or(false);
+        match agg.function {
+            AggFunction::Avg => {
+                columns.push(Arc::new(Float64Array::from(vec![state.finalized_avg(i)?])));
+            }
+            AggFunction::Stddev => {
+                columns.push(Arc::new(Float64Array::from(vec![
+                    state.finalized_stddev(i)?,
+                ])));
+            }
+            _ if is_float => {
+                columns.push(Arc::new(Float64Array::from(vec![
+                    state.finalized_float_value(i, agg)?,
+                ])));
+            }
+            _ => {
+                columns.push(Arc::new(Int64Array::from(vec![
+                    state.finalized_value(i, agg)?,
+                ])));
+            }
+        }
+    }
+    RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| ExecError::Arrow(format!("build count window batch: {e}")))
 }
 
 #[cfg(test)]

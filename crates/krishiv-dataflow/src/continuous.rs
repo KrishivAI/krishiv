@@ -566,7 +566,7 @@ impl ContinuousWindowExecutor {
         self.watermark.apply_idle_source_policy();
         let wm = self
             .last_watermark_ms
-            .unwrap_or(wall_clock_ms)
+            .unwrap_or(i64::MIN)
             .max(wall_clock_ms);
         op.set_watermark(wm);
         self.last_watermark_ms = Some(wm);
