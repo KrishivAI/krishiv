@@ -102,6 +102,10 @@ jobs:
           done
           # Regenerate Cargo.lock with the new version
           cargo generate-lockfile
+          # Also stamp the Python package version so the nightly wheels get a
+          # unique version (otherwise maturin uses pyproject.toml's hardcoded
+          # "0.1.0" and PyPI's skip-existing skips the upload).
+          sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" crates/krishiv-python/pyproject.toml
       - name: Publish crates in topological order
         if: steps.changes.outputs.has_changes == 'true'
         env:
