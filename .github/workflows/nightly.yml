@@ -103,9 +103,9 @@ jobs:
           # Regenerate Cargo.lock with the new version
           cargo generate-lockfile
           # Also stamp the Python package version so the nightly wheels get a
-          # unique version (otherwise maturin uses pyproject.toml's hardcoded
-          # "0.1.0" and PyPI's skip-existing skips the upload).
-          sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" crates/krishiv-python/pyproject.toml
+          # unique version. PEP 440 format required by maturin/PyPI
+          # (Cargo uses semver but PyPI needs 0.1.0aYYYYMMDDHHMM).
+          sed -i "s/^version = \"0\.1\.0\"/version = \"0.1.0a${STAMP}\"/" crates/krishiv-python/pyproject.toml
       - name: Publish crates in topological order
         if: steps.changes.outputs.has_changes == 'true'
         env:
@@ -374,7 +374,10 @@ jobs:
             sed -i -E "s/(krishiv-[a-z-]+ = \{[^}]*version = )\"0\.1\.0\"/\1\"=${NIGHTLY_VER}\"/g" "$f"
           done
           cargo generate-lockfile
-          sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" crates/krishiv-python/pyproject.toml
+          # PEP 440 version for pyproject.toml (maturin/PyPI).
+          # Cargo uses semver (0.1.0-nightly.YYYYMMDDHHMM) but PyPI requires
+          # PEP 440 (0.1.0aYYYYMMDDHHMM = alpha pre-release).
+          sed -i "s/^version = \"0\.1\.0\"/version = \"0.1.0a${STAMP}\"/" crates/krishiv-python/pyproject.toml
       - uses: actions/setup-python@v5
         if: runner.os == 'macOS'
         with:
