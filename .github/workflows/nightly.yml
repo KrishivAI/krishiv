@@ -53,12 +53,12 @@ jobs:
               echo "No commits since ${LAST_TAG} — skipping publish"
             fi
           fi
-      - name: Generate crate READMEs
+      - name: Verify crate READMEs exist
         if: steps.changes.outputs.has_changes == 'true'
         run: |
-          cargo install cargo-readme --locked
-          # Topological order: leaves first, roots last.
-          # krishiv-bench and krishiv-chaos have publish=false and are excluded.
+          # Use the hand-maintained README.md files in each crate directory.
+          # These have richer content than cargo-readme generates from doc comments.
+          # cargo publish includes the file pointed to by the readme field in Cargo.toml.
           CRATES=(
             krishiv-common krishiv-proto krishiv-metrics krishiv-delta
             krishiv-engine-core krishiv-ivm krishiv-plan krishiv-state krishiv-shuffle
@@ -70,24 +70,13 @@ jobs:
             krishiv-flight-sql
             krishiv
           )
-          DIRS=(
-            crates/krishiv-common   crates/krishiv-proto    crates/krishiv-metrics
-            crates/krishiv-delta    crates/krishiv-engine-core crates/krishiv-ivm
-            crates/krishiv-plan     crates/krishiv-state    crates/krishiv-shuffle
-            crates/krishiv-connectors
-            crates/krishiv-dataflow crates/krishiv-sql      crates/krishiv-scheduler
-            crates/krishiv-executor crates/krishiv-ui
-            crates/krishiv-runtime  crates/krishiv-operator
-            crates/krishiv-api
-            crates/krishiv-flight-sql
-            crates/krishiv
-          )
-          for i in "${!CRATES[@]}"; do
-            dir="${DIRS[$i]}"
-            echo "==> README for ${dir}"
-            # cargo-readme must run from within the crate directory; it has no -p flag
-            (cd "${dir}" && cargo readme > README.md) || true
+          for crate in "${CRATES[@]}"; do
+            if [ ! -f "crates/${crate}/README.md" ]; then
+              echo "ERROR: crates/${crate}/README.md is missing"
+              exit 1
+            fi
           done
+          echo "✓ all ${#CRATES[@]} crate READMEs present"
       - name: Stamp nightly version
         if: steps.changes.outputs.has_changes == 'true'
         run: |
