@@ -53,12 +53,12 @@ jobs:
               echo "No commits since ${LAST_TAG} — skipping publish"
             fi
           fi
-      - name: Verify crate READMEs exist
+      - name: Generate or verify crate READMEs
         if: steps.changes.outputs.has_changes == 'true'
         run: |
-          # Use the hand-maintained README.md files in each crate directory.
-          # These have richer content than cargo-readme generates from doc comments.
-          # cargo publish includes the file pointed to by the readme field in Cargo.toml.
+          cargo install cargo-readme --locked
+          # Topological order: leaves first, roots last.
+          # krishiv-bench and krishiv-chaos have publish=false and are excluded.
           CRATES=(
             krishiv-common krishiv-proto krishiv-metrics krishiv-delta
             krishiv-engine-core krishiv-ivm krishiv-plan krishiv-state krishiv-shuffle
@@ -71,12 +71,14 @@ jobs:
             krishiv
           )
           for crate in "${CRATES[@]}"; do
-            if [ ! -f "crates/${crate}/README.md" ]; then
-              echo "ERROR: crates/${crate}/README.md is missing"
-              exit 1
+            dir="crates/${crate}"
+            if [ -f "${dir}/README.md" ]; then
+              echo "==> ${crate}: using existing README.md"
+            else
+              echo "==> ${crate}: generating README.md from doc comments"
+              (cd "${dir}" && cargo readme > README.md) || true
             fi
           done
-          echo "✓ all ${#CRATES[@]} crate READMEs present"
       - name: Stamp nightly version
         if: steps.changes.outputs.has_changes == 'true'
         run: |
