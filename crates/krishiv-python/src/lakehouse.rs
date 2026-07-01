@@ -22,13 +22,14 @@ fn reject_distributed_lakehouse(session: &PySession, operation: &str) -> PyResul
 #[pyfunction]
 #[pyo3(signature = (session, path, version=None))]
 pub fn read_delta(
+    py: Python<'_>,
     session: &PySession,
     path: String,
     version: Option<i64>,
 ) -> PyResult<PyDataFrame> {
     reject_distributed_lakehouse(session, "read_delta")?;
-    RUNTIME
-        .block_on(session.inner.read_delta_async(path, version))
+    let inner = session.inner.clone();
+    py.detach(move || RUNTIME.block_on(inner.read_delta_async(path, version)))
         .map(|df| PyDataFrame { inner: df })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -42,6 +43,7 @@ pub fn read_delta(
 #[pyfunction]
 #[pyo3(signature = (path, batches, *, mode = "append", schema_evolution = false))]
 pub fn write_delta(
+    py: Python<'_>,
     path: String,
     batches: Vec<PyBatch>,
     mode: &str,
@@ -56,19 +58,21 @@ pub fn write_delta(
         .into_iter()
         .map(|b| b.record_batch().clone())
         .collect();
-    RUNTIME
-        .block_on(krishiv_connectors::lakehouse::write_delta(
+    py.detach(move || {
+        RUNTIME.block_on(krishiv_connectors::lakehouse::write_delta(
             path,
             record_batches,
             write_mode,
             schema_evolution,
         ))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 #[pyfunction]
 #[pyo3(signature = (session, path, query_type="snapshot", begin_instant=None))]
 pub fn read_hudi(
+    py: Python<'_>,
     session: &PySession,
     path: String,
     query_type: &str,
@@ -79,12 +83,8 @@ pub fn read_hudi(
         "incremental" => krishiv_connectors::lakehouse::HudiQueryType::Incremental,
         _ => krishiv_connectors::lakehouse::HudiQueryType::Snapshot,
     };
-    RUNTIME
-        .block_on(
-            session
-                .inner
-                .read_hudi_async(path, qt, begin_instant.as_deref()),
-        )
+    let inner = session.inner.clone();
+    py.detach(move || RUNTIME.block_on(inner.read_hudi_async(path, qt, begin_instant.as_deref())))
         .map(|df| PyDataFrame { inner: df })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -119,35 +119,31 @@ impl PyHudiWriteResult {
 
 #[pyfunction]
 pub fn write_hudi_append(
+    py: Python<'_>,
     session: &PySession,
     path: String,
     dataframe: &PyDataFrame,
 ) -> PyResult<PyHudiWriteResult> {
     reject_distributed_lakehouse(session, "write_hudi_append")?;
-    RUNTIME
-        .block_on(
-            session
-                .inner
-                .write_hudi_append_async(path, &dataframe.inner),
-        )
+    let inner = session.inner.clone();
+    let df = dataframe.inner.clone();
+    py.detach(move || RUNTIME.block_on(inner.write_hudi_append_async(path, &df)))
         .map(|inner| PyHudiWriteResult { inner })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 #[pyfunction]
 pub fn write_hudi_upsert(
+    py: Python<'_>,
     session: &PySession,
     path: String,
     key_column: String,
     dataframe: &PyDataFrame,
 ) -> PyResult<PyHudiWriteResult> {
     reject_distributed_lakehouse(session, "write_hudi_upsert")?;
-    RUNTIME
-        .block_on(
-            session
-                .inner
-                .write_hudi_upsert_async(path, &key_column, &dataframe.inner),
-        )
+    let inner = session.inner.clone();
+    let df = dataframe.inner.clone();
+    py.detach(move || RUNTIME.block_on(inner.write_hudi_upsert_async(path, &key_column, &df)))
         .map(|inner| PyHudiWriteResult { inner })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -251,20 +247,25 @@ impl PyIcebergRestCatalog {
     }
 
     /// List all table names in `namespace`.
-    pub fn list_tables(&self, namespace: String) -> PyResult<Vec<String>> {
-        // Use block_in_place when a tokio handle is available so we yield the
-        // worker thread instead of blocking it — important for async Python
-        // frameworks and multi-threaded tokio runtimes.
-        RUNTIME
-            .block_on(self.inner.list_tables(&namespace))
+    pub fn list_tables(&self, py: Python<'_>, namespace: String) -> PyResult<Vec<String>> {
+        let inner = self.inner.clone();
+        // Release the GIL for the REST round-trip so other Python threads
+        // (and the event loop, when this is offloaded to an executor) are
+        // not frozen for the network wait.
+        py.detach(move || RUNTIME.block_on(inner.list_tables(&namespace)))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Load table metadata for `namespace.table_name` as a JSON string.
-    pub fn load_table_metadata(&self, namespace: String, table_name: String) -> PyResult<String> {
+    pub fn load_table_metadata(
+        &self,
+        py: Python<'_>,
+        namespace: String,
+        table_name: String,
+    ) -> PyResult<String> {
         let table_id = IcebergTableId::new(namespace, table_name).map_err(catalog_config_error)?;
-        RUNTIME
-            .block_on(self.inner.load_table_metadata(&table_id))
+        let inner = self.inner.clone();
+        py.detach(move || RUNTIME.block_on(inner.load_table_metadata(&table_id)))
             .map(|v| v.to_string())
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
@@ -321,23 +322,29 @@ impl PyMemoryLakehouseTable {
     }
 
     /// Append ``batch`` to the table.
-    pub fn append(&self, batch: &crate::batch::PyBatch) -> PyResult<()> {
-        RUNTIME
-            .block_on(krishiv_connectors::lakehouse::LakehouseTable::append(
-                self.inner.as_ref(),
-                vec![batch.record_batch().clone()],
+    pub fn append(&self, py: Python<'_>, batch: &crate::batch::PyBatch) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let rb = batch.record_batch().clone();
+        py.detach(move || {
+            RUNTIME.block_on(krishiv_connectors::lakehouse::LakehouseTable::append(
+                inner.as_ref(),
+                vec![rb],
             ))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Atomically replace all table contents with ``batch``.
-    pub fn overwrite(&self, batch: &crate::batch::PyBatch) -> PyResult<()> {
-        RUNTIME
-            .block_on(krishiv_connectors::lakehouse::LakehouseTable::overwrite(
-                self.inner.as_ref(),
-                vec![batch.record_batch().clone()],
+    pub fn overwrite(&self, py: Python<'_>, batch: &crate::batch::PyBatch) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let rb = batch.record_batch().clone();
+        py.detach(move || {
+            RUNTIME.block_on(krishiv_connectors::lakehouse::LakehouseTable::overwrite(
+                inner.as_ref(),
+                vec![rb],
             ))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Delete rows where ``column == value``.
@@ -345,12 +352,14 @@ impl PyMemoryLakehouseTable {
     /// ``value`` may be a Python ``int``, ``float``, ``bool``, ``str``, or ``None``.
     pub fn delete_where(&self, py: Python<'_>, column: String, value: Py<PyAny>) -> PyResult<()> {
         let lv = py_to_lakehouse_value(py, value)?;
-        RUNTIME
-            .block_on(krishiv_connectors::lakehouse::LakehouseTable::delete_where(
-                self.inner.as_ref(),
+        let inner = self.inner.clone();
+        py.detach(move || {
+            RUNTIME.block_on(krishiv_connectors::lakehouse::LakehouseTable::delete_where(
+                inner.as_ref(),
                 &LakehousePredicate { column, equals: lv },
             ))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Update rows matching ``predicate_column == predicate_value``, setting
@@ -365,9 +374,10 @@ impl PyMemoryLakehouseTable {
     ) -> PyResult<()> {
         let pred_val = py_to_lakehouse_value(py, predicate_value)?;
         let assign_val = py_to_lakehouse_value(py, assign_value)?;
-        RUNTIME
-            .block_on(krishiv_connectors::lakehouse::LakehouseTable::update_where(
-                self.inner.as_ref(),
+        let inner = self.inner.clone();
+        py.detach(move || {
+            RUNTIME.block_on(krishiv_connectors::lakehouse::LakehouseTable::update_where(
+                inner.as_ref(),
                 &LakehousePredicate {
                     column: predicate_column,
                     equals: pred_val,
@@ -377,18 +387,27 @@ impl PyMemoryLakehouseTable {
                     value: assign_val,
                 }],
             ))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Upsert ``batch`` into the table using ``key_columns`` to identify matching rows.
-    pub fn merge(&self, batch: &crate::batch::PyBatch, key_columns: Vec<String>) -> PyResult<()> {
-        RUNTIME
-            .block_on(krishiv_connectors::lakehouse::LakehouseTable::merge(
-                self.inner.as_ref(),
-                vec![batch.record_batch().clone()],
+    pub fn merge(
+        &self,
+        py: Python<'_>,
+        batch: &crate::batch::PyBatch,
+        key_columns: Vec<String>,
+    ) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let rb = batch.record_batch().clone();
+        py.detach(move || {
+            RUNTIME.block_on(krishiv_connectors::lakehouse::LakehouseTable::merge(
+                inner.as_ref(),
+                vec![rb],
                 &key_columns,
             ))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Evolve the table schema to a new version.
@@ -398,58 +417,59 @@ impl PyMemoryLakehouseTable {
     #[pyo3(signature = (schema_id, fields))]
     pub fn evolve_schema(
         &self,
+        py: Python<'_>,
         schema_id: i32,
         fields: Vec<std::collections::HashMap<String, Py<PyAny>>>,
     ) -> PyResult<()> {
-        let schema_fields: Vec<SchemaField> = Python::attach(|py| {
-            fields
-                .into_iter()
-                .map(|f| {
-                    Ok(SchemaField {
-                        id: f
-                            .get("id")
-                            .ok_or_else(|| PyRuntimeError::new_err("field missing 'id'"))?
-                            .extract::<i32>(py)?,
-                        name: f
-                            .get("name")
-                            .ok_or_else(|| PyRuntimeError::new_err("field missing 'name'"))?
-                            .extract::<String>(py)?,
-                        required: f
-                            .get("required")
-                            .map(|v| v.extract::<bool>(py))
-                            .transpose()?
-                            .unwrap_or(false),
-                        data_type: f
-                            .get("data_type")
-                            .ok_or_else(|| PyRuntimeError::new_err("field missing 'data_type'"))?
-                            .extract::<String>(py)?,
-                    })
+        let schema_fields: Vec<SchemaField> = fields
+            .into_iter()
+            .map(|f| {
+                Ok(SchemaField {
+                    id: f
+                        .get("id")
+                        .ok_or_else(|| PyRuntimeError::new_err("field missing 'id'"))?
+                        .extract::<i32>(py)?,
+                    name: f
+                        .get("name")
+                        .ok_or_else(|| PyRuntimeError::new_err("field missing 'name'"))?
+                        .extract::<String>(py)?,
+                    required: f
+                        .get("required")
+                        .map(|v| v.extract::<bool>(py))
+                        .transpose()?
+                        .unwrap_or(false),
+                    data_type: f
+                        .get("data_type")
+                        .ok_or_else(|| PyRuntimeError::new_err("field missing 'data_type'"))?
+                        .extract::<String>(py)?,
                 })
-                .collect::<PyResult<Vec<_>>>()
-        })?;
+            })
+            .collect::<PyResult<Vec<_>>>()?;
 
-        RUNTIME
-            .block_on(
+        let inner = self.inner.clone();
+        py.detach(move || {
+            RUNTIME.block_on(
                 krishiv_connectors::lakehouse::LakehouseTable::evolve_schema(
-                    self.inner.as_ref(),
+                    inner.as_ref(),
                     SchemaVersion {
                         schema_id,
                         fields: schema_fields,
                     },
                 ),
             )
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Return the current snapshot ID, or ``None`` if no data has been written.
-    pub fn current_snapshot_id(&self) -> PyResult<Option<i64>> {
-        RUNTIME
-            .block_on(
-                krishiv_connectors::lakehouse::LakehouseTable::current_snapshot_id(
-                    self.inner.as_ref(),
-                ),
+    pub fn current_snapshot_id(&self, py: Python<'_>) -> PyResult<Option<i64>> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            RUNTIME.block_on(
+                krishiv_connectors::lakehouse::LakehouseTable::current_snapshot_id(inner.as_ref()),
             )
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn __repr__(&self) -> String {
@@ -571,7 +591,7 @@ mod catalog_tests {
             None,
         )
         .unwrap();
-        let result = cat.list_tables("default".into());
+        let result = Python::attach(|py| cat.list_tables(py, "default".into()));
         assert!(
             result.is_err(),
             "IcebergRestCatalog::list_tables must return Err when unreachable"
@@ -590,7 +610,7 @@ mod catalog_tests {
             None,
         )
         .unwrap();
-        let result = cat.load_table_metadata("ns".into(), " ".into());
+        let result = Python::attach(|py| cat.load_table_metadata(py, "ns".into(), " ".into()));
         assert!(
             result.is_err(),
             "load_table_metadata must reject an invalid identifier before network I/O"

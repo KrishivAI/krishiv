@@ -58,9 +58,19 @@ pub async fn register_hudi_uri(
         }
         r
     };
-    let schema = reader.schema().map_err(|e| SqlError::DataFusion {
-        message: format!("hudi: failed to read table schema: {e}"),
-    })?;
+    // `HudiSnapshotReader::schema` does blocking filesystem/Parquet-decode I/O
+    // (unlike the object-store-backed Hudi reader, which is genuinely async).
+    // Run it on the blocking pool so registering a Hudi table doesn't stall
+    // this async DataFusion/Flight SQL task.
+    let reader_for_schema = reader.clone();
+    let schema = tokio::task::spawn_blocking(move || reader_for_schema.schema())
+        .await
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("hudi schema read task panicked: {e}"),
+        })?
+        .map_err(|e| SqlError::DataFusion {
+            message: format!("hudi: failed to read table schema: {e}"),
+        })?;
     let provider = Arc::new(HudiScanProvider { reader, schema });
     ctx.register_table(table_name, provider)
         .map_err(|e| SqlError::DataFusion {
@@ -136,9 +146,13 @@ impl TableProvider for HudiScanProvider {
         filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let batches = self
-            .reader
-            .scan_batches()
+        // Same blocking-I/O concern as `register_hudi_uri`: offload to the
+        // blocking pool instead of running filesystem/Parquet decode inline
+        // on the async DataFusion worker thread.
+        let reader = self.reader.clone();
+        let batches = tokio::task::spawn_blocking(move || reader.scan_batches())
+            .await
+            .map_err(|e| DataFusionError::External(format!("hudi scan task panicked: {e}").into()))?
             .map_err(|e| DataFusionError::External(e.to_string().into()))?;
         let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
         table.scan(state, projection, filters, limit).await

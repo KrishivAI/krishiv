@@ -433,7 +433,15 @@ impl PySession {
     ///     result = await handle.collect_async()
     pub fn submit_async(&self, py: Python<'_>, query: String) -> PyResult<PyQueryHandle> {
         let df = self.inner.sql(&query).map_err(map_krishiv_error)?;
-        let handle = py.detach(move || df.submit_async());
+        // `DataFrame::submit_async` uses a bare `tokio::spawn`, which requires
+        // an entered runtime context on the calling thread. `py.detach` only
+        // releases the GIL; it does not enter a runtime. Without `.enter()`
+        // here, this panics ("there is no reactor running") because the
+        // Python-calling thread has no ambient Tokio context.
+        let handle = py.detach(move || {
+            let _guard = crate::RUNTIME.enter();
+            df.submit_async()
+        });
         Ok(PyQueryHandle::new(handle))
     }
 

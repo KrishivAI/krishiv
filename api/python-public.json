@@ -64,14 +64,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/stream.rs#L711",
+      "documentation": "crates/krishiv-python/src/stream.rs#L714",
       "id": "crates/krishiv-python/src/stream.rs::BroadcastContext",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L719",
+          "documentation": "crates/krishiv-python/src/stream.rs#L722",
           "id": "BroadcastContext.emit",
           "kind": "method",
           "name": "emit",
@@ -86,14 +86,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/stream.rs#L705",
+      "documentation": "crates/krishiv-python/src/stream.rs#L708",
       "id": "crates/krishiv-python/src/stream.rs::BroadcastStream",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L857",
+          "documentation": "crates/krishiv-python/src/stream.rs#L860",
           "id": "BroadcastStream.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -103,7 +103,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L796",
+          "documentation": "crates/krishiv-python/src/stream.rs#L799",
           "id": "BroadcastStream.apply_broadcast_process",
           "kind": "method",
           "name": "apply_broadcast_process",
@@ -414,14 +414,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/stream.rs#L550",
+      "documentation": "crates/krishiv-python/src/stream.rs#L553",
       "id": "crates/krishiv-python/src/stream.rs::ConnectedStreams",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L634",
+          "documentation": "crates/krishiv-python/src/stream.rs#L637",
           "id": "ConnectedStreams.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -431,7 +431,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L564",
+          "documentation": "crates/krishiv-python/src/stream.rs#L567",
           "id": "ConnectedStreams.apply_co_process",
           "kind": "method",
           "name": "apply_co_process",
@@ -1102,14 +1102,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/streaming.rs#L199",
+      "documentation": "crates/krishiv-python/src/streaming.rs#L202",
       "id": "crates/krishiv-python/src/streaming.rs::DataStreamWriter",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L345",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L348",
           "id": "DataStreamWriter.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -1119,7 +1119,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L278",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L281",
           "id": "DataStreamWriter.foreach_batch",
           "kind": "method",
           "name": "foreach_batch",
@@ -1129,7 +1129,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L269",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L272",
           "id": "DataStreamWriter.option",
           "kind": "method",
           "name": "option",
@@ -1139,7 +1139,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L228",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L231",
           "id": "DataStreamWriter.output_mode",
           "kind": "method",
           "name": "output_mode",
@@ -1149,7 +1149,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L263",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L266",
           "id": "DataStreamWriter.query_name",
           "kind": "method",
           "name": "query_name",
@@ -1159,7 +1159,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L286",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L289",
           "id": "DataStreamWriter.start",
           "kind": "method",
           "name": "start",
@@ -1169,7 +1169,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L248",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L251",
           "id": "DataStreamWriter.trigger",
           "kind": "method",
           "name": "trigger",
@@ -1382,14 +1382,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/lakehouse.rs#L77",
+      "documentation": "crates/krishiv-python/src/lakehouse.rs#L92",
       "id": "crates/krishiv-python/src/lakehouse.rs::HudiWriteResult",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L85",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L100",
           "id": "HudiWriteResult.instant",
           "kind": "method",
           "name": "instant",
@@ -1399,7 +1399,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L90",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L105",
           "id": "HudiWriteResult.rows_inserted",
           "kind": "method",
           "name": "rows_inserted",
@@ -1409,7 +1409,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L95",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L110",
           "id": "HudiWriteResult.rows_updated",
           "kind": "method",
           "name": "rows_updated",
@@ -1419,7 +1419,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L100",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L115",
           "id": "HudiWriteResult.snapshot_rows",
           "kind": "method",
           "name": "snapshot_rows",
@@ -1434,14 +1434,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/lakehouse.rs#L172",
+      "documentation": "crates/krishiv-python/src/lakehouse.rs#L185",
       "id": "crates/krishiv-python/src/lakehouse.rs::IcebergRestCatalog",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L237",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L250",
           "id": "IcebergRestCatalog.list_tables",
           "kind": "method",
           "name": "list_tables",
@@ -1451,7 +1451,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L247",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L260",
           "id": "IcebergRestCatalog.load_table_metadata",
           "kind": "method",
           "name": "load_table_metadata",
@@ -1461,7 +1461,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L191",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L204",
           "id": "IcebergRestCatalog.new",
           "kind": "method",
           "name": "new",
@@ -1981,14 +1981,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/lakehouse.rs#L282",
+      "documentation": "crates/krishiv-python/src/lakehouse.rs#L300",
       "id": "crates/krishiv-python/src/lakehouse.rs::MemoryLakehouseTable",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L437",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L474",
           "id": "MemoryLakehouseTable.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -1998,7 +1998,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L307",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L325",
           "id": "MemoryLakehouseTable.append",
           "kind": "method",
           "name": "append",
@@ -2008,7 +2008,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L428",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L465",
           "id": "MemoryLakehouseTable.current_snapshot_id",
           "kind": "method",
           "name": "current_snapshot_id",
@@ -2018,7 +2018,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L329",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L353",
           "id": "MemoryLakehouseTable.delete_where",
           "kind": "method",
           "name": "delete_where",
@@ -2028,7 +2028,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L382",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L418",
           "id": "MemoryLakehouseTable.evolve_schema",
           "kind": "method",
           "name": "evolve_schema",
@@ -2038,7 +2038,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L367",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L395",
           "id": "MemoryLakehouseTable.merge",
           "kind": "method",
           "name": "merge",
@@ -2048,7 +2048,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L295",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L313",
           "id": "MemoryLakehouseTable.new",
           "kind": "method",
           "name": "new",
@@ -2058,7 +2058,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L317",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L338",
           "id": "MemoryLakehouseTable.overwrite",
           "kind": "method",
           "name": "overwrite",
@@ -2068,7 +2068,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/lakehouse.rs#L341",
+          "documentation": "crates/krishiv-python/src/lakehouse.rs#L367",
           "id": "MemoryLakehouseTable.update_where",
           "kind": "method",
           "name": "update_where",
@@ -2083,14 +2083,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/stream.rs#L658",
+      "documentation": "crates/krishiv-python/src/stream.rs#L661",
       "id": "crates/krishiv-python/src/stream.rs::MultiSourceWatermarkSpec",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L691",
+          "documentation": "crates/krishiv-python/src/stream.rs#L694",
           "id": "MultiSourceWatermarkSpec.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -2100,7 +2100,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L675",
+          "documentation": "crates/krishiv-python/src/stream.rs#L678",
           "id": "MultiSourceWatermarkSpec.add_source",
           "kind": "method",
           "name": "add_source",
@@ -2110,7 +2110,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L667",
+          "documentation": "crates/krishiv-python/src/stream.rs#L670",
           "id": "MultiSourceWatermarkSpec.new",
           "kind": "method",
           "name": "new",
@@ -2120,7 +2120,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L685",
+          "documentation": "crates/krishiv-python/src/stream.rs#L688",
           "id": "MultiSourceWatermarkSpec.with_source_id_column",
           "kind": "method",
           "name": "with_source_id_column",
@@ -2135,14 +2135,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/session.rs#L1318",
+      "documentation": "crates/krishiv-python/src/session.rs#L1490",
       "id": "crates/krishiv-python/src/session.rs::OperationRegistry",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1355",
+          "documentation": "crates/krishiv-python/src/session.rs#L1527",
           "id": "OperationRegistry.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -2152,7 +2152,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1332",
+          "documentation": "crates/krishiv-python/src/session.rs#L1504",
           "id": "OperationRegistry.cancel",
           "kind": "method",
           "name": "cancel",
@@ -2162,7 +2162,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1352",
+          "documentation": "crates/krishiv-python/src/session.rs#L1524",
           "id": "OperationRegistry.cancelled_ids",
           "kind": "method",
           "name": "cancelled_ids",
@@ -2172,7 +2172,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1337",
+          "documentation": "crates/krishiv-python/src/session.rs#L1509",
           "id": "OperationRegistry.is_cancelled",
           "kind": "method",
           "name": "is_cancelled",
@@ -2182,7 +2182,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1347",
+          "documentation": "crates/krishiv-python/src/session.rs#L1519",
           "id": "OperationRegistry.progress",
           "kind": "method",
           "name": "progress",
@@ -2192,7 +2192,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1342",
+          "documentation": "crates/krishiv-python/src/session.rs#L1514",
           "id": "OperationRegistry.remove",
           "kind": "method",
           "name": "remove",
@@ -2390,7 +2390,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/pipeline_api.rs#L328",
+          "documentation": "crates/krishiv-python/src/pipeline_api.rs#L337",
           "id": "Pipeline.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -2430,7 +2430,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/pipeline_api.rs#L307",
+          "documentation": "crates/krishiv-python/src/pipeline_api.rs#L312",
           "id": "Pipeline.refresh",
           "kind": "method",
           "name": "refresh",
@@ -2440,7 +2440,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/pipeline_api.rs#L282",
+          "documentation": "crates/krishiv-python/src/pipeline_api.rs#L281",
           "id": "Pipeline.run",
           "kind": "method",
           "name": "run",
@@ -3069,14 +3069,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/streaming.rs#L368",
+      "documentation": "crates/krishiv-python/src/streaming.rs#L371",
       "id": "crates/krishiv-python/src/streaming.rs::RemoteStreamingJob",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L415",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L418",
           "id": "RemoteStreamingJob.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -3086,7 +3086,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L406",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L409",
           "id": "RemoteStreamingJob.drain",
           "kind": "method",
           "name": "drain",
@@ -3096,7 +3096,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L388",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L391",
           "id": "RemoteStreamingJob.job_id",
           "kind": "method",
           "name": "job_id",
@@ -3106,7 +3106,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L393",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L396",
           "id": "RemoteStreamingJob.push",
           "kind": "method",
           "name": "push",
@@ -3116,7 +3116,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L380",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L383",
           "id": "RemoteStreamingJob.py_new",
           "kind": "method",
           "name": "py_new",
@@ -3244,7 +3244,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1107",
+          "documentation": "crates/krishiv-python/src/session.rs#L1149",
           "id": "Session.close_unbounded_input",
           "kind": "method",
           "name": "close_unbounded_input",
@@ -3254,7 +3254,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L624",
+          "documentation": "crates/krishiv-python/src/session.rs#L666",
           "id": "Session.configs",
           "kind": "method",
           "name": "configs",
@@ -3264,7 +3264,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L277",
+          "documentation": "crates/krishiv-python/src/session.rs#L306",
           "id": "Session.connect",
           "kind": "method",
           "name": "connect",
@@ -3274,7 +3274,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L775",
+          "documentation": "crates/krishiv-python/src/session.rs#L817",
           "id": "Session.create_temp_view",
           "kind": "method",
           "name": "create_temp_view",
@@ -3284,7 +3284,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1085",
+          "documentation": "crates/krishiv-python/src/session.rs#L1127",
           "id": "Session.create_view",
           "kind": "method",
           "name": "create_view",
@@ -3294,7 +3294,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L984",
+          "documentation": "crates/krishiv-python/src/session.rs#L1026",
           "id": "Session.dataframe",
           "kind": "method",
           "name": "dataframe",
@@ -3304,7 +3304,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L587",
+          "documentation": "crates/krishiv-python/src/session.rs#L629",
           "id": "Session.deregister_table",
           "kind": "method",
           "name": "deregister_table",
@@ -3314,7 +3314,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1092",
+          "documentation": "crates/krishiv-python/src/session.rs#L1134",
           "id": "Session.drop_table",
           "kind": "method",
           "name": "drop_table",
@@ -3334,7 +3334,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L674",
+          "documentation": "crates/krishiv-python/src/session.rs#L716",
           "id": "Session.execute_local",
           "kind": "method",
           "name": "execute_local",
@@ -3344,7 +3344,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L688",
+          "documentation": "crates/krishiv-python/src/session.rs#L730",
           "id": "Session.execute_remote",
           "kind": "method",
           "name": "execute_remote",
@@ -3354,7 +3354,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1007",
+          "documentation": "crates/krishiv-python/src/session.rs#L1049",
           "id": "Session.from_bounded_stream",
           "kind": "method",
           "name": "from_bounded_stream",
@@ -3364,7 +3364,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L310",
+          "documentation": "crates/krishiv-python/src/session.rs#L339",
           "id": "Session.from_env",
           "kind": "method",
           "name": "from_env",
@@ -3374,7 +3374,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L999",
+          "documentation": "crates/krishiv-python/src/session.rs#L1041",
           "id": "Session.from_source",
           "kind": "method",
           "name": "from_source",
@@ -3384,7 +3384,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L616",
+          "documentation": "crates/krishiv-python/src/session.rs#L658",
           "id": "Session.get_config",
           "kind": "method",
           "name": "get_config",
@@ -3394,7 +3394,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1097",
+          "documentation": "crates/krishiv-python/src/session.rs#L1139",
           "id": "Session.is_streaming_query",
           "kind": "method",
           "name": "is_streaming_query",
@@ -3404,7 +3404,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L920",
+          "documentation": "crates/krishiv-python/src/session.rs#L962",
           "id": "Session.ivm",
           "kind": "method",
           "name": "ivm",
@@ -3414,7 +3414,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L790",
+          "documentation": "crates/krishiv-python/src/session.rs#L832",
           "id": "Session.jobs",
           "kind": "method",
           "name": "jobs",
@@ -3424,7 +3424,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L594",
+          "documentation": "crates/krishiv-python/src/session.rs#L636",
           "id": "Session.list_aggregate_udfs",
           "kind": "method",
           "name": "list_aggregate_udfs",
@@ -3434,7 +3434,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L747",
+          "documentation": "crates/krishiv-python/src/session.rs#L789",
           "id": "Session.list_table_identifiers",
           "kind": "method",
           "name": "list_table_identifiers",
@@ -3444,7 +3444,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L599",
+          "documentation": "crates/krishiv-python/src/session.rs#L641",
           "id": "Session.list_table_udfs",
           "kind": "method",
           "name": "list_table_udfs",
@@ -3454,7 +3454,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1073",
+          "documentation": "crates/krishiv-python/src/session.rs#L1115",
           "id": "Session.list_tables",
           "kind": "method",
           "name": "list_tables",
@@ -3464,7 +3464,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L854",
+          "documentation": "crates/krishiv-python/src/session.rs#L896",
           "id": "Session.list_udfs",
           "kind": "method",
           "name": "list_udfs",
@@ -3474,7 +3474,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L909",
+          "documentation": "crates/krishiv-python/src/session.rs#L951",
           "id": "Session.live_table",
           "kind": "method",
           "name": "live_table",
@@ -3494,7 +3494,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L936",
+          "documentation": "crates/krishiv-python/src/session.rs#L978",
           "id": "Session.memory_stream",
           "kind": "method",
           "name": "memory_stream",
@@ -3504,7 +3504,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L951",
+          "documentation": "crates/krishiv-python/src/session.rs#L993",
           "id": "Session.memory_stream_collect",
           "kind": "method",
           "name": "memory_stream_collect",
@@ -3514,7 +3514,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L357",
+          "documentation": "crates/krishiv-python/src/session.rs#L386",
           "id": "Session.mode",
           "kind": "method",
           "name": "mode",
@@ -3534,7 +3534,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L740",
+          "documentation": "crates/krishiv-python/src/session.rs#L782",
           "id": "Session.operation_registry",
           "kind": "method",
           "name": "operation_registry",
@@ -3544,7 +3544,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L930",
+          "documentation": "crates/krishiv-python/src/session.rs#L972",
           "id": "Session.pipeline",
           "kind": "method",
           "name": "pipeline",
@@ -3554,7 +3554,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1058",
+          "documentation": "crates/krishiv-python/src/session.rs#L1100",
           "id": "Session.poll_stream_job",
           "kind": "method",
           "name": "poll_stream_job",
@@ -3574,7 +3574,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1047",
+          "documentation": "crates/krishiv-python/src/session.rs#L1089",
           "id": "Session.push_stream_job_input",
           "kind": "method",
           "name": "push_stream_job_input",
@@ -3584,7 +3584,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L473",
+          "documentation": "crates/krishiv-python/src/session.rs#L510",
           "id": "Session.read_csv",
           "kind": "method",
           "name": "read_csv",
@@ -3594,7 +3594,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L509",
+          "documentation": "crates/krishiv-python/src/session.rs#L546",
           "id": "Session.read_csv_with_options",
           "kind": "method",
           "name": "read_csv_with_options",
@@ -3614,7 +3614,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L602",
+          "documentation": "crates/krishiv-python/src/session.rs#L644",
           "id": "Session.read_json",
           "kind": "method",
           "name": "read_json",
@@ -3624,7 +3624,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L463",
+          "documentation": "crates/krishiv-python/src/session.rs#L500",
           "id": "Session.read_parquet",
           "kind": "method",
           "name": "read_parquet",
@@ -3634,7 +3634,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L488",
+          "documentation": "crates/krishiv-python/src/session.rs#L525",
           "id": "Session.read_parquet_with_options",
           "kind": "method",
           "name": "read_parquet_with_options",
@@ -3644,7 +3644,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L743",
+          "documentation": "crates/krishiv-python/src/session.rs#L785",
           "id": "Session.read_stream",
           "kind": "method",
           "name": "read_stream",
@@ -3654,7 +3654,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L866",
+          "documentation": "crates/krishiv-python/src/session.rs#L908",
           "id": "Session.register_aggregate_udf",
           "kind": "method",
           "name": "register_aggregate_udf",
@@ -3664,7 +3664,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L566",
+          "documentation": "crates/krishiv-python/src/session.rs#L603",
           "id": "Session.register_dataframe",
           "kind": "method",
           "name": "register_dataframe",
@@ -3674,7 +3674,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L846",
+          "documentation": "crates/krishiv-python/src/session.rs#L888",
           "id": "Session.register_function",
           "kind": "method",
           "name": "register_function",
@@ -3684,7 +3684,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1188",
+          "documentation": "crates/krishiv-python/src/session.rs#L1230",
           "id": "Session.register_kafka_source",
           "kind": "method",
           "name": "register_kafka_source",
@@ -3694,7 +3694,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1235",
+          "documentation": "crates/krishiv-python/src/session.rs#L1281",
           "id": "Session.register_kinesis_source",
           "kind": "method",
           "name": "register_kinesis_source",
@@ -3704,7 +3704,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L628",
+          "documentation": "crates/krishiv-python/src/session.rs#L670",
           "id": "Session.register_parquet",
           "kind": "method",
           "name": "register_parquet",
@@ -3714,7 +3714,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L634",
+          "documentation": "crates/krishiv-python/src/session.rs#L676",
           "id": "Session.register_parquet_stream",
           "kind": "method",
           "name": "register_parquet_stream",
@@ -3724,7 +3724,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1274",
+          "documentation": "crates/krishiv-python/src/session.rs#L1385",
           "id": "Session.register_pulsar_source",
           "kind": "method",
           "name": "register_pulsar_source",
@@ -3734,7 +3734,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L547",
+          "documentation": "crates/krishiv-python/src/session.rs#L584",
           "id": "Session.register_record_batches",
           "kind": "method",
           "name": "register_record_batches",
@@ -3744,7 +3744,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L897",
+          "documentation": "crates/krishiv-python/src/session.rs#L939",
           "id": "Session.register_table_udf",
           "kind": "method",
           "name": "register_table_udf",
@@ -3754,7 +3754,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L815",
+          "documentation": "crates/krishiv-python/src/session.rs#L857",
           "id": "Session.register_udf",
           "kind": "method",
           "name": "register_udf",
@@ -3764,7 +3764,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L640",
+          "documentation": "crates/krishiv-python/src/session.rs#L682",
           "id": "Session.register_unbounded",
           "kind": "method",
           "name": "register_unbounded",
@@ -3774,7 +3774,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L657",
+          "documentation": "crates/krishiv-python/src/session.rs#L699",
           "id": "Session.register_unbounded_with_capacity",
           "kind": "method",
           "name": "register_unbounded_with_capacity",
@@ -3784,7 +3784,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L612",
+          "documentation": "crates/krishiv-python/src/session.rs#L654",
           "id": "Session.set_config",
           "kind": "method",
           "name": "set_config",
@@ -3794,7 +3794,17 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L364",
+          "documentation": "crates/krishiv-python/src/session.rs#L274",
+          "id": "Session.single_node",
+          "kind": "method",
+          "name": "single_node",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "async": false,
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/session.rs#L393",
           "id": "Session.sql",
           "kind": "method",
           "name": "sql",
@@ -3804,7 +3814,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L783",
+          "documentation": "crates/krishiv-python/src/session.rs#L825",
           "id": "Session.sql_as",
           "kind": "method",
           "name": "sql_as",
@@ -3814,7 +3824,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L389",
+          "documentation": "crates/krishiv-python/src/session.rs#L418",
           "id": "Session.sql_async",
           "kind": "method",
           "name": "sql_async",
@@ -3824,7 +3834,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L710",
+          "documentation": "crates/krishiv-python/src/session.rs#L752",
           "id": "Session.sql_with_timeout",
           "kind": "method",
           "name": "sql_with_timeout",
@@ -3834,7 +3844,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L730",
+          "documentation": "crates/krishiv-python/src/session.rs#L772",
           "id": "Session.sql_with_timeout_async",
           "kind": "method",
           "name": "sql_with_timeout_async",
@@ -3844,7 +3854,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L800",
+          "documentation": "crates/krishiv-python/src/session.rs#L842",
           "id": "Session.stream",
           "kind": "method",
           "name": "stream",
@@ -3854,7 +3864,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L405",
+          "documentation": "crates/krishiv-python/src/session.rs#L434",
           "id": "Session.submit_async",
           "kind": "method",
           "name": "submit_async",
@@ -3864,7 +3874,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L424",
+          "documentation": "crates/krishiv-python/src/session.rs#L461",
           "id": "Session.submit_sql",
           "kind": "method",
           "name": "submit_sql",
@@ -3874,7 +3884,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1039",
+          "documentation": "crates/krishiv-python/src/session.rs#L1081",
           "id": "Session.submit_stream_job",
           "kind": "method",
           "name": "submit_stream_job",
@@ -3884,7 +3894,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L448",
+          "documentation": "crates/krishiv-python/src/session.rs#L485",
           "id": "Session.submit_streaming_sql",
           "kind": "method",
           "name": "submit_streaming_sql",
@@ -3904,7 +3914,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1078",
+          "documentation": "crates/krishiv-python/src/session.rs#L1120",
           "id": "Session.table_exists",
           "kind": "method",
           "name": "table_exists",
@@ -3914,7 +3924,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L758",
+          "documentation": "crates/krishiv-python/src/session.rs#L800",
           "id": "Session.table_metadata",
           "kind": "method",
           "name": "table_metadata",
@@ -3924,7 +3934,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L620",
+          "documentation": "crates/krishiv-python/src/session.rs#L662",
           "id": "Session.unset_config",
           "kind": "method",
           "name": "unset_config",
@@ -3934,7 +3944,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1126",
+          "documentation": "crates/krishiv-python/src/session.rs#L1168",
           "id": "Session.with_auth_token",
           "kind": "method",
           "name": "with_auth_token",
@@ -3944,7 +3954,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L1161",
+          "documentation": "crates/krishiv-python/src/session.rs#L1203",
           "id": "Session.with_oidc_provider",
           "kind": "method",
           "name": "with_oidc_provider",
@@ -3954,7 +3964,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/session.rs#L322",
+          "documentation": "crates/krishiv-python/src/session.rs#L351",
           "id": "Session.with_policy",
           "kind": "method",
           "name": "with_policy",
@@ -4262,7 +4272,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L172",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L175",
           "id": "StreamingQuery.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -4302,7 +4312,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/streaming.rs#L160",
+          "documentation": "crates/krishiv-python/src/streaming.rs#L163",
           "id": "StreamingQuery.last_progress",
           "kind": "method",
           "name": "last_progress",
@@ -4560,7 +4570,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L420",
+          "documentation": "crates/krishiv-python/src/stream.rs#L423",
           "id": "WindowedStream.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -4570,7 +4580,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L427",
+          "documentation": "crates/krishiv-python/src/stream.rs#L430",
           "id": "WindowedStream._repr_html_",
           "kind": "method",
           "name": "_repr_html_",
@@ -4600,7 +4610,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L401",
+          "documentation": "crates/krishiv-python/src/stream.rs#L404",
           "id": "WindowedStream.session_gap_ms",
           "kind": "method",
           "name": "session_gap_ms",
@@ -4610,7 +4620,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L395",
+          "documentation": "crates/krishiv-python/src/stream.rs#L398",
           "id": "WindowedStream.slide_ms",
           "kind": "method",
           "name": "slide_ms",
@@ -4620,7 +4630,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L380",
+          "documentation": "crates/krishiv-python/src/stream.rs#L383",
           "id": "WindowedStream.try_next",
           "kind": "method",
           "name": "try_next",
@@ -4640,7 +4650,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L413",
+          "documentation": "crates/krishiv-python/src/stream.rs#L416",
           "id": "WindowedStream.window_kind",
           "kind": "method",
           "name": "window_kind",
@@ -4650,7 +4660,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/stream.rs#L407",
+          "documentation": "crates/krishiv-python/src/stream.rs#L410",
           "id": "WindowedStream.window_size_ms",
           "kind": "method",
           "name": "window_size_ms",

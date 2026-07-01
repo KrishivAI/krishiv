@@ -358,13 +358,16 @@ impl PyWindowedStream {
             // Use block_in_place when running inside a tokio context so the
             // worker thread is properly yielded during the recv rather than
             // being permanently blocked. When no tokio runtime is active, fall
-            // back to blocking_recv directly.
-            let res = match tokio::runtime::Handle::try_current() {
+            // back to blocking_recv directly. Release the GIL for the wait
+            // (py.detach) so other Python threads / the event loop thread
+            // (when this call is offloaded to an executor) are not frozen
+            // for the whole wait duration.
+            let res = py.detach(|| match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
                     tokio::task::block_in_place(|| handle.block_on(async { rx.recv().await }))
                 }
                 Err(_) => rx.blocking_recv(),
-            };
+            });
             match res {
                 Some(Ok(batch)) => Ok(Some(Py::new(py, batch)?)),
                 Some(Err(e)) => Err(e),

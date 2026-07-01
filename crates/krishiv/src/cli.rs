@@ -885,7 +885,10 @@ fn run_savepoint(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     }
 }
 
-fn block_on_remote<F: std::future::Future>(fut: F) -> F::Output {
+fn block_on_remote<F: std::future::Future + Send>(fut: F) -> F::Output
+where
+    F::Output: Send,
+{
     block_on(fut)
 }
 

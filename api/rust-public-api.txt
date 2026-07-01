@@ -205,7 +205,7 @@ crates/krishiv-api/src/io.rs::fn::json::pub fn json(mut self, options: JsonReadO
 crates/krishiv-api/src/io.rs::fn::kafka::pub fn kafka(mut self, options: KafkaIoOptions) -> Result<Self>
 crates/krishiv-api/src/io.rs::fn::kafka::pub fn kafka(mut self, options: KafkaIoOptions) -> Result<Self>#2
 crates/krishiv-api/src/io.rs::fn::layout::pub fn layout(mut self, layout: FileLayout) -> Result<Self>
-crates/krishiv-api/src/io.rs::fn::load::pub fn load(self, path: impl AsRef<Path>) -> Result<DataFrame>
+crates/krishiv-api/src/io.rs::fn::load::pub fn load(self, path: impl AsRef<Path> + Send) -> Result<DataFrame>
 crates/krishiv-api/src/io.rs::fn::load_async::pub async fn load_async(mut self, path: impl AsRef<Path>) -> Result<DataFrame>
 crates/krishiv-api/src/io.rs::fn::load_source_async::pub async fn load_source_async(mut self) -> Result<DataFrame>
 crates/krishiv-api/src/io.rs::fn::mode::pub fn mode(mut self, mode: WriteMode) -> Self
@@ -322,7 +322,7 @@ crates/krishiv-api/src/query.rs::struct::QueryHandle::pub struct QueryHandle
 crates/krishiv-api/src/query.rs::struct::QueryId::#[derive(Debug, Clone, PartialEq, Eq, Hash)] pub struct QueryId(u64)
 crates/krishiv-api/src/query.rs::struct::QueryProgress::#[derive(Debug, Clone, Copy, Default)] pub struct QueryProgress
 crates/krishiv-api/src/session.rs::fn::aggregate_udf_names::pub fn aggregate_udf_names(&self) -> Vec<String>
-crates/krishiv-api/src/session.rs::fn::batch::pub fn batch(&self, query: impl AsRef<str>) -> Result<DataFrame>
+crates/krishiv-api/src/session.rs::fn::batch::pub fn batch(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::build::pub fn build(self) -> Result<Session>
 crates/krishiv-api/src/session.rs::fn::builder::pub fn builder() -> SessionBuilder
 crates/krishiv-api/src/session.rs::fn::check_routing::pub fn check_routing(&self) -> Result<()>
@@ -334,9 +334,9 @@ crates/krishiv-api/src/session.rs::fn::declared_pipeline_sinks::pub fn declared_
 crates/krishiv-api/src/session.rs::fn::deployment_target::pub fn deployment_target(&self) -> DeploymentTarget
 crates/krishiv-api/src/session.rs::fn::deregister_table::pub fn deregister_table(&self, name: &str) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::drop_table::pub fn drop_table(&self, name: &str) -> Result<()>
-crates/krishiv-api/src/session.rs::fn::execute_local::pub fn execute_local(&self, query: impl AsRef<str>) -> Result<DataFrame>
+crates/krishiv-api/src/session.rs::fn::execute_local::pub fn execute_local(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::execute_local_async::pub async fn execute_local_async(&self, query: impl AsRef<str>) -> Result<DataFrame>
-crates/krishiv-api/src/session.rs::fn::execute_remote::pub fn execute_remote(&self, query: impl AsRef<str>) -> Result<DataFrame>
+crates/krishiv-api/src/session.rs::fn::execute_remote::pub fn execute_remote(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::execute_remote_async::pub async fn execute_remote_async(&self, query: impl AsRef<str>) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::execution_runtime::pub fn execution_runtime(&self) -> Arc<dyn ExecutionRuntime>
 crates/krishiv-api/src/session.rs::fn::from_env::pub fn from_env() -> Result<Self>
@@ -387,11 +387,11 @@ crates/krishiv-api/src/session.rs::fn::register_unbounded_with_capacity::pub fn 
 crates/krishiv-api/src/session.rs::fn::reset_ivm_job::pub fn reset_ivm_job(&self, name: &str) -> bool
 crates/krishiv-api/src/session.rs::fn::scalar_udf_names::pub fn scalar_udf_names(&self) -> Vec<String>
 crates/krishiv-api/src/session.rs::fn::set_config::pub fn set_config(&self, key: impl Into<String>, value: impl Into<String>)
-crates/krishiv-api/src/session.rs::fn::sql::pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame>
-crates/krishiv-api/src/session.rs::fn::sql_as::pub fn sql_as(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame>
+crates/krishiv-api/src/session.rs::fn::sql::pub fn sql(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>
+crates/krishiv-api/src/session.rs::fn::sql_as::pub fn sql_as(&self, api_key: &str, query: impl AsRef<str> + Send) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::sql_as_async::pub async fn sql_as_async(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::sql_async::pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame>
-crates/krishiv-api/src/session.rs::fn::sql_with_timeout::pub fn sql_with_timeout(&self, query: impl AsRef<str>, timeout_ms: u64) -> Result<DataFrame>
+crates/krishiv-api/src/session.rs::fn::sql_with_timeout::pub fn sql_with_timeout(
 crates/krishiv-api/src/session.rs::fn::sql_with_timeout_async::pub async fn sql_with_timeout_async(
 crates/krishiv-api/src/session.rs::fn::state_ttl::pub fn state_ttl(&self) -> Option<StateTtlConfig>
 crates/krishiv-api/src/session.rs::fn::state_ttl_config::pub fn state_ttl_config(&self) -> Option<krishiv_state::TtlConfig>

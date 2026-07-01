@@ -1,5 +1,23 @@
 {
-  "additive": [],
-  "breaking": [],
+  "additive": [
+    "rust-public.json:items/crates/krishiv-api/src/io.rs::fn::load::pub fn load(self, path: impl AsRef<Path> + Send) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::batch::pub fn batch(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::execute_local::pub fn execute_local(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::execute_remote::pub fn execute_remote(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql::pub fn sql(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql_as::pub fn sql_as(&self, api_key: &str, query: impl AsRef<str> + Send) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql_with_timeout::pub fn sql_with_timeout(",
+    "python-public.json:classes/crates/krishiv-python/src/session.rs::Session/methods/Session.single_node",
+    "sql-public.json:items/crates/krishiv-sql/src/pipeline_ddl.rs::fn::view_for_sink::pub fn view_for_sink(&self, name: &str) -> SqlResult<Option<String>>"
+  ],
+  "breaking": [
+    "rust-public.json:items/crates/krishiv-api/src/io.rs::fn::load::pub fn load(self, path: impl AsRef<Path>) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::batch::pub fn batch(&self, query: impl AsRef<str>) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::execute_local::pub fn execute_local(&self, query: impl AsRef<str>) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::execute_remote::pub fn execute_remote(&self, query: impl AsRef<str>) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql::pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql_as::pub fn sql_as(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql_with_timeout::pub fn sql_with_timeout(&self, query: impl AsRef<str>, timeout_ms: u64) -> Result<DataFrame>"
+  ],
   "semantic": []
 }

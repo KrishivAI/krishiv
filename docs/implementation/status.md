@@ -1,5 +1,143 @@
 # Krishiv Implementation Status
 
+## 2026-07-01 — Cross-language (SQL/Rust/Python) sync-async correctness audit
+
+**Scope**: Audited the public API surface across SQL (krishiv-sql,
+krishiv-flight-sql, krishiv-sql-gateway), Rust (krishiv-api, krishiv-common,
+krishiv-runtime), and Python (krishiv-python) against the documented policy
+in ADR-0002 / `api/stable-api.toml` (`rust_execution = "async-first"`,
+`python_execution = "sync-convenience-and-asyncio"`,
+`sql_protocol = "flight-sql-first"`). Three parallel research passes produced
+~35 findings (bugs/gaps/improvements); the highest-confidence, most
+impactful ones were fixed and validated in this session.
+
+### Bugs fixed
+
+- **`krishiv_common::async_util::block_on`** (foundational fix): the
+  current-thread-runtime fallback branch called `.block_on()` on a *separate*
+  fallback runtime while the calling thread already had an entered runtime
+  context — Tokio's nesting guard is per-OS-thread, not per-runtime-instance,
+  so this still panicked ("Cannot start a runtime from within a runtime").
+  Discovered via a new regression test for `BlockingSession`. Fixed by hopping
+  to a fresh OS thread (`std::thread::scope`) with no Tokio context at all,
+  matching the safe pattern already used in
+  `krishiv-flight-sql/src/host.rs::run_blocking`. Required adding `Send`
+  bounds to `block_on<T, F>`, which cascaded into 8 call sites across
+  `krishiv-api` (`Session::sql/sql_as/sql_with_timeout/execute_local/
+  execute_remote/batch`, `DataFrameReader::load`) and 3 in the `krishiv` CLI
+  binary (stringifying `Box<dyn Error>` before crossing the `block_on` Send
+  boundary rather than changing krishiv-scheduler's error type). All 7
+  krishiv-api signature changes recorded in `api/approved-breaking.toml`.
+- **`BlockingSession::collect`**: used a raw `Runtime::block_on` with no
+  nested-runtime detection — the one facade the ADR says must "reject unsafe
+  runtime nesting" was the one place that didn't. Now returns a `KrishivError`
+  instead of panicking when called from an active Tokio context.
+- **`PySession::submit_async`** (krishiv-python): called bare `tokio::spawn`
+  via `py.detach` with no ambient runtime context entered, which panics
+  ("there is no reactor running"). Fixed with `crate::RUNTIME.enter()`.
+- **Python `sql_async`/`collect_async` regression** (the historical
+  ADR-0002 bug, reintroduced): `krishiv/__init__.py` shadowed the already
+  correctly-fixed native `Session.sql_async` (which uses
+  `pyo3_async_runtimes::tokio::future_into_py`) with a wrapper that called
+  the *synchronous* `Session.sql` inline, fully blocking the event loop.
+  `DataFrame.collect_async`'s wrapper had the same regression (recent commit
+  6027e7e removed the `run_in_executor` offload that a previous commit had
+  correctly added). Restored: `sql_async` now awaits the genuine native
+  coroutine; `collect_async` runs the (blocking) native call via
+  `run_in_executor` again.
+- **GIL discipline**: added `py.detach`/`py: Python<'_>` around blocking
+  `RUNTIME.block_on` calls that held the GIL through I/O in `lakehouse.rs`
+  (Delta/Hudi/Iceberg-REST/MemoryLakehouseTable — ~14 functions),
+  `sources.rs::read_iceberg_impl` (also switched from an ad hoc
+  `new_current_thread` runtime to the shared `crate::RUNTIME`),
+  `pipeline_api.rs` (`validate`/`run`/`refresh`), `streaming.rs::
+  await_termination`, and `incremental.rs::register_view*`.
+  `stream.rs::WindowedStream::__anext__` now releases the GIL during its
+  blocking recv (previously held it for the whole wait).
+- **Blocking filesystem/Parquet I/O in async DataFusion paths**:
+  `connector_table.rs::ConnectorTableFactory::create` did blocking
+  `Path::canonicalize` inline (now `spawn_blocking`);
+  `krishiv-sql/lakehouse/providers.rs::register_hudi_uri` /
+  `HudiScanProvider::scan` did blocking filesystem+Parquet-decode I/O inline
+  (Hudi's local-filesystem reader, unlike its object-store sibling, is fully
+  sync) — now `spawn_blocking`; `krishiv-api/connector_runtime.rs`'s
+  Parquet/CSV job-source `open()` did blocking file I/O inline (the adjacent
+  JSON branch was already fixed) — now `spawn_blocking`.
+
+### Known regression caught and reverted mid-fix
+
+`WindowedStream.__anext__`'s Python wrapper was initially given the same
+`run_in_executor` treatment as `DataFrameStream` (which worked), but
+`WindowedStream` is a PyO3 `unsendable` pyclass — pytest caught a real panic
+("is unsendable, but sent to another thread"). Reverted to a plain pass-through
+wrapper; the native GIL-release fix was kept. Documented as a real,
+unresolved gap: making this genuinely non-blocking would require removing
+`unsendable` from the type or a native `future_into_py`/experimental-async
+rewrite, both larger changes than this session's scope.
+
+### API-surface CI gate was already broken before this session
+
+`python3 scripts/check_api_surface.py` (no `--write`) was already failing at
+HEAD (commit 6027e7e) — that commit hand-edited
+`crates/krishiv-python/python/krishiv/krishiv.pyi` to add precise type stubs
+for `DataStreamWriter.*` and `Session.single_node` without updating
+`scripts/check_api_surface.py`'s `CLASS_METHOD_SIGNATURES` override table, so
+the generator could never reproduce them. Fixed by adding the missing
+override entries (verified against the hand-edit's exact text) rather than
+letting `--write` silently regenerate lower-precision stubs. `Session.
+is_embedded/is_single_node/is_distributed` (added via `__init__.py`
+monkey-patching, not `#[pymethods]`) remain absent from the generated `.pyi`
+— the inventory scanner only parses `.rs` sources, so pure-Python
+monkey-patched methods on native classes are structurally invisible to it.
+Documented as a gap; fixing it requires extending `python_inventory()` to
+also scan `__init__.py`, out of scope here.
+
+### Validation
+
+- `cargo fmt --check`, `cargo clippy --workspace --exclude krishiv-python
+  --exclude krishiv-chaos -- -D warnings`: clean.
+- `cargo test` across every touched/workspace crate (krishiv-common,
+  krishiv-api, krishiv-sql, krishiv-runtime, krishiv-flight-sql,
+  krishiv-sql-gateway, krishiv, krishiv-dataflow, krishiv-scheduler,
+  krishiv-executor, krishiv-state, krishiv-connectors, krishiv-plan,
+  krishiv-ivm, krishiv-shuffle, krishiv-operator, krishiv-metrics,
+  krishiv-proto, krishiv-engine-core, krishiv-delta, krishiv-ui): 0 failures
+  across ~3,600 tests.
+- `maturin develop` + full Python pytest suite (`crates/krishiv-python/
+  python/tests/`): 481 passed, 29 skipped, 0 failed — including the
+  `sql_async`/`collect_async`/`WindowedStream` async tests this session
+  touched.
+- `python3 scripts/check_api_surface.py` (validate mode, no `--write`):
+  passes; 7 approved-breaking entries added for the `block_on` Send-bound
+  signature changes.
+
+### Documented gaps not fixed this session (see chat/PR for full matrix)
+
+- Flight SQL `BeginTransaction`/`EndTransaction`/`Commit` provide no real
+  atomicity/isolation (autocommit regardless of "transaction" state) —
+  broader than the already-known Rollback no-op.
+- `krishiv::blocking` (the ADR's prescribed facade name) isn't re-exported
+  from the top-level `krishiv` facade crate; only reachable via the internal
+  `krishiv-api` crate.
+- Several genuinely I/O-performing Rust methods have no async twin
+  (`DataFrame::describe`/`show`, `Session::read_parquet_with_options`,
+  `Session::stream` in distributed mode, catalog/view DDL helpers).
+- `IcebergCatalogBridge::block_on` and `SqlBodyTableUdf::call` bridge
+  DataFusion's synchronous trait methods into async work via
+  `block_in_place`, correctly avoiding panics but still parking a tonic
+  worker thread on every cache miss / UDTF invocation — inherent to the
+  upstream sync trait shape, not fixable without an upstream API change.
+- `api/stable-api.toml`'s `python.true-asyncio` "implemented" claim isn't
+  verified by any automated check that distinguishes a genuine awaitable
+  from an awaitable-that-fully-blocks; `scripts/check_api_surface.py`'s
+  `"async"` field is a syntactic `async fn` regex check only.
+
+**Next useful command**: `cargo test --workspace --exclude krishiv-python
+--exclude krishiv-chaos --exclude krishiv-bench` (already green as of this
+session; rerun to confirm after any further changes).
+
+---
+
 ## 2026-06-30 — Docker image size optimization + nightly publish
 
 **Scope**: Shrink the distributed Docker image ~4x via multi-call binary,
