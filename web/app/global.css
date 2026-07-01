@@ -242,3 +242,71 @@ button,select,a.btn,.icon-link,.mobile-menu summary{min-height:44px;min-width:44
 .doc-diagram{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:linear-gradient(180deg,rgba(16,16,16,.6),rgba(8,8,8,.72));padding:18px 16px;display:grid;place-items:center}
 .doc-diagram svg{width:100%;max-width:100%;height:auto;display:block}
 .doc-caption{margin:10px 0 0;color:var(--muted);font-size:13px;line-height:1.5;text-align:center;font-style:italic}
+
+/* ── Mobile landing-page polish ───────────────────────────────────────────── */
+@media(max-width:900px){
+  .hero-new-copy{order:1}
+  .hero-new-viz{order:2}
+}
+@media(max-width:760px){
+  .site-shell{background:radial-gradient(circle at 50% 10%,rgba(245,158,11,.055),transparent 13rem),linear-gradient(180deg,#030303 0,#050505 42%,#030303 100%)}
+  .site-shell:before{background-size:56px 56px;opacity:.7}
+  .header{height:56px;grid-template-columns:auto 1fr auto;padding-left:max(12px,env(safe-area-inset-left));padding-right:max(12px,env(safe-area-inset-right))}
+  .brand-logo{gap:8px;font-size:18px;letter-spacing:-.035em}
+  .brand-logo img{width:26px;height:26px}
+  .nav-actions .btn-primary.small{display:none}
+  .mobile-menu summary{width:36px;height:36px;min-width:36px;min-height:36px;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:rgba(16,16,16,.55)}
+  .mobile-menu summary span{width:15px;height:1.5px}
+  .mobile-menu summary span:nth-child(2){margin:3.5px 0}
+  .mobile-menu div{top:56px;right:12px;left:12px;min-width:0;padding:10px;border-radius:12px}
+  .mobile-menu div a{padding:11px 12px;font-size:14px}
+  .section-container,.hero-new-inner{padding-left:max(16px,env(safe-area-inset-left));padding-right:max(16px,env(safe-area-inset-right))}
+  .hero-new{padding:26px 0 30px;border-bottom-color:rgba(255,255,255,.08)}
+  .hero-new-inner{gap:18px;align-items:start}
+  .hero-badge{font-size:9.5px;letter-spacing:.055em;padding:4px 9px;margin-bottom:10px;color:#e7c178;border-color:rgba(245,158,11,.18);background:rgba(245,158,11,.045)}
+  .hero-new h1{max-width:12ch;font-size:clamp(34px,10.2vw,42px);line-height:1.02;letter-spacing:-.055em;font-weight:720;margin-bottom:12px;text-wrap:balance}
+  .hero-lead{font-size:14.5px;line-height:1.55;max-width:33rem;margin-bottom:18px;color:#cfcfcf}
+  .hero-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px;width:100%}
+  .hero-actions .btn{justify-content:center;padding:10px 11px;min-height:42px;min-width:0;font-size:13px;border-radius:9px}
+  .hero-actions .btn:nth-child(3){grid-column:1 / -1;background:transparent;color:var(--muted-strong)}
+  .exec-graph{width:100%;max-width:none;margin:0;padding:12px;border-radius:14px;background:rgba(12,12,12,.54);border-color:rgba(255,255,255,.09);box-shadow:none}
+  .exec-graph svg{max-height:245px}
+  .exec-graph text{font-size:13px;font-weight:650}
+  .section-dark,.section-light,.section-cta{padding:42px 0}
+  .section-light{background:#0d0d0d}
+  .section-eyebrow{font-size:10.5px;margin-bottom:8px;color:#d99624;letter-spacing:.095em}
+  .section-dark h2,.section-light h2,.section-cta h2{font-size:clamp(25px,7.2vw,32px);line-height:1.08;letter-spacing:-.04em;text-wrap:balance}
+  .section-subtitle{font-size:14.5px;line-height:1.58;margin-bottom:24px;color:#b8b8b8}
+  .problem-card,.deploy-card,.audience-card{padding:18px 16px;border-radius:12px;background:rgba(16,16,16,.58)}
+  .problem-icon{width:34px;height:34px;margin-bottom:12px;background:rgba(245,158,11,.065);color:#f1bd62}
+  .eco-grid,.trust-grid{justify-content:flex-start;gap:10px}
+  .eco-item{padding:11px 13px;border-radius:10px;font-size:13px}
+  .trust-item{width:100%;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.07)}
+  .footer{padding-top:40px}
+}
+@media(max-width:430px){
+  .hero-actions{grid-template-columns:1fr}
+  .hero-actions .btn:nth-child(3){grid-column:auto}
+  .hero-new h1{max-width:11ch;font-size:clamp(32px,10vw,38px)}
+  .exec-graph svg{max-height:225px}
+}
+@media(max-width:360px){
+  .header{height:52px}
+  .mobile-menu div{top:52px}
+  .hero-new{padding-top:20px}
+  .hero-new h1{font-size:31px;max-width:10.5ch}
+  .hero-lead{font-size:14px;line-height:1.5}
+  .exec-graph{padding:9px}
+  .exec-graph svg{max-height:210px}
+}
+
+/* Keep architecture diagrams readable instead of shrinking labels into noise. */
+@media(max-width:760px){
+  .diagram,.doc-diagram{display:block;overflow-x:auto;padding:12px;border-radius:12px;-webkit-overflow-scrolling:touch;background:linear-gradient(90deg,rgba(245,158,11,.08),transparent 20px) rgba(8,8,8,.72)}
+  .diagram svg,.doc-diagram svg{width:640px;max-width:none;height:auto}
+  .diagram:after,.doc-diagram:after{content:"Swipe to inspect the full diagram";display:block;margin-top:8px;color:var(--muted);font-size:11px;text-align:center}
+}
+@media(max-width:360px){
+  .diagram,.doc-diagram{margin-left:-4px;margin-right:-4px;padding:10px}
+  .diagram svg,.doc-diagram svg{width:610px}
+}
