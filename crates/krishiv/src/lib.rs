@@ -115,6 +115,27 @@ pub use relation::{EmitMode, Relation, WindowSpec};
 pub use session_ext::SessionExt;
 pub use stream_handle::StreamHandle;
 
+/// Synchronous facade for CLI tools, scripts, or any context that doesn't run
+/// under an async executor.
+///
+/// [`blocking::BlockingSession`] wraps [`Session`] with an owned, reusable
+/// Tokio runtime so every method is purely synchronous with no hidden global
+/// runtime. It rejects unsafe runtime nesting (returns an error rather than
+/// panicking) if called from a thread that is already driving a Tokio
+/// runtime — from async code, use [`DataFrame::collect_async`] and friends
+/// directly instead.
+///
+/// ```rust,no_run
+/// use krishiv::blocking::BlockingSession;
+///
+/// let session = BlockingSession::embedded().unwrap();
+/// let result = session.sql("SELECT 42 AS answer").unwrap();
+/// println!("{}", result.row_count());
+/// ```
+pub mod blocking {
+    pub use krishiv_api::blocking::BlockingSession;
+}
+
 /// Distributed control-plane and data-plane building blocks for advanced embedding.
 ///
 /// Most applications use [`Session`] only; operators and custom tooling can use these

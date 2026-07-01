@@ -77,6 +77,7 @@ crates/krishiv-api/src/dataframe.rs::fn::collect_with_stats::pub fn collect_with
 crates/krishiv-api/src/dataframe.rs::fn::count::pub fn count(&self) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::create_or_replace_temp_view::pub fn create_or_replace_temp_view(&self, name: &str) -> Result<()>
 crates/krishiv-api/src/dataframe.rs::fn::describe::pub fn describe(&self) -> Result<DataFrame>
+crates/krishiv-api/src/dataframe.rs::fn::describe_async::pub async fn describe_async(&self) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::distinct::pub fn distinct(&self) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::drop::pub fn drop(&self, columns: &[&str]) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::drop_nulls::pub fn drop_nulls(&self, columns: &[&str]) -> Result<DataFrame>
@@ -118,6 +119,7 @@ crates/krishiv-api/src/dataframe.rs::fn::select::pub fn select(&self, columns: &
 crates/krishiv-api/src/dataframe.rs::fn::select_exprs::pub fn select_exprs(&self, expressions: &[Expr]) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::session_window::pub fn session_window(
 crates/krishiv-api/src/dataframe.rs::fn::show::pub fn show(&self, num_rows: usize) -> Result<String>
+crates/krishiv-api/src/dataframe.rs::fn::show_async::pub async fn show_async(&self, num_rows: usize) -> Result<String>
 crates/krishiv-api/src/dataframe.rs::fn::sliding_window::pub fn sliding_window(
 crates/krishiv-api/src/dataframe.rs::fn::sort::pub fn sort(&self, columns: &[&str], descending: &[bool]) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::stream::pub fn stream(&self) -> crate::streaming_dataframe::StreamingDataFrame
@@ -371,6 +373,7 @@ crates/krishiv-api/src/session.rs::fn::read_json_async::pub async fn read_json_a
 crates/krishiv-api/src/session.rs::fn::read_parquet::pub fn read_parquet(&self, path: impl AsRef<Path>) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::read_parquet_async::pub async fn read_parquet_async(&self, path: impl AsRef<Path>) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::read_parquet_with_options::pub fn read_parquet_with_options(
+crates/krishiv-api/src/session.rs::fn::read_parquet_with_options_async::pub async fn read_parquet_with_options_async(
 crates/krishiv-api/src/session.rs::fn::read_stream::pub fn read_stream(&self) -> crate::streaming_builder::DataStreamReader
 crates/krishiv-api/src/session.rs::fn::register_aggregate_udf::pub fn register_aggregate_udf(&self, udf: Arc<dyn AggregateUdf>) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::register_bounded::pub fn register_bounded(&self, name: &str, path: &Path) -> Result<()>
@@ -396,6 +399,7 @@ crates/krishiv-api/src/session.rs::fn::sql_with_timeout_async::pub async fn sql_
 crates/krishiv-api/src/session.rs::fn::state_ttl::pub fn state_ttl(&self) -> Option<StateTtlConfig>
 crates/krishiv-api/src/session.rs::fn::state_ttl_config::pub fn state_ttl_config(&self) -> Option<krishiv_state::TtlConfig>
 crates/krishiv-api/src/session.rs::fn::stream::pub fn stream(
+crates/krishiv-api/src/session.rs::fn::stream_async::pub async fn stream_async(
 crates/krishiv-api/src/session.rs::fn::submit::pub async fn submit(&self, job: crate::CompiledJob) -> Result<crate::JobHandle>
 crates/krishiv-api/src/session.rs::fn::submit_sql::pub async fn submit_sql(&self, sql: &str) -> Result<crate::JobHandle>
 crates/krishiv-api/src/session.rs::fn::submit_stream_job::pub fn submit_stream_job(

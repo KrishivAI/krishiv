@@ -46,6 +46,19 @@ const MAX_TRANSACTIONS: usize = 10_000;
 /// Transaction entries older than this are evicted on each `BeginTransaction` sweep.
 const TRANSACTION_TTL: Duration = Duration::from_secs(300);
 
+/// Bookkeeping for one open Flight SQL transaction id.
+///
+/// `statement_count` tracks how many statements have executed under this id
+/// so `do_action_end_transaction` can tell whether `Commit`/`Rollback` are
+/// truly no-ops (0 or 1 statement — autocommit-per-statement already behaves
+/// the same as a real transaction) or are silently failing to provide the
+/// atomicity/isolation a caller of a multi-statement transaction would expect.
+struct TransactionEntry {
+    owner: String,
+    created: Instant,
+    statement_count: u32,
+}
+
 /// Per-subject LRU cache mapping handle → bound parameter record batches.
 type PreparedStatementCache =
     Arc<tokio::sync::Mutex<HashMap<String, lru::LruCache<String, String>>>>;
@@ -63,9 +76,9 @@ pub struct KrishivFlightSqlService {
     /// Per-subject LRU caches of handle → bound parameter record batches (set via DoPut).
     bound_params: BoundParamCache,
     /// Active Flight SQL transaction ids issued by `BeginTransaction`.
-    /// Maps txn_id -> (subject, created_at).  Entries older than `TRANSACTION_TTL`
-    /// are swept on each new transaction request.  Capped at `MAX_TRANSACTIONS`.
-    transactions: Arc<tokio::sync::Mutex<HashMap<String, (String, Instant)>>>,
+    /// Entries older than `TRANSACTION_TTL` are swept on each new transaction
+    /// request.  Capped at `MAX_TRANSACTIONS`.
+    transactions: Arc<tokio::sync::Mutex<HashMap<String, TransactionEntry>>>,
     /// Semaphore that caps the number of queries executing concurrently through
     /// the Flight ingress. `None` means no cap.
     inflight_queries: Option<Arc<tokio::sync::Semaphore>>,
@@ -226,8 +239,8 @@ impl KrishivFlightSqlService {
             .map_err(|_| Status::invalid_argument("invalid transaction id encoding"))?;
         let transactions = self.transactions.lock().await;
         match transactions.get(id) {
-            Some((owner, created)) if subject.is_none_or(|s| s == owner) => {
-                if created.elapsed() >= TRANSACTION_TTL {
+            Some(entry) if subject.is_none_or(|s| s == entry.owner) => {
+                if entry.created.elapsed() >= TRANSACTION_TTL {
                     Err(Status::invalid_argument(format!(
                         "transaction id {id} has expired"
                     )))
@@ -241,6 +254,22 @@ impl KrishivFlightSqlService {
             None => Err(Status::invalid_argument(format!(
                 "unknown transaction id: {id}"
             ))),
+        }
+    }
+
+    /// Record that a statement executed under `transaction_id` (no-op if
+    /// `None` or the id is no longer tracked). Used only to decide whether
+    /// `Commit`/`Rollback` need to warn about missing atomicity — it has no
+    /// effect on execution, which always runs autocommit.
+    async fn record_transaction_statement(&self, transaction_id: Option<&[u8]>) {
+        let Some(id) = transaction_id
+            .filter(|id| !id.is_empty())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        else {
+            return;
+        };
+        if let Some(entry) = self.transactions.lock().await.get_mut(id) {
+            entry.statement_count = entry.statement_count.saturating_add(1);
         }
     }
 }
@@ -371,6 +400,8 @@ impl FlightSqlService for KrishivFlightSqlService {
         // checked it, the ticket could have been reused after EndTransaction.
         self.validate_transaction_id(transaction_id.as_deref(), subject.as_deref())
             .await?;
+        self.record_transaction_statement(transaction_id.as_deref())
+            .await;
 
         let query = std::str::from_utf8(query_bytes)
             .map_err(|e| Status::invalid_argument(format!("invalid query encoding: {e}")))?;
@@ -595,6 +626,15 @@ impl FlightSqlService for KrishivFlightSqlService {
         Ok(())
     }
 
+    /// Issue an opaque transaction id for client-side bookkeeping.
+    ///
+    /// **No atomicity or isolation**: this id is validated (exists, owned by
+    /// the calling subject, not expired) on subsequent `do_get_statement`
+    /// calls, but execution is unconditionally autocommit — statements run
+    /// immediately with no write buffering, no snapshot reads, and no
+    /// participation from the catalog or execution layer. `Commit` and
+    /// `Rollback` (see [`Self::do_action_end_transaction`]) are both no-ops
+    /// against already-applied statements.
     async fn do_action_begin_transaction(
         &self,
         _query: ActionBeginTransactionRequest,
@@ -606,19 +646,34 @@ impl FlightSqlService for KrishivFlightSqlService {
         let now = Instant::now();
         let mut txns = self.transactions.lock().await;
         // Sweep expired entries and enforce cap before inserting.
-        txns.retain(|_id, (_owner, created)| now.duration_since(*created) < TRANSACTION_TTL);
+        txns.retain(|_id, entry| now.duration_since(entry.created) < TRANSACTION_TTL);
         if txns.len() >= MAX_TRANSACTIONS {
             return Err(Status::resource_exhausted(format!(
                 "transaction limit reached ({MAX_TRANSACTIONS}); retry after existing transactions expire"
             )));
         }
-        txns.insert(transaction_id.clone(), (subject_key, now));
+        txns.insert(
+            transaction_id.clone(),
+            TransactionEntry {
+                owner: subject_key,
+                created: now,
+                statement_count: 0,
+            },
+        );
         drop(txns);
         Ok(ActionBeginTransactionResult {
             transaction_id: transaction_id.into_bytes().into(),
         })
     }
 
+    /// Retire a transaction id issued by `BeginTransaction`.
+    ///
+    /// Both `Commit` and `Rollback` are no-ops with respect to the statements
+    /// already executed under this transaction id: `do_get_statement` runs
+    /// every statement autocommit as soon as it is submitted, so there is
+    /// nothing staged to commit or discard. `Commit` "succeeding" does not
+    /// mean anything was atomically applied together, and `Rollback` cannot
+    /// undo statements that already ran.
     async fn do_action_end_transaction(
         &self,
         query: ActionEndTransactionRequest,
@@ -628,7 +683,7 @@ impl FlightSqlService for KrishivFlightSqlService {
         let subject_key = subject.as_deref().unwrap_or("__anon__");
         let transaction_id = std::str::from_utf8(&query.transaction_id)
             .map_err(|_| Status::invalid_argument("invalid transaction id encoding"))?;
-        {
+        let statement_count = {
             let mut txns = self.transactions.lock().await;
             match txns.get(transaction_id) {
                 None => {
@@ -636,22 +691,42 @@ impl FlightSqlService for KrishivFlightSqlService {
                         "unknown transaction id: {transaction_id}"
                     )));
                 }
-                Some((owner, _created)) if owner != subject_key => {
+                Some(entry) if entry.owner != subject_key => {
                     return Err(Status::permission_denied(format!(
                         "transaction id {transaction_id} does not belong to this subject"
                     )));
                 }
-                Some(_) => {
+                Some(entry) => {
+                    let count = entry.statement_count;
                     txns.remove(transaction_id);
+                    count
                 }
             }
-        }
+        };
         match EndTransaction::try_from(query.action)
             .map_err(|_| Status::invalid_argument("invalid EndTransaction action"))?
         {
-            EndTransaction::Commit => Ok(()),
+            // A single autocommit statement (or none) behaves identically to a
+            // real transaction, so only warn when there were multiple
+            // statements whose atomicity as a group was not actually provided.
+            EndTransaction::Commit => {
+                if statement_count > 1 {
+                    tracing::warn!(
+                        statement_count,
+                        "Flight SQL Commit is a no-op: {statement_count} statements ran \
+                         autocommit as they were submitted, not atomically as a group"
+                    );
+                }
+                Ok(())
+            }
             EndTransaction::Rollback => {
-                tracing::warn!("Flight SQL Rollback is a no-op: no transactional storage backend");
+                if statement_count > 0 {
+                    tracing::warn!(
+                        statement_count,
+                        "Flight SQL Rollback is a no-op: {statement_count} already-executed \
+                         statement(s) cannot be undone (no transactional storage backend)"
+                    );
+                }
                 Ok(())
             }
             EndTransaction::Unspecified => Err(Status::invalid_argument(
@@ -1120,5 +1195,134 @@ impl KrishivFlightSqlService {
                     .map_err(|e| KrishivActionError::Other(e.to_string()))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+
+    fn service() -> KrishivFlightSqlService {
+        KrishivFlightSqlService::with_host(FlightExecutionHost::embedded().expect("embedded host"))
+    }
+
+    fn action_request() -> Request<arrow_flight::Action> {
+        Request::new(arrow_flight::Action {
+            r#type: String::new(),
+            body: Default::default(),
+        })
+    }
+
+    /// Regression test documenting the transaction bookkeeping gap this
+    /// session's sync/async audit found: `do_get_statement` executes a
+    /// statement immediately, for real, as soon as it is submitted — even
+    /// while a transaction is open and un-committed. There is no staging to
+    /// later commit or discard, so `Commit`/`Rollback` (see
+    /// `do_action_end_transaction`) cannot change whether the statement's
+    /// effects happened. This test pins that observable behavior so a future
+    /// change that silently "fixes" it (or regresses it further) is noticed.
+    #[tokio::test]
+    async fn do_get_statement_executes_immediately_under_open_transaction() {
+        use futures::StreamExt as _;
+
+        let svc = service();
+        let begin = svc
+            .do_action_begin_transaction(ActionBeginTransactionRequest {}, action_request())
+            .await
+            .expect("begin_transaction");
+        let txn_id = begin.transaction_id.to_vec();
+
+        // Build the ticket the same way `get_flight_info_statement` does:
+        // [4-byte big-endian txn_len][txn_id][query].
+        let query = b"SELECT 1 AS n";
+        let mut handle = Vec::with_capacity(4 + txn_id.len() + query.len());
+        handle.extend_from_slice(&(txn_id.len() as u32).to_be_bytes());
+        handle.extend_from_slice(&txn_id);
+        handle.extend_from_slice(query);
+        let ticket = TicketStatementQuery {
+            statement_handle: handle.into(),
+        };
+
+        // The statement runs for real right now, under an open (not yet
+        // committed or rolled back) transaction.
+        let mut stream = svc
+            .do_get_statement(ticket, Request::new(Ticket::new(Vec::new())))
+            .await
+            .expect("statement executes under an open transaction")
+            .into_inner();
+        let mut saw_batch = false;
+        while let Some(chunk) = stream.next().await {
+            chunk.expect("flight data chunk");
+            saw_batch = true;
+        }
+        assert!(
+            saw_batch,
+            "do_get_statement must actually execute the query"
+        );
+
+        // The bookkeeping counter now reflects the one executed statement —
+        // this is the only visible trace of "the transaction," since nothing
+        // was staged.
+        let count = svc
+            .transactions
+            .lock()
+            .await
+            .get(std::str::from_utf8(&txn_id).unwrap())
+            .expect("transaction is still open")
+            .statement_count;
+        assert_eq!(count, 1);
+
+        // Rollback succeeds — but it does not, and cannot, undo the SELECT
+        // that already executed and returned its result to the caller.
+        svc.do_action_end_transaction(
+            ActionEndTransactionRequest {
+                transaction_id: txn_id.clone().into(),
+                action: EndTransaction::Rollback as i32,
+            },
+            action_request(),
+        )
+        .await
+        .expect("rollback succeeds even though the statement already ran");
+    }
+
+    #[tokio::test]
+    async fn transaction_id_is_retired_after_end_transaction() {
+        let svc = service();
+        let begin = svc
+            .do_action_begin_transaction(ActionBeginTransactionRequest {}, action_request())
+            .await
+            .expect("begin_transaction");
+        let txn_id = begin.transaction_id.to_vec();
+
+        svc.do_action_end_transaction(
+            ActionEndTransactionRequest {
+                transaction_id: txn_id.clone().into(),
+                action: EndTransaction::Commit as i32,
+            },
+            action_request(),
+        )
+        .await
+        .expect("end_transaction commit");
+
+        let reused = svc.validate_transaction_id(Some(&txn_id), None).await;
+        assert!(
+            reused.is_err(),
+            "a transaction id must not be reusable after EndTransaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn end_transaction_rejects_unknown_id() {
+        let svc = service();
+        let result = svc
+            .do_action_end_transaction(
+                ActionEndTransactionRequest {
+                    transaction_id: b"not-a-real-id".to_vec().into(),
+                    action: EndTransaction::Commit as i32,
+                },
+                action_request(),
+            )
+            .await;
+        assert!(result.is_err());
     }
 }

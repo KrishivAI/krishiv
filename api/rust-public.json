@@ -722,7 +722,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1442",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1462",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::cache::pub fn cache(&self) -> Result<DataFrame>",
       "kind": "fn",
       "name": "cache",
@@ -772,7 +772,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1508",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1528",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::create_or_replace_temp_view::pub fn create_or_replace_temp_view(&self, name: &str) -> Result<()>",
       "kind": "fn",
       "name": "create_or_replace_temp_view",
@@ -782,12 +782,22 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1180",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1190",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::describe::pub fn describe(&self) -> Result<DataFrame>",
       "kind": "fn",
       "name": "describe",
       "replacement": null,
       "signature": "pub fn describe(&self) -> Result<DataFrame>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1200",
+      "id": "crates/krishiv-api/src/dataframe.rs::fn::describe_async::pub async fn describe_async(&self) -> Result<DataFrame>",
+      "kind": "fn",
+      "name": "describe_async",
+      "replacement": null,
+      "signature": "pub async fn describe_async(&self) -> Result<DataFrame>",
       "stability": "preview"
     },
     {
@@ -1092,7 +1102,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1447",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1467",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::persist::pub fn persist(&self) -> Result<DataFrame>",
       "kind": "fn",
       "name": "persist",
@@ -1132,7 +1142,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1583",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1603",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::repartition::pub fn repartition(mut self, num_partitions: u32, key_columns: &[&str]) -> Self",
       "kind": "fn",
       "name": "repartition",
@@ -1198,6 +1208,16 @@
       "name": "show",
       "replacement": null,
       "signature": "pub fn show(&self, num_rows: usize) -> Result<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1138",
+      "id": "crates/krishiv-api/src/dataframe.rs::fn::show_async::pub async fn show_async(&self, num_rows: usize) -> Result<String>",
+      "kind": "fn",
+      "name": "show_async",
+      "replacement": null,
+      "signature": "pub async fn show_async(&self, num_rows: usize) -> Result<String>",
       "stability": "preview"
     },
     {
@@ -1272,7 +1292,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1494",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1514",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::unpersist::pub fn unpersist(&self) -> Result<()>",
       "kind": "fn",
       "name": "unpersist",
@@ -1312,7 +1332,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1193",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1213",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::write::pub fn write(&self) -> DataFrameWriter",
       "kind": "fn",
       "name": "write",
@@ -1322,7 +1342,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1388",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1408",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::write_csv::pub fn write_csv(&self, path: &str) -> Result<()>",
       "kind": "fn",
       "name": "write_csv",
@@ -1332,7 +1352,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1552",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1572",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::write_csv_with_options::pub fn write_csv_with_options(",
       "kind": "fn",
       "name": "write_csv_with_options",
@@ -1342,7 +1362,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1411",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1431",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::write_json::pub fn write_json(&self, path: &str) -> Result<()>",
       "kind": "fn",
       "name": "write_json",
@@ -1352,7 +1372,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1350",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1370",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::write_parquet::pub fn write_parquet(&self, path: &str) -> Result<()>",
       "kind": "fn",
       "name": "write_parquet",
@@ -1362,7 +1382,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1318",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1338",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::write_parquet_overwrite_partition::pub fn write_parquet_overwrite_partition(",
       "kind": "fn",
       "name": "write_parquet_overwrite_partition",
@@ -1372,7 +1392,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/dataframe.rs#L1518",
+      "documentation": "crates/krishiv-api/src/dataframe.rs#L1538",
       "id": "crates/krishiv-api/src/dataframe.rs::fn::write_parquet_with_options::pub fn write_parquet_with_options(",
       "kind": "fn",
       "name": "write_parquet_with_options",
@@ -3312,7 +3332,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2111",
+      "documentation": "crates/krishiv-api/src/session.rs#L2124",
       "id": "crates/krishiv-api/src/session.rs::fn::create_view::pub fn create_view(&self, name: &str, query: &str) -> Result<()>",
       "kind": "fn",
       "name": "create_view",
@@ -3342,7 +3362,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2234",
+      "documentation": "crates/krishiv-api/src/session.rs#L2259",
       "id": "crates/krishiv-api/src/session.rs::fn::deregister_table::pub fn deregister_table(&self, name: &str) -> Result<()>",
       "kind": "fn",
       "name": "deregister_table",
@@ -3352,7 +3372,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2122",
+      "documentation": "crates/krishiv-api/src/session.rs#L2135",
       "id": "crates/krishiv-api/src/session.rs::fn::drop_table::pub fn drop_table(&self, name: &str) -> Result<()>",
       "kind": "fn",
       "name": "drop_table",
@@ -3362,7 +3382,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1805",
+      "documentation": "crates/krishiv-api/src/session.rs#L1818",
       "id": "crates/krishiv-api/src/session.rs::fn::execute_local::pub fn execute_local(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>",
       "kind": "fn",
       "name": "execute_local",
@@ -3372,7 +3392,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1814",
+      "documentation": "crates/krishiv-api/src/session.rs#L1827",
       "id": "crates/krishiv-api/src/session.rs::fn::execute_local_async::pub async fn execute_local_async(&self, query: impl AsRef<str>) -> Result<DataFrame>",
       "kind": "fn",
       "name": "execute_local_async",
@@ -3382,7 +3402,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1849",
+      "documentation": "crates/krishiv-api/src/session.rs#L1862",
       "id": "crates/krishiv-api/src/session.rs::fn::execute_remote::pub fn execute_remote(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>",
       "kind": "fn",
       "name": "execute_remote",
@@ -3392,7 +3412,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1854",
+      "documentation": "crates/krishiv-api/src/session.rs#L1867",
       "id": "crates/krishiv-api/src/session.rs::fn::execute_remote_async::pub async fn execute_remote_async(&self, query: impl AsRef<str>) -> Result<DataFrame>",
       "kind": "fn",
       "name": "execute_remote_async",
@@ -3502,7 +3522,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2089",
+      "documentation": "crates/krishiv-api/src/session.rs#L2102",
       "id": "crates/krishiv-api/src/session.rs::fn::list_tables::pub fn list_tables(&self) -> Result<Vec<String>>",
       "kind": "fn",
       "name": "list_tables",
@@ -3532,7 +3552,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2025",
+      "documentation": "crates/krishiv-api/src/session.rs#L2038",
       "id": "crates/krishiv-api/src/session.rs::fn::memory_stream::pub fn memory_stream(",
       "kind": "fn",
       "name": "memory_stream",
@@ -3582,7 +3602,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1764",
+      "documentation": "crates/krishiv-api/src/session.rs#L1777",
       "id": "crates/krishiv-api/src/session.rs::fn::pipeline::pub fn pipeline(&self, name: impl Into<String>) -> crate::PipelineBuilder",
       "kind": "fn",
       "name": "pipeline",
@@ -3622,7 +3642,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2144",
+      "documentation": "crates/krishiv-api/src/session.rs#L2157",
       "id": "crates/krishiv-api/src/session.rs::fn::read_csv::pub fn read_csv(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame>",
       "kind": "fn",
       "name": "read_csv",
@@ -3632,7 +3652,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2150",
+      "documentation": "crates/krishiv-api/src/session.rs#L2163",
       "id": "crates/krishiv-api/src/session.rs::fn::read_csv_async::pub async fn read_csv_async(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame>",
       "kind": "fn",
       "name": "read_csv_async",
@@ -3642,7 +3662,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2190",
+      "documentation": "crates/krishiv-api/src/session.rs#L2203",
       "id": "crates/krishiv-api/src/session.rs::fn::read_csv_with_options::pub fn read_csv_with_options(",
       "kind": "fn",
       "name": "read_csv_with_options",
@@ -3652,7 +3672,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2153",
+      "documentation": "crates/krishiv-api/src/session.rs#L2166",
       "id": "crates/krishiv-api/src/session.rs::fn::read_csv_with_options_async::pub async fn read_csv_with_options_async(",
       "kind": "fn",
       "name": "read_csv_with_options_async",
@@ -3662,7 +3682,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1911",
+      "documentation": "crates/krishiv-api/src/session.rs#L1924",
       "id": "crates/krishiv-api/src/session.rs::fn::read_delta_async::pub async fn read_delta_async(",
       "kind": "fn",
       "name": "read_delta_async",
@@ -3672,7 +3692,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1924",
+      "documentation": "crates/krishiv-api/src/session.rs#L1937",
       "id": "crates/krishiv-api/src/session.rs::fn::read_hudi_async::pub async fn read_hudi_async(",
       "kind": "fn",
       "name": "read_hudi_async",
@@ -3682,7 +3702,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2173",
+      "documentation": "crates/krishiv-api/src/session.rs#L2186",
       "id": "crates/krishiv-api/src/session.rs::fn::read_json::pub fn read_json(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame>",
       "kind": "fn",
       "name": "read_json",
@@ -3692,7 +3712,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2179",
+      "documentation": "crates/krishiv-api/src/session.rs#L2192",
       "id": "crates/krishiv-api/src/session.rs::fn::read_json_async::pub async fn read_json_async(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame>",
       "kind": "fn",
       "name": "read_json_async",
@@ -3702,7 +3722,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1902",
+      "documentation": "crates/krishiv-api/src/session.rs#L1915",
       "id": "crates/krishiv-api/src/session.rs::fn::read_parquet::pub fn read_parquet(&self, path: impl AsRef<Path>) -> Result<DataFrame>",
       "kind": "fn",
       "name": "read_parquet",
@@ -3712,7 +3732,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2017",
+      "documentation": "crates/krishiv-api/src/session.rs#L2030",
       "id": "crates/krishiv-api/src/session.rs::fn::read_parquet_async::pub async fn read_parquet_async(&self, path: impl AsRef<Path>) -> Result<DataFrame>",
       "kind": "fn",
       "name": "read_parquet_async",
@@ -3722,7 +3742,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2206",
+      "documentation": "crates/krishiv-api/src/session.rs#L2219",
       "id": "crates/krishiv-api/src/session.rs::fn::read_parquet_with_options::pub fn read_parquet_with_options(",
       "kind": "fn",
       "name": "read_parquet_with_options",
@@ -3732,7 +3752,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2241",
+      "documentation": "crates/krishiv-api/src/session.rs#L2233",
+      "id": "crates/krishiv-api/src/session.rs::fn::read_parquet_with_options_async::pub async fn read_parquet_with_options_async(",
+      "kind": "fn",
+      "name": "read_parquet_with_options_async",
+      "replacement": null,
+      "signature": "pub async fn read_parquet_with_options_async(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/session.rs#L2266",
       "id": "crates/krishiv-api/src/session.rs::fn::read_stream::pub fn read_stream(&self) -> crate::streaming_builder::DataStreamReader",
       "kind": "fn",
       "name": "read_stream",
@@ -3812,7 +3842,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2224",
+      "documentation": "crates/krishiv-api/src/session.rs#L2249",
       "id": "crates/krishiv-api/src/session.rs::fn::register_record_batches::pub fn register_record_batches(",
       "kind": "fn",
       "name": "register_record_batches",
@@ -3862,7 +3892,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1771",
+      "documentation": "crates/krishiv-api/src/session.rs#L1784",
       "id": "crates/krishiv-api/src/session.rs::fn::reset_ivm_job::pub fn reset_ivm_job(&self, name: &str) -> bool",
       "kind": "fn",
       "name": "reset_ivm_job",
@@ -3932,7 +3962,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1793",
+      "documentation": "crates/krishiv-api/src/session.rs#L1806",
       "id": "crates/krishiv-api/src/session.rs::fn::sql_with_timeout::pub fn sql_with_timeout(",
       "kind": "fn",
       "name": "sql_with_timeout",
@@ -3942,7 +3972,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1779",
+      "documentation": "crates/krishiv-api/src/session.rs#L1792",
       "id": "crates/krishiv-api/src/session.rs::fn::sql_with_timeout_async::pub async fn sql_with_timeout_async(",
       "kind": "fn",
       "name": "sql_with_timeout_async",
@@ -3978,6 +4008,16 @@
       "name": "stream",
       "replacement": null,
       "signature": "pub fn stream(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/session.rs#L1732",
+      "id": "crates/krishiv-api/src/session.rs::fn::stream_async::pub async fn stream_async(",
+      "kind": "fn",
+      "name": "stream_async",
+      "replacement": null,
+      "signature": "pub async fn stream_async(",
       "stability": "preview"
     },
     {
@@ -4022,7 +4062,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2103",
+      "documentation": "crates/krishiv-api/src/session.rs#L2116",
       "id": "crates/krishiv-api/src/session.rs::fn::table_exists::pub fn table_exists(&self, name: &str) -> Result<bool>",
       "kind": "fn",
       "name": "table_exists",
@@ -4052,7 +4092,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2048",
+      "documentation": "crates/krishiv-api/src/session.rs#L2061",
       "id": "crates/krishiv-api/src/session.rs::fn::unbounded_memory_stream::pub fn unbounded_memory_stream(",
       "kind": "fn",
       "name": "unbounded_memory_stream",
@@ -4062,7 +4102,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L2067",
+      "documentation": "crates/krishiv-api/src/session.rs#L2080",
       "id": "crates/krishiv-api/src/session.rs::fn::unbounded_memory_stream_with_capacity::pub fn unbounded_memory_stream_with_capacity(",
       "kind": "fn",
       "name": "unbounded_memory_stream_with_capacity",
@@ -4242,7 +4282,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1942",
+      "documentation": "crates/krishiv-api/src/session.rs#L1955",
       "id": "crates/krishiv-api/src/session.rs::fn::write_hudi_append_async::pub async fn write_hudi_append_async(",
       "kind": "fn",
       "name": "write_hudi_append_async",
@@ -4252,7 +4292,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/session.rs#L1979",
+      "documentation": "crates/krishiv-api/src/session.rs#L1992",
       "id": "crates/krishiv-api/src/session.rs::fn::write_hudi_upsert_async::pub async fn write_hudi_upsert_async(",
       "kind": "fn",
       "name": "write_hudi_upsert_async",

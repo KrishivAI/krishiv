@@ -1,5 +1,72 @@
 # Krishiv Implementation Status
 
+## 2026-07-01 (follow-up) — Close remaining gaps from the sync-async audit
+
+**Scope**: Same PR (#95) as the audit below. Addressed the gaps that entry
+listed as "documented, not fixed":
+
+- **`krishiv::blocking` now re-exported** from the top-level `krishiv` facade
+  (`pub mod blocking { pub use krishiv_api::blocking::BlockingSession; }`),
+  matching the exact path ADR-0002 prescribes. Previously only reachable via
+  the internal `krishiv-api` crate.
+- **Added the missing async twins**: `DataFrame::describe_async`,
+  `DataFrame::show_async`, `Session::read_parquet_with_options_async`,
+  `Session::stream_async` (distributed job submission) — each with the sync
+  version delegating via `block_on`, matching the existing `collect`/
+  `collect_async` convention. `stream`'s `name` parameter needed `+ Send`
+  (same cascade as the original `block_on` fix). 5 new tests added
+  (`describe_async_matches_describe`, `show_async_matches_show`,
+  `read_parquet_with_options_async_collects_rows`,
+  `stream_async_embedded_push_and_drain`, plus a current-thread-runtime
+  variant of the existing multi-thread `block_on` regression test).
+- **Flight SQL transaction honesty**: transactions now track a
+  `statement_count` per id. `Commit` only warns when more than one statement
+  ran under the id (a single autocommit statement is indistinguishable from
+  a real transaction, so warning there would be noise); `Rollback` only warns
+  when at least one statement ran (previously it warned unconditionally,
+  including when there was nothing to roll back). Added 3 tests exercising
+  `do_action_begin_transaction`/`do_get_statement`/`do_action_end_transaction`
+  directly, including one that executes a real statement under an open
+  transaction and proves the statement-count bookkeeping and that `Rollback`
+  cannot undo it. Documented the no-atomicity behavior in doc comments and
+  `docs/implementation/phase-4-user-apis.md`. Did **not** attempt to build
+  real staged-write/snapshot-isolation semantics — that's a multi-week
+  engine feature, not a scoped fix.
+- **Deterministic Python regression tests** for the exact "fake async blocks
+  the event loop" bug class found twice this session:
+  `test_session_sql_async_yields_to_event_loop` and
+  `test_dataframe_collect_async_yields_to_event_loop` schedule a concurrent
+  `ticker()` task before awaiting the target call and assert it made
+  progress — a coroutine with no real suspension point can't yield control
+  to any other task, so this is deterministic (no timing/sleep assumptions).
+  Verified both tests fail against the pre-fix `__init__.py` (commit
+  6027e7e) and pass against the fix, confirming they're not vacuous.
+
+### Explicitly not attempted (too large for a scoped fix)
+- Real Flight SQL transaction atomicity/isolation (staged writes, snapshot
+  reads, real abort) — would require buffering writes and coordinating with
+  the catalog/execution layer; a genuine multi-week feature.
+- `IcebergCatalogBridge::block_on` / `SqlBodyTableUdf::call` bridging
+  DataFusion's synchronous `CatalogProvider`/`TableUdf` traits — inherent to
+  the upstream trait shape, not fixable without an upstream API change.
+- Extending `scripts/check_api_surface.py`'s Rust-source-only inventory
+  scanner to also discover pure-Python monkey-patched methods
+  (`Session.is_embedded`/`is_single_node`/`is_distributed` remain invisible
+  to it) — a materially different, riskier change to the inventory
+  discovery mechanism itself.
+
+### Validation
+- `cargo fmt --check`, `cargo clippy --workspace --exclude krishiv-python
+  --exclude krishiv-chaos -- -D warnings`: clean.
+- `cargo test` across every workspace crate: 0 failures (~3,600 tests).
+- `maturin develop` + full Python pytest suite: 483 passed, 29 skipped, 0
+  failed (up from 481 — the 2 new deterministic regression tests).
+- `python3 scripts/check_api_surface.py` (validate mode): passes; no new
+  `approved-breaking.toml` entries needed (the new async twins are purely
+  additive; the `stream_async` split didn't change any tracked signature).
+
+---
+
 ## 2026-07-01 — Cross-language (SQL/Rust/Python) sync-async correctness audit
 
 **Scope**: Audited the public API surface across SQL (krishiv-sql,

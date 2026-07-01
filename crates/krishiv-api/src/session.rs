@@ -1717,6 +1717,20 @@ impl Session {
     /// caller does not branch on placement.
     pub fn stream(
         &self,
+        name: impl Into<String> + Send,
+        spec: LocalWindowExecutionSpec,
+    ) -> Result<crate::StreamJob> {
+        block_on(self.stream_async(name, spec))
+    }
+
+    /// Asynchronously submit a continuous windowed streaming job.
+    ///
+    /// Prefer this over [`Self::stream`] from async code: the distributed
+    /// branch performs a real coordinator RPC round-trip via `block_on`,
+    /// which cannot be called from a thread already driving a Tokio runtime
+    /// without hopping to a fresh OS thread.
+    pub async fn stream_async(
+        &self,
         name: impl Into<String>,
         spec: LocalWindowExecutionSpec,
     ) -> Result<crate::StreamJob> {
@@ -1734,10 +1748,9 @@ impl Session {
                 // The conversion is lossless — both are the same windowed-
                 // aggregation spec represented at different layers.
                 let plan_spec = spec.to_plan_spec();
-                let remote = block_on(krishiv_runtime::RemoteStreamingJob::create(
-                    url, &plan_spec, &name,
-                ))
-                .map_err(KrishivError::from)?;
+                let remote = krishiv_runtime::RemoteStreamingJob::create(url, &plan_spec, &name)
+                    .await
+                    .map_err(KrishivError::from)?;
                 Ok(crate::StreamJob::Remote(remote))
             }
             ExecutionMode::Embedded | ExecutionMode::SingleNode => {
@@ -2208,14 +2221,26 @@ impl Session {
         path: impl AsRef<std::path::Path> + Send,
         opts: krishiv_sql::ParquetReaderOptions,
     ) -> Result<DataFrame> {
-        krishiv_common::async_util::block_on(async move {
-            let sql_dataframe = self
-                .sql_engine
-                .read_parquet_with_options(path, &opts)
-                .await
-                .map_err(KrishivError::from)?;
-            Ok(self.dataframe_from_sql(sql_dataframe))
-        })
+        krishiv_common::async_util::block_on(self.read_parquet_with_options_async(path, opts))
+    }
+
+    /// Asynchronously create a DataFrame by reading a local Parquet file with typed options.
+    ///
+    /// Prefer this over [`Self::read_parquet_with_options`] from async code:
+    /// the sync version performs real file/schema I/O via `block_on`, which
+    /// cannot be called from a thread already driving a Tokio runtime
+    /// without hopping to a fresh OS thread.
+    pub async fn read_parquet_with_options_async(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        opts: krishiv_sql::ParquetReaderOptions,
+    ) -> Result<DataFrame> {
+        let sql_dataframe = self
+            .sql_engine
+            .read_parquet_with_options(path, &opts)
+            .await
+            .map_err(KrishivError::from)?;
+        Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
     /// Register in-memory record batches as a named table in this session.

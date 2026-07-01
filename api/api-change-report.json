@@ -1,12 +1,16 @@
 {
   "additive": [
+    "rust-public.json:items/crates/krishiv-api/src/dataframe.rs::fn::describe_async::pub async fn describe_async(&self) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/dataframe.rs::fn::show_async::pub async fn show_async(&self, num_rows: usize) -> Result<String>",
     "rust-public.json:items/crates/krishiv-api/src/io.rs::fn::load::pub fn load(self, path: impl AsRef<Path> + Send) -> Result<DataFrame>",
     "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::batch::pub fn batch(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>",
     "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::execute_local::pub fn execute_local(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>",
     "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::execute_remote::pub fn execute_remote(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::read_parquet_with_options_async::pub async fn read_parquet_with_options_async(",
     "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql::pub fn sql(&self, query: impl AsRef<str> + Send) -> Result<DataFrame>",
     "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql_as::pub fn sql_as(&self, api_key: &str, query: impl AsRef<str> + Send) -> Result<DataFrame>",
     "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql_with_timeout::pub fn sql_with_timeout(",
+    "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::stream_async::pub async fn stream_async(",
     "python-public.json:classes/crates/krishiv-python/src/session.rs::Session/methods/Session.single_node",
     "sql-public.json:items/crates/krishiv-sql/src/pipeline_ddl.rs::fn::view_for_sink::pub fn view_for_sink(&self, name: &str) -> SqlResult<Option<String>>"
   ],
