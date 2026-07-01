@@ -9,13 +9,13 @@ export const gettingStartedPages: DocPage[] = [
     description: 'Krishiv — one engine for batch SQL, streaming pipelines, and incremental view maintenance.',
     status: 'Available',
     body: `
-<div class="note-box"><strong>New here?</strong> Jump to <a href="#sixty-seconds">60 seconds to your first query</a>, or read <a href="/docs/latest/why-krishiv">Why Krishiv</a> first if you are evaluating alternatives.</div>
+<div class="note-box"><strong>New here?</strong> Jump to <a href="#sixty-seconds">60 seconds to your first query</a>, or read <a href="/docs/latest/why-krishiv">Why Krishiv</a> if you are evaluating alternatives.</div>
 
 <h2 id="start-here">Start here — pick your role</h2>
 <table class="api-table">
   <thead><tr><th>I am a…</th><th>Start here</th><th>Then go to</th></tr></thead>
   <tbody>
-    <tr><td><strong>Data Engineer</strong></td><td><a href="#sixty-seconds">60 seconds to first query</a></td><td><a href="/docs/latest/sql">SQL</a> → <a href="/docs/latest/connectors/parquet">Parquet</a> → <a href="/docs/latest/connectors/iceberg">Iceberg</a> → <a href="/docs/latest/recipes/single-node-deploy">Single Node</a></td></tr>
+    <tr><td><strong>Data Engineer</strong></td><td><a href="#sixty-seconds">60 seconds to first query</a></td><td><a href="/docs/latest/sql">SQL</a> → <a href="/docs/latest/connectors/parquet">Parquet</a> → <a href="/docs/latest/connectors/iceberg">Iceberg</a></td></tr>
     <tr><td><strong>Rust Developer</strong></td><td><a href="/docs/latest/rust">Rust API Overview</a></td><td><a href="/docs/latest/rust/session">Session</a> → <a href="/docs/latest/rust/dataframe">DataFrame</a> → <a href="/docs/latest/concepts/execution-model">Runtime</a></td></tr>
     <tr><td><strong>Python User</strong></td><td><a href="#sixty-seconds">Python quickstart</a></td><td><a href="/docs/latest/python/session">Session</a> → <a href="/docs/latest/python/dataframe">DataFrame</a> → <a href="/docs/latest/python/stream">Stream</a></td></tr>
     <tr><td><strong>Platform Engineer</strong></td><td><a href="/docs/latest/concepts/execution-model">Runtime Modes</a></td><td><a href="/docs/latest/operations/scheduler">Scheduler</a> → <a href="/docs/latest/concepts/distributed-mode">Executor</a> → <a href="/docs/latest/operations/deployment">K8s</a></td></tr>
@@ -26,16 +26,6 @@ export const gettingStartedPages: DocPage[] = [
 <h2 id="what-is">What is Krishiv?</h2>
 <p>Krishiv is a Rust-native compute framework that unifies batch SQL, streaming pipelines, and incremental view maintenance under a single execution model. It uses <strong>Apache Arrow RecordBatch</strong> as the internal columnar data model and <strong>DataFusion</strong> for SQL parsing, planning, expressions, and local execution.</p>
 <p>The same session, plan, and scheduler/executor runtime works across embedded (in-process), single-node daemon, and distributed cluster deployments.</p>
-
-<h2 id="when-to-use">When to use Krishiv</h2>
-<p>Krishiv fits when you need more than one of these from the same engine and the same APIs:</p>
-<ul>
-  <li>Batch SQL over Parquet, CSV, Iceberg, Delta, or Hudi.</li>
-  <li>Streaming pipelines with event-time windows, watermarks, and keyed state.</li>
-  <li>Incremental view maintenance that updates as source data changes.</li>
-  <li>A single Rust-native runtime that can run embedded, as a local daemon, or on a cluster.</li>
-</ul>
-<p>Read <a href="/docs/latest/why-krishiv">Why Krishiv</a> for an honest comparison with alternatives.</p>
 
 <h2 id="interfaces">Three interfaces, one engine</h2>
 <table class="api-table">
@@ -48,33 +38,20 @@ export const gettingStartedPages: DocPage[] = [
 </table>
 <p>All three share the same planner, optimizer, and runtime. SQL parses into the same <code>Expr</code> AST that the DataFrame API builds directly.</p>
 
-<h2 id="key-properties">Key Properties</h2>
-<ul>
-  <li><strong>Unified execution:</strong> batch and streaming share Arrow batches, planning, runtime routing, and scheduler/executor boundaries.</li>
-  <li><strong>Rust-native:</strong> Rust 2024 + Tokio; typed IDs, typed plans, typed errors, explicit durability profiles.</li>
-  <li><strong>Three interfaces:</strong> SQL, Rust API (<code>krishiv-api</code>), Python bindings (<code>krishiv</code> via PyO3).</li>
-  <li><strong>Iceberg-first lakehouse:</strong> Apache Iceberg is the primary lakehouse platform (Preview — see <a href="/product/maturity">Maturity</a>).</li>
-  <li><strong>Incremental processing:</strong> <code>DeltaBatch</code> (weighted Arrow rows) and <code>IncrementalFlow</code> for incremental view maintenance (Experimental).</li>
-</ul>
-
 <h2 id="sixty-seconds">60 seconds to your first query</h2>
 <p>Pick your language. All three run in-process with no external services.</p>
 
 <h3 id="py-quick">Python</h3>
-<pre><code class="language-bash">pip install --no-build-isolation krishiv
-# or, from a source checkout:
-maturin develop --manifest-path crates/krishiv-python/Cargo.toml
+<pre><code class="language-bash">pip install krishiv
 </code></pre>
 <pre><code class="language-python">import krishiv as ks
-
 session = ks.Session.embedded()
-df = session.sql("SELECT 42 AS answer")
-df.show()
+session.sql("SELECT 42 AS answer").show()
 </code></pre>
 
 <h3 id="rs-quick">Rust</h3>
 <pre><code class="language-toml">[dependencies]
-krishiv-api = { path = "../crates/krishiv-api" }
+krishiv-api = "0.1"
 tokio = { version = "1", features = ["full"] }
 </code></pre>
 <pre><code class="language-rust">use krishiv_api::Session;
@@ -91,51 +68,19 @@ async fn main() -&gt; krishiv_api::Result&lt;()&gt; {
 <pre><code class="language-bash">cargo run -p krishiv -- sql --query "SELECT 42 AS answer"
 </code></pre>
 
-<p>Output: a single-row table with <code>answer = 42</code>. From here, the <a href="/docs/latest/tutorial">Your first Krishiv pipeline</a> tutorial walks you through reading a file, aggregating, and writing a result.</p>
+<p>Output: a single-row table with <code>answer = 42</code>. Next, read the <a href="/docs/latest/tutorial">Your first Krishiv pipeline</a> tutorial to build a real pipeline.</p>
 
 <h2 id="next">What to read next</h2>
 <table class="api-table">
   <thead><tr><th>If you want to…</th><th>Go to…</th></tr></thead>
   <tbody>
-    <tr><td>Understand the mental model (Session → plan → runtime → coordinator → executor)</td><td><a href="/docs/latest/concepts/how-it-executes">How Krishiv executes a query</a></td></tr>
-    <tr><td>Evaluate against Spark, Flink, DataFusion, DuckDB</td><td><a href="/docs/latest/why-krishiv">Why Krishiv</a></td></tr>
-    <tr><td>Build a real pipeline end-to-end</td><td><a href="/docs/latest/tutorial">Your first Krishiv pipeline</a></td></tr>
-    <tr><td>Look up a specific API</td><td><a href="/docs/latest/python">Python API</a> · <a href="/docs/latest/rust">Rust API</a> · <a href="/docs/latest/sql">SQL</a></td></tr>
-    <tr><td>Solve a specific task ("I want to…")</td><td><a href="/docs/latest/recipes">Recipes</a></td></tr>
-    <tr><td>Check what is production-ready today</td><td><a href="/product/maturity">Feature Maturity</a></td></tr>
-  </tbody>
-</table>
-
-<h2 id="architecture">Architecture at a Glance</h2>
-<pre><code>SQL / Rust API / Python API
-  └─ Session + catalog
-     └─ DataFusion + Krishiv plan + optimizer
-        └─ ExecutionRuntime
-              Embedded          → in-process
-              SingleNode        → local Flight/gRPC daemon
-              Distributed       → remote Flight/gRPC cluster
-           └─ Coordinator
-              └─ ExecutorTaskRunner
-                 └─ Arrow/DataFusion ops, shuffle, state, checkpoints, connectors
-</code></pre>
-<p>For the full breakdown see the <a href="/docs/latest/concepts/architecture">Architecture reference</a>.</p>
-
-<h2 id="crate-map">Workspace Crate Map</h2>
-<table class="api-table">
-  <thead><tr><th>Crate</th><th>Responsibility</th></tr></thead>
-  <tbody>
-    <tr><td><code>krishiv</code></td><td>User-facing facade and CLI binary.</td></tr>
-    <tr><td><code>krishiv-api</code></td><td>Session, DataFrame, Stream, IncrementalFlow, and all public Rust API types.</td></tr>
-    <tr><td><code>krishiv-sql</code></td><td>DataFusion integration, SQL execution, catalog and table-provider abstractions.</td></tr>
-    <tr><td><code>krishiv-plan</code></td><td>Logical/physical plans, expression AST, UDF contracts, governance/policy, CEP.</td></tr>
-    <tr><td><code>krishiv-runtime</code></td><td>Embedded, single-node, and remote runtime routing.</td></tr>
-    <tr><td><code>krishiv-dataflow</code></td><td>Arrow operator runtime, queues, barriers, windows, joins, stateful ops.</td></tr>
-    <tr><td><code>krishiv-scheduler</code></td><td>Coordinator, job/task lifecycle, metadata stores, leadership, gRPC server.</td></tr>
-    <tr><td><code>krishiv-executor</code></td><td>Executor process, task runner, shuffle/checkpoint hooks.</td></tr>
-    <tr><td><code>krishiv-state</code></td><td>In-memory and RocksDB-backed keyed state, TTL, migration, checkpoint/savepoint.</td></tr>
-    <tr><td><code>krishiv-connectors</code></td><td>Source/sink contracts, Parquet/Kafka/S3 paths, Iceberg-first lakehouse helpers.</td></tr>
-    <tr><td><code>krishiv-python</code></td><td>PyO3 Python bindings.</td></tr>
-    <tr><td><code>krishiv-shuffle</code></td><td>In-memory, local disk, object-store, and Flight-oriented shuffle support.</td></tr>
+    <tr><td>Understand the mental model</td><td><a href="/docs/latest/concepts/how-it-executes">How Krishiv executes a query</a></td></tr>
+    <tr><td>Evaluate against alternatives</td><td><a href="/docs/latest/why-krishiv">Why Krishiv</a></td></tr>
+    <tr><td>Build a real pipeline</td><td><a href="/docs/latest/tutorial">Your first Krishiv pipeline</a></td></tr>
+    <tr><td>Look up a specific API</td><td><a href="/docs/latest/python">Python</a> · <a href="/docs/latest/rust">Rust</a> · <a href="/docs/latest/sql">SQL</a></td></tr>
+    <tr><td>Solve a specific task</td><td><a href="/docs/latest/recipes">Recipes</a></td></tr>
+    <tr><td>Check what is production-ready</td><td><a href="/product/maturity">Feature Maturity</a></td></tr>
+    <tr><td>See the full crate map</td><td><a href="/docs/latest/development/workspace-map">Workspace Map</a></td></tr>
   </tbody>
 </table>
 `,
