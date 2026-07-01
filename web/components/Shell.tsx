@@ -65,6 +65,7 @@ export function Footer() {
         <Link href="/release-notes">Release notes</Link>
         <a href={`${githubUrl}/blob/main/LICENSE`}>License</a>
         <a href={githubUrl}>GitHub</a>
+        <a href="/feed.xml" type="application/rss+xml">RSS</a>
       </div>
     </footer>
   );

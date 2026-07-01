@@ -1,8 +1,32 @@
+import type { Metadata } from 'next';
 import Link from 'next/link';
 import type { JSX, ReactNode } from 'react';
 import { BrandLogo, SiteShell } from '@/components/Shell';
 import { CodeTabs } from '@/components/CodeTabs';
 import { githubUrl } from '@/lib/site';
+
+export const metadata: Metadata = {
+  title: {
+    default: 'Krishiv — Rust-native batch, streaming & incremental compute',
+    template: '%s | Krishiv',
+  },
+  description:
+    'Krishiv is a Rust-native compute engine for batch SQL, streaming pipelines, and incremental view maintenance. Apache Arrow data model, DataFusion SQL, embedded to distributed.',
+  openGraph: {
+    title: 'Krishiv — Rust-native batch, streaming & incremental compute',
+    description:
+      'One Rust-native engine for batch SQL, streaming pipelines, and incremental view maintenance. Apache Arrow + DataFusion. Embedded, single-node, or distributed.',
+  },
+  twitter: {
+    card: 'summary_large_image',
+    title: 'Krishiv — Rust-native batch, streaming & incremental compute',
+    description:
+      'One Rust-native engine for batch SQL, streaming pipelines, and incremental view maintenance. Apache Arrow + DataFusion.',
+  },
+  alternates: {
+    canonical: 'https://krishiv.ai',
+  },
+};
 
 type IconName =
   | 'terminal'
@@ -241,6 +265,81 @@ function WhyKrishivSection() {
 
 function GithubMark() { return <svg viewBox="0 0 20 20" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M10 .9a9.1 9.1 0 0 0-2.9 17.7c.46.08.63-.2.63-.44v-1.6c-2.57.56-3.11-1.1-3.11-1.1-.42-1.07-1.03-1.03-1.03-1.03-.84-.58.06-.57.06-.57.93.07 1.42.96 1.42.96.83 1.41 2.18 1 2.71.77.08-.6.32-1 .59-1.23-2.05-.23-4.2-1.02-4.2-4.55 0-1 .36-1.83.95-2.47-.1-.24-.41-1.18.09-2.44 0 0 .78-.25 2.5.94A8.7 8.7 0 0 1 10 5.2c.77 0 1.54.1 2.27.3 1.72-1.19 2.5-.94 2.5-.94.5 1.26.19 2.2.1 2.44.59.64.94 1.46.94 2.47 0 3.54-2.16 4.31-4.21 4.54.33.29.63.85.63 1.72v2.55c0 .25.17.53.64.44A9.1 9.1 0 0 0 10 .9Z"/></svg>; }
 
+const faqItems = [
+  {
+    q: 'What is Krishiv?',
+    a: 'Krishiv is a Rust-native compute engine that unifies batch SQL, streaming pipelines, and incremental view maintenance under one Apache Arrow / DataFusion runtime. It runs as an embedded library, a single-node daemon, or a distributed coordinator-plus-executors cluster.',
+  },
+  {
+    q: 'How does Krishiv compare to Apache Spark?',
+    a: 'Krishiv uses Apache Arrow as its in-memory data model (zero-copy between operators) and DataFusion for SQL planning, rather than Spark\'s JVM-based RDD/DataFrame model. Krishiv runs natively in Rust with Tokio async, offering lower latency and smaller memory footprint. It supports embedded mode (in-process), single-node, and distributed deployment.',
+  },
+  {
+    q: 'How does Krishiv compare to Apache Flink?',
+    a: 'Krishiv unifies batch and streaming in one engine with shared Arrow batches and shared planning, while Flink treats batch as a subset of streaming. Krishiv adds incremental view maintenance (DeltaBatch / IncrementalFlow) which Flink does not natively provide. Both support stateful processing, windowing, and exactly-once semantics.',
+  },
+  {
+    q: 'Is Krishiv production-ready?',
+    a: 'Batch SQL, the Rust/Python APIs, embedded and single-node modes, and Iceberg/Parquet connectors are Available (implemented, tested, stable APIs). Distributed mode, Kafka, and checkpoint storage are Preview. Incremental view maintenance is Experimental. See the Feature Maturity page for details.',
+  },
+  {
+    q: 'What language bindings does Krishiv support?',
+    a: 'Krishiv provides native Rust APIs (Session, DataFrame, Stream, IncrementalFlow) and Python bindings via PyO3 (Session, DataFrame, Stream, DeltaBatch, IncrementalFlow). A CLI binary is also available for interactive SQL queries.',
+  },
+  {
+    q: 'What connectors does Krishiv support?',
+    a: 'Krishiv supports Apache Iceberg (REST, Hive, Glue catalogs), Apache Kafka (source and transactional sink), Parquet files, S3 / ADLS / GCS object storage, and Avro. Vector sinks (Qdrant, pgvector) are experimental. See the Feature Maturity page for current status.',
+  },
+  {
+    q: 'What is incremental view maintenance (IVM)?',
+    a: 'IVM continuously updates materialized views as new data arrives, without recomputing from scratch. Krishiv implements this via DeltaBatch (weighted Arrow rows with +1/-1 weights) and IncrementalFlow, which runs SQL over cumulative snapshots and emits only the delta changes each tick.',
+  },
+  {
+    q: 'How do I install Krishiv?',
+    a: 'Install via Docker (docker pull ghcr.io/krishivai/krishiv:latest), Rust crates (krishiv = "0.1" on crates.io), or Python (pip install krishiv). See the Getting Started guide for detailed instructions.',
+  },
+];
+
+function FaqSection() {
+  const faqJsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'FAQPage',
+    mainEntity: faqItems.map((item) => ({
+      '@type': 'Question',
+      name: item.q,
+      acceptedAnswer: {
+        '@type': 'Answer',
+        text: item.a,
+      },
+    })),
+  };
+
+  return (
+    <section className="developer-section" aria-label="Frequently Asked Questions">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqJsonLd) }}
+      />
+      <div className="developer-copy">
+        <p className="section-eyebrow">FAQ</p>
+        <h2>Frequently Asked Questions</h2>
+      </div>
+      <div style={{ maxWidth: 720, margin: '0 auto' }}>
+        {faqItems.map((item) => (
+          <details key={item.q} style={{ marginBottom: 16 }}>
+            <summary style={{ cursor: 'pointer', fontWeight: 650, fontSize: 16, padding: '12px 0', color: 'var(--text)' }}>
+              {item.q}
+            </summary>
+            <p style={{ color: 'var(--muted-strong)', lineHeight: 1.7, padding: '4px 0 16px' }}>
+              {item.a}
+            </p>
+          </details>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export default function Home() {
   return (
     <SiteShell>
@@ -250,6 +349,7 @@ export default function Home() {
         <DeveloperSection/>
         <WhyKrishivSection/>
         <EcosystemRow/>
+        <FaqSection/>
       </main>
     </SiteShell>
   );

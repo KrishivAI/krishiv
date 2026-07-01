@@ -3,7 +3,16 @@ import { Badge, SiteShell } from '@/components/Shell';
 
 export const metadata: Metadata = {
   title: 'Feature Maturity',
-  description: 'Codebase-verified capability maturity for Krishiv — Stable, Experimental, Preview, and Planned features.',
+  description:
+    'Krishiv feature maturity matrix — codebase-verified status for batch SQL, streaming, Iceberg, Kafka, distributed mode, and incremental view maintenance.',
+  openGraph: {
+    title: 'Krishiv Feature Maturity — What Is Production-Ready',
+    description:
+      'Codebase-verified capability maturity for Krishiv — Available, Experimental, Preview, and Planned features.',
+  },
+  alternates: {
+    canonical: 'https://krishiv.ai/product/maturity',
+  },
 };
 
 type MaturityTier = {
