@@ -424,6 +424,30 @@ CLASS_METHOD_SIGNATURES: dict[tuple[str, str], list[str]] = {
     ("StreamingDataFrame", "session_window"): ["    def session_window(self, gap_ms: int) -> StreamingDataFrame: ..."],
     ("StreamingDataFrame", "with_event_time"): ["    def with_event_time(self, column: str) -> StreamingDataFrame: ..."],
     ("StreamingDataFrame", "with_watermark_lag"): ["    def with_watermark_lag(self, lag_ms: int) -> StreamingDataFrame: ..."],
+    ("DataStreamWriter", "foreach_batch"): ["    def foreach_batch(self, func: object) -> None: ..."],
+    ("DataStreamWriter", "option"): ["    def option(self, key: str, value: str) -> None: ..."],
+    ("DataStreamWriter", "output_mode"): ["    def output_mode(self, mode: Literal[\"append\", \"update\", \"complete\"]) -> None: ..."],
+    ("DataStreamWriter", "query_name"): ["    def query_name(self, name: str) -> None: ..."],
+    ("DataStreamWriter", "start"): ["    def start(self) -> StreamingQuery: ..."],
+    ("DataStreamWriter", "trigger"): [
+        "    def trigger(",
+        "        self,",
+        "        trigger_type: Literal[\"once\", \"available_now\", \"processing_time\", \"continuous\"],",
+        "        interval_ms: int = ...,",
+        "    ) -> None: ...",
+    ],
+    ("Session", "single_node"): [
+        "    @classmethod",
+        "    def single_node(",
+        "        cls,",
+        "        url: str,",
+        "        *,",
+        "        grpc_url: str | None = ...,",
+        "        target_parallelism: int | None = ...,",
+        "        shuffle_partitions: int | None = ...,",
+        "        state_ttl_ms: int | None = ...,",
+        "    ) -> Session: ...",
+    ],
 }
 
 

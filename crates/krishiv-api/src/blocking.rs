@@ -65,7 +65,21 @@ impl BlockingSession {
     }
 
     /// Collect a [`DataFrame`] synchronously using the owned runtime.
+    ///
+    /// Rejects unsafe runtime nesting instead of panicking: calling
+    /// `Runtime::block_on` while the current thread is already driving a
+    /// Tokio runtime panics with "Cannot start a runtime from within a
+    /// runtime". Callers already inside async code should use
+    /// [`DataFrame::collect_async`] directly instead of `BlockingSession`.
     pub fn collect(&self, df: DataFrame) -> Result<QueryResult> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(KrishivError::Runtime {
+                message: "BlockingSession cannot be used from within an active Tokio runtime; \
+                          call DataFrame::collect_async().await instead of BlockingSession::collect \
+                          when already in async code"
+                    .to_string(),
+            });
+        }
         self.rt.block_on(df.collect_async())
     }
 
@@ -105,5 +119,22 @@ mod tests {
         let df = session.session().sql("SELECT 1 AS x, 2 AS y").unwrap();
         let result = session.collect(df).unwrap();
         assert_eq!(result.row_count(), 1);
+    }
+
+    #[test]
+    fn blocking_session_collect_rejects_nested_runtime() {
+        // Calling BlockingSession::collect from a thread already driving a
+        // Tokio runtime must return an error, not panic with "Cannot start a
+        // runtime from within a runtime". Build and tear down `session` and
+        // the probe runtime outside of any active async context (dropping a
+        // `tokio::Runtime` from within an async context is itself a separate
+        // panic) — only the `collect` call happens while nested.
+        let session = BlockingSession::embedded().unwrap();
+        let df = session.session().sql("SELECT 1 AS x").unwrap();
+        let probe_rt = tokio::runtime::Runtime::new().unwrap();
+        let err = probe_rt
+            .block_on(async { session.collect(df) })
+            .unwrap_err();
+        assert!(err.to_string().contains("active Tokio runtime"));
     }
 }

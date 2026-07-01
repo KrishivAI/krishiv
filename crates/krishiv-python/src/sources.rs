@@ -115,6 +115,7 @@ pub fn read_kafka(
 /// is not used for real REST catalog connectivity — it is stored as a source identifier.
 /// The returned stream has no watermark set.
 pub fn read_iceberg(
+    py: Python<'_>,
     session: &PySession,
     catalog_uri: String,
     table_name: String,
@@ -123,19 +124,20 @@ pub fn read_iceberg(
     let _ = schema;
     #[cfg(not(feature = "iceberg"))]
     {
-        let _ = (session, &catalog_uri, &table_name);
+        let _ = (py, session, &catalog_uri, &table_name);
         Err(ConnectorError::new_err(
             "Iceberg support requires the `iceberg` feature (pip install krishiv[iceberg])",
         ))
     }
     #[cfg(feature = "iceberg")]
     {
-        read_iceberg_impl(session, catalog_uri, table_name, schema)
+        read_iceberg_impl(py, session, catalog_uri, table_name, schema)
     }
 }
 
 #[cfg(feature = "iceberg")]
 fn read_iceberg_impl(
+    py: Python<'_>,
     session: &PySession,
     catalog_uri: String,
     table_name: String,
@@ -197,15 +199,15 @@ fn read_iceberg_impl(
     let table = MemoryLakehouseTable::new(table_ref.clone(), schema_version);
     let _opts = IcebergScanOptions::new();
     // Validate catalog reachability via in-memory scan (empty table is OK).
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    rt.block_on(async {
-        table
-            .scan(&_opts)
-            .await
-            .map_err(|e| ConnectorError::new_err(format!("Iceberg catalog error: {e}")))
+    // Reuse the shared crate::RUNTIME instead of building a one-off runtime
+    // per call, and release the GIL for the wait.
+    py.detach(|| {
+        crate::RUNTIME.block_on(async {
+            table
+                .scan(&_opts)
+                .await
+                .map_err(|e| ConnectorError::new_err(format!("Iceberg catalog error: {e}")))
+        })
     })?;
     Ok(PyStream::from_pipeline(
         session.inner.clone(),

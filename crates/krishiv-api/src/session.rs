@@ -1207,7 +1207,7 @@ impl Session {
     }
 
     /// Create a DataFrame from a SQL query.
-    pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+    pub fn sql(&self, query: impl AsRef<str> + Send) -> Result<DataFrame> {
         block_on(self.sql_async(query))
     }
 
@@ -1445,7 +1445,7 @@ impl Session {
     /// Requires [`SessionBuilder::with_auth`]. When [`SessionBuilder::with_policy`]
     /// is configured, every table referenced by the query must pass
     /// [`PolicyHook::check_table_access`].
-    pub fn sql_as(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame> {
+    pub fn sql_as(&self, api_key: &str, query: impl AsRef<str> + Send) -> Result<DataFrame> {
         block_on(self.sql_as_async(api_key, query))
     }
 
@@ -1671,7 +1671,7 @@ impl Session {
     ///
     /// This is an alias for [`sql`](Self::sql) that names the execution mode at
     /// the call site, symmetric with [`ivm`](Self::ivm) and [`stream`](Self::stream).
-    pub fn batch(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+    pub fn batch(&self, query: impl AsRef<str> + Send) -> Result<DataFrame> {
         self.sql(query)
     }
 
@@ -1790,7 +1790,11 @@ impl Session {
     }
 
     /// Synchronous variant of [`sql_with_timeout_async`].
-    pub fn sql_with_timeout(&self, query: impl AsRef<str>, timeout_ms: u64) -> Result<DataFrame> {
+    pub fn sql_with_timeout(
+        &self,
+        query: impl AsRef<str> + Send,
+        timeout_ms: u64,
+    ) -> Result<DataFrame> {
         let query = query.as_ref().to_owned();
         block_on(self.sql_with_timeout_async(query, timeout_ms))
     }
@@ -1798,7 +1802,7 @@ impl Session {
     /// Execute SQL on the local `SqlEngine` only (embedded / single-node path).
     ///
     /// Never routes to a remote Flight endpoint, even in distributed mode.
-    pub fn execute_local(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+    pub fn execute_local(&self, query: impl AsRef<str> + Send) -> Result<DataFrame> {
         block_on(self.execute_local_async(query))
     }
 
@@ -1842,7 +1846,7 @@ impl Session {
     }
 
     /// Execute SQL through the session [`ExecutionRuntime`] (remote when configured).
-    pub fn execute_remote(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+    pub fn execute_remote(&self, query: impl AsRef<str> + Send) -> Result<DataFrame> {
         block_on(self.execute_remote_async(query))
     }
 
@@ -2185,7 +2189,7 @@ impl Session {
     /// Create a DataFrame by reading a local CSV file with typed options.
     pub fn read_csv_with_options(
         &self,
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<std::path::Path> + Send,
         opts: krishiv_sql::CsvReaderOptions,
     ) -> Result<DataFrame> {
         krishiv_common::async_util::block_on(async move {
@@ -2201,7 +2205,7 @@ impl Session {
     /// Create a DataFrame by reading a local Parquet file with typed options.
     pub fn read_parquet_with_options(
         &self,
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<std::path::Path> + Send,
         opts: krishiv_sql::ParquetReaderOptions,
     ) -> Result<DataFrame> {
         krishiv_common::async_util::block_on(async move {

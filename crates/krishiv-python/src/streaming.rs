@@ -128,10 +128,12 @@ impl PyStreamingQuery {
     /// ``timeout_ms`` — optional maximum wait in milliseconds.
     /// Raises ``RuntimeError`` on query failure or timeout.
     #[pyo3(signature = (timeout_ms=None))]
-    fn await_termination(&self, timeout_ms: Option<u64>) -> PyResult<()> {
+    fn await_termination(&self, py: Python<'_>, timeout_ms: Option<u64>) -> PyResult<()> {
         let q = Arc::clone(&self.inner);
-        RUNTIME
-            .block_on(async move {
+        // Release the GIL for the (potentially long, up to timeout_ms) wait
+        // so other Python threads are not frozen.
+        py.detach(move || {
+            RUNTIME.block_on(async move {
                 // Poll the is_active flag until done, respecting timeout.
                 let deadline =
                     timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
@@ -153,7 +155,8 @@ impl PyStreamingQuery {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })
-            .map_err(map_krishiv_error)
+        })
+        .map_err(map_krishiv_error)
     }
 
     /// Return the latest progress snapshot, if any micro-batch has run.

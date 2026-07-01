@@ -30,3 +30,38 @@ replacement = "DataFrameWriter::option(mut self, key, value)"
 id = "rust-public.json:items/crates/krishiv-api/src/streaming_dataframe.rs::struct::StreamingDataFrame::pub struct StreamingDataFrame"
 reason = "StreamingDataFrame gained Clone derive for Python streaming join bindings; inventory id updated."
 replacement = "StreamingDataFrame (#[derive(Clone)] retained)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/io.rs::fn::load::pub fn load(self, path: impl AsRef<Path>) -> Result<DataFrame>"
+reason = "Sync/async audit: krishiv_common::async_util::block_on's current-thread fallback path could still panic with \"Cannot start a runtime from within a runtime\" (Tokio's nesting guard is per-OS-thread, not per-runtime-instance); the fix hops to a fresh OS thread, which requires the driven future to be Send. `load`'s generic `path` parameter needed `+ Send` so its `block_on(self.load_async(path))` call type-checks."
+replacement = "DataFrameReader::load(self, path: impl AsRef<Path> + Send)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::batch::pub fn batch(&self, query: impl AsRef<str>) -> Result<DataFrame>"
+reason = "Sync/async audit: transitively requires Send because it forwards to Session::sql, whose block_on call now requires a Send future (see async_util::block_on fix)."
+replacement = "Session::batch(&self, query: impl AsRef<str> + Send)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::execute_local::pub fn execute_local(&self, query: impl AsRef<str>) -> Result<DataFrame>"
+reason = "Sync/async audit: block_on's current-thread fallback now hops to a fresh OS thread (fixing a real panic hazard), which requires the driven future to be Send; execute_local's query parameter needed `+ Send` accordingly."
+replacement = "Session::execute_local(&self, query: impl AsRef<str> + Send)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::execute_remote::pub fn execute_remote(&self, query: impl AsRef<str>) -> Result<DataFrame>"
+reason = "Sync/async audit: same block_on Send-bound fix as execute_local/sql."
+replacement = "Session::execute_remote(&self, query: impl AsRef<str> + Send)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql::pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame>"
+reason = "Sync/async audit: krishiv_common::async_util::block_on's current-thread fallback path used to call `.block_on` on a separate fallback runtime while the calling thread already had an entered runtime context, which still panics (Tokio's nesting guard is per-OS-thread, not per-runtime-instance). Fixed by hopping to a fresh OS thread via `std::thread::scope`, which requires the driven future (and its output) to be Send; Session::sql's generic query parameter needed `+ Send` for its `block_on(self.sql_async(query))` call to type-check."
+replacement = "Session::sql(&self, query: impl AsRef<str> + Send)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql_as::pub fn sql_as(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame>"
+reason = "Sync/async audit: same block_on Send-bound fix as sql."
+replacement = "Session::sql_as(&self, api_key: &str, query: impl AsRef<str> + Send)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql_with_timeout::pub fn sql_with_timeout(&self, query: impl AsRef<str>, timeout_ms: u64) -> Result<DataFrame>"
+reason = "Sync/async audit: same block_on Send-bound fix as sql."
+replacement = "Session::sql_with_timeout(&self, query: impl AsRef<str> + Send, timeout_ms: u64)"

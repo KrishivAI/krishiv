@@ -1632,7 +1632,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L171",
+      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L185",
       "id": "crates/krishiv-sql/src/lakehouse/providers.rs::fn::apply_as_of_refs::pub async fn apply_as_of_refs(",
       "kind": "fn",
       "name": "apply_as_of_refs",
@@ -1662,7 +1662,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L149",
+      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L163",
       "id": "crates/krishiv-sql/src/lakehouse/providers.rs::fn::register_scan_batches::pub async fn register_scan_batches(",
       "kind": "fn",
       "name": "register_scan_batches",
@@ -2762,7 +2762,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L276",
+      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L287",
       "id": "crates/krishiv-sql/src/pipeline_ddl.rs::fn::execute_pipeline_ddl::pub fn execute_pipeline_ddl(registry: &PipelineRegistry, sql: &str) -> SqlResult<Option<String>>",
       "kind": "fn",
       "name": "execute_pipeline_ddl",
@@ -2782,7 +2782,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L185",
+      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L196",
       "id": "crates/krishiv-sql/src/pipeline_ddl.rs::fn::parse_pipeline_statement::pub fn parse_pipeline_statement(sql: &str) -> SqlResult<Option<PipelineStatement>>",
       "kind": "fn",
       "name": "parse_pipeline_statement",
@@ -2812,7 +2812,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L171",
+      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L182",
       "id": "crates/krishiv-sql/src/pipeline_ddl.rs::fn::remove_sink::pub fn remove_sink(&self, name: &str) -> SqlResult<bool>",
       "kind": "fn",
       "name": "remove_sink",
@@ -2822,7 +2822,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L162",
+      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L173",
       "id": "crates/krishiv-sql/src/pipeline_ddl.rs::fn::remove_source::pub fn remove_source(&self, name: &str) -> SqlResult<bool>",
       "kind": "fn",
       "name": "remove_source",
@@ -2852,7 +2852,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L142",
+      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L153",
       "id": "crates/krishiv-sql/src/pipeline_ddl.rs::fn::sink_names::pub fn sink_names(&self) -> SqlResult<Vec<String>>",
       "kind": "fn",
       "name": "sink_names",
@@ -2872,12 +2872,22 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L153",
+      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L164",
       "id": "crates/krishiv-sql/src/pipeline_ddl.rs::fn::sources::pub fn sources(&self) -> SqlResult<Vec<(String, SourceSpec)>>",
       "kind": "fn",
       "name": "sources",
       "replacement": null,
       "signature": "pub fn sources(&self) -> SqlResult<Vec<(String, SourceSpec)>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/pipeline_ddl.rs#L143",
+      "id": "crates/krishiv-sql/src/pipeline_ddl.rs::fn::view_for_sink::pub fn view_for_sink(&self, name: &str) -> SqlResult<Option<String>>",
+      "kind": "fn",
+      "name": "view_for_sink",
+      "replacement": null,
+      "signature": "pub fn view_for_sink(&self, name: &str) -> SqlResult<Option<String>>",
       "stability": "preview"
     },
     {
