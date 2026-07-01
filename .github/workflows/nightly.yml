@@ -359,6 +359,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
+      - name: Stamp nightly version
+        # Wheels run in parallel with publish-crates, so we need to stamp
+        # the version independently here. Must use the same NIGHTLY_VER
+        # format (YYYYMMDDHHMM) as the publish-crates job.
+        run: |
+          set -e
+          STAMP="$(date +%Y%m%d%H%M)"
+          NIGHTLY_VER="0.1.0-nightly.${STAMP}"
+          echo "Stamping version ${NIGHTLY_VER}"
+          sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" Cargo.toml
+          find crates -name 'Cargo.toml' | while read f; do
+            sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" "$f"
+            sed -i -E "s/(krishiv-[a-z-]+ = \{[^}]*version = )\"0\.1\.0\"/\1\"=${NIGHTLY_VER}\"/g" "$f"
+          done
+          cargo generate-lockfile
+          sed -i "s/^version = \"0\.1\.0\"/version = \"${NIGHTLY_VER}\"/" crates/krishiv-python/pyproject.toml
       - uses: actions/setup-python@v5
         if: runner.os == 'macOS'
         with:
