@@ -1,8 +1,4 @@
-export const navItems = [
-  { label: 'Docs', href: '/docs/latest' },
-  { label: 'Architecture', href: '/architecture' },
-  { label: 'Blog', href: '/blog' },
-];
+export const githubUrl = 'https://github.com/KrishivAI/krishiv';
 
 export const publicFacts = [
   { name: 'Batch SQL', status: 'Available', text: 'DataFusion-backed SQL over Arrow RecordBatches and registered sources.' },
@@ -12,5 +8,3 @@ export const publicFacts = [
   { name: 'Iceberg and catalogs', status: 'Preview', text: 'Iceberg is the primary lakehouse target with REST, Hive, and Glue catalog paths documented; certification work continues.' },
   { name: 'Kafka, Parquet, S3, ADLS', status: 'Preview', text: 'Connector contracts and implementations exist with maturity labels; end-to-end guarantees depend on certified combinations.' },
 ];
-
-export const githubUrl = 'https://github.com/KrishivAI/krishiv';
