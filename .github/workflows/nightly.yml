@@ -395,7 +395,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           command: build
-          args: --release --out dist/ --find-interpreter --version ${{ env.PEP440_VER }}
+          args: --release --out dist/ --find-interpreter
           working-directory: crates/krishiv-python
           before-script-linux: |
             # manylinux_2_28 = AlmaLinux 8; install build deps:
