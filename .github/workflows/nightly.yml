@@ -360,23 +360,18 @@ jobs:
         with:
           ref: main
       - name: Stamp nightly version
-        # Wheels run in parallel with publish-crates, so we need to stamp
-        # independently. For wheels, we use PEP 440 version format
-        # (0.1.0aYYYYMMDDHHMM) because maturin reads Cargo.toml and requires
-        # a valid Python version. The crates job uses semver format.
+        # Wheels run in parallel with publish-crates. We ONLY stamp
+        # pyproject.toml here (not Cargo.toml) because Cargo requires
+        # semver in Cargo.toml while maturin/PyPI requires PEP 440.
+        # The PEP 440 version is passed to maturin via --version flag.
         run: |
           set -e
           STAMP="$(date +%Y%m%d%H%M)"
           PEP440_VER="0.1.0a${STAMP}"
-          echo "Stamping version ${PEP440_VER}"
-          sed -i "s/^version = \"0\.1\.0\"/version = \"${PEP440_VER}\"/" Cargo.toml
-          find crates -name 'Cargo.toml' | while read f; do
-            sed -i "s/^version = \"0\.1\.0\"/version = \"${PEP440_VER}\"/" "$f"
-            sed -i -E "s/(krishiv-[a-z-]+ = \{[^}]*version = )\"0\.1\.0\"/\1\"=${PEP440_VER}\"/g" "$f"
-          done
-          cargo generate-lockfile || true  # may fail if version is PEP 440 (not semver)
-          # Also stamp pyproject.toml with the same PEP 440 version.
+          echo "PEP440 version: ${PEP440_VER}"
           sed -i "s/^version = \"0\.1\.0\"/version = \"${PEP440_VER}\"/" crates/krishiv-python/pyproject.toml
+          # Export for the maturin step
+          echo "PEP440_VER=${PEP440_VER}" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         if: runner.os == 'macOS'
         with:
@@ -400,7 +395,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           command: build
-          args: --release --out dist/ --find-interpreter
+          args: --release --out dist/ --find-interpreter --version ${{ env.PEP440_VER }}
           working-directory: crates/krishiv-python
           before-script-linux: |
             # manylinux_2_28 = AlmaLinux 8; install build deps:
