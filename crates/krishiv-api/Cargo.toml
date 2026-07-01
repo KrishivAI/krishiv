@@ -52,7 +52,6 @@ iceberg-catalog = [
 [dev-dependencies]
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
 krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
-krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.0" }
 tempfile = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }

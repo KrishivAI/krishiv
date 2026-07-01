@@ -42,7 +42,6 @@ kafka = []
 vector-sinks = ["dep:krishiv-connectors"]
 
 [dev-dependencies]
-krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.0" }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 
