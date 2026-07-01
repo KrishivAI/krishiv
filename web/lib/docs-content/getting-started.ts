@@ -11,6 +11,18 @@ export const gettingStartedPages: DocPage[] = [
     body: `
 <div class="note-box"><strong>New here?</strong> Jump to <a href="#sixty-seconds">60 seconds to your first query</a>, or read <a href="/docs/latest/why-krishiv">Why Krishiv</a> first if you are evaluating alternatives.</div>
 
+<h2 id="start-here">Start here — pick your role</h2>
+<table class="api-table">
+  <thead><tr><th>I am a…</th><th>Start here</th><th>Then go to</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Data Engineer</strong></td><td><a href="#sixty-seconds">60 seconds to first query</a></td><td><a href="/docs/latest/sql">SQL</a> → <a href="/docs/latest/connectors/parquet">Parquet</a> → <a href="/docs/latest/connectors/iceberg">Iceberg</a> → <a href="/docs/latest/recipes/single-node-deploy">Single Node</a></td></tr>
+    <tr><td><strong>Rust Developer</strong></td><td><a href="/docs/latest/rust">Rust API Overview</a></td><td><a href="/docs/latest/rust/session">Session</a> → <a href="/docs/latest/rust/dataframe">DataFrame</a> → <a href="/docs/latest/concepts/execution-model">Runtime</a></td></tr>
+    <tr><td><strong>Python User</strong></td><td><a href="#sixty-seconds">Python quickstart</a></td><td><a href="/docs/latest/python/session">Session</a> → <a href="/docs/latest/python/dataframe">DataFrame</a> → <a href="/docs/latest/python/stream">Stream</a></td></tr>
+    <tr><td><strong>Platform Engineer</strong></td><td><a href="/docs/latest/concepts/execution-model">Runtime Modes</a></td><td><a href="/docs/latest/operations/scheduler">Scheduler</a> → <a href="/docs/latest/concepts/distributed-mode">Executor</a> → <a href="/docs/latest/operations/deployment">K8s</a></td></tr>
+    <tr><td><strong>Engine Contributor</strong></td><td><a href="/docs/latest/development/workspace-map">Workspace Map</a></td><td><a href="/docs/latest/development/contributing">Contributing</a> → <a href="/docs/latest/concepts/architecture">Architecture</a></td></tr>
+  </tbody>
+</table>
+
 <h2 id="what-is">What is Krishiv?</h2>
 <p>Krishiv is a Rust-native compute framework that unifies batch SQL, streaming pipelines, and incremental view maintenance under a single execution model. It uses <strong>Apache Arrow RecordBatch</strong> as the internal columnar data model and <strong>DataFusion</strong> for SQL parsing, planning, expressions, and local execution.</p>
 <p>The same session, plan, and scheduler/executor runtime works across embedded (in-process), single-node daemon, and distributed cluster deployments.</p>

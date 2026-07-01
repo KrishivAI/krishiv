@@ -80,11 +80,7 @@ function Hero() {
       <div className="hero-new-inner">
         <div className="hero-new-copy">
           <div className="hero-badge">Rust-native Unified Compute Engine</div>
-          <h1>
-            One compute engine for<br />
-            <em>Batch</em>, <em>Streaming</em>,<br />
-            and <em>AI Pipelines</em>
-          </h1>
+          <h1>One compute engine for batch, streaming, and AI&nbsp;pipelines</h1>
           <p className="hero-lead">
             Krishiv unifies batch SQL, streaming pipelines, and incremental processing
             under one Apache Arrow / DataFusion runtime. Write once in SQL, Rust, or Python.
@@ -100,15 +96,6 @@ function Hero() {
             <a className="btn btn-secondary" href={githubUrl}>
               <GithubIcon /> GitHub
             </a>
-            <Link className="btn btn-ghost" href="/architecture">
-              Architecture
-            </Link>
-          </div>
-          <div className="hero-install">
-            <code>
-              <span className="hero-install-label">Quick install</span>
-              <span className="hero-install-cmd">pip install krishiv</span>
-            </code>
           </div>
         </div>
         <div className="hero-new-viz">
@@ -127,22 +114,22 @@ function GithubIcon() {
 
 function ExecutionGraphViz() {
   const nodes = [
-    { x: 50, y: 20, w: 100, h: 32, label: 'SQL', type: 'input' as const },
-    { x: 170, y: 20, w: 100, h: 32, label: 'Python', type: 'input' as const },
-    { x: 290, y: 20, w: 100, h: 32, label: 'Rust', type: 'input' as const },
-    { x: 130, y: 80, w: 180, h: 36, label: 'Unified Planner', type: 'core' as const },
-    { x: 130, y: 140, w: 180, h: 36, label: 'Arrow + DataFusion', type: 'core' as const },
-    { x: 30, y: 205, w: 80, h: 30, label: 'Batch', type: 'mode' as const },
-    { x: 130, y: 205, w: 80, h: 30, label: 'Streaming', type: 'mode' as const },
-    { x: 230, y: 205, w: 100, h: 30, label: 'Incremental', type: 'mode' as const },
-    { x: 20, y: 265, w: 70, h: 26, label: 'Iceberg', type: 'connector' as const },
-    { x: 100, y: 265, w: 60, h: 26, label: 'Kafka', type: 'connector' as const },
-    { x: 170, y: 265, w: 70, h: 26, label: 'Parquet', type: 'connector' as const },
-    { x: 250, y: 265, w: 50, h: 26, label: 'S3', type: 'connector' as const },
-    { x: 310, y: 265, w: 70, h: 26, label: 'ADLS', type: 'connector' as const },
+    { x: 50, y: 16, w: 100, h: 32, label: 'SQL', type: 'input' as const },
+    { x: 170, y: 16, w: 100, h: 32, label: 'Python', type: 'input' as const },
+    { x: 290, y: 16, w: 100, h: 32, label: 'Rust', type: 'input' as const },
+    { x: 130, y: 72, w: 180, h: 36, label: 'Unified Planner', type: 'core' as const },
+    { x: 130, y: 128, w: 180, h: 36, label: 'Arrow + DataFusion', type: 'core' as const },
+    { x: 30, y: 190, w: 80, h: 30, label: 'Batch', type: 'mode' as const },
+    { x: 130, y: 190, w: 80, h: 30, label: 'Streaming', type: 'mode' as const },
+    { x: 230, y: 190, w: 100, h: 30, label: 'Incremental', type: 'mode' as const },
+    { x: 20, y: 248, w: 70, h: 26, label: 'Iceberg', type: 'connector' as const },
+    { x: 100, y: 248, w: 60, h: 26, label: 'Kafka', type: 'connector' as const },
+    { x: 170, y: 248, w: 70, h: 26, label: 'Parquet', type: 'connector' as const },
+    { x: 250, y: 248, w: 50, h: 26, label: 'S3', type: 'connector' as const },
+    { x: 310, y: 248, w: 70, h: 26, label: 'ADLS', type: 'connector' as const },
   ];
 
-  const edges: Array<[number, number, string?]> = [
+  const edges: Array<[number, number]> = [
     [0, 3], [1, 3], [2, 3],
     [3, 4], [4, 5], [4, 6], [4, 7],
     [5, 8], [5, 9], [5, 10], [6, 8], [6, 9], [6, 11], [7, 8], [7, 9], [7, 10], [7, 11], [7, 12],
@@ -150,29 +137,29 @@ function ExecutionGraphViz() {
 
   const typeColors = {
     input: { fill: '#151515', stroke: '#2A2A2A', text: '#D4D4D4' },
-    core: { fill: 'rgba(245,158,11,.12)', stroke: '#F59E0B', text: '#FFB52A' },
+    core: { fill: 'rgba(245,158,11,.10)', stroke: 'rgba(245,158,11,.45)', text: '#FFB52A' },
     mode: { fill: '#101010', stroke: '#343434', text: '#A3A3A3' },
     connector: { fill: '#0A0A0A', stroke: '#2A2A2A', text: '#A3A3A3' },
   };
 
   return (
     <div className="exec-graph" aria-label="Krishiv execution pipeline visualization">
-      <svg viewBox="0 0 400 310" width="100%" role="img" aria-label="Execution graph showing SQL, Python, and Rust inputs flowing through unified planner and Arrow execution to batch, streaming, and incremental outputs">
+      <svg viewBox="0 0 400 290" width="100%" role="img" aria-label="Execution graph showing SQL, Python, and Rust inputs flowing through unified planner and Arrow execution to batch, streaming, and incremental outputs">
         <defs>
-          <marker id="eg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="#F59E0B" opacity=".6" />
+          <marker id="eg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#F59E0B" opacity=".5" />
           </marker>
         </defs>
         {edges.map(([from, to], i) => {
           const f = nodes[from];
           const t = nodes[to];
-          return <line key={i} x1={f.x + f.w / 2} y1={f.y + f.h} x2={t.x + t.w / 2} y2={t.y} stroke="#F59E0B" strokeWidth=".8" opacity=".3" markerEnd="url(#eg-arrow)" />;
+          return <line key={i} x1={f.x + f.w / 2} y1={f.y + f.h} x2={t.x + t.w / 2} y2={t.y} stroke="#F59E0B" strokeWidth=".7" opacity=".25" markerEnd="url(#eg-arrow)" />;
         })}
         {nodes.map((n, i) => {
           const c = typeColors[n.type];
           return (
             <g key={i}>
-              <rect x={n.x} y={n.y} width={n.w} height={n.h} rx={n.type === 'connector' ? 6 : 8} fill={c.fill} stroke={c.stroke} strokeWidth={n.type === 'core' ? 1.5 : 1} />
+              <rect x={n.x} y={n.y} width={n.w} height={n.h} rx={n.type === 'connector' ? 6 : 8} fill={c.fill} stroke={c.stroke} strokeWidth={n.type === 'core' ? 1.2 : 1} />
               <text x={n.x + n.w / 2} y={n.y + n.h / 2 + 4} textAnchor="middle" fontSize={n.type === 'connector' ? 10 : 12} fontWeight={n.type === 'core' ? 700 : 600} fill={c.text}>{n.label}</text>
             </g>
           );
