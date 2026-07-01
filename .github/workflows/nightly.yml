@@ -374,7 +374,7 @@ jobs:
             sed -i "s/^version = \"0\.1\.0\"/version = \"${PEP440_VER}\"/" "$f"
             sed -i -E "s/(krishiv-[a-z-]+ = \{[^}]*version = )\"0\.1\.0\"/\1\"=${PEP440_VER}\"/g" "$f"
           done
-          cargo generate-lockfile
+          cargo generate-lockfile || true  # may fail if version is PEP 440 (not semver)
           # Also stamp pyproject.toml with the same PEP 440 version.
           sed -i "s/^version = \"0\.1\.0\"/version = \"${PEP440_VER}\"/" crates/krishiv-python/pyproject.toml
       - uses: actions/setup-python@v5
