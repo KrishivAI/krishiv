@@ -1,0 +1,138 @@
+/* ── Docs components CSS ──────────────────────────────────────────────────── */
+
+/* Maturity badge */
+.maturity-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .03em;
+  white-space: nowrap;
+}
+
+/* Callout boxes */
+.docs-box {
+  padding: 16px 20px;
+  border-radius: 12px;
+  margin: 20px 0;
+  font-size: 14px;
+  line-height: 1.65;
+}
+.docs-box strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.docs-box-warn {
+  background: rgba(245,158,11,.08);
+  border: 1px solid rgba(245,158,11,.3);
+  color: #ffd28a;
+}
+.docs-box-note {
+  background: rgba(59,130,246,.08);
+  border: 1px solid rgba(59,130,246,.3);
+  color: #93c5fd;
+}
+.docs-box-info {
+  background: rgba(16,16,16,.6);
+  border: 1px solid var(--border);
+  color: var(--muted-strong);
+}
+
+/* Next steps */
+.docs-next-steps {
+  margin-top: 40px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+}
+.docs-next-steps h3 {
+  margin: 0 0 16px;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--text);
+}
+.docs-next-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+.docs-next-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(16,16,16,.4);
+  transition: border-color .15s;
+}
+.docs-next-card:hover {
+  border-color: rgba(245,158,11,.3);
+}
+.docs-next-card strong {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text);
+}
+.docs-next-card span {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* Related pages */
+.docs-related {
+  margin-top: 24px;
+}
+.docs-related h3 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--muted);
+}
+.docs-related ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.docs-related li a {
+  display: inline-block;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--muted-strong);
+  transition: border-color .15s, color .15s;
+}
+.docs-related li a:hover {
+  border-color: rgba(245,158,11,.3);
+  color: var(--gold-bright);
+}
+
+/* API signature block */
+.api-sig {
+  display: inline-block;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(10,10,10,.6);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: var(--gold-bright);
+  margin: 8px 0 16px;
+}
+
+/* Role cards in introduction */
+.docs-box code {
+  background: rgba(245,158,11,.08);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 12px;
+}

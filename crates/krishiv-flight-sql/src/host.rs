@@ -398,12 +398,16 @@ impl FlightExecutionHost {
                 })
             }
             FlightHostBackend::Coordinator(_) => {
-                tracing::warn!(
-                    name,
+                // M-12 (audit): the prior implementation returned `Ok(())`
+                // and just logged a warning. Clients had no way to know
+                // the registration was a no-op. Surface the limitation
+                // as a proper gRPC error so the caller fails fast and
+                // can fall back to the InProcess backend.
+                Err(Status::unimplemented(
                     "Kafka source registration in co-located mode is not yet implemented; \
-                     the source will not be visible to the coordinator's executors"
-                );
-                Ok(())
+                     use the InProcess backend or call Session::register_kafka_source from \
+                     the coordinator's own admin API",
+                ))
             }
         }
     }

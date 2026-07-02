@@ -46,6 +46,7 @@ pub use catalog::{
 };
 pub use compute::{
     Checkpointable, EmbeddedStreamJob, FeedableJob, IvmJob, Job, JobKind, StepReport, StreamJob,
+    ViewError, ViewErrorKind,
 };
 pub use connector_runtime::{
     ConnectorSinkProvider, ConnectorSourceProvider, DebeziumCdcSourceProvider,

@@ -49,7 +49,13 @@ pub async fn api_continuous_register(
     use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
     let job_id = JobId::try_new(&body.job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
     let stage_id = StageId::try_new("stage-streaming").map_err(|_| StatusCode::BAD_REQUEST)?;
-    let task_id = TaskId::try_new("task-streaming").map_err(|_| StatusCode::BAD_REQUEST)?;
+    // The task_id is unique per job_id so per-task lease fencing, per-task
+    // ack waiters, and apply_barrier_acks cannot collide between concurrent
+    // continuous-streaming jobs. The fragment body already carries the
+    // job_id for routing; this just gives the per-task bookkeeping its own
+    // identity.
+    let task_id = TaskId::try_new(format!("task-streaming-{}", body.job_id))
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Preserve the registered operation in a typed fragment. Each push
     // dispatches one bounded input cycle to a stateful stream:loop executor.

@@ -1,3 +1,4 @@
+import type { Metadata } from 'next';
 import Link from 'next/link';
 import { Badge, Section, SiteShell } from '@/components/Shell';
 import {
@@ -6,6 +7,20 @@ import {
   DataPlaneDiagram,
   LifecycleDiagram,
 } from '@/components/ArchitectureDiagrams';
+
+export const metadata: Metadata = {
+  title: 'Architecture',
+  description:
+    'Krishiv architecture: one Rust-native compute engine running as embedded library, single-node daemon, or distributed cluster with coordinator and executors.',
+  openGraph: {
+    title: 'Krishiv Architecture — One Engine, Three Shapes',
+    description:
+      'How Krishiv runs the same batch SQL, streaming, and incremental processing code in embedded, single-node, and distributed modes.',
+  },
+  alternates: {
+    canonical: 'https://krishiv.ai/architecture',
+  },
+};
 
 export default function Architecture() {
   return (

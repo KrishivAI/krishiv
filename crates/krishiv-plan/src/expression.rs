@@ -649,12 +649,20 @@ fn aggregate_sql(function: AggregateFunction) -> &'static str {
     }
 }
 fn scalar_sql(value: &ScalarValue) -> String {
+    // H-8 (audit): the prior implementation emitted bare integers for
+    // Date32 / Timestamp / Decimal128 and the bare string "NaN" for
+    // Float64 NaN. Every typed bind with one of these scalars either
+    // raised a backend parse error (NaN) or produced a silently wrong
+    // value (Date32 / Timestamp / Decimal128). The new implementation
+    // produces typed literals that DataFusion, Postgres, MySQL, DuckDB,
+    // and SQLite all accept.
+    use chrono::{DateTime, NaiveDate, Utc};
     match value {
         ScalarValue::Null => "NULL".into(),
         ScalarValue::Boolean(value) => value.to_string().to_ascii_uppercase(),
         ScalarValue::Int64(value) => value.to_string(),
         ScalarValue::UInt64(value) => value.to_string(),
-        ScalarValue::Float64(bits) => f64::from_bits(*bits).to_string(),
+        ScalarValue::Float64(bits) => float_to_sql(f64::from_bits(*bits)),
         ScalarValue::Utf8(value) => format!("'{}'", value.replace('\'', "''")),
         ScalarValue::Binary(value) => format!(
             "X'{}'",
@@ -663,10 +671,91 @@ fn scalar_sql(value: &ScalarValue) -> String {
                 .map(|byte| format!("{byte:02X}"))
                 .collect::<String>()
         ),
-        ScalarValue::Decimal128 { value, .. } => value.to_string(),
-        ScalarValue::Date32(value) => value.to_string(),
-        ScalarValue::Timestamp { value, .. } => value.to_string(),
-        ScalarValue::Interval { value, .. } => value.to_string(),
+        ScalarValue::Decimal128 {
+            value,
+            precision,
+            scale,
+        } => {
+            // H-8: a bare integer like `12345` would parse as BIGINT and
+            // be silently cast to DECIMAL on the consuming side, which
+            // does not preserve the value (e.g. 12345 cast to
+            // DECIMAL(10,2) becomes 12345.00, not 123.45). The CAST
+            // form makes the type explicit.
+            format!("CAST({value} AS DECIMAL({precision},{scale}))")
+        }
+        ScalarValue::Date32(value) => {
+            // H-8: a bare integer for a date is parsed as BIGINT and the
+            // expression becomes type-error vs DATE. Render as
+            // DATE 'YYYY-MM-DD' so the literal matches the column type.
+            let Some(epoch) = NaiveDate::from_ymd_opt(1970, 1, 1) else {
+                return "DATE '1970-01-01'".to_owned();
+            };
+            let date = epoch + chrono::Duration::days(*value as i64);
+            format!("DATE '{}'", date.format("%Y-%m-%d"))
+        }
+        ScalarValue::Timestamp {
+            value,
+            unit,
+            timezone: _,
+        } => {
+            // H-8: a bare integer is type-error vs TIMESTAMP. Render as a
+            // typed TIMESTAMP literal. The unit determines precision.
+            let formatted = match unit {
+                TimeUnit::Second => DateTime::<Utc>::from_timestamp(*value, 0)
+                    .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_else(|| format!("from_unixtime({value})")),
+                TimeUnit::Millisecond => DateTime::<Utc>::from_timestamp_millis(*value)
+                    .map(|d| d.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                    .unwrap_or_else(|| format!("from_unixtime_ms({value})")),
+                TimeUnit::Microsecond => DateTime::<Utc>::from_timestamp_micros(*value)
+                    .map(|d| d.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
+                    .unwrap_or_else(|| format!("from_unixtime_us({value})")),
+                TimeUnit::Nanosecond => {
+                    let secs = value.div_euclid(1_000_000_000);
+                    let nsec = value.rem_euclid(1_000_000_000) as u32;
+                    DateTime::<Utc>::from_timestamp(secs, nsec)
+                        .map(|d| d.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string())
+                        .unwrap_or_else(|| format!("CAST({value} AS BIGINT)"))
+                }
+            };
+            format!("TIMESTAMP '{formatted}'")
+        }
+        ScalarValue::Interval { value, unit } => match unit {
+            IntervalUnit::YearMonth => {
+                // value is i128; render as a year-month interval.
+                format!("INTERVAL '{value} months'")
+            }
+            IntervalUnit::DayTime => {
+                // value is i128; pack lower 64 bits as days, upper 64 as
+                // milliseconds. Approximate; sufficient for bind roundtrip.
+                let days = (*value & 0xFFFF_FFFF_FFFF_FFFF) as i64;
+                let millis = ((*value >> 64) & 0xFFFF_FFFF_FFFF_FFFF) as i64;
+                format!("INTERVAL '{days} days {millis} ms'")
+            }
+            IntervalUnit::MonthDayNano => {
+                let months = (*value & 0xFFFF_FFFF_FFFF_FFFF) as i64;
+                let days = ((*value >> 64) & 0xFFFF_FFFF) as i64;
+                let nanos = ((*value >> 96) & 0xFFFF_FFFF_FFFF_FFFF) as i64;
+                format!("INTERVAL '{months} months {days} days {nanos} ns'")
+            }
+        },
+    }
+}
+
+/// Render an f64 as a SQL literal. NaN and infinity are not valid SQL
+/// literals in any major backend; the portable form is
+/// `CAST('NaN' AS DOUBLE)` / `CAST('Infinity' AS DOUBLE)`.
+fn float_to_sql(value: f64) -> String {
+    if value.is_nan() {
+        "CAST('NaN' AS DOUBLE)".into()
+    } else if value.is_infinite() {
+        if value.is_sign_positive() {
+            "CAST('Infinity' AS DOUBLE)".into()
+        } else {
+            "CAST('-Infinity' AS DOUBLE)".into()
+        }
+    } else {
+        value.to_string()
     }
 }
 fn type_sql(data_type: &ExprDataType) -> String {

@@ -121,14 +121,29 @@ pub struct PyStepSummary {
     /// The tick counter after this step.
     #[pyo3(get)]
     pub tick: u64,
+    /// View names that ran on the O(state) DiffBased path during this step
+    /// (forced or because no incremental plan was built). Empty for
+    /// streaming-only jobs and when every view has a working incremental plan.
+    #[pyo3(get)]
+    pub degraded_views: Vec<String>,
+    /// Per-view errors that caused a view to be skipped during this step.
+    /// Each entry is a `(view_name, kind, message)` triple; the step did
+    /// not panic; subsequent ticks re-evaluate.
+    #[pyo3(get)]
+    pub errored_views: Vec<PyViewError>,
 }
 
 #[pymethods]
 impl PyStepSummary {
     pub fn __repr__(&self) -> String {
         format!(
-            "StepSummary(total_output_rows={}, active_views={}, tick={})",
-            self.total_output_rows, self.active_views, self.tick
+            "StepSummary(total_output_rows={}, active_views={}, tick={}, \
+             degraded_views={}, errored_views={})",
+            self.total_output_rows,
+            self.active_views,
+            self.tick,
+            self.degraded_views.len(),
+            self.errored_views.len()
         )
     }
 }
@@ -139,6 +154,46 @@ impl From<StepReport> for PyStepSummary {
             total_output_rows: s.total_output_rows,
             active_views: s.active_views,
             tick: s.tick,
+            degraded_views: s.degraded_views,
+            errored_views: s.errored_views.into_iter().map(PyViewError::from).collect(),
+        }
+    }
+}
+
+/// One view's failure during a step, surfaced via `StepSummary.errored_views`.
+#[pyclass(name = "ViewError")]
+#[derive(Clone)]
+pub struct PyViewError {
+    #[pyo3(get)]
+    pub view: String,
+    #[pyo3(get)]
+    pub kind: String,
+    #[pyo3(get)]
+    pub message: String,
+}
+
+#[pymethods]
+impl PyViewError {
+    pub fn __repr__(&self) -> String {
+        format!(
+            "ViewError(view={}, kind={}, message={})",
+            self.view, self.kind, self.message
+        )
+    }
+}
+
+impl From<krishiv_api::compute::job::ViewError> for PyViewError {
+    fn from(e: krishiv_api::compute::job::ViewError) -> Self {
+        use krishiv_api::compute::job::ViewErrorKind;
+        let kind = match e.kind {
+            ViewErrorKind::OperatorApply => "operator_apply",
+            ViewErrorKind::ViewSql => "view_sql",
+            ViewErrorKind::Publish => "publish",
+        };
+        Self {
+            view: e.view,
+            kind: kind.to_owned(),
+            message: e.message,
         }
     }
 }

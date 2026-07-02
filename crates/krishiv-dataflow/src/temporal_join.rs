@@ -3,7 +3,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use indexmap::IndexMap;
@@ -271,16 +276,79 @@ fn format_column_value(array: &dyn Array, row: usize) -> String {
     // control character that cannot appear in normal string data:
     //   \x00  = SQL NULL
     //   I<n>  = Int64 n
+    //   T<n>  = Int32 n
+    //   H<n>  = Int16 n
+    //   B<n>  = Int8 n
+    //   U<n>  = UInt64 n
+    //   u<n>  = UInt32 n
+    //   v<n>  = UInt16 n
+    //   w<n>  = UInt8 n
+    //   F<bits>  = Float64 (bit pattern, preserves NaN identity)
+    //   f<bits>  = Float32 (bit pattern)
+    //   Y<0|1>   = Boolean
+    //   D<days>  = Date32 (days since epoch)
+    //   d<ms>    = Date64 (ms since epoch)
+    //   M<ms>    = Timestamp(Millisecond)
+    //   m<us>    = Timestamp(Microsecond)
+    //   s<ns>    = Timestamp(Nanosecond)
     //   S<s>  = Utf8 string s
     //   ?     = unsupported type (cannot match any real value)
+    //
+    // H-2 (audit): the previous implementation only supported Int64 and
+    // Utf8; Float64 / Int32 / Boolean / Date32 / Timestamp / etc. all
+    // collapsed into the same "?" bucket, producing false matches
+    // across distinct types. Floats use their IEEE-754 bit pattern for
+    // injectivity (so two NaN values produce identical keys).
     if array.is_null(row) {
         return "\x00".to_owned();
     }
-    if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
-        return format!("I{}", arr.value(row));
+    macro_rules! int_key {
+        ($tag:literal, $arr_ty:ty) => {{
+            if let Some(arr) = array.as_any().downcast_ref::<$arr_ty>() {
+                return format!("{}{}", $tag, arr.value(row));
+            }
+        }};
+    }
+    int_key!("I", Int64Array);
+    int_key!("T", Int32Array);
+    int_key!("H", Int16Array);
+    int_key!("B", Int8Array);
+    int_key!("U", UInt64Array);
+    int_key!("u", UInt32Array);
+    int_key!("v", UInt16Array);
+    int_key!("w", UInt8Array);
+    if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+        return format!("F{:016x}", arr.value(row).to_bits());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
+        return format!("f{:08x}", arr.value(row).to_bits());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+        return format!("Y{}", if arr.value(row) { 1 } else { 0 });
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Date32Array>() {
+        return format!("D{}", arr.value(row));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Date64Array>() {
+        return format!("d{}", arr.value(row));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return format!("M{}", arr.value(row));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return format!("m{}", arr.value(row));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return format!("s{}", arr.value(row));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<TimestampSecondArray>() {
+        return format!("S{}", arr.value(row));
     }
     if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
         return format!("S{}", arr.value(row));
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return format!("L{}", arr.value(row));
     }
     "?".to_owned()
 }

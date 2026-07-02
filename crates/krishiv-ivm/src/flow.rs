@@ -259,6 +259,13 @@ impl IncrementalFlow {
         Ok(())
     }
 
+    /// Returns `true` when [`force_diff_based`] has been set; otherwise `false`.
+    /// Useful for tests and operator tooling to assert the flag took effect.
+    pub fn is_force_diff_based(&self) -> IvmResult<bool> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner.force_diff_based)
+    }
+
     /// Register or re-register an incremental view.
     ///
     /// **Idempotent**: re-registering a view with an identical spec (same SQL,

@@ -16,7 +16,7 @@ pub enum JobKind {
 }
 
 /// Result of advancing a feedable job by one tick.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StepReport {
     /// Views (or operators) that produced non-empty output this tick.
     pub active_views: usize,
@@ -24,6 +24,35 @@ pub struct StepReport {
     pub total_output_rows: usize,
     /// The tick counter after this step.
     pub tick: u64,
+    /// View names that ran on the O(state) DiffBased path during this step
+    /// (either forced by `force_diff_based` or because no incremental plan was
+    /// built — e.g. unsupported join types). Useful for operators to surface
+    /// the join-type degradations called out in the IVM plan code.
+    pub degraded_views: Vec<String>,
+    /// Per-view errors that caused a view to be skipped during this step.
+    /// Step did not panic; subsequent ticks re-evaluate. Each entry is a
+    /// `(view_name, kind, message)` triple.
+    pub errored_views: Vec<ViewError>,
+}
+
+/// One view's failure during a `step`. Carried in [`StepReport::errored_views`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewError {
+    pub view: String,
+    pub kind: ViewErrorKind,
+    pub message: String,
+}
+
+/// Category of failure for a view during a `step`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewErrorKind {
+    /// The incremental operator (`apply`) returned an error (trace capacity,
+    /// schema mismatch, type coercion, etc.).
+    OperatorApply,
+    /// The view's SQL body failed to execute (column not found, type mismatch).
+    ViewSql,
+    /// The view's published output failed (downstream backpressure, etc.).
+    Publish,
 }
 
 /// Identity common to every long-lived job. Batch is not a `Job` (it is

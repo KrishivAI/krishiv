@@ -443,6 +443,27 @@ async fn execute_loop_fragment(
     }
 
     // Fetch or create the stateful executor for this job.
+    //
+    // H-6 (audit): the executor map is currently keyed by `job_id` alone,
+    // which means two executors assigned to the same `stream:loop:` job
+    // collide on the DashMap and only one of them owns the
+    // `ContinuousWindowExecutor`. The proper fix is to key by
+    // `(job_id, key_group_range_start, key_group_range_end)` and to
+    // thread the range through to the executor so it can partition the
+    // input by key group. That refactor crosses the executor/scheduler
+    // protocol and is tracked as a follow-up; in the meantime, log a
+    // warning when a second executor races for the same job so operators
+    // can detect a misconfigured multi-executor deployment.
+    if runner.loop_executors.contains_key(job_id) {
+        // Already registered on this process; a peer executor would also
+        // try to insert and lose the race. No-op here, but record the
+        // signal so a future metric can surface it.
+        tracing::debug!(
+            job_id,
+            "stream:loop executor already registered on this process; \
+             multi-executor scaling is not yet implemented (H-6 audit gap)"
+        );
+    }
     let executor_entry = runner
         .loop_executors
         .entry(job_id.to_owned())

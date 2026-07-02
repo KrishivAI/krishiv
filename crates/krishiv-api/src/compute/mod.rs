@@ -13,9 +13,9 @@
 //! Batch is deliberately *not* a `Job` — it is one-shot and returns a `DataFrame`.
 
 mod ivm;
-mod job;
+pub mod job;
 mod stream;
 
 pub use ivm::IvmJob;
-pub use job::{Checkpointable, FeedableJob, Job, JobKind, StepReport};
+pub use job::{Checkpointable, FeedableJob, Job, JobKind, StepReport, ViewError, ViewErrorKind};
 pub use stream::{EmbeddedStreamJob, StreamJob};

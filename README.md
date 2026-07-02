@@ -2,102 +2,67 @@
   <img src="docs/assets/krishiv-banner.svg" alt="Krishiv — Rust-native batch SQL, streaming, and lakehouse compute" width="100%">
 </p>
 
-Krishiv is a Rust-native hybrid compute framework that unifies **batch SQL**,
-**streaming pipelines**, and **incremental view maintenance (IVM)** under a
-single Apache Arrow / DataFusion engine.
+<p align="center">
+  <a href="https://crates.io/crates/krishiv"><img src="https://img.shields.io/crates/v/krishiv.svg" alt="crates.io"></a>
+  <a href="https://pypi.org/project/krishiv/"><img src="https://img.shields.io/pypi/v/krishiv.svg" alt="PyPI"></a>
+  <a href="https://github.com/KrishivAI/krishiv/pkgs/container/krishiv"><img src="https://img.shields.io/badge/docker-ghcr.io-blue" alt="Docker"></a>
+  <a href="https://github.com/KrishivAI/krishiv/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License"></a>
+</p>
 
-The same plan runs in three shapes — **embedded** in your process, as a
-**single-node** daemon, or as a **coordinator-plus-executors** cluster. The
-same code reads Parquet, subscribes to Kafka, and writes Iceberg. The same
-SQL powers batch reports, real-time aggregations, and incrementally maintained
-views.
-
-## Compute Modes
-
-| | **Batch SQL** | **Streaming** | **DeltaBatch (IVM)** |
-|---|---|---|---|
-| Input | Snapshot `RecordBatch` | Continuous events | Cumulative + per-tick delta |
-| Output | Full result set | Windowed results | True incremental delta |
-| State | Stateless | Window / watermark | Materialized snapshots |
-| SQL | `SELECT … FROM source` | `SELECT … OVER window` | `CREATE INCREMENTAL VIEW` |
-| Latency | Query-latency | Sub-second | Tick-latency |
-| Use case | Reports, ETL, ad hoc | Real-time aggregations | Live dashboards, derived state |
+**Krishiv** is a Rust-native hybrid compute engine that unifies **batch SQL**, **streaming pipelines**, and **incremental view maintenance** under one Apache Arrow / DataFusion runtime. The same engine runs embedded in your process, as a single-node daemon, or as a distributed cluster.
 
 ---
 
-## Features
+## Install
 
-### Core Engine
-- Apache Arrow in-process columnar memory — zero-copy between operators
-- DataFusion SQL engine with full `SELECT`, `JOIN`, `GROUP BY`, window functions
-- Topological multi-view execution with inter-view MemTable registration
-- Pluggable connector SDK (source + sink) with capability and maturity metadata
+### Docker (recommended for getting started)
 
-### Batch SQL (`krishiv-api` / `krishiv-sql`)
-- `Session::sql(query)` — one-shot DataFusion query over any registered source
-- Schema coercion: projects / casts result columns to declared output schema by name
-- `cargo run -p krishiv -- sql --query "..."` CLI for interactive use
+```bash
+docker pull ghcr.io/krishivai/krishiv:latest
+docker run --rm -it ghcr.io/krishivai/krishiv:latest sql --query "SELECT 42 AS answer"
+```
 
-### Streaming (`krishiv-dataflow` / `krishiv-connectors`)
-- Event-driven pipelines with window semantics (tumbling, sliding, session)
-- Watermark-based late-data handling
-- `LatenessSpec` per-column lateness tolerance
-- Iceberg-first lakehouse sink (Parquet + manifest); Delta Lake and Hudi experimental
+Or run a single-node daemon with Flight SQL on `:50051`:
 
-### DeltaBatch / Incremental View Maintenance (`krishiv-delta` / `krishiv-api`)
-- **`DeltaBatch`** — Arrow `RecordBatch` + `_weight: Int64` column (DBSP Z-set)
-  - `DeltaBatch::from_inserts(rb)` — all rows get weight `+1`
-  - `DeltaBatch::from_deletes(rb)` — all rows get weight `−1`
-  - `DeltaBatch::from_update(before, after)` — retraction + insertion pair
-  - `DeltaBatch::from_weighted(rb)` — explicit weight column already present
-- **`differentiate(schema, prev, next)`** — diff two snapshots to a `DeltaBatch`
-- **`apply_delta(current, delta)`** — apply delta to snapshot; returns new snapshot
-- **`IntegrateOp`** — stateful accumulator: repeated `apply_delta` across ticks
-- **`IncrementalFlow`** — multi-view IVM session:
-  - `feed_source(name, delta)` — enqueue per-tick source delta (coalesced)
-  - `step_datafusion()` — run one tick: cumulative snapshots → SQL → diff → publish
-  - `register_view(name, sql, schema)` — add/replace a view (behavior-version invalidation)
-  - `watch_view(name)` — `watch::Receiver<Option<DeltaBatch>>` for live output
-  - `snapshot(name)` — current materialized state of any view
-  - `checkpoint() / restore(&[u8])` — Arrow IPC binary checkpoint with length-prefix framing
-  - `drop_view(name)` — remove a view at runtime
-  - `source_snapshot(name)` — inspect the current cumulative source state
-- **Topological sort** (Kahn's algorithm) — views referencing other views execute after
-- **Behavior-version invalidation** — `register_view` on existing name resets the diff baseline
-- **Coalescing pending** — multiple `feed_source` calls per source per tick are merged
+```bash
+docker run -d --name krishiv -p 50051:50051 ghcr.io/krishivai/krishiv:latest local start
+```
 
-### Lakehouse
-- Iceberg catalog integration (REST, Hive, Glue)
-- Parquet read/write with column pruning and predicate pushdown
-- Snapshot isolation; time-travel queries
+### Rust (crates.io)
 
-### Deployment
-- **Embedded** — library in any Rust or Python process
-- **Single-node daemon** — `krishiv-operator` binary with Flight SQL endpoint
-- **Distributed** — `krishiv-scheduler` coordinator + `krishiv-executor` workers
-- **Kubernetes** — CRD-driven deployment via `krishiv-operator`
+```toml
+[dependencies]
+krishiv = "0.1"
+```
 
-### Python Bindings (`krishiv-python`)
-- `PyDeltaBatch`, `PyIncrementalFlow` — thin PyO3 wrappers over the Rust API
-- `IncrementalFlow.feed_source(name, pyarrow.RecordBatch)`
-- `IncrementalFlow.step()` — synchronous tick
-- `IncrementalFlow.watch_view(name)` — returns latest `DeltaBatch` from the watch channel
+For library use, add the specific crates you need:
+
+```toml
+[dependencies]
+krishiv-api     = "0.1"   # Session, DataFrame, IncrementalFlow
+krishiv-delta   = "0.1"   # DeltaBatch, IVM operators
+krishiv-connectors = { version = "0.1", features = ["iceberg"] }
+```
+
+### Python (PyPI)
+
+```bash
+pip install krishiv
+```
+
+With optional extras:
+
+```bash
+pip install "krishiv[arrow]"       # PyArrow + Pandas
+pip install "krishiv[iceberg]"     # Iceberg lakehouse support
+pip install "krishiv[all]"         # everything
+```
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-
-```bash
-# Rust 1.80+ required
-rustup update stable
-cargo check --workspace
-```
-
----
-
-### Mode 1 — Batch SQL
+### Batch SQL
 
 **Rust**
 
@@ -107,30 +72,14 @@ use krishiv_api::Session;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let session = Session::new();
-
-    // Register an Arrow RecordBatch as a table
     session.register_record_batch("orders", orders_batch)?;
 
-    // Run SQL — returns RecordBatch
-    let result = session.sql("SELECT status, COUNT(*) AS n FROM orders GROUP BY status").await?;
-
-    // Pretty-print via DataFusion
-    println!("{:?}", result);
+    let result = session
+        .sql("SELECT status, COUNT(*) AS n FROM orders GROUP BY status")
+        .await?;
+    println!("{result:?}");
     Ok(())
 }
-```
-
-**CLI**
-
-```bash
-# One-shot query
-cargo run -p krishiv -- sql --query "SELECT 1 AS value"
-
-# Explain plan
-cargo run -p krishiv -- explain --query "SELECT 1 AS value"
-
-# List registered jobs
-cargo run -p krishiv -- jobs
 ```
 
 **Python**
@@ -140,202 +89,77 @@ import pyarrow as pa
 import krishiv
 
 session = krishiv.Session()
-session.register_table("orders", orders_table)          # pa.Table
+session.register_table("orders", pa.table({"status": ["a", "b", "a"], "amount": [10.0, 25.0, 5.0]}))
+
 result = session.sql("SELECT status, COUNT(*) AS n FROM orders GROUP BY status")
 print(result.to_pandas())
 ```
 
----
+**CLI**
 
-### Mode 2 — Streaming
-
-**Rust**
-
-```rust
-use krishiv_api::{StreamSession, WindowSpec};
-use std::time::Duration;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut stream = StreamSession::new();
-
-    // Tumbling 1-minute window on event_time
-    stream.register_window(
-        "orders_1m",
-        "orders",
-        WindowSpec::tumbling("event_time", Duration::from_secs(60)),
-    );
-
-    // Aggregate within each window
-    stream.register_view(
-        "order_totals",
-        "SELECT window_start, SUM(amount) AS total FROM orders_1m GROUP BY window_start",
-    );
-
-    // Receive windowed output batches
-    let mut rx = stream.watch("order_totals");
-    while let Ok(batch) = rx.recv().await {
-        println!("window batch: {} rows", batch.num_rows());
-    }
-    Ok(())
-}
+```bash
+krishiv sql --query "SELECT 1 AS value"
+krishiv explain --query "SELECT 1 AS value"
 ```
 
----
+### Streaming
 
-### Mode 3 — DeltaBatch / Incremental View Maintenance
+```python
+import krishiv
 
-**Rust — single view**
+stream = krishiv.StreamSession()
+stream.register_window("orders_1m", "orders", tumbling="60s")
+stream.register_view("totals", "SELECT window_start, SUM(amount) AS total FROM orders_1m GROUP BY window_start")
 
-```rust
-use krishiv_api::IncrementalFlow;
-use krishiv_delta::DeltaBatch;
-use arrow::datatypes::{DataType, Field, Schema};
-use std::sync::Arc;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut flow = IncrementalFlow::new();
-
-    // Declare a view — SQL runs over the cumulative source snapshot
-    let out_schema = Arc::new(Schema::new(vec![
-        Field::new("status", DataType::Utf8, false),
-        Field::new("n", DataType::Int64, false),
-    ]));
-    flow.register_view(
-        "order_counts",
-        "SELECT status, COUNT(*) AS n FROM orders GROUP BY status",
-        out_schema,
-    ).await?;
-
-    // Tick 1 — three new orders arrive
-    let inserts = make_orders_batch(&[("pending", 10.0), ("shipped", 25.0), ("pending", 5.0)]);
-    flow.feed_source("orders", DeltaBatch::from_inserts(inserts)?).await?;
-    let active = flow.step_datafusion().await?;
-    println!("tick 1: {} views emitted output", active);
-
-    // Tick 2 — one order status changes (retract old, insert new)
-    let before = make_orders_batch(&[("pending", 10.0)]);
-    let after  = make_orders_batch(&[("shipped", 10.0)]);
-    flow.feed_source("orders", DeltaBatch::from_update(before, after)?).await?;
-    let active = flow.step_datafusion().await?;
-    println!("tick 2: {} views emitted output", active);
-
-    // Subscribe to live deltas
-    let mut rx = flow.watch_view("order_counts")?;
-    // rx.changed().await — use in async context
-    Ok(())
-}
+for batch in stream.start():
+    print(f"window: {batch.num_rows()} rows")
 ```
 
-**Rust — view referencing another view**
-
-```rust
-// Views execute in topological order automatically.
-// "summary" can reference "order_counts" — Krishiv detects the dependency.
-
-flow.register_view(
-    "order_counts",
-    "SELECT status, COUNT(*) AS n FROM orders GROUP BY status",
-    counts_schema,
-).await?;
-
-flow.register_view(
-    "summary",
-    "SELECT SUM(n) AS total_orders FROM order_counts",
-    summary_schema,
-).await?;
-
-// Both views update correctly on each tick.
-flow.feed_source("orders", delta).await?;
-flow.step_datafusion().await?;
-```
-
-**Rust — checkpoint and restore**
-
-```rust
-// Serialize the full cumulative state to bytes
-let checkpoint: Vec<u8> = flow.checkpoint().await?;
-
-// Restore into a fresh flow (e.g. after process restart)
-let mut restored = IncrementalFlow::new();
-// re-register views first …
-restored.register_view("order_counts", sql, schema).await?;
-restored.restore(&checkpoint).await?;
-
-// Next tick continues from the saved state
-restored.feed_source("orders", new_delta).await?;
-restored.step_datafusion().await?;
-```
-
-**Python — DeltaBatch IVM**
+### Incremental View Maintenance (IVM)
 
 ```python
 import pyarrow as pa
 import krishiv
 
 flow = krishiv.IncrementalFlow()
-
-# Register a view
 flow.register_view(
     "order_counts",
     "SELECT status, COUNT(*) AS n FROM orders GROUP BY status",
     pa.schema([pa.field("status", pa.utf8()), pa.field("n", pa.int64())]),
 )
 
-# Tick 1
-orders = pa.record_batch(
-    {"status": ["pending", "shipped", "pending"], "amount": [10.0, 25.0, 5.0]},
-    schema=pa.schema([pa.field("status", pa.utf8()), pa.field("amount", pa.float64())]),
-)
-flow.feed_source("orders", krishiv.DeltaBatch.from_inserts(orders))
+# Tick 1 — new data arrives
+flow.feed_source("orders", krishiv.DeltaBatch.from_inserts(orders_batch))
 flow.step()
 
-# Receive the delta for this tick
+# Get the incremental delta
 delta = flow.watch_view("order_counts")
-if delta is not None:
-    print("insertions:", delta.filter_positive().to_pydict())
-    print("retractions:", delta.filter_negative().to_pydict())
+print(delta.filter_positive().to_pandas())   # new rows
+print(delta.filter_negative().to_pandas())   # retracted rows
 ```
 
 ---
 
-## Deployment
+## Deployment Modes
 
-### Embedded library
+| Mode | When to use | Start |
+|---|---|---|
+| **Docker** | Quick eval, CI, sandbox | `docker run ghcr.io/krishivai/krishiv:latest local start` |
+| **Embedded** | Library in your Rust/Python process | `Session::new()` |
+| **Single-node** | Local daemon with Flight SQL | `krishiv local start` |
+| **Distributed** | Coordinator + executor cluster | `krishiv clusterd` |
+| **Kubernetes** | CRD-driven production deployment | `kubectl apply -k deploy/k8s/operator` |
 
-```toml
-# Cargo.toml
-[dependencies]
-krishiv-api    = { path = "crates/krishiv-api" }
-krishiv-delta  = { path = "crates/krishiv-delta" }
-```
+---
 
-### Single-node daemon
+## What's Inside
 
-```bash
-cargo build --release -p krishiv-operator
-./target/release/krishiv-operator --config config.toml
-# Flight SQL endpoint available on :50051
-```
-
-### Kubernetes CRD
-
-```yaml
-apiVersion: krishiv.io/v1alpha1
-kind: KrishivCluster
-metadata:
-  name: prod
-spec:
-  schedulers: 1
-  executors: 4
-  storage:
-    rocksdb:
-      volumeClaimTemplate:
-        resources:
-          requests:
-            storage: 100Gi
-```
+- **Apache Arrow** columnar memory — zero-copy between operators
+- **DataFusion** SQL engine — full `SELECT`, `JOIN`, `GROUP BY`, window functions
+- **Iceberg-first lakehouse** — catalog integration, Parquet read/write, snapshot isolation
+- **Exactly-once semantics** — for certified source/sink/checkpoint combinations
+- **Pluggable connectors** — Kafka, S3, Parquet, Iceberg (Delta and Hudi experimental)
+- **Durable state** — RocksDB-backed keyed state with TTL and checkpoint/restore
 
 ---
 
@@ -343,62 +167,58 @@ spec:
 
 | Crate | Purpose |
 |---|---|
-| `krishiv` | CLI — `sql`, `explain`, `jobs` |
-| `krishiv-api` | Session, DataFrame, Stream, `IncrementalFlow` |
-| `krishiv-delta` | `DeltaBatch`, operators, `IncrementalView`, `IntegrateOp` |
-| `krishiv-sql` | DataFusion integration, SQL helpers, DDL parser |
-| `krishiv-plan` | Logical / physical plans, task fragments |
-| `krishiv-runtime` | Embedded, single-node, distributed runtime routing |
-| `krishiv-scheduler` | Coordinator, metadata, leadership, task lifecycle |
+| `krishiv` | CLI binary (`sql`, `explain`, `jobs`, `local start`) |
+| `krishiv-api` | `Session`, `DataFrame`, `IncrementalFlow` |
+| `krishiv-delta` | `DeltaBatch`, IVM operators, `IntegrateOp` |
+| `krishiv-sql` | DataFusion SQL integration, DDL, catalog |
+| `krishiv-connectors` | Source/sink SDK, Iceberg, Kafka, Parquet |
+| `krishiv-runtime` | Embedded, single-node, distributed routing |
+| `krishiv-scheduler` | Coordinator, metadata, task lifecycle |
 | `krishiv-executor` | Executor process and task runner |
-| `krishiv-dataflow` | Arrow operator runtime, `behavior_version`, `LogicFingerprint` |
-| `krishiv-state` | RocksDB durable state, `IncrementalTrace`, checkpoints |
-| `krishiv-shuffle` | Data-plane shuffle service |
-| `krishiv-connectors` | Source/sink SDK, Iceberg lakehouse, Delta/Hudi (experimental) |
-| `krishiv-operator` | Kubernetes operator + Flight SQL daemon |
-| `krishiv-python` | PyO3 Python bindings (`PyDeltaBatch`, `PyIncrementalFlow`) |
-| `krishiv-flight-sql` | Arrow Flight SQL server |
-| `krishiv-ui` | Web UI (optional) |
+| `krishiv-dataflow` | Arrow operators, windows, joins, stateful ops |
+| `krishiv-state` | RocksDB state, checkpoints, savepoints |
+| `krishiv-shuffle` | Data-plane shuffle (memory, disk, object store) |
+| `krishiv-python` | PyO3 Python bindings |
 
 ---
 
-## Building and Testing
+## Building from Source
 
 ```bash
-# Check all crates
+# Check everything compiles
 cargo check --workspace
 
-# Run all tests (excludes krishiv-python due to pyo3-arrow version mismatch)
+# Run tests
 cargo test --workspace --exclude krishiv-python
 
-# Clippy (CI gate)
-cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings
+# Build single-node binary
+cargo build --release -p krishiv --features single-node
 
-# Format check
-cargo fmt --check
+# Build distributed + Kubernetes binary
+cargo build --release -p krishiv --features full
+```
 
-# Focused test suites
-cargo test -p krishiv-delta          # DeltaBatch, operators, IVM
-cargo test -p krishiv-api            # IncrementalFlow, Session
-cargo test -p krishiv-runtime
-cargo test -p krishiv-scheduler --lib
-cargo test -p krishiv-executor --lib
+### Docker build
+
+```bash
+# Fast local image (pre-built binaries)
+docker build -f deploy/docker/Dockerfile.fast -t krishiv:local .
+
+# Production image (multi-stage, ~50MB)
+docker build -f deploy/docker/Dockerfile.prod -t krishiv:prod .
 ```
 
 ---
 
 ## Documentation
 
-- [`docs/README.md`](docs/README.md) — contributor entry point and crate map
-- [`docs/architecture.md`](docs/architecture.md) — engine architecture and boundaries
-- [`docs/contracts/engine-semantics.md`](docs/contracts/engine-semantics.md) — batch, streaming, and delivery guarantees
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) — compute-engine priorities and platform exclusions
-- [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — API and durable-artifact upgrade policy
-- [`docs/connector-sdk.md`](docs/connector-sdk.md) — connector implementation and certification
+- [Architecture](docs/architecture.md) — engine internals and crate boundaries
+- [Engine Contracts](docs/contracts/engine-semantics.md) — batch, streaming, delivery guarantees
+- [Connector SDK](docs/connector-sdk.md) — building source/sink connectors
+- [Roadmap](docs/ROADMAP.md) — compute-engine priorities
+- [Compatibility](docs/COMPATIBILITY.md) — API and metadata upgrade policy
+- [Contributing](CONTRIBUTING.md) — how to open a change
 
-## Contributing
-
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a change. Architecture
-and durable-format changes should include an ADR under `docs/decisions/`.
+---
 
 Krishiv is licensed under the [Apache License 2.0](LICENSE).

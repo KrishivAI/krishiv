@@ -1639,6 +1639,33 @@ impl Session {
     /// placement is wired today; single-node and distributed continuous
     /// streaming is the cluster follow-up.
     pub fn submit_streaming(&self, job: crate::CompiledJob) -> Result<crate::RunningJob> {
+        // H-22 (audit): enforce table-access policy on streaming SQL the
+        // same way `submit` / `sql_async` do. Without this, a deny rule
+        // on a Kafka source table is bypassed by routing the job through
+        // `submit_streaming` instead of `submit`.
+        if let Some(policy) = &self.policy {
+            match krishiv_sql::referenced_table_names(&job.query) {
+                Ok(tables) => {
+                    for table in &tables {
+                        if !policy.check_table_access(table) {
+                            return Err(KrishivError::AccessDenied {
+                                reason: format!("access denied to table: {table}"),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        query = %job.query,
+                        "failed to extract table references for streaming policy check"
+                    );
+                    return Err(KrishivError::AccessDenied {
+                        reason: format!("access denied: could not verify streaming policy ({e})"),
+                    });
+                }
+            }
+        }
         match self.mode {
             ExecutionMode::Embedded => {
                 let runtime = crate::connector_runtime::embedded_connector_runtime();

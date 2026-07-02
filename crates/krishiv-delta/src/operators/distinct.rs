@@ -36,6 +36,20 @@ impl IncrementalDistinctOp {
         }
     }
 
+    /// Evict distinct entries whose event time is below `watermark`.
+    ///
+    /// Note: the current data model does not carry a per-row event time on
+    /// `IncrementalDistinctOp::counts` (the key is a string projection of the
+    /// row content, not a typed timestamp). Until that schema is added, the
+    /// operator is a no-op here. The interface exists so the `ViewPlan::Distinct`
+    /// arm of `gc_watermark` is reached; the eviction is wired to no-op
+    /// pending schema work. A long-running incremental DISTINCT over a
+    /// high-cardinality source should use `DISTINCT (event_time_col)` in the
+    /// view body so the SQL engine can prune older partitions.
+    pub fn gc_watermark(&mut self, _watermark: i64) -> crate::DeltaResult<usize> {
+        Ok(0)
+    }
+
     /// Apply one tick of DISTINCT to the incoming delta.
     pub fn apply(&mut self, delta: DeltaBatch) -> DeltaResult<DeltaBatch> {
         if delta.is_empty() {

@@ -1,8 +1,16 @@
 import Image from 'next/image';
 import Link from 'next/link';
 import type { ReactNode } from 'react';
-import { githubUrl, navItems } from '@/lib/site';
+import { githubUrl } from '@/lib/site';
 import { SearchButton } from '@/components/Search';
+
+export const navItems = [
+  { label: 'Product', href: '/#product' },
+  { label: 'Documentation', href: '/docs/latest' },
+  { label: 'Examples', href: '/docs/latest/recipes' },
+  { label: 'Blog', href: '/blog' },
+  { label: 'Roadmap', href: '/product/maturity' },
+];
 
 export function BrandLogo({ compact = false }: { compact?: boolean }) {
   return (
@@ -54,21 +62,60 @@ export function Header() {
 export function Footer() {
   return (
     <footer className="footer">
-      <div><strong>Krishiv</strong><p>Rust-native compute for batch SQL, streaming pipelines, and incremental processing. Apache&nbsp;Arrow · DataFusion · Tokio.</p></div>
-      <div className="footer-links">
-        <Link href="/docs/latest">Docs</Link>
-        <Link href="/docs/latest/getting-started">Quickstart</Link>
-        <Link href="/docs/latest/tutorial">Tutorial</Link>
-        <Link href="/docs/latest/recipes">Recipes</Link>
-        <Link href="/product/maturity">Maturity</Link>
-        <Link href="/architecture">Architecture</Link>
-        <Link href="/release-notes">Release notes</Link>
-        <a href={`${githubUrl}/blob/main/LICENSE`}>License</a>
-        <a href={githubUrl}>GitHub</a>
+      <div className="footer-grid">
+        <div className="footer-brand">
+          <strong>Krishiv</strong>
+          <p>Rust-native compute for batch SQL, streaming pipelines, and incremental processing. Apache&nbsp;Arrow · DataFusion · Tokio.</p>
+          <div className="footer-badges">
+            <span className="badge badge-green">Open Source</span>
+            <span className="badge badge-orange">Rust Native</span>
+            <span className="badge badge-blue">Apache Arrow</span>
+          </div>
+        </div>
+        <div className="footer-col">
+          <h4>Product</h4>
+          <Link href="/#product">Overview</Link>
+          <Link href="/architecture">Architecture</Link>
+          <Link href="/product/maturity">Feature Maturity</Link>
+          <Link href="/docs/latest/recipes">Examples</Link>
+          <a href={`${githubUrl}/releases`}>Releases</a>
+        </div>
+        <div className="footer-col">
+          <h4>Developers</h4>
+          <Link href="/docs/latest">Documentation</Link>
+          <Link href="/docs/latest/getting-started">Getting Started</Link>
+          <Link href="/docs/latest/python">Python API</Link>
+          <Link href="/docs/latest/rust">Rust API</Link>
+          <Link href="/docs/latest/sql">SQL Reference</Link>
+        </div>
+        <div className="footer-col">
+          <h4>Community</h4>
+          <a href={githubUrl}>GitHub</a>
+          <a href={`${githubUrl}/issues`}>Issues</a>
+          <a href={`${githubUrl}/discussions`}>Discussions</a>
+          <Link href="/blog">Blog</Link>
+          <a href={`${githubUrl}/blob/main/CONTRIBUTING.md`}>Contributing</a>
+        </div>
+        <div className="footer-col">
+          <h4>Resources</h4>
+          <Link href="/release-notes">Release Notes</Link>
+          <a href={`${githubUrl}/blob/main/LICENSE`}>License</a>
+          <a href={`${githubUrl}/blob/main/SECURITY.md`}>Security</a>
+          <a href="/feed.xml" type="application/rss+xml">RSS</a>
+          <a href="https://krishiv.ai">Website</a>
+        </div>
+      </div>
+      <div className="footer-bottom">
+        <span>&copy; {new Date().getFullYear()} KrishivAI. Apache License 2.0.</span>
+        <div className="footer-links-bottom">
+          <Link href="/docs/latest">Docs</Link>
+          <Link href="/architecture">Architecture</Link>
+          <a href={githubUrl}>GitHub</a>
+        </div>
       </div>
     </footer>
   );
 }
 
 export function Badge({ children, tone = 'gray' }: { children: ReactNode; tone?: string }) { return <span className={`badge badge-${tone}`}>{children}</span>; }
-export function Section({ eyebrow, title, children }: { eyebrow?: string; title: string; children: ReactNode }) { return <section className="section">{eyebrow && <p className="section-eyebrow">{eyebrow}</p>}<h2>{title}</h2>{children}</section>; }
+export function Section({ eyebrow, title, children, id }: { eyebrow?: string; title: string; children: ReactNode; id?: string }) { return <section className="section" id={id}>{eyebrow && <p className="section-eyebrow">{eyebrow}</p>}<h2>{title}</h2>{children}</section>; }

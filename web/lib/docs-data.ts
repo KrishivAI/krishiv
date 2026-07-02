@@ -10,6 +10,7 @@ import { statePages } from './docs-content/state';
 import { observabilityPages } from './docs-content/observability';
 import { cliPages } from './docs-content/cli';
 import { toolingPages } from './docs-content/tooling';
+import { developmentPages } from './docs-content/development';
 
 export type DocStatus = 'Available' | 'Experimental' | 'In Progress' | 'Preview' | 'Planned';
 
@@ -27,31 +28,33 @@ export type DocPage = {
 export const GROUP_ORDER = [
   'Getting Started',
   'Concepts',
-  'Recipes',
   'SQL Reference',
+  'Rust API',
+  'Python API',
+  'Connectors',
   'Streaming',
   'State',
   'CLI Reference',
   'Observability',
-  'Rust API',
-  'Python API',
-  'Connectors',
   'Tooling',
   'Operations',
+  'Recipes',
+  'Development',
 ] as const;
 
 export const docPages: DocPage[] = [
   ...gettingStartedPages,
-  ...recipesPages,
-  ...streamingPages,
-  ...statePages,
-  ...cliPages,
-  ...observabilityPages,
   ...sqlPages,
   ...rustPages,
   ...pythonPages,
   ...connectorsPages,
+  ...streamingPages,
+  ...statePages,
+  ...cliPages,
+  ...observabilityPages,
   ...toolingPages,
+  ...developmentPages,
+  ...recipesPages,
 ];
 
 export type GroupedPages = { group: string; pages: DocPage[] };

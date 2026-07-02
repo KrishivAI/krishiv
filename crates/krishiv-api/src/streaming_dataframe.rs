@@ -4,7 +4,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use twox_hash::XxHash64;
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use futures::Stream;
@@ -383,21 +385,38 @@ impl StreamingDataFrame {
     ///
     /// Matches events from `left` and `right` when:
     /// `lower_bound_ms <= right_ts - left_ts <= upper_bound_ms`.
+    ///
+    /// H-1 (audit): the previous wrapper ignored `key_column` and used
+    /// the empty string `""` for every event, silently producing
+    /// over-matching when the underlying batches had distinct keys. The
+    /// new wrapper requires explicit `left_key_col` / `right_key_col`
+    /// parameters and forwards them to the per-key join state map.
+    #[allow(clippy::too_many_arguments)]
     pub fn stream_stream_join(
         left: &[RecordBatch],
         right: &[RecordBatch],
         left_time_col: &str,
         right_time_col: &str,
+        left_key_col: &str,
+        right_key_col: &str,
         lower_bound_ms: i64,
         upper_bound_ms: i64,
     ) -> Result<Vec<(Arc<RecordBatch>, Arc<RecordBatch>)>> {
         let spec = IntervalJoinSpec {
             lower_bound_ms,
             upper_bound_ms,
-            key_column: "k".into(),
+            key_column: left_key_col.into(),
             max_buffer_per_side: 1_000_000,
         };
-        interval_join(left, right, left_time_col, right_time_col, spec)
+        interval_join(
+            left,
+            right,
+            left_time_col,
+            right_time_col,
+            left_key_col,
+            right_key_col,
+            spec,
+        )
     }
 }
 
@@ -448,12 +467,84 @@ impl DeduplicatingStream {
                 .index_of(col_name)
                 .map_err(|_| format!("dedup column '{col_name}' not found in batch schema"))?;
             let col = batch.column(col_idx);
+            // L-2 (audit): the prior implementation only supported Int64
+            // and Utf8; every other type fell through to a `format!("{:?}",
+            // col.slice(row, 1))` which allocates a String per row per
+            // column. Hot-path optimization: type-specialize the hash for
+            // the common primitive types so dedup over Float64 / Boolean /
+            // Date32 / Timestamp / Int32 / etc. avoids the per-row
+            // allocation. Type tag is mixed in so two values that happen
+            // to share the same bit pattern across types do not collide.
+            let tag: u8 = match col.data_type() {
+                DataType::Int64 => b'I',
+                DataType::Int32 => b'T',
+                DataType::Int16 => b'H',
+                DataType::Int8 => b'B',
+                DataType::UInt64 => b'U',
+                DataType::UInt32 => b'u',
+                DataType::UInt16 => b'v',
+                DataType::UInt8 => b'w',
+                DataType::Float64 => b'F',
+                DataType::Float32 => b'f',
+                DataType::Boolean => b'Y',
+                DataType::Date32 => b'D',
+                DataType::Date64 => b'd',
+                DataType::Timestamp(_, _) => b'M',
+                DataType::Utf8 => b'S',
+                _ => b'?',
+            };
+            tag.hash(&mut hasher);
+            tag.hash(&mut hasher2);
             match col.data_type() {
                 DataType::Int64 => {
                     if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
                         if arr.is_null(row) {
-                            "null".hash(&mut hasher);
-                            "null".hash(&mut hasher2);
+                            0u8.hash(&mut hasher);
+                            0u8.hash(&mut hasher2);
+                        } else {
+                            arr.value(row).hash(&mut hasher);
+                            arr.value(row).hash(&mut hasher2);
+                        }
+                    }
+                }
+                DataType::Int32 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                        if arr.is_null(row) {
+                            0u8.hash(&mut hasher);
+                            0u8.hash(&mut hasher2);
+                        } else {
+                            arr.value(row).hash(&mut hasher);
+                            arr.value(row).hash(&mut hasher2);
+                        }
+                    }
+                }
+                DataType::Float64 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+                        if arr.is_null(row) {
+                            0u8.hash(&mut hasher);
+                            0u8.hash(&mut hasher2);
+                        } else {
+                            arr.value(row).to_bits().hash(&mut hasher);
+                            arr.value(row).to_bits().hash(&mut hasher2);
+                        }
+                    }
+                }
+                DataType::Float32 => {
+                    if let Some(arr) = col.as_any().downcast_ref::<Float32Array>() {
+                        if arr.is_null(row) {
+                            0u8.hash(&mut hasher);
+                            0u8.hash(&mut hasher2);
+                        } else {
+                            arr.value(row).to_bits().hash(&mut hasher);
+                            arr.value(row).to_bits().hash(&mut hasher2);
+                        }
+                    }
+                }
+                DataType::Boolean => {
+                    if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
+                        if arr.is_null(row) {
+                            0u8.hash(&mut hasher);
+                            0u8.hash(&mut hasher2);
                         } else {
                             arr.value(row).hash(&mut hasher);
                             arr.value(row).hash(&mut hasher2);
@@ -463,8 +554,8 @@ impl DeduplicatingStream {
                 DataType::Utf8 => {
                     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
                         if arr.is_null(row) {
-                            "null".hash(&mut hasher);
-                            "null".hash(&mut hasher2);
+                            0u8.hash(&mut hasher);
+                            0u8.hash(&mut hasher2);
                         } else {
                             arr.value(row).hash(&mut hasher);
                             arr.value(row).hash(&mut hasher2);
@@ -472,6 +563,9 @@ impl DeduplicatingStream {
                     }
                 }
                 _ => {
+                    // Fallback for types we don't specialize. Per-row
+                    // String allocation, same as before. Acceptable for
+                    // uncommon types (Decimal128, Binary, List, etc.).
                     let s = format!("{:?}", col.slice(row, 1));
                     s.hash(&mut hasher);
                     s.hash(&mut hasher2);
@@ -491,7 +585,17 @@ impl DeduplicatingStream {
             // Bound memory: clear the seen set when it exceeds the capacity
             // limit. This trades exact dedup for bounded memory on high-
             // cardinality streams where tracking all unique keys is impractical.
+            // H-17 (audit): the prior code silently re-admitted previously
+            // seen rows after the clear. We now log a one-time warning per
+            // clear so operators can detect the silent re-admission. A
+            // downstream sink that needs strict dedup should use the
+            // state-backed `drop_duplicates_with_state` instead.
             if self.seen.len() >= DEDUP_SEEN_CAPACITY {
+                tracing::warn!(
+                    capacity = DEDUP_SEEN_CAPACITY,
+                    "dedup seen-set cleared; subsequent duplicates may pass through \
+                     (use the state-backed drop_duplicates for strict dedup)"
+                );
                 self.seen.clear();
             }
             let h = Self::row_hash(&batch, row, &self.columns)?;
@@ -802,54 +906,104 @@ pub fn temporal_join(
 ///
 /// Returns matched `(left_row, right_row)` pairs as individual single-row
 /// `RecordBatch` tuples.
+///
+/// H-1 (audit): every event was previously inserted into the join's
+/// per-key state map under the empty string `""`, regardless of the
+/// caller's intended key column. That caused events with distinct keys
+/// to match each other across the time window — silent over-matching.
+/// The fix routes each row through the join under its actual key value
+/// (a typed Arrow value rendered to a string for the per-key map).
 pub fn interval_join(
     left_batches: &[RecordBatch],
     right_batches: &[RecordBatch],
     left_time_col: &str,
     right_time_col: &str,
+    left_key_col: &str,
+    right_key_col: &str,
     spec: IntervalJoinSpec,
 ) -> Result<Vec<(Arc<RecordBatch>, Arc<RecordBatch>)>> {
     let mut join = PerKeyIntervalJoin::new(spec);
     let mut pairs = Vec::new();
 
-    // Helper: extract (row_index, i64 event time) pairs, skipping nulls.
-    let get_times = |batch: &RecordBatch, col: &str| -> Result<Vec<(usize, i64)>> {
-        let idx = batch
-            .schema()
-            .index_of(col)
-            .map_err(|e| KrishivError::Runtime {
-                message: e.to_string(),
-            })?;
-        let arr = batch
-            .column(idx)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| KrishivError::Runtime {
-                message: format!("event time column '{col}' must be Int64"),
-            })?;
-        Ok((0..arr.len())
-            .filter(|&i| !arr.is_null(i))
-            .map(|i| (i, arr.value(i)))
-            .collect())
-    };
+    // Helper: extract (row_index, i64 event time, key string) triples,
+    // skipping nulls in the time column. Null key values are rejected
+    // with a clear error rather than silently coerced to "".
+    let get_times_keys =
+        |batch: &RecordBatch, time_col: &str, key_col: &str| -> Result<Vec<(usize, i64, String)>> {
+            let t_idx = batch
+                .schema()
+                .index_of(time_col)
+                .map_err(|e| KrishivError::Runtime {
+                    message: format!("event time column '{time_col}' not found: {e}"),
+                })?;
+            let t_arr = batch
+                .column(t_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| KrishivError::Runtime {
+                    message: format!("event time column '{time_col}' must be Int64"),
+                })?;
+            let k_idx = batch
+                .schema()
+                .index_of(key_col)
+                .map_err(|e| KrishivError::Runtime {
+                    message: format!("key column '{key_col}' not found: {e}"),
+                })?;
+            let k_col = batch.column(k_idx);
+            let mut out = Vec::new();
+            for i in 0..t_arr.len() {
+                if t_arr.is_null(i) {
+                    continue;
+                }
+                if k_col.is_null(i) {
+                    return Err(KrishivError::Runtime {
+                        message: format!(
+                            "key column '{key_col}' has NULL at row {i}; \
+                         interval_join requires non-null keys for per-key matching"
+                        ),
+                    });
+                }
+                let key = arrow_array_value_to_string(k_col.as_ref(), i);
+                out.push((i, t_arr.value(i), key));
+            }
+            Ok(out)
+        };
 
     for batch in left_batches {
-        let times = get_times(batch, left_time_col)?;
-        for &(i, t) in &times {
+        let times = get_times_keys(batch, left_time_col, left_key_col)?;
+        for &(i, t, ref k) in &times {
             let row = batch.slice(i, 1);
-            let matched = join.push_left("", t, row);
+            let matched = join.push_left(k, t, row);
             pairs.extend(matched);
         }
     }
     for batch in right_batches {
-        let times = get_times(batch, right_time_col)?;
-        for &(i, t) in &times {
+        let times = get_times_keys(batch, right_time_col, right_key_col)?;
+        for &(i, t, ref k) in &times {
             let row = batch.slice(i, 1);
-            let matched = join.push_right("", t, row);
+            let matched = join.push_right(k, t, row);
             pairs.extend(matched);
         }
     }
     Ok(pairs)
+}
+
+/// Render one cell of an Arrow array to a stable string key. Mirrors
+/// `DeduplicatingStream::row_hash` but does not allocate when the value
+/// is already a primitive integer / string.
+fn arrow_array_value_to_string(array: &dyn arrow::array::Array, row: usize) -> String {
+    use arrow::array::{Int32Array, Int64Array, StringArray};
+    if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+        return arr.value(row).to_string();
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+        return arr.value(row).to_string();
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        return arr.value(row).to_owned();
+    }
+    // Fallback: arrow's `Display` for one-element slice.
+    format!("{:?}", array.slice(row, 1))
 }
 
 #[cfg(test)]
@@ -889,6 +1043,7 @@ mod tests {
 
     fn interval_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
             Field::new("event_ts", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
         ]))
@@ -937,10 +1092,11 @@ mod tests {
         .unwrap()
     }
 
-    fn interval_batch(times: &[i64], values: &[i64]) -> RecordBatch {
+    fn interval_batch(keys: &[&str], times: &[i64], values: &[i64]) -> RecordBatch {
         RecordBatch::try_new(
             interval_schema(),
             vec![
+                Arc::new(StringArray::from(keys.to_vec())) as _,
                 Arc::new(Int64Array::from(times.to_vec())) as _,
                 Arc::new(Int64Array::from(values.to_vec())) as _,
             ],
@@ -1167,8 +1323,8 @@ mod tests {
     #[test]
     fn interval_join_matches_events_within_window() {
         // Left event at t=100, right event at t=150 -> delta=50, within [0, 100].
-        let left = interval_batch(&[100], &[1]);
-        let right = interval_batch(&[150], &[2]);
+        let left = interval_batch(&["a"], &[100], &[1]);
+        let right = interval_batch(&["a"], &[150], &[2]);
 
         let spec = IntervalJoinSpec {
             lower_bound_ms: 0,
@@ -1176,15 +1332,16 @@ mod tests {
             key_column: "k".into(),
             max_buffer_per_side: 1000,
         };
-        let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
+        let pairs =
+            interval_join(&[left], &[right], "event_ts", "event_ts", "k", "k", spec).unwrap();
         assert_eq!(pairs.len(), 1, "events within window should match");
     }
 
     #[test]
     fn interval_join_excludes_events_outside_window() {
         // Left at t=100, right at t=300 -> delta=200, outside [0, 100].
-        let left = interval_batch(&[100], &[1]);
-        let right = interval_batch(&[300], &[2]);
+        let left = interval_batch(&["a"], &[100], &[1]);
+        let right = interval_batch(&["a"], &[300], &[2]);
 
         let spec = IntervalJoinSpec {
             lower_bound_ms: 0,
@@ -1192,15 +1349,60 @@ mod tests {
             key_column: "k".into(),
             max_buffer_per_side: 1000,
         };
-        let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
+        let pairs =
+            interval_join(&[left], &[right], "event_ts", "event_ts", "k", "k", spec).unwrap();
         assert!(pairs.is_empty(), "events outside window must not match");
+    }
+
+    #[test]
+    fn interval_join_isolates_distinct_keys() {
+        // H-1 regression: prior code used empty key "" for every event,
+        // so events with distinct user_ids would falsely match. With
+        // per-key routing, only same-key events within the window match.
+        let left = interval_batch(&["alice", "bob"], &[100, 100], &[1, 2]);
+        let right = interval_batch(&["alice", "bob"], &[150, 150], &[10, 20]);
+
+        let spec = IntervalJoinSpec {
+            lower_bound_ms: 0,
+            upper_bound_ms: 100,
+            key_column: "k".into(),
+            max_buffer_per_side: 1000,
+        };
+        let pairs =
+            interval_join(&[left], &[right], "event_ts", "event_ts", "k", "k", spec).unwrap();
+        assert_eq!(
+            pairs.len(),
+            2,
+            "alice@100 matches alice@150 and bob@100 matches bob@150"
+        );
+    }
+
+    #[test]
+    fn interval_join_does_not_cross_keys() {
+        // Alice@100 must NOT match bob@150 (different keys), even though
+        // the time difference is within the window.
+        let left = interval_batch(&["alice"], &[100], &[1]);
+        let right = interval_batch(&["bob"], &[150], &[2]);
+
+        let spec = IntervalJoinSpec {
+            lower_bound_ms: 0,
+            upper_bound_ms: 100,
+            key_column: "k".into(),
+            max_buffer_per_side: 1000,
+        };
+        let pairs =
+            interval_join(&[left], &[right], "event_ts", "event_ts", "k", "k", spec).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "different keys must not match under H-1 per-key routing"
+        );
     }
 
     #[test]
     fn interval_join_multiple_matches() {
         // One left event matched by two right events within the window.
-        let left = interval_batch(&[1000], &[1]);
-        let right = interval_batch(&[1050, 1080, 2000], &[10, 20, 30]);
+        let left = interval_batch(&["a"], &[1000], &[1]);
+        let right = interval_batch(&["a", "a", "a"], &[1050, 1080, 2000], &[10, 20, 30]);
 
         let spec = IntervalJoinSpec {
             lower_bound_ms: 0,
@@ -1208,7 +1410,8 @@ mod tests {
             key_column: "k".into(),
             max_buffer_per_side: 1000,
         };
-        let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
+        let pairs =
+            interval_join(&[left], &[right], "event_ts", "event_ts", "k", "k", spec).unwrap();
         // 1050-1000=50, 1080-1000=80, 2000-1000=1000 (outside)
         assert_eq!(pairs.len(), 2);
     }
@@ -1221,7 +1424,7 @@ mod tests {
             key_column: "k".into(),
             max_buffer_per_side: 1000,
         };
-        let pairs = interval_join(&[], &[], "event_ts", "event_ts", spec).unwrap();
+        let pairs = interval_join(&[], &[], "event_ts", "event_ts", "k", "k", spec).unwrap();
         assert!(pairs.is_empty());
     }
 
@@ -1324,8 +1527,8 @@ mod tests {
     fn stream_stream_join_convenience_matches_interval_join() {
         use super::StreamingDataFrame;
 
-        let left = interval_batch(&[100], &[1]);
-        let right = interval_batch(&[150], &[2]);
+        let left = interval_batch(&["a"], &[100], &[1]);
+        let right = interval_batch(&["a"], &[150], &[2]);
 
         let spec = IntervalJoinSpec {
             lower_bound_ms: 0,
@@ -1338,6 +1541,8 @@ mod tests {
             &[right.clone()],
             "event_ts",
             "event_ts",
+            "k",
+            "k",
             spec,
         )
         .unwrap();
@@ -1346,6 +1551,8 @@ mod tests {
             &[right],
             "event_ts",
             "event_ts",
+            "k",
+            "k",
             0,
             100,
         )

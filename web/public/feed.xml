@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Krishiv Blog</title>
+    <link>https://krishiv.ai/blog</link>
+    <description>Technical notes from the Krishiv engine — batch SQL, streaming pipelines, and incremental processing.</description>
+    <language>en</language>
+    <lastBuildDate>Wed, 01 Jul 2026 00:00:00 +0000</lastBuildDate>
+    <atom:link href="https://krishiv.ai/feed.xml" rel="self" type="application/rss+xml" />
+    <atom:link href="https://krishiv.ai" rel="alternate" type="text/html" />
+    <image>
+      <url>https://krishiv.ai/brand/logo-mark.svg</url>
+      <title>Krishiv</title>
+      <link>https://krishiv.ai</link>
+    </image>
+    <item>
+      <title>Introducing Krishiv: One Engine for Batch, Streaming, and Incremental Data Processing</title>
+      <link>https://krishiv.ai/blog/introducing-krishiv</link>
+      <guid>https://krishiv.ai/blog/introducing-krishiv</guid>
+      <pubDate>Wed, 01 Jul 2026 00:00:00 +0000</pubDate>
+      <dc:creator>KrishivAI</dc:creator>
+      <description>A codebase-grounded overview of the unified engine vision — why Krishiv exists, what it does today, and how it runs batch SQL, streaming, and incremental view maintenance under one Apache Arrow / DataFusion runtime.</description>
+    </item>
+  </channel>
+</rss>

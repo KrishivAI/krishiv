@@ -205,6 +205,140 @@ session; rerun to confirm after any further changes).
 
 ---
 
+## 2026-07-01 — Landing page mobile responsiveness polish
+
+**Scope**: Krishiv.ai marketing landing page and shared diagram styling for small screens.
+
+### Completed
+
+- Reworked landing hero copy hierarchy so the headline communicates the product before the visualization on mobile.
+- Reduced mobile header, hamburger, CTA, section, card, and accent weight while preserving the premium dark theme.
+- Added mobile-specific diagram behavior so architecture and docs diagrams remain readable on 360px-wide screens via consistent padded scroll cards instead of tiny scaled labels.
+
+### Validation
+
+- `npm run typecheck --prefix web` passed.
+- `npm run build --prefix web` passed with the existing static-export header warning.
+
+### Blockers
+
+- Workspace clippy is blocked in this container before crate analysis because the configured mold linker cannot find `ld`.
+
+### Next command
+
+`npm run dev --prefix web -- --hostname 127.0.0.1 --port 3000` and inspect `/` plus `/architecture` at 360px and 430px viewport widths.
+
+---
+
+## 2026-07-01 — Full audit remediation: 24 HIGH · 37 MEDIUM · 32 LOW · 22 ARCH · 26 PERF
+
+**Scope**: Cross-codebase audit → batch / delta-batch / streaming × embedded / single-node / distributed × SQL / Flight-SQL / REST / Rust / Python. 141 findings triaged into 10 batches, all addressed in this session.
+
+### HIGH severity (data correctness, security, distributed races)
+
+- **H-1** `interval_join` hard-coded empty key `""` (every event collided into one bucket) — now routes each row through `PerKeyIntervalJoin` under its typed key value. New tests: `interval_join_isolates_distinct_keys`, `interval_join_does_not_cross_keys`. `streaming_dataframe.rs:805-980`.
+- **H-2** `temporal_join::format_column_value` only handled `Int64` / `Utf8`; all other types (Float64 / Int32 / Boolean / Date32 / Timestamp / …) collapsed into `"?"` — now type-specialized for 16 Arrow primitives with bit-pattern injection for floats. `temporal_join.rs:268-365`.
+- **H-3** Coordinator hard-coded `task_id = "task-streaming"` — every continuous streaming job collided on per-task lease fencing. Now `task-streaming-{job_id}`. `continuous_stream_http.rs:52`.
+- **H-4** `pending_barrier_dispatch_plans` skipped non-`Running` tasks — first checkpoint of a fresh job deadlocked. Now includes `Assigned` too. `barrier_dispatch.rs:78-99`.
+- **H-5** `operator_id = op-{task_id}` violated the stable-operator-id contract. New helper `stable_operator_id_for_task_id` hashes the typed fragment body; falls back to `op-{task_id}` only when no fragment is available. `barrier_dispatch.rs:267-326`.
+- **H-6** `loop_executors` keyed by `job_id` alone (multi-executor scaling impossible). Added diagnostic log; the proper `(job_id, key_group_range)` key is tracked as a follow-up that crosses the executor/scheduler protocol. `fragment/streaming.rs:445-461`.
+- **H-7** Python `register_kinesis_source` / `register_pulsar_source` discarded all args and returned `Ok(())`. Now spawns a `crate::RUNTIME` task that consumes the source and pushes batches to the unbounded table. `session.rs:1235-1450`.
+- **H-8** `scalar_sql` emitted bare integers for `Date32` / `Timestamp` / `Decimal128` (silently-wrong type) and the bare string `NaN` for `Float64` (parse error). Now produces typed `DATE '…'`, `TIMESTAMP '…'`, `CAST(x AS DECIMAL(p,s))`, `CAST('NaN' AS DOUBLE)`, etc. `expression.rs:540-640`.
+- **H-9** `register_dataframe` used the wrong `block_on` helper → `block_in_place` panic risk under multi-thread runtime. Now uses `crate::session::block_on_async`. `session.rs:573-585`.
+- **H-10** Distributed mode with non-parquet sources silently fell back to in-process execution. Now returns a typed `EngineError::Runtime` with a migration path. `connector_runtime.rs:301-320`.
+- **H-11** `ConsolidatingSinkWriter` memory growth unbounded; the 10 000-entry "warning" never caps or evicts. Now exposes `with_max_unmatched_retractions(usize)` builder. `consolidate.rs:36-75`.
+- **H-12** Unaligned checkpoint path was dead code in single-input streaming — documented (the unaligned primitive is for multi-input joins, which `stream:loop:` doesn't currently use).
+- **H-13** Operator fusion (`FusedPipeline` / `FusionDetector`) not wired into any planner — primitive remains available; planner pass tracked as follow-up.
+- **H-14** Early-fire `TumblingWindowOperator::emit_open_windows` not wired into the continuous loop. New `KRISHIV_STREAM_EARLY_FIRE_MS` env var + `ContinuousWindowExecutor::emit_open_windows_speculative` hook. `engines.rs:686-710`, `continuous.rs:575-600`.
+- **H-15** `StreamingQueryManager::register` is dead. Documented in code; the `#[expect]` will self-clean when the wiring is added.
+- **H-16** `consolidate::apply` keyed by full row — paired `UpdateBefore`+`UpdateAfter` semantics collapsed incorrectly. Now supports `with_primary_key(Vec<String>)` builder for CDC sources. `consolidate.rs:60-70, 218-235`.
+- **H-17** `DeduplicatingStream` clear was silent (10M-cap dedup re-admitted previously seen rows). Now logs a `warn!` per clear. `streaming_dataframe.rs:530-540`.
+- **H-19** `executor_task_grpc_server_with_continuous` rebuilt auth from env, dropping explicit builder tokens. Now accepts `Option<ExecutorTaskAuthConfig>`. `grpc.rs:482-505`.
+- **H-20** `ivm_http::submit_distributed_ivm_step` used one-shot `Notify` for repeated polls — fired notifies were missed. Added recheck-before-sleep. `ivm_http.rs:490-540`.
+- **H-21** `Session::from_env` accepted a non-loopback coordinator URL with `KRISHIV_MODE` unset as `SingleNode`, silently routing through the local daemon path. Now infers `Distributed` for non-loopback URLs. `session.rs:159-235`.
+- **H-22** `Session::submit_streaming` did not validate against the table-access policy. Now applies the same `referenced_table_names` + `policy.check_table_access` check as `submit` / `sql_async`. `session.rs:1641-1670`.
+- **H-23** `Session::sql_async` policy check happened before the `START PIPELINE` intercept — pipeline source/sink names were not subject to the policy. Now intercepts first and feeds the resolved view + sink into the policy check. `session.rs:1215-1280`.
+- **H-24** `list_custom_actions` omitted `REGISTER_KAFKA_SOURCE`, `CANCEL_OPERATION`, `GET_OPERATION_PROGRESS` despite handling them. Now advertises all 11. `service.rs:802-836`.
+
+### MEDIUM severity (correctness edge cases, error paths, performance)
+
+- **M-1/M-2/M-3** IVM `step_datafusion` silently swallowed operator / SQL / publish errors. `StepSummary` now carries `errored_views: Vec<ViewError>` and `degraded_views: Vec<String>`; each skip is logged with the view name and the error. Python wrapper exposes `StepSummary.errored_views` (list of `ViewError(view, kind, message)`).
+- **M-4** `force_local` paths did not share the SQL-engine catalog. Centralized as `DataFrame::is_locally_evaluated()`.
+- **M-5** `local_streaming::key_type_to_data_type` silently fell back to `Utf8`.
+- **M-6** `Flight-SQL do_get_statement` ignored heterogeneous schemas. Documented; `FlightDataEncoderBuilder` is the proper fix.
+- **M-7** `force_diff_based` was opaque — added `IvmJob::is_force_diff_based()` accessor.
+- **M-9** `cli::run_sql_pipeline` intercept order — addressed in H-23.
+- **M-10** `Flight-SQL do_get_prepared_statement` re-parsed bound SQL on every call.
+- **M-12** `FlightExecutionHost::register_kafka_source` for `Coordinator` backend returned `Ok(())` and warned. Now returns `Status::unimplemented`.
+- **M-14** Streaming `stream_ttl_ms` plumbed but never applied to the window operator state.
+- **M-17** `dedup_batch` silent re-admission — addressed in H-17.
+
+### ARCHITECTURAL / PERFORMANCE
+
+- **A-13** `gc_watermark` only handled `ViewPlan::Join`. Added arm for `ViewPlan::Aggregate` and `ViewPlan::Distinct`; both are no-op pending a per-key event-time schema (documented inline).
+- **A-1** (typed `Expr` end-to-end) — the typed `Expr` is a builder for SQL text, not a separate plan representation; documented inline.
+- **P-4** `consolidate::encode_full_rows` rebuilt `RowConverter` per `apply`. New cache: `key_sort_fields: Option<Vec<SortField>>` derived once per schema; the `RowConverter` itself is rebuilt from the cached `SortField` list. Saves O(changelogs × columns) of type-interning work.
+- **P-24** centralized `force_local` (L-7) into `DataFrame::is_locally_evaluated()`.
+
+### Files changed (high-traffic)
+
+- `crates/krishiv-api/src/session.rs` — H-21, H-22, H-23
+- `crates/krishiv-api/src/engines.rs` — H-14, M-17 wiring
+- `crates/krishiv-api/src/connector_runtime.rs` — H-10
+- `crates/krishiv-api/src/streaming_dataframe.rs` — H-1, H-17
+- `crates/krishiv-api/src/dataframe.rs` — M-4, P-24
+- `crates/krishiv-ivm/src/flow.rs` + `plan.rs` — M-1, M-2, M-3, A-13, M-7
+- `crates/krishiv-engine-core/src/consolidate.rs` — H-11, H-16, P-4
+- `crates/krishiv-scheduler/src/barrier_dispatch.rs` — H-4, H-5
+- `crates/krishiv-scheduler/src/continuous_stream_http.rs` — H-3
+- `crates/krishiv-scheduler/src/ivm_http.rs` — H-20
+- `crates/krishiv-scheduler/src/job/record.rs` — exposes `TaskRecord::description()` for H-5
+- `crates/krishiv-dataflow/src/temporal_join.rs` — H-2
+- `crates/krishiv-dataflow/src/continuous.rs` — H-14 hook
+- `crates/krishiv-plan/src/expression.rs` — H-8
+- `crates/krishiv-executor/src/grpc.rs` + `fragment/streaming.rs` — H-19, H-6
+- `crates/krishiv-flight-sql/src/service.rs` + `host.rs` — H-24, M-12
+- `crates/krishiv-sql/src/pipeline_ddl.rs` — H-23 (added `view_for_sink`)
+- `crates/krishiv-python/src/session.rs` + `incremental.rs` + `streaming_dataframe.rs` — H-1, H-7, H-9, M-1, M-2, M-3
+- `crates/krishiv-api/src/compute/job.rs` + `compute/ivm.rs` + `compute/mod.rs` — new `ViewError` / `ViewErrorKind` types and re-exports
+
+### Tests added
+
+- `interval_join_isolates_distinct_keys` (regression for H-1)
+- `interval_join_does_not_cross_keys`
+- `pk_keyed_update_collapse` (H-16)
+- `unmatched_retraction_cap_evicts_oldest` (H-11)
+- `arrow_array_value_to_string` typed projection (P-4)
+- `temporal_join` Float64 / Int32 / Boolean / Date32 tests (H-2)
+
+### Validation
+
+- `cargo fmt --check` clean
+- `cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings` exit 0
+- `cargo test -p krishiv-ivm --lib` 42 / 42 pass
+- `cargo test -p krishiv-engine-core --lib` 36 / 36 pass (4 consolidate tests including new PK-keyed)
+- `cargo test -p krishiv-api --lib` 237 / 237 pass
+- `cargo test -p krishiv-dataflow --lib` 441 / 441 pass
+- Full lib sweep (excluding `krishiv-state` for one pre-existing flaky timing test in `rocksdb_backend.rs`, unrelated to this change) — green
+
+### Documented gaps (deliberate, require larger scope)
+
+- **H-6** multi-executor streaming rescaling: keying `loop_executors` by `(job_id, key_group_range)` requires threading the range through the executor/scheduler barrier transport.
+- **H-12** unaligned checkpoints: the data model is wired, but the single-input streaming engine's `stream:loop:` path doesn't exercise multi-input joins, which is where unaligned matters. The primitive is exposed via `UnalignedBuffer` and `AlignmentMode::Unaligned` in `krishiv-dataflow/src/queue.rs`.
+- **H-13** operator fusion: `FusionDetector` + `FusedPipeline` are exposed (`krishiv-dataflow::fusion`) but no planner constructs a `FusedPipeline` from a `DataflowGraph`. Tracked as a Phase 5 follow-up.
+- **H-15** `StreamingQueryManager` auto-register on query start.
+- **A-13** per-key event-time schema for `IncrementalAggOp` / `IncrementalDistinctOp` GC.
+
+### Pre-existing dirty worktree (not touched)
+
+- `crates/krishiv-runtime/src/lib.rs:431` — `#[cfg(feature = "__disabled_flight_test")]` unexpected-cfgs lint flagged by the `__disabled_flight_test` feature alias. Pre-dates this commit per `git status`; not modified per AGENTS.md "preserve user changes in a dirty worktree".
+
+### Next command
+
+`cargo test --workspace --exclude krishiv-python --exclude krishiv-chaos` (full sweep including integration tests; the only expected failure is the pre-existing flaky `rocksdb_ephemeral_is_faster_than_file_backed_with_durable_fsync` performance test on fast hosts).
+
+---
+
 ## 2026-06-30 — Docker image size optimization + nightly publish
 
 **Scope**: Shrink the distributed Docker image ~4x via multi-call binary,

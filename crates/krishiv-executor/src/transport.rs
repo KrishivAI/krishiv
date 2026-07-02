@@ -674,7 +674,12 @@ pub async fn serve_executor_task_grpc_with_listener_and_continuous(
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            executor_task_grpc_server_with_continuous(inbox, loop_executors, continuous_inputs),
+            executor_task_grpc_server_with_continuous(
+                inbox,
+                loop_executors,
+                continuous_inputs,
+                None,
+            ),
             krishiv_metrics::grpc::extract_trace_context,
         ))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
