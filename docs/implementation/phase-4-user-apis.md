@@ -34,6 +34,13 @@ DataFusion implementation types.
   They are not presented as distributed atomic sink operators.
 - Analyze statistics are currently local. Remote statistics require a versioned
   coordinator/Flight metrics response rather than client-side guesses.
+- Flight SQL `BeginTransaction`/`EndTransaction` track an opaque transaction id
+  for client bookkeeping only; every statement still executes autocommit
+  regardless of an open transaction (no write buffering, no snapshot reads,
+  no participation by the catalog or execution layer). `Commit` and
+  `Rollback` are therefore both no-ops against already-applied statements —
+  real atomicity/isolation requires staged execution and is tracked as
+  remaining work, not implied by the actions existing.
 
 ## Remaining Phase 4 work
 
@@ -60,7 +67,8 @@ DataFusion implementation types.
 - [x] SQL `DESCRIBE` / `SHOW COLUMNS` / `EXPLAIN` intercepts.
 - [x] `CREATE LIVE TABLE` routing through `SqlEngine::sql()`.
 - [x] Distributed atomic parquet sink writes via `DataFrameWriter` (remote SQL-backed).
-- [x] Flight SQL `BeginTransaction` / `EndTransaction` actions.
+- [x] Flight SQL `BeginTransaction` / `EndTransaction` actions (bookkeeping
+      only — see "Deliberate compatibility rules" for the atomicity caveat).
 - [x] Generic reader/writer `option()` compatibility mapping.
 - [x] `krishiv-sql-gateway` separately versioned JDBC/ODBC facade crate.
 - [x] Python `BlockingSession`, streaming joins (`stream_table_join`, `temporal_join`,

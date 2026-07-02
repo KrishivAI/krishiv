@@ -199,6 +199,64 @@ mod tests {
         );
     }
 
+    // Regression test: `pivot_sql::rewrite_pivot_unpivot` was defined and unit
+    // tested in isolation but never called from `SqlEngine::sql()`, so a raw
+    // `PIVOT (...)` query fell through to DataFusion (which does not parse
+    // PIVOT natively) and errored with "unsupported ast node Pivot". Verifies
+    // the rewrite is actually wired into the query path, not just present.
+    #[tokio::test]
+    async fn sql_text_pivot_is_wired_into_query_execution() {
+        let engine = SqlEngine::new();
+        let dataframe = engine
+            .sql(
+                "SELECT * FROM (VALUES (1,'a',10),(2,'b',20)) AS t(id,cat,val) \
+                 PIVOT (SUM(val) FOR cat IN ('a','b'))",
+            )
+            .await
+            .unwrap_or_else(|error| panic!("PIVOT query must execute, got: {error}"));
+        let batches = dataframe.collect().await.unwrap();
+        let schema = batches[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn sql_text_unpivot_is_wired_into_query_execution() {
+        let engine = SqlEngine::new();
+        let dataframe = engine
+            .sql(
+                "SELECT * FROM (VALUES (1,10,20)) AS t(id,jan,feb) \
+                 UNPIVOT (amount FOR month IN (jan, feb))",
+            )
+            .await
+            .unwrap_or_else(|error| panic!("UNPIVOT query must execute, got: {error}"));
+        let batches = dataframe.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2, "one row per unpivoted column (jan, feb)");
+    }
+
+    #[tokio::test]
+    async fn information_schema_tables_is_queryable() {
+        let engine = SqlEngine::new();
+        engine
+            .sql("SELECT 1 AS x")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let dataframe = engine
+            .sql("SELECT table_name FROM information_schema.tables ORDER BY table_name")
+            .await
+            .unwrap_or_else(|error| panic!("information_schema.tables must be queryable: {error}"));
+        let batches = dataframe.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(
+            total_rows > 0,
+            "information_schema.tables must list at least the information_schema tables themselves"
+        );
+    }
+
     #[test]
     fn resolve_query_memory_limit_bytes_falls_back_for_missing_invalid_and_zero() {
         assert_eq!(resolve_query_memory_limit_bytes(None), None);

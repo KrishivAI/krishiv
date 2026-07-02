@@ -46,7 +46,16 @@ fn run_coordinator(args: &[String]) -> i32 {
             if let Some(sidecar) = build_flight_sidecar(&config) {
                 sidecars.push(sidecar);
             }
-            match block_on(run_standalone_coordinator(config, factory, sidecars)) {
+            // Stringify the error inside the awaited future: `Box<dyn Error>`
+            // (krishiv-scheduler's return type) is not `Send`, but `block_on`
+            // requires its future's output to be `Send`. Only the `Display`
+            // text is used here, so converting before crossing that boundary
+            // avoids changing krishiv-scheduler's error type.
+            match block_on(async {
+                run_standalone_coordinator(config, factory, sidecars)
+                    .await
+                    .map_err(|e| e.to_string())
+            }) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("{e}");
@@ -73,7 +82,11 @@ fn run_clusterd(args: &[String]) -> i32 {
             if let Some(sidecar) = build_flight_sidecar(&config) {
                 sidecars.push(sidecar);
             }
-            match block_on(run_clusterd_daemon(config, factory, sidecars)) {
+            match block_on(async {
+                run_clusterd_daemon(config, factory, sidecars)
+                    .await
+                    .map_err(|e| e.to_string())
+            }) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("{e}");
@@ -146,7 +159,11 @@ fn run_job_coordinator(args: &[String]) -> i32 {
             print!("{}", job_coordinator_daemon_help());
             0
         }
-        Ok(config) => match block_on(run_job_coordinator_daemon(config)) {
+        Ok(config) => match block_on(async {
+            run_job_coordinator_daemon(config)
+                .await
+                .map_err(|e| e.to_string())
+        }) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("{e}");

@@ -56,6 +56,28 @@ impl PyColumn {
         )
     }
 
+    /// Attach a `ROWS BETWEEN start AND end` frame to a window column built
+    /// with `.over(...)`. `start`/`end` follow the PySpark convention:
+    /// a negative int is N PRECEDING, 0 is CURRENT ROW, a positive int is N
+    /// FOLLOWING, and `None` is UNBOUNDED (PRECEDING for `start`, FOLLOWING
+    /// for `end`). A no-op if called before `.over(...)`.
+    #[pyo3(signature = (start, end))]
+    pub fn rows_between(&self, start: Option<i64>, end: Option<i64>) -> Self {
+        Self::new(self.inner.clone().frame(krishiv_api::WindowFrame::rows(
+            frame_bound(start, true),
+            frame_bound(end, false),
+        )))
+    }
+
+    /// Same as [`Self::rows_between`] but for a `RANGE BETWEEN` frame.
+    #[pyo3(signature = (start, end))]
+    pub fn range_between(&self, start: Option<i64>, end: Option<i64>) -> Self {
+        Self::new(self.inner.clone().frame(krishiv_api::WindowFrame::range(
+            frame_bound(start, true),
+            frame_bound(end, false),
+        )))
+    }
+
     pub fn asc(&self) -> Self {
         Self::new(self.inner.clone().asc())
     }
@@ -207,6 +229,96 @@ pub fn call_function(name: String, arguments: Vec<PyColumn>) -> PyColumn {
         name,
         arguments.into_iter().map(|column| column.inner).collect(),
     ))
+}
+
+// ── Window functions ──────────────────────────────────────────────────────────
+//
+// Typed sugar meant to be chained with `.over(...)` (and optionally
+// `.rows_between(...)`/`.range_between(...)`), e.g.
+// `rank().over(partition_by=[col("dept")], order_by=[col("salary").desc()])`.
+
+/// Convert a PySpark-style signed frame bound (negative = N PRECEDING, 0 =
+/// CURRENT ROW, positive = N FOLLOWING, `None` = UNBOUNDED) into a typed
+/// `WindowFrameBound`. `is_start` picks UNBOUNDED PRECEDING vs. UNBOUNDED
+/// FOLLOWING for the `None` case, since a bare `None` doesn't say which side
+/// of the frame it bounds.
+fn frame_bound(value: Option<i64>, is_start: bool) -> krishiv_api::WindowFrameBound {
+    use krishiv_api::WindowFrameBound as B;
+    match value {
+        None if is_start => B::UnboundedPreceding,
+        None => B::UnboundedFollowing,
+        Some(0) => B::CurrentRow,
+        Some(n) if n < 0 => B::Preceding(n.unsigned_abs()),
+        Some(n) => B::Following(n as u64),
+    }
+}
+
+#[pyfunction]
+pub fn row_number() -> PyColumn {
+    PyColumn::new(krishiv_api::row_number())
+}
+#[pyfunction]
+pub fn rank() -> PyColumn {
+    PyColumn::new(krishiv_api::rank())
+}
+#[pyfunction]
+pub fn dense_rank() -> PyColumn {
+    PyColumn::new(krishiv_api::dense_rank())
+}
+#[pyfunction]
+pub fn percent_rank() -> PyColumn {
+    PyColumn::new(krishiv_api::percent_rank())
+}
+#[pyfunction]
+pub fn cume_dist() -> PyColumn {
+    PyColumn::new(krishiv_api::cume_dist())
+}
+#[pyfunction]
+pub fn ntile(n: i64) -> PyColumn {
+    PyColumn::new(krishiv_api::ntile(n))
+}
+
+#[pyfunction]
+#[pyo3(signature = (column, offset=1, default=None))]
+pub fn lag(
+    column: PyColumn,
+    offset: i64,
+    default: Option<&Bound<'_, PyAny>>,
+) -> PyResult<PyColumn> {
+    let default = default.map(expression_from_python).transpose()?;
+    Ok(PyColumn::new(krishiv_api::lag(
+        column.inner,
+        offset,
+        default,
+    )))
+}
+
+#[pyfunction]
+#[pyo3(signature = (column, offset=1, default=None))]
+pub fn lead(
+    column: PyColumn,
+    offset: i64,
+    default: Option<&Bound<'_, PyAny>>,
+) -> PyResult<PyColumn> {
+    let default = default.map(expression_from_python).transpose()?;
+    Ok(PyColumn::new(krishiv_api::lead(
+        column.inner,
+        offset,
+        default,
+    )))
+}
+
+#[pyfunction]
+pub fn first_value(column: PyColumn) -> PyColumn {
+    PyColumn::new(krishiv_api::first_value(column.inner))
+}
+#[pyfunction]
+pub fn last_value(column: PyColumn) -> PyColumn {
+    PyColumn::new(krishiv_api::last_value(column.inner))
+}
+#[pyfunction]
+pub fn nth_value(column: PyColumn, n: i64) -> PyColumn {
+    PyColumn::new(krishiv_api::nth_value(column.inner, n))
 }
 
 fn parse_data_type(value: &str) -> PyResult<krishiv_api::ExprDataType> {

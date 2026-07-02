@@ -453,10 +453,30 @@ pub struct ConnectorSourceProvider;
 impl SourceProvider for ConnectorSourceProvider {
     async fn open(&self, spec: &SourceSpec) -> EngineResult<Box<dyn SourceReader>> {
         match spec.connector.as_str() {
-            "parquet" => Ok(Box::new(DynSourceReader {
-                inner: build_dyn_source(spec)?,
-            })),
-            "csv" => Ok(Box::new(CsvFileSourceReader::open(&spec.uri)?)),
+            "parquet" => {
+                // `ParquetSource::open` reads the file footer synchronously
+                // (blocking `std::fs::File::open` + metadata parse). Offload
+                // to the blocking pool so opening a Parquet source doesn't
+                // stall the tokio reactor, matching the JSON branch below.
+                let spec = spec.clone();
+                let inner = tokio::task::spawn_blocking(move || build_dyn_source(&spec))
+                    .await
+                    .map_err(|e| {
+                        EngineError::Source(format!("parquet source open task panicked: {e}"))
+                    })??;
+                Ok(Box::new(DynSourceReader { inner }))
+            }
+            "csv" => {
+                // Same concern as Parquet above: `CsvFileSourceReader::open`
+                // does a blocking file open + header/schema inference.
+                let uri = spec.uri.clone();
+                let reader = tokio::task::spawn_blocking(move || CsvFileSourceReader::open(&uri))
+                    .await
+                    .map_err(|e| {
+                        EngineError::Source(format!("csv source open task panicked: {e}"))
+                    })??;
+                Ok(Box::new(reader))
+            }
             "json" | "ndjson" => {
                 // `JsonFileSourceReader::open` reads the entire file into
                 // memory. Use the async variant so large NDJSON files do

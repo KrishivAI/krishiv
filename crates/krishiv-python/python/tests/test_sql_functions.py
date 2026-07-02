@@ -22,18 +22,24 @@ FUNCTION_NAMES = {
     "cos",
     "count",
     "count_all",
+    "cume_dist",
     "current_date",
     "current_timestamp",
     "date_trunc",
+    "dense_rank",
     "desc",
     "exp",
     "expr",
+    "first_value",
     "floor",
     "function",
     "ifnull",
     "isnan",
     "isnotnull",
     "isnull",
+    "lag",
+    "last_value",
+    "lead",
     "length",
     "lit",
     "log",
@@ -42,8 +48,13 @@ FUNCTION_NAMES = {
     "max",
     "mean",
     "min",
+    "nth_value",
+    "ntile",
     "nullif",
+    "percent_rank",
+    "rank",
     "round",
+    "row_number",
     "rtrim",
     "sin",
     "sqrt",
@@ -145,6 +156,54 @@ def test_aggregate_helpers_render_and_execute():
         "mean_amount",
         "min_amount",
         "max_amount",
+    ]:
+        assert header in text
+
+
+def test_window_functions_render_and_execute():
+    dataframe = ks.Session.local().sql(
+        "SELECT 1 AS grp, 10 AS amount UNION ALL SELECT 1 AS grp, 20 AS amount "
+        "UNION ALL SELECT 1 AS grp, 30 AS amount"
+    )
+    order = [F.asc(F.col("amount"))]
+    windowed = dataframe.select_columns(
+        [
+            F.col("grp"),
+            F.col("amount"),
+            F.row_number().over(partition_by=[F.col("grp")], order_by=order).alias("rn"),
+            F.rank().over(partition_by=[F.col("grp")], order_by=order).alias("rk"),
+            F.dense_rank().over(partition_by=[F.col("grp")], order_by=order).alias("dr"),
+            F.percent_rank().over(partition_by=[F.col("grp")], order_by=order).alias("pr"),
+            F.cume_dist().over(partition_by=[F.col("grp")], order_by=order).alias("cd"),
+            F.ntile(2).over(partition_by=[F.col("grp")], order_by=order).alias("nt"),
+            F.lag(F.col("amount"), 1).over(partition_by=[F.col("grp")], order_by=order).alias("lag_amt"),
+            F.lead(F.col("amount"), 1).over(partition_by=[F.col("grp")], order_by=order).alias("lead_amt"),
+            F.first_value(F.col("amount")).over(partition_by=[F.col("grp")], order_by=order).alias("first_amt"),
+            F.last_value(F.col("amount"))
+            .over(partition_by=[F.col("grp")], order_by=order)
+            .rows_between(None, None)
+            .alias("last_amt"),
+            F.sum(F.col("amount"))
+            .over(partition_by=[F.col("grp")], order_by=order)
+            .rows_between(None, 0)
+            .alias("running_sum"),
+        ]
+    )
+    result = windowed.collect()
+    assert result.row_count == 3
+    text = result.pretty()
+    for header in [
+        "rn",
+        "rk",
+        "dr",
+        "pr",
+        "cd",
+        "nt",
+        "lag_amt",
+        "lead_amt",
+        "first_amt",
+        "last_amt",
+        "running_sum",
     ]:
         assert header in text
     assert "6" in text

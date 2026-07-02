@@ -261,7 +261,7 @@ impl PyPipeline {
 
     /// Validate the pipeline without executing it (dry run). Raises on the first
     /// problem (undefined sink view, schema error, dependency cycle).
-    pub fn validate(&self) -> PyResult<()> {
+    pub fn validate(&self, py: Python<'_>) -> PyResult<()> {
         let builder = self.to_builder(
             self.sources.clone(),
             self.views.clone(),
@@ -269,8 +269,7 @@ impl PyPipeline {
             self.expectations.clone(),
             self.flows.clone(),
         );
-        crate::RUNTIME
-            .block_on(builder.build().validate())
+        py.detach(move || crate::RUNTIME.block_on(builder.build().validate()))
             .map_err(rt_err)
     }
 
@@ -279,7 +278,12 @@ impl PyPipeline {
     /// `advance` ∈ {"once", "on_change"}; `every_rows` coalesces input by row
     /// count. There is no trigger argument.
     #[pyo3(signature = (advance="once".to_string(), every_rows=None))]
-    pub fn run(&mut self, advance: String, every_rows: Option<usize>) -> PyResult<()> {
+    pub fn run(
+        &mut self,
+        py: Python<'_>,
+        advance: String,
+        every_rows: Option<usize>,
+    ) -> PyResult<()> {
         let policy = if let Some(n) = every_rows {
             RunPolicy::EveryRows(n)
         } else {
@@ -298,13 +302,19 @@ impl PyPipeline {
         let flows = std::mem::take(&mut self.flows);
 
         let builder = self.to_builder(sources, views, sinks, expectations, flows);
-        crate::RUNTIME.block_on(builder.run(policy)).map_err(rt_err)
+        py.detach(move || crate::RUNTIME.block_on(builder.run(policy)))
+            .map_err(rt_err)
     }
 
     /// Full-refresh: reset the pipeline's persisted IVM state, then run from
     /// scratch (Spark SDP `--full-refresh`). `advance`/`every_rows` as in `run`.
     #[pyo3(signature = (advance="once".to_string(), every_rows=None))]
-    pub fn refresh(&mut self, advance: String, every_rows: Option<usize>) -> PyResult<()> {
+    pub fn refresh(
+        &mut self,
+        py: Python<'_>,
+        advance: String,
+        every_rows: Option<usize>,
+    ) -> PyResult<()> {
         let policy = if let Some(n) = every_rows {
             RunPolicy::EveryRows(n)
         } else {
@@ -321,8 +331,7 @@ impl PyPipeline {
         let flows = std::mem::take(&mut self.flows);
 
         let builder = self.to_builder(sources, views, sinks, expectations, flows);
-        crate::RUNTIME
-            .block_on(builder.refresh(policy))
+        py.detach(move || crate::RUNTIME.block_on(builder.refresh(policy)))
             .map_err(rt_err)
     }
 

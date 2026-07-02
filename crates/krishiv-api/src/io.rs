@@ -202,7 +202,7 @@ impl DataFrameReader {
         Ok(self)
     }
 
-    pub fn load(self, path: impl AsRef<Path>) -> Result<DataFrame> {
+    pub fn load(self, path: impl AsRef<Path> + Send) -> Result<DataFrame> {
         krishiv_common::async_util::block_on(self.load_async(path))
     }
 

@@ -1136,9 +1136,18 @@ Execution statistics:
         }
     }
 
-    /// Print the first `num_rows` rows of this DataFrame to stdout.
+    /// Render the first `num_rows` rows of this DataFrame as a pretty-printed table.
     pub fn show(&self, num_rows: usize) -> Result<String> {
-        let batches = krishiv_common::async_util::block_on({
+        krishiv_common::async_util::block_on(self.show_async(num_rows))
+    }
+
+    /// Asynchronously render the first `num_rows` rows of this DataFrame.
+    ///
+    /// Prefer this over [`Self::show`] from async code: `show` executes the
+    /// query via `block_on`, which cannot be called from a thread already
+    /// driving a Tokio runtime without hopping to a fresh OS thread.
+    pub async fn show_async(&self, num_rows: usize) -> Result<String> {
+        let batches = {
             let df = self.clone();
             async move {
                 if let Some(batches) = &df.pre_collected {
@@ -1151,7 +1160,8 @@ Execution statistics:
                     "show requires an executable DataFrame",
                 ))
             }
-        })?;
+        }
+        .await?;
         let display: Vec<_> = batches
             .iter()
             .flat_map(|b| (0..b.num_rows()).map(|i| b.slice(i, 1)))
@@ -1189,9 +1199,19 @@ Execution statistics:
 
     /// Return a DataFrame with summary statistics (count, null_count, mean, std, min, max, median).
     pub fn describe(&self) -> Result<DataFrame> {
+        krishiv_common::async_util::block_on(self.describe_async())
+    }
+
+    /// Asynchronously compute summary statistics (count, null_count, mean, std, min, max, median).
+    ///
+    /// Prefer this over [`Self::describe`] from async code: `describe` runs a
+    /// real aggregate query via `block_on`, which cannot be called from a
+    /// thread already driving a Tokio runtime without hopping to a fresh OS
+    /// thread.
+    pub async fn describe_async(&self) -> Result<DataFrame> {
         match &self.sql_dataframe {
             Some(df) => {
-                let new_ops = krishiv_common::async_util::block_on(df.describe())?;
+                let new_ops = df.describe().await?;
                 Ok(self.with_new_ops(new_ops))
             }
             None => Err(KrishivError::unsupported(

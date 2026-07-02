@@ -44,21 +44,31 @@ fn fallback_runtime() -> &'static tokio::runtime::Runtime {
 /// 1. If called inside a multi-threaded Tokio runtime, use `block_in_place`
 ///    so the current worker thread can be borrowed without starving the
 ///    runtime.
-/// 2. If called inside a current-thread (single-threaded) Tokio runtime,
-///    drive `fut` on the lazily-initialised fallback multi-thread runtime.
-///    Calling `Handle::block_on` on the current-thread runtime would panic
-///    because the caller's task cannot block its own worker.
+/// 2. If called inside a current-thread (single-threaded) Tokio runtime, hop
+///    to a fresh OS thread with no Tokio context and drive `fut` there on the
+///    lazily-initialised fallback multi-thread runtime. `block_in_place`
+///    cannot be used here (it requires a multi-threaded runtime), and calling
+///    `.block_on` on *any* runtime — even a separate fallback one — from this
+///    thread would still panic with "Cannot start a runtime from within a
+///    runtime": Tokio's nesting guard is a per-OS-thread flag, not a
+///    per-runtime-instance one, so only a thread with no entered runtime at
+///    all can safely call `block_on`.
 /// 3. If no Tokio runtime is active in the calling thread, drive `fut` on a
 ///    lazily-initialised multi-thread fallback runtime. The fallback is
 ///    deliberately lazy because constructing a runtime while another runtime
 ///    is active on the same thread is undefined behaviour in Tokio.
-pub fn block_on<T, F: Future<Output = T>>(fut: F) -> T {
+pub fn block_on<T: Send, F: Future<Output = T> + Send>(fut: F) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(|| handle.block_on(fut))
             }
-            _ => fallback_runtime().block_on(fut),
+            _ => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| fallback_runtime().block_on(fut))
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e))
+            }),
         },
         Err(_) => fallback_runtime().block_on(fut),
     }
@@ -119,6 +129,25 @@ mod tests {
                 .await
                 .unwrap()
         });
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn block_on_works_inside_current_thread_tokio_runtime() {
+        // Regression test: calling `block_on` synchronously from within an
+        // *async* fn running on a current-thread (single-threaded) runtime —
+        // e.g. the default `#[tokio::test]` flavor, or any
+        // `#[tokio::main(flavor = "current_thread")]` app — used to panic
+        // ("Cannot start a runtime from within a runtime") because the old
+        // fallback path called `.block_on` on a *different* runtime object
+        // without first releasing this thread from its already-entered
+        // runtime context. Tokio's nesting guard is per-OS-thread, not
+        // per-runtime-instance, so that didn't actually avoid the panic.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(async { block_on(async { 42u32 }) });
         assert_eq!(result, 42);
     }
 }

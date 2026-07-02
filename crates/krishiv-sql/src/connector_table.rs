@@ -171,7 +171,20 @@ impl TableProviderFactory for ConnectorTableFactory {
         _state: &dyn datafusion::catalog::Session,
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
-        let config = connector_config_from_ddl(self.connector_kind, cmd)?;
+        // `connector_config_from_ddl` calls `validate_path_under_warehouse`,
+        // which does blocking `Path::canonicalize` syscalls. Run it on the
+        // blocking pool so this async `create` never stalls the DataFusion/
+        // Flight SQL async worker thread on filesystem I/O.
+        let kind = self.connector_kind;
+        let cmd_owned = cmd.clone();
+        let config =
+            tokio::task::spawn_blocking(move || connector_config_from_ddl(kind, &cmd_owned))
+                .await
+                .map_err(|e| {
+                    DataFusionError::External(Box::new(ConnectorError::Unsupported {
+                        message: format!("connector config validation task panicked: {e}"),
+                    }))
+                })??;
         self.registry
             .validate_source(&config)
             .map_err(connector_error)?;

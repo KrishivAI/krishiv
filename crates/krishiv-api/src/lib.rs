@@ -66,7 +66,9 @@ pub use error::{KrishivError, Result};
 pub use expression::{
     AggregateFunction as ExprAggregateFunction, BinaryOperator as ExprBinaryOperator,
     EXPRESSION_FORMAT_VERSION, Expr, ExprDataType, ExprField, IntervalUnit, Literal, NullOrdering,
-    ScalarValue, SortDirection, TimeUnit, avg, col, count, count_all, function, lit, max, min, sum,
+    ScalarValue, SortDirection, TimeUnit, WindowFrame, WindowFrameBound, WindowFrameUnits, avg,
+    col, count, count_all, cume_dist, dense_rank, first_value, function, lag, last_value, lead,
+    lit, max, min, nth_value, ntile, percent_rank, rank, row_number, sum,
 };
 pub use incremental_flow::{IncrementalFlow, StepSummary};
 pub use io::{

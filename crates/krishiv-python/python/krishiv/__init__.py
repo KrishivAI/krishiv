@@ -81,19 +81,41 @@ async def connect_async(url: str) -> Session:
 
 
 _native_session_sql = Session.sql
+_native_session_sql_async = getattr(Session, "sql_async", None)
 
 
 async def _session_sql_async(self, query: str):
-    """Plan SQL from async code and return a lazy DataFrame."""
-    return _native_session_sql(self, query)
+    """Plan SQL from async code and return a lazy DataFrame.
+
+    Prefers the native ``sql_async`` (a genuine coroutine created via
+    ``pyo3-async-runtimes::future_into_py`` — it schedules work on the Tokio
+    runtime and suspends this coroutine without blocking the event loop).
+    Falls back to running the synchronous ``sql`` on a thread-pool executor
+    if the native method is unavailable or is not itself awaitable, so this
+    never blocks the calling event loop either way.
+    """
+    if _native_session_sql_async is not None:
+        result = _native_session_sql_async(self, query)
+        if _inspect.isawaitable(result):
+            return await result
+        return result
+    loop = _asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _native_session_sql, self, query)
 
 
-_native_dataframe_collect = DataFrame.collect
+_native_dataframe_collect_async = DataFrame.collect_async
 
 
 async def _dataframe_collect_async(self):
-    """Collect a DataFrame from async code."""
-    return _native_dataframe_collect(self)
+    """Collect a DataFrame from async code (runs on a thread pool).
+
+    The native ``collect_async`` blocks the calling thread until the query
+    completes (it releases the GIL internally but returns only once the
+    result is ready), so it must run on a worker thread rather than be
+    called directly on the event loop thread.
+    """
+    loop = _asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _native_dataframe_collect_async, self)
 
 
 _native_dataframe_execute_stream_async = DataFrame.execute_stream_async
@@ -256,6 +278,15 @@ try:
     from .krishiv import WindowedStream
     _orig_windowed_anext = WindowedStream.__anext__
     async def _new_windowed_anext(self):
+        # NOTE: unlike DataFrameStream below, WindowedStream is a PyO3
+        # `unsendable` pyclass (bound to the OS thread that created it), so
+        # its __anext__ cannot be offloaded to a thread-pool executor the
+        # way DataFrameStream's is -- pyo3 panics ("is unsendable, but sent
+        # to another thread") if it's touched from any other thread. The
+        # native __anext__ (stream.rs) still releases the GIL (py.detach)
+        # around its blocking recv, so other Python threads can make
+        # progress during the wait, but this call itself still blocks the
+        # calling event loop's thread until a batch arrives.
         return _orig_windowed_anext(self)
     WindowedStream.__anext__ = _new_windowed_anext
 except (ImportError, AttributeError):

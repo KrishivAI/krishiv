@@ -228,6 +228,7 @@ impl PyIvmJob {
     #[pyo3(signature = (name, body_sql, schema, is_materialized=false, is_recursive=false))]
     pub fn register_view(
         &self,
+        py: Python<'_>,
         name: String,
         body_sql: String,
         schema: &Bound<'_, PyType>,
@@ -243,8 +244,7 @@ impl PyIvmJob {
             is_recursive,
             lateness: vec![],
         };
-        crate::RUNTIME
-            .block_on(self.inner.register_view(spec))
+        py.detach(move || crate::RUNTIME.block_on(self.inner.register_view(spec)))
             .map_err(rt_err)
     }
 
@@ -253,6 +253,7 @@ impl PyIvmJob {
     #[pyo3(signature = (name, body_sql, schema, lateness_ms, is_materialized=false, is_recursive=false))]
     pub fn register_view_with_lateness(
         &self,
+        py: Python<'_>,
         name: String,
         body_sql: String,
         schema: &Bound<'_, PyType>,
@@ -276,8 +277,7 @@ impl PyIvmJob {
             is_recursive,
             lateness,
         };
-        crate::RUNTIME
-            .block_on(self.inner.register_view(spec))
+        py.detach(move || crate::RUNTIME.block_on(self.inner.register_view(spec)))
             .map_err(rt_err)
     }
 

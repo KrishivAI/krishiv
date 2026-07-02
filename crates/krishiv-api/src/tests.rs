@@ -33,6 +33,25 @@ async fn block_on_does_not_panic_inside_tokio_runtime() {
     );
 }
 
+// Regression test for a bug found auditing this exact call path: the old
+// current-thread fallback in `krishiv_common::async_util::block_on` called
+// `.block_on` on a *separate* fallback runtime while this thread already had
+// one entered — Tokio's nesting guard is per-OS-thread, not per-runtime-
+// instance, so it still panicked with "Cannot start a runtime from within a
+// runtime". `#[tokio::test]` without an explicit flavor uses a current-thread
+// runtime, exercising exactly the branch the multi-thread test above does not.
+#[tokio::test]
+async fn block_on_does_not_panic_inside_current_thread_tokio_runtime() {
+    let session = Session::builder()
+        .build()
+        .expect("SessionBuilder must succeed");
+    let result = session.sql("SELECT 1 AS v");
+    assert!(
+        result.is_ok(),
+        "block_on panicked inside a current-thread Tokio runtime: {result:?}"
+    );
+}
+
 #[test]
 fn session_builder_defaults_to_embedded() {
     let session = match Session::builder().build() {
@@ -671,6 +690,149 @@ async fn embedded_read_parquet_collects_locally() {
     let session = Session::builder().build().unwrap();
     let df = session.read_parquet_async(&parquet_path).await.unwrap();
     let result = df.collect_async().await.unwrap();
+    assert_eq!(result.row_count(), 3);
+}
+
+// ── Async twins added alongside the sync/async correctness audit ───────────
+
+#[tokio::test]
+async fn describe_async_matches_describe() {
+    let session = Session::builder().build().unwrap();
+    let df = session
+        .sql("SELECT * FROM (VALUES (1), (2), (3)) AS t(x)")
+        .unwrap();
+    let sync_result = df.describe().unwrap().collect().unwrap();
+    let async_result = df
+        .describe_async()
+        .await
+        .unwrap()
+        .collect_async()
+        .await
+        .unwrap();
+    assert_eq!(sync_result.row_count(), async_result.row_count());
+    assert!(sync_result.row_count() > 0);
+}
+
+#[tokio::test]
+async fn show_async_matches_show() {
+    let session = Session::builder().build().unwrap();
+    let df = session.sql("SELECT 1 AS x").unwrap();
+    let sync_text = df.show(10).unwrap();
+    let async_text = df.show_async(10).await.unwrap();
+    assert_eq!(sync_text, async_text);
+    assert!(sync_text.contains('1'));
+}
+
+#[tokio::test]
+async fn read_parquet_with_options_async_collects_rows() {
+    let temp = tempdir().unwrap();
+    let parquet_path = temp.path().join("people.parquet");
+    write_people_parquet(&parquet_path);
+    let session = Session::builder().build().unwrap();
+    let df = session
+        .read_parquet_with_options_async(
+            &parquet_path,
+            krishiv_sql::ParquetReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+    let result = df.collect_async().await.unwrap();
+    assert_eq!(result.row_count(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_async_embedded_push_and_drain() {
+    use krishiv_runtime::LocalWindowExecutionSpec;
+
+    let session = Session::builder().build().unwrap();
+    let spec = LocalWindowExecutionSpec {
+        key_column: "user_id".into(),
+        key_column_type: String::from("utf8"),
+        event_time_column: "ts".into(),
+        watermark_lag_ms: 0,
+        window_kind: LocalWindowKind::Tumbling,
+        window_size_ms: 10_000,
+        agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+        state_ttl_ms: None,
+        allowed_lateness_ms: None,
+        source_watermark_lags: HashMap::new(),
+        source_id_column: None,
+        window_timezone: None,
+    };
+    let job = session
+        .stream_async("stream-async-test", spec)
+        .await
+        .expect("stream_async");
+    assert!(matches!(job, crate::StreamJob::Embedded(_)));
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a"])) as _,
+            Arc::new(Int64Array::from(vec![1_000])) as _,
+        ],
+    )
+    .unwrap();
+    job.push(vec![batch]).await.expect("push");
+    let _ = job.drain().await.expect("drain");
+}
+
+#[test]
+fn typed_window_functions_and_frame_execute() {
+    use crate::expression::{
+        WindowFrame, WindowFrameBound, col, dense_rank, first_value, lag, last_value, lead, rank,
+        row_number, sum,
+    };
+
+    let session = Session::builder().build().unwrap();
+    let df = session
+        .sql(
+            "SELECT 1 AS grp, 10 AS amount UNION ALL SELECT 1 AS grp, 20 AS amount \
+             UNION ALL SELECT 1 AS grp, 30 AS amount",
+        )
+        .unwrap();
+    let order = vec![col("amount").asc()];
+    let windowed = df
+        .select_exprs(&[
+            col("grp"),
+            col("amount"),
+            row_number()
+                .over(vec![col("grp")], order.clone())
+                .alias("rn"),
+            rank().over(vec![col("grp")], order.clone()).alias("rk"),
+            dense_rank()
+                .over(vec![col("grp")], order.clone())
+                .alias("dr"),
+            lag(col("amount"), 1, None)
+                .over(vec![col("grp")], order.clone())
+                .alias("lag_amt"),
+            lead(col("amount"), 1, None)
+                .over(vec![col("grp")], order.clone())
+                .alias("lead_amt"),
+            first_value(col("amount"))
+                .over(vec![col("grp")], order.clone())
+                .alias("first_amt"),
+            last_value(col("amount"))
+                .over(vec![col("grp")], order.clone())
+                .frame(WindowFrame::rows(
+                    WindowFrameBound::UnboundedPreceding,
+                    WindowFrameBound::UnboundedFollowing,
+                ))
+                .alias("last_amt"),
+            sum(col("amount"))
+                .over(vec![col("grp")], order.clone())
+                .frame(WindowFrame::rows(
+                    WindowFrameBound::UnboundedPreceding,
+                    WindowFrameBound::CurrentRow,
+                ))
+                .alias("running_sum"),
+        ])
+        .unwrap();
+    let result = windowed.collect().unwrap();
     assert_eq!(result.row_count(), 3);
 }
 
