@@ -9,11 +9,10 @@ use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 
-use krishiv_connectors::ConnectorConfig;
 use krishiv_runtime::LocalWindowKind;
 
 use crate::error::KrishivError;
-use crate::session::{Session, SessionBuilder, SubmittedSqlJobState};
+use crate::session::{Session, SessionBuilder};
 use crate::types::{ExecutionMode, StreamBatch, StreamMode};
 use crate::window::{
     KeyedStream, MultiSourceWatermarkSpec, SessionWindowedStream, SlidingWindowedStream,
@@ -89,108 +88,6 @@ fn session_builder_preserves_coordinator_grpc_url() {
         session.coordinator_grpc_url(),
         Some("http://127.0.0.1:9090")
     );
-}
-
-#[test]
-fn session_registers_validated_sink_configs() {
-    let session = Session::builder().build().unwrap();
-    let config = ConnectorConfig::new("out", "parquet").with_property("path", "/tmp/out.parquet");
-
-    session.register_sink_config(config).unwrap();
-
-    let sinks = session.registered_sink_configs();
-    assert_eq!(sinks.len(), 1);
-    assert_eq!(sinks[0].name, "out");
-    assert_eq!(sinks[0].kind, "parquet");
-    assert!(session.sink_config("out").is_some());
-}
-
-#[test]
-fn session_rejects_invalid_sink_configs() {
-    let session = Session::builder().build().unwrap();
-    let error = session
-        .register_sink_config(ConnectorConfig::new("out", "parquet"))
-        .unwrap_err();
-
-    assert!(
-        matches!(error, KrishivError::InvalidConfig { .. }),
-        "expected invalid config, got {error:?}"
-    );
-    assert!(session.registered_sink_configs().is_empty());
-}
-
-#[tokio::test]
-async fn submit_sql_background_tracks_failed_local_job() {
-    let session = Session::builder().build().unwrap();
-    let dir = tempdir().unwrap();
-    let input = dir.path().join("people.parquet");
-    let output = dir.path().join("out.parquet");
-    write_people_parquet(&input);
-    let sql = format!(
-        "CREATE SOURCE orders FROM parquet(path='{}'); \
-         CREATE SOURCE bad AS SELECT missing_column FROM orders; \
-         CREATE SINK out FROM bad INTO parquet(path='{}');",
-        input.display(),
-        output.display()
-    );
-
-    let submitted = session.submit_sql_background(&sql).unwrap();
-    assert_eq!(submitted.job_id(), "out");
-    assert_eq!(submitted.state(), SubmittedSqlJobState::Running);
-
-    let final_status = wait_for_submitted_sql_terminal(&session, "out").await;
-    assert_eq!(final_status.state(), SubmittedSqlJobState::Failed);
-    assert!(final_status.error().is_some());
-    assert_eq!(
-        session
-            .jobs()
-            .into_iter()
-            .find(|job| job.id().as_str() == "out")
-            .map(|job| job.state()),
-        Some(krishiv_runtime::JobState::Failed)
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_submitted_sql_job_marks_local_status_cancelled() {
-    let session = Session::builder().build().unwrap();
-    let dir = tempdir().unwrap();
-    let input = dir.path().join("missing.parquet");
-    let output = dir.path().join("out.parquet");
-    let sql = format!(
-        "CREATE SOURCE orders FROM parquet(path='{}'); \
-         CREATE SINK out FROM orders INTO parquet(path='{}');",
-        input.display(),
-        output.display()
-    );
-
-    session.submit_sql_background(&sql).unwrap();
-    let cancelled = session.cancel_submitted_sql_job("out").unwrap();
-
-    assert_eq!(cancelled.state(), SubmittedSqlJobState::Cancelled);
-    assert_eq!(
-        session
-            .jobs()
-            .into_iter()
-            .find(|job| job.id().as_str() == "out")
-            .map(|job| job.state()),
-        Some(krishiv_runtime::JobState::Cancelled)
-    );
-}
-
-async fn wait_for_submitted_sql_terminal(
-    session: &Session,
-    job_id: &str,
-) -> crate::SubmittedSqlJobStatus {
-    for _ in 0..100 {
-        if let Some(status) = session.submitted_sql_job_status(job_id)
-            && status.state().is_terminal()
-        {
-            return status;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("background SQL job {job_id} did not reach a terminal state");
 }
 
 #[test]

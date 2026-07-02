@@ -134,7 +134,7 @@ fn window_aggs_to_exec(aggs: &[krishiv_plan::window::WindowAgg]) -> Vec<AggExpr>
 
 #[cfg(test)]
 mod tests {
-    use krishiv_plan::window::WindowExecutionSpec;
+    use krishiv_plan::window::{WindowAgg, WindowExecutionSpec};
     use krishiv_plan::{ExecutionKind, NodeOp, PhysicalPlan, PlanNode};
 
     use super::*;

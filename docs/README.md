@@ -45,7 +45,6 @@ Core implementation choices:
 | `krishiv-flight-sql` | Arrow Flight SQL service. |
 | `krishiv-sql-gateway` | Separately versioned JDBC/ODBC SQL gateway facade. |
 | `krishiv-python` | PyO3 Python bindings. |
-| `krishiv-mcp` | Model Context Protocol frontend over the public `Session` API. |
 | `krishiv-metrics` | Metrics, tracing, and debug report structures. |
 | `krishiv-chaos` | Cross-crate chaos and fault-injection integration tests. |
 | `krishiv-bench` | Benchmarks (on-demand; excluded from default workspace builds). Schema registry helpers live in `krishiv-connectors`'s `schema-registry` feature. |
@@ -53,7 +52,7 @@ Core implementation choices:
 ## Runtime Modes
 
 ```text
-SQL / API / Flight / MCP
+SQL / API / Flight
   -> Session + catalog
   -> DataFusion + Krishiv plan
   -> ExecutionRuntime
@@ -78,29 +77,6 @@ storage is async-capable; scheduler gRPC checkpoint acks use the async path.
 is the user-visible mode; `ExecutionPlacement` says where data-plane work may
 actually run. Distributed sessions require an explicit remote Flight endpoint
 and must not silently fall back to in-process execution.
-
-## MCP Frontend
-
-`krishiv-mcp` exposes Krishiv through Model Context Protocol without adding a
-second engine path. The server is built over `SessionBuilder::from_env`, so the
-same embedded, single-node, and distributed routing rules apply to MCP clients.
-
-Current MCP tool families:
-
-- runtime/ops: health, runtime info, executor listing, metrics summary
-- SQL/catalog: execute, explain, list catalogs/tables, describe, sample
-- jobs: submit SQL jobs, list jobs, inspect status, fetch coordinator batch SQL
-  results or local submitted-job metadata, cancel coordinator jobs or local
-  background submissions
-- streaming: submit streaming pipelines and inspect streaming job status
-- IVM: create, feed, step, and snapshot incremental views
-- connectors: list connectors, validate configs, and register supported
-  sources/sinks
-
-MCP transports:
-
-- line-delimited JSON-RPC over stdio: `krishiv mcp --stdio`
-- HTTP JSON-RPC: `krishiv mcp --http --addr 127.0.0.1:8765`
 
 ## Deployment Modes
 
@@ -256,8 +232,6 @@ cargo fmt --check
 cargo run -p krishiv -- sql --query "select 1 as value"
 cargo run -p krishiv -- explain --query "select 1 as value"
 cargo run -p krishiv -- jobs
-cargo run -p krishiv -- mcp --stdio
-cargo run -p krishiv -- mcp --http --addr 127.0.0.1:8765
 ```
 
 Use narrower package tests while iterating, for example:

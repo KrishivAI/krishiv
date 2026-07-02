@@ -7,13 +7,11 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_common::async_util::block_on;
-use krishiv_connectors::ConnectorConfig;
-use krishiv_connectors::registry::default_registry;
 use krishiv_plan::governance::{AuthProvider, PolicyHook};
 use krishiv_plan::udf::{AggregateUdf, ScalarUdf, TableUdf, UdfRegistry};
 use krishiv_runtime::{
-    BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobState,
-    JobStatus, LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
+    BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobStatus,
+    LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
 };
 use krishiv_sql::{ContinuousTableInput, SqlEngine};
 
@@ -22,99 +20,6 @@ use crate::error::{KrishivError, Result};
 use crate::stream::Stream;
 use crate::types::{DeploymentTarget, ExecutionMode, StreamBatch, StreamMode};
 use crate::window::StateTtlConfig;
-
-/// Session-local lifecycle state for a background SQL job submitted through
-/// [`Session::submit_sql_background`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubmittedSqlJobState {
-    /// Accepted and registered, but not yet running.
-    Pending,
-    /// Running in this process through the session's normal mode-aware runtime.
-    Running,
-    /// Completed successfully.
-    Succeeded,
-    /// Failed with an error message.
-    Failed,
-    /// Cancellation was requested and the driver task was aborted.
-    Cancelled,
-}
-
-impl SubmittedSqlJobState {
-    /// Stable lowercase state token for frontends.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    /// Whether the job has reached a terminal state.
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
-    }
-}
-
-impl fmt::Display for SubmittedSqlJobState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Snapshot of a SQL job submitted in the background through a [`Session`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubmittedSqlJobStatus {
-    job_id: String,
-    name: String,
-    engine: crate::EngineKind,
-    state: SubmittedSqlJobState,
-    error: Option<String>,
-}
-
-impl SubmittedSqlJobStatus {
-    fn new(
-        job_id: impl Into<String>,
-        name: impl Into<String>,
-        engine: crate::EngineKind,
-        state: SubmittedSqlJobState,
-        error: Option<String>,
-    ) -> Self {
-        Self {
-            job_id: job_id.into(),
-            name: name.into(),
-            engine,
-            state,
-            error,
-        }
-    }
-
-    /// Job id used by the engine and local registry.
-    pub fn job_id(&self) -> &str {
-        &self.job_id
-    }
-
-    /// User-facing job name from the compiled SQL pipeline.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Engine selected by the SQL job compiler.
-    pub fn engine(&self) -> crate::EngineKind {
-        self.engine
-    }
-
-    /// Current lifecycle state.
-    pub fn state(&self) -> SubmittedSqlJobState {
-        self.state
-    }
-
-    /// Terminal failure reason, if any.
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
-}
 
 /// Builder for Krishiv sessions.
 #[derive(Clone)]
@@ -683,9 +588,6 @@ impl SessionBuilder {
             local_cluster,
             runtime,
             registered_parquet: Arc::new(DashMap::new()),
-            registered_sinks: Arc::new(DashMap::new()),
-            submitted_sql_jobs: Arc::new(DashMap::new()),
-            submitted_sql_job_aborts: Arc::new(DashMap::new()),
             stream_jobs: Arc::new(DashMap::new()),
             unbounded_streams: Arc::new(DashMap::new()),
             config: Arc::new(DashMap::from_iter(self.config)),
@@ -713,9 +615,6 @@ pub struct Session {
     local_cluster: Arc<InProcessCluster>,
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
-    registered_sinks: Arc<DashMap<String, ConnectorConfig>>,
-    submitted_sql_jobs: Arc<DashMap<String, SubmittedSqlJobStatus>>,
-    submitted_sql_job_aborts: Arc<DashMap<String, tokio::task::AbortHandle>>,
     stream_jobs: Arc<DashMap<String, LocalWindowExecutionSpec>>,
     unbounded_streams: Arc<DashMap<String, Arc<ContinuousTableInput>>>,
     config: Arc<DashMap<String, String>>,
@@ -903,149 +802,9 @@ impl Session {
         }
     }
 
-    /// Submit a SQL pipeline script on a background task and track its local
-    /// lifecycle in this session.
-    ///
-    /// Execution still goes through [`Session::submit`], so embedded,
-    /// single-node, and distributed placement rules stay centralized. The
-    /// returned status is an immediate snapshot; use
-    /// [`submitted_sql_job_status`](Self::submitted_sql_job_status) or
-    /// [`submitted_sql_jobs`](Self::submitted_sql_jobs) to poll.
-    pub fn submit_sql_background(&self, sql: &str) -> Result<SubmittedSqlJobStatus> {
-        tokio::runtime::Handle::try_current().map_err(|_| KrishivError::Runtime {
-            message: "submit_sql_background requires an active Tokio runtime".into(),
-        })?;
-
-        let job = crate::sql_job::compile_sql_job(sql)?;
-        let job_id = krishiv_runtime::JobId::try_new(job.name.clone()).map_err(|error| {
-            KrishivError::InvalidConfig {
-                message: format!("invalid SQL job name '{}': {error}", job.name),
-            }
-        })?;
-        let key = job_id.as_str().to_owned();
-        if let Some(existing) = self.submitted_sql_jobs.get(&key)
-            && !existing.state().is_terminal()
-        {
-            return Err(KrishivError::InvalidConfig {
-                message: format!("SQL job '{key}' is already running in this session"),
-            });
-        }
-
-        let initial = SubmittedSqlJobStatus::new(
-            key.clone(),
-            job.name.clone(),
-            job.engine,
-            SubmittedSqlJobState::Running,
-            None,
-        );
-        self.submitted_sql_jobs.insert(key.clone(), initial.clone());
-        self.set_local_job_state(&job_id, &job.name, JobState::Running);
-
-        let runner = self.clone();
-        let supervisor = self.clone();
-        let job_name = job.name.clone();
-        let engine = job.engine;
-        let worker = tokio::spawn(async move { runner.submit(job).await });
-        self.submitted_sql_job_aborts
-            .insert(key.clone(), worker.abort_handle());
-
-        tokio::spawn(async move {
-            let (state, error) = match worker.await {
-                Ok(Ok(handle)) => match handle.status() {
-                    krishiv_engine_core::JobStatus::Completed => {
-                        (SubmittedSqlJobState::Succeeded, None)
-                    }
-                    krishiv_engine_core::JobStatus::Failed => (
-                        SubmittedSqlJobState::Failed,
-                        Some("engine returned failed job status".to_string()),
-                    ),
-                    krishiv_engine_core::JobStatus::Running => (
-                        SubmittedSqlJobState::Failed,
-                        Some("engine returned non-terminal running status after task exit".into()),
-                    ),
-                },
-                Ok(Err(error)) => (SubmittedSqlJobState::Failed, Some(error.to_string())),
-                Err(join_error) if join_error.is_cancelled() => (
-                    SubmittedSqlJobState::Cancelled,
-                    Some("job cancelled by caller".to_string()),
-                ),
-                Err(join_error) => (
-                    SubmittedSqlJobState::Failed,
-                    Some(format!(
-                        "background SQL job task failed to join: {join_error}"
-                    )),
-                ),
-            };
-            let final_status =
-                SubmittedSqlJobStatus::new(key.clone(), job_name.clone(), engine, state, error);
-            supervisor.submitted_sql_job_aborts.remove(&key);
-            supervisor
-                .submitted_sql_jobs
-                .insert(key.clone(), final_status);
-            if let Ok(job_id) = krishiv_runtime::JobId::try_new(key) {
-                supervisor.set_local_job_state(
-                    &job_id,
-                    &job_name,
-                    submitted_sql_state_to_job_state(state),
-                );
-            }
-        });
-
-        Ok(initial)
-    }
-
-    /// Snapshot all SQL jobs submitted through [`submit_sql_background`].
-    pub fn submitted_sql_jobs(&self) -> Vec<SubmittedSqlJobStatus> {
-        let mut jobs = self
-            .submitted_sql_jobs
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect::<Vec<_>>();
-        jobs.sort_by(|left, right| left.job_id().cmp(right.job_id()));
-        jobs
-    }
-
-    /// Return one background SQL job status by id.
-    pub fn submitted_sql_job_status(&self, job_id: &str) -> Option<SubmittedSqlJobStatus> {
-        self.submitted_sql_jobs
-            .get(job_id)
-            .map(|entry| entry.value().clone())
-    }
-
-    /// Cancel a background SQL job submitted through this session.
-    pub fn cancel_submitted_sql_job(&self, job_id: &str) -> Result<SubmittedSqlJobStatus> {
-        let current = self.submitted_sql_job_status(job_id).ok_or_else(|| {
-            KrishivError::unsupported(format!("SQL job '{job_id}' is not tracked in this session"))
-        })?;
-        if current.state().is_terminal() {
-            return Ok(current);
-        }
-
-        if let Some((_, abort)) = self.submitted_sql_job_aborts.remove(job_id) {
-            abort.abort();
-        }
-        let cancelled = SubmittedSqlJobStatus::new(
-            current.job_id().to_string(),
-            current.name().to_string(),
-            current.engine(),
-            SubmittedSqlJobState::Cancelled,
-            Some("job cancelled by caller".into()),
-        );
-        self.submitted_sql_jobs
-            .insert(job_id.to_string(), cancelled.clone());
-        if let Ok(id) = krishiv_runtime::JobId::try_new(job_id) {
-            self.set_local_job_state(&id, current.name(), JobState::Cancelled);
-        }
-        Ok(cancelled)
-    }
-
-    fn set_local_job_state(&self, job_id: &krishiv_runtime::JobId, name: &str, state: JobState) {
-        let mut jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
-        jobs.upsert(JobStatus::new(job_id.clone(), name, state));
-    }
-
-    /// A-4: list every job tracked by the configured coordinator
-    /// (`GET /api/v1/jobs`).
+    /// A-4: list every job tracked by the **remote** coordinator
+    /// (`GET /api/v1/jobs`). Distributed-only — embedded/single-node
+    /// sessions return `Unsupported`.
     ///
     /// For local jobs, use [`Session::jobs`]. For a single job by name
     /// (distributed), use [`Session::get_job_remote`].
@@ -1062,53 +821,7 @@ impl Session {
         Ok(jobs)
     }
 
-    /// List every executor tracked by the configured coordinator
-    /// (`GET /api/v1/executors`).
-    pub async fn list_executors_remote(&self) -> Result<Vec<krishiv_scheduler::LiveExecutorView>> {
-        let url = self.ivm_http_url().ok_or_else(|| {
-            KrishivError::unsupported(
-                "list_executors_remote requires a coordinator URL; \
-                 call with_coordinator() or set KRISHIV_COORDINATOR_URL",
-            )
-        })?;
-        let executors = krishiv_runtime::execute_coordinator_list_executors(url)
-            .await
-            .map_err(KrishivError::from)?;
-        Ok(executors)
-    }
-
-    /// Cancel a job on the configured coordinator
-    /// (`POST /api/v1/jobs/{job_id}/cancel`).
-    pub async fn cancel_job_remote(&self, job_id: &str) -> Result<()> {
-        let url = self.ivm_http_url().ok_or_else(|| {
-            KrishivError::unsupported(
-                "cancel_job_remote requires a coordinator URL; \
-                 call with_coordinator() or set KRISHIV_COORDINATOR_URL",
-            )
-        })?;
-        krishiv_runtime::execute_coordinator_cancel_job(url, job_id)
-            .await
-            .map_err(KrishivError::from)
-    }
-
-    /// Poll materialized results for a batch SQL job on the configured
-    /// coordinator (`GET /api/v1/batch-sql/{job_id}`).
-    pub async fn get_job_result_remote(
-        &self,
-        job_id: &str,
-    ) -> Result<krishiv_runtime::CoordinatorBatchSqlJobResult> {
-        let url = self.ivm_http_url().ok_or_else(|| {
-            KrishivError::unsupported(
-                "get_job_result_remote requires a coordinator URL; \
-                 call with_coordinator() or set KRISHIV_COORDINATOR_URL",
-            )
-        })?;
-        krishiv_runtime::execute_coordinator_batch_sql_result(url, job_id)
-            .await
-            .map_err(KrishivError::from)
-    }
-
-    /// A-4: look up a single job by name on the configured coordinator
+    /// A-4: look up a single job by name on the **remote** coordinator
     /// (`GET /api/v1/jobs/{job_id}`). Returns `Ok(None)` if the coordinator
     /// doesn't know about the job.
     pub async fn get_job_remote(
@@ -1463,36 +1176,6 @@ impl Session {
             .map_err(KrishivError::from)?;
         self.registered_parquet.insert(table_name, path);
         Ok(())
-    }
-
-    /// Validate and register a connector sink configuration in this session.
-    ///
-    /// The registration is session metadata: execution still happens through
-    /// explicit job/pipeline APIs (`submit_sql`, `submit`, streaming builders).
-    /// Keeping the config here lets frontends validate and reuse named sinks
-    /// without bypassing connector capability checks.
-    pub fn register_sink_config(&self, config: ConnectorConfig) -> Result<()> {
-        default_registry()
-            .validate_sink(&config)
-            .map_err(KrishivError::from)?;
-        self.registered_sinks.insert(config.name.clone(), config);
-        Ok(())
-    }
-
-    /// Return a registered sink config by name.
-    pub fn sink_config(&self, name: &str) -> Option<ConnectorConfig> {
-        self.registered_sinks.get(name).map(|entry| entry.clone())
-    }
-
-    /// Snapshot registered sink configs in deterministic name order.
-    pub fn registered_sink_configs(&self) -> Vec<ConnectorConfig> {
-        let mut sinks = self
-            .registered_sinks
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect::<Vec<_>>();
-        sinks.sort_by(|left, right| left.name.cmp(&right.name));
-        sinks
     }
 
     fn dataframe_from_sql(
@@ -2662,16 +2345,6 @@ pub(crate) async fn runtime_collect_batch_sql(
         .collect_batch_sql_async(query, tables, is_streaming)
         .await
         .map_err(KrishivError::from)
-}
-
-fn submitted_sql_state_to_job_state(state: SubmittedSqlJobState) -> JobState {
-    match state {
-        SubmittedSqlJobState::Pending => JobState::Pending,
-        SubmittedSqlJobState::Running => JobState::Running,
-        SubmittedSqlJobState::Succeeded => JobState::Succeeded,
-        SubmittedSqlJobState::Failed => JobState::Failed,
-        SubmittedSqlJobState::Cancelled => JobState::Cancelled,
-    }
 }
 
 use krishiv_common::sql_util::quote_identifier;

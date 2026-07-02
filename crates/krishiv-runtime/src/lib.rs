@@ -27,17 +27,15 @@ pub mod vector_sink_bridge;
 
 pub use continuous_stream::{ContinuousStreamError, ContinuousStreamRegistry};
 pub use coordinator_http_client::{
-    CoordinatorBatchSqlJobResult, RemoteStepSummary, execute_coordinator_batch_sql,
-    execute_coordinator_batch_sql_inline, execute_coordinator_batch_sql_result,
-    execute_coordinator_bounded_window, execute_coordinator_cancel_job,
-    execute_coordinator_continuous_drain, execute_coordinator_continuous_push,
-    execute_coordinator_continuous_register, execute_coordinator_get_job,
-    execute_coordinator_ivm_checkpoint, execute_coordinator_ivm_checkpoint_delta,
-    execute_coordinator_ivm_create_job, execute_coordinator_ivm_feed_source,
-    execute_coordinator_ivm_feed_stream_delta, execute_coordinator_ivm_register_view,
-    execute_coordinator_ivm_restore, execute_coordinator_ivm_restore_delta,
-    execute_coordinator_ivm_snapshot, execute_coordinator_ivm_step,
-    execute_coordinator_ivm_stream_bridge, execute_coordinator_list_executors,
+    RemoteStepSummary, execute_coordinator_batch_sql, execute_coordinator_batch_sql_inline,
+    execute_coordinator_bounded_window, execute_coordinator_continuous_drain,
+    execute_coordinator_continuous_push, execute_coordinator_continuous_register,
+    execute_coordinator_get_job, execute_coordinator_ivm_checkpoint,
+    execute_coordinator_ivm_checkpoint_delta, execute_coordinator_ivm_create_job,
+    execute_coordinator_ivm_feed_source, execute_coordinator_ivm_feed_stream_delta,
+    execute_coordinator_ivm_register_view, execute_coordinator_ivm_restore,
+    execute_coordinator_ivm_restore_delta, execute_coordinator_ivm_snapshot,
+    execute_coordinator_ivm_step, execute_coordinator_ivm_stream_bridge,
     execute_coordinator_list_jobs, execute_coordinator_physical_plan,
 };
 pub use execution_runtime::{
@@ -138,8 +136,6 @@ pub enum JobState {
     Succeeded,
     /// Job failed.
     Failed,
-    /// Job was cancelled before successful completion.
-    Cancelled,
 }
 
 impl fmt::Display for JobState {
@@ -149,7 +145,6 @@ impl fmt::Display for JobState {
             Self::Running => f.write_str("running"),
             Self::Succeeded => f.write_str("succeeded"),
             Self::Failed => f.write_str("failed"),
-            Self::Cancelled => f.write_str("cancelled"),
         }
     }
 }
@@ -606,11 +601,6 @@ mod tests {
     #[test]
     fn job_state_display_failed() {
         assert_eq!(JobState::Failed.to_string(), "failed");
-    }
-
-    #[test]
-    fn job_state_display_cancelled() {
-        assert_eq!(JobState::Cancelled.to_string(), "cancelled");
     }
 
     #[test]

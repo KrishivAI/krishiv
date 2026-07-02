@@ -5487,7 +5487,6 @@ dependencies = [
  "krishiv-connectors",
  "krishiv-executor",
  "krishiv-flight-sql",
- "krishiv-mcp",
  "krishiv-metrics",
  "krishiv-operator",
  "krishiv-plan",
@@ -5769,24 +5768,6 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
-]
-
-[[package]]
-name = "krishiv-mcp"
-version = "0.1.0"
-dependencies = [
- "arrow 58.3.0",
- "axum 0.8.9",
- "krishiv-api",
- "krishiv-connectors",
- "krishiv-ivm",
- "parquet 58.3.0",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]

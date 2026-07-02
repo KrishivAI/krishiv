@@ -163,16 +163,6 @@ pub mod distributed {
     };
 }
 
-/// Model Context Protocol server frontend.
-///
-/// The MCP server is a typed control surface over [`Session`]; it does not own
-/// scheduling or execution logic.
-pub mod mcp {
-    pub use krishiv_mcp::{
-        KrishivMcpServer, McpConfig, McpServerError, mcp_help, run_mcp_from_env,
-    };
-}
-
 /// Convenient glob import for the most common Krishiv types.
 ///
 /// ```rust

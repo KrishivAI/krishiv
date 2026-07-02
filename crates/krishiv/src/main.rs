@@ -86,7 +86,6 @@ fn multipass_subcommand() -> Option<&'static str> {
         "krishiv-job-coordinator" => Some("job-coordinator"),
         "krishiv-flight-server" => Some("flight-server"),
         "krishiv-shuffle-svc" => Some("shuffle-svc"),
-        "krishiv-mcp" => Some("mcp"),
         _ => None,
     }
 }

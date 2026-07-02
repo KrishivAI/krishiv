@@ -1139,7 +1139,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires binding a local TCP listener; run with --ignored outside restricted sandboxes"]
     async fn do_action_rejects_response_exceeding_size_cap()
     -> Result<(), Box<dyn std::error::Error>> {
         use arrow_flight::flight_service_server::FlightServiceServer;

@@ -93,7 +93,7 @@ pub use pipeline::{
 pub use prepared::PreparedStatement;
 pub use process::{apply_async_io, apply_process_function};
 pub use query::{QueryCompletion, QueryHandle, QueryId, QueryProgress, QueryStatus};
-pub use session::{Session, SessionBuilder, SubmittedSqlJobState, SubmittedSqlJobStatus};
+pub use session::{Session, SessionBuilder};
 pub use sql_job::compile_sql_job;
 pub use stream::{KeyedStream, Stream};
 pub use streaming_builder::{
@@ -122,9 +122,9 @@ pub use krishiv_dataflow::{
 pub use krishiv_plan::udf::{ScalarUdf, UdfError, UdfRegistry};
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
 pub use krishiv_runtime::{
-    ClusterEndpoints, CoordinatorBatchSqlJobResult, InProcessCluster, InProcessStreamingRuntime,
-    JobStatus, LocalJobRegistry, LocalWindowExecutionSpec, LocalWindowKind,
-    execute_streaming_window, execute_windowed_stream, is_streaming_plan,
+    ClusterEndpoints, InProcessCluster, InProcessStreamingRuntime, JobStatus, LocalJobRegistry,
+    LocalWindowExecutionSpec, LocalWindowKind, execute_streaming_window, execute_windowed_stream,
+    is_streaming_plan,
 };
 pub use krishiv_state::TtlConfig;
 
