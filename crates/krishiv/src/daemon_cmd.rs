@@ -14,7 +14,7 @@ pub fn try_run_daemon(args: &[String]) -> Option<i32> {
     let sub = args.first()?.as_str();
     match sub {
         "coordinator" | "clusterd" | "executor" | "job-coordinator" | "flight-server"
-        | "shuffle-svc" | "health" => {}
+        | "shuffle-svc" | "mcp" | "health" => {}
         _ => return None,
     }
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
@@ -25,6 +25,7 @@ pub fn try_run_daemon(args: &[String]) -> Option<i32> {
         "job-coordinator" => run_job_coordinator(&rest),
         "flight-server" => run_flight_server(&rest),
         "shuffle-svc" => run_shuffle_svc(&rest),
+        "mcp" => run_mcp(&rest),
         "health" => run_health_check(),
         other => {
             tracing::error!(subcommand = %other, "unexpected daemon subcommand after validation");
@@ -32,6 +33,20 @@ pub fn try_run_daemon(args: &[String]) -> Option<i32> {
         }
     };
     Some(code)
+}
+
+fn run_mcp(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{}", krishiv_mcp::mcp_help());
+        return 0;
+    }
+    match block_on(krishiv_mcp::run_mcp_from_env(args)) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    }
 }
 
 fn run_coordinator(args: &[String]) -> i32 {
@@ -282,6 +297,7 @@ pub fn daemons_help() -> String {
     help.push_str(
         "           krishiv shuffle-svc               Optional shuffle HTTP service [disabled; build with feature `shuffle`]\n",
     );
+    help.push_str("           krishiv mcp                       Model Context Protocol server\n");
     help.push_str(
         "\n\
          Legacy binaries remain install aliases; prefer `krishiv <subcommand>`.\n",
@@ -323,6 +339,7 @@ pub fn daemon_help_section() -> String {
     help.push_str(
         "  shuffle-svc       Optional shuffle HTTP service [disabled; build with feature `shuffle`]\n",
     );
+    help.push_str("  mcp               Run Model Context Protocol server\n");
     help
 }
 

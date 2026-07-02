@@ -82,6 +82,20 @@ impl ConnectorRegistry {
         driver.validate(config)
     }
 
+    pub fn validate_two_phase_sink(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
+        let kind = ConnectorKind::parse(&config.kind)?;
+        let driver = self
+            .two_phase_sinks
+            .get(&kind)
+            .ok_or_else(|| ConnectorError::Config {
+                message: format!(
+                    "no two-phase sink driver registered for kind '{}'",
+                    config.kind
+                ),
+            })?;
+        driver.validate(config)
+    }
+
     /// Return the estimated row count for a source without opening it.
     /// Returns `None` if the driver does not support row count queries or the
     /// path/config is invalid.

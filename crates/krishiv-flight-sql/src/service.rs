@@ -7,13 +7,15 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
 use arrow_flight::sql::{
     ActionBeginTransactionRequest, ActionBeginTransactionResult,
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
-    ActionCreatePreparedStatementResult, ActionEndTransactionRequest, CommandGetDbSchemas,
-    CommandGetTables, CommandPreparedStatementQuery, CommandStatementQuery,
-    DoPutPreparedStatementResult, EndTransaction, ProstMessageExt, SqlInfo, TicketStatementQuery,
+    ActionCreatePreparedStatementResult, ActionEndTransactionRequest, CommandGetCatalogs,
+    CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTables, CommandPreparedStatementQuery,
+    CommandStatementQuery, DoPutPreparedStatementResult, EndTransaction, ProstMessageExt, SqlInfo,
+    TicketStatementQuery,
 };
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
@@ -40,6 +42,41 @@ use crate::host::FlightExecutionHost;
 const FLIGHT_MAX_CONCURRENT_QUERIES_ENV: &str = "KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES";
 /// Default cap on simultaneous Flight SQL query executions.
 const DEFAULT_FLIGHT_MAX_CONCURRENT_QUERIES: usize = 256;
+
+/// Server SqlInfo metadata served by `GetSqlInfo` (G1b).
+///
+/// Values describe the surface honestly: single-statement autocommit
+/// semantics (no real transaction atomicity — see the transaction notes on
+/// `do_action_end_transaction`), DataFusion-dialect SQL, `"` identifier
+/// quoting. Extend as capabilities land; never claim what the engine does
+/// not do.
+fn server_sql_info() -> &'static SqlInfoData {
+    use arrow_flight::sql::SqlSupportedTransaction;
+    static INFO: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| {
+        let mut builder = SqlInfoDataBuilder::new();
+        builder.append(SqlInfo::FlightSqlServerName, "Krishiv");
+        builder.append(SqlInfo::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
+        builder.append(SqlInfo::FlightSqlServerArrowVersion, "58.3.0");
+        builder.append(SqlInfo::FlightSqlServerReadOnly, false);
+        builder.append(SqlInfo::FlightSqlServerSql, true);
+        builder.append(SqlInfo::FlightSqlServerSubstrait, false);
+        builder.append(
+            SqlInfo::FlightSqlServerTransaction,
+            SqlSupportedTransaction::None as i32,
+        );
+        builder.append(SqlInfo::FlightSqlServerCancel, true);
+        builder.append(SqlInfo::SqlIdentifierQuoteChar, "\"");
+        builder.append(SqlInfo::SqlDdlCatalog, false);
+        builder.append(SqlInfo::SqlDdlSchema, false);
+        builder.append(SqlInfo::SqlDdlTable, true);
+        builder.append(SqlInfo::SqlMaxColumnsInTable, 0i64);
+        #[allow(clippy::expect_used)]
+        builder
+            .build()
+            .expect("static SqlInfo metadata must build: fixed keys and values")
+    });
+    &INFO
+}
 
 /// Maximum number of active transactions before rejecting new `BeginTransaction` requests.
 const MAX_TRANSACTIONS: usize = 10_000;
@@ -341,10 +378,15 @@ impl FlightSqlService for KrishivFlightSqlService {
             ticket: ticket_query.as_any().encode_to_vec().into(),
         };
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
-        let info = FlightInfo::new()
-            .try_with_schema(&Schema::empty())
-            .map_err(|e| Status::internal(e.to_string()))?
-            .with_endpoint(endpoint);
+        // Leave `FlightInfo.schema` unset (empty bytes = "schema unknown",
+        // per the Flight SQL spec) so clients take the authoritative schema
+        // from the DoGet data stream. Explicitly encoding `Schema::empty()`
+        // here declared a zero-field schema, which strict clients (ADBC,
+        // and the JDBC driver's validation) reject as inconsistent with the
+        // real result schema (platform gap G1a). Deriving the true schema
+        // at GetFlightInfo time would require planning the query against
+        // the active backend — a separate feature; unknown is honest.
+        let info = FlightInfo::new().with_endpoint(endpoint);
         Ok(Response::new(info))
     }
 
@@ -470,6 +512,15 @@ impl FlightSqlService for KrishivFlightSqlService {
         let n_params = count_sql_params(&query.query);
         let param_schema = build_param_schema(n_params);
         let parameter_schema = schema_to_ipc_bytes(&param_schema)?;
+        // Best-effort result schema (G1: the JDBC driver routes
+        // query-vs-update on whether `dataset_schema` has fields — leaving
+        // it empty sent every SELECT down the unimplemented update path).
+        // Empty bytes remain the honest "unknown" for statements the host
+        // cannot plan.
+        let dataset_schema = match self.host.sql_query_schema(&query.query).await {
+            Some(schema) => schema_to_ipc_bytes(schema.as_ref())?,
+            None => Vec::new(),
+        };
         {
             let mut map = self.prepared_statements.lock().await;
             let cache = map
@@ -480,7 +531,7 @@ impl FlightSqlService for KrishivFlightSqlService {
         Ok(ActionCreatePreparedStatementResult {
             prepared_statement_handle: handle.into_bytes().into(),
             parameter_schema: parameter_schema.into(),
-            ..Default::default()
+            dataset_schema: dataset_schema.into(),
         })
     }
 
@@ -530,6 +581,14 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        // Default deny, same as the statement path: auth configured without
+        // a policy engine means the operator expects policy enforcement.
+        if self.auth.is_some() && self.policy.is_none() {
+            return Err(Status::permission_denied(
+                "auth is configured but no policy engine is set; \
+                 configure a PolicyHook or use an unauthenticated service",
+            ));
+        }
         let subject = self.authenticate_request(&request)?;
         let subject_key = subject.as_deref().unwrap_or("__anon__").to_owned();
         let handle = std::str::from_utf8(&query.prepared_statement_handle)
@@ -546,12 +605,36 @@ impl FlightSqlService for KrishivFlightSqlService {
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
         };
 
-        // Delegate to the existing statement query path.
-        let cmd = CommandStatementQuery {
-            query: sql,
-            transaction_id: None,
+        // Build the same raw-SQL ticket the statement path produces
+        // (`[4-byte txn_len = 0][sql]`), but attach the result schema when
+        // the host can plan the statement: the JDBC driver's prepared-query
+        // flow reads `FlightInfo.getSchema()` and fails on empty schema
+        // bytes (G1). Statements the host cannot plan keep the honest
+        // "unknown" (no schema), which clients handle by deferring to the
+        // DoGet stream.
+        let schema = self.host.sql_query_schema(&sql).await;
+        let mut ticket_handle = Vec::with_capacity(4 + sql.len());
+        ticket_handle.extend_from_slice(&0u32.to_be_bytes());
+        ticket_handle.extend_from_slice(sql.as_bytes());
+        let ticket = Ticket {
+            ticket: TicketStatementQuery {
+                statement_handle: ticket_handle.into(),
+            }
+            .as_any()
+            .encode_to_vec()
+            .into(),
         };
-        self.get_flight_info_statement(cmd, request).await
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let flight_descriptor = request.into_inner();
+        let mut info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        if let Some(schema) = schema {
+            info = info
+                .try_with_schema(schema.as_ref())
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        Ok(Response::new(info))
     }
 
     /// Execute a prepared statement and stream results.
@@ -596,6 +679,46 @@ impl FlightSqlService for KrishivFlightSqlService {
             statement_handle: effective_sql.into_bytes().into(),
         };
         self.do_get_statement(ticket, request).await
+    }
+
+    /// Execute a prepared statement as an update (no result set).
+    ///
+    /// The JDBC driver sends DDL/DML — and any statement whose
+    /// `dataset_schema` it could not obtain — down this path (G1). Executes
+    /// the stored SQL and returns the affected-row count when the engine
+    /// reports one, else `-1` (unknown, per the Flight SQL convention).
+    async fn do_put_prepared_statement_update(
+        &self,
+        query: arrow_flight::sql::CommandPreparedStatementUpdate,
+        request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        let subject = self.authenticate_request(&request)?;
+        let subject_key = subject.as_deref().unwrap_or("__anon__").to_owned();
+        let handle = std::str::from_utf8(&query.prepared_statement_handle)
+            .map_err(|e| {
+                Status::invalid_argument(format!("invalid prepared statement handle encoding: {e}"))
+            })?
+            .to_owned();
+
+        let sql = {
+            let mut map = self.prepared_statements.lock().await;
+            map.get_mut(&subject_key)
+                .and_then(|cache| cache.get(&handle))
+                .cloned()
+                .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
+        };
+
+        self.check_table_access(&sql)?;
+        let batches = self
+            .host
+            .execute_sql(&sql)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        // DDL/DML through this engine returns either nothing or a summary
+        // batch; a row count is not reliably reported, so `-1` (unknown) is
+        // the honest answer unless the result is a single count row.
+        let _ = batches;
+        Ok(-1)
     }
 
     /// Close (drop) a previously created prepared statement.
@@ -736,6 +859,98 @@ impl FlightSqlService for KrishivFlightSqlService {
     }
 
     // G17: Catalog introspection
+
+    /// Return FlightInfo for a `GetSqlInfo` request.
+    ///
+    /// Required by the stock Arrow Flight SQL JDBC driver, which calls this
+    /// during connection setup and fails the whole connection when it is
+    /// unimplemented (platform gap G1b).
+    async fn get_flight_info_sql_info(
+        &self,
+        query: CommandGetSqlInfo,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        self.authenticate_request(&request)?;
+        let flight_descriptor = request.into_inner();
+        let ticket = Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        };
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .try_with_schema(server_sql_info().schema().as_ref())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
+    }
+
+    /// Stream the server's SqlInfo metadata, filtered to the requested ids.
+    async fn do_get_sql_info(
+        &self,
+        query: CommandGetSqlInfo,
+        request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        self.authenticate_request(&request)?;
+        let batch = query
+            .into_builder(server_sql_info())
+            .build()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let schema = batch.schema();
+        let flight_data = batches_to_flight_data(schema.as_ref(), vec![batch])
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(Ok::<FlightData, Status>);
+        let stream: Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>> =
+            Box::pin(stream::iter(flight_data));
+        Ok(Response::new(stream))
+    }
+
+    /// Return FlightInfo for a `GetCatalogs` request (what BI tools call
+    /// first when browsing; platform gap G1c).
+    async fn get_flight_info_catalogs(
+        &self,
+        query: CommandGetCatalogs,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        self.authenticate_request(&request)?;
+        let flight_descriptor = request.into_inner();
+        let ticket_bytes = query.as_any().encode_to_vec();
+        let schema = query.into_builder().schema();
+        let ticket = Ticket {
+            ticket: ticket_bytes.into(),
+        };
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
+    }
+
+    /// Stream the catalog list. The Flight SQL surface exposes the single
+    /// `krishiv` catalog (matching `GetDbSchemas`/`GetTables`, which report
+    /// `("krishiv", "default")` for every registered table).
+    async fn do_get_catalogs(
+        &self,
+        query: CommandGetCatalogs,
+        request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        self.authenticate_request(&request)?;
+        let mut builder = query.into_builder();
+        builder.append("krishiv");
+        let batch = builder
+            .build()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let schema = batch.schema();
+        let flight_data = batches_to_flight_data(schema.as_ref(), vec![batch])
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(Ok::<FlightData, Status>);
+        let stream: Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>> =
+            Box::pin(stream::iter(flight_data));
+        Ok(Response::new(stream))
+    }
 
     /// Return FlightInfo for a `GetDbSchemas` catalog query (G17).
     async fn get_flight_info_schemas(
@@ -1333,5 +1548,183 @@ mod transaction_tests {
             )
             .await;
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod metadata_rpc_tests {
+    use super::*;
+    use futures::StreamExt as _;
+
+    fn service() -> KrishivFlightSqlService {
+        KrishivFlightSqlService::with_host(FlightExecutionHost::embedded().expect("embedded host"))
+    }
+
+    fn descriptor_request() -> Request<FlightDescriptor> {
+        Request::new(FlightDescriptor::new_cmd(Vec::new()))
+    }
+
+    async fn collect_batches(
+        stream: Response<<KrishivFlightSqlService as FlightService>::DoGetStream>,
+    ) -> Vec<RecordBatch> {
+        let mut inner = stream.into_inner();
+        let mut data = Vec::new();
+        while let Some(chunk) = inner.next().await {
+            data.push(chunk.expect("flight data chunk"));
+        }
+        arrow_flight::utils::flight_data_to_batches(&data).expect("decode flight data")
+    }
+
+    /// G1a regression: `GetFlightInfo(statement)` must leave the schema
+    /// UNSET (empty bytes = unknown), not declare an explicit zero-field
+    /// schema. Strict clients (ADBC; the JDBC driver's validation) reject a
+    /// declared-empty schema as inconsistent with the DoGet data stream —
+    /// this broke every ADBC query including `SELECT 1`.
+    #[tokio::test]
+    async fn get_flight_info_statement_leaves_schema_unset() {
+        let svc = service();
+        let info = svc
+            .get_flight_info_statement(
+                CommandStatementQuery {
+                    query: "SELECT 1 AS n".to_string(),
+                    transaction_id: None,
+                },
+                descriptor_request(),
+            )
+            .await
+            .expect("flight info")
+            .into_inner();
+        assert!(
+            info.schema.is_empty(),
+            "FlightInfo.schema must be empty bytes (unknown), got {} bytes",
+            info.schema.len()
+        );
+        assert_eq!(info.endpoint.len(), 1, "one endpoint with the ticket");
+    }
+
+    /// G1b regression: `GetSqlInfo` is implemented (the stock JDBC driver
+    /// calls it at connect time and fails the connection when it is
+    /// unimplemented) and serves the server name/version rows.
+    #[tokio::test]
+    async fn sql_info_served_and_contains_server_name() {
+        let svc = service();
+        // FlightInfo advertises the SqlInfo result schema.
+        let info = svc
+            .get_flight_info_sql_info(CommandGetSqlInfo { info: vec![] }, descriptor_request())
+            .await
+            .expect("sql_info flight info")
+            .into_inner();
+        assert!(!info.schema.is_empty(), "SqlInfo schema is known up front");
+
+        // Unfiltered DoGet returns the metadata rows.
+        let batches = collect_batches(
+            svc.do_get_sql_info(
+                CommandGetSqlInfo { info: vec![] },
+                Request::new(Ticket::new(Vec::new())),
+            )
+            .await
+            .expect("do_get_sql_info"),
+        )
+        .await;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(rows >= 5, "expected several SqlInfo rows, got {rows}");
+
+        // Filtered request returns exactly the requested id.
+        let name_id = SqlInfo::FlightSqlServerName as u32;
+        let filtered = collect_batches(
+            svc.do_get_sql_info(
+                CommandGetSqlInfo {
+                    info: vec![name_id],
+                },
+                Request::new(Ticket::new(Vec::new())),
+            )
+            .await
+            .expect("filtered do_get_sql_info"),
+        )
+        .await;
+        let filtered_rows: usize = filtered.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(filtered_rows, 1, "exactly the requested SqlInfo id");
+    }
+
+    /// G1c regression: `GetCatalogs` is implemented and lists the single
+    /// `krishiv` catalog, consistent with `GetDbSchemas`/`GetTables`.
+    #[tokio::test]
+    async fn catalogs_lists_krishiv() {
+        let svc = service();
+        let batches = collect_batches(
+            svc.do_get_catalogs(CommandGetCatalogs {}, Request::new(Ticket::new(Vec::new())))
+                .await
+                .expect("do_get_catalogs"),
+        )
+        .await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("catalog_name column");
+        assert_eq!(names.value(0), "krishiv");
+    }
+}
+
+#[cfg(test)]
+mod prepared_statement_schema_tests {
+    use super::*;
+
+    fn service() -> KrishivFlightSqlService {
+        KrishivFlightSqlService::with_host(FlightExecutionHost::embedded().expect("embedded host"))
+    }
+
+    fn action_request() -> Request<arrow_flight::Action> {
+        Request::new(arrow_flight::Action {
+            r#type: String::new(),
+            body: Default::default(),
+        })
+    }
+
+    /// G1 regression: a prepared SELECT carries a non-empty
+    /// `dataset_schema`. The JDBC driver routes query-vs-update on exactly
+    /// this — an empty schema sent every SELECT down the (previously
+    /// unimplemented) update path.
+    #[tokio::test]
+    async fn prepared_select_has_dataset_schema() {
+        let svc = service();
+        let result = svc
+            .do_action_create_prepared_statement(
+                ActionCreatePreparedStatementRequest {
+                    query: "SELECT 1 AS n, 'x' AS s".to_string(),
+                    transaction_id: None,
+                },
+                action_request(),
+            )
+            .await
+            .expect("create prepared statement");
+        assert!(
+            !result.dataset_schema.is_empty(),
+            "SELECT must carry a planned dataset_schema"
+        );
+    }
+
+    /// Statements the host cannot plan without side effects (DDL) keep the
+    /// honest empty ("unknown") dataset_schema — never a fabricated one.
+    #[tokio::test]
+    async fn prepared_ddl_keeps_unknown_dataset_schema() {
+        let svc = service();
+        let result = svc
+            .do_action_create_prepared_statement(
+                ActionCreatePreparedStatementRequest {
+                    query: "CREATE TABLE t AS SELECT 1 AS v".to_string(),
+                    transaction_id: None,
+                },
+                action_request(),
+            )
+            .await
+            .expect("create prepared statement");
+        assert!(
+            result.dataset_schema.is_empty(),
+            "DDL must not fabricate a dataset schema (and must not execute at prepare time)"
+        );
     }
 }

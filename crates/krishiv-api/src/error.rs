@@ -35,6 +35,28 @@ impl From<krishiv_runtime::RuntimeError> for KrishivError {
     }
 }
 
+impl From<krishiv_connectors::ConnectorError> for KrishivError {
+    fn from(value: krishiv_connectors::ConnectorError) -> Self {
+        use krishiv_connectors::ConnectorError as E;
+        let message = value.to_string();
+        match value {
+            E::Config { .. } | E::Schema { .. } | E::Offset { .. } => {
+                Self::InvalidConfig { message }
+            }
+            E::Unsupported { .. } => Self::Unsupported { feature: message },
+            E::Kafka { .. }
+            | E::Parquet(_)
+            | E::ObjectStore { .. }
+            | E::Cdc(_)
+            | E::Io(_)
+            | E::Quality { .. }
+            | E::CertificationFailed { .. }
+            | E::Protocol { .. } => Self::Runtime { message },
+            _ => Self::Runtime { message },
+        }
+    }
+}
+
 impl From<krishiv_engine_core::EngineError> for KrishivError {
     fn from(value: krishiv_engine_core::EngineError) -> Self {
         use krishiv_engine_core::EngineError as E;

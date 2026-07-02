@@ -374,6 +374,40 @@ impl FlightExecutionHost {
         explain_sql(query).map_err(|e| Status::internal(e.to_string()))
     }
 
+    /// Best-effort output schema for a read-only statement, without
+    /// executing it.
+    ///
+    /// Only statements whose leading keyword is side-effect-free under
+    /// planning (`SELECT`/`WITH`/`VALUES`/`SHOW`/`EXPLAIN`) are planned —
+    /// DDL/DML would execute eagerly at plan time. `None` means "schema
+    /// unknown": the InProcess backend could not plan the statement (e.g.
+    /// it references tables only the coordinator knows), or the backend is
+    /// a remote coordinator (no remote plan/schema API yet). Callers must
+    /// treat `None` as unknown, never as "no columns".
+    pub async fn sql_query_schema(&self, query: &str) -> Option<arrow::datatypes::SchemaRef> {
+        let head = query
+            .trim_start()
+            .get(..8)
+            .unwrap_or(query.trim_start())
+            .to_ascii_uppercase();
+        let read_only = ["SELECT", "WITH", "VALUES", "SHOW", "EXPLAIN"]
+            .iter()
+            .any(|kw| head.starts_with(kw));
+        if !read_only {
+            return None;
+        }
+        match self.backend.as_ref() {
+            FlightHostBackend::InProcess(cluster) => cluster
+                .streaming_runtime()
+                .runner_sql_engine()
+                .sql(query)
+                .await
+                .ok()
+                .map(|df| df.arrow_schema()),
+            FlightHostBackend::Coordinator(_) => None,
+        }
+    }
+
     /// Register a Kafka streaming source.
     ///
     /// In `InProcess` mode registers on the local cluster's SQL engine.

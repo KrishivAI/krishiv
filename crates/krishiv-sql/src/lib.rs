@@ -2746,6 +2746,15 @@ impl SqlDataFrame {
         self.query.as_deref()
     }
 
+    /// The Arrow schema of this DataFrame's output.
+    ///
+    /// Available immediately after planning — no execution happens. Used by
+    /// the Flight SQL server to populate `dataset_schema` on prepared
+    /// statements so JDBC clients can route query-vs-update correctly.
+    pub fn arrow_schema(&self) -> arrow::datatypes::SchemaRef {
+        std::sync::Arc::new(self.dataframe.schema().as_arrow().clone())
+    }
+
     /// Return a new `SqlDataFrame` with the given DataFusion DataFrame,
     /// preserving the rest of this instance's state.  The new name suffix
     /// helps distinguish transform steps in logical-plan descriptions.

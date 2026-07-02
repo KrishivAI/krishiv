@@ -81,8 +81,8 @@ pub use coordinator::{
     StallCancelWork,
 };
 pub use coordinator_daemon::{
-    CoordinatorDaemonConfig, CoordinatorSidecarFn, JobCoordinatorDaemonConfig, LiveJobView,
-    build_leader_election, build_shared_coordinator, coordinator_daemon_help,
+    CoordinatorDaemonConfig, CoordinatorSidecarFn, JobCoordinatorDaemonConfig, LiveExecutorView,
+    LiveJobView, build_leader_election, build_shared_coordinator, coordinator_daemon_help,
     coordinator_http_router, job_coordinator_daemon_help, parse_coordinator_daemon_config,
     parse_job_coordinator_daemon_config, run_cluster_control_plane, run_clusterd_daemon,
     run_job_coordinator_daemon, run_standalone_coordinator, spawn_coordinator_sidecars,
