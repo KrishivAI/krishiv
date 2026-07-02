@@ -154,6 +154,17 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(expression::min, m)?)?;
     m.add_function(wrap_pyfunction!(expression::max, m)?)?;
     m.add_function(wrap_pyfunction!(expression::call_function, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::row_number, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::rank, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::dense_rank, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::percent_rank, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::cume_dist, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::ntile, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::lag, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::lead, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::first_value, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::last_value, m)?)?;
+    m.add_function(wrap_pyfunction!(expression::nth_value, m)?)?;
 
     m.add_function(wrap_pyfunction!(sources::read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(sources::read_kafka, m)?)?;

@@ -193,6 +193,62 @@ pub enum NullOrdering {
     Last,
 }
 
+/// `ROWS` or `RANGE` framing for a window function's frame bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowFrameUnits {
+    Rows,
+    Range,
+}
+
+/// One bound (start or end) of a window frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "bound", rename_all = "snake_case")]
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+/// A window function frame specification, e.g. `ROWS BETWEEN 3 PRECEDING AND CURRENT ROW`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WindowFrame {
+    pub units: WindowFrameUnits,
+    pub start: WindowFrameBound,
+    pub end: WindowFrameBound,
+}
+
+impl WindowFrame {
+    /// `ROWS BETWEEN start AND end`.
+    pub fn rows(start: WindowFrameBound, end: WindowFrameBound) -> Self {
+        Self {
+            units: WindowFrameUnits::Rows,
+            start,
+            end,
+        }
+    }
+    /// `RANGE BETWEEN start AND end`.
+    pub fn range(start: WindowFrameBound, end: WindowFrameBound) -> Self {
+        Self {
+            units: WindowFrameUnits::Range,
+            start,
+            end,
+        }
+    }
+}
+
+fn window_frame_bound_sql(bound: WindowFrameBound) -> String {
+    match bound {
+        WindowFrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+        WindowFrameBound::Preceding(n) => format!("{n} PRECEDING"),
+        WindowFrameBound::CurrentRow => "CURRENT ROW".to_string(),
+        WindowFrameBound::Following(n) => format!("{n} FOLLOWING"),
+        WindowFrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+    }
+}
+
 /// Structured public expression AST.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "node", rename_all = "snake_case")]
@@ -239,6 +295,11 @@ pub enum Expr {
         expression: Box<Expr>,
         partition_by: Vec<Expr>,
         order_by: Vec<Expr>,
+        /// `ROWS`/`RANGE BETWEEN ... AND ...` frame bounds. `#[serde(default)]`
+        /// so expressions serialized before this field existed still decode
+        /// (as "no frame specified", DataFusion's own OVER-clause default).
+        #[serde(default)]
+        frame: Option<WindowFrame>,
     },
     RawSql {
         sql: String,
@@ -295,6 +356,26 @@ impl Expr {
             expression: Box::new(self),
             partition_by,
             order_by,
+            frame: None,
+        }
+    }
+    /// Attach a `ROWS`/`RANGE BETWEEN ... AND ...` frame to a window
+    /// expression built by [`Expr::over`]. A no-op on any other variant —
+    /// there is no frame to attach without a preceding `.over(...)` call.
+    pub fn frame(self, frame: WindowFrame) -> Self {
+        match self {
+            Self::Window {
+                expression,
+                partition_by,
+                order_by,
+                frame: _,
+            } => Self::Window {
+                expression,
+                partition_by,
+                order_by,
+                frame: Some(frame),
+            },
+            other => other,
         }
     }
     pub fn normalize_json(&self) -> Result<String, PlanError> {
@@ -380,10 +461,28 @@ impl Expr {
                 expression,
                 partition_by,
                 order_by,
+                frame,
             } => {
                 expression.validate()?;
                 partition_by.iter().try_for_each(Self::validate)?;
-                order_by.iter().try_for_each(Self::validate)
+                order_by.iter().try_for_each(Self::validate)?;
+                if let Some(frame) = frame
+                    && order_by.is_empty()
+                    && frame.units == WindowFrameUnits::Range
+                    && !matches!(
+                        (frame.start, frame.end),
+                        (
+                            WindowFrameBound::UnboundedPreceding,
+                            WindowFrameBound::UnboundedFollowing
+                        )
+                    )
+                {
+                    return Err(PlanError::Validation(
+                        "RANGE frame with PRECEDING/FOLLOWING/CURRENT ROW bounds requires ORDER BY"
+                            .into(),
+                    ));
+                }
+                Ok(())
             }
             Self::RawSql { sql } => {
                 if sql.trim().is_empty() {
@@ -477,6 +576,7 @@ impl Expr {
                 expression,
                 partition_by,
                 order_by,
+                frame,
             } => {
                 let mut clauses = Vec::new();
                 if !partition_by.is_empty() {
@@ -497,6 +597,17 @@ impl Expr {
                             .map(Self::to_sql)
                             .collect::<Vec<_>>()
                             .join(", ")
+                    ));
+                }
+                if let Some(frame) = frame {
+                    let units = match frame.units {
+                        WindowFrameUnits::Rows => "ROWS",
+                        WindowFrameUnits::Range => "RANGE",
+                    };
+                    clauses.push(format!(
+                        "{units} BETWEEN {} AND {}",
+                        window_frame_bound_sql(frame.start),
+                        window_frame_bound_sql(frame.end),
                     ));
                 }
                 format!("{} OVER ({})", expression.to_sql(), clauses.join(" "))
@@ -643,6 +754,97 @@ mod tests {
             r#"row_number() OVER (PARTITION BY "account_id" ORDER BY "event_time" ASC NULLS LAST)"#
         );
         expression.validate().unwrap();
+    }
+
+    #[test]
+    fn window_frame_renders_rows_between() {
+        let expression = Expr::function("sum", vec![Expr::column("amount")])
+            .over(
+                vec![],
+                vec![Expr::Sort {
+                    expression: Box::new(Expr::column("ts")),
+                    direction: SortDirection::Ascending,
+                    nulls: NullOrdering::First,
+                }],
+            )
+            .frame(WindowFrame::rows(
+                WindowFrameBound::Preceding(3),
+                WindowFrameBound::CurrentRow,
+            ));
+        assert_eq!(
+            expression.to_sql(),
+            r#"sum("amount") OVER (ORDER BY "ts" ASC NULLS FIRST ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)"#
+        );
+        expression.validate().unwrap();
+    }
+
+    #[test]
+    fn window_frame_renders_range_unbounded() {
+        let expression = Expr::function("avg", vec![Expr::column("amount")])
+            .over(vec![], vec![])
+            .frame(WindowFrame::range(
+                WindowFrameBound::UnboundedPreceding,
+                WindowFrameBound::UnboundedFollowing,
+            ));
+        assert_eq!(
+            expression.to_sql(),
+            r#"avg("amount") OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"#
+        );
+        expression.validate().unwrap();
+    }
+
+    #[test]
+    fn window_frame_range_with_bounds_requires_order_by() {
+        let expression = Expr::function("sum", vec![Expr::column("amount")])
+            .over(vec![], vec![])
+            .frame(WindowFrame::range(
+                WindowFrameBound::Preceding(1),
+                WindowFrameBound::CurrentRow,
+            ));
+        assert!(matches!(
+            expression.validate(),
+            Err(PlanError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn frame_is_a_no_op_on_non_window_expressions() {
+        let expression = Expr::column("amount").frame(WindowFrame::rows(
+            WindowFrameBound::CurrentRow,
+            WindowFrameBound::CurrentRow,
+        ));
+        assert_eq!(expression, Expr::column("amount"));
+    }
+
+    #[test]
+    fn window_frame_versioned_round_trip() {
+        let expression = Expr::function("row_number", vec![])
+            .over(
+                vec![],
+                vec![Expr::Sort {
+                    expression: Box::new(Expr::column("ts")),
+                    direction: SortDirection::Ascending,
+                    nulls: NullOrdering::First,
+                }],
+            )
+            .frame(WindowFrame::rows(
+                WindowFrameBound::UnboundedPreceding,
+                WindowFrameBound::CurrentRow,
+            ));
+        let bytes = expression.encode_versioned().unwrap();
+        assert_eq!(Expr::decode_versioned(&bytes).unwrap(), expression);
+    }
+
+    #[test]
+    fn window_without_frame_field_still_decodes() {
+        // Pre-frame-field serialized shape (no "frame" key at all) must still
+        // decode, defaulting to "no frame specified" via #[serde(default)].
+        let json = br#"{"version":1,"expression":{"node":"window","expression":{"node":"function","name":"row_number","arguments":[]},"partition_by":[],"order_by":[]}}"#;
+        let expression = Expr::decode_versioned(json).unwrap();
+        assert_eq!(
+            expression,
+            Expr::function("row_number", vec![]).over(vec![], vec![])
+        );
     }
 
     #[test]

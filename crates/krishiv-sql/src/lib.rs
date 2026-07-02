@@ -337,6 +337,7 @@ fn build_single_node_session_config(
     let mut config = datafusion::prelude::SessionConfig::new()
         .with_target_partitions(tp)
         .with_batch_size(batch_size)
+        .with_information_schema(true)
         .set_bool(
             "datafusion.optimizer.enable_round_robin_repartition",
             tp > 1,
@@ -1917,6 +1918,10 @@ impl SqlEngine {
                 .await?;
             return Ok(self.attach_query_metadata(self.make_sql_df("cep", dataframe), query));
         }
+
+        // Rewrite PIVOT / UNPIVOT into equivalent CASE WHEN / UNION ALL SQL —
+        // DataFusion does not parse either construct natively.
+        let query = &pivot_sql::rewrite_pivot_unpivot(query)?;
 
         // Rewrite TUMBLE/HOP/SESSION TVFs before other preprocessing.
         let query = &streaming_tvf::rewrite_window_tvfs(query);

@@ -163,11 +163,15 @@ crates/krishiv-api/src/expression.rs::fn::cast::pub fn cast(self, data_type: Exp
 crates/krishiv-api/src/expression.rs::fn::col::pub fn col(name: &str) -> Expr
 crates/krishiv-api/src/expression.rs::fn::count::pub fn count(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::count_all::pub fn count_all() -> Expr
+crates/krishiv-api/src/expression.rs::fn::cume_dist::pub fn cume_dist() -> Expr
 crates/krishiv-api/src/expression.rs::fn::decode_versioned::pub fn decode_versioned(bytes: &[u8]) -> Result<Self, PlanError>
+crates/krishiv-api/src/expression.rs::fn::dense_rank::pub fn dense_rank() -> Expr
 crates/krishiv-api/src/expression.rs::fn::desc::pub fn desc(self) -> Self
 crates/krishiv-api/src/expression.rs::fn::divide::pub fn divide(self, right: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::encode_versioned::pub fn encode_versioned(&self) -> Result<Vec<u8>, PlanError>
 crates/krishiv-api/src/expression.rs::fn::eq::pub fn eq(self, right: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::first_value::pub fn first_value(expr: Expr) -> Expr
+crates/krishiv-api/src/expression.rs::fn::frame::pub fn frame(self, frame: WindowFrame) -> Self
 crates/krishiv-api/src/expression.rs::fn::from_node::pub fn from_node(node: krishiv_plan::expression::Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::function::pub fn function(name: impl Into<String>, arguments: Vec<Expr>) -> Expr
 crates/krishiv-api/src/expression.rs::fn::gt::pub fn gt(self, right: Expr) -> Self
@@ -175,6 +179,9 @@ crates/krishiv-api/src/expression.rs::fn::gt_eq::pub fn gt_eq(self, right: Expr)
 crates/krishiv-api/src/expression.rs::fn::into_node::pub fn into_node(self) -> krishiv_plan::expression::Expr
 crates/krishiv-api/src/expression.rs::fn::is_not_null::pub fn is_not_null(self) -> Self
 crates/krishiv-api/src/expression.rs::fn::is_null::pub fn is_null(self) -> Self
+crates/krishiv-api/src/expression.rs::fn::lag::pub fn lag(expr: Expr, offset: i64, default: Option<Expr>) -> Expr
+crates/krishiv-api/src/expression.rs::fn::last_value::pub fn last_value(expr: Expr) -> Expr
+crates/krishiv-api/src/expression.rs::fn::lead::pub fn lead(expr: Expr, offset: i64, default: Option<Expr>) -> Expr
 crates/krishiv-api/src/expression.rs::fn::lit::pub fn lit(value: impl Into<Literal>) -> Expr
 crates/krishiv-api/src/expression.rs::fn::lt::pub fn lt(self, right: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::lt_eq::pub fn lt_eq(self, right: Expr) -> Self
@@ -185,10 +192,15 @@ crates/krishiv-api/src/expression.rs::fn::multiply::pub fn multiply(self, right:
 crates/krishiv-api/src/expression.rs::fn::node::pub fn node(&self) -> &krishiv_plan::expression::Expr
 crates/krishiv-api/src/expression.rs::fn::normalize_json::pub fn normalize_json(&self) -> Result<String, PlanError>
 crates/krishiv-api/src/expression.rs::fn::not_eq::pub fn not_eq(self, right: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::nth_value::pub fn nth_value(expr: Expr, n: i64) -> Expr
+crates/krishiv-api/src/expression.rs::fn::ntile::pub fn ntile(n: i64) -> Expr
 crates/krishiv-api/src/expression.rs::fn::or::pub fn or(self, right: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::over::pub fn over(self, partition_by: Vec<Expr>, order_by: Vec<Expr>) -> Self
+crates/krishiv-api/src/expression.rs::fn::percent_rank::pub fn percent_rank() -> Expr
 crates/krishiv-api/src/expression.rs::fn::plus::pub fn plus(self, right: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::rank::pub fn rank() -> Expr
 crates/krishiv-api/src/expression.rs::fn::raw::pub fn raw(sql: impl Into<String>) -> Self
+crates/krishiv-api/src/expression.rs::fn::row_number::pub fn row_number() -> Expr
 crates/krishiv-api/src/expression.rs::fn::sum::pub fn sum(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::try_cast::pub fn try_cast(self, data_type: ExprDataType) -> Self
 crates/krishiv-api/src/expression.rs::struct::Expr::#[derive(Debug, Clone, PartialEq, Eq, Hash)] pub struct Expr

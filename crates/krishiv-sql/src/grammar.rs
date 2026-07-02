@@ -337,6 +337,9 @@ static FEATURES: &[FeatureEntry] = &[
         S,
     ),
     // ── DML ──────────────────────────────────────────────────────────────────
+    FeatureEntry::new("dml.copy_to", "DML", "COPY (query) TO 'path' (FORMAT …)", S).with_note(
+        "inherited from DataFusion's native parser/planner; no Krishiv-side code involved",
+    ),
     FeatureEntry::new("dml.insert_into", "DML", "INSERT INTO table SELECT …", S),
     FeatureEntry::new(
         "dml.insert_overwrite",
@@ -390,6 +393,8 @@ static FEATURES: &[FeatureEntry] = &[
         P,
     )
     .with_note("Iceberg schema evolution via ALTER TABLE is supported"),
+    FeatureEntry::new("ddl.create_schema", "DDL", "CREATE SCHEMA name", S)
+        .with_note("inherited from DataFusion's native catalog; no Krishiv-side code involved"),
     // ── TEMPORAL ─────────────────────────────────────────────────────────────
     FeatureEntry::new(
         "temporal.as_of",
@@ -401,7 +406,12 @@ static FEATURES: &[FeatureEntry] = &[
         "temporal.match_recognize",
         "TEMPORAL",
         "MATCH_RECOGNIZE pattern matching over ordered rows",
-        S,
+        P,
+    )
+    .with_note(
+        "streaming CEP subset only: PARTITION BY / ORDER BY / PATTERN (…) / WITHIN <duration>; \
+         no DEFINE (pattern-variable predicates) or MEASURES (computed output) clauses, unlike \
+         Oracle/Flink's full MATCH_RECOGNIZE grammar",
     ),
     FeatureEntry::new(
         "temporal.system_time",
@@ -436,6 +446,16 @@ static FEATURES: &[FeatureEntry] = &[
         S,
     )
     .with_note("local PreparedStatement::bind and Flight SQL DoPut parameter batches"),
+    FeatureEntry::new(
+        "prepared.sql_text",
+        "PREPARED",
+        "PREPARE name AS …; EXECUTE name(…); DEALLOCATE name",
+        S,
+    )
+    .with_note(
+        "inherited from DataFusion's native parser/planner (session-scoped named plans); \
+         distinct from the Flight SQL protocol-level prepared statement actions above",
+    ),
     // ── OPERATION CONTROL ────────────────────────────────────────────────────
     FeatureEntry::new(
         "operation.id",
@@ -586,6 +606,12 @@ static FEATURES: &[FeatureEntry] = &[
         "introspection.explain",
         "INTROSPECTION",
         "EXPLAIN [LOGICAL|PHYSICAL|ANALYZE] query plans",
+        S,
+    ),
+    FeatureEntry::new(
+        "introspection.information_schema",
+        "INTROSPECTION",
+        "information_schema.{tables,columns,views,df_settings,routines,parameters,schemata}",
         S,
     ),
     FeatureEntry::new(

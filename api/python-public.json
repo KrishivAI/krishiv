@@ -219,7 +219,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L90",
+          "documentation": "crates/krishiv-python/src/expression.rs#L112",
           "id": "Column.__add__",
           "kind": "method",
           "name": "__add__",
@@ -229,7 +229,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L114",
+          "documentation": "crates/krishiv-python/src/expression.rs#L136",
           "id": "Column.__and__",
           "kind": "method",
           "name": "__and__",
@@ -239,7 +239,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L126",
+          "documentation": "crates/krishiv-python/src/expression.rs#L148",
           "id": "Column.__bool__",
           "kind": "method",
           "name": "__bool__",
@@ -249,7 +249,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L102",
+          "documentation": "crates/krishiv-python/src/expression.rs#L124",
           "id": "Column.__mul__",
           "kind": "method",
           "name": "__mul__",
@@ -259,7 +259,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L120",
+          "documentation": "crates/krishiv-python/src/expression.rs#L142",
           "id": "Column.__or__",
           "kind": "method",
           "name": "__or__",
@@ -269,7 +269,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L132",
+          "documentation": "crates/krishiv-python/src/expression.rs#L154",
           "id": "Column.__repr__",
           "kind": "method",
           "name": "__repr__",
@@ -279,7 +279,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L76",
+          "documentation": "crates/krishiv-python/src/expression.rs#L98",
           "id": "Column.__richcmp__",
           "kind": "method",
           "name": "__richcmp__",
@@ -289,7 +289,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L96",
+          "documentation": "crates/krishiv-python/src/expression.rs#L118",
           "id": "Column.__sub__",
           "kind": "method",
           "name": "__sub__",
@@ -299,7 +299,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L108",
+          "documentation": "crates/krishiv-python/src/expression.rs#L130",
           "id": "Column.__truediv__",
           "kind": "method",
           "name": "__truediv__",
@@ -319,7 +319,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L58",
+          "documentation": "crates/krishiv-python/src/expression.rs#L80",
           "id": "Column.asc",
           "kind": "method",
           "name": "asc",
@@ -339,7 +339,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L62",
+          "documentation": "crates/krishiv-python/src/expression.rs#L84",
           "id": "Column.desc",
           "kind": "method",
           "name": "desc",
@@ -369,7 +369,7 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L66",
+          "documentation": "crates/krishiv-python/src/expression.rs#L88",
           "id": "Column.normalized_ast",
           "kind": "method",
           "name": "normalized_ast",
@@ -389,7 +389,27 @@
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/expression.rs#L72",
+          "documentation": "crates/krishiv-python/src/expression.rs#L74",
+          "id": "Column.range_between",
+          "kind": "method",
+          "name": "range_between",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "async": false,
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L65",
+          "id": "Column.rows_between",
+          "kind": "method",
+          "name": "rows_between",
+          "replacement": null,
+          "stability": "preview"
+        },
+        {
+          "async": false,
+          "deprecated": false,
+          "documentation": "crates/krishiv-python/src/expression.rs#L94",
           "id": "Column.sql",
           "kind": "method",
           "name": "sql",
@@ -4751,6 +4771,24 @@
     {
       "deprecated": false,
       "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "cume_dist",
+      "kind": "function",
+      "name": "cume_dist",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "dense_rank",
+      "kind": "function",
+      "name": "dense_rank",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
       "id": "expr",
       "kind": "function",
       "name": "expr",
@@ -4760,9 +4798,45 @@
     {
       "deprecated": false,
       "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "first_value",
+      "kind": "function",
+      "name": "first_value",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
       "id": "interval_join",
       "kind": "function",
       "name": "interval_join",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "lag",
+      "kind": "function",
+      "name": "lag",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "last_value",
+      "kind": "function",
+      "name": "last_value",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "lead",
+      "kind": "function",
+      "name": "lead",
       "replacement": null,
       "stability": "preview"
     },
@@ -4817,6 +4891,42 @@
       "id": "min",
       "kind": "function",
       "name": "min",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "nth_value",
+      "kind": "function",
+      "name": "nth_value",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "ntile",
+      "kind": "function",
+      "name": "ntile",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "percent_rank",
+      "kind": "function",
+      "name": "percent_rank",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "rank",
+      "kind": "function",
+      "name": "rank",
       "replacement": null,
       "stability": "preview"
     },
@@ -4889,6 +4999,15 @@
       "id": "register_state_migration",
       "kind": "function",
       "name": "register_state_migration",
+      "replacement": null,
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-python/src/lib.rs",
+      "id": "row_number",
+      "kind": "function",
+      "name": "row_number",
       "replacement": null,
       "stability": "preview"
     },

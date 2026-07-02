@@ -3,7 +3,8 @@
 use krishiv_plan::PlanError;
 pub use krishiv_plan::expression::{
     AggregateFunction, BinaryOperator, EXPRESSION_FORMAT_VERSION, ExprDataType, ExprField,
-    IntervalUnit, NullOrdering, ScalarValue, SortDirection, TimeUnit,
+    IntervalUnit, NullOrdering, ScalarValue, SortDirection, TimeUnit, WindowFrame,
+    WindowFrameBound, WindowFrameUnits,
 };
 
 /// Public expression wrapper around Krishiv's structured, versioned AST.
@@ -118,6 +119,11 @@ impl Expr {
             order_by.into_iter().map(Expr::into_node).collect(),
         ))
     }
+    /// Attach a `ROWS`/`RANGE BETWEEN ... AND ...` frame to a window
+    /// expression built by [`Expr::over`]. A no-op if called before `.over(...)`.
+    pub fn frame(self, frame: WindowFrame) -> Self {
+        Self::from_node(self.node.frame(frame))
+    }
     fn binary(self, op: BinaryOperator, right: Expr) -> Self {
         Self::from_node(self.node.binary(op, right.node))
     }
@@ -154,6 +160,53 @@ pub fn function(name: impl Into<String>, arguments: Vec<Expr>) -> Expr {
         name,
         arguments.into_iter().map(Expr::into_node).collect(),
     ))
+}
+
+// ── Window functions ──────────────────────────────────────────────────────────
+//
+// Typed sugar over `function(name, args)`, meant to be chained with `.over(...)`
+// (and optionally `.frame(...)`), e.g. `rank().over(vec![col("dept")], vec![col("salary").desc()])`.
+// These render through the same SQL text path as any other `Expr`, so they
+// work anywhere `over`/`frame` already do.
+
+pub fn row_number() -> Expr {
+    function("row_number", vec![])
+}
+pub fn rank() -> Expr {
+    function("rank", vec![])
+}
+pub fn dense_rank() -> Expr {
+    function("dense_rank", vec![])
+}
+pub fn percent_rank() -> Expr {
+    function("percent_rank", vec![])
+}
+pub fn cume_dist() -> Expr {
+    function("cume_dist", vec![])
+}
+pub fn ntile(n: i64) -> Expr {
+    function("ntile", vec![lit(n)])
+}
+/// `LAG(expr, offset)`, or `LAG(expr, offset, default)` when `default` is given.
+pub fn lag(expr: Expr, offset: i64, default: Option<Expr>) -> Expr {
+    let mut args = vec![expr, lit(offset)];
+    args.extend(default);
+    function("lag", args)
+}
+/// `LEAD(expr, offset)`, or `LEAD(expr, offset, default)` when `default` is given.
+pub fn lead(expr: Expr, offset: i64, default: Option<Expr>) -> Expr {
+    let mut args = vec![expr, lit(offset)];
+    args.extend(default);
+    function("lead", args)
+}
+pub fn first_value(expr: Expr) -> Expr {
+    function("first_value", vec![expr])
+}
+pub fn last_value(expr: Expr) -> Expr {
+    function("last_value", vec![expr])
+}
+pub fn nth_value(expr: Expr, n: i64) -> Expr {
+    function("nth_value", vec![expr, lit(n)])
 }
 fn aggregate(function: AggregateFunction, expression: Option<Expr>) -> Expr {
     Expr::from_node(krishiv_plan::expression::Expr::Aggregate {

@@ -18,10 +18,21 @@ from ..krishiv import (
     col as _col,
     count as _count,
     count_all as _count_all,
+    cume_dist as _cume_dist,
+    dense_rank as _dense_rank,
     expr as _expr,
+    first_value as _first_value,
+    lag as _lag,
+    last_value as _last_value,
+    lead as _lead,
     lit as _lit,
     max as _max,
     min as _min,
+    nth_value as _nth_value,
+    ntile as _ntile,
+    percent_rank as _percent_rank,
+    rank as _rank,
+    row_number as _row_number,
     sum as _sum,
 )
 
@@ -221,6 +232,59 @@ def try_cast(column: ColumnLike, data_type: str) -> Column:
     return _to_column(column).try_cast(data_type)
 
 
+# ── Window functions ──────────────────────────────────────────────────────────
+#
+# Chain with `.over(partition_by=[...], order_by=[...])` and optionally
+# `.rows_between(start, end)` / `.range_between(start, end)`, e.g.
+# `rank().over(partition_by=[col("dept")], order_by=[desc(col("salary"))])`.
+
+
+def row_number() -> Column:
+    return _row_number()
+
+
+def rank() -> Column:
+    return _rank()
+
+
+def dense_rank() -> Column:
+    return _dense_rank()
+
+
+def percent_rank() -> Column:
+    return _percent_rank()
+
+
+def cume_dist() -> Column:
+    return _cume_dist()
+
+
+def ntile(n: int) -> Column:
+    return _ntile(n)
+
+
+def lag(column: ColumnLike, offset: int = 1, default: ColumnLike = None) -> Column:
+    default_column = None if default is None else _to_column(default)
+    return _lag(_to_column(column), offset, default_column)
+
+
+def lead(column: ColumnLike, offset: int = 1, default: ColumnLike = None) -> Column:
+    default_column = None if default is None else _to_column(default)
+    return _lead(_to_column(column), offset, default_column)
+
+
+def first_value(column: ColumnLike) -> Column:
+    return _first_value(_to_column(column))
+
+
+def last_value(column: ColumnLike) -> Column:
+    return _last_value(_to_column(column))
+
+
+def nth_value(column: ColumnLike, n: int) -> Column:
+    return _nth_value(_to_column(column), n)
+
+
 __all__ = [
     "abs",
     "asc",
@@ -235,18 +299,24 @@ __all__ = [
     "cos",
     "count",
     "count_all",
+    "cume_dist",
     "current_date",
     "current_timestamp",
     "date_trunc",
+    "dense_rank",
     "desc",
     "exp",
     "expr",
+    "first_value",
     "floor",
     "function",
     "ifnull",
     "isnan",
     "isnotnull",
     "isnull",
+    "lag",
+    "last_value",
+    "lead",
     "length",
     "lit",
     "log",
@@ -255,8 +325,13 @@ __all__ = [
     "max",
     "mean",
     "min",
+    "nth_value",
+    "ntile",
     "nullif",
+    "percent_rank",
+    "rank",
     "round",
+    "row_number",
     "rtrim",
     "sin",
     "sqrt",

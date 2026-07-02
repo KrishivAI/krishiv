@@ -781,6 +781,61 @@ async fn stream_async_embedded_push_and_drain() {
     let _ = job.drain().await.expect("drain");
 }
 
+#[test]
+fn typed_window_functions_and_frame_execute() {
+    use crate::expression::{
+        WindowFrame, WindowFrameBound, col, dense_rank, first_value, lag, last_value, lead, rank,
+        row_number, sum,
+    };
+
+    let session = Session::builder().build().unwrap();
+    let df = session
+        .sql(
+            "SELECT 1 AS grp, 10 AS amount UNION ALL SELECT 1 AS grp, 20 AS amount \
+             UNION ALL SELECT 1 AS grp, 30 AS amount",
+        )
+        .unwrap();
+    let order = vec![col("amount").asc()];
+    let windowed = df
+        .select_exprs(&[
+            col("grp"),
+            col("amount"),
+            row_number()
+                .over(vec![col("grp")], order.clone())
+                .alias("rn"),
+            rank().over(vec![col("grp")], order.clone()).alias("rk"),
+            dense_rank()
+                .over(vec![col("grp")], order.clone())
+                .alias("dr"),
+            lag(col("amount"), 1, None)
+                .over(vec![col("grp")], order.clone())
+                .alias("lag_amt"),
+            lead(col("amount"), 1, None)
+                .over(vec![col("grp")], order.clone())
+                .alias("lead_amt"),
+            first_value(col("amount"))
+                .over(vec![col("grp")], order.clone())
+                .alias("first_amt"),
+            last_value(col("amount"))
+                .over(vec![col("grp")], order.clone())
+                .frame(WindowFrame::rows(
+                    WindowFrameBound::UnboundedPreceding,
+                    WindowFrameBound::UnboundedFollowing,
+                ))
+                .alias("last_amt"),
+            sum(col("amount"))
+                .over(vec![col("grp")], order.clone())
+                .frame(WindowFrame::rows(
+                    WindowFrameBound::UnboundedPreceding,
+                    WindowFrameBound::CurrentRow,
+                ))
+                .alias("running_sum"),
+        ])
+        .unwrap();
+    let result = windowed.collect().unwrap();
+    assert_eq!(result.row_count(), 3);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn continuous_stream_job_poll_drains_via_coordinator() {
     use krishiv_runtime::LocalWindowExecutionSpec;

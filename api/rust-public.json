@@ -1552,7 +1552,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L166",
+      "documentation": "crates/krishiv-api/src/expression.rs#L219",
       "id": "crates/krishiv-api/src/expression.rs::enum::Literal::#[derive(Debug, Clone, PartialEq)] pub enum Literal",
       "kind": "enum",
       "name": "Literal",
@@ -1562,7 +1562,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L44",
+      "documentation": "crates/krishiv-api/src/expression.rs#L45",
       "id": "crates/krishiv-api/src/expression.rs::fn::alias::pub fn alias(self, name: &str) -> Self",
       "kind": "fn",
       "name": "alias",
@@ -1572,7 +1572,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L65",
+      "documentation": "crates/krishiv-api/src/expression.rs#L66",
       "id": "crates/krishiv-api/src/expression.rs::fn::and::pub fn and(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "and",
@@ -1582,7 +1582,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L32",
+      "documentation": "crates/krishiv-api/src/expression.rs#L33",
       "id": "crates/krishiv-api/src/expression.rs::fn::as_sql::pub fn as_sql(&self) -> &str",
       "kind": "fn",
       "name": "as_sql",
@@ -1592,7 +1592,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L101",
+      "documentation": "crates/krishiv-api/src/expression.rs#L102",
       "id": "crates/krishiv-api/src/expression.rs::fn::asc::pub fn asc(self) -> Self",
       "kind": "fn",
       "name": "asc",
@@ -1602,7 +1602,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L143",
+      "documentation": "crates/krishiv-api/src/expression.rs#L149",
       "id": "crates/krishiv-api/src/expression.rs::fn::avg::pub fn avg(expr: Expr) -> Expr",
       "kind": "fn",
       "name": "avg",
@@ -1612,7 +1612,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L95",
+      "documentation": "crates/krishiv-api/src/expression.rs#L96",
       "id": "crates/krishiv-api/src/expression.rs::fn::cast::pub fn cast(self, data_type: ExprDataType) -> Self",
       "kind": "fn",
       "name": "cast",
@@ -1622,7 +1622,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L125",
+      "documentation": "crates/krishiv-api/src/expression.rs#L131",
       "id": "crates/krishiv-api/src/expression.rs::fn::col::pub fn col(name: &str) -> Expr",
       "kind": "fn",
       "name": "col",
@@ -1632,7 +1632,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L134",
+      "documentation": "crates/krishiv-api/src/expression.rs#L140",
       "id": "crates/krishiv-api/src/expression.rs::fn::count::pub fn count(expr: Expr) -> Expr",
       "kind": "fn",
       "name": "count",
@@ -1642,7 +1642,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L137",
+      "documentation": "crates/krishiv-api/src/expression.rs#L143",
       "id": "crates/krishiv-api/src/expression.rs::fn::count_all::pub fn count_all() -> Expr",
       "kind": "fn",
       "name": "count_all",
@@ -1652,7 +1652,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L41",
+      "documentation": "crates/krishiv-api/src/expression.rs#L184",
+      "id": "crates/krishiv-api/src/expression.rs::fn::cume_dist::pub fn cume_dist() -> Expr",
+      "kind": "fn",
+      "name": "cume_dist",
+      "replacement": null,
+      "signature": "pub fn cume_dist() -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L42",
       "id": "crates/krishiv-api/src/expression.rs::fn::decode_versioned::pub fn decode_versioned(bytes: &[u8]) -> Result<Self, PlanError>",
       "kind": "fn",
       "name": "decode_versioned",
@@ -1662,7 +1672,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L108",
+      "documentation": "crates/krishiv-api/src/expression.rs#L178",
+      "id": "crates/krishiv-api/src/expression.rs::fn::dense_rank::pub fn dense_rank() -> Expr",
+      "kind": "fn",
+      "name": "dense_rank",
+      "replacement": null,
+      "signature": "pub fn dense_rank() -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L109",
       "id": "crates/krishiv-api/src/expression.rs::fn::desc::pub fn desc(self) -> Self",
       "kind": "fn",
       "name": "desc",
@@ -1672,7 +1692,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L80",
+      "documentation": "crates/krishiv-api/src/expression.rs#L81",
       "id": "crates/krishiv-api/src/expression.rs::fn::divide::pub fn divide(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "divide",
@@ -1682,7 +1702,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L38",
+      "documentation": "crates/krishiv-api/src/expression.rs#L39",
       "id": "crates/krishiv-api/src/expression.rs::fn::encode_versioned::pub fn encode_versioned(&self) -> Result<Vec<u8>, PlanError>",
       "kind": "fn",
       "name": "encode_versioned",
@@ -1692,7 +1712,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L47",
+      "documentation": "crates/krishiv-api/src/expression.rs#L48",
       "id": "crates/krishiv-api/src/expression.rs::fn::eq::pub fn eq(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "eq",
@@ -1702,7 +1722,27 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L17",
+      "documentation": "crates/krishiv-api/src/expression.rs#L202",
+      "id": "crates/krishiv-api/src/expression.rs::fn::first_value::pub fn first_value(expr: Expr) -> Expr",
+      "kind": "fn",
+      "name": "first_value",
+      "replacement": null,
+      "signature": "pub fn first_value(expr: Expr) -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L124",
+      "id": "crates/krishiv-api/src/expression.rs::fn::frame::pub fn frame(self, frame: WindowFrame) -> Self",
+      "kind": "fn",
+      "name": "frame",
+      "replacement": null,
+      "signature": "pub fn frame(self, frame: WindowFrame) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L18",
       "id": "crates/krishiv-api/src/expression.rs::fn::from_node::pub fn from_node(node: krishiv_plan::expression::Expr) -> Self",
       "kind": "fn",
       "name": "from_node",
@@ -1712,7 +1752,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L152",
+      "documentation": "crates/krishiv-api/src/expression.rs#L158",
       "id": "crates/krishiv-api/src/expression.rs::fn::function::pub fn function(name: impl Into<String>, arguments: Vec<Expr>) -> Expr",
       "kind": "fn",
       "name": "function",
@@ -1722,7 +1762,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L53",
+      "documentation": "crates/krishiv-api/src/expression.rs#L54",
       "id": "crates/krishiv-api/src/expression.rs::fn::gt::pub fn gt(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "gt",
@@ -1732,7 +1772,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L56",
+      "documentation": "crates/krishiv-api/src/expression.rs#L57",
       "id": "crates/krishiv-api/src/expression.rs::fn::gt_eq::pub fn gt_eq(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "gt_eq",
@@ -1742,7 +1782,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L24",
+      "documentation": "crates/krishiv-api/src/expression.rs#L25",
       "id": "crates/krishiv-api/src/expression.rs::fn::into_node::pub fn into_node(self) -> krishiv_plan::expression::Expr",
       "kind": "fn",
       "name": "into_node",
@@ -1752,7 +1792,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L89",
+      "documentation": "crates/krishiv-api/src/expression.rs#L90",
       "id": "crates/krishiv-api/src/expression.rs::fn::is_not_null::pub fn is_not_null(self) -> Self",
       "kind": "fn",
       "name": "is_not_null",
@@ -1762,7 +1802,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L83",
+      "documentation": "crates/krishiv-api/src/expression.rs#L84",
       "id": "crates/krishiv-api/src/expression.rs::fn::is_null::pub fn is_null(self) -> Self",
       "kind": "fn",
       "name": "is_null",
@@ -1772,7 +1812,37 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L129",
+      "documentation": "crates/krishiv-api/src/expression.rs#L191",
+      "id": "crates/krishiv-api/src/expression.rs::fn::lag::pub fn lag(expr: Expr, offset: i64, default: Option<Expr>) -> Expr",
+      "kind": "fn",
+      "name": "lag",
+      "replacement": null,
+      "signature": "pub fn lag(expr: Expr, offset: i64, default: Option<Expr>) -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L205",
+      "id": "crates/krishiv-api/src/expression.rs::fn::last_value::pub fn last_value(expr: Expr) -> Expr",
+      "kind": "fn",
+      "name": "last_value",
+      "replacement": null,
+      "signature": "pub fn last_value(expr: Expr) -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L197",
+      "id": "crates/krishiv-api/src/expression.rs::fn::lead::pub fn lead(expr: Expr, offset: i64, default: Option<Expr>) -> Expr",
+      "kind": "fn",
+      "name": "lead",
+      "replacement": null,
+      "signature": "pub fn lead(expr: Expr, offset: i64, default: Option<Expr>) -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L135",
       "id": "crates/krishiv-api/src/expression.rs::fn::lit::pub fn lit(value: impl Into<Literal>) -> Expr",
       "kind": "fn",
       "name": "lit",
@@ -1782,7 +1852,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L59",
+      "documentation": "crates/krishiv-api/src/expression.rs#L60",
       "id": "crates/krishiv-api/src/expression.rs::fn::lt::pub fn lt(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "lt",
@@ -1792,7 +1862,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L62",
+      "documentation": "crates/krishiv-api/src/expression.rs#L63",
       "id": "crates/krishiv-api/src/expression.rs::fn::lt_eq::pub fn lt_eq(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "lt_eq",
@@ -1802,7 +1872,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L149",
+      "documentation": "crates/krishiv-api/src/expression.rs#L155",
       "id": "crates/krishiv-api/src/expression.rs::fn::max::pub fn max(expr: Expr) -> Expr",
       "kind": "fn",
       "name": "max",
@@ -1812,7 +1882,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L146",
+      "documentation": "crates/krishiv-api/src/expression.rs#L152",
       "id": "crates/krishiv-api/src/expression.rs::fn::min::pub fn min(expr: Expr) -> Expr",
       "kind": "fn",
       "name": "min",
@@ -1822,7 +1892,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L74",
+      "documentation": "crates/krishiv-api/src/expression.rs#L75",
       "id": "crates/krishiv-api/src/expression.rs::fn::minus::pub fn minus(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "minus",
@@ -1832,7 +1902,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L77",
+      "documentation": "crates/krishiv-api/src/expression.rs#L78",
       "id": "crates/krishiv-api/src/expression.rs::fn::multiply::pub fn multiply(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "multiply",
@@ -1842,7 +1912,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L21",
+      "documentation": "crates/krishiv-api/src/expression.rs#L22",
       "id": "crates/krishiv-api/src/expression.rs::fn::node::pub fn node(&self) -> &krishiv_plan::expression::Expr",
       "kind": "fn",
       "name": "node",
@@ -1852,7 +1922,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L35",
+      "documentation": "crates/krishiv-api/src/expression.rs#L36",
       "id": "crates/krishiv-api/src/expression.rs::fn::normalize_json::pub fn normalize_json(&self) -> Result<String, PlanError>",
       "kind": "fn",
       "name": "normalize_json",
@@ -1862,7 +1932,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L50",
+      "documentation": "crates/krishiv-api/src/expression.rs#L51",
       "id": "crates/krishiv-api/src/expression.rs::fn::not_eq::pub fn not_eq(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "not_eq",
@@ -1872,7 +1942,27 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L68",
+      "documentation": "crates/krishiv-api/src/expression.rs#L208",
+      "id": "crates/krishiv-api/src/expression.rs::fn::nth_value::pub fn nth_value(expr: Expr, n: i64) -> Expr",
+      "kind": "fn",
+      "name": "nth_value",
+      "replacement": null,
+      "signature": "pub fn nth_value(expr: Expr, n: i64) -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L187",
+      "id": "crates/krishiv-api/src/expression.rs::fn::ntile::pub fn ntile(n: i64) -> Expr",
+      "kind": "fn",
+      "name": "ntile",
+      "replacement": null,
+      "signature": "pub fn ntile(n: i64) -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L69",
       "id": "crates/krishiv-api/src/expression.rs::fn::or::pub fn or(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "or",
@@ -1882,7 +1972,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L115",
+      "documentation": "crates/krishiv-api/src/expression.rs#L116",
       "id": "crates/krishiv-api/src/expression.rs::fn::over::pub fn over(self, partition_by: Vec<Expr>, order_by: Vec<Expr>) -> Self",
       "kind": "fn",
       "name": "over",
@@ -1892,7 +1982,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L71",
+      "documentation": "crates/krishiv-api/src/expression.rs#L181",
+      "id": "crates/krishiv-api/src/expression.rs::fn::percent_rank::pub fn percent_rank() -> Expr",
+      "kind": "fn",
+      "name": "percent_rank",
+      "replacement": null,
+      "signature": "pub fn percent_rank() -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L72",
       "id": "crates/krishiv-api/src/expression.rs::fn::plus::pub fn plus(self, right: Expr) -> Self",
       "kind": "fn",
       "name": "plus",
@@ -1902,7 +2002,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L28",
+      "documentation": "crates/krishiv-api/src/expression.rs#L175",
+      "id": "crates/krishiv-api/src/expression.rs::fn::rank::pub fn rank() -> Expr",
+      "kind": "fn",
+      "name": "rank",
+      "replacement": null,
+      "signature": "pub fn rank() -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L29",
       "id": "crates/krishiv-api/src/expression.rs::fn::raw::pub fn raw(sql: impl Into<String>) -> Self",
       "kind": "fn",
       "name": "raw",
@@ -1912,7 +2022,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L140",
+      "documentation": "crates/krishiv-api/src/expression.rs#L171",
+      "id": "crates/krishiv-api/src/expression.rs::fn::row_number::pub fn row_number() -> Expr",
+      "kind": "fn",
+      "name": "row_number",
+      "replacement": null,
+      "signature": "pub fn row_number() -> Expr",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-api/src/expression.rs#L146",
       "id": "crates/krishiv-api/src/expression.rs::fn::sum::pub fn sum(expr: Expr) -> Expr",
       "kind": "fn",
       "name": "sum",
@@ -1922,7 +2042,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L98",
+      "documentation": "crates/krishiv-api/src/expression.rs#L99",
       "id": "crates/krishiv-api/src/expression.rs::fn::try_cast::pub fn try_cast(self, data_type: ExprDataType) -> Self",
       "kind": "fn",
       "name": "try_cast",
@@ -1932,7 +2052,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-api/src/expression.rs#L10",
+      "documentation": "crates/krishiv-api/src/expression.rs#L11",
       "id": "crates/krishiv-api/src/expression.rs::struct::Expr::#[derive(Debug, Clone, PartialEq, Eq, Hash)] pub struct Expr",
       "kind": "struct",
       "name": "Expr",
@@ -6704,7 +6824,7 @@
     "engines::{ BatchEngine, IncrementalEngine, RunningJob, StreamingEngine, run_job, spawn_streaming_job, }",
     "error::{KrishivError, Result}",
     "execute::Execute",
-    "expression::{ AggregateFunction as ExprAggregateFunction, BinaryOperator as ExprBinaryOperator, EXPRESSION_FORMAT_VERSION, Expr, ExprDataType, ExprField, IntervalUnit, Literal, NullOrdering, ScalarValue, SortDirection, TimeUnit, avg, col, count, count_all, function, lit, max, min, sum, }",
+    "expression::{ AggregateFunction as ExprAggregateFunction, BinaryOperator as ExprBinaryOperator, EXPRESSION_FORMAT_VERSION, Expr, ExprDataType, ExprField, IntervalUnit, Literal, NullOrdering, ScalarValue, SortDirection, TimeUnit, WindowFrame, WindowFrameBound, WindowFrameUnits, avg, col, count, count_all, cume_dist, dense_rank, first_value, function, lag, last_value, lead, lit, max, min, nth_value, ntile, percent_rank, rank, row_number, sum, }",
     "incremental_flow::{IncrementalFlow, StepSummary}",
     "io::{ CsvReadOptions, DataFormat, DataFrameReader, DataFrameWriter, FileReadOptions, FileWriteOptions, JsonReadOptions, MalformedRecordPolicy, ParquetReadOptions, }",
     "ivm::IvmJob",
@@ -6724,7 +6844,7 @@
     "krishiv_dataflow::{ AggExpr, AggFunction, BroadcastContext, BroadcastProcessExecutor, BroadcastProcessFunction, BroadcastStateDescriptor, CoProcessExecutor, CoProcessFunction, ConnectedStreams, ListState, MapState, OperatorConfig, OperatorUid, ProcessContext, ProcessFunction, ProcessFunctionExecutor, ReducingState, StateError, StateValue, TimerEntry, TimerKind, ValueState, }",
     "krishiv_engine_core::{ ChangelogBatch, CompiledJob, ComputeEngine, DeliveryContract, EngineError, EngineKind, EngineRuntime, JobHandle, Placement, QueryExecutor, RowKind, SinkSpec, SourceSpec, StatePolicy, }",
     "krishiv_ivm::{IncrementalFlow, IvmError, StepSummary}",
-    "krishiv_plan::expression::{ AggregateFunction, BinaryOperator, EXPRESSION_FORMAT_VERSION, ExprDataType, ExprField, IntervalUnit, NullOrdering, ScalarValue, SortDirection, TimeUnit, }",
+    "krishiv_plan::expression::{ AggregateFunction, BinaryOperator, EXPRESSION_FORMAT_VERSION, ExprDataType, ExprField, IntervalUnit, NullOrdering, ScalarValue, SortDirection, TimeUnit, WindowFrame, WindowFrameBound, WindowFrameUnits, }",
     "krishiv_plan::governance::{AuthProvider, PolicyHook}",
     "krishiv_plan::udf::{AggregateUdf, ScalarUdf, TableUdf, UdfError, UdfRegistry}",
     "krishiv_plan::udf::{ScalarUdf, UdfError, UdfRegistry}",

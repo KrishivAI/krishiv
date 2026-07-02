@@ -6346,3 +6346,67 @@ live.
 `podAntiAffinity` with `topologyKey: kubernetes.io/hostname`, so executor pods
 spread across nodes automatically once a second node joins. Nothing to implement —
 purely awaiting a second physical node.
+
+---
+
+## 2026-07-02 — Rust/Python/SQL API matrix vs. DataFusion SQL support: gaps closed
+
+Follow-up to the earlier sync/async API audit (PR #95). Compared Krishiv's
+Rust/Python/SQL surface against DataFusion's native SQL feature set and closed
+every gap that was in scope for the engine we actually have:
+
+- **PIVOT/UNPIVOT dead-code bug**: `crates/krishiv-sql/src/pivot_sql.rs`'s
+  `rewrite_pivot_unpivot` (CASE WHEN / UNION ALL rewrite) existed and was tested
+  in isolation but was never called from `SqlEngine::sql()` — PIVOT/UNPIVOT
+  queries silently fell through to DataFusion's native parser, which doesn't
+  support either construct, and would have errored. Wired the rewrite into the
+  text-preprocessing pipeline in `lib.rs` ahead of the TUMBLE/HOP/SESSION TVF
+  rewrite. Added `sql_text_pivot_is_wired_into_query_execution` and
+  `sql_text_unpivot_is_wired_into_query_execution` regression tests so this
+  can't silently regress again.
+- **`information_schema` was disabled**: `build_single_node_session_config()`
+  never set `.with_information_schema(true)`, so `information_schema.tables`
+  etc. were unqueryable even though DataFusion supports them natively. Enabled
+  it; added `information_schema_tables_is_queryable`.
+- **Window function / frame gap**: `krishiv_plan::expression::Expr::Window` had
+  no frame-spec (`ROWS`/`RANGE BETWEEN`) field, and there were no typed
+  constructors for `row_number`, `rank`, `dense_rank`, `percent_rank`,
+  `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`
+  in the Rust (`krishiv-api`) or Python (`krishiv-python`) layers — callers had
+  to hand-write raw SQL strings for anything beyond a bare `OVER(...)`. Added
+  `WindowFrame`/`WindowFrameUnits`/`WindowFrameBound` to `krishiv-plan`
+  (versioned, serde round-trippable, `#[serde(default)]` on the new `frame`
+  field for backward-compatible decoding of pre-existing serialized plans), a
+  `.frame(...)` builder, `validate()` enforcement that `RANGE` frames with
+  non-unbounded bounds require an `ORDER BY`, and `to_sql()` rendering. Added
+  the 11 typed constructors to `krishiv-api`, PyO3 bindings + a PySpark-style
+  `.rows_between(start, end)`/`.range_between(start, end)` on `Column` (signed
+  int convention: negative = N PRECEDING, 0 = CURRENT ROW, positive = N
+  FOLLOWING, `None` = UNBOUNDED) in `krishiv-python`, and the corresponding
+  `krishiv.sql.functions` wrappers. Because `Expr::Window`/`Function` already
+  lower via SQL-string rendering + re-parse in `lower_public_expression()`, no
+  execution-path changes were needed beyond correct `to_sql()` output.
+- **`grammar.rs` corrections** (the crate's self-declared SQL feature matrix):
+  added `dml.copy_to`, `ddl.create_schema`, `prepared.sql_text`,
+  `introspection.information_schema` as Supported; corrected
+  `temporal.match_recognize` from Supported to Partial (it's a streaming-CEP
+  subset — `PARTITION BY`/`ORDER BY`/`PATTERN`/`WITHIN <duration>` only, no
+  `DEFINE`/`MEASURES` clauses — not the full Oracle/Flink grammar the old
+  `Supported` label implied).
+- Confirmed **not** gaps (verified via existing passing tests before doing any
+  work, to avoid redundant changes): Python `how=` already exposes LEFT/RIGHT
+  SEMI/ANTI joins.
+- `scripts/check_api_surface.py`: added `CLASS_METHOD_SIGNATURES`/
+  `FUNCTION_SIGNATURES` override entries for the 2 new `Column` methods and 11
+  new functions so the generated `.pyi` stub carries precise signatures instead
+  of the generic `*args/**kwargs` fallback.
+
+Validation: `cargo fmt --check` clean; `cargo clippy --workspace --exclude
+krishiv-python --exclude krishiv-chaos -- -D warnings` clean; full Rust
+workspace `--lib` suite green across all 21 crates (0 failures); Python pytest
+suite green (484 passed, 29 skipped — pre-existing, unrelated flake in
+`test_sample`'s random-sampling assertion, not touched); `check_api_surface.py`
+validates cleanly and `compare_api_surface.py --against-ref origin/main` shows
+only additive changes for this work (the 7 breaking entries are the
+already-`approved-breaking.toml`-covered `+ Send` bound changes from the
+earlier sync/async-audit commit in this same PR, not new).
