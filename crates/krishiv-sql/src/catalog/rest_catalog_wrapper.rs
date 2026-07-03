@@ -16,7 +16,10 @@ use iceberg::{
     Catalog, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation,
     TableIdent,
 };
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use iceberg::CatalogBuilder as _;
+use iceberg_catalog_rest::{
+    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
+};
 
 use crate::catalog::CatalogError;
 
@@ -29,25 +32,31 @@ pub struct KrishivRestCatalog {
 impl KrishivRestCatalog {
     /// Connect to the Iceberg REST catalog at `uri`.
     ///
-    /// `warehouse` identifies the default warehouse within the catalog server.
-    /// `token` is an optional Bearer token for servers that require authentication.
+    /// `warehouse` identifies the default warehouse within the catalog server
+    /// (empty string = server default). `token` is an optional Bearer token
+    /// for servers that require authentication.
     pub async fn new(
         uri: &str,
         warehouse: &str,
         token: Option<&str>,
     ) -> Result<Self, CatalogError> {
-        let mut builder = RestCatalogConfig::builder()
-            .uri(uri.to_string())
-            .warehouse(warehouse.to_string());
-
-        if let Some(t) = token {
-            builder = builder.token(t.to_string());
+        let mut props: HashMap<String, String> = HashMap::new();
+        props.insert(REST_CATALOG_PROP_URI.to_string(), uri.to_string());
+        if !warehouse.is_empty() {
+            props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string());
         }
-
-        let config = builder.build();
-
+        if let Some(t) = token {
+            props.insert(String::from("token"), t.to_string());
+        }
+        // v1 platform warehouses are file:// paths; the S3 factory arrives
+        // with object-store deployments (platform Phase 14).
+        let inner = RestCatalogBuilder::default()
+            .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
+            .load("rest", props)
+            .await
+            .map_err(|e| CatalogError::Iceberg(e.to_string()))?;
         Ok(Self {
-            inner: Arc::new(RestCatalog::new(config)),
+            inner: Arc::new(inner),
         })
     }
 

@@ -37,6 +37,9 @@ prost = { workspace = true }
 [features]
 kafka = ["krishiv-runtime/kafka", "krishiv-api/kafka"]
 jemalloc = ["dep:tikv-jemallocator"]
+# Attach an Iceberg REST catalog (e.g. the Krishiv Platform catalog) to the
+# in-process engine at daemon startup via KRISHIV_ICEBERG_REST_* env vars.
+rest-catalog = ["krishiv-sql/rest-catalog", "krishiv-sql/iceberg-datafusion"]
 
 [dev-dependencies]
 futures = { workspace = true }

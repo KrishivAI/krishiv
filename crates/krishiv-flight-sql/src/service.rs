@@ -1205,6 +1205,8 @@ pub async fn run_flight_server_with_host(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_stream::wrappers::TcpListenerStream;
 
+    #[cfg(feature = "rest-catalog")]
+    host.register_rest_catalog_from_env().await?;
     let service = KrishivFlightSqlService::with_host(host);
     let service = configure_flight_auth_from_env(service)?;
     let server = arrow_flight::flight_service_server::FlightServiceServer::new(service);
@@ -1228,7 +1230,11 @@ pub async fn run_flight_server(
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!(addr = %addr, "krishiv-flight-server listening");
-    let server = make_flight_sql_server()?;
+    let host = FlightExecutionHost::from_env()?;
+    #[cfg(feature = "rest-catalog")]
+    host.register_rest_catalog_from_env().await?;
+    let service = configure_flight_auth_from_env(KrishivFlightSqlService::with_host(host))?;
+    let server = arrow_flight::flight_service_server::FlightServiceServer::new(service);
     tonic::transport::Server::builder()
         .add_service(server)
         .serve(addr)

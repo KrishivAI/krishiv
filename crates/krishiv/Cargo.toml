@@ -37,7 +37,7 @@ default = ["local"]
 
 # Build presets
 minimal = []
-local   = ["embedded", "single-node", "jemalloc"]
+local   = ["embedded", "single-node", "jemalloc", "rest-catalog"]
 full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "jemalloc"]
 
 # Deployment capability surfaces (gate optional dep families)
@@ -50,6 +50,9 @@ k8s         = ["distributed", "dep:krishiv-operator", "krishiv-operator/k8s"]
 
 # Optional dependency families
 flight-sql = ["dep:krishiv-flight-sql"]
+# Platform catalog bridge: the local daemon can attach an Iceberg REST
+# catalog (KRISHIV_ICEBERG_REST_* env) so SQL resolves governed tables.
+rest-catalog = ["flight-sql", "krishiv-flight-sql/rest-catalog"]
 shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
 kafka = ["krishiv-connectors/kafka"]

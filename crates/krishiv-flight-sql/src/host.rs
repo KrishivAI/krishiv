@@ -408,6 +408,55 @@ impl FlightExecutionHost {
         }
     }
 
+    /// Register an Iceberg REST catalog on the local runner SQL engine from
+    /// the environment; the platform daemon points these at its catalog so
+    /// SQL can reference governed tables as `<name>.<namespace>.<table>`.
+    ///
+    /// Env: `KRISHIV_ICEBERG_REST_URI` (activates when set),
+    /// `KRISHIV_ICEBERG_REST_WAREHOUSE`, `KRISHIV_ICEBERG_REST_TOKEN`
+    /// (bearer, e.g. a platform PAT), `KRISHIV_ICEBERG_REST_NAME`
+    /// (catalog name, default `krishiv`).
+    ///
+    /// Returns `Ok(false)` when the env var is unset or the backend is
+    /// coordinator-delegated (registration must happen on the coordinator's
+    /// engine — not reachable from here yet).
+    #[cfg(feature = "rest-catalog")]
+    pub async fn register_rest_catalog_from_env(&self) -> Result<bool, Status> {
+        let Ok(uri) = std::env::var("KRISHIV_ICEBERG_REST_URI") else {
+            return Ok(false);
+        };
+        let warehouse = std::env::var("KRISHIV_ICEBERG_REST_WAREHOUSE").unwrap_or_default();
+        let token = std::env::var("KRISHIV_ICEBERG_REST_TOKEN").ok();
+        let name = std::env::var("KRISHIV_ICEBERG_REST_NAME")
+            .unwrap_or_else(|_| String::from("krishiv"));
+        match self.backend.as_ref() {
+            FlightHostBackend::InProcess(cluster) => {
+                let catalog = krishiv_sql::catalog::unified::KrishivCatalog::rest(
+                    &uri,
+                    &warehouse,
+                    token.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("iceberg REST catalog at {uri}: {e}"))
+                })?;
+                cluster
+                    .streaming_runtime()
+                    .runner_sql_engine()
+                    .register_iceberg_catalog(Arc::new(catalog), &name);
+                tracing::info!(%uri, catalog = %name, "iceberg REST catalog registered");
+                Ok(true)
+            }
+            FlightHostBackend::Coordinator(_) => {
+                tracing::warn!(
+                    "KRISHIV_ICEBERG_REST_URI is set but the Flight host delegates to a \
+                     coordinator; register the catalog on the coordinator instead"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// Register a Kafka streaming source.
     ///
     /// In `InProcess` mode registers on the local cluster's SQL engine.

@@ -1210,6 +1210,22 @@ impl SqlEngine {
         catalog: std::sync::Arc<catalog::unified::KrishivCatalog>,
         catalog_name: impl Into<String>,
     ) -> Self {
+        self.register_iceberg_catalog(catalog, catalog_name);
+        self
+    }
+
+    /// Register an Iceberg [`KrishivCatalog`] on an already-built engine.
+    ///
+    /// Non-consuming twin of [`Self::with_iceberg_catalog`] for callers that
+    /// only hold a shared reference (e.g. the Flight SQL daemon attaching a
+    /// platform REST catalog at startup). Invalidates the plan cache so
+    /// statements planned before registration cannot pin the old schema view.
+    #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+    pub fn register_iceberg_catalog(
+        &self,
+        catalog: std::sync::Arc<catalog::unified::KrishivCatalog>,
+        catalog_name: impl Into<String>,
+    ) {
         let catalog_name = catalog_name.into();
         let bridge = catalog::iceberg_catalog_bridge::IcebergCatalogBridge::new(
             Arc::clone(&catalog),
@@ -1221,7 +1237,7 @@ impl SqlEngine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .push((catalog, catalog_name));
-        self
+        self.invalidate_plan_cache();
     }
 
     /// Share a session UDF registry so scalar UDFs are visible in SQL.
