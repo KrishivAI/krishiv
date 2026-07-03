@@ -299,6 +299,7 @@ impl Coordinator {
         self.job_input_partitions.remove(job_id);
         self.job_task_input_partitions.remove(job_id);
         self.continuous_input_cycles.remove(job_id);
+        self.pending_continuous_restores.remove(job_id);
         self.batch_sql_job_tables.remove(job_id);
 
         Ok(())
@@ -636,6 +637,7 @@ impl Coordinator {
             self.job_input_partitions.remove(&job_id);
             self.job_task_input_partitions.remove(&job_id);
             self.continuous_input_cycles.remove(&job_id);
+            self.pending_continuous_restores.remove(&job_id);
             self.batch_sql_job_tables.remove(&job_id);
             if state != JobState::Succeeded {
                 self.job_inline_results.remove(&job_id);
@@ -808,6 +810,7 @@ impl Coordinator {
         self.job_input_partitions.remove(job_id);
         self.job_task_input_partitions.remove(job_id);
         self.continuous_input_cycles.remove(job_id);
+        self.pending_continuous_restores.remove(job_id);
         self.batch_sql_job_tables.remove(job_id);
         self.ckpt.coordinators.remove(job_id);
         self.gc_ready_jobs.retain(|id| id != job_id);

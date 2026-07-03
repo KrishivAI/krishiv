@@ -8,7 +8,7 @@ use krishiv_plan::udf::ResourceLimits;
 
 use crate::fragment::common::{
     build_hot_key_reports, checkpoint_offset_from_dyn_source, parse_registry_partition_specs,
-    task_fragment_body,
+    read_continuous_restore_hint, task_fragment_body,
 };
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
@@ -516,6 +516,23 @@ async fn execute_loop_fragment(
         })?;
     let executor_arc = executor_entry.value().clone();
     drop(executor_entry); // release dashmap lock
+
+    if let Some((snapshot_bytes, _watermark_ms)) =
+        read_continuous_restore_hint(assignment.input_partitions())
+    {
+        let mut exec = executor_arc
+            .lock()
+            .map_err(|_| ExecutorError::LocalExecution {
+                message: format!(
+                    "stream:loop job '{job_id}' executor lock poisoned during restore"
+                ),
+            })?;
+        exec.restore_from_snapshot(&snapshot_bytes)
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("stream:loop restore hint failed: {e}"),
+            })?;
+        runner.pending_restores.remove(job_id);
+    }
 
     // Embedded execution drains the shared session registry. Distributed
     // execution receives the cycle's batches as coordinator-owned InlineIpc

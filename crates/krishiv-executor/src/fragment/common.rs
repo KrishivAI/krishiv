@@ -809,6 +809,23 @@ pub(crate) fn read_watermark_hint(partitions: &[krishiv_proto::InputPartition]) 
         .max()
 }
 
+/// Extract a one-shot continuous-stream restore snapshot from task inputs.
+pub(crate) fn read_continuous_restore_hint(
+    partitions: &[krishiv_proto::InputPartition],
+) -> Option<(Vec<u8>, i64)> {
+    partitions.iter().find_map(|p| {
+        if let Some(InputPartitionDescriptor::ContinuousRestore {
+            snapshot_bytes,
+            watermark_ms,
+        }) = p.descriptor()
+        {
+            Some((snapshot_bytes.clone(), *watermark_ms))
+        } else {
+            None
+        }
+    })
+}
+
 pub(crate) fn read_inline_ipc_partitions(
     partitions: &[krishiv_proto::InputPartition],
 ) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {

@@ -40,11 +40,34 @@ pub struct RocksDbStateBackend {
 }
 
 impl RocksDbStateBackend {
+    /// STATE-2: Build production-tuned RocksDB options with bloom filters,
+    /// dynamic level compaction, and configurable write buffer / max open files.
+    fn production_options() -> Options {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_level_compaction_dynamic_level_bytes(true);
+        let write_buffer_mb = std::env::var("KRISHIV_ROCKSDB_WRITE_BUFFER_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64);
+        opts.set_write_buffer_size(write_buffer_mb as usize * 1024 * 1024);
+        opts.set_max_write_buffer_number(3);
+        let max_open_files = std::env::var("KRISHIV_ROCKSDB_MAX_OPEN_FILES")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(512);
+        opts.set_max_open_files(max_open_files);
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_bloom_filter(10.0, false);
+        block_opts.set_block_size(16 * 1024);
+        opts.set_block_based_table_factory(&block_opts);
+        opts
+    }
+
     /// Open or create a file-backed RocksDB database at `path` with
     /// `durable_fsync = true` (per-write fsync).
     pub fn open(path: impl AsRef<std::path::Path>) -> StateResult<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
+        let opts = Self::production_options();
         let db = DB::open(&opts, path.as_ref()).map_err(db_err)?;
         Ok(Self {
             db,
@@ -65,8 +88,7 @@ impl RocksDbStateBackend {
             });
         }
         let dir = tempfile::tempdir().map_err(db_err)?;
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
+        let opts = Self::production_options();
         let db = DB::open(&opts, dir.path()).map_err(db_err)?;
         Ok(Self {
             db,

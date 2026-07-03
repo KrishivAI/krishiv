@@ -75,87 +75,116 @@ pub struct DeltaJoinSpec {
     pub window_ms: u64,
 }
 
-/// Stateless stream-stream join operator for append-only streams.
+/// Default maximum number of retained rows per side before oldest entries
+/// are evicted. Bounds memory while still allowing cross-batch joins for
+/// recently-arrived events.
+const DEFAULT_MAX_BUFFER_ROWS: usize = 10_000;
+
+/// Stream-stream join operator for append-only streams.
 ///
 /// This operator matches events from two streams that arrive within a time
-/// window, without maintaining any state between micro-batches.
+/// window.  Pending rows from each side are retained (bounded by
+/// `max_buffer_rows`) so that a new batch on one side can join against
+/// recently-seen rows on the other side (cross-batch join).
 pub struct DeltaJoinOperator {
     spec: DeltaJoinSpec,
-    /// Pending left events from the current micro-batch
+    /// Retained left events (bounded by `max_buffer_rows`).
     pending_left: Vec<RecordBatch>,
-    /// Pending right events from the current micro-batch
+    /// Retained right events (bounded by `max_buffer_rows`).
     pending_right: Vec<RecordBatch>,
+    /// Maximum total rows retained per side before oldest batches are evicted.
+    max_buffer_rows: usize,
 }
 
 impl DeltaJoinOperator {
-    /// Create a new delta join operator with the given specification.
+    /// Create a new delta join operator with the default buffer capacity.
     pub fn new(spec: DeltaJoinSpec) -> Self {
+        Self::new_with_capacity(spec, DEFAULT_MAX_BUFFER_ROWS)
+    }
+
+    /// Create a new delta join operator with a custom per-side buffer
+    /// capacity (in rows).  When a side exceeds this capacity the oldest
+    /// batches are evicted.
+    pub fn new_with_capacity(spec: DeltaJoinSpec, max_buffer_rows: usize) -> Self {
         Self {
             spec,
             pending_left: Vec::new(),
             pending_right: Vec::new(),
+            max_buffer_rows,
+        }
+    }
+
+    /// STREAM-3: total number of rows held across all batches in a buffer.
+    fn total_rows(buffers: &[RecordBatch]) -> usize {
+        buffers.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// STREAM-3: evict oldest batches from the front until the buffer's total
+    /// row count is within `max_rows`.  Bounded eviction retains recent rows
+    /// for cross-batch joins without unbounded memory growth.
+    fn evict_overflow(buffers: &mut Vec<RecordBatch>, max_rows: usize) {
+        while Self::total_rows(buffers) > max_rows && buffers.len() > 1 {
+            buffers.remove(0);
         }
     }
 
     /// Process a left stream batch and return any joined results.
     ///
-    /// This method buffers the left batch and attempts to match it against
-    /// any pending right batches. Since this is stateless, only the current
-    /// micro-batch data is considered.
+    /// STREAM-3: the new left batch probes against all retained right rows,
+    /// then the left batch is itself retained so that future right batches
+    /// can join against it.  Buffers are NOT cleared after a join — memory is
+    /// bounded by `max_buffer_rows` eviction.
     pub fn process_left(
         &mut self,
         batch: RecordBatch,
     ) -> Result<Option<RecordBatch>, DeltaJoinError> {
+        // Probe the new left batch against the retained right buffer.
+        let mut results = Vec::new();
+        for right_batch in &self.pending_right {
+            if let Some(joined) = self.join_batches(&batch, right_batch)? {
+                results.push(joined);
+            }
+        }
+        // Retain the new left batch for future right-side probes.
         self.pending_left.push(batch);
-        self.try_join()
+        Self::evict_overflow(&mut self.pending_left, self.max_buffer_rows);
+        Self::evict_overflow(&mut self.pending_right, self.max_buffer_rows);
+        Self::concat_results(results)
     }
 
     /// Process a right stream batch and return any joined results.
     ///
-    /// This method buffers the right batch and attempts to match it against
-    /// any pending left batches.
+    /// STREAM-3: the new right batch probes against all retained left rows,
+    /// then the right batch is itself retained for future left-side probes.
     pub fn process_right(
         &mut self,
         batch: RecordBatch,
     ) -> Result<Option<RecordBatch>, DeltaJoinError> {
-        self.pending_right.push(batch);
-        self.try_join()
-    }
-
-    /// Attempt to join pending left and right batches.
-    fn try_join(&mut self) -> Result<Option<RecordBatch>, DeltaJoinError> {
-        if self.pending_left.is_empty() || self.pending_right.is_empty() {
-            return Ok(None);
-        }
-
         let mut results = Vec::new();
-
-        // For each left batch, try to match against all right batches
         for left_batch in &self.pending_left {
-            for right_batch in &self.pending_right {
-                if let Some(joined) = self.join_batches(left_batch, right_batch)? {
-                    results.push(joined);
-                }
+            if let Some(joined) = self.join_batches(left_batch, &batch)? {
+                results.push(joined);
             }
         }
+        self.pending_right.push(batch);
+        Self::evict_overflow(&mut self.pending_left, self.max_buffer_rows);
+        Self::evict_overflow(&mut self.pending_right, self.max_buffer_rows);
+        Self::concat_results(results)
+    }
 
-        // Clear pending batches after joining
-        self.pending_left.clear();
-        self.pending_right.clear();
-
+    /// Concatenate a vector of joined result batches into a single batch.
+    fn concat_results(results: Vec<RecordBatch>) -> Result<Option<RecordBatch>, DeltaJoinError> {
         if results.is_empty() {
-            Ok(None)
-        } else {
-            // Concatenate all joined results
-            let schema = results
-                .first()
-                .ok_or_else(|| DeltaJoinError::JoinFailed("empty results".into()))?
-                .schema();
-            let batch_refs: Vec<&RecordBatch> = results.iter().collect();
-            let concatenated = compute::concat_batches(&schema, batch_refs)
-                .map_err(|e| DeltaJoinError::JoinFailed(e.to_string()))?;
-            Ok(Some(concatenated))
+            return Ok(None);
         }
+        let schema = results
+            .first()
+            .ok_or_else(|| DeltaJoinError::JoinFailed("empty results".into()))?
+            .schema();
+        let batch_refs: Vec<&RecordBatch> = results.iter().collect();
+        let concatenated = compute::concat_batches(&schema, batch_refs)
+            .map_err(|e| DeltaJoinError::JoinFailed(e.to_string()))?;
+        Ok(Some(concatenated))
     }
 
     /// Join two individual batches based on the join spec.
@@ -320,11 +349,32 @@ impl DeltaJoinOperator {
     }
 }
 
-/// Extract a string value from an array at the given index.
+/// Extract a join-key value from an array at the given index as a `String`.
+///
+/// STREAM-4: match on the array's data type before downcasting so that
+/// non-`Utf8` key columns (e.g. `Int32`, `Int64`) are handled correctly and
+/// unsupported types return an error instead of panicking.
 fn extract_string_value(array: &ArrayRef, index: usize) -> Result<String, DeltaJoinError> {
     use arrow::array::AsArray;
-    let string_array = array.as_string::<i32>();
-    Ok(string_array.value(index).to_string())
+    match array.data_type() {
+        DataType::Utf8 => {
+            let s = array.as_string::<i32>();
+            Ok(s.value(index).to_string())
+        }
+        DataType::LargeUtf8 => {
+            let s = array.as_string::<i64>();
+            Ok(s.value(index).to_string())
+        }
+        DataType::Int32 => {
+            let arr = array.as_primitive::<arrow::datatypes::Int32Type>();
+            Ok(arr.value(index).to_string())
+        }
+        DataType::Int64 => {
+            let arr = array.as_primitive::<arrow::datatypes::Int64Type>();
+            Ok(arr.value(index).to_string())
+        }
+        other => Err(DeltaJoinError::UnsupportedKeyType(other.clone())),
+    }
 }
 
 /// Extract a timestamp value from an array at the given index.
@@ -359,12 +409,17 @@ fn extract_timestamp_value(array: &ArrayRef, index: usize) -> Result<Option<u64>
 pub enum DeltaJoinError {
     /// Join operation failed.
     JoinFailed(String),
+    /// Join key data type is not supported by the delta join key extractor.
+    UnsupportedKeyType(DataType),
 }
 
 impl std::fmt::Display for DeltaJoinError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::JoinFailed(msg) => write!(f, "join failed: {msg}"),
+            Self::UnsupportedKeyType(data_type) => {
+                write!(f, "unsupported delta join key type: {data_type}")
+            }
         }
     }
 }

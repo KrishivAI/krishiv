@@ -189,22 +189,42 @@ pub mod native {
                     return Err(LakehouseError::Iceberg(e.to_string()));
                 }
             };
-            if let Some(loc) = table.metadata_location() {
-                if let Err(e) = self.update_version_hint(loc) {
-                    tracing::warn!(
-                        table = %self.ident,
-                        location = loc,
-                        error = %e,
-                        "version hint update failed after overwrite commit; hint may be stale"
-                    );
-                }
-            }
+            // CONN-1: Write the version-hint AFTER the data commit succeeds,
+            // not before. Writing it here (for the empty recreated table)
+            // would mean a crash between hint-write and data-commit leaves the
+            // version-hint permanently pointing at an empty table → total data
+            // loss on restart.
 
             if batches.is_empty() {
+                // No data to commit — safe to write hint for the new empty table.
+                if let Some(loc) = table.metadata_location() {
+                    if let Err(e) = self.update_version_hint(loc) {
+                        tracing::warn!(
+                            table = %self.ident,
+                            location = loc,
+                            error = %e,
+                            "version hint update failed after overwrite commit; hint may be stale"
+                        );
+                    }
+                }
                 return Ok(0);
             }
             let staged = self.prepare(batches).await?;
-            self.commit(staged, kafka_offsets).await
+            let committed = self.commit(staged, kafka_offsets).await?;
+            // CONN-1: Now that data is durable, write the version-hint.
+            if let Ok(table) = self.catalog.load_table(&self.ident).await {
+                if let Some(loc) = table.metadata_location() {
+                    if let Err(e) = self.update_version_hint(loc) {
+                        tracing::warn!(
+                            table = %self.ident,
+                            location = loc,
+                            error = %e,
+                            "version hint update failed after overwrite commit; hint may be stale"
+                        );
+                    }
+                }
+            }
+            Ok(committed)
         }
 
         /// Record schema evolution in table properties.
@@ -421,9 +441,30 @@ pub mod native {
 
     // ── helpers ─────────────────────────────────────────────────────────────
 
-    fn write_version_hint(root: &Path, metadata_location: &str) -> Result<(), LakehouseError> {
-        let path = root.join("metadata").join(VERSION_HINT);
-        fs::write(&path, metadata_location).map_err(|e| LakehouseError::Io(e.to_string()))
+    /// CONN-2: Atomically write the version-hint file (temp + fsync + rename +
+    /// dir-sync) so a crash or power loss cannot leave a torn hint that makes
+    /// the table unopenable.
+    pub(crate) fn write_version_hint(root: &Path, metadata_location: &str) -> Result<(), LakehouseError> {
+        let dir = root.join("metadata");
+        let target = dir.join(VERSION_HINT);
+        let temp = dir.join(format!(
+            "{VERSION_HINT}.tmp.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::write(&temp, metadata_location).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let f = fs::File::open(&temp).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        f.sync_all().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        drop(f);
+        fs::rename(&temp, &target).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        // Sync the parent directory so the rename is durable.
+        if let Ok(dir_handle) = fs::File::open(&dir) {
+            let _ = dir_handle.sync_all();
+        }
+        Ok(())
     }
 
     /// Convert an absolute local path to a `file://` URI.

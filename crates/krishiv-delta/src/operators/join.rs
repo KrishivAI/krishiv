@@ -21,6 +21,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::delta_batch::{DeltaBatch, WEIGHT_COLUMN};
 use crate::error::{DeltaError, DeltaResult};
+use crate::operators::key_util::scalar_to_key;
 use crate::trace::Trace;
 
 /// Join type for incremental joins.
@@ -66,11 +67,38 @@ impl IncrementalJoinOp {
         right_key_cols: Vec<String>,
         join_type: IncrJoinType,
     ) -> DeltaResult<Self> {
+        Self::new_with_lateness(
+            left_schema,
+            right_schema,
+            left_key_cols,
+            right_key_cols,
+            join_type,
+            None,
+        )
+    }
+
+    /// Create a new incremental join operator with an optional lateness column
+    /// for watermark-driven GC of the join traces.
+    ///
+    /// IVM-3: without calling `with_lateness_column`, `gc_below_watermark` is a
+    /// universal no-op and join traces grow unbounded.
+    pub fn new_with_lateness(
+        left_schema: SchemaRef,
+        right_schema: SchemaRef,
+        left_key_cols: Vec<String>,
+        right_key_cols: Vec<String>,
+        join_type: IncrJoinType,
+        lateness_col: Option<&str>,
+    ) -> DeltaResult<Self> {
         let left_key_refs: Vec<&str> = left_key_cols.iter().map(String::as_str).collect();
         let right_key_refs: Vec<&str> = right_key_cols.iter().map(String::as_str).collect();
 
-        let left_trace = Trace::new(left_schema.clone(), &left_key_refs)?;
-        let right_trace = Trace::new(right_schema.clone(), &right_key_refs)?;
+        let mut left_trace = Trace::new(left_schema.clone(), &left_key_refs)?;
+        let mut right_trace = Trace::new(right_schema.clone(), &right_key_refs)?;
+        if let Some(col) = lateness_col {
+            left_trace = left_trace.with_lateness_column(col)?;
+            right_trace = right_trace.with_lateness_column(col)?;
+        }
 
         // Output schema: all left columns + right non-key columns.
         // For LEFT OUTER JOIN the right non-key columns must be nullable (they are
@@ -599,87 +627,8 @@ impl IncrementalJoinOp {
 fn extract_key(batch: &RecordBatch, row: usize, key_indices: &[usize]) -> Vec<Option<String>> {
     key_indices
         .iter()
-        .map(|&i| extract_str_opt(batch.column(i).as_ref(), row))
+        .map(|&i| scalar_to_key(batch.column(i).as_ref(), row))
         .collect()
-}
-
-fn extract_str_opt(arr: &dyn Array, row: usize) -> Option<String> {
-    use arrow::array::{
-        BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-    };
-    if arr.is_null(row) {
-        return None;
-    }
-    // Signed integers
-    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int16Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int8Array>() {
-        return Some(a.value(row).to_string());
-    }
-    // Unsigned integers
-    if let Some(a) = arr.as_any().downcast_ref::<UInt64Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt32Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt16Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt8Array>() {
-        return Some(a.value(row).to_string());
-    }
-    // Floats: use bit-repr for stable, injective join keys.
-    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return Some(a.value(row).to_bits().to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        return Some((a.value(row).to_bits() as u64).to_string());
-    }
-    // String types
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
-        return Some(a.value(row).to_string());
-    }
-    // Boolean (join on bool columns: rare but valid)
-    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
-        return Some((a.value(row) as u8).to_string());
-    }
-    // Date / Timestamp — raw integer value is the join key
-    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Date64Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampSecondArray>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        return Some(a.value(row).to_string());
-    }
-    None
 }
 
 /// Build a DeltaBatch of null-padded left rows (output for unmatched LEFT OUTER rows).

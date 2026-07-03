@@ -445,6 +445,8 @@ pub fn coordinator_http_router(
 
     let protected: Router<()> = Router::new()
         .route("/api/v1/jobs", get(api_jobs))
+        .route("/api/v1/jobs/{job_id}", get(api_job_by_id))
+        .route("/api/v1/jobs/{job_id}/cancel", post(api_job_cancel))
         .route("/api/v1/executors", get(api_executors))
         .route(
             "/api/v1/executors/{executor_id}/reset",
@@ -461,6 +463,22 @@ pub fn coordinator_http_router(
         .route(
             "/api/v1/bounded-window",
             post(crate::bounded_window_http::api_bounded_window),
+        )
+        .route(
+            "/api/v1/continuous",
+            get(crate::continuous_stream_http::api_continuous_list),
+        )
+        .route(
+            "/api/v1/continuous/{job_id}",
+            get(crate::continuous_stream_http::api_continuous_get),
+        )
+        .route(
+            "/api/v1/continuous/{job_id}/checkpoint",
+            post(crate::continuous_stream_http::api_continuous_checkpoint),
+        )
+        .route(
+            "/api/v1/continuous/{job_id}/restore",
+            post(crate::continuous_stream_http::api_continuous_restore),
         )
         .route(
             "/api/v1/continuous-register",
@@ -532,13 +550,13 @@ pub struct LiveJobView {
     failed_task_count: usize,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct LiveExecutorsResponse {
     executors: Vec<LiveExecutorView>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-struct LiveExecutorView {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LiveExecutorView {
     executor_id: String,
     host: String,
     slots: usize,
@@ -550,26 +568,86 @@ struct LiveExecutorView {
     consecutive_task_failures: u32,
 }
 
+fn live_job_view(job: crate::JobSnapshot) -> LiveJobView {
+    LiveJobView {
+        job_id: job.job_id().to_string(),
+        kind: format!("{:?}", job.kind()),
+        state: format!("{:?}", job.state()),
+        stage_count: job.stage_count(),
+        task_count: job.task_count(),
+        assigned_task_count: job.assigned_task_count(),
+        running_task_count: job.running_task_count(),
+        succeeded_task_count: job.succeeded_task_count(),
+        failed_task_count: job.failed_task_count(),
+    }
+}
+
 async fn api_jobs(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
     let jobs = {
         let coord = coordinator.read().await;
         coord
             .job_snapshots()
             .into_iter()
-            .map(|job| LiveJobView {
-                job_id: job.job_id().to_string(),
-                kind: format!("{:?}", job.kind()),
-                state: format!("{:?}", job.state()),
-                stage_count: job.stage_count(),
-                task_count: job.task_count(),
-                assigned_task_count: job.assigned_task_count(),
-                running_task_count: job.running_task_count(),
-                succeeded_task_count: job.succeeded_task_count(),
-                failed_task_count: job.failed_task_count(),
-            })
+            .map(live_job_view)
             .collect::<Vec<_>>()
     };
     Json(LiveJobsResponse { jobs })
+}
+
+async fn api_job_by_id(
+    State(coordinator): State<SharedCoordinator>,
+    axum::extract::Path(job_id_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let job = {
+        let coord = coordinator.read().await;
+        coord
+            .job_snapshots()
+            .into_iter()
+            .find(|job| job.job_id().as_str() == job_id_str)
+            .map(live_job_view)
+    };
+    match job {
+        Some(job) => (axum::http::StatusCode::OK, Json(serde_json::json!(job))),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job not found", "job_id": job_id_str})),
+        ),
+    }
+}
+
+async fn api_job_cancel(
+    State(coordinator): State<SharedCoordinator>,
+    axum::extract::Path(job_id_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    use krishiv_proto::JobId;
+    let job_id = match JobId::try_new(&job_id_str) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid job id", "job_id": job_id_str})),
+            );
+        }
+    };
+    match coordinator.write().await.cancel_job(&job_id) {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({"cancelled": true, "job_id": job_id_str})),
+        ),
+        Err(error) => {
+            let status = if error.to_string().contains("not found") {
+                axum::http::StatusCode::NOT_FOUND
+            } else {
+                axum::http::StatusCode::CONFLICT
+            };
+            (
+                status,
+                Json(
+                    serde_json::json!({"cancelled": false, "job_id": job_id_str, "error": error.to_string()}),
+                ),
+            )
+        }
+    }
 }
 
 async fn api_executors(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
@@ -1695,6 +1773,112 @@ mod parse_tests {
         assert_eq!(
             failures, 0,
             "circuit breaker counter must be zero after reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_lookup_and_cancel_endpoints_are_live() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+        use tower::ServiceExt;
+
+        let _ = crate::auth::set_allow_anonymous();
+
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-job-http").unwrap(),
+        ));
+        let job_id = JobId::try_new("job-http-cancel").unwrap();
+        let stage_id = StageId::try_new("stage-http-cancel").unwrap();
+        let task_id = TaskId::try_new("task-http-cancel").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "http-cancel", JobKind::Batch).with_stage(
+            StageSpec::new(stage_id, "stage")
+                .with_task(TaskSpec::new(task_id, "window:http-cancel")),
+        );
+        coordinator.write().await.submit_job(spec).unwrap();
+
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let router = coordinator_http_router(coordinator.clone(), &config);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/jobs/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["job_id"], serde_json::json!(job_id.to_string()));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/jobs/{job_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["cancelled"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn executor_list_endpoint_returns_registered_executors() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use krishiv_proto::{ExecutorDescriptor, ExecutorId};
+        use tower::ServiceExt;
+
+        let _ = crate::auth::set_allow_anonymous();
+
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-executors-http").unwrap(),
+        ));
+        let exec_id = ExecutorId::try_new("exec-http-list").unwrap();
+        coordinator
+            .write()
+            .await
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "localhost", 2))
+            .unwrap();
+
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let router = coordinator_http_router(coordinator.clone(), &config);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/executors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            json["executors"][0]["executor_id"],
+            serde_json::json!(exec_id.to_string())
         );
     }
 

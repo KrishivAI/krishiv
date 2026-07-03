@@ -42,6 +42,10 @@ use crate::host::FlightExecutionHost;
 const FLIGHT_MAX_CONCURRENT_QUERIES_ENV: &str = "KRISHIV_FLIGHT_MAX_CONCURRENT_QUERIES";
 /// Default cap on simultaneous Flight SQL query executions.
 const DEFAULT_FLIGHT_MAX_CONCURRENT_QUERIES: usize = 256;
+/// API-1: Cap on the total serialized result size per DoGet to prevent OOM.
+/// Read from env `KRISHIV_FLIGHT_MAX_RESULT_BYTES`; default 2 GiB.
+const FLIGHT_MAX_RESULT_BYTES_ENV: &str = "KRISHIV_FLIGHT_MAX_RESULT_BYTES";
+const DEFAULT_FLIGHT_MAX_RESULT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Server SqlInfo metadata served by `GetSqlInfo` (G1b).
 ///
@@ -119,6 +123,9 @@ pub struct KrishivFlightSqlService {
     /// Semaphore that caps the number of queries executing concurrently through
     /// the Flight ingress. `None` means no cap.
     inflight_queries: Option<Arc<tokio::sync::Semaphore>>,
+    /// API-1: Maximum total bytes for a single DoGet result. Exceeding it
+    /// returns `resource_exhausted` to prevent server OOM.
+    max_result_bytes: usize,
 }
 
 const FLIGHT_PREPARED_STMT_CAPACITY_ENV: &str = "KRISHIV_FLIGHT_PREPARED_STMT_CAPACITY";

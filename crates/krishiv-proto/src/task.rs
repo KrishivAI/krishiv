@@ -922,6 +922,16 @@ pub enum InputPartitionDescriptor {
     /// applies it as the initial `prev_watermark_ms` so late-event detection
     /// is accurate from the very first batch.
     WatermarkHint { watermark_ms: i64 },
+    /// One-shot continuous stream state restore payload for the next cycle.
+    ///
+    /// The executor applies `snapshot_bytes` to the job's `stream:loop`
+    /// operator before processing the cycle's input batches. `watermark_ms`
+    /// is carried for observability and parity with the coordinator's stored
+    /// snapshot metadata.
+    ContinuousRestore {
+        snapshot_bytes: Vec<u8>,
+        watermark_ms: i64,
+    },
 }
 
 impl InputPartitionDescriptor {
@@ -976,6 +986,15 @@ impl InputPartitionDescriptor {
             }
             Self::WatermarkHint { watermark_ms } => {
                 format!("watermark-hint:{watermark_ms}")
+            }
+            Self::ContinuousRestore {
+                snapshot_bytes,
+                watermark_ms,
+            } => {
+                format!(
+                    "continuous-restore:{}b:{watermark_ms}",
+                    snapshot_bytes.len()
+                )
             }
         }
     }

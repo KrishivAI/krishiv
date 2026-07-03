@@ -337,13 +337,19 @@ fn require_nonempty(s: &str) -> SqlResult<()> {
     }
 }
 
-/// Parse a connector reference of the form `KIND(key='value', key2='value2')`.
-/// Keys are lowercased; values are unquoted (single or double quotes).
+/// Parse a connector reference of the form `KIND(key='value', key2='value2')`
+/// or a bare registered connector name (`registered_sink`). Keys are
+/// lowercased; values are unquoted (single or double quotes).
 fn parse_connector_spec(s: &str) -> SqlResult<ConnectorSpec> {
     let s = s.trim();
-    let open = s.find('(').ok_or_else(|| SqlError::Unsupported {
-        feature: "connector spec must be '<KIND>(key='value', ...)'".into(),
-    })?;
+    let Some(open) = s.find('(') else {
+        let kind = s.trim().to_lowercase();
+        require_nonempty(&kind)?;
+        return Ok(ConnectorSpec {
+            kind,
+            options: HashMap::new(),
+        });
+    };
     let close = s.rfind(')').ok_or_else(|| SqlError::Unsupported {
         feature: "connector spec missing closing ')'".into(),
     })?;
@@ -403,6 +409,22 @@ mod tests {
         assert_eq!(name, "orders");
         assert_eq!(spec.kind, "parquet");
         assert_eq!(spec.require("path").unwrap(), "/data/o.parquet");
+    }
+
+    #[test]
+    fn parse_bare_registered_connector_reference() {
+        let Some(PipelineStatement::CreateSink {
+            name,
+            view,
+            connector: Some(spec),
+        }) = parse_pipeline_statement("CREATE SINK out FROM revenue INTO registered_out").unwrap()
+        else {
+            panic!("expected connector sink");
+        };
+        assert_eq!(name, "out");
+        assert_eq!(view, "revenue");
+        assert_eq!(spec.kind, "registered_out");
+        assert!(spec.options.is_empty());
     }
 
     #[test]

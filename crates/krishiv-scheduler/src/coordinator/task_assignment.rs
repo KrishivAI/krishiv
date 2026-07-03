@@ -285,7 +285,7 @@ impl Coordinator {
     pub(crate) fn prepare_continuous_input_cycle(
         &mut self,
         job_id: &JobId,
-        partitions: Vec<krishiv_proto::InputPartition>,
+        mut partitions: Vec<krishiv_proto::InputPartition>,
     ) -> SchedulerResult<()> {
         self.ensure_active()?;
         if self.continuous_input_cycles.contains(job_id) {
@@ -363,6 +363,19 @@ impl Coordinator {
             job.refresh_state();
         }
 
+        if let Some(snapshot) = self.pending_continuous_restores.get(job_id) {
+            partitions.insert(
+                0,
+                krishiv_proto::InputPartition::typed(
+                    "continuous-restore",
+                    krishiv_proto::InputPartitionDescriptor::ContinuousRestore {
+                        snapshot_bytes: snapshot.snapshot_bytes.clone(),
+                        watermark_ms: snapshot.watermark_ms,
+                    },
+                ),
+            );
+        }
+
         self.job_input_partitions.insert(job_id.clone(), partitions);
         self.continuous_input_cycles.insert(job_id.clone());
         self.exec.notify.notify_waiters();
@@ -384,6 +397,9 @@ impl Coordinator {
             for task in stage.tasks_mut() {
                 if task.state == TaskState::Assigned {
                     task.state = TaskState::Succeeded;
+                    // DIST-1: Reset loss counter on successful completion so
+                    // cumulative losses across weeks don't kill streaming jobs.
+                    task.executor_loss_count = 0;
                     task.launch_in_flight = false;
                     task.assigned_at_ms = None;
                     task.last_progress_ms = None;
@@ -412,6 +428,15 @@ impl Coordinator {
             .flat_map(|stage| stage.tasks())
             .any(|task| task.task_id() == task_id && task.state == TaskState::Succeeded);
         if completed {
+            // DIST-1: Reset loss counter when a continuous cycle completes
+            // successfully so cumulative losses don't permanently kill the job.
+            for stage in job.stages.iter_mut() {
+                for task in stage.tasks_mut() {
+                    if task.task_id() == task_id {
+                        task.executor_loss_count = 0;
+                    }
+                }
+            }
             // Keep the task terminal for idempotent terminal-status retries,
             // but keep the logical continuous job active and ready for the
             // next coordinator-fenced input cycle.
@@ -910,6 +935,9 @@ impl Coordinator {
                 }
                 _ => self.clear_launch_in_flight_for_task(job_id, assignment.task_id()),
             }
+        }
+        if accepted == responses.len() && self.continuous_input_cycles.contains(job_id) {
+            self.pending_continuous_restores.remove(job_id);
         }
         accepted
     }

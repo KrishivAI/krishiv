@@ -55,7 +55,7 @@ impl ObjectStoreCheckpointStorage {
         let payload = bytes::Bytes::copy_from_slice(data);
         tokio::time::timeout(
             WRITE_TIMEOUT,
-            self.store.put(&object_staging, payload.clone().into()),
+            self.store.put(&object_staging, payload.into()),
         )
         .await
         .map_err(|_| CheckpointError::Storage {
@@ -64,13 +64,15 @@ impl ObjectStoreCheckpointStorage {
         .map_err(|e| CheckpointError::Storage {
             message: format!("object store staging put: {e}"),
         })?;
-        tokio::time::timeout(WRITE_TIMEOUT, self.store.put(&object_path, payload.into()))
+        // CONN-9: Use server-side copy instead of re-uploading the payload.
+        // This halves bandwidth cost and latency for every checkpoint write.
+        tokio::time::timeout(WRITE_TIMEOUT, self.store.copy(&object_staging, &object_path))
             .await
             .map_err(|_| CheckpointError::Storage {
-                message: "object store write timed out".into(),
+                message: "object store copy timed out".into(),
             })?
             .map_err(|e| CheckpointError::Storage {
-                message: format!("object store put: {e}"),
+                message: format!("object store copy: {e}"),
             })?;
         let _ = self.store.delete(&object_staging).await;
         Ok(())

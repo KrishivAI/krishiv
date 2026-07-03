@@ -468,6 +468,43 @@ impl ContinuousStreamRegistry {
         }
     }
 
+    /// Replace a registered job's executor state with the supplied snapshot.
+    ///
+    /// Any queued input is cleared so the restored state becomes the next
+    /// processing baseline.
+    pub fn restore_job_snapshot(&self, job_id: &str, snapshot_bytes: &[u8]) -> RuntimeResult<()> {
+        let entry = self
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| ContinuousStreamError::JobNotFound {
+                job_id: job_id.to_owned(),
+            })?;
+        let mut exec = entry
+            .executor
+            .lock()
+            .map_err(|_| ContinuousStreamError::LockPoisoned {
+                job_id: job_id.to_owned(),
+                component: "executor",
+                operation: "restore_job_snapshot",
+            })?;
+        exec.restore_from_snapshot(snapshot_bytes)
+            .map_err(|error| ContinuousStreamError::Execution {
+                job_id: job_id.to_owned(),
+                message: format!("snapshot restore failed: {error}"),
+            })?;
+        let mut input = entry
+            .input
+            .lock()
+            .map_err(|_| ContinuousStreamError::LockPoisoned {
+                job_id: job_id.to_owned(),
+                component: "input",
+                operation: "restore_job_snapshot",
+            })?;
+        input.batches.clear();
+        input.schema = None;
+        Ok(())
+    }
+
     /// Remove a registered continuous job and its in-memory state.
     ///
     /// Returns `Ok(())` when the job was found and removed. Returns

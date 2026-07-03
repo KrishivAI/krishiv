@@ -92,20 +92,23 @@ impl PushShuffleStore {
         ipc_bytes: Vec<u8>,
     ) -> Result<(), String> {
         let incoming = ipc_bytes.len();
-        let current = self.total_bytes.load(Ordering::Relaxed);
-        if current.saturating_add(incoming) > self.memory_limit {
+        // DIST-5: Atomically reserve bytes first, then check and roll back if
+        // over the limit. The old load-then-check-then-add pattern allowed N
+        // concurrent pushers to all pass the check before any incremented.
+        let new_total = self.total_bytes.fetch_add(incoming, Ordering::Relaxed) + incoming;
+        if new_total > self.memory_limit {
+            self.total_bytes.fetch_sub(incoming, Ordering::Relaxed);
             return Err(format!(
                 "push shuffle store memory limit ({} bytes) exceeded; \
-                 {} bytes used + {} bytes incoming; \
+                 {} bytes after adding {} bytes incoming; \
                  reduce tasks may be lagging",
-                self.memory_limit, current, incoming
+                self.memory_limit, new_total, incoming
             ));
         }
         self.inner
             .entry((job_id.to_owned(), stage_id.to_owned(), partition))
             .or_default()
             .push(ipc_bytes);
-        self.total_bytes.fetch_add(incoming, Ordering::Relaxed);
         Ok(())
     }
 

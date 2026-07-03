@@ -34,6 +34,7 @@ use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use tokio::sync::watch;
 
+use krishiv_delta::operators::key_util::scalar_to_string;
 use krishiv_delta::{
     DeltaBatch, DeltaError, IncrementalView, IncrementalViewRegistry, IncrementalViewSpec,
     LatenessSpec, WatermarkTracker, apply_delta, consolidate_batch, deserialize_delta_batch,
@@ -1004,6 +1005,13 @@ impl IncrementalFlow {
             active_views += 1;
 
             // Provenance (DiffBased only).
+            //
+            // IVM-7: This recording maps each input hash to ALL output hashes
+            // of the tick (a complete bipartite graph). This means
+            // `query_provenance(input)` returns the entire output set for any
+            // input, so targeted per-row retraction via provenance is not
+            // possible on the DiffBased path. True per-row provenance requires
+            // the incremental operators to emit input→output lineage.
             if plan_kind == ViewPlanKind::DiffBased
                 && let (Some(input_hs), Some(prov)) = (&input_hashes, &mut inner.provenance)
             {
@@ -1408,94 +1416,6 @@ pub(crate) fn hash_row(batch: &RecordBatch, row: usize) -> u64 {
         combined.push(0u8);
     }
     twox_hash::XxHash64::oneshot(0xcafe_babe_dead_beef_u64, &combined)
-}
-
-fn scalar_to_string(arr: &dyn arrow::array::Array, row: usize) -> String {
-    use arrow::array::{
-        BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-        LargeStringArray, StringArray, UInt32Array, UInt64Array,
-    };
-    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt64Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt32Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            let bytes = a.value(row);
-            let mut s = String::with_capacity(2 + bytes.len() * 2);
-            s.push_str("0x");
-            for b in bytes {
-                s.push_str(&format!("{b:02x}"));
-            }
-            s
-        };
-    }
-    if arr.is_null(row) {
-        "NULL".into()
-    } else {
-        format!("<unsupported type: {}>", arr.data_type())
-    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -11,12 +11,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use iceberg::CatalogBuilder as _;
 use iceberg::table::Table;
 use iceberg::{
     Catalog, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation,
     TableIdent,
 };
-use iceberg::CatalogBuilder as _;
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
 };
@@ -43,7 +43,10 @@ impl KrishivRestCatalog {
         let mut props: HashMap<String, String> = HashMap::new();
         props.insert(REST_CATALOG_PROP_URI.to_string(), uri.to_string());
         if !warehouse.is_empty() {
-            props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string());
+            props.insert(
+                REST_CATALOG_PROP_WAREHOUSE.to_string(),
+                warehouse.to_string(),
+            );
         }
         if let Some(t) = token {
             props.insert(String::from("token"), t.to_string());

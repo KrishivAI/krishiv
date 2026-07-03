@@ -560,16 +560,29 @@ impl ContinuousWindowExecutor {
     /// Called by the streaming engine's idle-tick path (ST-4) so session windows
     /// whose inactivity gap has elapsed can close even when the source is quiet.
     pub fn tick(&mut self, wall_clock_ms: i64) -> ExecResult<Vec<RecordBatch>> {
+        // STREAM-1: Only session windows should advance the watermark to
+        // wall-clock on idle (inactivity = close is correct for sessions).
+        let is_session = matches!(self.operator, Some(WindowOperatorState::Session(_)));
         let Some(op) = &mut self.operator else {
             return Ok(Vec::new()); // operator not yet initialised; no open windows
         };
         self.watermark.apply_idle_source_policy();
-        let wm = self
-            .last_watermark_ms
-            .unwrap_or(i64::MIN)
-            .max(wall_clock_ms);
+        // Tumbling/sliding windows have pure event-time semantics; advancing
+        // their watermark to wall-clock during source idle closes windows that
+        // may still receive events, silently dropping them as late.
+        let wm = if is_session {
+            self.last_watermark_ms
+                .unwrap_or(i64::MIN)
+                .max(wall_clock_ms)
+        } else {
+            // For tumbling/sliding: use the last event-time watermark only.
+            // Flush windows that are due based on event time, not wall clock.
+            self.last_watermark_ms.unwrap_or(i64::MIN)
+        };
         op.set_watermark(wm);
-        self.last_watermark_ms = Some(wm);
+        if is_session {
+            self.last_watermark_ms = Some(wm);
+        }
         op.purge_expired()?;
         op.flush_due(wm)
     }

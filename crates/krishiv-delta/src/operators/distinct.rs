@@ -21,6 +21,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use crate::delta_batch::{DeltaBatch, WEIGHT_COLUMN};
 use crate::error::{DeltaError, DeltaResult};
+use crate::operators::key_util::scalar_to_string;
 
 /// Incremental DISTINCT operator with per-row threshold tracking.
 pub struct IncrementalDistinctOp {
@@ -157,39 +158,6 @@ fn build_output(
 
     let inner = RecordBatch::try_new(full_schema, cols)?;
     DeltaBatch::from_weighted(inner)
-}
-
-fn scalar_to_string(arr: &dyn Array, row: usize) -> String {
-    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
-    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    "NULL".to_string()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

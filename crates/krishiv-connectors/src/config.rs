@@ -70,6 +70,13 @@ impl ConnectorConfig {
         self.properties.get(key).map(String::as_str)
     }
 
+    /// Iterate over connector properties as borrowed key/value pairs.
+    pub fn properties(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.properties
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+
     /// Look up a required property, returning a [`ConnectorError::Config`] if
     /// it is absent.
     pub fn required(&self, key: &str) -> ConnectorResult<&str> {

@@ -975,9 +975,11 @@ impl RdkafkaKafkaSource {
     /// partition assignment and seek-based restore implement [`CheckpointSource`].
     pub fn commit_offsets(&self) {
         use rdkafka::consumer::Consumer;
+        // CONN-6: Use Async commit to avoid blocking the Tokio reactor.
+        // Sync commit waits for the broker's response, stalling the thread.
         if let Err(e) = self
             .consumer
-            .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
+            .commit_consumer_state(rdkafka::consumer::CommitMode::Async)
         {
             tracing::warn!(
                 topic = %self.topic,
@@ -1233,28 +1235,32 @@ impl CheckpointSource for RdkafkaKafkaSource {
 
     fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()> {
         use rdkafka::consumer::Consumer;
-        use rdkafka::topic_partition_list::{Offset as RdOffset, TopicPartitionList};
+        use rdkafka::topic_partition_list::Offset as RdOffset;
 
         if offset.offsets.is_empty() {
             return Ok(());
         }
 
-        let mut tpl = TopicPartitionList::new();
+        // CONN-3: Use seek() instead of assign() to restore offsets.
+        // assign() unsubscribes from the consumer group and switches to manual
+        // assignment mode, permanently breaking rebalancing. seek() positions
+        // the consumer at a specific offset while keeping the existing
+        // subscription intact.
         for ko in &offset.offsets {
-            tpl.add_partition_offset(&ko.topic, ko.partition, RdOffset::Offset(ko.offset))
+            self.consumer
+                .seek(
+                    &ko.topic,
+                    ko.partition,
+                    RdOffset::Offset(ko.offset),
+                    std::time::Duration::from_secs(5),
+                )
                 .map_err(|e| ConnectorError::Offset {
                     message: format!(
-                        "restore: failed to add partition {}/{} at offset {}: {e}",
+                        "restore: failed to seek partition {}/{} at offset {}: {e}",
                         ko.topic, ko.partition, ko.offset
                     ),
                 })?;
         }
-
-        self.consumer
-            .assign(&tpl)
-            .map_err(|e| ConnectorError::Offset {
-                message: format!("restore: rdkafka assign failed: {e}"),
-            })?;
 
         // Rebuild partition_offsets so that checkpoint_offset() is accurate
         // immediately after restore (before any new messages are read).

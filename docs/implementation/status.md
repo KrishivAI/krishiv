@@ -1,5 +1,91 @@
 # Krishiv Implementation Status
 
+## 2026-07-03 — MCP continuous-stream restore/import slice
+
+**Scope**: extended the `krishiv-mcp` continuous-stream surface so exported
+checkpoints can be restored through the same mode-aware `Session` path across
+embedded, single-node, and coordinator-backed runtimes.
+
+### Completed
+
+- Added `restore_continuous_stream` to `krishiv-mcp`, including optional
+  stream recreation from SQL when the target job is not already registered.
+- Added `Session::restore_continuous_stream` and runtime/control-plane support
+  for continuous snapshot import.
+- Added coordinator restore staging and executor restore-hint transport using a
+  one-shot `InputPartitionDescriptor::ContinuousRestore` injected into the next
+  fenced continuous input cycle.
+- Aligned the coordinator HTTP restore handler with the programmatic restore
+  helper so both use the same watermark selection rule.
+- Added focused tests for:
+  - local API restore rollback of exported stream state
+  - coordinator restore staging and cleanup on accepted assignment dispatch
+  - MCP checkpoint export/restore round-trip
+  - MCP tool listing including `restore_continuous_stream`
+
+### Validation
+
+- `cargo fmt --check`
+- `cargo test -p krishiv-scheduler restore_stages_snapshot_for_next_continuous_cycle --lib`
+- `cargo test -p krishiv-api local_continuous_stream_restore_rolls_back_exported_state --lib`
+- `cargo test -p krishiv-mcp continuous_stream_ --lib`
+- `cargo test -p krishiv-mcp tools_list_includes_runtime_and_sql_tools --lib`
+
+### Remaining gap
+
+- The distributed restore path is now wired through coordinator staging and the
+  executor restore hint, but it still lacks a true remote end-to-end test that
+  proves a coordinator-backed restore reaches a remote executor and rehydrates
+  live window state across an actual control-plane boundary.
+
+**Next useful command**: `cargo clippy -p krishiv-api -p krishiv-runtime -p krishiv-scheduler -p krishiv-mcp -- -D warnings`
+
+## 2026-07-03 — MCP continuous-stream status/checkpoint control-plane slice
+
+**Scope**: continued the `krishiv-mcp` rollout so continuous streams expose a
+mode-aware inspection/checkpoint surface instead of only register/feed/drain.
+
+### Completed
+
+- Added coordinator HTTP endpoints for continuous streams:
+  - `GET /api/v1/continuous`
+  - `GET /api/v1/continuous/{job_id}`
+  - `POST /api/v1/continuous/{job_id}/checkpoint`
+- Added typed runtime HTTP clients for those endpoints and re-exported them
+  through `krishiv-runtime`.
+- Added local runtime helpers for listing continuous jobs, reading their spec,
+  checking pending input depth, and snapshotting live local window state.
+- Added public `krishiv-api` types and mode-aware session methods:
+  - `ContinuousStreamStatus`
+  - `ContinuousStreamCheckpoint`
+  - `Session::list_continuous_stream_statuses`
+  - `Session::continuous_stream_status`
+  - `Session::checkpoint_continuous_stream`
+- Updated `krishiv-mcp`:
+  - `get_streaming_job_status` now uses the mode-aware session status path
+  - `list_continuous_streams` now returns real continuous status metadata
+  - new `checkpoint_continuous_stream` tool exports checkpoint bytes as base64
+- Added focused tests for:
+  - coordinator continuous list/get/checkpoint handlers
+  - local session continuous status/checkpoint behavior
+  - MCP continuous stream checkpoint export
+
+### Validation
+
+- `cargo test -p krishiv-scheduler list_get_and_checkpoint_expose_continuous_job_metadata --lib`
+- `cargo test -p krishiv-api local_continuous_stream_status_and_checkpoint_are_mode_aware --lib`
+- `cargo test -p krishiv-mcp continuous_stream_tools_register_feed_and_drain --lib`
+- `cargo fmt --check`
+
+### Remaining gap
+
+- Distributed **restore/import** of a continuous stream snapshot is still not
+  end-to-end. The coordinator can persist and export snapshots, but the remote
+  executor restore path is still tied to checkpoint restore directives rather
+  than the lightweight continuous snapshot store.
+
+**Next useful command**: `cargo clippy -p krishiv-api -p krishiv-runtime -p krishiv-scheduler -p krishiv-mcp -- -D warnings`
+
 ## 2026-07-01 (follow-up) — Close remaining gaps from the sync-async audit
 
 **Scope**: Same PR (#95) as the audit below. Addressed the gaps that entry
@@ -227,6 +313,225 @@ session; rerun to confirm after any further changes).
 ### Next command
 
 `npm run dev --prefix web -- --hostname 127.0.0.1 --port 3000` and inspect `/` plus `/architecture` at 360px and 430px viewport widths.
+
+---
+
+## 2026-07-02 — MCP server frontend foundation
+
+**Scope**: Added a first-class `krishiv-mcp` workspace crate plus `krishiv mcp`
+daemon entrypoint. The MCP server is a frontend over `Session`, not a separate
+engine, so embedded, single-node, and distributed routing continue through
+`SessionBuilder::from_env`, `ExecutionRuntime`, coordinator HTTP/gRPC, and the
+existing IVM/streaming APIs.
+
+### Completed
+
+- New crate: `crates/krishiv-mcp`.
+- New command: `krishiv mcp [--stdio]` and `krishiv mcp --http --addr <addr>`.
+- Multi-call alias: `krishiv-mcp -> krishiv mcp`.
+- Public re-export: `krishiv::mcp::{KrishivMcpServer, McpConfig, run_mcp_from_env}`.
+- MCP protocol surface:
+  - `initialize`, `ping`
+  - `tools/list`, `tools/call`
+  - `resources/list`, `resources/read`
+  - `prompts/list`, `prompts/get`
+- Transports:
+  - line-delimited JSON-RPC over stdio
+  - HTTP `POST /mcp` plus `GET /healthz`
+- Initial tools:
+  - runtime/ops: `krishiv_health`, `runtime_info`, `list_executors`,
+    `get_metrics_summary`
+  - SQL/catalog: `execute_sql`, `explain_sql`, `list_catalogs`, `list_tables`,
+    `describe_table`, `sample_table`
+  - jobs: `submit_sql_job`, `list_jobs`, `get_job_status`, `get_job_result`,
+    `cancel_job`
+  - streaming: `submit_streaming_pipeline`, `get_streaming_job_status`,
+    `list_continuous_streams`, `create_continuous_stream`,
+    `feed_continuous_stream`, `drain_continuous_stream`
+  - IVM: `create_incremental_view`, `feed_incremental_view`,
+    `step_incremental_view`, `snapshot_incremental_view`,
+    `checkpoint_incremental_job`, `restore_incremental_job`
+  - connectors: `list_connectors`, `validate_connector_config`,
+    `register_source`, `register_sink`
+- MCP resources:
+  - `krishiv://runtime`
+  - `krishiv://catalog/tables`
+  - `krishiv://jobs`
+  - `krishiv://connectors`
+- MCP prompts:
+  - `investigate_sql`
+  - `build_streaming_pipeline`
+  - `inspect_job`
+- Coordinator-backed operations now exposed through public mode-aware APIs:
+  - scheduler HTTP `GET /api/v1/jobs/{job_id}`
+  - scheduler HTTP `POST /api/v1/jobs/{job_id}/cancel`
+  - runtime non-blocking poll for `GET /api/v1/batch-sql/{job_id}` results
+  - runtime HTTP clients for coordinator executor listing and job cancellation
+  - `Session::list_executors_remote`
+  - `Session::cancel_job_remote`
+  - `Session::get_job_result_remote`
+- Connector-backed session metadata now exposed through public APIs:
+  - `Session::register_source_config`
+  - `Session::source_config`
+  - `Session::registered_source_configs`
+  - `Session::register_sink_config`
+  - `Session::sink_config`
+  - `Session::registered_sink_configs`
+- Compiled job specs now preserve connector option maps with serde defaults, so
+  registered connector configs can flow from MCP/SQL lowering into the shared
+  engine runtime without a parallel MCP-only execution path.
+- Registered SQL jobs now execute local-object-store S3 connectors through the
+  runtime connector providers:
+  - sources: `s3`, `s3-prefix`
+  - sinks: `s3`
+  - plus `parquet-directory` source support through the same compiled spec
+    option path
+- `list_connectors` reports per-driver `sql_job_execution` metadata so clients
+  can distinguish executable SQL-job connectors from registry-only metadata.
+- `runtime_info` now includes the effective coordinator HTTP URL and embeds a
+  mode-aware MCP capability matrix.
+- New `deployment_capabilities` tool and `krishiv://deployment/capabilities`
+  resource report execution placement, coordinator control-plane availability,
+  and per-tool fallback policy.
+- MCP job-control tools now route by coordinator capability instead of checking
+  only `ExecutionMode::Distributed`: single-node daemon sessions with a
+  coordinator HTTP base use the same coordinator-backed list/status/result/
+  cancel paths, while embedded/no-coordinator sessions stay local.
+- Runtime-backed batch jobs now support bounded non-parquet connector sources
+  in single-node daemon/distributed placements without local compute fallback:
+  `RuntimeQueryExecutor` drains supported connector sources through the shared
+  source provider, spills them to temporary parquet registrations, and dispatches
+  the SQL query through the configured `ExecutionRuntime` so computation still
+  runs on the coordinator/executor path.
+- IVM lifecycle tools now expose full and delta checkpoint/restore through the
+  existing mode-aware `Session::ivm` handle. MCP returns checkpoint bytes as
+  base64 JSON, using the local registry for embedded/single-node sessions and
+  coordinator IVM checkpoint APIs for distributed sessions.
+- Continuous streaming MCP tools now expose the dedicated session/runtime seam
+  instead of only the bounded `submit()` path. Windowed SQL compiles through a
+  new public `Session::compile_continuous_stream_job` /
+  `register_stream_job_sql` surface, registrations are tracked in session-owned
+  metadata, and feed/drain route through `push_stream_job_input` /
+  `poll_stream_job` across embedded, single-node, and distributed modes.
+- Continuous stream input now normalizes `Utf8View` columns to `Utf8` before
+  pushing batches into the streaming runtime so parquet/DataFusion-produced
+  batches can feed keyed window operators without an MCP-only workaround.
+- Local submitted SQL job lifecycle now exposed through public APIs:
+  - `Session::submit_sql_background`
+  - `Session::submitted_sql_jobs`
+  - `Session::submitted_sql_job_status`
+  - `Session::cancel_submitted_sql_job`
+
+### Guardrails / current gaps
+
+- `execute_sql` defaults to read-only and row-capped execution. Write SQL is
+  rejected unless `KRISHIV_MCP_ALLOW_WRITE_SQL=1` and the caller passes
+  `read_only=false`.
+- `list_executors` is live against a configured coordinator and returns a local
+  runtime fallback for embedded/single-node sessions without a sidecar.
+- `submit_sql_job` runs through a session background registry while preserving
+  the session's configured runtime mode. `cancel_job` aborts local background
+  submissions and uses the configured coordinator endpoint whenever a
+  coordinator HTTP control plane is available.
+- `get_job_result` is live for coordinator batch-SQL jobs and returns
+  pending/failed/cancelled/succeeded states without submitting duplicate work.
+  Local `submit_sql_job` handles return lifecycle metadata and terminal errors
+  from the session registry; direct local row materialization should use
+  `execute_sql` or the job's declared sink.
+- `register_source` and `register_sink` validate connector configs through the
+  built-in connector registry and store them as session metadata. SQL job
+  scripts can reference those configs by bare name, e.g.
+  `CREATE SOURCE orders FROM orders_input;` and
+  `CREATE SINK out FROM view INTO orders_output;`.
+- Registered source names currently compile to `parquet`, `parquet-directory`,
+  `csv`, `json`/`ndjson`, `s3`, and `s3-prefix`. Registered sink names compile
+  to `parquet`, `csv`, `json`/`ndjson`, and `s3`. Other validated connector
+  metadata remains listed and reusable by frontends, but job execution returns a
+  typed unsupported-connector error until those providers are wired into the
+  engine runtime.
+- Distributed/single-node daemon batch execution supports bounded non-parquet
+  and object-store sources via local connector drain plus temporary parquet
+  spill/inline shipping. This is intentionally a bounded batch bridge:
+  connector-native distributed source ownership is still needed for unbounded
+  Kafka-like sources, JDBC pushdown/partitioning, and lakehouse/table providers.
+  Supported sinks are opened by the submitting process after query results are
+  produced.
+- `submit_streaming_pipeline` remains the bounded run-once streaming submit
+  path. Long-lived continuous streaming now uses the dedicated continuous stream
+  MCP tools; distributed continuous streaming still relies on the coordinator
+  register/push/drain HTTP seam rather than the bounded job registry.
+- IVM checkpoint payloads are intentionally base64-encoded bytes, not expanded
+  rows. Clients that restore a checkpoint must create/register the expected IVM
+  view definitions before restoring, matching the underlying `Session::ivm`
+  contract.
+
+### Validation
+
+- `cargo fmt --check`
+- `cargo check -p krishiv-mcp`
+- `cargo check -p krishiv-connectors`
+- `cargo check -p krishiv-sql`
+- `cargo check -p krishiv-dataflow`
+- `cargo check -p krishiv-api`
+- `cargo check -p krishiv`
+- `cargo test -p krishiv-scheduler job_lookup_and_cancel_endpoints_are_live`
+- `cargo test -p krishiv-scheduler executor_list_endpoint_returns_registered_executors`
+- `cargo test -p krishiv-runtime --lib batch_sql_result_payload_decodes_succeeded_batches`
+- `cargo test -p krishiv-runtime --lib job_state_display_cancelled`
+- `cargo test -p krishiv-sql --lib parse_bare_registered_connector_reference`
+- `cargo test -p krishiv-api --lib session_registers_validated_sink_configs`
+- `cargo test -p krishiv-api --lib session_rejects_invalid_sink_configs`
+- `cargo test -p krishiv-api --lib session_registers_validated_source_configs`
+- `cargo test -p krishiv-api --lib session_rejects_invalid_source_configs`
+- `cargo test -p krishiv-api --lib compiles_job_with_registered_source_and_sink_refs`
+- `cargo test -p krishiv-api --lib s3`
+- `cargo test -p krishiv-api --lib registered`
+- `cargo test -p krishiv-api --lib registered_unknown_connector_still_reports_compiler_support_gap`
+- `cargo test -p krishiv-api --lib submit_sql_resolves_registered_connector_names`
+- `cargo test -p krishiv-api --lib submit_sql_background_tracks_failed_local_job`
+- `cargo test -p krishiv-api --lib cancel_submitted_sql_job_marks_local_status_cancelled`
+- `cargo test -p krishiv-api --lib coordinator_url_tests::ivm_http_url_prefers_explicit_http_then_falls_back_to_flight`
+- `cargo test -p krishiv-api --lib register_stream_job_sql_tracks_compiled_source_and_spec`
+- `cargo test -p krishiv-api --lib remote_runtime_spills_csv_sources_to_parquet_registrations`
+- `cargo test -p krishiv-api --lib connector_runtime::tests::`
+- `cargo test -p krishiv-mcp --lib register_sink_stores_validated_session_sink`
+- `cargo test -p krishiv-mcp --lib deployment_capabilities_report_single_node_control_plane`
+- `cargo test -p krishiv-mcp --lib list_connectors_marks_csv_sources_distributed_executable`
+- `cargo test -p krishiv-mcp --lib continuous_stream_tools_register_feed_and_drain`
+- `cargo test -p krishiv-mcp --lib incremental_job_checkpoint_restore_round_trips_base64`
+- `cargo test -p krishiv-mcp --lib get_job_result_uses_local_submitted_job_registry`
+- `cargo test -p krishiv-mcp --lib cancel_job_uses_local_submitted_job_registry`
+- `cargo test -p krishiv-mcp --lib submit_sql_job_resolves_registered_source_and_sink_names`
+- `cargo test -p krishiv-mcp --lib`
+- `cargo test -p krishiv-mcp`
+- `cargo test -p krishiv-runtime --no-fail-fast` (322 passed, 1 ignored
+  sandbox-local TCP listener test)
+- `cargo clippy -p krishiv-mcp -- -D warnings`
+- `cargo clippy -p krishiv-connectors -- -D warnings`
+- `cargo clippy -p krishiv-sql -- -D warnings`
+- `cargo clippy -p krishiv-dataflow -- -D warnings`
+- `cargo clippy -p krishiv-api -- -D warnings`
+- `cargo clippy -p krishiv-api -p krishiv-mcp -- -D warnings`
+- `cargo clippy -p krishiv-engine-core -p krishiv-api -p krishiv-mcp -- -D warnings`
+- `cargo clippy -p krishiv-runtime -- -D warnings`
+- `cargo clippy -p krishiv -- -D warnings`
+- `cargo clippy -p krishiv-scheduler -- -D warnings`
+- `cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings`
+
+Attempted but not green in the restricted Codex sandbox:
+
+- `cargo test --workspace --exclude krishiv-python --exclude krishiv-chaos --no-fail-fast`
+  failed on test targets that bind local TCP/mock-server ports
+  (`krishiv-executor`, `krishiv-shuffle`, `krishiv-sql`) plus the known
+  RocksDB timing assertion in `krishiv-state`.
+
+### Next command
+
+`cargo test --workspace --exclude krishiv-python --exclude krishiv-chaos --no-fail-fast`
+outside the restricted sandbox, or continue MCP connector work by designing the
+non-file registry execution contract for connectors whose configs cannot be
+represented as local bounded `SourceSpec`/`SinkSpec` jobs yet (Kafka, JDBC, and
+lakehouse/table providers).
 
 ---
 
@@ -6544,3 +6849,71 @@ validates cleanly and `compare_api_surface.py --against-ref origin/main` shows
 only additive changes for this work (the 7 breaking entries are the
 already-`approved-breaking.toml`-covered `+ Send` bound changes from the
 earlier sync/async-audit commit in this same PR, not new).
+
+---
+
+## 2026-07-02 — Flight SQL server completeness: JDBC/ADBC clients unblocked (G1)
+
+**Scope**: Closed the Flight SQL server gaps that blocked every ADBC query
+and stock-JDBC-driver connection, found by the krishiv-platform Phase 01
+spikes (`krishiv-platform/tests/e2e/spikes/spike_a_*`). Crates touched:
+`krishiv-flight-sql`, `krishiv-sql` (one additive method),
+`krishiv-runtime` (none — used existing public accessors).
+
+### Completed
+
+- `get_flight_info_statement` no longer declares an explicit zero-field
+  schema; `FlightInfo.schema` stays unset (spec-compliant "unknown"), so
+  strict clients take the schema from the DoGet stream. Previously ADBC
+  rejected **every** query ("inconsistent schema"), including `SELECT 1`.
+- `GetSqlInfo` implemented (`server_sql_info()` static via arrow-flight's
+  `SqlInfoDataBuilder` + `get_flight_info_sql_info`/`do_get_sql_info`).
+  Values are honest: transactions declared `None` (autocommit reality),
+  server name/version, `"` identifier quoting. The stock JDBC driver calls
+  this at connect and previously failed the whole connection.
+- `GetCatalogs` implemented (single `krishiv` catalog, consistent with the
+  existing `GetDbSchemas`/`GetTables`).
+- Prepared statements now carry a real `dataset_schema`: new additive
+  `SqlDataFrame::arrow_schema()` (krishiv-sql; schema after planning, no
+  execution) + `FlightExecutionHost::sql_query_schema()` (best-effort:
+  read-only-statement guard so DDL cannot execute at plan time; InProcess
+  backend plans via `runner_sql_engine`; Coordinator backend returns
+  unknown). The JDBC driver routes query-vs-update on this field — empty
+  sent every SELECT down the update path.
+- `get_flight_info_prepared_statement` attaches the planned schema to
+  FlightInfo (the JDBC prepared flow reads `FlightInfo.getSchema()` and
+  fails on empty bytes) and keeps the statement path's default-deny
+  auth/policy guard.
+- `do_put_prepared_statement_update` implemented (executes stored SQL,
+  returns -1 unknown-count) — JDBC DDL/DML path.
+- Tests: `metadata_rpc_tests` (schema-unset pin, SqlInfo served+filtered,
+  catalogs) and `prepared_statement_schema_tests` (SELECT carries schema;
+  DDL keeps honest unknown and does not execute at prepare).
+
+### Validation
+
+- `cargo test -p krishiv-flight-sql --release`: full crate suite green
+  (61 pre-existing + 5 new).
+- `cargo clippy -p krishiv-flight-sql -p krishiv-sql`: clean.
+- Live verification against `krishiv local start` (single-node):
+  - stock Flight SQL JDBC driver 18.1.0: connects (server name "Krishiv"),
+    getTables metadata, typed SELECT (int/double/utf8/NULL/timestamp all
+    correct), 1M-row result in 280ms.
+  - ADBC (Go driver): typed queries, `adbc_get_info`, `get_objects`,
+    1M rows in 0.1s.
+  - Harness note: Arrow Java on JDK 17+ requires
+    `--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED`;
+    without it every stream read fails as a misleading
+    "CANCELLED: Failed to read message".
+
+### Known remaining (not attempted, tracked platform-side as G12)
+
+- `?`-placeholder parameter binding: the engine's prepared-statement
+  substitution counts `$N` placeholders only; JDBC/ADBC bind `?` ordinals
+  → "parameter ordinal 1 out of range" / DataFusion placeholder error.
+  Needs `?`→`$N` normalization (or DataFusion param exec) in the prepared
+  path.
+- True query schema in `get_flight_info_statement` (non-prepared) for the
+  Coordinator backend — needs a remote plan/schema API.
+
+Next useful command: `cargo test -p krishiv-flight-sql --release`

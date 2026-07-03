@@ -247,6 +247,7 @@ message InputPartitionDescriptor {
   bytes ipc_bytes = 14;
   // WatermarkHint: upstream stage watermark for window operator initialisation.
   int64 watermark_ms = 15;
+  // ContinuousRestore: one-shot stream:loop restore snapshot for the next cycle.
 }
 
 message MemoryKafkaRecord {
@@ -396,6 +397,8 @@ enum InputPartitionDescriptorKind {
   INPUT_PARTITION_DESCRIPTOR_KIND_INLINE_IPC = 6;
   // Upstream stage watermark hint for window operator initialisation.
   INPUT_PARTITION_DESCRIPTOR_KIND_WATERMARK_HINT = 7;
+  // One-shot continuous stream restore snapshot for the next cycle.
+  INPUT_PARTITION_DESCRIPTOR_KIND_CONTINUOUS_RESTORE = 8;
 }
 
 enum OutputContractDescriptorKind {

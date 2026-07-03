@@ -407,19 +407,22 @@ impl ComputeEngine for IncrementalEngine {
                 "incremental engine needs at least one source".into(),
             ));
         }
-        let first_source = job.sources.first().ok_or_else(|| {
-            EngineError::InvalidJob("incremental engine needs at least one source".into())
-        })?;
-        let mut first_reader = rt.sources.open(first_source).await?;
-        let first_batch = first_reader.next_changelog().await?.ok_or_else(|| {
-            EngineError::Source(format!(
-                "source '{}' (uri: '{}') produced no batches; the incremental engine \
-                 requires a non-empty source to infer the view schema",
-                first_source.name, first_source.uri
-            ))
-        })?;
-        let mut source_schemas: Vec<(String, SchemaRef)> =
-            vec![(first_source.name.clone(), first_batch.batch().schema())];
+        // IVM-8: seed schemas from ALL sources so that incremental joins
+        // (which reference multiple tables) can be planned. Previously only
+        // the first source's schema was seeded, making multi-source views
+        // unreachable via the unified spine.
+        let mut source_schemas: Vec<(String, SchemaRef)> = Vec::with_capacity(job.sources.len());
+        for spec in &job.sources {
+            let mut reader = rt.sources.open(spec).await?;
+            let first = reader.next_changelog().await?.ok_or_else(|| {
+                EngineError::Source(format!(
+                    "source '{}' (uri: '{}') produced no batches; the incremental \
+                     engine requires a non-empty source to infer the view schema",
+                    spec.name, spec.uri
+                ))
+            })?;
+            source_schemas.push((spec.name.clone(), first.batch().schema()));
+        }
         let output_schema = infer_output_schema(&source_schemas, &job.query).await?;
 
         // Maintain the query as a materialized view named after the job.

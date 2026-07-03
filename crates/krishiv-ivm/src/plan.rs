@@ -378,9 +378,14 @@ fn expr_to_aggregation(expr: &Expr, output_col: &str) -> Option<Aggregation> {
                         output_col: output_col.to_string(),
                     })
                 }
-                "count" => Some(Aggregation::Count {
-                    output_col: output_col.to_string(),
-                }),
+                "count" => {
+                    // IVM-6: COUNT(col) excludes nulls; COUNT(*) counts all rows.
+                    let input_col = agg_fn.params.args.first().and_then(expr_col_name);
+                    Some(Aggregation::Count {
+                        output_col: output_col.to_string(),
+                        input_col,
+                    })
+                }
                 "avg" | "mean" => {
                     let input_col = agg_fn.params.args.first().and_then(expr_col_name)?;
                     Some(Aggregation::Avg {

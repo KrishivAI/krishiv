@@ -12,7 +12,11 @@
 //! concatenated + consolidated into one and promoted to level+1. This gives
 //! O(log N) amortized merge cost and O(L · hash) probe cost where L ≤ 8.
 
-use arrow::array::{Array, BooleanArray, Int64Array, RecordBatch};
+use arrow::array::{
+    Array, BooleanArray, Date32Array, Date64Array, Int64Array, RecordBatch,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
+};
 use arrow::datatypes::SchemaRef;
 
 use crate::delta_batch::DeltaBatch;
@@ -204,7 +208,7 @@ impl Trace {
             return Ok(());
         }
         let merged = DeltaBatch::concat(&all)?;
-        let consolidated = consolidate_batch(merged, &self.key_col_names, &self.data_schema)?;
+        let consolidated = consolidate_batch(merged, &[], &self.data_schema)?;
         self.total_rows = consolidated.num_rows();
         self.levels[NUM_LEVELS - 1].push(consolidated);
         Ok(())
@@ -226,15 +230,64 @@ impl Trace {
                     continue;
                 }
                 let ts_col = data.column(ts_idx);
-                // Try Int64 first (epoch ms), then TimestampMillisecond.
-                let mask: BooleanArray =
+                // IVM-4: try all common temporal/integer types for the lateness
+                // column.  Previously only Int64 was handled, so a Timestamp
+                // lateness column (the natural event-time type) hit `continue`
+                // and skipped every batch, making GC a universal no-op.
+                let mask: BooleanArray = {
+                    let make_mask = |extract: &dyn Fn(&dyn Array, usize) -> Option<i64>| {
+                        Some(
+                            (0..data.num_rows())
+                                .map(|r| Some(extract(ts_col, r)? < watermark_ms))
+                                .collect::<Option<Vec<_>>>()?,
+                        )
+                    };
                     if let Some(arr) = ts_col.as_any().downcast_ref::<Int64Array>() {
+                        let m: BooleanArray = arr
+                            .iter()
+                            .map(|v| Some(v.unwrap_or(i64::MIN) < watermark_ms))
+                            .collect();
+                        m
+                    } else if let Some(arr) =
+                        ts_col.as_any().downcast_ref::<TimestampMillisecondArray>()
+                    {
                         arr.iter()
-                            .map(|v| Some(v.unwrap_or(i64::MIN) >= watermark_ms))
+                            .map(|v| Some(v.unwrap_or(i64::MIN) < watermark_ms))
+                            .collect()
+                    } else if let Some(arr) =
+                        ts_col.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                    {
+                        arr.iter()
+                            .map(|v| Some(v.unwrap_or(i64::MIN / 1000) < watermark_ms * 1000))
+                            .collect()
+                    } else if let Some(arr) =
+                        ts_col.as_any().downcast_ref::<TimestampSecondArray>()
+                    {
+                        arr.iter()
+                            .map(|v| {
+                                Some(v.unwrap_or(i64::MIN / 1000).saturating_mul(1000) < watermark_ms)
+                            })
+                            .collect()
+                    } else if let Some(arr) =
+                        ts_col.as_any().downcast_ref::<TimestampNanosecondArray>()
+                    {
+                        arr.iter()
+                            .map(|v| Some(v.unwrap_or(i64::MIN / 1_000_000) < watermark_ms * 1_000_000))
+                            .collect()
+                    } else if let Some(arr) = ts_col.as_any().downcast_ref::<Date32Array>() {
+                        arr.iter()
+                            .map(|v| Some(v.unwrap_or(i32::MIN) as i64 * 86_400 < watermark_ms))
+                            .collect()
+                    } else if let Some(arr) = ts_col.as_any().downcast_ref::<Date64Array>() {
+                        arr.iter()
+                            .map(|v| Some(v.unwrap_or(i64::MIN) * 86_400_000 < watermark_ms))
                             .collect()
                     } else {
+                        // Suppress unused-variable warning for the helper closure.
+                        let _ = make_mask;
                         continue;
-                    };
+                    }
+                };
                 let before = batch.num_rows();
                 *batch = batch.filter_mask(&mask)?;
                 removed += before - batch.num_rows();

@@ -22,6 +22,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::delta_batch::{DeltaBatch, WEIGHT_COLUMN};
 use crate::error::{DeltaError, DeltaResult};
+use crate::operators::key_util::{scalar_to_key as scalar_to_group_key, scalar_to_string};
 
 // ── Aggregation specification ──────────────────────────────────────────────────
 
@@ -33,6 +34,10 @@ pub enum Aggregation {
     },
     Count {
         output_col: String,
+        /// When `Some`, only non-null values of this column are counted
+        /// (SQL `COUNT(col)` excludes nulls).  When `None`, counts all rows
+        /// (SQL `COUNT(*)`).
+        input_col: Option<String>,
     },
     Avg {
         input_col: String,
@@ -52,7 +57,7 @@ impl Aggregation {
     pub fn output_col(&self) -> &str {
         match self {
             Self::Sum { output_col, .. }
-            | Self::Count { output_col }
+            | Self::Count { output_col, .. }
             | Self::Avg { output_col, .. }
             | Self::Min { output_col, .. }
             | Self::Max { output_col, .. } => output_col,
@@ -65,7 +70,7 @@ impl Aggregation {
             | Self::Avg { input_col, .. }
             | Self::Min { input_col, .. }
             | Self::Max { input_col, .. } => Some(input_col),
-            Self::Count { .. } => None,
+            Self::Count { input_col, .. } => input_col.as_deref(),
         }
     }
 }
@@ -137,8 +142,13 @@ impl AggState {
                 self.sum += numeric * weight as f64;
                 self.count += weight;
             }
-            Aggregation::Count { .. } => {
-                // COUNT(*) counts every row including those with null values.
+            Aggregation::Count { input_col, .. } => {
+                // IVM-6: COUNT(col) excludes nulls; COUNT(*) counts all rows.
+                // When `input_col` is `Some`, the caller has already converted
+                // null values to the "NULL" sentinel via `scalar_to_string`.
+                if input_col.is_some() && input_val_str == "NULL" {
+                    return;
+                }
                 self.count += weight;
             }
             Aggregation::Avg { .. } => {
@@ -491,180 +501,6 @@ fn build_output_batch(
     DeltaBatch::from_weighted(inner)
 }
 
-/// Stringify a scalar for use as a group-key hash component.
-///
-/// Returns `None` for SQL nulls (they hash together as a single null group).
-/// Returns `None` for unrecognized array types so callers can detect the gap.
-///
-/// Float types use their bit representation (not `to_string`) for a stable,
-/// injective key: `to_string` is not injective across NaN variants and may
-/// not reliably distinguish denormals. Bit-repr is always unique per value.
-fn scalar_to_group_key(arr: &dyn Array, row: usize) -> Option<String> {
-    use arrow::array::{
-        BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-    };
-    if arr.is_null(row) {
-        return None;
-    }
-    // Signed integers
-    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int16Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int8Array>() {
-        return Some(a.value(row).to_string());
-    }
-    // Unsigned integers
-    if let Some(a) = arr.as_any().downcast_ref::<UInt64Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt32Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt16Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt8Array>() {
-        return Some(a.value(row).to_string());
-    }
-    // Floats: bit-repr for injective, stable keys (to_string varies across NaN
-    // variants and is not guaranteed unique under all rounding modes).
-    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return Some(a.value(row).to_bits().to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        return Some((a.value(row).to_bits() as u64).to_string());
-    }
-    // String types
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
-        return Some(a.value(row).to_string());
-    }
-    // Boolean (store as "0"/"1" for a compact, unambiguous key)
-    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
-        return Some((a.value(row) as u8).to_string());
-    }
-    // Date types (stored as day / ms offsets — stringify the raw integer)
-    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Date64Array>() {
-        return Some(a.value(row).to_string());
-    }
-    // Timestamp types (all stored as i64 epoch ticks, unit is irrelevant for
-    // grouping since the column already carries a fixed unit in its DataType)
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampSecondArray>() {
-        return Some(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        return Some(a.value(row).to_string());
-    }
-    None
-}
-
-/// Stringify a scalar for use as an aggregate input value.
-///
-/// Returns `"NULL"` for SQL nulls. Callers for SUM/AVG/MIN/MAX must check for
-/// this sentinel and skip the row (SQL excludes nulls from these aggregates).
-/// COUNT uses a separate path and does not call this function.
-fn scalar_to_string(arr: &dyn Array, row: usize) -> String {
-    use arrow::array::{
-        BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-    };
-    if arr.is_null(row) {
-        return "NULL".to_string();
-    }
-    // Signed integers
-    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int16Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int8Array>() {
-        return a.value(row).to_string();
-    }
-    // Unsigned integers
-    if let Some(a) = arr.as_any().downcast_ref::<UInt64Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt32Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt16Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<UInt8Array>() {
-        return a.value(row).to_string();
-    }
-    // Floats: use Rust's shortest-round-trip decimal format (Ryu algorithm)
-    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
-        return a.value(row).to_string();
-    }
-    // String types
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
-        return a.value(row).to_string();
-    }
-    // Boolean
-    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
-        return (a.value(row) as u8).to_string();
-    }
-    // Date / Timestamp — stringify as raw integer epoch ticks
-    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Date64Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampSecondArray>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        return a.value(row).to_string();
-    }
-    "NULL".to_string()
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -744,6 +580,7 @@ mod tests {
             vec!["customer_id".into()],
             vec![Aggregation::Count {
                 output_col: "cnt".into(),
+                input_col: None,
             }],
         )
         .unwrap();

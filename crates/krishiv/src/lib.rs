@@ -71,10 +71,11 @@
 // ── Session API ───────────────────────────────────────────────────────────────
 
 pub use krishiv_api::{
-    AggExpr, AggFunction, DataFrame, DeploymentTarget, ExecutionMode, KeyedStream, KrishivError,
-    MultiSourceWatermarkSpec, QueryResult, RecordBatch, Session, SessionBuilder,
-    SessionWindowedStream, SlidingWindowedStream, StateTtlConfig, Stream, StreamBatch, StreamMode,
-    StreamingDataFrame, WatermarkSpec, WindowedStream,
+    AggExpr, AggFunction, ContinuousStreamCheckpoint, ContinuousStreamStatus, DataFrame,
+    DeploymentTarget, ExecutionMode, KeyedStream, KrishivError, MultiSourceWatermarkSpec,
+    QueryResult, RecordBatch, Session, SessionBuilder, SessionWindowedStream,
+    SlidingWindowedStream, StateTtlConfig, Stream, StreamBatch, StreamMode, StreamingDataFrame,
+    WatermarkSpec, WindowedStream,
 };
 
 // Arrow schema/type primitives re-exported so users never import `arrow` directly.
@@ -160,6 +161,16 @@ pub mod distributed {
         parse_coordinator_daemon_config, parse_job_coordinator_daemon_config,
         run_cluster_control_plane, run_clusterd_daemon, run_job_coordinator_daemon,
         run_standalone_coordinator, spawn_coordinator_sidecars,
+    };
+}
+
+/// Model Context Protocol server frontend.
+///
+/// The MCP server is a typed control surface over [`Session`]; it does not own
+/// scheduling or execution logic.
+pub mod mcp {
+    pub use krishiv_mcp::{
+        KrishivMcpServer, McpConfig, McpServerError, mcp_help, run_mcp_from_env,
     };
 }
 

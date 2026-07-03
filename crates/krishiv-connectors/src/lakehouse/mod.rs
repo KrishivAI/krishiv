@@ -14,7 +14,8 @@ mod delta_lake;
 pub mod dml;
 mod hudi;
 mod iceberg_fs;
-mod iceberg_native;
+#[cfg(feature = "iceberg")]
+pub(crate) mod iceberg_native;
 mod local_delta;
 #[cfg(feature = "iceberg")]
 pub mod maintenance;

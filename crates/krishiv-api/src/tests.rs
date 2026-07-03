@@ -9,10 +9,11 @@ use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 
+use krishiv_connectors::ConnectorConfig;
 use krishiv_runtime::LocalWindowKind;
 
 use crate::error::KrishivError;
-use crate::session::{Session, SessionBuilder};
+use crate::session::{Session, SessionBuilder, SubmittedSqlJobState};
 use crate::types::{ExecutionMode, StreamBatch, StreamMode};
 use crate::window::{
     KeyedStream, MultiSourceWatermarkSpec, SessionWindowedStream, SlidingWindowedStream,
@@ -88,6 +89,174 @@ fn session_builder_preserves_coordinator_grpc_url() {
         session.coordinator_grpc_url(),
         Some("http://127.0.0.1:9090")
     );
+}
+
+#[test]
+fn session_registers_validated_sink_configs() {
+    let session = Session::builder().build().unwrap();
+    let config = ConnectorConfig::new("out", "parquet").with_property("path", "/tmp/out.parquet");
+
+    session.register_sink_config(config).unwrap();
+
+    let sinks = session.registered_sink_configs();
+    assert_eq!(sinks.len(), 1);
+    assert_eq!(sinks[0].name, "out");
+    assert_eq!(sinks[0].kind, "parquet");
+    assert!(session.sink_config("out").is_some());
+}
+
+#[test]
+fn session_rejects_invalid_sink_configs() {
+    let session = Session::builder().build().unwrap();
+    let error = session
+        .register_sink_config(ConnectorConfig::new("out", "parquet"))
+        .unwrap_err();
+
+    assert!(
+        matches!(error, KrishivError::InvalidConfig { .. }),
+        "expected invalid config, got {error:?}"
+    );
+    assert!(session.registered_sink_configs().is_empty());
+}
+
+#[test]
+fn session_registers_validated_source_configs() {
+    let session = Session::builder().build().unwrap();
+    let config =
+        ConnectorConfig::new("orders_input", "parquet").with_property("path", "/tmp/in.parquet");
+
+    session.register_source_config(config).unwrap();
+
+    let sources = session.registered_source_configs();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].name, "orders_input");
+    assert_eq!(sources[0].kind, "parquet");
+    assert!(session.source_config("orders_input").is_some());
+}
+
+#[test]
+fn session_rejects_invalid_source_configs() {
+    let session = Session::builder().build().unwrap();
+    let error = session
+        .register_source_config(ConnectorConfig::new("orders_input", "parquet"))
+        .unwrap_err();
+
+    assert!(
+        matches!(error, KrishivError::InvalidConfig { .. }),
+        "expected invalid config, got {error:?}"
+    );
+    assert!(session.registered_source_configs().is_empty());
+}
+
+#[tokio::test]
+async fn submit_sql_resolves_registered_connector_names() {
+    use krishiv_connectors::Source;
+    use krishiv_connectors::parquet::ParquetSource;
+
+    let session = Session::builder().build().unwrap();
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("people.parquet");
+    let output = dir.path().join("cities.parquet");
+    write_people_parquet(&input);
+    session
+        .register_source_config(
+            ConnectorConfig::new("people_input", "parquet")
+                .with_property("path", input.display().to_string()),
+        )
+        .unwrap();
+    session
+        .register_sink_config(
+            ConnectorConfig::new("cities_output", "parquet")
+                .with_property("path", output.display().to_string()),
+        )
+        .unwrap();
+
+    let sql = "
+        CREATE SOURCE people FROM people_input;
+        CREATE SOURCE cities AS SELECT city, COUNT(*) AS n FROM people GROUP BY city;
+        CREATE SINK out FROM cities INTO cities_output;
+    ";
+
+    let handle = session.submit_sql(sql).await.unwrap();
+
+    assert_eq!(handle.status(), krishiv_engine_core::JobStatus::Completed);
+    let mut reader = ParquetSource::open(&output).unwrap();
+    let out = reader.read_batch().await.unwrap().expect("output batch");
+    assert_eq!(out.num_rows(), 2);
+}
+
+#[tokio::test]
+async fn submit_sql_background_tracks_failed_local_job() {
+    let session = Session::builder().build().unwrap();
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("people.parquet");
+    let output = dir.path().join("out.parquet");
+    write_people_parquet(&input);
+    let sql = format!(
+        "CREATE SOURCE orders FROM parquet(path='{}'); \
+         CREATE SOURCE bad AS SELECT missing_column FROM orders; \
+         CREATE SINK out FROM bad INTO parquet(path='{}');",
+        input.display(),
+        output.display()
+    );
+
+    let submitted = session.submit_sql_background(&sql).unwrap();
+    assert_eq!(submitted.job_id(), "out");
+    assert_eq!(submitted.state(), SubmittedSqlJobState::Running);
+
+    let final_status = wait_for_submitted_sql_terminal(&session, "out").await;
+    assert_eq!(final_status.state(), SubmittedSqlJobState::Failed);
+    assert!(final_status.error().is_some());
+    assert_eq!(
+        session
+            .jobs()
+            .into_iter()
+            .find(|job| job.id().as_str() == "out")
+            .map(|job| job.state()),
+        Some(krishiv_runtime::JobState::Failed)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_submitted_sql_job_marks_local_status_cancelled() {
+    let session = Session::builder().build().unwrap();
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("missing.parquet");
+    let output = dir.path().join("out.parquet");
+    let sql = format!(
+        "CREATE SOURCE orders FROM parquet(path='{}'); \
+         CREATE SINK out FROM orders INTO parquet(path='{}');",
+        input.display(),
+        output.display()
+    );
+
+    session.submit_sql_background(&sql).unwrap();
+    let cancelled = session.cancel_submitted_sql_job("out").unwrap();
+
+    assert_eq!(cancelled.state(), SubmittedSqlJobState::Cancelled);
+    assert_eq!(
+        session
+            .jobs()
+            .into_iter()
+            .find(|job| job.id().as_str() == "out")
+            .map(|job| job.state()),
+        Some(krishiv_runtime::JobState::Cancelled)
+    );
+}
+
+async fn wait_for_submitted_sql_terminal(
+    session: &Session,
+    job_id: &str,
+) -> crate::SubmittedSqlJobStatus {
+    for _ in 0..100 {
+        if let Some(status) = session.submitted_sql_job_status(job_id)
+            && status.state().is_terminal()
+        {
+            return status;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("background SQL job {job_id} did not reach a terminal state");
 }
 
 #[test]
@@ -872,6 +1041,188 @@ async fn continuous_stream_job_poll_drains_via_coordinator() {
         .push_stream_job_input("events", vec![batch])
         .expect("push");
     let _ = session.poll_stream_job("events").await.expect("poll");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_continuous_stream_status_and_checkpoint_are_mode_aware() {
+    use krishiv_runtime::LocalWindowExecutionSpec;
+
+    let session = Session::builder().build().unwrap();
+    let spec = LocalWindowExecutionSpec {
+        key_column: "user_id".into(),
+        key_column_type: String::from("utf8"),
+        event_time_column: "ts".into(),
+        watermark_lag_ms: 0,
+        window_kind: LocalWindowKind::Tumbling,
+        window_size_ms: 10_000,
+        agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+        state_ttl_ms: None,
+        allowed_lateness_ms: None,
+        source_watermark_lags: HashMap::new(),
+        source_id_column: None,
+        window_timezone: None,
+    };
+    session
+        .submit_stream_job("status-job", spec)
+        .expect("submit");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a"])) as _,
+            Arc::new(Int64Array::from(vec![1_000])) as _,
+        ],
+    )
+    .unwrap();
+    session
+        .push_stream_job_input("status-job", vec![batch])
+        .expect("push");
+    let _ = session.poll_stream_job("status-job").await.expect("poll");
+
+    let status = session
+        .continuous_stream_status("status-job")
+        .await
+        .expect("status call must succeed")
+        .expect("status must exist");
+    assert_eq!(status.job_id(), "status-job");
+    assert_eq!(status.state(), "registered");
+    assert_eq!(status.pending_input_batches(), Some(0));
+    assert!(status.last_watermark_ms().is_some());
+    assert!(status.snapshot_available());
+    assert!(!status.uses_remote_execution());
+
+    let statuses = session
+        .list_continuous_stream_statuses()
+        .await
+        .expect("list call must succeed");
+    assert!(statuses.iter().any(|entry| entry.job_id() == "status-job"));
+
+    let checkpoint = session
+        .checkpoint_continuous_stream("status-job")
+        .await
+        .expect("checkpoint export must succeed");
+    assert_eq!(checkpoint.job_id(), "status-job");
+    assert!(checkpoint.snapshot_available());
+    assert!(checkpoint.snapshot_bytes().is_some());
+    assert!(checkpoint.watermark_ms().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_continuous_stream_restore_rolls_back_exported_state() {
+    use krishiv_runtime::LocalWindowExecutionSpec;
+
+    let session = Session::builder().build().unwrap();
+    let spec = LocalWindowExecutionSpec {
+        key_column: "user_id".into(),
+        key_column_type: String::from("utf8"),
+        event_time_column: "ts".into(),
+        watermark_lag_ms: 0,
+        window_kind: LocalWindowKind::Tumbling,
+        window_size_ms: 10_000,
+        agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+        state_ttl_ms: None,
+        allowed_lateness_ms: None,
+        source_watermark_lags: HashMap::new(),
+        source_id_column: None,
+        window_timezone: None,
+    };
+    session
+        .submit_stream_job("restore-job", spec)
+        .expect("submit");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let first = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a"])) as _,
+            Arc::new(Int64Array::from(vec![1_000])) as _,
+        ],
+    )
+    .unwrap();
+    session
+        .push_stream_job_input("restore-job", vec![first])
+        .expect("push first");
+    let _ = session
+        .poll_stream_job("restore-job")
+        .await
+        .expect("drain first");
+    let checkpoint1 = session
+        .checkpoint_continuous_stream("restore-job")
+        .await
+        .expect("checkpoint 1");
+    let bytes1 = checkpoint1.snapshot_bytes().unwrap().to_vec();
+
+    let second = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a"])) as _,
+            Arc::new(Int64Array::from(vec![2_000])) as _,
+        ],
+    )
+    .unwrap();
+    session
+        .push_stream_job_input("restore-job", vec![second])
+        .expect("push second");
+    let _ = session
+        .poll_stream_job("restore-job")
+        .await
+        .expect("drain second");
+    let checkpoint2 = session
+        .checkpoint_continuous_stream("restore-job")
+        .await
+        .expect("checkpoint 2");
+    let bytes2 = checkpoint2.snapshot_bytes().unwrap().to_vec();
+    assert_ne!(bytes1, bytes2, "second cycle should change saved state");
+
+    let restored = session
+        .restore_continuous_stream("restore-job", &bytes1)
+        .await
+        .expect("restore");
+    assert_eq!(restored.job_id(), "restore-job");
+
+    let checkpoint3 = session
+        .checkpoint_continuous_stream("restore-job")
+        .await
+        .expect("checkpoint 3");
+    assert_eq!(
+        checkpoint3.snapshot_bytes().unwrap(),
+        bytes1.as_slice(),
+        "restored state should match the exported checkpoint"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn register_stream_job_sql_tracks_compiled_source_and_spec() {
+    let session = Session::builder().build().unwrap();
+    let registered = session
+        .register_stream_job_sql(
+            "windowed-events",
+            "SELECT user_id, COUNT(*) AS count \
+             FROM TUMBLE(TABLE events_src, DESCRIPTOR(ts), 10000) \
+             GROUP BY user_id, window_start, window_end",
+        )
+        .await
+        .expect("register continuous stream from SQL");
+
+    assert_eq!(registered.name(), "windowed-events");
+    assert_eq!(registered.source(), Some("events_src"));
+    assert_eq!(registered.spec().event_time_column, "ts");
+    assert_eq!(registered.spec().window_size_ms, 10_000);
+    assert!(matches!(
+        registered.spec().window_kind,
+        LocalWindowKind::Tumbling
+    ));
+
+    let lookup = session
+        .registered_stream_job("windowed-events")
+        .expect("registered stream job metadata");
+    assert_eq!(lookup.source(), Some("events_src"));
+    assert_eq!(lookup.spec().key_column, "user_id");
 }
 
 #[tokio::test(flavor = "multi_thread")]

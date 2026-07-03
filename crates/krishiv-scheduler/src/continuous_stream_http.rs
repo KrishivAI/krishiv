@@ -9,11 +9,13 @@
 //! not establish an exactly-once recovery guarantee.
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use krishiv_plan::window::{WindowExecutionSpec, encode_window_execution_spec};
+use krishiv_plan::window::{
+    WindowExecutionSpec, decode_window_execution_spec, encode_window_execution_spec,
+};
 use krishiv_plan::{ExecutionKind, TypedTaskFragment};
-use krishiv_proto::{InputPartition, InputPartitionDescriptor};
+use krishiv_proto::{InputPartition, InputPartitionDescriptor, JobId, JobKind};
 use serde::{Deserialize, Serialize};
 
 use crate::{Coordinator, SchedulerError, SharedCoordinator};
@@ -42,11 +44,120 @@ pub struct ContinuousRegisterResponse {
     pub success: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuousJobView {
+    pub job_id: String,
+    pub state: String,
+    pub task_count: usize,
+    pub assigned_task_count: usize,
+    pub running_task_count: usize,
+    pub succeeded_task_count: usize,
+    pub failed_task_count: usize,
+    pub last_watermark_ms: Option<i64>,
+    pub persisted_watermark_ms: Option<i64>,
+    pub snapshot_available: bool,
+    pub cycle_in_flight: bool,
+    pub spec: WindowExecutionSpec,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContinuousListResponse {
+    pub streams: Vec<ContinuousJobView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContinuousCheckpointResponse {
+    pub job_id: String,
+    pub snapshot_b64: Option<String>,
+    pub watermark_ms: Option<i64>,
+    pub snapshot_available: bool,
+    pub spec: WindowExecutionSpec,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContinuousRestoreRequest {
+    pub snapshot_b64: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContinuousRestoreResponse {
+    pub job_id: String,
+    pub restored: bool,
+    pub watermark_ms: i64,
+}
+
+fn invalid_continuous_job(job_id: &JobId, message: impl Into<String>) -> SchedulerError {
+    SchedulerError::InvalidJob {
+        message: format!("continuous job {} {}", job_id.as_str(), message.into()),
+    }
+}
+
+fn decode_continuous_job_spec(
+    record: &crate::JobRecord,
+) -> crate::SchedulerResult<WindowExecutionSpec> {
+    let job_id = record.job_id();
+    let fragment = record
+        .spec
+        .stages()
+        .first()
+        .and_then(|stage| stage.tasks().first())
+        .map(|task| task.description())
+        .ok_or_else(|| invalid_continuous_job(job_id, "has no continuous task fragment"))?;
+    let typed = TypedTaskFragment::decode(fragment)
+        .ok_or_else(|| invalid_continuous_job(job_id, "typed fragment decode failed"))?;
+    let prefix = format!("stream:loop:{}|", job_id.as_str());
+    let encoded = typed
+        .body
+        .strip_prefix(&prefix)
+        .ok_or_else(|| invalid_continuous_job(job_id, "does not use a stream:loop fragment"))?;
+    decode_window_execution_spec(encoded).map_err(|error| {
+        invalid_continuous_job(job_id, format!("window spec decode failed: {error}"))
+    })
+}
+
+fn continuous_job_view(
+    coordinator: &Coordinator,
+    job_id: &JobId,
+) -> crate::SchedulerResult<ContinuousJobView> {
+    let job = coordinator
+        .job_coordinator(job_id)
+        .ok_or_else(|| SchedulerError::UnknownJob {
+            job_id: job_id.clone(),
+        })?;
+    let record = job.read_record();
+    if record.spec.kind() != JobKind::Streaming {
+        return Err(invalid_continuous_job(job_id, "is not a streaming job"));
+    }
+    let spec = decode_continuous_job_spec(&record)?;
+    let detail = record.detail_snapshot();
+    let last_watermark_ms = detail
+        .stages()
+        .iter()
+        .flat_map(|stage| stage.tasks().iter())
+        .filter_map(|task| task.last_watermark_ms())
+        .max();
+    let persisted = coordinator.load_continuous_snapshot(job_id.as_str());
+    Ok(ContinuousJobView {
+        job_id: job_id.to_string(),
+        state: format!("{:?}", detail.job().state()),
+        task_count: detail.job().task_count(),
+        assigned_task_count: detail.job().assigned_task_count(),
+        running_task_count: detail.job().running_task_count(),
+        succeeded_task_count: detail.job().succeeded_task_count(),
+        failed_task_count: detail.job().failed_task_count(),
+        last_watermark_ms,
+        persisted_watermark_ms: persisted.as_ref().map(|snapshot| snapshot.watermark_ms),
+        snapshot_available: persisted.is_some(),
+        cycle_in_flight: coordinator.continuous_input_cycles.contains(job_id),
+        spec,
+    })
+}
+
 pub async fn api_continuous_register(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousRegisterRequest>,
 ) -> Result<Json<ContinuousRegisterResponse>, StatusCode> {
-    use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+    use krishiv_proto::{JobSpec, StageId, StageSpec, TaskId, TaskSpec};
     let job_id = JobId::try_new(&body.job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
     let stage_id = StageId::try_new("stage-streaming").map_err(|_| StatusCode::BAD_REQUEST)?;
     // The task_id is unique per job_id so per-task lease fencing, per-task
@@ -81,6 +192,101 @@ pub async fn api_continuous_register(
     }
 
     Ok(Json(ContinuousRegisterResponse { success: true }))
+}
+
+pub async fn api_continuous_list(
+    State(coordinator): State<SharedCoordinator>,
+) -> Result<Json<ContinuousListResponse>, StatusCode> {
+    let streams = {
+        let coord = coordinator.read().await;
+        let mut streams = coord
+            .job_snapshots()
+            .into_iter()
+            .filter(|job| job.kind() == JobKind::Streaming)
+            .filter_map(|job| continuous_job_view(&coord, job.job_id()).ok())
+            .collect::<Vec<_>>();
+        streams.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        streams
+    };
+    Ok(Json(ContinuousListResponse { streams }))
+}
+
+pub async fn api_continuous_get(
+    State(coordinator): State<SharedCoordinator>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ContinuousJobView>, StatusCode> {
+    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let view = {
+        let coord = coordinator.read().await;
+        continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?
+    };
+    Ok(Json(view))
+}
+
+pub async fn api_continuous_checkpoint(
+    State(coordinator): State<SharedCoordinator>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ContinuousCheckpointResponse>, StatusCode> {
+    use base64::Engine as _;
+
+    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let response = {
+        let coord = coordinator.read().await;
+        let view =
+            continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?;
+        let persisted = coord.load_continuous_snapshot(job_id.as_str());
+        ContinuousCheckpointResponse {
+            job_id: view.job_id,
+            snapshot_b64: persisted.as_ref().map(|snapshot| {
+                base64::engine::general_purpose::STANDARD.encode(&snapshot.snapshot_bytes)
+            }),
+            watermark_ms: persisted.as_ref().map(|snapshot| snapshot.watermark_ms),
+            snapshot_available: persisted.is_some(),
+            spec: view.spec,
+        }
+    };
+    Ok(Json(response))
+}
+
+pub async fn api_continuous_restore(
+    State(coordinator): State<SharedCoordinator>,
+    Path(job_id): Path<String>,
+    Json(body): Json<ContinuousRestoreRequest>,
+) -> Result<Json<ContinuousRestoreResponse>, StatusCode> {
+    use base64::Engine as _;
+
+    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let snapshot_bytes = base64::engine::general_purpose::STANDARD
+        .decode(body.snapshot_b64.as_bytes())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if snapshot_bytes.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let watermark_ms = {
+        let mut coord = coordinator.write().await;
+        let view =
+            continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?;
+        let watermark_ms = view
+            .persisted_watermark_ms
+            .or(view.last_watermark_ms)
+            .unwrap_or(i64::MIN);
+        let snapshot = crate::ContinuousSnapshot {
+            snapshot_bytes,
+            watermark_ms,
+        };
+        coord
+            .pending_continuous_restores
+            .insert(job_id.clone(), snapshot.clone());
+        coord.save_continuous_snapshot(job_id.as_str(), snapshot);
+        // Keep the existing streaming job active; the restore is applied on the
+        // next fenced cycle assignment, not out-of-band.
+        watermark_ms
+    };
+    Ok(Json(ContinuousRestoreResponse {
+        job_id: job_id.to_string(),
+        restored: true,
+        watermark_ms,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,6 +655,40 @@ pub async fn drain_continuous_stream_coordinated(
         .unwrap_or_default())
 }
 
+/// Stage a one-shot continuous-stream restore snapshot for the next cycle.
+pub async fn restore_continuous_stream_coordinated(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    snapshot_bytes: Vec<u8>,
+) -> Result<(), ContinuousStreamError> {
+    let job_id_typed = JobId::try_new(job_id).map_err(|e| {
+        ContinuousStreamError::Scheduler(crate::SchedulerError::InvalidJob {
+            message: e.to_string(),
+        })
+    })?;
+    if snapshot_bytes.is_empty() {
+        return Err(ContinuousStreamError::Scheduler(
+            crate::SchedulerError::InvalidJob {
+                message: format!("continuous job {job_id} restore snapshot must not be empty"),
+            },
+        ));
+    }
+    let mut coord = coordinator.write().await;
+    let watermark_ms = continuous_job_view(&coord, &job_id_typed)
+        .ok()
+        .and_then(|view| view.persisted_watermark_ms.or(view.last_watermark_ms))
+        .unwrap_or(i64::MIN);
+    let snapshot = crate::ContinuousSnapshot {
+        snapshot_bytes,
+        watermark_ms,
+    };
+    coord
+        .pending_continuous_restores
+        .insert(job_id_typed.clone(), snapshot.clone());
+    coord.save_continuous_snapshot(job_id, snapshot);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -461,7 +701,9 @@ mod tests {
     use axum::Json;
     use axum::extract::State;
     use krishiv_plan::window::{WindowExecutionSpec, WindowKind, decode_window_execution_spec};
-    use krishiv_proto::{CoordinatorId, ExecutorTaskAssignment};
+    use krishiv_proto::{
+        CoordinatorId, ExecutorTaskAssignment, TaskStatusResponse, TransportDisposition,
+    };
 
     use crate::{Coordinator, SharedCoordinator};
 
@@ -591,6 +833,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_get_and_checkpoint_expose_continuous_job_metadata() {
+        use base64::Engine as _;
+
+        let coordinator = make_coordinator_with_executor("list-checkpoint").await;
+        coordinator
+            .write()
+            .await
+            .attach_store(crate::InMemoryMetadataStore::default());
+
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-list-job".into(),
+                spec: tumbling_spec(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        coordinator.write().await.save_continuous_snapshot(
+            "cs-list-job",
+            crate::ContinuousSnapshot {
+                snapshot_bytes: b"checkpoint".to_vec(),
+                watermark_ms: 12_345,
+            },
+        );
+        for _ in 0..50 {
+            if coordinator
+                .read()
+                .await
+                .load_continuous_snapshot("cs-list-job")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let list = api_continuous_list(State(coordinator.clone()))
+            .await
+            .unwrap();
+        assert_eq!(list.0.streams.len(), 1);
+        assert_eq!(list.0.streams[0].job_id, "cs-list-job");
+        assert!(list.0.streams[0].snapshot_available);
+        assert_eq!(list.0.streams[0].persisted_watermark_ms, Some(12_345));
+
+        let get = api_continuous_get(
+            State(coordinator.clone()),
+            Path(String::from("cs-list-job")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(get.0.job_id, "cs-list-job");
+        assert_eq!(get.0.spec, tumbling_spec());
+
+        let checkpoint =
+            api_continuous_checkpoint(State(coordinator), Path(String::from("cs-list-job")))
+                .await
+                .unwrap();
+        assert_eq!(checkpoint.0.job_id, "cs-list-job");
+        assert_eq!(checkpoint.0.watermark_ms, Some(12_345));
+        assert_eq!(
+            checkpoint.0.snapshot_b64,
+            Some(base64::engine::general_purpose::STANDARD.encode("checkpoint"))
+        );
+    }
+
+    #[tokio::test]
     async fn coordinator_prepares_one_fenced_executor_cycle() {
         let coordinator = make_coordinator_with_executor("push").await;
 
@@ -610,6 +920,88 @@ mod tests {
         let job_id = krishiv_proto::JobId::try_new("cs-push-job").unwrap();
         assert!(coord.continuous_input_cycles.contains(&job_id));
         assert_eq!(coord.job_input_partitions[&job_id].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restore_stages_snapshot_for_next_continuous_cycle() {
+        use base64::Engine as _;
+
+        let coordinator = make_coordinator_with_executor("restore").await;
+        coordinator
+            .write()
+            .await
+            .attach_store(crate::InMemoryMetadataStore::default());
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-restore-job".into(),
+                spec: tumbling_spec(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        coordinator.write().await.save_continuous_snapshot(
+            "cs-restore-job",
+            crate::ContinuousSnapshot {
+                snapshot_bytes: b"old-checkpoint".to_vec(),
+                watermark_ms: 777,
+            },
+        );
+        for _ in 0..50 {
+            if coordinator
+                .read()
+                .await
+                .load_continuous_snapshot("cs-restore-job")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let restore = api_continuous_restore(
+            State(coordinator.clone()),
+            Path(String::from("cs-restore-job")),
+            Json(ContinuousRestoreRequest {
+                snapshot_b64: base64::engine::general_purpose::STANDARD.encode("new-checkpoint"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(restore.0.restored);
+        assert_eq!(restore.0.watermark_ms, 777);
+
+        let assignment = prepare_cycle(&coordinator, "cs-restore-job").await;
+        assert_eq!(assignment.input_partitions().len(), 2);
+        match assignment.input_partitions()[0].descriptor() {
+            Some(InputPartitionDescriptor::ContinuousRestore {
+                snapshot_bytes,
+                watermark_ms,
+            }) => {
+                assert_eq!(snapshot_bytes.as_slice(), b"new-checkpoint");
+                assert_eq!(*watermark_ms, 777);
+            }
+            other => panic!("expected restore descriptor, got {other:?}"),
+        }
+
+        let job_id = krishiv_proto::JobId::try_new("cs-restore-job").unwrap();
+        {
+            let coord = coordinator.read().await;
+            assert!(coord.pending_continuous_restores.contains_key(&job_id));
+        }
+        {
+            let mut coord = coordinator.write().await;
+            let accepted = coord.apply_assignment_dispatch_responses(
+                &job_id,
+                &[(
+                    assignment,
+                    TaskStatusResponse::new(TransportDisposition::Accepted),
+                )],
+            );
+            assert_eq!(accepted, 1);
+            assert!(!coord.pending_continuous_restores.contains_key(&job_id));
+        }
     }
 
     #[tokio::test]

@@ -13,6 +13,11 @@
 
 ---
 
+> **⚠️ Pre-release — not for production use**
+> Krishiv is under active development and has not yet reached its first stable release. APIs, storage formats, and wire protocols may change between versions. We recommend using Krishiv for evaluation, prototyping, and development purposes only. Please wait for the first stable release before deploying to production.
+
+---
+
 ## Install
 
 ### Docker (recommended for getting started)

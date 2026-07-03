@@ -1195,6 +1195,15 @@ fn input_partition_descriptor_to_wire(
                 ..Default::default()
             })
         }
+        InputPartitionDescriptor::ContinuousRestore {
+            snapshot_bytes,
+            watermark_ms,
+        } => Ok(v1::InputPartitionDescriptor {
+            kind: v1::InputPartitionDescriptorKind::ContinuousRestore as i32,
+            ipc_bytes: snapshot_bytes.clone(),
+            watermark_ms: *watermark_ms,
+            ..Default::default()
+        }),
     }
 }
 
@@ -1281,6 +1290,17 @@ fn input_partition_descriptor_from_wire(
         }
         v1::InputPartitionDescriptorKind::WatermarkHint => {
             Ok(InputPartitionDescriptor::WatermarkHint {
+                watermark_ms: value.watermark_ms,
+            })
+        }
+        v1::InputPartitionDescriptorKind::ContinuousRestore => {
+            if value.ipc_bytes.is_empty() {
+                return Err(WireError::new(
+                    "continuous restore snapshot bytes cannot be empty",
+                ));
+            }
+            Ok(InputPartitionDescriptor::ContinuousRestore {
+                snapshot_bytes: value.ipc_bytes,
                 watermark_ms: value.watermark_ms,
             })
         }

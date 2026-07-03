@@ -22,14 +22,15 @@
 //!   `(SELECT …)`.
 //! - Exactly one `CREATE SINK … INTO <connector>(...)` defines the output.
 //!
-//! `parquet` is the wired connector (matching [`connector_runtime`](crate::connector_runtime));
+//! File/object-store connectors wired by the shared runtime are accepted here;
 //! other kinds return a typed [`KrishivError`]. Multi-level view graphs and
 //! `START PIPELINE`/`REFRESH` triggers are out of scope here — `submit_sql` is
 //! itself the run trigger.
 
 use krishiv_common::sql_util::{quote_identifier, split_sql_statements};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use krishiv_connectors::ConnectorConfig;
 use krishiv_sql::pipeline_ddl::{
     ConnectorSpec, PipelineStatement, SourceSpec as SqlSourceSpec, parse_pipeline_statement,
 };
@@ -42,6 +43,18 @@ use crate::{CompiledJob, KrishivError, Result, SinkSpec, SourceSpec};
 /// Returns a typed [`KrishivError`] when the script is not a recognised
 /// single-sink connector pipeline (see the [module docs](self) for the shape).
 pub fn compile_sql_job(sql: &str) -> Result<CompiledJob> {
+    compile_sql_job_with_registered_connectors(sql, &[], &[])
+}
+
+/// Compile a SQL pipeline script, resolving bare connector names against
+/// session-registered source/sink configs.
+pub fn compile_sql_job_with_registered_connectors(
+    sql: &str,
+    registered_sources: &[ConnectorConfig],
+    registered_sinks: &[ConnectorConfig],
+) -> Result<CompiledJob> {
+    let registered_sources = connector_config_map(registered_sources);
+    let registered_sinks = connector_config_map(registered_sinks);
     let mut connector_sources: Vec<(String, ConnectorSpec)> = Vec::new();
     let mut query_sources: HashMap<String, String> = HashMap::new();
     let mut sink: Option<(String, String, ConnectorSpec)> = None;
@@ -115,9 +128,9 @@ pub fn compile_sql_job(sql: &str) -> Result<CompiledJob> {
     let query = resolve_view_query(&view, &query_sources, &connector_sources)?;
     let sources = connector_sources
         .iter()
-        .map(|(name, connector)| source_spec(name, connector))
+        .map(|(name, connector)| source_spec(name, connector, &registered_sources))
         .collect::<Result<Vec<_>>>()?;
-    let sink_spec = sink_spec(&sink_name, &sink_connector)?;
+    let sink_spec = sink_spec(&sink_name, &sink_connector, &registered_sinks)?;
     let event_time_window = is_windowed_streaming_sql(&query);
     // Parse the transform query once, here at compile time, so a malformed query
     // fails fast with a typed error instead of surfacing deep inside whichever
@@ -181,32 +194,104 @@ fn resolve_view_query(
     )))
 }
 
-fn source_spec(name: &str, connector: &ConnectorSpec) -> Result<SourceSpec> {
+fn source_spec(
+    name: &str,
+    connector: &ConnectorSpec,
+    registered: &HashMap<String, ConnectorSpec>,
+) -> Result<SourceSpec> {
+    let connector = resolve_registered_connector(connector, registered);
     match connector.kind.as_str() {
-        "parquet" => Ok(SourceSpec::bounded(
+        "parquet" | "parquet-directory" | "csv" | "json" | "ndjson" => Ok(SourceSpec::bounded(
             name,
-            "parquet",
+            connector.kind.as_str(),
             connector.require("path").map_err(KrishivError::from)?,
-        )),
+        )
+        .with_options(connector_options(connector))),
+        "s3" => Ok(SourceSpec::bounded(
+            name,
+            connector.kind.as_str(),
+            connector
+                .require("object_path")
+                .map_err(KrishivError::from)?,
+        )
+        .with_options(connector_options(connector))),
+        "s3-prefix" => Ok(SourceSpec::bounded(
+            name,
+            connector.kind.as_str(),
+            connector.require("prefix").map_err(KrishivError::from)?,
+        )
+        .with_options(connector_options(connector))),
         other => Err(KrishivError::unsupported(format!(
             "connector source '{other}' is not yet supported by the SQL job compiler; \
-             supported: parquet"
+             supported: parquet, parquet-directory, csv, json, s3, s3-prefix"
         ))),
     }
 }
 
-fn sink_spec(view: &str, connector: &ConnectorSpec) -> Result<SinkSpec> {
+fn sink_spec(
+    view: &str,
+    connector: &ConnectorSpec,
+    registered: &HashMap<String, ConnectorSpec>,
+) -> Result<SinkSpec> {
+    let connector = resolve_registered_connector(connector, registered);
     match connector.kind.as_str() {
-        "parquet" => Ok(SinkSpec::new(
+        "parquet" | "csv" | "json" | "ndjson" => Ok(SinkSpec::new(
             view,
-            "parquet",
+            connector.kind.as_str(),
             connector.require("path").map_err(KrishivError::from)?,
-        )),
+        )
+        .with_options(connector_options(connector))),
+        "s3" => Ok(SinkSpec::new(
+            view,
+            connector.kind.as_str(),
+            connector
+                .require("object_path")
+                .map_err(KrishivError::from)?,
+        )
+        .with_options(connector_options(connector))),
         other => Err(KrishivError::unsupported(format!(
             "connector sink '{other}' is not yet supported by the SQL job compiler; \
-             supported: parquet"
+             supported: parquet, csv, json, s3"
         ))),
     }
+}
+
+fn connector_options(connector: &ConnectorSpec) -> BTreeMap<String, String> {
+    connector
+        .options
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn connector_config_map(configs: &[ConnectorConfig]) -> HashMap<String, ConnectorSpec> {
+    configs
+        .iter()
+        .map(|config| {
+            (
+                config.name.trim().to_ascii_lowercase(),
+                ConnectorSpec {
+                    kind: config.kind.trim().to_ascii_lowercase(),
+                    options: config
+                        .properties()
+                        .map(|(key, value)| (key.trim().to_ascii_lowercase(), value.to_string()))
+                        .collect(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn resolve_registered_connector<'a>(
+    connector: &'a ConnectorSpec,
+    registered: &'a HashMap<String, ConnectorSpec>,
+) -> &'a ConnectorSpec {
+    if connector.options.is_empty()
+        && let Some(registered) = registered.get(&connector.kind)
+    {
+        return registered;
+    }
+    connector
 }
 
 #[cfg(test)]
@@ -237,6 +322,74 @@ mod tests {
         assert_eq!(job.sources[0].uri, "/data/orders.parquet");
         assert_eq!(job.sinks.len(), 1);
         assert_eq!(job.sinks[0].uri, "/data/out.parquet");
+    }
+
+    #[test]
+    fn compiles_job_with_registered_source_and_sink_refs() {
+        let sources = vec![
+            ConnectorConfig::new("orders_input", "parquet").with_property("path", "/in.parquet"),
+        ];
+        let sinks =
+            vec![ConnectorConfig::new("summary_output", "csv").with_property("path", "/out.csv")];
+        let sql = "
+            CREATE SOURCE orders FROM orders_input;
+            CREATE SOURCE summary AS SELECT id FROM orders;
+            CREATE SINK out FROM summary INTO summary_output;
+        ";
+
+        let job = compile_sql_job_with_registered_connectors(sql, &sources, &sinks).unwrap();
+
+        assert_eq!(job.sources[0].connector, "parquet");
+        assert_eq!(job.sources[0].uri, "/in.parquet");
+        assert_eq!(job.sinks[0].connector, "csv");
+        assert_eq!(job.sinks[0].uri, "/out.csv");
+    }
+
+    #[test]
+    fn compiles_registered_s3_connector_refs_with_options() {
+        let sources = vec![
+            ConnectorConfig::new("orders_input", "s3")
+                .with_property("base_path", "/object-root")
+                .with_property("object_path", "orders/input.parquet"),
+        ];
+        let sinks = vec![
+            ConnectorConfig::new("summary_output", "s3")
+                .with_property("base_path", "/object-root")
+                .with_property("object_path", "summary/out.parquet"),
+        ];
+        let sql = "
+            CREATE SOURCE orders FROM orders_input;
+            CREATE SINK out FROM (SELECT COUNT(*) AS n FROM orders) INTO summary_output;
+        ";
+
+        let job = compile_sql_job_with_registered_connectors(sql, &sources, &sinks).unwrap();
+
+        assert_eq!(job.sources[0].connector, "s3");
+        assert_eq!(job.sources[0].uri, "orders/input.parquet");
+        assert_eq!(
+            job.sources[0].options.get("base_path").map(String::as_str),
+            Some("/object-root")
+        );
+        assert_eq!(job.sinks[0].connector, "s3");
+        assert_eq!(job.sinks[0].uri, "summary/out.parquet");
+        assert_eq!(
+            job.sinks[0].options.get("base_path").map(String::as_str),
+            Some("/object-root")
+        );
+    }
+
+    #[test]
+    fn registered_unknown_connector_still_reports_compiler_support_gap() {
+        let sources = vec![ConnectorConfig::new("events", "kafka").with_property("topic", "t")];
+        let sql = "
+            CREATE SOURCE events FROM events;
+            CREATE SINK out FROM events INTO parquet(path='/out.parquet');
+        ";
+
+        let err = compile_sql_job_with_registered_connectors(sql, &sources, &[]).unwrap_err();
+
+        assert!(matches!(err, KrishivError::Unsupported { .. }));
+        assert!(err.to_string().contains("kafka"));
     }
 
     #[test]

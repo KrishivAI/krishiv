@@ -3,15 +3,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 
-use arrow::datatypes::SchemaRef;
+use arrow::compute::cast;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_common::async_util::block_on;
+use krishiv_connectors::ConnectorConfig;
+use krishiv_connectors::registry::default_registry;
 use krishiv_plan::governance::{AuthProvider, PolicyHook};
 use krishiv_plan::udf::{AggregateUdf, ScalarUdf, TableUdf, UdfRegistry};
 use krishiv_runtime::{
-    BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobStatus,
-    LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
+    BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobState,
+    JobStatus, LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
 };
 use krishiv_sql::{ContinuousTableInput, SqlEngine};
 
@@ -20,6 +23,380 @@ use crate::error::{KrishivError, Result};
 use crate::stream::Stream;
 use crate::types::{DeploymentTarget, ExecutionMode, StreamBatch, StreamMode};
 use crate::window::StateTtlConfig;
+
+/// Session-local lifecycle state for a background SQL job submitted through
+/// [`Session::submit_sql_background`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmittedSqlJobState {
+    /// Accepted and registered, but not yet running.
+    Pending,
+    /// Running in this process through the session's normal mode-aware runtime.
+    Running,
+    /// Completed successfully.
+    Succeeded,
+    /// Failed with an error message.
+    Failed,
+    /// Cancellation was requested and the driver task was aborted.
+    Cancelled,
+}
+
+impl SubmittedSqlJobState {
+    /// Stable lowercase state token for frontends.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Whether the job has reached a terminal state.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+
+impl fmt::Display for SubmittedSqlJobState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Snapshot of a SQL job submitted in the background through a [`Session`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmittedSqlJobStatus {
+    job_id: String,
+    name: String,
+    engine: crate::EngineKind,
+    state: SubmittedSqlJobState,
+    error: Option<String>,
+}
+
+impl SubmittedSqlJobStatus {
+    fn new(
+        job_id: impl Into<String>,
+        name: impl Into<String>,
+        engine: crate::EngineKind,
+        state: SubmittedSqlJobState,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            name: name.into(),
+            engine,
+            state,
+            error,
+        }
+    }
+
+    /// Job id used by the engine and local registry.
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    /// User-facing job name from the compiled SQL pipeline.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Engine selected by the SQL job compiler.
+    pub fn engine(&self) -> crate::EngineKind {
+        self.engine
+    }
+
+    /// Current lifecycle state.
+    pub fn state(&self) -> SubmittedSqlJobState {
+        self.state
+    }
+
+    /// Terminal failure reason, if any.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+/// Compiled continuous streaming job shape derived from windowed SQL.
+#[derive(Debug, Clone)]
+pub struct CompiledContinuousStreamJob {
+    source: String,
+    spec: LocalWindowExecutionSpec,
+}
+
+impl CompiledContinuousStreamJob {
+    fn new(source: impl Into<String>, spec: LocalWindowExecutionSpec) -> Self {
+        Self {
+            source: source.into(),
+            spec,
+        }
+    }
+
+    /// The source table referenced by the window TVF.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// The compiled continuous window execution spec.
+    pub fn spec(&self) -> &LocalWindowExecutionSpec {
+        &self.spec
+    }
+
+    /// Consume the compiled shape into its local execution spec.
+    pub fn into_spec(self) -> LocalWindowExecutionSpec {
+        self.spec
+    }
+}
+
+/// Session-tracked continuous stream registration metadata.
+#[derive(Debug, Clone)]
+pub struct RegisteredContinuousStreamJob {
+    name: String,
+    source: Option<String>,
+    spec: LocalWindowExecutionSpec,
+}
+
+impl RegisteredContinuousStreamJob {
+    fn new(
+        name: impl Into<String>,
+        source: Option<String>,
+        spec: LocalWindowExecutionSpec,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            source,
+            spec,
+        }
+    }
+
+    /// Stable job name/id.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Source table referenced by the original windowed SQL, when available.
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// Local execution spec registered for this job.
+    pub fn spec(&self) -> &LocalWindowExecutionSpec {
+        &self.spec
+    }
+}
+
+/// Mode-aware status view of a continuous stream job.
+#[derive(Debug, Clone)]
+pub struct ContinuousStreamStatus {
+    job_id: String,
+    source: Option<String>,
+    spec: LocalWindowExecutionSpec,
+    state: String,
+    uses_remote_execution: bool,
+    task_count: Option<usize>,
+    assigned_task_count: Option<usize>,
+    running_task_count: Option<usize>,
+    succeeded_task_count: Option<usize>,
+    failed_task_count: Option<usize>,
+    pending_input_batches: Option<usize>,
+    last_watermark_ms: Option<i64>,
+    persisted_watermark_ms: Option<i64>,
+    snapshot_available: bool,
+    cycle_in_flight: Option<bool>,
+}
+
+impl ContinuousStreamStatus {
+    fn local(
+        job_id: impl Into<String>,
+        source: Option<String>,
+        spec: LocalWindowExecutionSpec,
+        pending_input_batches: usize,
+        last_watermark_ms: Option<i64>,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            source,
+            spec,
+            state: String::from("registered"),
+            uses_remote_execution: false,
+            task_count: None,
+            assigned_task_count: None,
+            running_task_count: None,
+            succeeded_task_count: None,
+            failed_task_count: None,
+            pending_input_batches: Some(pending_input_batches),
+            last_watermark_ms,
+            persisted_watermark_ms: last_watermark_ms,
+            snapshot_available: true,
+            cycle_in_flight: None,
+        }
+    }
+
+    fn remote(
+        view: krishiv_runtime::RemoteContinuousStreamJobView,
+        source: Option<String>,
+        uses_remote_execution: bool,
+    ) -> Self {
+        let job_id = view.job_id.clone();
+        let state = view.state.clone();
+        let spec = krishiv_runtime::plan_spec_to_local(&view.spec);
+        Self {
+            job_id,
+            source,
+            spec,
+            state,
+            uses_remote_execution,
+            task_count: Some(view.task_count),
+            assigned_task_count: Some(view.assigned_task_count),
+            running_task_count: Some(view.running_task_count),
+            succeeded_task_count: Some(view.succeeded_task_count),
+            failed_task_count: Some(view.failed_task_count),
+            pending_input_batches: None,
+            last_watermark_ms: view.last_watermark_ms,
+            persisted_watermark_ms: view.persisted_watermark_ms,
+            snapshot_available: view.snapshot_available,
+            cycle_in_flight: Some(view.cycle_in_flight),
+        }
+    }
+
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    pub fn spec(&self) -> &LocalWindowExecutionSpec {
+        &self.spec
+    }
+
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
+    pub fn uses_remote_execution(&self) -> bool {
+        self.uses_remote_execution
+    }
+
+    pub fn task_count(&self) -> Option<usize> {
+        self.task_count
+    }
+
+    pub fn assigned_task_count(&self) -> Option<usize> {
+        self.assigned_task_count
+    }
+
+    pub fn running_task_count(&self) -> Option<usize> {
+        self.running_task_count
+    }
+
+    pub fn succeeded_task_count(&self) -> Option<usize> {
+        self.succeeded_task_count
+    }
+
+    pub fn failed_task_count(&self) -> Option<usize> {
+        self.failed_task_count
+    }
+
+    pub fn pending_input_batches(&self) -> Option<usize> {
+        self.pending_input_batches
+    }
+
+    pub fn last_watermark_ms(&self) -> Option<i64> {
+        self.last_watermark_ms
+    }
+
+    pub fn persisted_watermark_ms(&self) -> Option<i64> {
+        self.persisted_watermark_ms
+    }
+
+    pub fn snapshot_available(&self) -> bool {
+        self.snapshot_available
+    }
+
+    pub fn cycle_in_flight(&self) -> Option<bool> {
+        self.cycle_in_flight
+    }
+}
+
+/// Exported checkpoint bytes for a continuous stream job.
+#[derive(Debug, Clone)]
+pub struct ContinuousStreamCheckpoint {
+    job_id: String,
+    source: Option<String>,
+    spec: LocalWindowExecutionSpec,
+    snapshot_bytes: Option<Vec<u8>>,
+    watermark_ms: Option<i64>,
+    snapshot_available: bool,
+    uses_remote_execution: bool,
+}
+
+impl ContinuousStreamCheckpoint {
+    fn local(
+        job_id: impl Into<String>,
+        source: Option<String>,
+        spec: LocalWindowExecutionSpec,
+        snapshot_bytes: Vec<u8>,
+        watermark_ms: i64,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            source,
+            spec,
+            snapshot_bytes: Some(snapshot_bytes),
+            watermark_ms: Some(watermark_ms),
+            snapshot_available: true,
+            uses_remote_execution: false,
+        }
+    }
+
+    fn remote(
+        checkpoint: krishiv_runtime::RemoteContinuousStreamCheckpoint,
+        source: Option<String>,
+        uses_remote_execution: bool,
+    ) -> Self {
+        let job_id = checkpoint.job_id.clone();
+        let spec = krishiv_runtime::plan_spec_to_local(&checkpoint.spec);
+        Self {
+            job_id,
+            source,
+            spec,
+            snapshot_bytes: checkpoint.snapshot_bytes,
+            watermark_ms: checkpoint.watermark_ms,
+            snapshot_available: checkpoint.snapshot_available,
+            uses_remote_execution,
+        }
+    }
+
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    pub fn spec(&self) -> &LocalWindowExecutionSpec {
+        &self.spec
+    }
+
+    pub fn snapshot_bytes(&self) -> Option<&[u8]> {
+        self.snapshot_bytes.as_deref()
+    }
+
+    pub fn watermark_ms(&self) -> Option<i64> {
+        self.watermark_ms
+    }
+
+    pub fn snapshot_available(&self) -> bool {
+        self.snapshot_available
+    }
+
+    pub fn uses_remote_execution(&self) -> bool {
+        self.uses_remote_execution
+    }
+}
 
 /// Builder for Krishiv sessions.
 #[derive(Clone)]
@@ -184,6 +561,42 @@ fn is_loopback_coordinator_url(url: &str) -> bool {
     };
     let host_only = host_only.trim_matches(|c| c == '[' || c == ']');
     matches!(host_only, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
+}
+
+fn normalize_stream_input_batch(batch: RecordBatch) -> Result<RecordBatch> {
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        if column.data_type() == &DataType::Utf8View {
+            let casted = cast(column.as_ref(), &DataType::Utf8).map_err(|error| {
+                KrishivError::Runtime {
+                    message: format!(
+                        "failed to normalize continuous stream column '{}' from Utf8View to Utf8: {error}",
+                        field.name()
+                    ),
+                }
+            })?;
+            fields.push(Field::new(
+                field.name(),
+                DataType::Utf8,
+                field.is_nullable(),
+            ));
+            columns.push(casted);
+            changed = true;
+        } else {
+            fields.push(field.as_ref().clone());
+            columns.push(column.clone());
+        }
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| {
+        KrishivError::Runtime {
+            message: format!("failed to rebuild normalized continuous stream batch: {error}"),
+        }
+    })
 }
 
 impl SessionBuilder {
@@ -588,6 +1001,10 @@ impl SessionBuilder {
             local_cluster,
             runtime,
             registered_parquet: Arc::new(DashMap::new()),
+            registered_sources: Arc::new(DashMap::new()),
+            registered_sinks: Arc::new(DashMap::new()),
+            submitted_sql_jobs: Arc::new(DashMap::new()),
+            submitted_sql_job_aborts: Arc::new(DashMap::new()),
             stream_jobs: Arc::new(DashMap::new()),
             unbounded_streams: Arc::new(DashMap::new()),
             config: Arc::new(DashMap::from_iter(self.config)),
@@ -615,7 +1032,11 @@ pub struct Session {
     local_cluster: Arc<InProcessCluster>,
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
-    stream_jobs: Arc<DashMap<String, LocalWindowExecutionSpec>>,
+    registered_sources: Arc<DashMap<String, ConnectorConfig>>,
+    registered_sinks: Arc<DashMap<String, ConnectorConfig>>,
+    submitted_sql_jobs: Arc<DashMap<String, SubmittedSqlJobStatus>>,
+    submitted_sql_job_aborts: Arc<DashMap<String, tokio::task::AbortHandle>>,
+    stream_jobs: Arc<DashMap<String, RegisteredContinuousStreamJob>>,
     unbounded_streams: Arc<DashMap<String, Arc<ContinuousTableInput>>>,
     config: Arc<DashMap<String, String>>,
     auth: Option<Arc<dyn AuthProvider>>,
@@ -747,11 +1168,239 @@ impl Session {
         self.runtime
             .register_continuous_stream(&name, &spec)
             .map_err(KrishivError::from)?;
-        self.stream_jobs.insert(name.clone(), spec);
+        self.remember_stream_job(&name, None, spec);
         Ok(name)
     }
 
+    /// Compile a windowed streaming SQL query to the continuous stream runtime shape.
+    pub fn compile_continuous_stream_job(
+        &self,
+        query: &str,
+    ) -> Result<CompiledContinuousStreamJob> {
+        let plan = krishiv_sql::streaming_window_plan::compile_streaming_window_sql(query)
+            .map_err(KrishivError::from)?;
+        Ok(CompiledContinuousStreamJob::new(
+            plan.source,
+            krishiv_runtime::plan_spec_to_local(&plan.spec),
+        ))
+    }
+
+    /// Register a continuous stream job from windowed streaming SQL.
+    ///
+    /// The query must compile through the canonical `TUMBLE` / `HOP` / `SESSION`
+    /// windowed SQL path. The returned metadata is also stored in the session's
+    /// continuous stream registry so frontends can list and inspect the job later.
+    pub async fn register_stream_job_sql(
+        &self,
+        name: impl Into<String>,
+        query: &str,
+    ) -> Result<RegisteredContinuousStreamJob> {
+        let compiled = self.compile_continuous_stream_job(query)?;
+        let name = name.into();
+        self.stream_async(name.clone(), compiled.spec().clone())
+            .await?;
+        let registered = RegisteredContinuousStreamJob::new(
+            name.clone(),
+            Some(compiled.source().to_string()),
+            compiled.into_spec(),
+        );
+        self.stream_jobs.insert(name, registered.clone());
+        Ok(registered)
+    }
+
+    /// Snapshot registered continuous stream jobs in deterministic name order.
+    pub fn registered_stream_jobs(&self) -> Vec<RegisteredContinuousStreamJob> {
+        let mut jobs = self
+            .stream_jobs
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        jobs.sort_by(|left, right| left.name.cmp(&right.name));
+        jobs
+    }
+
+    /// Return registered continuous stream metadata by name.
+    pub fn registered_stream_job(&self, name: &str) -> Option<RegisteredContinuousStreamJob> {
+        self.stream_jobs
+            .get(name)
+            .map(|entry| entry.value().clone())
+    }
+
+    fn continuous_stream_source(&self, job_id: &str) -> Option<String> {
+        self.registered_stream_job(job_id)
+            .and_then(|job| job.source().map(ToOwned::to_owned))
+    }
+
+    fn has_remote_continuous_control_plane(&self) -> bool {
+        self.ivm_http_url().is_some() && self.execution_runtime().uses_remote_execution()
+    }
+
+    fn local_continuous_stream_status(&self, job_id: &str) -> Result<ContinuousStreamStatus> {
+        let spec = self
+            .local_cluster
+            .continuous_job_spec(job_id)
+            .map_err(KrishivError::from)?;
+        let pending_input_batches = self
+            .local_cluster
+            .continuous_job_pending_batch_depth(job_id)
+            .map_err(KrishivError::from)?;
+        let snapshot = self
+            .local_cluster
+            .snapshot_continuous_job(job_id)
+            .map_err(KrishivError::from)?;
+        Ok(ContinuousStreamStatus::local(
+            job_id,
+            self.continuous_stream_source(job_id),
+            spec,
+            pending_input_batches,
+            Some(snapshot.watermark_ms),
+        ))
+    }
+
+    /// List continuous streams through the active runtime control plane.
+    pub async fn list_continuous_stream_statuses(&self) -> Result<Vec<ContinuousStreamStatus>> {
+        if self.has_remote_continuous_control_plane() {
+            let url = self.ivm_http_url().ok_or_else(|| {
+                KrishivError::unsupported("continuous stream listing requires a coordinator URL")
+            })?;
+            let mut streams = krishiv_runtime::execute_coordinator_list_continuous_streams(url)
+                .await
+                .map_err(KrishivError::from)?
+                .into_iter()
+                .map(|view| {
+                    let source = self.continuous_stream_source(&view.job_id);
+                    ContinuousStreamStatus::remote(
+                        view,
+                        source,
+                        self.execution_runtime().uses_remote_execution(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            streams.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+            return Ok(streams);
+        }
+
+        let mut jobs = self.local_cluster.list_continuous_jobs();
+        jobs.sort();
+        jobs.into_iter()
+            .map(|job_id| self.local_continuous_stream_status(&job_id))
+            .collect()
+    }
+
+    /// Inspect one continuous stream job if it exists.
+    pub async fn continuous_stream_status(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ContinuousStreamStatus>> {
+        if self.has_remote_continuous_control_plane() {
+            let url = self.ivm_http_url().ok_or_else(|| {
+                KrishivError::unsupported("continuous stream status requires a coordinator URL")
+            })?;
+            let view = krishiv_runtime::execute_coordinator_get_continuous_stream(url, job_id)
+                .await
+                .map_err(KrishivError::from)?;
+            return Ok(view.map(|view| {
+                let source = self.continuous_stream_source(&view.job_id);
+                ContinuousStreamStatus::remote(
+                    view,
+                    source,
+                    self.execution_runtime().uses_remote_execution(),
+                )
+            }));
+        }
+
+        if !self
+            .local_cluster
+            .list_continuous_jobs()
+            .iter()
+            .any(|id| id == job_id)
+        {
+            return Ok(None);
+        }
+        self.local_continuous_stream_status(job_id).map(Some)
+    }
+
+    /// Export checkpoint bytes for a continuous stream job.
+    pub async fn checkpoint_continuous_stream(
+        &self,
+        job_id: &str,
+    ) -> Result<ContinuousStreamCheckpoint> {
+        if self.has_remote_continuous_control_plane() {
+            let url = self.ivm_http_url().ok_or_else(|| {
+                KrishivError::unsupported(
+                    "continuous stream checkpoint export requires a coordinator URL",
+                )
+            })?;
+            let checkpoint =
+                krishiv_runtime::execute_coordinator_checkpoint_continuous_stream(url, job_id)
+                    .await
+                    .map_err(KrishivError::from)?;
+            return Ok(ContinuousStreamCheckpoint::remote(
+                checkpoint,
+                self.continuous_stream_source(job_id),
+                self.execution_runtime().uses_remote_execution(),
+            ));
+        }
+
+        let spec = self
+            .local_cluster
+            .continuous_job_spec(job_id)
+            .map_err(KrishivError::from)?;
+        let snapshot = self
+            .local_cluster
+            .snapshot_continuous_job(job_id)
+            .map_err(KrishivError::from)?;
+        Ok(ContinuousStreamCheckpoint::local(
+            job_id,
+            self.continuous_stream_source(job_id),
+            spec,
+            snapshot.snapshot_bytes,
+            snapshot.watermark_ms,
+        ))
+    }
+
+    /// Restore a continuous stream job from checkpoint bytes.
+    ///
+    /// The job must already be registered. In remote modes, the restore is
+    /// staged on the coordinator and applied on the next fenced input cycle.
+    pub async fn restore_continuous_stream(
+        &self,
+        job_id: &str,
+        snapshot_bytes: &[u8],
+    ) -> Result<ContinuousStreamStatus> {
+        if snapshot_bytes.is_empty() {
+            return Err(KrishivError::InvalidConfig {
+                message: format!("continuous stream {job_id} restore snapshot must not be empty"),
+            });
+        }
+
+        if self.has_remote_continuous_control_plane() {
+            let url = self.ivm_http_url().ok_or_else(|| {
+                KrishivError::unsupported("continuous stream restore requires a coordinator URL")
+            })?;
+            krishiv_runtime::execute_coordinator_restore_continuous_stream(
+                url,
+                job_id,
+                snapshot_bytes,
+            )
+            .await
+            .map_err(KrishivError::from)?;
+            return self.continuous_stream_status(job_id).await?.ok_or_else(|| {
+                KrishivError::unsupported(format!("continuous stream '{job_id}' is not registered"))
+            });
+        }
+
+        self.local_cluster
+            .restore_continuous_job(job_id, snapshot_bytes)
+            .map_err(KrishivError::from)?;
+        self.local_continuous_stream_status(job_id)
+    }
+
     pub fn push_stream_job_input(&self, job_id: &str, batches: Vec<RecordBatch>) -> Result<()> {
+        let batches = batches
+            .into_iter()
+            .map(normalize_stream_input_batch)
+            .collect::<Result<Vec<_>>>()?;
         if self.stream_jobs.contains_key(job_id) {
             return self
                 .runtime
@@ -774,6 +1423,18 @@ impl Session {
         self.runtime
             .drain_continuous_stream(job_id)
             .map_err(KrishivError::from)
+    }
+
+    fn remember_stream_job(
+        &self,
+        name: &str,
+        source: Option<String>,
+        spec: LocalWindowExecutionSpec,
+    ) {
+        self.stream_jobs.insert(
+            name.to_string(),
+            RegisteredContinuousStreamJob::new(name, source, spec),
+        );
     }
 
     /// Register in-memory stream batches for `memory:<name>` pipeline sources.
@@ -802,9 +1463,159 @@ impl Session {
         }
     }
 
-    /// A-4: list every job tracked by the **remote** coordinator
-    /// (`GET /api/v1/jobs`). Distributed-only — embedded/single-node
-    /// sessions return `Unsupported`.
+    /// Submit a SQL pipeline script on a background task and track its local
+    /// lifecycle in this session.
+    ///
+    /// Execution still goes through [`Session::submit`], so embedded,
+    /// single-node, and distributed placement rules stay centralized. The
+    /// returned status is an immediate snapshot; use
+    /// [`submitted_sql_job_status`](Self::submitted_sql_job_status) or
+    /// [`submitted_sql_jobs`](Self::submitted_sql_jobs) to poll.
+    pub fn submit_sql_background(&self, sql: &str) -> Result<SubmittedSqlJobStatus> {
+        tokio::runtime::Handle::try_current().map_err(|_| KrishivError::Runtime {
+            message: "submit_sql_background requires an active Tokio runtime".into(),
+        })?;
+
+        let job = self.compile_sql_job(sql)?;
+        let job_id = krishiv_runtime::JobId::try_new(job.name.clone()).map_err(|error| {
+            KrishivError::InvalidConfig {
+                message: format!("invalid SQL job name '{}': {error}", job.name),
+            }
+        })?;
+        let key = job_id.as_str().to_owned();
+        if let Some(existing) = self.submitted_sql_jobs.get(&key)
+            && !existing.state().is_terminal()
+        {
+            return Err(KrishivError::InvalidConfig {
+                message: format!("SQL job '{key}' is already running in this session"),
+            });
+        }
+
+        let initial = SubmittedSqlJobStatus::new(
+            key.clone(),
+            job.name.clone(),
+            job.engine,
+            SubmittedSqlJobState::Running,
+            None,
+        );
+        self.submitted_sql_jobs.insert(key.clone(), initial.clone());
+        self.set_local_job_state(&job_id, &job.name, JobState::Running);
+
+        let runner = self.clone();
+        let supervisor = self.clone();
+        let job_name = job.name.clone();
+        let engine = job.engine;
+        let worker = tokio::spawn(async move { runner.submit(job).await });
+        self.submitted_sql_job_aborts
+            .insert(key.clone(), worker.abort_handle());
+
+        tokio::spawn(async move {
+            let (state, error) = match worker.await {
+                Ok(Ok(handle)) => match handle.status() {
+                    krishiv_engine_core::JobStatus::Completed => {
+                        (SubmittedSqlJobState::Succeeded, None)
+                    }
+                    krishiv_engine_core::JobStatus::Failed => (
+                        SubmittedSqlJobState::Failed,
+                        Some("engine returned failed job status".to_string()),
+                    ),
+                    krishiv_engine_core::JobStatus::Running => (
+                        SubmittedSqlJobState::Failed,
+                        Some("engine returned non-terminal running status after task exit".into()),
+                    ),
+                },
+                Ok(Err(error)) => (SubmittedSqlJobState::Failed, Some(error.to_string())),
+                Err(join_error) if join_error.is_cancelled() => (
+                    SubmittedSqlJobState::Cancelled,
+                    Some("job cancelled by caller".to_string()),
+                ),
+                Err(join_error) => (
+                    SubmittedSqlJobState::Failed,
+                    Some(format!(
+                        "background SQL job task failed to join: {join_error}"
+                    )),
+                ),
+            };
+            let final_status =
+                SubmittedSqlJobStatus::new(key.clone(), job_name.clone(), engine, state, error);
+            supervisor.submitted_sql_job_aborts.remove(&key);
+            supervisor
+                .submitted_sql_jobs
+                .insert(key.clone(), final_status);
+            if let Ok(job_id) = krishiv_runtime::JobId::try_new(key) {
+                supervisor.set_local_job_state(
+                    &job_id,
+                    &job_name,
+                    submitted_sql_state_to_job_state(state),
+                );
+            }
+        });
+
+        Ok(initial)
+    }
+
+    /// Compile a SQL pipeline script using this session's registered connector
+    /// configs to resolve bare connector names.
+    pub fn compile_sql_job(&self, sql: &str) -> Result<crate::CompiledJob> {
+        crate::sql_job::compile_sql_job_with_registered_connectors(
+            sql,
+            &self.registered_source_configs(),
+            &self.registered_sink_configs(),
+        )
+    }
+
+    /// Snapshot all SQL jobs submitted through [`submit_sql_background`].
+    pub fn submitted_sql_jobs(&self) -> Vec<SubmittedSqlJobStatus> {
+        let mut jobs = self
+            .submitted_sql_jobs
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        jobs.sort_by(|left, right| left.job_id().cmp(right.job_id()));
+        jobs
+    }
+
+    /// Return one background SQL job status by id.
+    pub fn submitted_sql_job_status(&self, job_id: &str) -> Option<SubmittedSqlJobStatus> {
+        self.submitted_sql_jobs
+            .get(job_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Cancel a background SQL job submitted through this session.
+    pub fn cancel_submitted_sql_job(&self, job_id: &str) -> Result<SubmittedSqlJobStatus> {
+        let current = self.submitted_sql_job_status(job_id).ok_or_else(|| {
+            KrishivError::unsupported(format!("SQL job '{job_id}' is not tracked in this session"))
+        })?;
+        if current.state().is_terminal() {
+            return Ok(current);
+        }
+
+        if let Some((_, abort)) = self.submitted_sql_job_aborts.remove(job_id) {
+            abort.abort();
+        }
+        let cancelled = SubmittedSqlJobStatus::new(
+            current.job_id().to_string(),
+            current.name().to_string(),
+            current.engine(),
+            SubmittedSqlJobState::Cancelled,
+            Some("job cancelled by caller".into()),
+        );
+        self.submitted_sql_jobs
+            .insert(job_id.to_string(), cancelled.clone());
+        if let Ok(id) = krishiv_runtime::JobId::try_new(job_id) {
+            self.set_local_job_state(&id, current.name(), JobState::Cancelled);
+        }
+        Ok(cancelled)
+    }
+
+    fn set_local_job_state(&self, job_id: &krishiv_runtime::JobId, name: &str, state: JobState) {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
+        jobs.upsert(JobStatus::new(job_id.clone(), name, state));
+    }
+
+    /// A-4: list every job tracked by the configured coordinator
+    /// (`GET /api/v1/jobs`).
     ///
     /// For local jobs, use [`Session::jobs`]. For a single job by name
     /// (distributed), use [`Session::get_job_remote`].
@@ -821,7 +1632,53 @@ impl Session {
         Ok(jobs)
     }
 
-    /// A-4: look up a single job by name on the **remote** coordinator
+    /// List every executor tracked by the configured coordinator
+    /// (`GET /api/v1/executors`).
+    pub async fn list_executors_remote(&self) -> Result<Vec<krishiv_scheduler::LiveExecutorView>> {
+        let url = self.ivm_http_url().ok_or_else(|| {
+            KrishivError::unsupported(
+                "list_executors_remote requires a coordinator URL; \
+                 call with_coordinator() or set KRISHIV_COORDINATOR_URL",
+            )
+        })?;
+        let executors = krishiv_runtime::execute_coordinator_list_executors(url)
+            .await
+            .map_err(KrishivError::from)?;
+        Ok(executors)
+    }
+
+    /// Cancel a job on the configured coordinator
+    /// (`POST /api/v1/jobs/{job_id}/cancel`).
+    pub async fn cancel_job_remote(&self, job_id: &str) -> Result<()> {
+        let url = self.ivm_http_url().ok_or_else(|| {
+            KrishivError::unsupported(
+                "cancel_job_remote requires a coordinator URL; \
+                 call with_coordinator() or set KRISHIV_COORDINATOR_URL",
+            )
+        })?;
+        krishiv_runtime::execute_coordinator_cancel_job(url, job_id)
+            .await
+            .map_err(KrishivError::from)
+    }
+
+    /// Poll materialized results for a batch SQL job on the configured
+    /// coordinator (`GET /api/v1/batch-sql/{job_id}`).
+    pub async fn get_job_result_remote(
+        &self,
+        job_id: &str,
+    ) -> Result<krishiv_runtime::CoordinatorBatchSqlJobResult> {
+        let url = self.ivm_http_url().ok_or_else(|| {
+            KrishivError::unsupported(
+                "get_job_result_remote requires a coordinator URL; \
+                 call with_coordinator() or set KRISHIV_COORDINATOR_URL",
+            )
+        })?;
+        krishiv_runtime::execute_coordinator_batch_sql_result(url, job_id)
+            .await
+            .map_err(KrishivError::from)
+    }
+
+    /// A-4: look up a single job by name on the configured coordinator
     /// (`GET /api/v1/jobs/{job_id}`). Returns `Ok(None)` if the coordinator
     /// doesn't know about the job.
     pub async fn get_job_remote(
@@ -843,6 +1700,15 @@ impl Session {
     /// Optional control-plane gRPC endpoint associated with this session.
     pub fn coordinator_grpc_url(&self) -> Option<&str> {
         self.coordinator_grpc_url.as_deref()
+    }
+
+    /// Effective coordinator HTTP base used for management endpoints.
+    ///
+    /// This prefers the explicit HTTP URL configured with
+    /// [`SessionBuilder::with_coordinator_http`] and falls back to the
+    /// coordinator/Flight URL for single-port local deployments.
+    pub fn coordinator_http_url(&self) -> Option<&str> {
+        self.ivm_http_url()
     }
 
     /// Shared UDF registry for this session.
@@ -1176,6 +2042,69 @@ impl Session {
             .map_err(KrishivError::from)?;
         self.registered_parquet.insert(table_name, path);
         Ok(())
+    }
+
+    /// Validate and register a connector source configuration in this session.
+    ///
+    /// The registration is session metadata used by SQL job compilation and
+    /// frontends. Direct ad-hoc SQL access still requires registering a table
+    /// provider (for example [`register_parquet_async`](Self::register_parquet_async)).
+    pub fn register_source_config(&self, config: ConnectorConfig) -> Result<()> {
+        default_registry()
+            .validate_source(&config)
+            .map_err(KrishivError::from)?;
+        self.registered_sources.insert(config.name.clone(), config);
+        Ok(())
+    }
+
+    /// Return a registered source config by name.
+    pub fn source_config(&self, name: &str) -> Option<ConnectorConfig> {
+        self.registered_sources
+            .get(name)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Snapshot registered source configs in deterministic name order.
+    pub fn registered_source_configs(&self) -> Vec<ConnectorConfig> {
+        let mut sources = self
+            .registered_sources
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        sources.sort_by(|left, right| left.name.cmp(&right.name));
+        sources
+    }
+
+    /// Validate and register a connector sink configuration in this session.
+    ///
+    /// The registration is session metadata: execution still happens through
+    /// explicit job/pipeline APIs (`submit_sql`, `submit`, streaming builders).
+    /// Keeping the config here lets frontends validate and reuse named sinks
+    /// without bypassing connector capability checks.
+    pub fn register_sink_config(&self, config: ConnectorConfig) -> Result<()> {
+        default_registry()
+            .validate_sink(&config)
+            .map_err(KrishivError::from)?;
+        self.registered_sinks.insert(config.name.clone(), config);
+        Ok(())
+    }
+
+    /// Return a registered sink config by name.
+    pub fn sink_config(&self, name: &str) -> Option<ConnectorConfig> {
+        self.registered_sinks
+            .get(name)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Snapshot registered sink configs in deterministic name order.
+    pub fn registered_sink_configs(&self) -> Vec<ConnectorConfig> {
+        let mut sinks = self
+            .registered_sinks
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        sinks.sort_by(|left, right| left.name.cmp(&right.name));
+        sinks
     }
 
     fn dataframe_from_sql(
@@ -1625,7 +2554,7 @@ impl Session {
     /// CREATE SINK out FROM summary INTO parquet(path='/out.parquet');
     /// ```
     pub async fn submit_sql(&self, sql: &str) -> Result<crate::JobHandle> {
-        let job = crate::sql_job::compile_sql_job(sql)?;
+        let job = self.compile_sql_job(sql)?;
         self.submit(job).await
     }
 
@@ -1778,6 +2707,7 @@ impl Session {
                 let remote = krishiv_runtime::RemoteStreamingJob::create(url, &plan_spec, &name)
                     .await
                     .map_err(KrishivError::from)?;
+                self.remember_stream_job(&name, None, spec);
                 Ok(crate::StreamJob::Remote(remote))
             }
             ExecutionMode::Embedded | ExecutionMode::SingleNode => {
@@ -2347,6 +3277,16 @@ pub(crate) async fn runtime_collect_batch_sql(
         .map_err(KrishivError::from)
 }
 
+fn submitted_sql_state_to_job_state(state: SubmittedSqlJobState) -> JobState {
+    match state {
+        SubmittedSqlJobState::Pending => JobState::Pending,
+        SubmittedSqlJobState::Running => JobState::Running,
+        SubmittedSqlJobState::Succeeded => JobState::Succeeded,
+        SubmittedSqlJobState::Failed => JobState::Failed,
+        SubmittedSqlJobState::Cancelled => JobState::Cancelled,
+    }
+}
+
 use krishiv_common::sql_util::quote_identifier;
 
 /// Collect the transitive closure of incremental views that `view` depends on,
@@ -2392,6 +3332,7 @@ mod coordinator_url_tests {
             .build()
             .expect("session builds");
         assert_eq!(s.ivm_http_url(), Some("http://coord:2002"));
+        assert_eq!(s.coordinator_http_url(), Some("http://coord:2002"));
 
         // Without an explicit HTTP URL, fall back to the Flight URL (single-port
         // / local setups where they coincide).
@@ -2400,6 +3341,7 @@ mod coordinator_url_tests {
             .build()
             .expect("session builds");
         assert_eq!(s.ivm_http_url(), Some("http://coord:2003"));
+        assert_eq!(s.coordinator_http_url(), Some("http://coord:2003"));
     }
 }
 

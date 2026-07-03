@@ -76,6 +76,36 @@ impl InProcessCluster {
         self.inner.drain_continuous_job(job_id)
     }
 
+    /// List registered continuous job ids.
+    pub fn list_continuous_jobs(&self) -> Vec<String> {
+        self.inner.list_continuous_jobs()
+    }
+
+    /// Return the registered continuous job spec.
+    pub fn continuous_job_spec(&self, job_id: &str) -> RuntimeResult<LocalWindowExecutionSpec> {
+        self.inner
+            .continuous_job_spec(job_id)
+            .map(|spec| plan_spec_to_local(&spec))
+    }
+
+    /// Return the number of queued input batches for a continuous job.
+    pub fn continuous_job_pending_batch_depth(&self, job_id: &str) -> RuntimeResult<usize> {
+        self.inner.continuous_job_pending_batch_depth(job_id)
+    }
+
+    /// Snapshot live continuous stream state directly from the local registry.
+    pub fn snapshot_continuous_job(
+        &self,
+        job_id: &str,
+    ) -> RuntimeResult<krishiv_scheduler::ContinuousSnapshot> {
+        self.inner.snapshot_continuous_job(job_id)
+    }
+
+    /// Restore a registered continuous job from snapshot bytes.
+    pub fn restore_continuous_job(&self, job_id: &str, snapshot_bytes: &[u8]) -> RuntimeResult<()> {
+        self.inner.restore_continuous_job(job_id, snapshot_bytes)
+    }
+
     /// Execute a bounded windowed stream through coordinator → executor.
     pub fn collect_bounded_window(
         &self,

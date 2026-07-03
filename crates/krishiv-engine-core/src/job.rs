@@ -5,6 +5,8 @@
 //! and by placement to an [`EngineRuntime`](crate::EngineRuntime). One artifact,
 //! one dispatch point — no per-API forks.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::kind::EngineKind;
@@ -18,6 +20,9 @@ pub struct SourceSpec {
     pub connector: String,
     /// Connector locator (URI, path, topic, …). Empty for in-memory sources.
     pub uri: String,
+    /// Connector-specific options preserved from the front-end registration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, String>,
     /// Whether the source is bounded (ends) or unbounded (runs forever).
     pub is_bounded: bool,
     /// Whether the source carries change events (CDC/changelog) rather than
@@ -36,6 +41,7 @@ impl SourceSpec {
             name: name.into(),
             connector: connector.into(),
             uri: uri.into(),
+            options: BTreeMap::new(),
             is_bounded: true,
             is_cdc: false,
         }
@@ -51,6 +57,7 @@ impl SourceSpec {
             name: name.into(),
             connector: connector.into(),
             uri: uri.into(),
+            options: BTreeMap::new(),
             is_bounded: false,
             is_cdc: false,
         }
@@ -66,9 +73,25 @@ impl SourceSpec {
             name: name.into(),
             connector: connector.into(),
             uri: uri.into(),
+            options: BTreeMap::new(),
             is_bounded: false,
             is_cdc: true,
         }
+    }
+
+    /// Attach connector-specific options to the source spec.
+    #[must_use]
+    pub fn with_options<I, K, V>(mut self, options: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.options = options
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        self
     }
 }
 
@@ -81,6 +104,9 @@ pub struct SinkSpec {
     pub connector: String,
     /// Connector locator.
     pub uri: String,
+    /// Connector-specific options preserved from the front-end registration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, String>,
     /// Primary-key columns for **upsert** delivery. When set, a stateful engine's
     /// changelog is applied by key — an insert/update writes (replaces) the keyed
     /// row, a delete removes it — so per-row upserts land without carrying the
@@ -100,8 +126,24 @@ impl SinkSpec {
             view: view.into(),
             connector: connector.into(),
             uri: uri.into(),
+            options: BTreeMap::new(),
             primary_key: None,
         }
+    }
+
+    /// Attach connector-specific options to the sink spec.
+    #[must_use]
+    pub fn with_options<I, K, V>(mut self, options: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.options = options
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        self
     }
 
     /// Declare the sink an **upsert** target keyed on `columns` (by name).

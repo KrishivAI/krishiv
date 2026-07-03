@@ -478,6 +478,21 @@ pub async fn overwrite_table_pub(
         .await
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
+    // CONN-4: Update the version-hint after commit so DML changes survive
+    // restart. Without this, the hint still points at the old (dropped)
+    // table's metadata and all DML changes are silently rolled back on restart.
+    if let Some(loc) = committed.metadata().metadata_location() {
+        let table_root = std::path::Path::new(table_location.trim_start_matches("file://"));
+        if let Err(e) = super::iceberg_native::write_version_hint(table_root, loc) {
+            tracing::warn!(
+                table = %ident,
+                location = loc,
+                error = %e,
+                "version hint update failed after DML commit; hint may be stale"
+            );
+        }
+    }
+
     let snapshot_id = committed
         .metadata()
         .current_snapshot()

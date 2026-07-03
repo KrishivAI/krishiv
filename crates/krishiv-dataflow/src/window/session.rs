@@ -320,7 +320,13 @@ impl SessionWindowOperator {
         // the per-row update avoids a `schema().index_of()` + `downcast_ref()`.
         let pre_cols = crate::aggregate::downcast_agg_input_cols(batch, &self.spec.agg_exprs)?;
 
-        for row in 0..batch.num_rows() {
+        // STREAM-2: Sort rows by event time before processing so out-of-order
+        // events within a batch don't trigger premature session closes.
+        // Real sources (Kafka, Kinesis) don't guarantee intra-batch ordering.
+        let mut row_order: Vec<usize> = (0..batch.num_rows()).collect();
+        row_order.sort_unstable_by_key(|&r| time_arr.value(r));
+
+        for &row in &row_order {
             let event_time_ms = time_arr.value(row);
             if event_time_ms < late_threshold {
                 self.late_events_dropped = self.late_events_dropped.saturating_add(1);
@@ -420,25 +426,33 @@ impl SessionWindowOperator {
         let mut starts = Vec::with_capacity(closed.len());
         let mut ends = Vec::with_capacity(closed.len());
         let mut states = Vec::with_capacity(closed.len());
-        for key in closed {
-            if let Some(s) = self.sessions.remove(&key) {
-                if let Some(budget) = &self.memory_budget {
-                    budget.release(128);
-                }
+        // STREAM-8: Build the output batch BEFORE removing sessions from state.
+        // If batch construction fails, sessions must remain so they aren't lost.
+        for key in &closed {
+            if let Some(s) = self.sessions.get(key) {
                 ends.push(s.last_event_time_ms.saturating_add(gap));
                 starts.push(s.session_start_ms);
-                keys.push(key);
-                states.push(s.agg);
+                keys.push(key.clone());
+                states.push(s.agg.clone());
             }
         }
         let state_refs: Vec<&AggState> = states.iter().collect();
         let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        Ok(vec![self.build_multi_row_output_batch(
+        let batch = self.build_multi_row_output_batch(
             &key_refs,
             &starts,
             &ends,
             &state_refs,
-        )?])
+        )?;
+        // Only now that the batch is built, remove the closed sessions.
+        for key in &closed {
+            if self.sessions.remove(key).is_some() {
+                if let Some(budget) = &self.memory_budget {
+                    budget.release(128);
+                }
+            }
+        }
+        Ok(vec![batch])
     }
 
     fn build_multi_row_output_batch(

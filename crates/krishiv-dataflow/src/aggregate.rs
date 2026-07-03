@@ -141,7 +141,7 @@ pub(crate) struct AggEntry {
 }
 
 /// Running aggregation state for one group — one `AggEntry` per expression.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AggState {
     pub(crate) entries: Vec<AggEntry>,
 }

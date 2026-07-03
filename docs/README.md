@@ -45,6 +45,7 @@ Core implementation choices:
 | `krishiv-flight-sql` | Arrow Flight SQL service. |
 | `krishiv-sql-gateway` | Separately versioned JDBC/ODBC SQL gateway facade. |
 | `krishiv-python` | PyO3 Python bindings. |
+| `krishiv-mcp` | Model Context Protocol frontend over the public `Session` API. |
 | `krishiv-metrics` | Metrics, tracing, and debug report structures. |
 | `krishiv-chaos` | Cross-crate chaos and fault-injection integration tests. |
 | `krishiv-bench` | Benchmarks (on-demand; excluded from default workspace builds). Schema registry helpers live in `krishiv-connectors`'s `schema-registry` feature. |
@@ -52,7 +53,7 @@ Core implementation choices:
 ## Runtime Modes
 
 ```text
-SQL / API / Flight
+SQL / API / Flight / MCP
   -> Session + catalog
   -> DataFusion + Krishiv plan
   -> ExecutionRuntime
@@ -77,6 +78,58 @@ storage is async-capable; scheduler gRPC checkpoint acks use the async path.
 is the user-visible mode; `ExecutionPlacement` says where data-plane work may
 actually run. Distributed sessions require an explicit remote Flight endpoint
 and must not silently fall back to in-process execution.
+
+## MCP Frontend
+
+`krishiv-mcp` exposes Krishiv through Model Context Protocol without adding a
+second engine path. The server is built over `SessionBuilder::from_env`, so the
+same embedded, single-node, and distributed routing rules apply to MCP clients.
+
+Current MCP tool families:
+
+- runtime/ops: health, runtime info, deployment capabilities, executor
+  listing, metrics summary
+- SQL/catalog: execute, explain, list catalogs/tables, describe, sample
+- jobs: submit SQL jobs, list jobs, inspect status, fetch coordinator batch SQL
+  results or local submitted-job metadata, cancel coordinator jobs or local
+  background submissions
+- streaming: submit bounded streaming pipelines, register/list/feed/drain
+  continuous stream jobs, inspect streaming job status, and export continuous
+  stream checkpoints, and restore continuous stream snapshots through the
+  active runtime or coordinator control plane
+- IVM: create, feed, step, snapshot, full-checkpoint, delta-checkpoint, and
+  restore incremental jobs/views
+- connectors: list connectors with SQL-job execution metadata, validate configs,
+  and register supported sources/sinks; registered `parquet`,
+  `parquet-directory`, `csv`, `json`/`ndjson`, `s3`, and `s3-prefix` sources
+  plus `parquet`, `csv`, `json`/`ndjson`, and `s3` sinks can be referenced by
+  name in SQL job scripts submitted through MCP
+
+`runtime_info` and `deployment_capabilities` expose whether the current session
+has a coordinator HTTP control plane. MCP job/executor tools use that
+capability, not just the mode enum, so single-node daemon sessions and
+distributed sessions share the same coordinator-backed management path when it
+is configured. IVM checkpoint tools use the same mode-aware `Session::ivm`
+handle: embedded/single-node sessions use the local registry and distributed
+sessions use coordinator IVM checkpoint APIs.
+
+For bounded SQL jobs, supported non-parquet sources still read through the
+submitting process's connector configuration, then spill to temporary parquet
+registrations that are shipped to the configured single-node or distributed
+runtime for compute. Connector-native distributed source ownership remains the
+follow-up for streaming/unbounded providers such as Kafka, JDBC, and lakehouse
+table scans.
+
+Continuous streaming MCP tools use the same `Session::stream` /
+`push_stream_job_input` / `poll_stream_job` seam as the Rust API. Windowed SQL
+is compiled to `LocalWindowExecutionSpec` once, then registered against the
+embedded registry or the coordinator continuous-stream HTTP API depending on
+the configured mode.
+
+MCP transports:
+
+- line-delimited JSON-RPC over stdio: `krishiv mcp --stdio`
+- HTTP JSON-RPC: `krishiv mcp --http --addr 127.0.0.1:8765`
 
 ## Deployment Modes
 
@@ -232,6 +285,8 @@ cargo fmt --check
 cargo run -p krishiv -- sql --query "select 1 as value"
 cargo run -p krishiv -- explain --query "select 1 as value"
 cargo run -p krishiv -- jobs
+cargo run -p krishiv -- mcp --stdio
+cargo run -p krishiv -- mcp --http --addr 127.0.0.1:8765
 ```
 
 Use narrower package tests while iterating, for example:

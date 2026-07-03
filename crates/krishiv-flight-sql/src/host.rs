@@ -427,8 +427,8 @@ impl FlightExecutionHost {
         };
         let warehouse = std::env::var("KRISHIV_ICEBERG_REST_WAREHOUSE").unwrap_or_default();
         let token = std::env::var("KRISHIV_ICEBERG_REST_TOKEN").ok();
-        let name = std::env::var("KRISHIV_ICEBERG_REST_NAME")
-            .unwrap_or_else(|_| String::from("krishiv"));
+        let name =
+            std::env::var("KRISHIV_ICEBERG_REST_NAME").unwrap_or_else(|_| String::from("krishiv"));
         match self.backend.as_ref() {
             FlightHostBackend::InProcess(cluster) => {
                 let catalog = krishiv_sql::catalog::unified::KrishivCatalog::rest(
@@ -437,9 +437,7 @@ impl FlightExecutionHost {
                     token.as_deref(),
                 )
                 .await
-                .map_err(|e| {
-                    Status::internal(format!("iceberg REST catalog at {uri}: {e}"))
-                })?;
+                .map_err(|e| Status::internal(format!("iceberg REST catalog at {uri}: {e}")))?;
                 cluster
                     .streaming_runtime()
                     .runner_sql_engine()

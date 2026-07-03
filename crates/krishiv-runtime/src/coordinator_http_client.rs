@@ -1,8 +1,8 @@
 //! HTTP client for the cluster control plane APIs.
 
-use krishiv_scheduler::LiveJobView;
 use krishiv_scheduler::configured_coordinator_bearer_token;
 use krishiv_scheduler::decode_inline_record_batches;
+use krishiv_scheduler::{LiveExecutorView, LiveJobView};
 
 use crate::flight_protocol::parquet_file_to_ipc_b64;
 use crate::in_process::BatchSqlTable;
@@ -19,8 +19,7 @@ const BOUNDED_WINDOW_POLL_TIMEOUT_SECS: u64 = 300;
 const COORDINATOR_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Process-global `reqwest::Client` shared across all coordinator HTTP calls.
-/// Wrapped in a `Mutex<Option<...>>` so tests can inject a mock client and
-/// reset between test runs for isolation.
+/// Wrapped in a `Mutex<Option<...>>` so the client is lazily initialized once.
 static COORDINATOR_HTTP_CLIENT: std::sync::Mutex<Option<reqwest::Client>> =
     std::sync::Mutex::new(None);
 
@@ -51,22 +50,6 @@ fn coordinator_http_client() -> RuntimeResult<reqwest::Client> {
         .map_err(|e| RuntimeError::transport(format!("HTTP client build failed: {e}")))?;
     *guard = Some(client.clone());
     Ok(client)
-}
-
-/// Inject a custom HTTP client for test isolation. Only available in test builds.
-#[cfg(test)]
-pub(crate) fn set_test_http_client(client: reqwest::Client) {
-    if let Ok(mut guard) = COORDINATOR_HTTP_CLIENT.lock() {
-        *guard = Some(client);
-    }
-}
-
-/// Reset the shared HTTP client so the next call rebuilds it. Only for tests.
-#[cfg(test)]
-pub(crate) fn reset_test_http_client() {
-    if let Ok(mut guard) = COORDINATOR_HTTP_CLIENT.lock() {
-        *guard = None;
-    }
 }
 
 fn apply_coordinator_bearer(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -110,13 +93,60 @@ struct BatchSqlInlineTableJson {
 
 #[derive(serde::Deserialize)]
 struct BatchSqlResponseBody {
-    #[serde(rename = "job_id")]
-    _job_id: String,
+    job_id: String,
     state: String,
     #[serde(default)]
     inline_record_batch_ipc: Vec<Vec<u8>>,
     #[serde(default)]
     error: Option<String>,
+}
+
+/// One non-blocking poll result for a coordinator-managed batch SQL job.
+#[derive(Debug, Clone)]
+pub enum CoordinatorBatchSqlJobResult {
+    Pending {
+        job_id: String,
+        state: String,
+    },
+    Succeeded {
+        job_id: String,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    },
+    Failed {
+        job_id: String,
+        error: Option<String>,
+    },
+    Cancelled {
+        job_id: String,
+        error: Option<String>,
+    },
+}
+
+fn batch_sql_job_result_from_payload(
+    payload: BatchSqlResponseBody,
+) -> RuntimeResult<CoordinatorBatchSqlJobResult> {
+    match payload.state.as_str() {
+        "Succeeded" => {
+            let batches = decode_inline_record_batches(&payload.inline_record_batch_ipc)
+                .map_err(RuntimeError::transport)?;
+            Ok(CoordinatorBatchSqlJobResult::Succeeded {
+                job_id: payload.job_id,
+                batches,
+            })
+        }
+        "Failed" => Ok(CoordinatorBatchSqlJobResult::Failed {
+            job_id: payload.job_id,
+            error: payload.error,
+        }),
+        "Cancelled" => Ok(CoordinatorBatchSqlJobResult::Cancelled {
+            job_id: payload.job_id,
+            error: payload.error,
+        }),
+        state => Ok(CoordinatorBatchSqlJobResult::Pending {
+            job_id: payload.job_id,
+            state: state.to_owned(),
+        }),
+    }
 }
 
 /// Shared poll loop for batch-SQL jobs.
@@ -269,6 +299,43 @@ pub async fn execute_coordinator_batch_sql(
     poll_batch_sql_job(&client, &poll_url, &job_id, deadline).await
 }
 
+/// Poll one existing coordinator batch-SQL job for materialized results.
+///
+/// This does not wait for job completion. Callers get the current terminal or
+/// non-terminal state and can decide whether to poll again.
+pub async fn execute_coordinator_batch_sql_result(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<CoordinatorBatchSqlJobResult> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let poll_url = format!("{base}/api/v1/batch-sql/{}", urlencoding::encode(job_id));
+    let poll_resp = apply_coordinator_bearer(client.get(&poll_url))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("batch-sql result poll failed: {e}")))?;
+    if !poll_resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "batch-sql result poll HTTP {} from {poll_url}",
+            poll_resp.status()
+        )));
+    }
+    let resp_bytes = poll_resp
+        .bytes()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("batch-sql result poll read failed: {e}")))?;
+    if resp_bytes.len() > COORDINATOR_MAX_RESPONSE_BYTES {
+        return Err(RuntimeError::transport(format!(
+            "batch-sql result poll response exceeded {} MiB limit",
+            COORDINATOR_MAX_RESPONSE_BYTES / (1024 * 1024)
+        )));
+    }
+    let payload: BatchSqlResponseBody = serde_json::from_slice(&resp_bytes).map_err(|e| {
+        RuntimeError::transport(format!("batch-sql result poll decode failed: {e}"))
+    })?;
+    batch_sql_job_result_from_payload(payload)
+}
+
 /// Execute batch SQL via the coordinator with **pre-encoded inline IPC** tables.
 ///
 /// Called from the flight server when the client sent `RegisterParquetIpc`
@@ -387,7 +454,34 @@ pub async fn execute_coordinator_bounded_window(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_http_base;
+    use super::{
+        BatchSqlResponseBody, CoordinatorBatchSqlJobResult, batch_sql_job_result_from_payload,
+        normalize_http_base,
+    };
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+
+    fn one_row_ipc() -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "answer",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![42]))])
+                .expect("record batch");
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("ipc writer");
+            writer.write(&batch).expect("ipc write");
+            writer.finish().expect("ipc finish");
+        }
+        bytes
+    }
 
     #[test]
     fn normalize_http_base_empty_fails() {
@@ -447,6 +541,25 @@ mod tests {
     fn normalize_http_base_preserves_path() {
         let result = normalize_http_base("http://host:8080/api/v1").unwrap();
         assert_eq!(result, "http://host:8080/api/v1");
+    }
+
+    #[test]
+    fn batch_sql_result_payload_decodes_succeeded_batches() {
+        let payload = BatchSqlResponseBody {
+            job_id: "job-result".to_owned(),
+            state: "Succeeded".to_owned(),
+            inline_record_batch_ipc: vec![one_row_ipc()],
+            error: None,
+        };
+        let result = batch_sql_job_result_from_payload(payload).expect("poll result");
+        match result {
+            CoordinatorBatchSqlJobResult::Succeeded { job_id, batches } => {
+                assert_eq!(job_id, "job-result");
+                assert_eq!(batches.len(), 1);
+                assert_eq!(batches[0].num_rows(), 1);
+            }
+            other => panic!("expected succeeded result, got {other:?}"),
+        }
     }
 }
 
@@ -554,6 +667,174 @@ pub async fn execute_coordinator_continuous_drain(
     })?;
 
     decode_inline_record_batches(&payload.inline_record_batch_ipc).map_err(RuntimeError::transport)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RemoteContinuousStreamJobView {
+    pub job_id: String,
+    pub state: String,
+    pub task_count: usize,
+    pub assigned_task_count: usize,
+    pub running_task_count: usize,
+    pub succeeded_task_count: usize,
+    pub failed_task_count: usize,
+    pub last_watermark_ms: Option<i64>,
+    pub persisted_watermark_ms: Option<i64>,
+    pub snapshot_available: bool,
+    pub cycle_in_flight: bool,
+    pub spec: krishiv_plan::window::WindowExecutionSpec,
+}
+
+#[derive(serde::Deserialize)]
+struct RemoteContinuousStreamsResponse {
+    streams: Vec<RemoteContinuousStreamJobView>,
+}
+
+#[derive(serde::Deserialize)]
+struct RemoteContinuousCheckpointResponse {
+    job_id: String,
+    snapshot_b64: Option<String>,
+    watermark_ms: Option<i64>,
+    snapshot_available: bool,
+    spec: krishiv_plan::window::WindowExecutionSpec,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteContinuousStreamCheckpoint {
+    pub job_id: String,
+    pub snapshot_bytes: Option<Vec<u8>>,
+    pub watermark_ms: Option<i64>,
+    pub snapshot_available: bool,
+    pub spec: krishiv_plan::window::WindowExecutionSpec,
+}
+
+pub async fn execute_coordinator_list_continuous_streams(
+    coordinator_http: &str,
+) -> RuntimeResult<Vec<RemoteContinuousStreamJobView>> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let resp = apply_coordinator_bearer(client.get(format!("{base}/api/v1/continuous")))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("list continuous streams: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "list continuous streams HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: RemoteContinuousStreamsResponse = resp
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("list continuous streams decode: {e}")))?;
+    Ok(parsed.streams)
+}
+
+pub async fn execute_coordinator_get_continuous_stream(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<Option<RemoteContinuousStreamJobView>> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let url = format!("{base}/api/v1/continuous/{}", urlencoding::encode(job_id));
+    let resp = apply_coordinator_bearer(client.get(url))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("get continuous stream: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "get continuous stream HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: RemoteContinuousStreamJobView = resp
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("get continuous stream decode: {e}")))?;
+    Ok(Some(parsed))
+}
+
+pub async fn execute_coordinator_checkpoint_continuous_stream(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<RemoteContinuousStreamCheckpoint> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let url = format!(
+        "{base}/api/v1/continuous/{}/checkpoint",
+        urlencoding::encode(job_id)
+    );
+    let resp = apply_coordinator_bearer(client.post(url))
+        .json(&serde_json::Value::Null)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("checkpoint continuous stream: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "checkpoint continuous stream HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: RemoteContinuousCheckpointResponse = resp.json().await.map_err(|e| {
+        RuntimeError::transport(format!("checkpoint continuous stream decode: {e}"))
+    })?;
+    let snapshot_bytes = match parsed.snapshot_b64 {
+        Some(snapshot_b64) => Some(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &snapshot_b64)
+                .map_err(|e| {
+                    RuntimeError::transport(format!(
+                        "checkpoint continuous stream base64 decode: {e}"
+                    ))
+                })?,
+        ),
+        None => None,
+    };
+    Ok(RemoteContinuousStreamCheckpoint {
+        job_id: parsed.job_id,
+        snapshot_bytes,
+        watermark_ms: parsed.watermark_ms,
+        snapshot_available: parsed.snapshot_available,
+        spec: parsed.spec,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct RemoteContinuousRestoreBody {
+    snapshot_b64: String,
+}
+
+pub async fn execute_coordinator_restore_continuous_stream(
+    coordinator_http: &str,
+    job_id: &str,
+    snapshot_bytes: &[u8],
+) -> RuntimeResult<()> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let url = format!(
+        "{base}/api/v1/continuous/{}/restore",
+        urlencoding::encode(job_id)
+    );
+    let body = RemoteContinuousRestoreBody {
+        snapshot_b64: base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            snapshot_bytes,
+        ),
+    };
+    let resp = apply_coordinator_bearer(client.post(url))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("restore continuous stream: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "restore continuous stream HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
 }
 
 /// Execute a physical plan on the coordinator via HTTP (batch SQL or continuous register).
@@ -1078,6 +1359,12 @@ pub struct ListJobsResponse {
     pub jobs: Vec<LiveJobView>,
 }
 
+/// Response for `execute_coordinator_list_executors`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ListExecutorsResponse {
+    pub executors: Vec<LiveExecutorView>,
+}
+
 /// List all jobs currently tracked by the coordinator (`GET /api/v1/jobs`).
 ///
 /// The coordinator's `api_jobs` route returns `{ "jobs": [...] }` where each
@@ -1138,4 +1425,48 @@ pub async fn execute_coordinator_get_job(
         .await
         .map_err(|e| RuntimeError::transport(format!("get job decode: {e}")))?;
     Ok(Some(view))
+}
+
+/// List executors currently tracked by the coordinator (`GET /api/v1/executors`).
+pub async fn execute_coordinator_list_executors(
+    coordinator_http: &str,
+) -> RuntimeResult<Vec<LiveExecutorView>> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let resp = apply_coordinator_bearer(client.get(format!("{base}/api/v1/executors")))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("list executors: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "list executors HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: ListExecutorsResponse = resp
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("list executors decode: {e}")))?;
+    Ok(parsed.executors)
+}
+
+/// Cancel a coordinator job (`POST /api/v1/jobs/{job_id}/cancel`).
+pub async fn execute_coordinator_cancel_job(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<()> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let url = format!("{base}/api/v1/jobs/{}/cancel", urlencoding::encode(job_id));
+    let resp = apply_coordinator_bearer(client.post(url))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("cancel job: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "cancel job HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
 }

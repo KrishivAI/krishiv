@@ -13,6 +13,7 @@ use arrow::datatypes::SchemaRef;
 
 use crate::delta_batch::{DeltaBatch, WEIGHT_COLUMN};
 use crate::error::{DeltaError, DeltaResult};
+use crate::operators::key_util::scalar_to_string;
 
 /// Consolidate a `DeltaBatch`: for each group of rows with identical key
 /// column values, sum their weights. Rows with weight == 0 are dropped.
@@ -119,42 +120,6 @@ pub fn consolidate_batch(
 
     let inner = RecordBatch::try_new(full_schema, output_cols)?;
     DeltaBatch::from_weighted(inner)
-}
-
-fn scalar_to_string(arr: &dyn Array, row: usize) -> String {
-    use arrow::array::{
-        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
-        UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-    };
-    macro_rules! try_fmt {
-        ($t:ty) => {
-            if let Some(a) = arr.as_any().downcast_ref::<$t>() {
-                return if a.is_null(row) {
-                    "NULL".into()
-                } else {
-                    a.value(row).to_string()
-                };
-            }
-        };
-    }
-    try_fmt!(Int8Array);
-    try_fmt!(Int16Array);
-    try_fmt!(Int32Array);
-    try_fmt!(Int64Array);
-    try_fmt!(UInt8Array);
-    try_fmt!(UInt16Array);
-    try_fmt!(UInt32Array);
-    try_fmt!(UInt64Array);
-    try_fmt!(Float32Array);
-    try_fmt!(Float64Array);
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return if a.is_null(row) {
-            "NULL".into()
-        } else {
-            a.value(row).to_string()
-        };
-    }
-    format!("<{:?}>", arr.data_type())
 }
 
 /// `ConsolidateOp` applies `consolidate_batch` as a streaming operator.

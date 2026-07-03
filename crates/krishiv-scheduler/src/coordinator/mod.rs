@@ -160,6 +160,9 @@ pub struct Coordinator {
     /// Continuous jobs with one coordinator-dispatched input cycle currently
     /// assigned or executing. This fences concurrent pushes for the same job.
     pub(crate) continuous_input_cycles: HashSet<JobId>,
+    /// One-shot continuous stream restore snapshots to inject into the next
+    /// coordinator-dispatched cycle for a job.
+    pub(crate) pending_continuous_restores: HashMap<JobId, crate::ContinuousSnapshot>,
 
     /// S1: Skew-aware repartitioning overrides. When a hot-key report exceeds
     /// the threshold, the affected job's stage is added here with a RoundRobin
@@ -1044,6 +1047,7 @@ impl Coordinator {
             job_input_partitions: HashMap::new(),
             job_task_input_partitions: HashMap::new(),
             continuous_input_cycles: HashSet::new(),
+            pending_continuous_restores: HashMap::new(),
             skew_repartition_overrides: HashMap::new(),
             pending_source_throttles: HashMap::new(),
             streaming_advisory_partitions: HashMap::new(),

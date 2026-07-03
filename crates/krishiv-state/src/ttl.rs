@@ -347,13 +347,22 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
             .collect();
 
         let namespaces = self.inner.list_namespaces()?;
+        // STATE-1: Collect all keys to delete and use delete_batch (single
+        // RocksDB WriteBatch) instead of per-key individual deletes that each
+        // trigger a separate WAL fsync.
+        let mut to_delete: Vec<(&Namespace, Vec<u8>)> = Vec::new();
         for ns in &namespaces {
             let existing_keys = self.inner.list_keys(ns)?;
             for key in existing_keys {
                 if !new_keys.contains(&(ns.clone(), key.clone())) {
-                    self.inner.delete(ns, &key)?;
+                    to_delete.push((ns, key));
                 }
             }
+        }
+        if !to_delete.is_empty() {
+            let batch: Vec<(&Namespace, &[u8])> =
+                to_delete.iter().map(|(ns, k)| (*ns, k.as_slice())).collect();
+            self.inner.delete_batch(&batch)?;
         }
         Ok(())
     }

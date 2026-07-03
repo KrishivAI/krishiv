@@ -14,25 +14,30 @@
 //! the real `ExecutionRuntime` (in-process cluster or remote coordinator). The
 //! engine code does not change — only the injected service does.
 //!
-//! Wired file connectors: `parquet`, `csv`, and `json` (NDJSON) for both job
-//! sources and sinks. Other connector kinds return a typed error pointing at the
-//! per-connector follow-up; this mirrors the SQL DDL `connector_factory` path.
-//! (The off-engine batch executor — single-node / distributed — still registers
-//! only `parquet` paths with the cluster; csv/json run through the in-process
-//! drain path used by embedded and the stateful engines.)
+//! Wired file/object-store connectors: `parquet`, `parquet-directory`, `csv`,
+//! `json` (NDJSON), `s3`, and `s3-prefix` for job sources; `parquet`, `csv`,
+//! `json` (NDJSON), and `s3` for sinks. Other connector kinds return a typed
+//! error pointing at the per-connector follow-up; this mirrors the SQL DDL
+//! `connector_factory` path. Off-engine batch execution keeps compute on the
+//! configured single-node/distributed runtime: native parquet sources are
+//! registered directly, while bounded non-parquet sources are drained locally
+//! and spilled to temporary parquet registrations that the runtime ships inline.
 
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use krishiv_connectors::cdc::{CdcEvent, CdcOp, parse_debezium_envelope};
-use krishiv_connectors::parquet::{ParquetSink, ParquetSource};
-use krishiv_connectors::{DynSink, DynSource};
+use krishiv_connectors::parquet::{ParquetDirectorySource, ParquetSink, ParquetSource};
+use krishiv_connectors::{ConnectorConfig, DynSink, DynSource, default_registry};
 use krishiv_engine_core::mem::embedded_runtime;
 use krishiv_engine_core::{
     BatchOutputStream, ChangelogBatch, CompiledJob, ConsolidatingSinkProvider,
@@ -41,6 +46,10 @@ use krishiv_engine_core::{
     SourceReader, SourceSpec, UpsertSinkProvider,
 };
 use krishiv_runtime::{BatchTableRegistration, ExecutionRuntime};
+
+const MAX_CONNECTOR_DRAIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const MAX_BATCH_RESULT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+static SPILL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Run a bounded **streaming** job through an [`ExecutionRuntime`]'s continuous
 /// seam — the distributed-stateful path behind the unified `Session::submit`.
@@ -304,26 +313,8 @@ impl QueryExecutor for RuntimeQueryExecutor {
         use futures::StreamExt as _;
 
         let all_parquet = job.sources.iter().all(|s| s.connector == "parquet");
-        // For distributed placement, refuse to silently fall back to embedded
-        // execution when the cluster is supposed to handle the work. The
-        // architecture invariant is that a Distributed session must actually
-        // run on the cluster; the previous behavior of building a local
-        // SessionContext for mixed-source jobs in distributed mode produced
-        // a "Successful" query with the wrong execution placement.
         if self.runtime.uses_remote_execution() && !all_parquet {
-            let offending: Vec<&str> = job
-                .sources
-                .iter()
-                .filter(|s| s.connector != "parquet")
-                .map(|s| s.connector.as_str())
-                .collect();
-            return Err(EngineError::Runtime(format!(
-                "Distributed placement does not support non-parquet sources \
-                 (offending: {offending:?}). Either convert the source to \
-                 parquet first, switch to an embedded or single-node session, \
-                 or register the source as a SQL table that the cluster's \
-                 connector registry knows about."
-            )));
+            return self.execute_remote_with_connector_sources(job).await;
         }
 
         if all_parquet {
@@ -343,18 +334,7 @@ impl QueryExecutor for RuntimeQueryExecutor {
                 .await
                 .map_err(|e| EngineError::Runtime(e.to_string()))?;
 
-            // G-2: enforce the same 2 GiB result cap as the embedded and
-            // mixed-connector paths so large query results don't OOM the
-            // coordinator or client when running at distributed placement.
-            const MAX_RESULT_BYTES: usize = 2 * 1024 * 1024 * 1024;
-            let total_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-            if total_bytes > MAX_RESULT_BYTES {
-                return Err(EngineError::Runtime(format!(
-                    "all-parquet batch query result exceeded the 2 GiB in-memory limit \
-                     ({total_bytes} bytes); use a LIMIT clause, add a WHERE predicate, \
-                     or write results directly to a sink instead of collecting them"
-                )));
-            }
+            enforce_result_size_limit(&batches, "all-parquet batch query")?;
 
             let stream = futures::stream::iter(batches.into_iter().map(Ok));
             return Ok(Box::pin(stream));
@@ -386,32 +366,7 @@ impl QueryExecutor for RuntimeQueryExecutor {
                         EngineError::Source(format!("register parquet '{}': {e}", spec.name))
                     })?;
             } else {
-                // Drain through the connector layer (csv/json/ndjson).
-                // 2 GiB cap prevents OOM on large files; parquet avoids this
-                // entirely via the ListingTable path above.
-                const MAX_DRAIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
-                let provider = ConnectorSourceProvider;
-                let mut reader = provider.open(spec).await?;
-                let mut batches = Vec::new();
-                let mut total_bytes: usize = 0;
-                while let Some(batch) = reader.next().await? {
-                    total_bytes += batch.get_array_memory_size();
-                    if total_bytes > MAX_DRAIN_BYTES {
-                        return Err(EngineError::Source(format!(
-                            "source '{}' (uri: '{}') exceeded the 2 GiB in-memory drain \
-                             limit; convert to parquet for large datasets",
-                            spec.name, spec.uri
-                        )));
-                    }
-                    batches.push(batch);
-                }
-                if batches.is_empty() {
-                    return Err(EngineError::Source(format!(
-                        "source '{}' (connector '{}', uri: '{}') produced no batches; \
-                         the batch engine requires a non-empty source to infer schema",
-                        spec.name, spec.connector, spec.uri
-                    )));
-                }
+                let batches = drain_connector_source(spec).await?;
                 let schema = batches
                     .first()
                     .ok_or_else(|| {
@@ -443,6 +398,179 @@ impl QueryExecutor for RuntimeQueryExecutor {
     }
 }
 
+impl RuntimeQueryExecutor {
+    async fn execute_remote_with_connector_sources(
+        &self,
+        job: &CompiledJob,
+    ) -> EngineResult<BatchOutputStream> {
+        let mut spilled_tables = Vec::new();
+        let mut tables = Vec::new();
+        for spec in &job.sources {
+            if spec.connector == "parquet" {
+                tables.push(BatchTableRegistration::new(
+                    spec.name.clone(),
+                    PathBuf::from(&spec.uri),
+                ));
+                continue;
+            }
+
+            let batches = drain_connector_source(spec).await?;
+            let spilled = spill_source_batches_to_parquet(spec, batches).await?;
+            tables.push(spilled.registration.clone());
+            spilled_tables.push(spilled);
+        }
+
+        let batches = self
+            .runtime
+            .collect_batch_sql_async(&job.query, &tables, false)
+            .await
+            .map_err(|e| EngineError::Runtime(e.to_string()))?;
+        enforce_result_size_limit(&batches, "remote mixed-connector batch query")?;
+
+        // Keep spilled source directories alive until after the remote runtime
+        // has inlined/read the generated parquet registrations.
+        drop(spilled_tables);
+
+        let stream = futures::stream::iter(batches.into_iter().map(Ok));
+        Ok(Box::pin(stream))
+    }
+}
+
+async fn drain_connector_source(spec: &SourceSpec) -> EngineResult<Vec<RecordBatch>> {
+    let provider = ConnectorSourceProvider;
+    let mut reader = provider.open(spec).await?;
+    let mut batches = Vec::new();
+    let mut total_bytes: usize = 0;
+    while let Some(batch) = reader.next().await? {
+        total_bytes += batch.get_array_memory_size();
+        if total_bytes > MAX_CONNECTOR_DRAIN_BYTES {
+            return Err(EngineError::Source(format!(
+                "source '{}' (connector '{}', uri: '{}') exceeded the 2 GiB in-memory drain \
+                 limit; convert to parquet for large datasets or use a connector-native \
+                 distributed source provider",
+                spec.name, spec.connector, spec.uri
+            )));
+        }
+        batches.push(batch);
+    }
+    if batches.is_empty() {
+        return Err(EngineError::Source(format!(
+            "source '{}' (connector '{}', uri: '{}') produced no batches; \
+             the batch engine requires a non-empty source to infer schema",
+            spec.name, spec.connector, spec.uri
+        )));
+    }
+    Ok(batches)
+}
+
+struct SpilledBatchTable {
+    registration: BatchTableRegistration,
+    dir: PathBuf,
+}
+
+impl Drop for SpilledBatchTable {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.dir) {
+            tracing::debug!(
+                path = %self.dir.display(),
+                error = %error,
+                "failed to remove temporary connector spill directory"
+            );
+        }
+    }
+}
+
+async fn spill_source_batches_to_parquet(
+    spec: &SourceSpec,
+    batches: Vec<RecordBatch>,
+) -> EngineResult<SpilledBatchTable> {
+    let source_name = spec.name.clone();
+    tokio::task::spawn_blocking(move || {
+        spill_source_batches_to_parquet_blocking(source_name, batches)
+    })
+    .await
+    .map_err(|e| EngineError::Source(format!("connector spill task panicked: {e}")))?
+}
+
+fn spill_source_batches_to_parquet_blocking(
+    source_name: String,
+    batches: Vec<RecordBatch>,
+) -> EngineResult<SpilledBatchTable> {
+    let Some(first) = batches.first() else {
+        return Err(EngineError::Source(format!(
+            "source '{source_name}' produced no batches to spill"
+        )));
+    };
+    let dir = unique_spill_dir(&source_name)?;
+    let path = dir.join("source.parquet");
+    let cleanup_dir = dir.clone();
+    let result = (|| {
+        let file = File::create(&path).map_err(|e| {
+            EngineError::Source(format!("create spill parquet '{}': {e}", path.display()))
+        })?;
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, first.schema(), None)
+            .map_err(|e| EngineError::Source(format!("create spill parquet writer: {e}")))?;
+        for batch in &batches {
+            writer
+                .write(batch)
+                .map_err(|e| EngineError::Source(format!("write spill parquet batch: {e}")))?;
+        }
+        writer
+            .close()
+            .map_err(|e| EngineError::Source(format!("close spill parquet writer: {e}")))?;
+        Ok(SpilledBatchTable {
+            registration: BatchTableRegistration::new(source_name, path),
+            dir,
+        })
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&cleanup_dir);
+    }
+    result
+}
+
+fn unique_spill_dir(source_name: &str) -> EngineResult<PathBuf> {
+    let safe_name = source_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let counter = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let dir = std::env::temp_dir().join(format!(
+        "krishiv-connector-spill-{}-{counter}-{nanos}-{safe_name}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).map_err(|e| {
+        EngineError::Source(format!(
+            "create connector spill directory '{}': {e}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
+}
+
+fn enforce_result_size_limit(batches: &[RecordBatch], label: &str) -> EngineResult<()> {
+    let total_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+    if total_bytes > MAX_BATCH_RESULT_BYTES {
+        return Err(EngineError::Runtime(format!(
+            "{label} result exceeded the 2 GiB in-memory limit ({total_bytes} bytes); \
+             use a LIMIT clause, add a WHERE predicate, or write results directly to a sink \
+             instead of collecting them"
+        )));
+    }
+    Ok(())
+}
+
 // ── Sources ──────────────────────────────────────────────────────────────────
 
 /// Opens connector-backed [`SourceReader`]s from a [`SourceSpec`].
@@ -453,16 +581,17 @@ pub struct ConnectorSourceProvider;
 impl SourceProvider for ConnectorSourceProvider {
     async fn open(&self, spec: &SourceSpec) -> EngineResult<Box<dyn SourceReader>> {
         match spec.connector.as_str() {
-            "parquet" => {
+            "parquet" | "parquet-directory" => {
                 // `ParquetSource::open` reads the file footer synchronously
                 // (blocking `std::fs::File::open` + metadata parse). Offload
                 // to the blocking pool so opening a Parquet source doesn't
                 // stall the tokio reactor, matching the JSON branch below.
                 let spec = spec.clone();
+                let connector = spec.connector.clone();
                 let inner = tokio::task::spawn_blocking(move || build_dyn_source(&spec))
                     .await
                     .map_err(|e| {
-                        EngineError::Source(format!("parquet source open task panicked: {e}"))
+                        EngineError::Source(format!("{connector} source open task panicked: {e}"))
                     })??;
                 Ok(Box::new(DynSourceReader { inner }))
             }
@@ -489,9 +618,18 @@ impl SourceProvider for ConnectorSourceProvider {
                         .map_err(|e| EngineError::Source(e.to_string()))?;
                 Ok(Box::new(JsonFileSourceReader { inner }))
             }
+            "s3" | "s3-prefix" => {
+                let config = connector_config_from_source_spec(spec);
+                let registry = default_registry();
+                let inner = registry
+                    .open_source(&config)
+                    .await
+                    .map_err(|e| EngineError::Source(e.to_string()))?;
+                Ok(Box::new(DynSourceReader { inner }))
+            }
             other => Err(EngineError::Source(format!(
                 "connector '{other}' is not available as a job source yet; \
-                 supported: parquet, csv, json"
+                 supported: parquet, parquet-directory, csv, json, s3, s3-prefix"
             ))),
         }
     }
@@ -504,9 +642,18 @@ fn build_dyn_source(spec: &SourceSpec) -> EngineResult<Box<dyn DynSource>> {
                 ParquetSource::open(&spec.uri).map_err(|e| EngineError::Source(e.to_string()))?;
             Ok(Box::new(source))
         }
+        "parquet-directory" => {
+            let recursive = spec
+                .options
+                .get("recursive")
+                .is_some_and(|value| value == "true" || value == "1");
+            let source = ParquetDirectorySource::open(&spec.uri, recursive)
+                .map_err(|e| EngineError::Source(e.to_string()))?;
+            Ok(Box::new(source))
+        }
         other => Err(EngineError::Source(format!(
             "connector '{other}' is not available as an embedded job source yet; \
-             supported: parquet"
+             supported: parquet, parquet-directory"
         ))),
     }
 }
@@ -727,12 +874,25 @@ impl SinkProvider for ConnectorSinkProvider {
         match spec.connector.as_str() {
             "parquet" => Ok(Box::new(DynSinkWriter {
                 inner: build_dyn_sink(spec)?,
+                connector: spec.connector.clone(),
             })),
             "csv" => Ok(Box::new(CsvFileSinkWriter::create(&spec.uri)?)),
             "json" | "ndjson" => Ok(Box::new(JsonFileSinkWriter::create(&spec.uri)?)),
+            "s3" => {
+                let config = connector_config_from_sink_spec(spec);
+                let registry = default_registry();
+                let inner = registry
+                    .open_sink(&config)
+                    .await
+                    .map_err(|e| EngineError::Sink(e.to_string()))?;
+                Ok(Box::new(DynSinkWriter {
+                    inner,
+                    connector: spec.connector.clone(),
+                }))
+            }
             other => Err(EngineError::Sink(format!(
                 "connector '{other}' is not available as a job sink yet; \
-                 supported: parquet, csv, json"
+                 supported: parquet, csv, json, s3"
             ))),
         }
     }
@@ -750,6 +910,40 @@ fn build_dyn_sink(spec: &SinkSpec) -> EngineResult<Box<dyn DynSink>> {
              supported: parquet"
         ))),
     }
+}
+
+fn connector_config_from_source_spec(spec: &SourceSpec) -> ConnectorConfig {
+    connector_config_from_spec(&spec.name, &spec.connector, &spec.uri, &spec.options)
+}
+
+fn connector_config_from_sink_spec(spec: &SinkSpec) -> ConnectorConfig {
+    connector_config_from_spec(&spec.view, &spec.connector, &spec.uri, &spec.options)
+}
+
+fn connector_config_from_spec(
+    name: &str,
+    connector: &str,
+    uri: &str,
+    options: &BTreeMap<String, String>,
+) -> ConnectorConfig {
+    let mut config = ConnectorConfig::new(name, connector);
+    if !uri.is_empty() {
+        let locator_key = match connector {
+            "s3" => Some("object_path"),
+            "s3-prefix" => Some("prefix"),
+            "parquet" | "parquet-directory" | "csv" | "json" | "ndjson" => Some("path"),
+            _ => None,
+        };
+        if let Some(locator_key) = locator_key
+            && !options.contains_key(locator_key)
+        {
+            config = config.with_property(locator_key, uri);
+        }
+    }
+    for (key, value) in options {
+        config = config.with_property(key, value);
+    }
+    config
 }
 
 /// Guard: file sinks are append-only, so a changelog carrying retractions is
@@ -861,12 +1055,13 @@ impl SinkWriter for JsonFileSinkWriter {
 /// into the net table so only insert-only output reaches this writer.
 struct DynSinkWriter {
     inner: Box<dyn DynSink>,
+    connector: String,
 }
 
 #[async_trait]
 impl SinkWriter for DynSinkWriter {
     async fn write(&mut self, changes: ChangelogBatch) -> EngineResult<()> {
-        require_append_only(&changes, "parquet")?;
+        require_append_only(&changes, &self.connector)?;
         let (batch, _kinds) = changes.into_parts();
         self.inner
             .write_batch_dyn(batch)
@@ -886,19 +1081,143 @@ impl SinkWriter for DynSinkWriter {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::sync::Arc;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use futures::StreamExt as _;
     use krishiv_connectors::parquet::{ParquetSink, ParquetSource};
     use krishiv_connectors::{Sink, Source};
     // The engine-core `JobStatus` is what `JobHandle::status` returns; the
     // crate-root `JobStatus` is `krishiv_runtime`'s, so name it explicitly here.
     use krishiv_engine_core::JobStatus;
+    use krishiv_runtime::{
+        BatchTableRegistration, ExecutionPlacement, ExecutionReport, ExecutionRuntime,
+        LocalWindowExecutionSpec, RuntimeError, RuntimeMode, RuntimeResult,
+    };
 
-    use super::{run_incremental_job_via_ivm, run_streaming_job_via_runtime};
+    use super::{RuntimeQueryExecutor, run_incremental_job_via_ivm, run_streaming_job_via_runtime};
     use crate::{CompiledJob, EngineKind, ExecutionMode, KrishivError, SinkSpec, SourceSpec};
+
+    #[derive(Debug, Clone)]
+    struct CapturedRemoteTable {
+        table_name: String,
+        path: PathBuf,
+        rows: usize,
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingRemoteRuntime {
+        captured_tables: Arc<Mutex<Vec<CapturedRemoteTable>>>,
+    }
+
+    impl CapturingRemoteRuntime {
+        fn captured_tables(&self) -> Vec<CapturedRemoteTable> {
+            self.captured_tables.lock().unwrap().clone()
+        }
+    }
+
+    impl ExecutionRuntime for CapturingRemoteRuntime {
+        fn mode(&self) -> RuntimeMode {
+            RuntimeMode::Distributed
+        }
+
+        fn placement(&self) -> ExecutionPlacement {
+            ExecutionPlacement::RemoteClusterRequired
+        }
+
+        fn accept_plan(
+            &self,
+            _plan: &krishiv_plan::PhysicalPlan,
+        ) -> RuntimeResult<ExecutionReport> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
+        fn collect_bounded_window(
+            &self,
+            _topic: &str,
+            _input_batches: Vec<RecordBatch>,
+            _spec: &LocalWindowExecutionSpec,
+        ) -> RuntimeResult<Vec<RecordBatch>> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
+        fn collect_batch_sql(
+            &self,
+            _query: &str,
+            _tables: &[BatchTableRegistration],
+            _is_streaming: bool,
+        ) -> RuntimeResult<Vec<RecordBatch>> {
+            Err(RuntimeError::unsupported("use async batch SQL path"))
+        }
+
+        fn collect_batch_sql_async<'a>(
+            &'a self,
+            _query: &'a str,
+            tables: &'a [BatchTableRegistration],
+            _is_streaming: bool,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = RuntimeResult<Vec<RecordBatch>>> + Send + 'a>,
+        > {
+            let table_snapshot = tables
+                .iter()
+                .map(|table| (table.table_name.clone(), table.path.clone()))
+                .collect::<Vec<_>>();
+            let captured_tables = Arc::clone(&self.captured_tables);
+            Box::pin(async move {
+                let mut captured = Vec::new();
+                for (table_name, path) in table_snapshot {
+                    let mut source = ParquetSource::open(&path)
+                        .map_err(|e| RuntimeError::transport(e.to_string()))?;
+                    let mut rows = 0usize;
+                    while let Some(batch) = source
+                        .read_batch()
+                        .await
+                        .map_err(|e| RuntimeError::transport(e.to_string()))?
+                    {
+                        rows += batch.num_rows();
+                    }
+                    captured.push(CapturedRemoteTable {
+                        table_name,
+                        path,
+                        rows,
+                    });
+                }
+                *captured_tables.lock().unwrap() = captured;
+                Ok(vec![v_batch(&[6])])
+            })
+        }
+
+        fn explain_sql(&self, _query: &str) -> RuntimeResult<String> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
+        fn register_continuous_stream(
+            &self,
+            _job_id: &str,
+            _spec: &LocalWindowExecutionSpec,
+        ) -> RuntimeResult<()> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
+        fn push_continuous_stream_input(
+            &self,
+            _job_id: &str,
+            _batches: Vec<RecordBatch>,
+        ) -> RuntimeResult<()> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
+        fn drain_continuous_stream(&self, _job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+            Err(RuntimeError::unsupported("not used by this test"))
+        }
+
+        fn flight_url(&self) -> Option<&str> {
+            Some("memory://capturing-remote")
+        }
+    }
 
     #[tokio::test]
     async fn submit_runs_batch_job_over_csv_connectors() {
@@ -950,6 +1269,81 @@ mod tests {
         assert!(
             written.contains("\"total\":6"),
             "SUM(v)=6 in ndjson output: {written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_runs_batch_job_over_s3_connectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("object-store");
+        std::fs::create_dir_all(&base_path).unwrap();
+        let input = base_path.join("input.parquet");
+        let output = base_path.join("out.parquet");
+
+        let mut input_sink = ParquetSink::create(&input).unwrap();
+        input_sink.write_batch(v_batch(&[1, 2, 3])).await.unwrap();
+        input_sink.flush().await.unwrap();
+
+        let source_options = vec![
+            ("base_path".to_owned(), base_path.display().to_string()),
+            ("object_path".to_owned(), "input.parquet".to_owned()),
+        ];
+        let sink_options = vec![
+            ("base_path".to_owned(), base_path.display().to_string()),
+            ("object_path".to_owned(), "out.parquet".to_owned()),
+        ];
+        let session = crate::SessionBuilder::new().build().unwrap();
+        let job = CompiledJob::new(
+            "s3-sum",
+            "SELECT SUM(v) AS total FROM t",
+            vec![SourceSpec::bounded("t", "s3", "input.parquet").with_options(source_options)],
+            vec![SinkSpec::new("out", "s3", "out.parquet").with_options(sink_options)],
+            false,
+        );
+
+        let handle = session.submit(job).await.unwrap();
+        assert_eq!(handle.status(), JobStatus::Completed);
+        assert!(output.exists(), "s3 sink should write the object");
+
+        let mut written = ParquetSource::open(&output).unwrap();
+        let batch = written.read_batch().await.unwrap().expect("output batch");
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_runtime_spills_csv_sources_to_parquet_registrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.csv");
+        std::fs::write(&input, "v\n1\n2\n3\n").unwrap();
+
+        let runtime = CapturingRemoteRuntime::default();
+        let executor = RuntimeQueryExecutor {
+            runtime: Arc::new(runtime.clone()),
+        };
+        let job = CompiledJob::new(
+            "remote-csv-sum",
+            "SELECT SUM(v) AS total FROM t",
+            vec![SourceSpec::bounded("t", "csv", input.to_str().unwrap())],
+            vec![SinkSpec::new("out", "json", "")],
+            false,
+        );
+
+        let mut stream = krishiv_engine_core::QueryExecutor::execute_batch(&executor, &job)
+            .await
+            .unwrap();
+        let mut output_rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            output_rows += batch.unwrap().num_rows();
+        }
+        assert_eq!(output_rows, 1);
+
+        let captured = runtime.captured_tables();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].table_name, "t");
+        assert_eq!(captured[0].rows, 3);
+        assert!(
+            !captured[0].path.exists(),
+            "temporary spill parquet should be removed after remote dispatch"
         );
     }
 

@@ -216,6 +216,60 @@ impl InProcessStreamingRuntime {
         self.continuous_registry.push_input(job_id, batches)
     }
 
+    /// List all currently registered continuous job ids.
+    pub fn list_continuous_jobs(&self) -> Vec<String> {
+        self.continuous_registry.list_jobs()
+    }
+
+    /// Return the registered continuous job spec.
+    pub fn continuous_job_spec(&self, job_id: &str) -> RuntimeResult<WindowExecutionSpec> {
+        self.continuous_registry.job_spec(job_id)
+    }
+
+    /// Return the number of queued input batches for a continuous job.
+    pub fn continuous_job_pending_batch_depth(&self, job_id: &str) -> RuntimeResult<usize> {
+        self.continuous_registry.pending_batch_depth(job_id)
+    }
+
+    /// Snapshot live continuous window state directly from the registry.
+    pub fn snapshot_continuous_job(&self, job_id: &str) -> RuntimeResult<ContinuousSnapshot> {
+        let (snapshot_bytes, watermark_ms) = self
+            .continuous_registry
+            .snapshot_job_with_watermark(job_id)?;
+        Ok(ContinuousSnapshot {
+            snapshot_bytes,
+            watermark_ms,
+        })
+    }
+
+    /// Restore a registered continuous job from snapshot bytes.
+    pub fn restore_continuous_job(&self, job_id: &str, snapshot_bytes: &[u8]) -> RuntimeResult<()> {
+        self.continuous_registry
+            .restore_job_snapshot(job_id, snapshot_bytes)?;
+        if let Ok((snapshot_bytes, watermark_ms)) =
+            self.continuous_registry.snapshot_job_with_watermark(job_id)
+        {
+            match self.coordinator.lock() {
+                Ok(coord) => {
+                    coord.save_continuous_snapshot(
+                        job_id,
+                        ContinuousSnapshot {
+                            snapshot_bytes,
+                            watermark_ms,
+                        },
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        job_id,
+                        "coordinator mutex poisoned; restored continuous snapshot not persisted"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Deregister a streaming source and clear any matching parquet-cache entries.
     ///
     /// Wraps [`SqlEngine::deregister_streaming_source`] and additionally removes

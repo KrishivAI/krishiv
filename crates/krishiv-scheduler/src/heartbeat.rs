@@ -180,11 +180,18 @@ impl ExecutorRegistry {
             if protected.contains(executor.executor_id()) {
                 continue;
             }
-            if executor.state().can_accept_work()
-                && self
-                    .current_tick
-                    .saturating_sub(executor.last_heartbeat_tick)
-                    >= self.heartbeat_timeout_ticks
+            // DIST-2: Also evict Draining executors that stop heartbeating.
+            // Previously only Registered|Healthy were checked, so a crashed
+            // Draining executor persisted in the registry forever.
+            if matches!(
+                executor.state(),
+                ExecutorState::Registered
+                    | ExecutorState::Healthy
+                    | ExecutorState::Draining
+            ) && self
+                .current_tick
+                .saturating_sub(executor.last_heartbeat_tick)
+                >= self.heartbeat_timeout_ticks
             {
                 executor.state = ExecutorState::Lost;
                 executor.running_tasks.clear();
