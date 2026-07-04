@@ -1613,6 +1613,9 @@ impl KrishivMcpServer {
             ConnectorRole::Source => registry.validate_source(&config),
             ConnectorRole::Sink => registry.validate_sink(&config),
             ConnectorRole::TwoPhaseSink => registry.validate_two_phase_sink(&config),
+            // A vector sink is a member of the sink family; validate it as one
+            // until the registry exposes a dedicated vector-sink validator.
+            ConnectorRole::VectorSink => registry.validate_sink(&config),
         };
         match result {
             Ok(()) => {
@@ -2160,6 +2163,7 @@ fn parse_connector_role(role: &str) -> ToolResult<ConnectorRole> {
         "source" => Ok(ConnectorRole::Source),
         "sink" => Ok(ConnectorRole::Sink),
         "two_phase_sink" | "two-phase-sink" | "two_phase" => Ok(ConnectorRole::TwoPhaseSink),
+        "vector_sink" | "vector-sink" => Ok(ConnectorRole::VectorSink),
         _ => Err(ToolError::InvalidArgument {
             name: "role",
             expected: "source, sink, or two_phase_sink",
@@ -2172,6 +2176,7 @@ fn connector_role_str(role: ConnectorRole) -> &'static str {
         ConnectorRole::Source => "source",
         ConnectorRole::Sink => "sink",
         ConnectorRole::TwoPhaseSink => "two_phase_sink",
+        ConnectorRole::VectorSink => "vector_sink",
     }
 }
 
@@ -2199,6 +2204,8 @@ fn connector_sql_job_execution(kind: &str, role: ConnectorRole) -> Value {
             matches!(kind.as_str(), "parquet" | "csv" | "json" | "ndjson" | "s3")
         }
         ConnectorRole::TwoPhaseSink => false,
+        // Vector sinks are not driven through the batch SQL-job execution path.
+        ConnectorRole::VectorSink => false,
     };
     let modes = match (role, kind.as_str()) {
         (ConnectorRole::Source, "parquet") => json!(["embedded", "single-node", "distributed"]),

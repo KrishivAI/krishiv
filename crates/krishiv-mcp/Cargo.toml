@@ -19,7 +19,7 @@ arrow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 krishiv-api = { path = "../krishiv-api", version = "0.1.0" }
-krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse"] }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse", "vector-sinks"] }
 krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
