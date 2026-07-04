@@ -6,8 +6,6 @@
 //! iceberg's `plan_files()` and wrap them in DataFusion 53's `ListingTable`,
 //! which provides native pushdown of projections and partition filters.
 
-#![cfg(feature = "iceberg-datafusion")]
-
 pub mod iceberg_scan {
     use std::sync::Arc;
 
@@ -97,17 +95,17 @@ pub mod iceberg_scan {
     }
 
     async fn listing_provider_from_paths(paths: Vec<String>) -> DfResult<Arc<dyn TableProvider>> {
-        if paths.is_empty() {
+        let Some(first_path) = paths.first() else {
             // Return an empty in-memory table; schema is unknown without files.
             use arrow::datatypes::{Schema, SchemaRef};
             use datafusion::datasource::MemTable;
             let empty_schema: SchemaRef = Arc::new(Schema::empty());
             return Ok(Arc::new(MemTable::try_new(empty_schema, vec![vec![]])?));
-        }
+        };
 
         // Use the first file path as the listing root; DataFusion globs for *.parquet.
         // For multiple files with different parents, we use the first file directly.
-        let listing_url = ListingTableUrl::parse(&paths[0])?;
+        let listing_url = ListingTableUrl::parse(first_path)?;
 
         let format = Arc::new(ParquetFormat::default().with_enable_pruning(true));
         let listing_options = ListingOptions::new(format)

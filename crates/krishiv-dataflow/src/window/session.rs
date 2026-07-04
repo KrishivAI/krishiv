@@ -438,18 +438,13 @@ impl SessionWindowOperator {
         }
         let state_refs: Vec<&AggState> = states.iter().collect();
         let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let batch = self.build_multi_row_output_batch(
-            &key_refs,
-            &starts,
-            &ends,
-            &state_refs,
-        )?;
+        let batch = self.build_multi_row_output_batch(&key_refs, &starts, &ends, &state_refs)?;
         // Only now that the batch is built, remove the closed sessions.
         for key in &closed {
-            if self.sessions.remove(key).is_some() {
-                if let Some(budget) = &self.memory_budget {
-                    budget.release(128);
-                }
+            if self.sessions.remove(key).is_some()
+                && let Some(budget) = &self.memory_budget
+            {
+                budget.release(128);
             }
         }
         Ok(vec![batch])

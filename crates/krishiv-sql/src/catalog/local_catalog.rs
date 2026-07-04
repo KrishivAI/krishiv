@@ -30,8 +30,6 @@
 //! in-memory registry.  This mirrors the recovery logic already used by
 //! `krishiv_connectors::lakehouse::IcebergNativeTwoPhaseCommit`.
 
-#![cfg(feature = "local-catalog")]
-
 use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;

@@ -12,8 +12,6 @@
 //! Iceberg type universe (SQL DDL, the REST/Flight surface) do not need to
 //! construct `NamespaceIdent` / `TableIdent` values themselves.
 
-#![cfg(feature = "local-catalog")]
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;

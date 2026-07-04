@@ -100,6 +100,9 @@ impl IcebergCatalogBridge {
     /// Iceberg catalog is async. We bridge with the current Tokio runtime via
     /// `block_in_place` (multi-thread runtime) and fall back to a private
     /// current-thread runtime when not inside a runtime worker.
+    // Building a current-thread runtime only fails on OS resource exhaustion,
+    // from which this synchronous bridge has no way to recover.
+    #[allow(clippy::expect_used)]
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),

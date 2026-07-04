@@ -5,8 +5,6 @@
 //! to any Iceberg REST-compatible catalog server — Nessie, Apache Polaris,
 //! Tabular, AWS Glue, or any custom implementation — via a single URL.
 
-#![cfg(feature = "rest-catalog")]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 

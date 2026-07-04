@@ -347,6 +347,13 @@ fn build_single_node_session_config(
     config
 }
 
+/// Iceberg catalogs registered via `with_iceberg_catalog`, paired with their
+/// DataFusion catalog name, behind a shared lock for `CALL system.<proc>`
+/// dispatch.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+type IcebergCatalogRegistry =
+    Arc<std::sync::RwLock<Vec<(Arc<catalog::unified::KrishivCatalog>, String)>>>;
+
 #[derive(Clone)]
 pub struct SqlEngine {
     context: SessionContext,
@@ -396,7 +403,7 @@ pub struct SqlEngine {
     /// DataFusion catalog name. Stored so that `CALL system.<proc>` statements
     /// can dispatch maintenance operations to the right catalog.
     #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
-    iceberg_catalogs: Arc<std::sync::RwLock<Vec<(Arc<catalog::unified::KrishivCatalog>, String)>>>,
+    iceberg_catalogs: IcebergCatalogRegistry,
     /// Live-table DDL registry shared across SQL and session APIs.
     live_table_registry: Arc<live_table::LiveTableRegistry>,
     /// Incremental-view DDL registry shared across SQL and session APIs.
@@ -1796,96 +1803,84 @@ impl SqlEngine {
         // Route to copy-on-write iceberg_delete_where when the table is tracked
         // by a registered KrishivCatalog. Falls through to DataFusion otherwise.
         #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
-        if trimmed.to_ascii_uppercase().starts_with("DELETE FROM ") {
-            if let Some((table_ref, predicate)) = parse_dml_delete(trimmed) {
-                if let Some((iceberg_catalog, table_ident)) = self.resolve_iceberg_table(&table_ref)
-                {
-                    use arrow::array::{ArrayRef, Int64Array};
-                    use arrow::datatypes::{DataType, Field, Schema};
-                    let (deleted, _) = krishiv_connectors::lakehouse::dml::iceberg_delete_where(
-                        iceberg_catalog,
-                        &table_ident,
-                        &predicate,
-                        &self.context,
-                    )
-                    .await
-                    .map_err(|e| SqlError::DataFusion {
-                        message: e.to_string(),
-                    })?;
-                    let schema = Arc::new(Schema::new(vec![Field::new(
-                        "deleted_rows",
-                        DataType::Int64,
-                        false,
-                    )]));
-                    let array: ArrayRef = Arc::new(Int64Array::from(vec![deleted as i64]));
-                    let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| {
-                        SqlError::DataFusion {
-                            message: e.to_string(),
-                        }
-                    })?;
-                    let res_table = next_ephemeral_name("delete_result");
-                    lakehouse::register_scan_batches(&self.context, &res_table, vec![batch])
-                        .await?;
-                    let dataframe = self
-                        .context
-                        .sql(&format!("SELECT * FROM {res_table}"))
-                        .await?;
-                    return Ok(
-                        self.attach_query_metadata(self.make_sql_df("delete", dataframe), query)
-                    );
-                }
-            }
+        if trimmed.to_ascii_uppercase().starts_with("DELETE FROM ")
+            && let Some((table_ref, predicate)) = parse_dml_delete(trimmed)
+            && let Some((iceberg_catalog, table_ident)) = self.resolve_iceberg_table(&table_ref)
+        {
+            use arrow::array::{ArrayRef, Int64Array};
+            use arrow::datatypes::{DataType, Field, Schema};
+            let (deleted, _) = krishiv_connectors::lakehouse::dml::iceberg_delete_where(
+                iceberg_catalog,
+                &table_ident,
+                &predicate,
+                &self.context,
+            )
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "deleted_rows",
+                DataType::Int64,
+                false,
+            )]));
+            let array: ArrayRef = Arc::new(Int64Array::from(vec![deleted as i64]));
+            let batch =
+                RecordBatch::try_new(schema, vec![array]).map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
+            let res_table = next_ephemeral_name("delete_result");
+            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
+            let dataframe = self
+                .context
+                .sql(&format!("SELECT * FROM {res_table}"))
+                .await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("delete", dataframe), query));
         }
 
         // ── Intercept UPDATE <iceberg-table> SET … [WHERE …] ─────────────────
         #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
-        if trimmed.to_ascii_uppercase().starts_with("UPDATE ") {
-            if let Some(parsed) = parse_dml_update(trimmed) {
-                if let Some((iceberg_catalog, table_ident)) =
-                    self.resolve_iceberg_table(&parsed.table_ref)
-                {
-                    use arrow::array::{ArrayRef, Int64Array};
-                    use arrow::datatypes::{DataType, Field, Schema};
-                    let borrowed: Vec<(&str, &str)> = parsed
-                        .assignments
-                        .iter()
-                        .map(|(c, e)| (c.as_str(), e.as_str()))
-                        .collect();
-                    let pred = parsed.predicate.as_deref();
-                    let (updated, _) = krishiv_connectors::lakehouse::dml::iceberg_update_where(
-                        iceberg_catalog,
-                        &table_ident,
-                        &borrowed,
-                        pred,
-                        &self.context,
-                    )
-                    .await
-                    .map_err(|e| SqlError::DataFusion {
-                        message: e.to_string(),
-                    })?;
-                    let schema = Arc::new(Schema::new(vec![Field::new(
-                        "updated_rows",
-                        DataType::Int64,
-                        false,
-                    )]));
-                    let array: ArrayRef = Arc::new(Int64Array::from(vec![updated as i64]));
-                    let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| {
-                        SqlError::DataFusion {
-                            message: e.to_string(),
-                        }
-                    })?;
-                    let res_table = next_ephemeral_name("update_result");
-                    lakehouse::register_scan_batches(&self.context, &res_table, vec![batch])
-                        .await?;
-                    let dataframe = self
-                        .context
-                        .sql(&format!("SELECT * FROM {res_table}"))
-                        .await?;
-                    return Ok(
-                        self.attach_query_metadata(self.make_sql_df("update", dataframe), query)
-                    );
-                }
-            }
+        if trimmed.to_ascii_uppercase().starts_with("UPDATE ")
+            && let Some(parsed) = parse_dml_update(trimmed)
+            && let Some((iceberg_catalog, table_ident)) =
+                self.resolve_iceberg_table(&parsed.table_ref)
+        {
+            use arrow::array::{ArrayRef, Int64Array};
+            use arrow::datatypes::{DataType, Field, Schema};
+            let borrowed: Vec<(&str, &str)> = parsed
+                .assignments
+                .iter()
+                .map(|(c, e)| (c.as_str(), e.as_str()))
+                .collect();
+            let pred = parsed.predicate.as_deref();
+            let (updated, _) = krishiv_connectors::lakehouse::dml::iceberg_update_where(
+                iceberg_catalog,
+                &table_ident,
+                &borrowed,
+                pred,
+                &self.context,
+            )
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "updated_rows",
+                DataType::Int64,
+                false,
+            )]));
+            let array: ArrayRef = Arc::new(Int64Array::from(vec![updated as i64]));
+            let batch =
+                RecordBatch::try_new(schema, vec![array]).map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
+            let res_table = next_ephemeral_name("update_result");
+            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
+            let dataframe = self
+                .context
+                .sql(&format!("SELECT * FROM {res_table}"))
+                .await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("update", dataframe), query));
         }
 
         // ── Intercept MATCH_RECOGNIZE ─────────────────────────────────────────

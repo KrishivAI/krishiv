@@ -481,9 +481,9 @@ pub async fn overwrite_table_pub(
     // CONN-4: Update the version-hint after commit so DML changes survive
     // restart. Without this, the hint still points at the old (dropped)
     // table's metadata and all DML changes are silently rolled back on restart.
-    if let Some(loc) = committed.metadata().metadata_location() {
+    if let Some(loc) = committed.metadata_location() {
         let table_root = std::path::Path::new(table_location.trim_start_matches("file://"));
-        if let Err(e) = super::iceberg_native::write_version_hint(table_root, loc) {
+        if let Err(e) = super::iceberg_native::native::write_version_hint(table_root, loc) {
             tracing::warn!(
                 table = %ident,
                 location = loc,

@@ -197,32 +197,31 @@ pub mod native {
 
             if batches.is_empty() {
                 // No data to commit — safe to write hint for the new empty table.
-                if let Some(loc) = table.metadata_location() {
-                    if let Err(e) = self.update_version_hint(loc) {
-                        tracing::warn!(
-                            table = %self.ident,
-                            location = loc,
-                            error = %e,
-                            "version hint update failed after overwrite commit; hint may be stale"
-                        );
-                    }
+                if let Some(loc) = table.metadata_location()
+                    && let Err(e) = self.update_version_hint(loc)
+                {
+                    tracing::warn!(
+                        table = %self.ident,
+                        location = loc,
+                        error = %e,
+                        "version hint update failed after overwrite commit; hint may be stale"
+                    );
                 }
                 return Ok(0);
             }
             let staged = self.prepare(batches).await?;
             let committed = self.commit(staged, kafka_offsets).await?;
             // CONN-1: Now that data is durable, write the version-hint.
-            if let Ok(table) = self.catalog.load_table(&self.ident).await {
-                if let Some(loc) = table.metadata_location() {
-                    if let Err(e) = self.update_version_hint(loc) {
-                        tracing::warn!(
-                            table = %self.ident,
-                            location = loc,
-                            error = %e,
-                            "version hint update failed after overwrite commit; hint may be stale"
-                        );
-                    }
-                }
+            if let Ok(table) = self.catalog.load_table(&self.ident).await
+                && let Some(loc) = table.metadata_location()
+                && let Err(e) = self.update_version_hint(loc)
+            {
+                tracing::warn!(
+                    table = %self.ident,
+                    location = loc,
+                    error = %e,
+                    "version hint update failed after overwrite commit; hint may be stale"
+                );
             }
             Ok(committed)
         }
@@ -410,16 +409,16 @@ pub mod native {
             // Persist the new metadata location as a best-effort recovery hint.
             // The transaction is already committed and durable in the catalog;
             // a hint-write failure must not surface as a commit failure.
-            if let Some(loc) = committed.metadata_location() {
-                if let Err(e) = self.update_version_hint(loc) {
-                    tracing::warn!(
-                        table = %self.ident,
-                        location = loc,
-                        error = %e,
-                        "version hint update failed after successful commit; \
-                         hint file may be stale — data is durable in the catalog"
-                    );
-                }
+            if let Some(loc) = committed.metadata_location()
+                && let Err(e) = self.update_version_hint(loc)
+            {
+                tracing::warn!(
+                    table = %self.ident,
+                    location = loc,
+                    error = %e,
+                    "version hint update failed after successful commit; \
+                     hint file may be stale — data is durable in the catalog"
+                );
             }
 
             committed
@@ -444,7 +443,10 @@ pub mod native {
     /// CONN-2: Atomically write the version-hint file (temp + fsync + rename +
     /// dir-sync) so a crash or power loss cannot leave a torn hint that makes
     /// the table unopenable.
-    pub(crate) fn write_version_hint(root: &Path, metadata_location: &str) -> Result<(), LakehouseError> {
+    pub(crate) fn write_version_hint(
+        root: &Path,
+        metadata_location: &str,
+    ) -> Result<(), LakehouseError> {
         let dir = root.join("metadata");
         let target = dir.join(VERSION_HINT);
         let temp = dir.join(format!(
@@ -457,7 +459,8 @@ pub mod native {
         ));
         fs::write(&temp, metadata_location).map_err(|e| LakehouseError::Io(e.to_string()))?;
         let f = fs::File::open(&temp).map_err(|e| LakehouseError::Io(e.to_string()))?;
-        f.sync_all().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        f.sync_all()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         drop(f);
         fs::rename(&temp, &target).map_err(|e| LakehouseError::Io(e.to_string()))?;
         // Sync the parent directory so the rename is durable.
