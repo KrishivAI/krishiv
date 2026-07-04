@@ -236,11 +236,9 @@ impl Trace {
                 // and skipped every batch, making GC a universal no-op.
                 let mask: BooleanArray = {
                     let make_mask = |extract: &dyn Fn(&dyn Array, usize) -> Option<i64>| {
-                        Some(
-                            (0..data.num_rows())
-                                .map(|r| Some(extract(ts_col, r)? < watermark_ms))
-                                .collect::<Option<Vec<_>>>()?,
-                        )
+                        (0..data.num_rows())
+                            .map(|r| Some(extract(ts_col, r)? < watermark_ms))
+                            .collect::<Option<Vec<_>>>()
                     };
                     if let Some(arr) = ts_col.as_any().downcast_ref::<Int64Array>() {
                         let m: BooleanArray = arr

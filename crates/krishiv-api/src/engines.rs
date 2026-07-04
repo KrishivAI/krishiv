@@ -475,16 +475,10 @@ impl ComputeEngine for IncrementalEngine {
             Ok(())
         };
 
-        // Drive the first source (whose reader we already opened) to EOF.
-        if first_batch.num_rows() > 0 {
-            step_and_emit(&flow, &first_source.name, &first_batch, &mut writers).await?;
-        }
-        while let Some(changelog) = first_reader.next_changelog().await? {
-            step_and_emit(&flow, &first_source.name, &changelog, &mut writers).await?;
-        }
-
-        // Drive every other source to EOF with the same streaming path.
-        for spec in job.sources.get(1..).unwrap_or(&[]) {
+        // Drive ALL sources to EOF with the same streaming path.
+        // (IVM-8: the schema-seeding loop above opened and consumed one batch
+        // from each source; re-open for the full drain.)
+        for spec in &job.sources {
             let mut reader = rt.sources.open(spec).await?;
             while let Some(changelog) = reader.next_changelog().await? {
                 if let Some(first) = source_schemas.iter_mut().find(|(n, _)| n == &spec.name) {
@@ -1264,7 +1258,15 @@ async fn run_streaming_continuous(
                             operator_state,
                             source_offsets,
                             in_flight: Vec::new(),
-                            source_in_flight: Vec::new(),
+                            // STREAM-5: Capture source in-flight data for
+                            // exactly-once recovery, matching the final stop
+                            // checkpoint path. Previously this was always empty,
+                            // degrading exactly-once to at-least-once on crash.
+                            source_in_flight: setup
+                                .reader
+                                .snapshot_in_flight()
+                                .map(|records| vec![(setup.source_name.clone(), records)])
+                                .unwrap_or_default(),
                         };
                         let checkpoint_svc = Arc::clone(&rt.checkpoint);
                         let job_id = setup.handle.job_id().clone();

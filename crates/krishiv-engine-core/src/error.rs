@@ -37,11 +37,32 @@ impl EngineError {
     /// Returns `true` for errors that may be transient (network blips, executor
     /// restarts) and for which the caller should retry. Structural errors
     /// (`InvalidJob`, `Unsupported`) are never transient.
+    ///
+    /// BATCH-1: Previously ALL `Runtime` and `Source` errors were classified as
+    /// transient, causing permanent failures (SQL parse errors, "table not
+    /// found", "source produced no batches") to be retried 3× with backoff.
+    /// Now only checkpoint I/O errors and runtime/source errors whose message
+    /// contains transient indicators (connection, timeout, reset, unavailable)
+    /// are considered retryable.
     pub fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            Self::Runtime(_) | Self::Source(_) | Self::Checkpoint(_)
-        )
+        match self {
+            Self::Checkpoint(_) => true,
+            Self::Runtime(msg) | Self::Source(msg) => {
+                let lower = msg.to_lowercase();
+                lower.contains("connection")
+                    || lower.contains("connect")
+                    || lower.contains("timeout")
+                    || lower.contains("timed out")
+                    || lower.contains("reset")
+                    || lower.contains("unavailable")
+                    || lower.contains("broken pipe")
+                    || lower.contains("temporary")
+                    || lower.contains("retry")
+                    || lower.contains("transport")
+                    || lower.contains("rpc")
+            }
+            _ => false,
+        }
     }
 }
 

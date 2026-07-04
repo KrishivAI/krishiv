@@ -13,7 +13,8 @@ use arrow_flight::sql::{
     ActionBeginTransactionRequest, ActionBeginTransactionResult,
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
     ActionCreatePreparedStatementResult, ActionEndTransactionRequest, CommandGetCatalogs,
-    CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTables, CommandPreparedStatementQuery,
+    CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables,
+    CommandPreparedStatementQuery,
     CommandStatementQuery, DoPutPreparedStatementResult, EndTransaction, ProstMessageExt, SqlInfo,
     TicketStatementQuery,
 };
@@ -147,6 +148,14 @@ fn read_max_concurrent_queries() -> Option<usize> {
     if n == 0 { None } else { Some(n) }
 }
 
+/// API-1: Read the result-size cap from the environment.
+fn read_max_result_bytes() -> usize {
+    std::env::var(FLIGHT_MAX_RESULT_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FLIGHT_MAX_RESULT_BYTES)
+}
+
 impl std::fmt::Debug for KrishivFlightSqlService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KrishivFlightSqlService")
@@ -178,6 +187,7 @@ impl KrishivFlightSqlService {
             bound_params: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             transactions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
+            max_result_bytes: read_max_result_bytes(),
         })
     }
 
@@ -192,6 +202,7 @@ impl KrishivFlightSqlService {
             bound_params: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             transactions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
+            max_result_bytes: read_max_result_bytes(),
         }
     }
 
@@ -481,6 +492,19 @@ impl FlightSqlService for KrishivFlightSqlService {
                 .map_err(|e| Status::internal(e.to_string()))?
             // _permit drops here
         };
+
+        // API-1: Enforce a result-size cap to prevent server OOM from
+        // unbounded `SELECT *` queries. Bypasses the 2 GiB batch-engine cap.
+        if self.max_result_bytes > 0 {
+            let total: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+            if total > self.max_result_bytes {
+                return Err(Status::resource_exhausted(format!(
+                    "Flight SQL result ({} bytes) exceeds maximum ({} bytes); \
+                     add a LIMIT clause or raise {}",
+                    total, self.max_result_bytes, FLIGHT_MAX_RESULT_BYTES_ENV
+                )));
+            }
+        }
 
         let schema: Arc<Schema> = batches
             .first()
@@ -946,6 +970,54 @@ impl FlightSqlService for KrishivFlightSqlService {
         self.authenticate_request(&request)?;
         let mut builder = query.into_builder();
         builder.append("krishiv");
+        let batch = builder
+            .build()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let schema = batch.schema();
+        let flight_data = batches_to_flight_data(schema.as_ref(), vec![batch])
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(Ok::<FlightData, Status>);
+        let stream: Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>> =
+            Box::pin(stream::iter(flight_data));
+        Ok(Response::new(stream))
+    }
+
+    /// Return FlightInfo for a `GetTableTypes` request. BI tools and the
+    /// Flight SQL JDBC driver call this while introspecting the catalog
+    /// (platform gap G1); mirrors `get_flight_info_catalogs`.
+    async fn get_flight_info_table_types(
+        &self,
+        query: CommandGetTableTypes,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        self.authenticate_request(&request)?;
+        let flight_descriptor = request.into_inner();
+        let ticket_bytes = query.as_any().encode_to_vec();
+        let schema = query.into_builder().schema();
+        let ticket = Ticket {
+            ticket: ticket_bytes.into(),
+        };
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
+    }
+
+    /// Stream the list of table types. Krishiv exposes a single `TABLE`
+    /// type, matching `do_get_tables`, which reports `TABLE` for every
+    /// registered table.
+    async fn do_get_table_types(
+        &self,
+        query: CommandGetTableTypes,
+        request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        self.authenticate_request(&request)?;
+        let mut builder = query.into_builder();
+        builder.append("TABLE");
         let batch = builder
             .build()
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -1679,6 +1751,29 @@ mod metadata_rpc_tests {
             .downcast_ref::<arrow::array::StringArray>()
             .expect("catalog_name column");
         assert_eq!(names.value(0), "krishiv");
+    }
+
+    #[tokio::test]
+    async fn table_types_lists_table() {
+        let svc = service();
+        let batches = collect_batches(
+            svc.do_get_table_types(
+                CommandGetTableTypes {},
+                Request::new(Ticket::new(Vec::new())),
+            )
+            .await
+            .expect("do_get_table_types"),
+        )
+        .await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        let types = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("table_type column");
+        assert_eq!(types.value(0), "TABLE");
     }
 }
 

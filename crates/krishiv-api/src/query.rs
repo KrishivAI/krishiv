@@ -147,9 +147,17 @@ impl QueryHandle {
         self.state_rx.borrow().progress
     }
 
-    /// Request cancellation. Returns immediately; the task may not stop instantly.
+    /// Request cancellation. Returns immediately; the task is aborted.
+    ///
+    /// API-2: Previously this only sent a watch signal that was checked once
+    /// before the query started — it had no effect on a running query. Now
+    /// it also aborts the spawned task for immediate effect.
     pub fn cancel(&self) {
         let _ = self.cancel_tx.send(true);
+        // API-2: Abort the spawned task so a running query actually stops.
+        if let Some(task) = &self._task {
+            task.abort();
+        }
     }
 
     /// Await completion and return the [`QueryResult`].
@@ -212,12 +220,25 @@ impl QueryHandle {
     }
 
     /// Await completion with a timeout.
-    pub async fn wait_timeout(self, timeout: std::time::Duration) -> Result<QueryResult> {
-        tokio::time::timeout(timeout, self.wait())
-            .await
-            .map_err(|_| KrishivError::Runtime {
-                message: "query timed out".to_string(),
-            })?
+    /// Await completion with a timeout.
+    ///
+    /// API-4: On timeout, the background task is aborted to prevent a
+    /// resource leak. Previously the task kept running after the timeout.
+    pub async fn wait_timeout(mut self, timeout: std::time::Duration) -> Result<QueryResult> {
+        // API-4: Take the task handle before wait() consumes self, so we can
+        // abort it on timeout to prevent a resource leak.
+        let task = self._task.take();
+        match tokio::time::timeout(timeout, self.wait()).await {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(task) = task {
+                    task.abort();
+                }
+                Err(KrishivError::Runtime {
+                    message: "query timed out".to_string(),
+                })
+            }
+        }
     }
 }
 

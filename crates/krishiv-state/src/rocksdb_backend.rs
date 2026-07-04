@@ -50,7 +50,7 @@ impl RocksDbStateBackend {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(64);
-        opts.set_write_buffer_size(write_buffer_mb as usize * 1024 * 1024);
+        opts.set_write_buffer_size(write_buffer_mb * 1024 * 1024);
         opts.set_max_write_buffer_number(3);
         let max_open_files = std::env::var("KRISHIV_ROCKSDB_MAX_OPEN_FILES")
             .ok()

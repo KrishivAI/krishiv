@@ -8,6 +8,16 @@ use krishiv_proto::{
     StageSpec, TaskId, TaskSpec,
 };
 
+/// BATCH-5: Configurable batch SQL timeout (env `KRISHIV_BATCH_SQL_TIMEOUT_SECS`,
+/// default 300s).
+fn batch_sql_timeout() -> Duration {
+    std::env::var("KRISHIV_BATCH_SQL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(300))
+}
+
 use crate::{SchedulerError, SchedulerResult, SharedCoordinator};
 
 const BATCH_SQL_JOB_PREFIX: &str = "batch-sql-";
@@ -62,7 +72,7 @@ pub async fn execute_batch_sql_coordinated(
         coord.notify().clone()
     };
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now() + batch_sql_timeout();
     loop {
         if tokio::time::Instant::now() >= deadline {
             let _ = coordinator.write().await.cancel_job(&job_id);
@@ -136,7 +146,7 @@ pub async fn execute_batch_sql_sink_coordinated(
         coord.notify().clone()
     };
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now() + batch_sql_timeout();
     loop {
         if tokio::time::Instant::now() >= deadline {
             let _ = coordinator.write().await.cancel_job(&job_id);
@@ -205,8 +215,13 @@ async fn submit_batch_sql_job_inner(
 ) -> SchedulerResult<JobId> {
     use base64::Engine as _;
 
+    // BATCH-4: Append a process-unique counter to avoid job-ID collisions
+    // when two batch SQL jobs are submitted in the same millisecond.
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static BATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = BATCH_SEQ.fetch_add(1, AtomicOrdering::SeqCst);
     let job_id = JobId::try_new(format!(
-        "{BATCH_SQL_JOB_PREFIX}{}",
+        "{BATCH_SQL_JOB_PREFIX}{}-{seq}",
         krishiv_common::async_util::unix_now_ms()
     ))
     .map_err(|error| SchedulerError::InvalidJob {

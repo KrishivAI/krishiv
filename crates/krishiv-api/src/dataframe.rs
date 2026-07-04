@@ -668,7 +668,10 @@ Execution statistics:
         let (mut handle, driver) = crate::query::QueryHandle::new(id);
         let task = tokio::spawn(async move {
             driver.set_running();
+            // BATCH-7: if cancelled before execution starts, set the terminal
+            // status so wait() returns a clean cancellation error.
             if driver.is_cancelled() {
+                driver.set_failed("cancelled before execution started");
                 return;
             }
             match self.collect_async().await {
