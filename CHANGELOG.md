@@ -34,7 +34,31 @@ Semantic Versioning as described in `docs/RELEASE.md`.
   409'd forever.
 - A `Cancelled` continuous-cycle task now releases the input-cycle fence like
   a `Failed` one (previously only Succeeded/Failed cleared it).
-
+- **Continuous-job recovery after executor loss**, found live via the
+  Krishiv Platform executor fault loop (`tests/e2e/pipelines/fault_loop.py
+  MODE=executor`): (1) the input-cycle fence (`continuous_input_cycles`)
+  used to stay stuck forever if the executor holding the task was lost
+  before it ever sent a terminal status update — `advance_heartbeat_tick`
+  now releases it once a tick evicts the executor and the task shows no
+  assignment; (2) a continuous task's `assigned_executor` is sticky across
+  cycles by design, so once its executor was evicted and reset to
+  `Pending`, nothing retried placement unless a *new* executor happened to
+  register afterward — `reset_running_tasks_for_lost_executor` now treats
+  an idle (`Succeeded`, between-cycles) continuous task the same as
+  `Running`/`Assigned` for reassignment purposes; (3) a freshly reassigned
+  task started with an empty accumulator, silently losing whatever the job
+  had accumulated — the coordinator now seeds `pending_continuous_restores`
+  from the job's latest persisted `ContinuousSnapshot` at reassignment
+  time, the same recovery a manual `/restore` call would give, automatically;
+  also, deregister now clears a job's persisted snapshot so a later job
+  reusing the same id doesn't silently inherit a stale watermark; (4) the
+  generic background task-launch loop doesn't understand continuous jobs
+  are driven exclusively by an explicit `continuous-push` — it would
+  auto-dispatch a spurious extra cycle the moment reassignment (2) set the
+  task `Assigned`, racing the next real push — `should_consider_for_launch`
+  now excludes streaming jobs outright. Result: zero data corruption or
+  loss across ~40 live executor-kill iterations after all four fixes,
+  versus consistent corruption/loss before them.
 - Coordinator HTTP `POST /api/v1/continuous-register-sql`: register a continuous
   windowed streaming job from **SQL** (`SELECT key, AGG(col) FROM TUMBLE/HOP/
   SESSION(TABLE src, DESCRIPTOR(ts), <ms>) GROUP BY …`). The coordinator compiles
