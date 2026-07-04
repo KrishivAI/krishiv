@@ -68,8 +68,10 @@ impl VectorSink for PineconeSink {
             })
             .collect();
         let mut body = json!({ "vectors": vectors });
-        if let Some(ns) = &self.namespace {
-            body["namespace"] = json!(ns);
+        if let Some(ns) = &self.namespace
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("namespace".to_string(), json!(ns));
         }
         let base = self.host.trim_end_matches('/');
         let url = if base.starts_with("http://") || base.starts_with("https://") {
@@ -97,8 +99,10 @@ impl VectorSink for PineconeSink {
 
     async fn delete_by_ids(&self, ids: &[String]) -> VectorSinkResult<()> {
         let mut body = json!({ "ids": ids });
-        if let Some(ns) = &self.namespace {
-            body["namespace"] = json!(ns);
+        if let Some(ns) = &self.namespace
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("namespace".to_string(), json!(ns));
         }
         let base = self.host.trim_end_matches('/');
         let url = if base.starts_with("http://") || base.starts_with("https://") {
@@ -138,8 +142,10 @@ impl VectorSink for PineconeSink {
             "topK": top_k,
             "includeMetadata": true,
         });
-        if let Some(ns) = &self.namespace {
-            body["namespace"] = json!(ns);
+        if let Some(ns) = &self.namespace
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("namespace".to_string(), json!(ns));
         }
         let url = format!("https://{}/query", self.host);
         let response = self
