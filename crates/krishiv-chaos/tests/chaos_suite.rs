@@ -669,3 +669,151 @@ fn multi_executor_shuffle_failure_triggers_reshuffle() {
         "exec-1 recovers"
     );
 }
+
+// ── G6: IVM restart correctness (permanent kill-loop gate) ────────────────────
+//
+// The Spike B scenario (tests/e2e/spikes/spike_b_ivm_kill.py) made a permanent
+// in-process CI gate. A maintained GROUP BY view is checkpointed, its flow is
+// destroyed (simulating a coordinator/executor restart), rebuilt from the
+// checkpoint, and fed a fresh delta — repeatedly. The view must converge to the
+// same running total a never-restarted flow would hold. This is the pipelines
+// product promise; a regression here (e.g. losing incremental-operator
+// accumulator state across restore) must fail CI, not a manual spike run.
+
+use std::sync::Arc;
+
+use arrow::array::{Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use krishiv_ivm::{DeltaBatch, IncrementalViewSpec};
+use krishiv_scheduler::IvmJobRegistry;
+
+fn g6_orders(regions: &[&str], amounts: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(regions.to_vec())),
+            Arc::new(Int64Array::from(amounts.to_vec())),
+        ],
+    )
+    .expect("g6 orders batch")
+}
+
+fn g6_revenue_spec() -> IncrementalViewSpec {
+    IncrementalViewSpec {
+        name: "revenue".into(),
+        body_sql: "SELECT region, SUM(amount) AS total FROM orders GROUP BY region".into(),
+        output_schema: Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("total", DataType::Float64, true),
+        ])),
+        is_materialized: true,
+        is_recursive: false,
+        lateness: vec![],
+    }
+}
+
+fn g6_view_total(reg: &IvmJobRegistry, job: &str) -> f64 {
+    let snap = reg
+        .get(job)
+        .expect("job present")
+        .snapshot("revenue")
+        .expect("snapshot ok")
+        .expect("materialized snapshot after step");
+    snap.column_by_name("total")
+        .expect("total column")
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("total is f64")
+        .iter()
+        .map(|v| v.unwrap_or(0.0))
+        .sum()
+}
+
+/// Register the view, feed the seed batch (total 185), and step once.
+async fn g6_seed(reg: &IvmJobRegistry, job: &str) {
+    reg.create(job.to_string()).expect("create job");
+    reg.register_view(job, g6_revenue_spec()).expect("register view");
+    reg.get(job)
+        .expect("job")
+        .feed(
+            "orders",
+            DeltaBatch::from_inserts(g6_orders(&["US", "EU", "US", "APAC"], &[100, 50, 25, 10]))
+                .expect("seed delta"),
+        )
+        .expect("feed seed");
+    reg.get(job)
+        .expect("job")
+        .step_datafusion()
+        .await
+        .expect("step seed");
+}
+
+/// N-iteration kill loop over the coordinator IVM registry. Each iteration
+/// checkpoints, optionally destroys+recreates the flow (a real restart), then
+/// restores, feeds +2, and asserts the maintained view converges exactly.
+async fn g6_kill_loop(recreate: bool, iterations: usize) {
+    let reg = IvmJobRegistry::with_default_shards(4); // force partitioned shards
+    let job = "g6-killloop";
+    g6_seed(&reg, job).await;
+    let mut running = g6_view_total(&reg, job);
+    assert!(
+        (running - 185.0).abs() < 1e-9,
+        "pre-restart total wrong: {running}"
+    );
+
+    for i in 0..iterations {
+        let cp = reg
+            .get(job)
+            .expect("job")
+            .checkpoint_full()
+            .expect("checkpoint_full");
+        if recreate {
+            // Destroy all in-memory flow state, then rebuild the view fresh —
+            // the coordinator-restart recovery path.
+            assert!(reg.delete(job), "job existed to delete");
+            reg.create(job.to_string()).expect("recreate job");
+            reg.register_view(job, g6_revenue_spec())
+                .expect("re-register view");
+        }
+        reg.get(job)
+            .expect("job")
+            .restore_full(&cp)
+            .expect("restore_full");
+        reg.get(job)
+            .expect("job")
+            .feed(
+                "orders",
+                DeltaBatch::from_inserts(g6_orders(&["US", "EU"], &[1, 1])).expect("delta"),
+            )
+            .expect("feed delta");
+        reg.get(job)
+            .expect("job")
+            .step_datafusion()
+            .await
+            .expect("step");
+        running += 2.0;
+        let got = g6_view_total(&reg, job);
+        assert!(
+            (got - running).abs() < 1e-9,
+            "G6 kill loop diverged at iteration {i} (recreate={recreate}): \
+             total={got} expected={running} — IVM lost state across restart"
+        );
+    }
+}
+
+/// G6 gate — restore into the live flow, 50 iterations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g6_ivm_restart_restore_into_live_flow_converges() {
+    g6_kill_loop(false, 50).await;
+}
+
+/// G6 gate — full destroy → recreate → restore (coordinator restart), 50
+/// iterations. This is the path that regressed when incremental-operator
+/// accumulator state was not part of the checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g6_ivm_restart_recreate_flow_converges() {
+    g6_kill_loop(true, 50).await;
+}
