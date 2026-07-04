@@ -263,6 +263,34 @@ pub async fn api_continuous_get(
     Ok(Json(view))
 }
 
+#[derive(Debug, Serialize)]
+pub struct ContinuousDeregisterResponse {
+    pub cancelled: bool,
+}
+
+/// Tear down a continuous streaming job: cancel it (stops the loop and pushes
+/// the cancel RPC to the executor), then evict it from the registry so its
+/// `job_id` is freed for re-registration — cancel alone leaves a terminal
+/// tombstone that would make a later register of the same id conflict. This is
+/// the teardown leg the pipeline reconciler drives when a windowed streaming
+/// table is dropped or replaced. Verifies the job is a streaming job before
+/// cancelling, so an errant DELETE cannot cancel a batch/IVM job.
+pub async fn api_continuous_deregister(
+    State(coordinator): State<SharedCoordinator>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ContinuousDeregisterResponse>, StatusCode> {
+    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut coord = coordinator.write().await;
+    // Confirm it exists and is a streaming job (404 if unknown, 409 otherwise).
+    continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?;
+    coord
+        .cancel_job(&job_id)
+        .map_err(|error| scheduler_status(&error))?;
+    // Cancel is terminal → evict removes it from `job_coordinators`, freeing the id.
+    coord.evict_completed_job(&job_id);
+    Ok(Json(ContinuousDeregisterResponse { cancelled: true }))
+}
+
 pub async fn api_continuous_checkpoint(
     State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,

@@ -24,10 +24,26 @@ Semantic Versioning as described in `docs/RELEASE.md`.
   which the materialized source snapshot (a set, not a multiset) cannot capture.
   Verified live on k8s: `spike_b_ivm_kill.py --recreate` converges over 50
   destroy→rebuild→restore cycles (G6/F4).
+- Coordinator HTTP `DELETE /api/v1/continuous/{job_id}`: deregister (cancel and
+  tear down) a continuous windowed streaming job by id. Mirrors the IVM
+  view-drop endpoint so an external reconciler can converge a windowed streaming
+  table by removing it. Verified live on k8s as part of the pipeline reconcile
+  Drop path (`streams: []` after drop).
 
 ### Changed
 
 ### Fixed
+
+- Coordinator `submit_job` now **replaces** a terminal (Cancelled/Failed/
+  Succeeded) job that shares the incoming job id instead of rejecting it as a
+  `DuplicateJob`. `cancel_job` marks a job GC-ready but keeps it in the registry
+  until the next GC tick, so a delete-then-recreate flow (e.g. a reconciler
+  Replace: `DELETE /api/v1/continuous/{id}` then re-register the same id) raced
+  the GC and hit `409 Conflict`, leaving the replacement job `Cancelled`.
+  `submit_job` now evicts the terminal same-id job up front; a still-live same-id
+  job is still rejected as a duplicate. Regression test
+  `submit_job_replaces_a_terminal_job_with_the_same_id`; verified live on k8s
+  (reconcile Replace converges to a `Running` job with the new window spec).
 
 - IVM: a checkpoint-restored flow no longer loses its incremental aggregate
   accumulator, which previously made the second recreate-recovery cycle diverge

@@ -199,6 +199,54 @@ fn cancel_job_marks_active_tasks_cancelled() {
 }
 
 #[test]
+fn submit_job_replaces_a_terminal_job_with_the_same_id() {
+    // A pipeline reconcile deregisters (cancels) a live job, then re-registers
+    // the same id. cancel_job marks the job GC-ready but keeps it in the
+    // registry, so re-submission must evict the terminal job rather than reject
+    // it as a duplicate (previously a 409 until the background GC tick ran).
+    let executor_id = ExecutorId::try_new("exec-1").unwrap();
+    let job_id = JobId::try_new("job-replace").unwrap();
+    let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+    coordinator
+        .register_executor(ExecutorDescriptor::new(executor_id, "pod-a", 1))
+        .unwrap();
+    coordinator
+        .submit_job(demo_job_with_id(job_id.clone()))
+        .unwrap();
+    coordinator.launch_assigned_tasks(&job_id).unwrap();
+    coordinator.cancel_job(&job_id).unwrap();
+    assert!(
+        coordinator
+            .job_detail_snapshot(&job_id)
+            .unwrap()
+            .job()
+            .state()
+            .is_terminal()
+    );
+
+    // Re-submitting the same id succeeds (evicts the cancelled job) rather than
+    // failing DuplicateJob.
+    coordinator
+        .submit_job(demo_job_with_id(job_id.clone()))
+        .expect("re-submit of a terminal job id must replace it, not 409");
+    assert!(
+        !coordinator
+            .job_detail_snapshot(&job_id)
+            .unwrap()
+            .job()
+            .state()
+            .is_terminal(),
+        "the replacement job must be a fresh, non-terminal job"
+    );
+
+    // A *live* job with the same id is still a genuine duplicate.
+    let err = coordinator
+        .submit_job(demo_job_with_id(job_id.clone()))
+        .unwrap_err();
+    assert!(matches!(err, SchedulerError::DuplicateJob { .. }), "got {err:?}");
+}
+
+#[test]
 fn task_output_metadata_is_visible_in_job_detail_snapshot() {
     let executor_id = ExecutorId::try_new("exec-1").unwrap();
     let job_id = JobId::try_new("job-output-meta").unwrap();

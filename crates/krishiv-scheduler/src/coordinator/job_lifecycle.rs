@@ -20,10 +20,21 @@ impl Coordinator {
         self.ensure_active()?;
         validate_job(&spec)?;
 
-        if self.job_coordinators.contains_key(spec.job_id()) {
-            return Err(SchedulerError::DuplicateJob {
-                job_id: spec.job_id().clone(),
-            });
+        if let Some(existing) = self.job_coordinators.get(spec.job_id()) {
+            // A terminal (Cancelled/Failed/Succeeded) job with this id is being
+            // replaced: evict it now so the id is immediately reusable instead
+            // of waiting for the background GC tick. This is what a pipeline
+            // reconcile does when it re-registers a streaming job it just
+            // deregistered (cancel marks the job GC-ready but keeps it in the
+            // registry). A live job is still a genuine duplicate.
+            if existing.read_record().state().is_terminal() {
+                let job_id = spec.job_id().clone();
+                self.evict_completed_job(&job_id);
+            } else {
+                return Err(SchedulerError::DuplicateJob {
+                    job_id: spec.job_id().clone(),
+                });
+            }
         }
 
         // Admission control: queued jobs are persisted as visible job records
