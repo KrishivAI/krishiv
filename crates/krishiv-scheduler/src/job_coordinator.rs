@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::job::JobRecord;
-use krishiv_proto::{ExecutorId, JobId, TaskState};
+use krishiv_proto::{ExecutorId, JobId, JobKind, TaskState};
 
 /// Default heartbeat staleness threshold in milliseconds (30 seconds).
 const DEFAULT_HEARTBEAT_STALE_MS: u64 = 30_000;
@@ -203,6 +203,23 @@ impl JobCoordinator {
         if job.state().is_terminal() {
             return false;
         }
+        // Streaming (`stream:loop`) jobs are launched exclusively by the
+        // explicit continuous-push handler (`api_continuous_push`'s own
+        // `prepare_continuous_input_cycle` + `launch_assigned_task_assignments`
+        // call, synchronous within that HTTP request), never by this generic
+        // background driving loop. This matters once a continuous task is
+        // reassigned to a healthy executor after its previous one was lost
+        // (`assign_pending_tasks` sets it `Assigned`, exactly the state this
+        // check otherwise treats as "ready to just launch") — with no
+        // exclusion here, this loop raced the reassignment, auto-dispatching
+        // a spurious extra cycle (consuming the restore hint seeded for it)
+        // before the next real push arrived, found live via the Phase-20
+        // executor fault loop as an open, unresolved intermittent failure.
+        // Streaming jobs get their first placement eagerly at submission
+        // time (`submit_job`) and need nothing further from this loop.
+        if job.spec.kind() == JobKind::Streaming {
+            return false;
+        }
         job.stages().iter().any(|stage| {
             stage.tasks().iter().any(|task| {
                 task.assigned_executor.is_some()
@@ -263,7 +280,7 @@ impl JobCoordinator {
 mod tests {
     use super::*;
     use crate::job::JobRecord;
-    use krishiv_proto::{JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+    use krishiv_proto::{JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 
     fn make_job_coordinator(job_id: &str, task_count: usize) -> JobCoordinator {
         let jid = JobId::try_new(job_id).unwrap();
@@ -363,6 +380,40 @@ mod tests {
         jc.write_record().state = krishiv_proto::JobState::Succeeded;
         rt.block_on(async {
             assert!(!jc.should_consider_for_launch().await);
+        });
+    }
+
+    /// A streaming job's task can look exactly like a normal "assigned,
+    /// ready to launch" task — e.g. right after `assign_pending_tasks`
+    /// reassigns it to a healthy executor following an executor loss (this
+    /// is precisely the state that reassignment leaves it in). The generic
+    /// background driving loop (`drive_pending_task_launches`) must never
+    /// auto-launch it anyway: continuous jobs are driven exclusively by an
+    /// explicit `continuous-push`, and letting this loop dispatch a cycle on
+    /// its own raced that explicit push and consumed a seeded restore via a
+    /// spurious extra cycle (found live via the Phase-20 executor fault
+    /// loop).
+    #[test]
+    fn should_consider_for_launch_excludes_streaming_jobs_even_when_assigned() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let jc = make_job_coordinator("streaming-assigned-test", 1);
+        {
+            let mut record = jc.write_record();
+            let executor_id = ExecutorId::try_new("exec-1").unwrap();
+            for stage in record.stages_mut() {
+                for task in stage.tasks_mut() {
+                    task.assigned_executor = Some(executor_id.clone());
+                    task.state = TaskState::Assigned;
+                    task.launch_in_flight = false;
+                }
+            }
+        }
+        rt.block_on(async {
+            assert!(
+                !jc.should_consider_for_launch().await,
+                "an assigned, launch-ready streaming task must still be excluded — \
+                 only the explicit continuous-push handler may launch it"
+            );
         });
     }
 }

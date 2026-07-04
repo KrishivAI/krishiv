@@ -294,6 +294,11 @@ pub async fn api_continuous_deregister(
         .map_err(|error| scheduler_status(&error))?;
     // Cancel is terminal → evict removes it from `job_coordinators`, freeing the id.
     coord.evict_completed_job(&job_id);
+    // A job id can be reused (a fresh `continuous-register-sql` with the same
+    // id after deregister is a normal, supported pattern). Clear the retired
+    // job's persisted checkpoint so the next job with this id starts clean
+    // instead of silently inheriting a stale watermark/state.
+    coord.remove_continuous_snapshot(job_id.as_str());
     Ok(Json(ContinuousDeregisterResponse { cancelled: true }))
 }
 
@@ -1346,5 +1351,107 @@ mod tests {
              holding the task is lost mid-cycle, or every future push 409s"
         );
         assert!(!coord.job_input_partitions.contains_key(&job_id));
+    }
+
+    /// Real-world root cause (found live via the Phase-20 executor fault
+    /// loop, distinct from the fence bug above): placement onto a healthy
+    /// executor (`assign_pending_tasks_for_schedulable_jobs`) is otherwise
+    /// only ever triggered by a NEW executor *registering*. A completed
+    /// cycle's task keeps its `assigned_executor` set (by design — sticky
+    /// placement across cycles) until the heartbeat clock evicts that
+    /// executor and resets the task to `Pending`. If a replacement executor
+    /// already registered *before* that eviction tick fires — the ordinary
+    /// case, since eviction takes `heartbeat_timeout_ticks` ticks while a
+    /// k8s replacement pod registers within seconds — that registration
+    /// event is already in the past, and nothing else ever re-attempts
+    /// placement: the task sits `Pending`/unassigned forever, and
+    /// `prepare_continuous_input_cycle` permanently rejects every future
+    /// push ("not idle and ready for input"). Fixed by extending
+    /// `reset_running_tasks_for_lost_executor`'s state match to include a
+    /// continuous task's idle `Succeeded` state, so the existing per-job
+    /// reassignment sweep picks it up immediately.
+    #[tokio::test]
+    async fn heartbeat_tick_reassigns_task_to_already_registered_executor_after_loss() {
+        use krishiv_proto::{ExecutorDescriptor, ExecutorId, TaskState};
+
+        let coordinator = make_coordinator_with_executor("reassign").await;
+
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-reassign-job".into(),
+                spec: tumbling_spec(),
+            }),
+        )
+        .await
+        .unwrap();
+        let job_id = krishiv_proto::JobId::try_new("cs-reassign-job").unwrap();
+
+        // Run one cycle to completion (Succeeded) on the fixture's sole
+        // executor — the task's `assigned_executor` stays set to it
+        // afterward (sticky placement), matching real behavior.
+        let assignment = prepare_cycle(&coordinator, "cs-reassign-job").await;
+        let original_executor = assignment.executor_id().clone();
+        let succeeded = krishiv_proto::TaskStatusUpdate::new(
+            job_id.clone(),
+            assignment.stage_id().clone(),
+            assignment.task_id().clone(),
+            assignment.executor_id().clone(),
+            TaskState::Succeeded,
+            assignment.attempt_id().as_u32(),
+        )
+        .with_lease_generation(assignment.lease_generation());
+        coordinator
+            .write()
+            .await
+            .apply_task_update(succeeded)
+            .unwrap();
+
+        // Advance 2 ticks (default `heartbeat_timeout_ticks` is 3, so
+        // `original_executor` is not yet stale), *then* register the
+        // replacement — giving it a fresher heartbeat baseline, exactly like
+        // a k8s replacement pod registering only after the old one has
+        // already gone quiet for a while. One more tick pushes
+        // `original_executor` past the threshold (3 - 0 >= 3) while
+        // `replacement_id` stays comfortably under it (3 - 2 < 3).
+        coordinator.advance_heartbeat_tick().await.unwrap();
+        coordinator.advance_heartbeat_tick().await.unwrap();
+
+        let replacement_id = ExecutorId::try_new("exec-cs-reassign-replacement").unwrap();
+        let replacement_desc = ExecutorDescriptor::new(replacement_id.clone(), "localhost", 4)
+            .with_task_endpoint(crate::IN_PROCESS_TASK_ENDPOINT);
+        coordinator
+            .write()
+            .await
+            .register_executor(replacement_desc)
+            .unwrap();
+
+        let evicted = coordinator.advance_heartbeat_tick().await.unwrap();
+        assert!(
+            evicted.contains(&original_executor),
+            "this tick must be the one that evicts the original executor"
+        );
+
+        let coord = coordinator.read().await;
+        let jc = coord.job_coordinator(&job_id).unwrap();
+        let record = jc.read_record();
+        let task = record
+            .stages()
+            .iter()
+            .flat_map(|s| s.tasks())
+            .find(|t| t.task_id() == assignment.task_id())
+            .unwrap();
+        assert_ne!(
+            task.assigned_executor(),
+            Some(&original_executor),
+            "the lost executor must not still be the assignment"
+        );
+        assert_eq!(
+            task.assigned_executor(),
+            Some(&replacement_id),
+            "the task must be reassigned to the already-registered healthy \
+             executor immediately on eviction, not left unassigned forever \
+             waiting for a registration event that already happened"
+        );
     }
 }

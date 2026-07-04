@@ -1549,6 +1549,21 @@ impl NonBlockingStoreHandle {
         self.inner().load_continuous_snapshot(job_id)
     }
 
+    /// Remove a persisted continuous job snapshot (synchronous — deregistration
+    /// is infrequent, no need for the async write channel). Without this, a
+    /// deregistered job's snapshot lingers in the store keyed by its plain
+    /// job id string; a later job registered with the *same* id (as this
+    /// engine's continuous-streaming API allows and this repo's own fault-
+    /// loop tests do, deliberately reusing one id across iterations)
+    /// silently inherits a stale watermark/state that has nothing to do
+    /// with its own run.
+    pub fn remove_continuous_snapshot(&self, job_id: &str) {
+        if let Err(e) = self.inner().remove_continuous_snapshot(job_id) {
+            tracing::warn!(error = %e, job_id = %job_id,
+                "NonBlockingStoreHandle: remove_continuous_snapshot failed");
+        }
+    }
+
     /// Wait until all previously enqueued async writes have been processed.
     ///
     /// No-op in synchronous mode (writes already landed synchronously).

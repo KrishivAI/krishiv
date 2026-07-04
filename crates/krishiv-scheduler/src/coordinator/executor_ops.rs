@@ -559,16 +559,33 @@ impl Coordinator {
 
     pub(crate) fn reset_running_tasks_for_lost_executor(&mut self, lost_id: &ExecutorId) {
         const MAX_EXECUTOR_LOSSES_BEFORE_FAIL: u32 = 5;
+        let profile = self.durability_profile;
 
         let mut jobs_to_reassign = Vec::new();
+        let mut jobs_needing_restore_seed: Vec<JobId> = Vec::new();
         for (job_id, job_arc) in &self.job_coordinators {
             let mut job = job_arc.write_record();
             let mut job_affected = false;
             for stage in &mut job.stages {
                 let mut stage_affected = false;
                 for task in &mut stage.tasks {
+                    // A continuous (`stream:loop`) task sits `Succeeded`
+                    // between cycles rather than truly terminal — it is
+                    // "idle", not "done", since the job stays Running and
+                    // expects more pushes. Losing its assigned executor
+                    // while idle must also reset it to Pending so
+                    // `assign_pending_tasks` can place it on another healthy
+                    // executor; otherwise it is stuck forever (found live
+                    // via the Phase-20 executor fault loop — neither this
+                    // function, which only handled Running|Assigned, nor
+                    // anything else ever revives a Succeeded-and-unassigned
+                    // continuous task).
+                    let is_idle_continuous_task = task.state == TaskState::Succeeded
+                        && krishiv_plan::task_body_for_profile(task.spec.description(), profile)
+                            .is_ok_and(|body| body.starts_with("stream:loop:"));
                     if task.assigned_executor.as_ref() == Some(lost_id)
-                        && matches!(task.state, TaskState::Running | TaskState::Assigned)
+                        && (matches!(task.state, TaskState::Running | TaskState::Assigned)
+                            || is_idle_continuous_task)
                     {
                         task.executor_loss_count = task.executor_loss_count.saturating_add(1);
                         task.assigned_executor = None;
@@ -586,6 +603,18 @@ impl Coordinator {
                             );
                         } else {
                             task.state = TaskState::Pending;
+                            // Placement alone recovers structurally (a fresh
+                            // window starts empty) but loses whatever the
+                            // job had accumulated. If a checkpoint exists
+                            // (G5's per-cycle `state_snapshot`, persisted as
+                            // `ContinuousSnapshot`), seed a restore for the
+                            // next cycle automatically instead of requiring
+                            // the manual `/restore` endpoint — the same
+                            // effective recovery a human running that
+                            // endpoint by hand would get, just automatic.
+                            if is_idle_continuous_task {
+                                jobs_needing_restore_seed.push(job_id.clone());
+                            }
                         }
                         stage_affected = true;
                         job_affected = true;
@@ -614,6 +643,17 @@ impl Coordinator {
 
             if job_affected {
                 jobs_to_reassign.push(job_id.clone());
+            }
+        }
+        for job_id in &jobs_needing_restore_seed {
+            if let Some(snapshot) = self.load_continuous_snapshot(job_id.as_str()) {
+                self.pending_continuous_restores
+                    .insert(job_id.clone(), snapshot);
+                tracing::info!(
+                    job_id = %job_id,
+                    executor_id = %lost_id,
+                    "seeded automatic restore for continuous job after executor loss"
+                );
             }
         }
         for job_id in jobs_to_reassign {

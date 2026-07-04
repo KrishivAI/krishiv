@@ -1213,6 +1213,16 @@ impl Coordinator {
         self.store.as_ref()?.load_continuous_snapshot(job_id)
     }
 
+    /// Remove a persisted continuous job snapshot. No-op when no store is
+    /// configured. Called on deregister so a later job registered with the
+    /// same id starts from a clean slate instead of silently inheriting a
+    /// stale watermark/state left over from the retired job.
+    pub fn remove_continuous_snapshot(&self, job_id: &str) {
+        if let Some(store) = &self.store {
+            store.remove_continuous_snapshot(job_id);
+        }
+    }
+
     /// Replace the default `InMemoryQueueManager` with a custom admission controller.
     ///
     /// R7.1 will use this to inject quota-aware and CRD-backed queue managers.
