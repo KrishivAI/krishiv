@@ -9,6 +9,7 @@
 pub mod iceberg_scan {
     use std::sync::Arc;
 
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
     use datafusion::catalog::TableProvider;
     use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::datasource::listing::{
@@ -17,7 +18,60 @@ pub mod iceberg_scan {
     use datafusion::error::{DataFusionError, Result as DfResult};
     use datafusion::execution::SessionStateBuilder;
     use futures::TryStreamExt;
+    use iceberg::spec::{PrimitiveType, Type};
     use iceberg::table::Table;
+
+    /// The table's current schema as a workspace-Arrow schema, so an empty
+    /// table (no data files yet) still exposes its columns to introspection.
+    ///
+    /// We map the Iceberg *spec* schema directly rather than call
+    /// `iceberg::arrow::schema_to_arrow_schema`: iceberg 0.9.1 pins a different
+    /// `arrow` than the workspace/DataFusion, so its Arrow types are a distinct
+    /// (incompatible) crate version. Any field whose Iceberg type we do not map
+    /// (nested struct/list/map) makes us fall back to an empty schema — never
+    /// worse than the previous "schema unknown without files" behavior.
+    fn table_arrow_schema(table: &Table) -> SchemaRef {
+        let iceberg_schema = table.metadata().current_schema();
+        let mut fields = Vec::new();
+        for nested in iceberg_schema.as_struct().fields() {
+            let Type::Primitive(prim) = nested.field_type.as_ref() else {
+                return Arc::new(Schema::empty());
+            };
+            let Some(dt) = primitive_to_arrow(prim) else {
+                return Arc::new(Schema::empty());
+            };
+            fields.push(Field::new(&nested.name, dt, !nested.required));
+        }
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Map an Iceberg primitive type to the workspace Arrow `DataType`.
+    fn primitive_to_arrow(prim: &PrimitiveType) -> Option<DataType> {
+        Some(match prim {
+            PrimitiveType::Boolean => DataType::Boolean,
+            PrimitiveType::Int => DataType::Int32,
+            PrimitiveType::Long => DataType::Int64,
+            PrimitiveType::Float => DataType::Float32,
+            PrimitiveType::Double => DataType::Float64,
+            PrimitiveType::Date => DataType::Date32,
+            PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
+            PrimitiveType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+            PrimitiveType::Timestamptz => {
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            }
+            PrimitiveType::TimestampNs => DataType::Timestamp(TimeUnit::Nanosecond, None),
+            PrimitiveType::TimestamptzNs => {
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+            }
+            PrimitiveType::String => DataType::Utf8,
+            PrimitiveType::Uuid => DataType::FixedSizeBinary(16),
+            PrimitiveType::Fixed(n) => DataType::FixedSizeBinary(i32::try_from(*n).ok()?),
+            PrimitiveType::Binary => DataType::Binary,
+            PrimitiveType::Decimal { precision, scale } => {
+                DataType::Decimal128(u8::try_from(*precision).ok()?, i8::try_from(*scale).ok()?)
+            }
+        })
+    }
 
     /// Build a DataFusion [`TableProvider`] for an Iceberg table using its
     /// current snapshot's Parquet files.
@@ -26,8 +80,9 @@ pub mod iceberg_scan {
     /// DataFusion `ListingTable` so projection/filter pushdown works without
     /// going through `iceberg-datafusion` (which targets DataFusion 52.x).
     pub async fn iceberg_table_provider(table: Table) -> DfResult<Arc<dyn TableProvider>> {
+        let arrow_schema = table_arrow_schema(&table);
         let file_paths = collect_file_paths(&table).await?;
-        listing_provider_from_paths(file_paths).await
+        listing_provider_from_paths(file_paths, arrow_schema).await
     }
 
     /// Time-travel variant pinned to `snapshot_id`.
@@ -35,6 +90,7 @@ pub mod iceberg_scan {
         table: Table,
         snapshot_id: i64,
     ) -> DfResult<Arc<dyn TableProvider>> {
+        let arrow_schema = table_arrow_schema(&table);
         // Build a scan scoped to the requested snapshot.
         let scan = table
             .scan()
@@ -57,7 +113,7 @@ pub mod iceberg_scan {
             .map(|t| local_path(t.data_file_path()))
             .collect();
 
-        listing_provider_from_paths(file_paths).await
+        listing_provider_from_paths(file_paths, arrow_schema).await
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -94,13 +150,15 @@ pub mod iceberg_scan {
         }
     }
 
-    async fn listing_provider_from_paths(paths: Vec<String>) -> DfResult<Arc<dyn TableProvider>> {
+    async fn listing_provider_from_paths(
+        paths: Vec<String>,
+        arrow_schema: SchemaRef,
+    ) -> DfResult<Arc<dyn TableProvider>> {
         let Some(first_path) = paths.first() else {
-            // Return an empty in-memory table; schema is unknown without files.
-            use arrow::datatypes::{Schema, SchemaRef};
+            // No data files yet: expose the table's schema via an empty
+            // in-memory table so introspection still sees the columns.
             use datafusion::datasource::MemTable;
-            let empty_schema: SchemaRef = Arc::new(Schema::empty());
-            return Ok(Arc::new(MemTable::try_new(empty_schema, vec![vec![]])?));
+            return Ok(Arc::new(MemTable::try_new(arrow_schema, vec![vec![]])?));
         };
 
         // Use the first file path as the listing root; DataFusion globs for *.parquet.
