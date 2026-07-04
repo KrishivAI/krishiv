@@ -8,6 +8,15 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- Coordinator HTTP `POST /api/v1/continuous-register-sql`: register a continuous
+  windowed streaming job from **SQL** (`SELECT key, AGG(col) FROM TUMBLE/HOP/
+  SESSION(TABLE src, DESCRIPTOR(ts), <ms>) GROUP BY …`). The coordinator compiles
+  the window TVF to a `WindowExecutionSpec` itself (`krishiv_sql::
+  streaming_window_plan`), so callers pass SQL and stay decoupled from the
+  operator spec type; the response returns the fed source table. Verified live on
+  k8s: register → push timestamped Arrow IPC via `continuous-push` → `continuous-
+  drain` emits exact per-region tumbling-window `SUM`/`COUNT` as the watermark
+  closes each window.
 - IVM incremental-operator state (per-group SUM/COUNT/AVG/MIN-MAX accumulators
   and DISTINCT multiplicities) is now serialized by `checkpoint_full` and
   reapplied on `restore_full`, so a maintained view is restored **losslessly**

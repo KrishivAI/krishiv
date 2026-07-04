@@ -485,6 +485,10 @@ pub fn coordinator_http_router(
             post(crate::continuous_stream_http::api_continuous_register),
         )
         .route(
+            "/api/v1/continuous-register-sql",
+            post(crate::continuous_stream_http::api_continuous_register_sql),
+        )
+        .route(
             "/api/v1/continuous-push",
             post(crate::continuous_stream_http::api_continuous_push),
         )

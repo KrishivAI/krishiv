@@ -194,6 +194,46 @@ pub async fn api_continuous_register(
     Ok(Json(ContinuousRegisterResponse { success: true }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ContinuousRegisterSqlRequest {
+    pub job_id: String,
+    /// A windowed streaming query:
+    /// `SELECT key, AGG(col) FROM TUMBLE(TABLE src, DESCRIPTOR(ts), <ms>) GROUP BY key`.
+    pub sql: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContinuousRegisterSqlResponse {
+    pub success: bool,
+    /// The source table the window reads from (feed pushes target it).
+    pub source: String,
+}
+
+/// Register a continuous streaming job from **SQL**: the coordinator compiles
+/// the windowed query to a [`WindowExecutionSpec`] itself
+/// (`krishiv_sql::streaming_window_plan`), so callers (the platform pipeline
+/// reconciler) pass SQL and stay decoupled from the operator spec type.
+pub async fn api_continuous_register_sql(
+    State(coordinator): State<SharedCoordinator>,
+    Json(body): Json<ContinuousRegisterSqlRequest>,
+) -> Result<Json<ContinuousRegisterSqlResponse>, StatusCode> {
+    let plan = krishiv_sql::streaming_window_plan::compile_streaming_window_sql(&body.sql)
+        .map_err(|error| {
+            tracing::warn!(error = %error, "continuous-register-sql: compile failed");
+            StatusCode::BAD_REQUEST
+        })?;
+    register_continuous_stream_coordinated(&coordinator, &body.job_id, &plan.spec)
+        .await
+        .map_err(|error| match error {
+            ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    Ok(Json(ContinuousRegisterSqlResponse {
+        success: true,
+        source: plan.source,
+    }))
+}
+
 pub async fn api_continuous_list(
     State(coordinator): State<SharedCoordinator>,
 ) -> Result<Json<ContinuousListResponse>, StatusCode> {
