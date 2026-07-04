@@ -20,8 +20,10 @@ use arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::{Aggregate, Expr, Join, JoinType, LogicalPlan, Projection, Window};
 use datafusion::prelude::SessionContext;
 
+use arrow::record_batch::RecordBatch;
 use krishiv_delta::{
-    Aggregation, IncrJoinType, IncrementalAggOp, IncrementalDistinctOp, IncrementalJoinOp,
+    Aggregation, DeltaBatch, DeltaResult, IncrJoinType, IncrementalAggOp, IncrementalDistinctOp,
+    IncrementalJoinOp,
 };
 
 // ── ViewPlan enum ─────────────────────────────────────────────────────────────
@@ -66,6 +68,96 @@ impl ViewPlan {
             ViewPlan::DiffBased => ViewPlanKind::DiffBased,
             _ => ViewPlanKind::Incremental,
         }
+    }
+
+    /// Serialize the operator's internal accumulator state, or `None` when the
+    /// operator has no losslessly-serializable state (`Join`, whose traces carry
+    /// Arrow data, and `DiffBased`, which is stateless). A caller that gets
+    /// `None` falls back to [`seed_from_snapshots`](Self::seed_from_snapshots).
+    ///
+    /// This is what makes an incremental view survive a coordinator restart
+    /// *losslessly*, including sources with genuinely duplicate rows: the
+    /// materialized source snapshot is a set (multiplicity dropped by
+    /// `filter_positive`), so the accumulator cannot be rebuilt from it — only
+    /// the operator itself holds the ground truth (G6/F4).
+    pub fn checkpoint_state(&self) -> Option<Vec<u8>> {
+        match self {
+            ViewPlan::Aggregate { op, .. } => Some(op.state_bytes()),
+            ViewPlan::Distinct { op, .. } => Some(op.state_bytes()),
+            ViewPlan::Join { .. } | ViewPlan::DiffBased => None,
+        }
+    }
+
+    /// Restore operator state produced by [`checkpoint_state`]. Returns `false`
+    /// when this plan variant does not carry restorable state (caller should
+    /// seed instead); `true` when the state was applied.
+    pub fn restore_state_bytes(&mut self, bytes: &[u8]) -> DeltaResult<bool> {
+        match self {
+            ViewPlan::Aggregate { op, .. } => {
+                op.restore_state_bytes(bytes)?;
+                Ok(true)
+            }
+            ViewPlan::Distinct { op, .. } => {
+                op.restore_state_bytes(bytes)?;
+                Ok(true)
+            }
+            ViewPlan::Join { .. } | ViewPlan::DiffBased => Ok(false),
+        }
+    }
+
+    /// Seed a freshly built incremental operator's internal state from the
+    /// current full snapshot(s) of its source(s).
+    ///
+    /// A checkpoint restore rebuilds the flow's operators **empty** — the
+    /// per-group accumulator / join traces / distinct multiplicities live only
+    /// in the operator and are not serialized by `checkpoint_full`. Without
+    /// seeding, the first delta after a restore is applied against empty state,
+    /// so the operator emits an *insertion* for a group that already exists in
+    /// the restored view snapshot (no matching retraction), corrupting the
+    /// materialized output on the next restore cycle (G6/F4 recreate path).
+    ///
+    /// `lookup(source)` returns the restored full snapshot of a base source or
+    /// upstream view (pre-tick, i.e. before this tick's delta). Replaying it as
+    /// an insert-only delta reconstructs the exact operator state the original
+    /// flow held; the emitted output is discarded (the view snapshot + baseline
+    /// were restored separately, in lockstep). A no-op when the source snapshot
+    /// is absent or empty — the normal first-build case, where data has not yet
+    /// arrived and the operator *should* start empty.
+    pub fn seed_from_snapshots(
+        &mut self,
+        lookup: impl Fn(&str) -> Option<RecordBatch>,
+    ) -> DeltaResult<()> {
+        let seed_delta = |name: &str| -> DeltaResult<Option<DeltaBatch>> {
+            match lookup(name) {
+                Some(snap) if snap.num_rows() > 0 => Ok(Some(DeltaBatch::from_inserts(snap)?)),
+                _ => Ok(None),
+            }
+        };
+        match self {
+            ViewPlan::Aggregate { source, op } => {
+                if let Some(delta) = seed_delta(source)? {
+                    let _ = op.apply(delta)?;
+                }
+            }
+            ViewPlan::Distinct { source, op } => {
+                if let Some(delta) = seed_delta(source)? {
+                    let _ = op.apply(delta)?;
+                }
+            }
+            ViewPlan::Join {
+                left_source,
+                right_source,
+                op,
+            } => {
+                let left = seed_delta(left_source)?;
+                let right = seed_delta(right_source)?;
+                if left.is_some() || right.is_some() {
+                    let _ = op.apply(left, right)?;
+                }
+            }
+            ViewPlan::DiffBased => {}
+        }
+        Ok(())
     }
 
     /// GC trace state for join operators.

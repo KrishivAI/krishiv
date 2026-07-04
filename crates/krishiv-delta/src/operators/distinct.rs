@@ -106,6 +106,59 @@ impl IncrementalDistinctOp {
     pub fn count_for_key(&self, key: &[String]) -> i64 {
         *self.counts.get(key).unwrap_or(&0)
     }
+
+    /// Serialize the per-row multiplicity map (the operator's full state) so a
+    /// DISTINCT view can be restored losslessly across a coordinator restart —
+    /// the materialized snapshot only records *presence*, not the accumulated
+    /// weight needed to know when a row crosses the zero threshold (G6/F4).
+    ///
+    /// Format (little-endian): `u32 n_rows || (u32 n_cols || (u32 len || utf8)*
+    /// || i64 count)*`.
+    pub fn state_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.counts.len() as u32).to_le_bytes());
+        for (key, count) in &self.counts {
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            for col in key {
+                out.extend_from_slice(&(col.len() as u32).to_le_bytes());
+                out.extend_from_slice(col.as_bytes());
+            }
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        out
+    }
+
+    /// Replace the multiplicity map with one produced by [`state_bytes`].
+    pub fn restore_state_bytes(&mut self, bytes: &[u8]) -> DeltaResult<()> {
+        let err = || DeltaError::Operator("distinct state truncated".into());
+        let mut pos = 0usize;
+        let rd_u32 = |pos: &mut usize| -> DeltaResult<u32> {
+            let raw = bytes.get(*pos..*pos + 4).ok_or_else(err)?;
+            *pos += 4;
+            Ok(u32::from_le_bytes(raw.try_into().unwrap_or([0; 4])))
+        };
+        let n_rows = rd_u32(&mut pos)? as usize;
+        let mut counts: AHashMap<Vec<String>, i64> = AHashMap::with_capacity(n_rows);
+        for _ in 0..n_rows {
+            let n_cols = rd_u32(&mut pos)? as usize;
+            let mut key: Vec<String> = Vec::with_capacity(n_cols);
+            for _ in 0..n_cols {
+                let len = rd_u32(&mut pos)? as usize;
+                let raw = bytes.get(pos..pos + len).ok_or_else(err)?;
+                key.push(
+                    std::str::from_utf8(raw)
+                        .map_err(|e| DeltaError::Operator(e.to_string()))?
+                        .to_string(),
+                );
+                pos += len;
+            }
+            let raw = bytes.get(pos..pos + 8).ok_or_else(err)?;
+            pos += 8;
+            counts.insert(key, i64::from_le_bytes(raw.try_into().unwrap_or([0; 8])));
+        }
+        self.counts = counts;
+        Ok(())
+    }
 }
 
 impl Default for IncrementalDistinctOp {

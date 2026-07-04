@@ -132,10 +132,12 @@ def restore(job, b64):
 
 
 def main():
-    iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 50
-    # --recreate exercises the full flow-recreate recovery path (see the note at
-    # the bottom); the default exercises the checkpoint/restore *mechanism*.
-    recreate = "--recreate" in sys.argv
+    # --recreate exercises the full destroy→rebuild→restore recovery path (see
+    # the note at the bottom); the default restores into the live flow. The flag
+    # may appear in any position; iterations is the first non-flag argument.
+    recreate = "--recreate" in sys.argv[1:]
+    positional = [a for a in sys.argv[1:] if not a.startswith("-")]
+    iterations = int(positional[0]) if positional else 50
     job = f"spikeb-{os.getpid()}"
 
     register(job)
@@ -168,9 +170,16 @@ if __name__ == "__main__":
     main()
 
 # NOTE (2026-07-04, verified live on k8s coordinator):
-#   Default mode PASSES 50 cycles — checkpoint_full/restore_full preserves view
-#   baselines across restore (the G6/F4 fix). `--recreate` mode still FAILS: a
-#   freshly-registered flow has not auto-partitioned yet (partitioning triggers
-#   on first data), so an N-shard checkpoint restores into an unshaped flow.
-#   The remaining fix is to reshape a recreated flow to the checkpoint's shard
-#   count before restore (coordinator IVM registry) — tracked as G6 follow-up.
+#   BOTH modes PASS 50 cycles. Default mode (restore into the live flow) and
+#   `--recreate` (destroy → rebuild → restore) both converge exactly.
+#
+#   The `--recreate` fix: `checkpoint_full` now also serializes each incremental
+#   operator's accumulator (per-group SUM/COUNT/AVG/MIN-MAX, DISTINCT
+#   multiplicities), and `restore_full` reapplies it when the view's plan is
+#   rebuilt. The materialized source snapshot is a *set* (multiplicity dropped by
+#   `filter_positive`) and the view snapshot loses the MIN/MAX multiset and the
+#   SUM/COUNT split AVG needs, so the operator is the only lossless ground truth
+#   — persisting it is what makes recovery correct even for duplicate-valued
+#   sources (this test feeds identical ["US","EU"],[1,1] rows every cycle).
+#   Join views (whose traces carry Arrow data) are not yet serialized; they fall
+#   back to seeding from the restored source, correct for distinct-key joins.

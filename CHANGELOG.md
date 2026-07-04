@@ -8,9 +8,27 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- IVM incremental-operator state (per-group SUM/COUNT/AVG/MIN-MAX accumulators
+  and DISTINCT multiplicities) is now serialized by `checkpoint_full` and
+  reapplied on `restore_full`, so a maintained view is restored **losslessly**
+  after a coordinator restart — including sources with genuinely duplicate rows,
+  which the materialized source snapshot (a set, not a multiset) cannot capture.
+  Verified live on k8s: `spike_b_ivm_kill.py --recreate` converges over 50
+  destroy→rebuild→restore cycles (G6/F4).
+
 ### Changed
 
 ### Fixed
+
+- IVM: a checkpoint-restored flow no longer loses its incremental aggregate
+  accumulator, which previously made the second recreate-recovery cycle diverge
+  (a non-retracting insertion corrupted the materialized view). Operators are
+  restored from serialized state, or seeded from the restored source snapshot as
+  a fallback (correct for distinct-row Join sources).
+- connectors: panic-free vector point-id derivation (`first_chunk` instead of
+  slice+`expect`) and Pinecone namespace injection (`as_object_mut` instead of
+  index-assign), clearing `clippy::indexing_slicing`/`expect_used` under the
+  workspace lint now that `vector-sinks` is feature-active.
 
 ## [0.1.0-rc.1] - 2026-06-26
 

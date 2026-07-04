@@ -145,6 +145,13 @@ struct IncrementalFlowInner {
     // consume the O(Δ) changelog the flow already computed (`take_step_output`)
     // instead of re-materializing the full view and diffing snapshots.
     last_step_outputs: AHashMap<String, DeltaBatch>,
+
+    // Operator accumulator state captured by `checkpoint_full`, awaiting the
+    // (lazy) rebuild of each view's plan. `restore_full` stashes it here; the
+    // plan-build step in `step_datafusion` drains the matching entry and applies
+    // it to the fresh operator, restoring the incremental view losslessly across
+    // a coordinator restart (G6/F4). Views absent here fall back to seeding.
+    pending_plan_state: HashMap<String, Vec<u8>>,
 }
 
 // ── IncrementalFlow ───────────────────────────────────────────────────────────
@@ -185,6 +192,7 @@ impl IncrementalFlow {
                 force_diff_based: false,
                 view_deps: AHashMap::new(),
                 last_step_outputs: AHashMap::new(),
+                pending_plan_state: HashMap::new(),
             })),
         }
     }
@@ -622,6 +630,18 @@ impl IncrementalFlow {
 
         let dirty_sources: HashSet<String> = inputs.keys().map(|k| k.to_lowercase()).collect();
 
+        // Pre-delta source snapshots, kept only when we may build new
+        // incremental operators this tick (first step after a view is
+        // registered or after a checkpoint restore, where `view_plans` is
+        // empty). A freshly built operator is seeded from these so it holds the
+        // restored state before this tick's delta is applied (G6/F4). In steady
+        // state `views_needing_plans` is empty, so this clone never happens.
+        let pre_delta_snapshots: HashMap<String, RecordBatch> = if views_needing_plans.is_empty() {
+            HashMap::new()
+        } else {
+            current_snapshots.clone()
+        };
+
         let mut new_snapshots = current_snapshots;
         for (name, delta) in &inputs {
             let current = new_snapshots.remove(name);
@@ -860,8 +880,44 @@ impl IncrementalFlow {
             None
         };
 
-        // Insert newly built plans.
-        for (name, plan, sql) in new_plans {
+        // Insert newly built plans, seeding each operator from the restored
+        // pre-tick state of its source(s). Precedence:
+        //   1. A checkpoint-restored operator accumulator (lossless, incl.
+        //      duplicate-valued sources) stashed in `pending_plan_state` by
+        //      `restore_full` — the correct path for Aggregate/Distinct.
+        //   2. Otherwise seed from the restored source/view snapshots — the
+        //      fallback for operators without serializable state (Join) and the
+        //      no-op normal first-build case (empty source).
+        // Without either, the first post-restore delta emits a non-retracting
+        // insertion and corrupts the materialized view on the next restore
+        // cycle (G6/F4).
+        for (name, mut plan, sql) in new_plans {
+            let restored = match inner.pending_plan_state.remove(&name) {
+                Some(state_bytes) => plan.restore_state_bytes(&state_bytes).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        view = %name,
+                        error = %e,
+                        "failed to restore incremental operator state from checkpoint"
+                    );
+                    false
+                }),
+                None => false,
+            };
+            if !restored
+                && let Err(e) = plan.seed_from_snapshots(|src| {
+                    pre_delta_snapshots
+                        .get(src)
+                        .cloned()
+                        .or_else(|| view_full_outputs.get(src).cloned())
+                })
+            {
+                tracing::warn!(
+                    view = %name,
+                    error = %e,
+                    "failed to seed incremental operator from restored state; \
+                     view may diverge until re-registered"
+                );
+            }
             inner.view_plan_sqls.insert(name.clone(), sql);
             inner.view_plans.insert(name, plan);
         }
@@ -1257,8 +1313,17 @@ impl IncrementalFlow {
     /// resulting full view outputs. Capturing view baselines is what makes the
     /// remote diff correct (the source-only [`checkpoint`] does not).
     ///
-    /// Format: `u32 num_sources || (source entries) || u32 num_views || (view entries)`
-    /// where each entry is `u32 name_len || name || u32 ipc_len || arrow_ipc`.
+    /// Format: `u32 num_sources || (source entries) || u32 num_views ||
+    /// (view entries) || u32 num_plan_states || (plan-state entries)` where each
+    /// source/view entry is `u32 name_len || name || u32 ipc_len || arrow_ipc`
+    /// and each plan-state entry is `u32 name_len || name || u32 len || bytes`.
+    ///
+    /// The trailing plan-state section carries incremental operators' accumulator
+    /// state (per-group SUM/COUNT/AVG/MIN-MAX, DISTINCT multiplicities). Unlike
+    /// the view snapshot/baseline, this state cannot be reconstructed from the
+    /// materialized snapshots (the source snapshot is a set, not a multiset), so
+    /// persisting it is what lets an incremental view be restored losslessly
+    /// after a coordinator restart — including duplicate-valued sources (G6/F4).
     pub fn checkpoint_full(&self) -> IvmResult<Vec<u8>> {
         let inner = self.inner.lock().map_err(lock_err)?;
         let mut out: Vec<u8> = Vec::new();
@@ -1278,6 +1343,20 @@ impl IncrementalFlow {
             // IPC length followed by the schema-only batch.
             encode_named_batch_optional(&mut out, name, snap.as_ref(), &view)?;
             encode_named_batch_optional(&mut out, name, full.as_ref(), &view)?;
+        }
+        // Plan-state section: incremental operator accumulators (Aggregate,
+        // Distinct). Views on the DiffBased/Join path contribute nothing.
+        let plan_states: Vec<(&String, Vec<u8>)> = inner
+            .view_plans
+            .iter()
+            .filter_map(|(name, plan)| plan.checkpoint_state().map(|b| (name, b)))
+            .collect();
+        out.extend_from_slice(&(plan_states.len() as u32).to_le_bytes());
+        for (name, bytes) in plan_states {
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
         }
         Ok(out)
     }
@@ -1300,8 +1379,31 @@ impl IncrementalFlow {
             let (_name2, full) = decode_named_batch_opt(bytes, &mut pos)?;
             view_state.insert(name, (snap, full));
         }
+        // Plan-state section (optional for forward-compat with older blobs that
+        // predate it): stash operator accumulators for the lazy plan rebuild.
+        let mut pending_plan_state: HashMap<String, Vec<u8>> = HashMap::new();
+        if pos < bytes.len() {
+            let n_states = read_u32(bytes, &mut pos)? as usize;
+            for _ in 0..n_states {
+                let name_len = read_u32(bytes, &mut pos)? as usize;
+                let name =
+                    std::str::from_utf8(bytes.get(pos..pos + name_len).ok_or_else(slice_err)?)
+                        .map_err(|e| IvmError::execution(e.to_string()))?
+                        .to_string();
+                pos += name_len;
+                let len = read_u32(bytes, &mut pos)? as usize;
+                let data = bytes.get(pos..pos + len).ok_or_else(slice_err)?.to_vec();
+                pos += len;
+                pending_plan_state.insert(name, data);
+            }
+        }
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.source_snapshots = source_snapshots;
+        // Drop any stale cached plans so the next step rebuilds them fresh and
+        // applies the restored operator state (below) at build time.
+        inner.view_plans.clear();
+        inner.view_plan_sqls.clear();
+        inner.pending_plan_state = pending_plan_state;
         let names = inner.view_registry.view_names().map_err(delta_err)?;
         for name in &names {
             if let Ok(view) = inner.view_registry.get(name) {
@@ -2269,5 +2371,98 @@ mod integration_tests {
             (sum_total(&flow) - 15.0).abs() < 1e-9,
             "central fallback after re_feed must total 15"
         );
+    }
+
+    /// G6/F4 recreate path: repeatedly destroying the flow and rebuilding it
+    /// from `checkpoint_full`/`restore_full` must converge across *multiple*
+    /// cycles on the O(Δ) incremental path (no `force_diff_based`).
+    ///
+    /// Regression: a restored flow rebuilds its incremental operator empty, so
+    /// before the seed-from-restored-state fix the first post-restore delta
+    /// emitted a non-retracting insertion. Cycle 1 happened to total correctly
+    /// (the inserted group row was new), but cycle 2 re-emitted the identical
+    /// row, `apply_delta` deduplicated it, and the increment was lost — the view
+    /// froze at the cycle-1 value. This drives the exact `spike_b --recreate`
+    /// scenario in-process.
+    #[tokio::test]
+    async fn checkpoint_full_recreate_converges_across_cycles() {
+        use arrow::array::{Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        fn orders(regions: &[&str], amounts: &[i64]) -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("region", DataType::Utf8, false),
+                    Field::new("amount", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(regions.to_vec())),
+                    Arc::new(Int64Array::from(amounts.to_vec())),
+                ],
+            )
+            .unwrap()
+        }
+        fn revenue_spec() -> krishiv_delta::IncrementalViewSpec {
+            krishiv_delta::IncrementalViewSpec {
+                name: "revenue".into(),
+                body_sql: "SELECT region, SUM(amount) AS total FROM orders GROUP BY region".into(),
+                output_schema: Arc::new(Schema::new(vec![
+                    Field::new("region", DataType::Utf8, true),
+                    Field::new("total", DataType::Float64, true),
+                ])),
+                is_materialized: true,
+                is_recursive: false,
+                lateness: vec![],
+            }
+        }
+        fn total(flow: &IncrementalFlow) -> f64 {
+            let snap = flow.snapshot("revenue").unwrap().unwrap();
+            snap.column_by_name("total")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap_or(0.0))
+                .sum()
+        }
+
+        // Original flow, mirrors spike_b's pre-restore state (185).
+        let mut flow = IncrementalFlow::new();
+        flow.register_view(revenue_spec()).unwrap();
+        flow.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&["US", "EU", "US", "APAC"], &[100, 50, 25, 10]))
+                .unwrap(),
+        )
+        .unwrap();
+        flow.step_datafusion().await.unwrap();
+        let mut running = total(&flow);
+        assert!((running - 185.0).abs() < 1e-9, "pre-restore total: {running}");
+
+        // Five destroy → recreate → restore → feed +2 → step cycles.
+        for cycle in 1..=5 {
+            let cp = flow.checkpoint_full().unwrap();
+            // Destroy the flow entirely and rebuild from the checkpoint (the
+            // real coordinator-restart recovery, not restore-into-live-flow).
+            let fresh = IncrementalFlow::new();
+            fresh.register_view(revenue_spec()).unwrap();
+            fresh.restore_full(&cp).unwrap();
+            flow = fresh;
+
+            flow.feed(
+                "orders",
+                DeltaBatch::from_inserts(orders(&["US", "EU"], &[1, 1])).unwrap(),
+            )
+            .unwrap();
+            flow.step_datafusion().await.unwrap();
+            running += 2.0;
+            let got = total(&flow);
+            assert!(
+                (got - running).abs() < 1e-9,
+                "cycle {cycle}: total={got} expected={running} (baseline lost across restore)"
+            );
+        }
+        assert!((running - 195.0).abs() < 1e-9); // 185 + 2*5
     }
 }

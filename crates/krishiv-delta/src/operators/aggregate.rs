@@ -431,6 +431,152 @@ impl IncrementalAggOp {
             &self.output_schema,
         )
     }
+
+    /// Serialize the per-group accumulator state to a self-contained blob.
+    ///
+    /// This is the piece of an incremental view that a full flow checkpoint
+    /// cannot reconstruct from the materialized source or view snapshots: the
+    /// source snapshot is a *set* (multiplicity is dropped by `filter_positive`)
+    /// and the view snapshot loses the multiset MIN/MAX and the SUM/COUNT split
+    /// AVG needs. Persisting the accumulator directly is the only lossless way
+    /// to restore an incremental aggregate across a coordinator restart (G6/F4).
+    ///
+    /// Format (all little-endian): `u32 n_groups || (group)*` where a group is
+    /// `u32 n_key_cols || (u8 present || u32 len || utf8)* || u32 n_states ||
+    /// (state)*` and a state is `f64 sum || i64 count || i64 avg_sum_i64 ||
+    /// i64 avg_count_i64 || u8 avg_is_integer || u32 n_minmax || (f64 key ||
+    /// i64 weight)*`.
+    pub fn state_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.state.len() as u32).to_le_bytes());
+        for (group_key, states) in &self.state {
+            out.extend_from_slice(&(group_key.len() as u32).to_le_bytes());
+            for col in group_key {
+                match col {
+                    Some(s) => {
+                        out.push(1u8);
+                        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        out.extend_from_slice(s.as_bytes());
+                    }
+                    None => out.push(0u8),
+                }
+            }
+            out.extend_from_slice(&(states.len() as u32).to_le_bytes());
+            for st in states {
+                st.write_bytes(&mut out);
+            }
+        }
+        out
+    }
+
+    /// Replace the accumulator state with one previously produced by
+    /// [`state_bytes`](Self::state_bytes). The group-by / aggregation shape is
+    /// taken from `self` (rebuilt from the view SQL), so only the running
+    /// values are transferred.
+    pub fn restore_state_bytes(&mut self, bytes: &[u8]) -> DeltaResult<()> {
+        let mut pos = 0usize;
+        let n_groups = read_u32(bytes, &mut pos)? as usize;
+        let mut state: GroupStateMap = AHashMap::with_capacity(n_groups);
+        for _ in 0..n_groups {
+            let n_key = read_u32(bytes, &mut pos)? as usize;
+            let mut key: Vec<Option<String>> = Vec::with_capacity(n_key);
+            for _ in 0..n_key {
+                let present = read_u8(bytes, &mut pos)?;
+                if present == 1 {
+                    let len = read_u32(bytes, &mut pos)? as usize;
+                    let raw = bytes
+                        .get(pos..pos + len)
+                        .ok_or_else(|| DeltaError::Operator("agg state truncated".into()))?;
+                    key.push(Some(
+                        std::str::from_utf8(raw)
+                            .map_err(|e| DeltaError::Operator(e.to_string()))?
+                            .to_string(),
+                    ));
+                    pos += len;
+                } else {
+                    key.push(None);
+                }
+            }
+            let n_states = read_u32(bytes, &mut pos)? as usize;
+            let mut states: Vec<AggState> = Vec::with_capacity(n_states);
+            for _ in 0..n_states {
+                states.push(AggState::read_bytes(bytes, &mut pos)?);
+            }
+            state.insert(key, states);
+        }
+        self.state = state;
+        Ok(())
+    }
+}
+
+fn read_u8(bytes: &[u8], pos: &mut usize) -> DeltaResult<u8> {
+    let b = *bytes
+        .get(*pos)
+        .ok_or_else(|| DeltaError::Operator("agg state truncated".into()))?;
+    *pos += 1;
+    Ok(b)
+}
+
+fn read_u32(bytes: &[u8], pos: &mut usize) -> DeltaResult<u32> {
+    let raw = bytes
+        .get(*pos..*pos + 4)
+        .ok_or_else(|| DeltaError::Operator("agg state truncated".into()))?;
+    *pos += 4;
+    Ok(u32::from_le_bytes(raw.try_into().unwrap_or([0; 4])))
+}
+
+fn read_i64(bytes: &[u8], pos: &mut usize) -> DeltaResult<i64> {
+    let raw = bytes
+        .get(*pos..*pos + 8)
+        .ok_or_else(|| DeltaError::Operator("agg state truncated".into()))?;
+    *pos += 8;
+    Ok(i64::from_le_bytes(raw.try_into().unwrap_or([0; 8])))
+}
+
+fn read_f64(bytes: &[u8], pos: &mut usize) -> DeltaResult<f64> {
+    let raw = bytes
+        .get(*pos..*pos + 8)
+        .ok_or_else(|| DeltaError::Operator("agg state truncated".into()))?;
+    *pos += 8;
+    Ok(f64::from_le_bytes(raw.try_into().unwrap_or([0; 8])))
+}
+
+impl AggState {
+    fn write_bytes(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.sum.to_le_bytes());
+        out.extend_from_slice(&self.count.to_le_bytes());
+        out.extend_from_slice(&self.avg_sum_i64.to_le_bytes());
+        out.extend_from_slice(&self.avg_count_i64.to_le_bytes());
+        out.push(self.avg_is_integer as u8);
+        out.extend_from_slice(&(self.min_max_set.len() as u32).to_le_bytes());
+        for (k, w) in &self.min_max_set {
+            out.extend_from_slice(&k.0.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+
+    fn read_bytes(bytes: &[u8], pos: &mut usize) -> DeltaResult<Self> {
+        let sum = read_f64(bytes, pos)?;
+        let count = read_i64(bytes, pos)?;
+        let avg_sum_i64 = read_i64(bytes, pos)?;
+        let avg_count_i64 = read_i64(bytes, pos)?;
+        let avg_is_integer = read_u8(bytes, pos)? == 1;
+        let n_minmax = read_u32(bytes, pos)? as usize;
+        let mut min_max_set: BTreeMap<OrdF64, i64> = BTreeMap::new();
+        for _ in 0..n_minmax {
+            let k = read_f64(bytes, pos)?;
+            let w = read_i64(bytes, pos)?;
+            min_max_set.insert(OrdF64(k), w);
+        }
+        Ok(Self {
+            sum,
+            count,
+            avg_sum_i64,
+            avg_count_i64,
+            avg_is_integer,
+            min_max_set,
+        })
+    }
 }
 
 fn compute_agg_values(states: &[AggState], aggregations: &[Aggregation]) -> Vec<Option<f64>> {
@@ -721,6 +867,64 @@ mod tests {
         assert!(
             (max_after.unwrap_or(f64::NAN) - 2.7).abs() < 1e-9,
             "max after retracting 3.5 should be 2.7, got {max_after:?}"
+        );
+    }
+
+    /// `state_bytes` → `restore_state_bytes` transfers the accumulator
+    /// losslessly, *including* the multiset multiplicity of genuinely-identical
+    /// rows — the exact property the materialized source snapshot loses. A fresh
+    /// op restored from the bytes then emits the same retract+insert on the next
+    /// delta as the original would (G6/F4 lossless restore).
+    #[test]
+    fn state_bytes_round_trip_preserves_multiset() {
+        let group = vec!["customer_id".to_string()];
+        let sum = vec![Aggregation::Sum {
+            input_col: "amount".into(),
+            output_col: "total".into(),
+        }];
+        let mut op =
+            IncrementalAggOp::new(&order_schema(), group.clone(), sum.clone()).unwrap();
+        // Two *identical* rows (c1, 5.0) — a set-based snapshot would collapse
+        // these; the accumulator must remember both (sum = 10, count = 2).
+        op.apply(DeltaBatch::from_inserts(order_batch(&["c1", "c1"], &[5.0, 5.0])).unwrap())
+            .unwrap();
+
+        // Serialize, then restore into a brand-new empty operator.
+        let bytes = op.state_bytes();
+        let mut restored = IncrementalAggOp::new(&order_schema(), group, sum).unwrap();
+        restored.restore_state_bytes(&bytes).unwrap();
+
+        // Retract ONE of the two identical rows on the restored op. If the
+        // multiset was preserved, c1 remains present with sum=5 → the op emits
+        // retract(total=10) + insert(total=5). If multiplicity had been lost
+        // (count=1), the group would vanish → retract(total=5) + nothing.
+        let out = restored
+            .apply(DeltaBatch::from_deletes(order_batch(&["c1"], &[5.0])).unwrap())
+            .unwrap();
+        let data = out.data_batch();
+        let weights = out.weights();
+        let totals = data
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let mut retract_10 = false;
+        let mut insert_5 = false;
+        for i in 0..data.num_rows() {
+            let w = weights.value(i);
+            let t = totals.value(i);
+            if w < 0 && (t - 10.0).abs() < 1e-9 {
+                retract_10 = true;
+            }
+            if w > 0 && (t - 5.0).abs() < 1e-9 {
+                insert_5 = true;
+            }
+        }
+        assert!(
+            retract_10 && insert_5,
+            "restored op must retract total=10 and insert total=5 \
+             (multiset multiplicity preserved); got {out:?}"
         );
     }
 }
