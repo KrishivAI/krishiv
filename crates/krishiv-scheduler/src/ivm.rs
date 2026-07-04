@@ -169,6 +169,24 @@ impl IvmJob {
         }
     }
 
+    /// Full checkpoint: sources **and view state** (snapshot + baseline), so a
+    /// restore converges maintained views after restart (G6). Prefer this over
+    /// [`checkpoint`](Self::checkpoint), which captures sources only.
+    pub fn checkpoint_full(&self) -> IvmResult<Vec<u8>> {
+        match self {
+            IvmJob::Single(f) => f.checkpoint_full(),
+            IvmJob::Partitioned(p) => p.checkpoint_full(),
+        }
+    }
+
+    /// Restore a full checkpoint (see [`checkpoint_full`](Self::checkpoint_full)).
+    pub fn restore_full(&self, bytes: &[u8]) -> IvmResult<()> {
+        match self {
+            IvmJob::Single(f) => f.restore_full(bytes),
+            IvmJob::Partitioned(p) => p.restore_full(bytes),
+        }
+    }
+
     /// Delta checkpoint (per-shard framed when partitioned).
     pub fn checkpoint_delta(&self) -> IvmResult<Vec<u8>> {
         match self {

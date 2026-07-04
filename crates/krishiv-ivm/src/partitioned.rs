@@ -349,6 +349,45 @@ impl PartitionedIncrementalFlow {
         Ok(())
     }
 
+    /// Full checkpoint: every shard's source snapshots **and view state**
+    /// (snapshot + full-output baseline), plus the streaming-prev map, framed
+    /// with the shard count. Unlike [`checkpoint`](Self::checkpoint) — which
+    /// captures shard *sources* only — this preserves each shard's view
+    /// baselines, so a restore recomputes deltas against the right state and
+    /// maintained views converge after a coordinator/executor restart (G6).
+    /// Same wire framing as `checkpoint`; only the per-shard payload differs.
+    pub fn checkpoint_full(&self) -> IvmResult<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.shards.len() as u32).to_le_bytes());
+        for shard in &self.shards {
+            let bytes = shard.checkpoint_full()?;
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        self.write_streaming_prev(&mut out)?;
+        Ok(out)
+    }
+
+    /// Restore from [`checkpoint_full`](Self::checkpoint_full) bytes.
+    pub fn restore_full(&self, bytes: &[u8]) -> IvmResult<()> {
+        let mut pos = 0usize;
+        let n = read_u32(bytes, &mut pos)? as usize;
+        if n != self.shards.len() {
+            return Err(IvmError::execution(format!(
+                "checkpoint shard count {n} != live shard count {}",
+                self.shards.len()
+            )));
+        }
+        for shard in &self.shards {
+            let len = read_u32(bytes, &mut pos)? as usize;
+            let chunk = bytes.get(pos..pos + len).ok_or_else(slice_err)?;
+            pos += len;
+            shard.restore_full(chunk)?;
+        }
+        self.read_streaming_prev(bytes, &mut pos)?;
+        Ok(())
+    }
+
     /// Delta checkpoint: every shard's accumulated deltas + `streaming_prev`, shard-count framed.
     ///
     /// `streaming_prev` is included so that after `restore_delta` the next
@@ -685,6 +724,62 @@ mod tests {
 
         // Every source row survives the round-trip across all shards.
         assert_eq!(before.num_rows(), after.num_rows());
+    }
+
+    /// `checkpoint_full` → `restore_full` preserves each shard's *view baseline*
+    /// (not just sources), so a partitioned flow restored mid-stream converges
+    /// to the same maintained totals as one that never restarted (G6/F4). The
+    /// source-only `checkpoint`/`restore` loses view baselines and would
+    /// mis-count the post-restore delta.
+    #[tokio::test]
+    async fn checkpoint_full_restore_full_preserves_view_baseline_across_shards() {
+        fn total(batch: &RecordBatch) -> f64 {
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap_or(0.0))
+                .sum()
+        }
+
+        let src = PartitionedIncrementalFlow::new(3, "region");
+        src.register_view(revenue_spec()).unwrap();
+        src.feed(
+            "orders",
+            DeltaBatch::from_inserts(orders(&["US", "EU", "US", "APAC"], &[100, 50, 25, 10]))
+                .unwrap(),
+        )
+        .unwrap();
+        src.step_datafusion().await.unwrap();
+        let base = total(&src.snapshot("revenue").unwrap().unwrap());
+        assert!((base - 185.0).abs() < 1e-9, "baseline total wrong: {base}");
+
+        // Full checkpoint → fresh same-shape flow → restore_full.
+        let bytes = src.checkpoint_full().unwrap();
+        let restored = PartitionedIncrementalFlow::new(3, "region");
+        restored.register_view(revenue_spec()).unwrap();
+        restored.restore_full(&bytes).unwrap();
+
+        // Same new delta to both; the restored flow must accumulate on top of
+        // the restored baseline, not from zero.
+        let delta = DeltaBatch::from_inserts(orders(&["US", "EU"], &[200, 5])).unwrap();
+        src.feed("orders", delta.clone()).unwrap();
+        restored.feed("orders", delta).unwrap();
+        src.step_datafusion().await.unwrap();
+        restored.step_datafusion().await.unwrap();
+
+        let src_total = total(&src.snapshot("revenue").unwrap().unwrap());
+        let restored_total = total(&restored.snapshot("revenue").unwrap().unwrap());
+        assert!(
+            (src_total - 390.0).abs() < 1e-9,
+            "central total wrong: {src_total}"
+        );
+        assert!(
+            (restored_total - src_total).abs() < 1e-9,
+            "restored partitioned flow diverged after restart: {restored_total} != {src_total}"
+        );
     }
 
     /// Restoring a checkpoint with a mismatched shard count is rejected.

@@ -697,7 +697,9 @@ pub async fn api_ivm_checkpoint(
     let flow = registry
         .get(&job_id)
         .ok_or_else(|| ivm_not_found(&job_id))?;
-    let bytes = flow.checkpoint().map_err(ivm_err)?;
+    // Full checkpoint (sources + view baselines): the source-only `checkpoint`
+    // loses view state across a restart, which broke IVM recovery (G6/F4).
+    let bytes = flow.checkpoint_full().map_err(ivm_err)?;
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
     Ok(Json(CheckpointResponse {
         checkpoint_b64: b64,
@@ -729,7 +731,8 @@ pub async fn api_ivm_restore(
         &body.checkpoint_b64,
     )
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
-    flow.restore(&bytes).map_err(ivm_err)?;
+    // Matches `api_ivm_checkpoint`'s full checkpoint (sources + view baselines).
+    flow.restore_full(&bytes).map_err(ivm_err)?;
     Ok(Json(RestoreResponse { success: true }))
 }
 
