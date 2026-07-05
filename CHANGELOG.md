@@ -22,6 +22,17 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **G2 (memory-constrained sort spill)**: a `SqlEngine` configured with a
+  memory limit under ~15MB had every sort fail immediately with "Not enough
+  memory to continue external sort" — DataFusion's `sort_spill_reservation_bytes`
+  defaults to a hardcoded 10MB reserved up front for the merge phase,
+  regardless of the configured pool size, so the reservation itself didn't
+  fit. `build_single_node_session_config` now scales the reservation down
+  proportionally (`(limit / 4).clamp(64KB, 10MB)`) when a memory limit is
+  set; deployments at or above 40MB are unaffected. New
+  `crates/krishiv-sql/tests/memory_spill.rs` proves sort, grouped
+  aggregation, and hash join spill correctly under a 2MB pool, with a
+  negative control confirming the workload genuinely requires spill.
 - Deregistering a continuous job now actually reaches its executor: the
   teardown uses `push_cancel_job` (broadened to cancel *assigned* streaming
   tasks — a `stream:loop` task is only `Running` inside a cycle), and the

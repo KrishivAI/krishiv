@@ -1,5 +1,60 @@
 # Krishiv Implementation Status
 
+## 2026-07-05 — G2: memory-constrained sort spill was reservation-starved
+
+**Scope**: the platform's engine gap register lists G2 ("memory accounting +
+spill for large batch queries") as unmet. `SqlEngine::new_with_memory_limit`
+(added in #72) already wires a `FairSpillPool` at the requested limit, but
+never adjusted DataFusion's `sort_spill_reservation_bytes`, which defaults to
+a hardcoded 10MB reserved up front for the external sort's merge phase.
+
+### Found
+
+Any memory limit below roughly 15MB made every sort fail immediately with
+"Not enough memory to continue external sort" — the reservation itself
+didn't fit the pool, so the operator never got a chance to spill a single
+byte. Memory-constrained containers are exactly the deployment case G2
+exists to cover, so this was a real correctness/robustness gap, not just an
+unverified claim.
+
+### Completed
+
+- `build_single_node_session_config` now scales `sort_spill_reservation_bytes`
+  down to `(memory_limit_bytes / 4).clamp(64KB, 10MB)` whenever a memory
+  limit is configured. Deployments at or above 40MB are unaffected.
+- New `crates/krishiv-sql/tests/memory_spill.rs`: sort, grouped aggregation,
+  and hash join all proven to spill *correctly* (exact result parity
+  asserted, not just "didn't crash") under a 2MB `FairSpillPool` against an
+  in-memory dataset engineered to exceed it. A negative control runs the
+  identical workload through DataFusion's non-spilling `GreedyMemoryPool` at
+  the same limit and confirms it fails with a resources-exhausted error —
+  proving the workload genuinely requires spill, not that it happened to
+  fit. A fifth test confirms two queries sharing one engine's pool
+  concurrently don't corrupt each other's results.
+
+### Validation
+
+- `cargo test -p krishiv-sql` — 407 tests green (366 lib + 26 comprehensive +
+  5 new memory_spill + 10 sql_compat).
+- `cargo clippy -p krishiv-sql -- -D warnings` — clean (the repo's real gate
+  omits `--all-targets`; `sql_tests.rs` is `#[cfg(test)]`-gated and isn't
+  part of it — confirmed this is pre-existing behavior, not something this
+  change touches).
+- `cargo fmt --check -p krishiv-sql` — clean.
+
+### Remaining gap
+
+This proves the spill mechanism itself is correct and no longer
+reservation-starved at small scale. It does **not** close G2's full exit
+criterion: a real TPC-H run at a scale factor exceeding actual executor RAM.
+This sandbox had no disk headroom for a multi-GB dataset (target/ artifacts
+alone had filled the 193GB disk; `cargo clean` recovered ~78GB to keep
+working). A real over-RAM TPC-H run, on hardware with room for the dataset,
+is still open — see `docs/BENCHMARKING.md` for the reproducibility bar that
+run needs to clear.
+
+**Next useful command**: `KRISHIV_TPCH_DATA_DIR_SF10=/path/to/sf10 cargo bench -p krishiv-bench --bench tpch_sf10` once a real scale-factor dataset and a machine with room for it are available; pair with `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` set below the dataset size to force real spill.
+
 ## 2026-07-03 — MCP continuous-stream restore/import slice
 
 **Scope**: extended the `krishiv-mcp` continuous-stream surface so exported
