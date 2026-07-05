@@ -1,8 +1,22 @@
 //! Filesystem-backed Iceberg-style table with Parquet data files (P1-10).
 //!
-//! Persists snapshot layers as Parquet under `{root}/data/` and metadata in
-//! `{root}/metadata.json`. Supports restart durability: reopen the same path
-//! and scan committed rows.
+//! Persists snapshot layers as Parquet under `{root}/data/` and metadata as
+//! versioned files `{root}/metadata-v{N}.json`. Supports restart durability:
+//! reopen the same path and scan committed rows.
+//!
+//! ## Concurrent commits (G2/G3 gap register)
+//!
+//! Commits are optimistic-concurrency, Iceberg-style: `append` reads the
+//! highest existing `metadata-v{N}.json`, then atomically creates
+//! `metadata-v{N+1}.json` via `create_new` (`O_EXCL` on Unix) — the OS
+//! guarantees only one writer can win that create. A losing writer (file
+//! already exists) re-reads the fresh latest version and retries. This has
+//! no unconditional-overwrite step anywhere, so two concurrent committers —
+//! whether two tasks in one process or two separate `krishiv` processes
+//! pointed at the same directory — can never lose one another's commit; the
+//! loser retries instead of clobbering. There is no in-memory state to keep
+//! consistent: every read (`scan`, `current_snapshot_id`, `append`) goes
+//! straight to whatever `metadata-v{N}.json` is highest on disk right now.
 
 use arrow::record_batch::RecordBatch;
 use futures::stream::Stream;
@@ -13,6 +27,12 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use super::{IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaVersion};
+
+/// Bound on commit retries under contention. Each retry is cheap (a
+/// directory listing + one `create_new` attempt), so this only matters
+/// under pathological contention; exceeding it is treated as a hard error
+/// rather than looping forever.
+const MAX_COMMIT_ATTEMPTS: u32 = 64;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FsLayerMeta {
@@ -38,7 +58,6 @@ pub struct IcebergFsTable {
     table_ref: IcebergTableRef,
     schema_version: SchemaVersion,
     root: PathBuf,
-    state: tokio::sync::Mutex<Vec<FsLayer>>,
 }
 
 impl IcebergFsTable {
@@ -50,38 +69,80 @@ impl IcebergFsTable {
     ) -> Result<Self, LakehouseError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("data")).map_err(|e| LakehouseError::Io(e.to_string()))?;
-        let layers = Self::load_layers(&root)?;
         Ok(Self {
             table_ref,
             schema_version,
             root,
-            state: tokio::sync::Mutex::new(layers),
         })
     }
 
-    fn metadata_path(root: &Path) -> PathBuf {
-        root.join("metadata.json")
+    fn metadata_version_path(root: &Path, version: u64) -> PathBuf {
+        root.join(format!("metadata-v{version:020}.json"))
     }
 
-    fn load_layers(root: &Path) -> Result<Vec<FsLayer>, LakehouseError> {
-        let meta_path = Self::metadata_path(root);
-        if !meta_path.exists() {
-            return Ok(Vec::new());
+    /// Parse the version number out of a `metadata-v{N}.json` file name, if
+    /// that's what it is.
+    fn parse_metadata_version(file_name: &str) -> Option<u64> {
+        file_name
+            .strip_prefix("metadata-v")?
+            .strip_suffix(".json")?
+            .parse()
+            .ok()
+    }
+
+    /// The highest committed version currently on disk, or `0` if the table
+    /// has never been committed to. Always a fresh directory scan — this is
+    /// the only source of truth, so concurrent commits from other processes
+    /// are visible on the next call.
+    fn latest_version(root: &Path) -> Result<u64, LakehouseError> {
+        if !root.exists() {
+            return Ok(0);
         }
+        let mut max_version = 0u64;
+        for entry in fs::read_dir(root).map_err(|e| LakehouseError::Io(e.to_string()))? {
+            let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if let Some(v) = Self::parse_metadata_version(&name) {
+                max_version = max_version.max(v);
+            }
+        }
+        Ok(max_version)
+    }
+
+    /// The current committed layers, read fresh from the highest version on
+    /// disk. `(0, vec![])` when the table has never been committed to.
+    fn load_latest(root: &Path) -> Result<(u64, Vec<FsLayer>), LakehouseError> {
+        let version = Self::latest_version(root)?;
+        if version == 0 {
+            return Ok((0, Vec::new()));
+        }
+        let meta_path = Self::metadata_version_path(root, version);
         let text = fs::read_to_string(&meta_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
         let meta: FsTableMetadata =
             serde_json::from_str(&text).map_err(|e| LakehouseError::Io(e.to_string()))?;
-        Ok(meta
+        let layers = meta
             .layers
             .into_iter()
             .map(|l| FsLayer {
                 snapshot_id: l.snapshot_id,
                 path: root.join("data").join(l.file),
             })
-            .collect())
+            .collect();
+        Ok((version, layers))
     }
 
-    fn persist_metadata(layers: &[FsLayer], root: &Path) -> Result<(), LakehouseError> {
+    /// Attempt to commit `layers` as version `next_version`. Returns `true`
+    /// if this writer won (the version file didn't already exist and was
+    /// created atomically); `false` if another writer committed that
+    /// version first — the caller must re-read the fresh latest state and
+    /// retry with a new `next_version`.
+    fn try_commit_version(
+        root: &Path,
+        next_version: u64,
+        layers: &[FsLayer],
+    ) -> Result<bool, LakehouseError> {
         let last_snapshot_id = layers.last().map(|l| l.snapshot_id).unwrap_or(0);
         let meta = FsTableMetadata {
             last_snapshot_id,
@@ -100,27 +161,35 @@ impl IcebergFsTable {
         };
         let bytes =
             serde_json::to_vec_pretty(&meta).map_err(|e| LakehouseError::Io(e.to_string()))?;
-        let tmp = root.join("metadata.json.tmp");
-        let final_path = Self::metadata_path(root);
-        fs::write(&tmp, &bytes).map_err(|e| LakehouseError::Io(e.to_string()))?;
-        // Sync the temp file to ensure the bytes are durable on disk before
-        // the rename. Without this, a power loss between `write` and
-        // `rename` can leave the renamed file empty or stale.
-        if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp) {
-            let _ = f.sync_all();
-        }
-        fs::rename(&tmp, &final_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-        // Sync the parent directory so the rename itself is durable. On
-        // Linux this requires opening the parent as a `File`; on platforms
-        // where this is unsupported (e.g. Windows) the call is best-effort
-        // and a no-op.
+        let path = Self::metadata_version_path(root, next_version);
+        // `create_new` opens with O_EXCL on Unix (and CREATE_NEW on
+        // Windows): the OS guarantees this fails with `AlreadyExists` if
+        // another writer's create won the race, and that at most one of any
+        // number of concurrent callers can succeed. This is the whole fix —
+        // no unconditional overwrite exists anywhere in the commit path.
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) => return Err(LakehouseError::Io(e.to_string())),
+        };
+        use std::io::Write;
+        file.write_all(&bytes)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        // Sync the parent directory so the new file's directory entry is
+        // durable. Best-effort on platforms without this concept.
         #[cfg(unix)]
         {
             if let Ok(dir) = fs::File::open(root) {
                 let _ = dir.sync_all();
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn read_parquet_file(path: &Path) -> Result<Vec<RecordBatch>, LakehouseError> {
@@ -229,88 +298,103 @@ impl LakehouseTable for IcebergFsTable {
     }
 
     async fn scan(&self, opts: &IcebergScanOptions) -> Result<Vec<RecordBatch>, LakehouseError> {
-        let layers = self.state.lock().await;
-        let selected: Vec<&FsLayer> = if let Some(target) = opts.snapshot_id {
-            layers.iter().filter(|l| l.snapshot_id <= target).collect()
-        } else {
-            layers.iter().collect()
-        };
-        let mut out = Vec::new();
-        for layer in selected {
-            out.extend(Self::read_parquet_file(&layer.path)?);
-        }
-        if let Some(limit) = opts.row_limit {
-            let mut trimmed = Vec::new();
-            let mut rows = 0u64;
-            for batch in out {
-                if rows >= limit {
-                    break;
-                }
-                let take = (limit - rows).min(batch.num_rows() as u64) as usize;
-                if take < batch.num_rows() {
-                    trimmed.push(batch.slice(0, take));
-                } else {
-                    trimmed.push(batch);
-                }
-                rows += take as u64;
+        let root = self.root.clone();
+        let opts = opts.clone();
+        tokio::task::spawn_blocking(move || {
+            let (_version, layers) = Self::load_latest(&root)?;
+            let selected: Vec<&FsLayer> = if let Some(target) = opts.snapshot_id {
+                layers.iter().filter(|l| l.snapshot_id <= target).collect()
+            } else {
+                layers.iter().collect()
+            };
+            let mut out = Vec::new();
+            for layer in selected {
+                out.extend(Self::read_parquet_file(&layer.path)?);
             }
-            return Ok(trimmed);
-        }
-        Ok(out)
+            if let Some(limit) = opts.row_limit {
+                let mut trimmed = Vec::new();
+                let mut rows = 0u64;
+                for batch in out {
+                    if rows >= limit {
+                        break;
+                    }
+                    let take = (limit - rows).min(batch.num_rows() as u64) as usize;
+                    if take < batch.num_rows() {
+                        trimmed.push(batch.slice(0, take));
+                    } else {
+                        trimmed.push(batch);
+                    }
+                    rows += take as u64;
+                }
+                return Ok(trimmed);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| LakehouseError::Io(format!("spawn_blocking panicked: {e}")))?
     }
 
+    /// Commit `batches` as a new snapshot layer.
+    ///
+    /// Optimistic concurrency: reads the latest committed version, writes
+    /// the data file under an attempt-unique name (so two racing attempts
+    /// with the same candidate `snapshot_id` never clobber each other's
+    /// Parquet file), then tries to atomically create the next version's
+    /// metadata file. If another writer committed that version first, the
+    /// data file this attempt wrote becomes harmless orphaned garbage (a
+    /// future vacuum could reclaim it) and the whole attempt retries against
+    /// the now-current latest version — up to `MAX_COMMIT_ATTEMPTS`.
     async fn append(&self, batches: Vec<RecordBatch>) -> Result<(), LakehouseError> {
         if batches.is_empty() {
             return Ok(());
         }
-        let (next_id, current_layers) = {
-            let layers = self.state.lock().await;
-            let next_id = layers.last().map(|l| l.snapshot_id + 1).unwrap_or(1);
-            (next_id, layers.clone())
-        };
-        let file_name = format!("snap-{next_id:05}.parquet");
-        let path = self.root.join("data").join(&file_name);
-        let tmp_path = self.root.join("data").join(format!(".{file_name}.tmp"));
         let root = self.root.clone();
-
-        // Perform blocking I/O off the async runtime.
         tokio::task::spawn_blocking(move || {
-            Self::write_parquet_file(&tmp_path, &batches)?;
-            fs::rename(&tmp_path, &path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-            #[cfg(unix)]
-            {
-                if let Ok(dir) = File::open(root.join("data")) {
-                    let _ = dir.sync_all();
+            for _ in 0..MAX_COMMIT_ATTEMPTS {
+                let (current_version, current_layers) = Self::load_latest(&root)?;
+                let next_id = current_layers
+                    .last()
+                    .map(|l| l.snapshot_id + 1)
+                    .unwrap_or(1);
+                // Attempt-unique, not just snapshot-id-unique: two racing
+                // attempts can compute the same `next_id` from the same
+                // stale read, and must not write the same file path.
+                let attempt_tag = uuid::Uuid::new_v4().simple().to_string();
+                let file_name = format!("snap-{next_id:05}-{attempt_tag}.parquet");
+                let path = root.join("data").join(&file_name);
+                Self::write_parquet_file(&path, &batches)?;
+
+                let new_layer = FsLayer {
+                    snapshot_id: next_id,
+                    path: path.clone(),
+                };
+                let mut next_layers = current_layers;
+                next_layers.push(new_layer);
+
+                if Self::try_commit_version(&root, current_version + 1, &next_layers)? {
+                    return Ok(());
                 }
+                // Lost the race: another writer committed
+                // `current_version + 1` first. Our data file is now
+                // unreferenced garbage; leave it (harmless, reclaimable
+                // later) and retry against the fresh state.
             }
-            Ok::<_, LakehouseError>(())
+            Err(LakehouseError::Io(format!(
+                "commit did not succeed after {MAX_COMMIT_ATTEMPTS} attempts under contention"
+            )))
         })
         .await
-        .map_err(|e| LakehouseError::Io(format!("spawn_blocking panicked: {e}")))??;
-
-        let new_layer = FsLayer {
-            snapshot_id: next_id,
-            path: self.root.join("data").join(&file_name),
-        };
-        let mut next_layers = current_layers;
-        next_layers.push(new_layer);
-
-        // Persist metadata on a blocking thread — it writes to disk.
-        let root = self.root.clone();
-        let layers_for_persist = next_layers.clone();
-        tokio::task::spawn_blocking(move || Self::persist_metadata(&layers_for_persist, &root))
-            .await
-            .map_err(|e| LakehouseError::Io(format!("spawn_blocking panicked: {e}")))??;
-
-        // Update in-memory state after all I/O has succeeded.
-        let mut layers = self.state.lock().await;
-        *layers = next_layers;
-        Ok(())
+        .map_err(|e| LakehouseError::Io(format!("spawn_blocking panicked: {e}")))?
     }
 
     async fn current_snapshot_id(&self) -> Result<Option<i64>, LakehouseError> {
-        let layers = self.state.lock().await;
-        Ok(layers.last().map(|l| l.snapshot_id))
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            let (_version, layers) = Self::load_latest(&root)?;
+            Ok(layers.last().map(|l| l.snapshot_id))
+        })
+        .await
+        .map_err(|e| LakehouseError::Io(format!("spawn_blocking panicked: {e}")))?
     }
 }
 
@@ -526,7 +610,7 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
             .collect();
         assert_eq!(files.len(), 1);
-        let meta_path = dir.path().join("metadata.json");
+        let meta_path = IcebergFsTable::metadata_version_path(dir.path(), 1);
         assert!(meta_path.exists());
         let metadata: FsTableMetadata =
             serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
@@ -537,5 +621,66 @@ mod tests {
                 "metadata must not reference a data file before it exists"
             );
         }
+    }
+
+    /// G3 (gap register): proves the "concurrent committers last-write-win
+    /// (lost update)" bug is fixed. Each of `N` writers gets its *own*
+    /// `IcebergFsTable` instance pointed at the same directory — no shared
+    /// `Arc`, no shared in-memory state — the same shape a second `krishiv`
+    /// process pointed at the same table would have. All `N` commit
+    /// concurrently; if the old unconditional-overwrite scheme were still in
+    /// place, the losers' commits would vanish (last write wins) and this
+    /// would flake down to fewer than `N` rows / a non-`N` snapshot id.
+    #[tokio::test]
+    async fn concurrent_writers_with_independent_table_handles_lose_no_commits() {
+        const N: i64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "concurrent");
+        let root = dir.path().to_path_buf();
+
+        // Ensure the directory structure exists before racing writers start
+        // (each `IcebergFsTable::new` would otherwise also race to create
+        // it, which is fine — `create_dir_all` is idempotent — but this
+        // keeps the test focused on the commit race specifically).
+        IcebergFsTable::new(&root, table_ref.clone(), schema_version()).unwrap();
+
+        let writers = (0..N).map(|i| {
+            let root = root.clone();
+            let table_ref = table_ref.clone();
+            tokio::spawn(async move {
+                let table = IcebergFsTable::new(&root, table_ref, schema_version()).unwrap();
+                table.append(vec![batch(vec![i])]).await.unwrap();
+            })
+        });
+        for w in writers {
+            w.await.expect("writer task panicked");
+        }
+
+        // Fresh handle, fresh disk read — exactly what a reader in another
+        // process would see after all writers finished.
+        let reader = IcebergFsTable::new(&root, table_ref, schema_version()).unwrap();
+        let result = reader.scan(&IcebergScanOptions::new()).await.unwrap();
+        let mut values: Vec<i64> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            (0..N).collect::<Vec<_>>(),
+            "every writer's row must survive — a lost update would shrink this below N"
+        );
+        assert_eq!(
+            reader.current_snapshot_id().await.unwrap(),
+            Some(N),
+            "N successful commits must produce exactly N versions, none skipped/overwritten"
+        );
     }
 }
