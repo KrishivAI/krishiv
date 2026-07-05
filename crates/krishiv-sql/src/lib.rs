@@ -322,6 +322,17 @@ pub fn default_parallelism_from_env() -> NonZeroUsize {
         .unwrap_or_else(|| std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN))
 }
 
+/// DataFusion's own default `sort_spill_reservation_bytes` (the merge-phase
+/// buffer an external sort reserves up front). Deployments that set a
+/// `memory_limit_bytes` smaller than this would otherwise have every sort
+/// fail immediately with "Not enough memory to continue external sort"
+/// before a single byte spills — the reservation alone doesn't fit the pool.
+const DEFAULT_SORT_SPILL_RESERVATION_BYTES: usize = 10 * 1024 * 1024;
+
+/// Floor for the scaled-down reservation below which DataFusion's merge step
+/// has too little room to make forward progress.
+const MIN_SORT_SPILL_RESERVATION_BYTES: usize = 64 * 1024;
+
 /// Build the DataFusion session config with a configurable parallelism level.
 ///
 /// When `target_partitions > 1`, round-robin repartitioning is enabled so
@@ -329,8 +340,15 @@ pub fn default_parallelism_from_env() -> NonZeroUsize {
 /// aggregation spill, and parquet scan parallelism.
 ///
 /// `execution.batch_size` is set from `KRISHIV_BATCH_SIZE` (default: 8192).
+///
+/// `memory_limit_bytes`, when `Some`, scales `sort_spill_reservation_bytes`
+/// down proportionally so a tight memory pool can still spill instead of
+/// failing outright because the reservation itself doesn't fit. Pools at or
+/// above `4 * DEFAULT_SORT_SPILL_RESERVATION_BYTES` (40MB) are unaffected —
+/// this only kicks in for genuinely memory-constrained deployments.
 fn build_single_node_session_config(
     target_partitions: NonZeroUsize,
+    memory_limit_bytes: Option<usize>,
 ) -> datafusion::prelude::SessionConfig {
     let tp = target_partitions.get();
     let batch_size = batch_size_from_env();
@@ -344,6 +362,13 @@ fn build_single_node_session_config(
         );
     config.options_mut().execution.parquet.pushdown_filters = true;
     config.options_mut().execution.parquet.enable_page_index = true;
+    if let Some(limit) = memory_limit_bytes {
+        let scaled = (limit / 4).clamp(
+            MIN_SORT_SPILL_RESERVATION_BYTES,
+            DEFAULT_SORT_SPILL_RESERVATION_BYTES,
+        );
+        config = config.with_sort_spill_reservation_bytes(scaled);
+    }
     config
 }
 
@@ -641,7 +666,10 @@ impl SqlEngine {
         );
         let mut state_builder = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
-            .with_config(build_single_node_session_config(target_partitions))
+            .with_config(build_single_node_session_config(
+                target_partitions,
+                memory_limit_bytes,
+            ))
             .with_table_factories(table_factories);
         if let Some(limit) = memory_limit_bytes {
             // A FairSpillPool shares the limit across concurrently running
@@ -716,7 +744,7 @@ impl SqlEngine {
         );
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
-            .with_config(build_single_node_session_config(target_partitions))
+            .with_config(build_single_node_session_config(target_partitions, None))
             .with_table_factories(table_factories)
             .build();
         let context = SessionContext::new_with_state(state);
