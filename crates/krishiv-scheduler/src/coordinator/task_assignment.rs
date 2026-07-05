@@ -766,12 +766,19 @@ impl Coordinator {
     /// scheduler-side cancel is always applied.
     pub async fn push_cancel_job(&mut self, job_id: &JobId) -> SchedulerResult<()> {
         // Collect (endpoint, TaskCancellationRequest) for each running task.
+        // Streaming jobs also cancel *assigned* tasks regardless of state: a
+        // continuous `stream:loop` task is only `Running` inside a cycle, but
+        // its executor retains the window state and the inbox dedupe identity
+        // between cycles — the teardown must reach it (the executor retires
+        // the job identity on cancel) or a recreated job with the same
+        // deterministic ids is silently swallowed as a duplicate.
+        let job_is_streaming = self.find_job(job_id)?.spec.kind() == JobKind::Streaming;
         let mut targets: Vec<(String, TaskCancellationRequest)> = Vec::new();
         {
             let job = self.find_job(job_id)?;
             for stage in job.stages() {
                 for task in stage.tasks() {
-                    if task.state() == TaskState::Running
+                    if (task.state() == TaskState::Running || job_is_streaming)
                         && let Some(executor_id) = task.assigned_executor()
                         && let Ok(record) = self.exec.executors.find_executor(executor_id)
                         && let Some(endpoint) = record.descriptor().task_endpoint()

@@ -354,6 +354,14 @@ impl Coordinator {
             .output_metadata()
             .map(|meta| meta.inline_record_batch_ipc().to_vec())
             .unwrap_or_default();
+        // G5: post-cycle continuous operator state + its watermark (persisted
+        // below once the update is applied successfully).
+        let state_snapshot = update
+            .output_metadata()
+            .and_then(|meta| meta.state_snapshot().map(<[u8]>::to_vec));
+        let task_watermark_ms = update
+            .output_metadata()
+            .and_then(|meta| meta.watermark_ms());
         let terminal_state = update.state();
         let executor_id_for_circuit = update.executor_id().clone();
         // Save before update is moved.
@@ -482,6 +490,24 @@ impl Coordinator {
                 .extend(inline_ipc);
         }
 
+        // G5: a completed continuous cycle carries the executor's post-cycle
+        // operator state — persist it as the job's restorable checkpoint, so
+        // `POST /api/v1/continuous/{id}/checkpoint` returns live state and a
+        // recreated job can be rehydrated via the restore endpoint.
+        if terminal_state == TaskState::Succeeded
+            && is_continuous_cycle
+            && let Some(snapshot_bytes) = state_snapshot
+        {
+            let watermark_ms = task_watermark_ms.unwrap_or(i64::MIN);
+            self.save_continuous_snapshot(
+                job_id.as_str(),
+                crate::ContinuousSnapshot {
+                    snapshot_bytes,
+                    watermark_ms,
+                },
+            );
+        }
+
         // AQE stage-boundary re-optimization (Phase 2.9).
         //
         // When a shuffle stage completes, collect per-task serialized_bytes and
@@ -598,7 +624,12 @@ impl Coordinator {
 
         if is_continuous_cycle && terminal_state == TaskState::Succeeded {
             self.complete_continuous_input_cycle(&job_id, &task_id);
-        } else if is_continuous_cycle && terminal_state == TaskState::Failed {
+        } else if is_continuous_cycle
+            && matches!(terminal_state, TaskState::Failed | TaskState::Cancelled)
+        {
+            // A cancelled cycle (e.g. an executor-side tombstone from a prior
+            // incarnation of this job id) must release the fence too —
+            // otherwise every later push 409s forever.
             self.continuous_input_cycles.remove(&job_id);
             self.job_input_partitions.remove(&job_id);
         }

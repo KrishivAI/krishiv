@@ -163,6 +163,12 @@ pub struct TaskOutputMetadata {
     /// commit protocol (Phase 2.3); the coordinator publishes these into the
     /// destination once the whole job succeeds.
     sink_staged_files: Vec<String>,
+    /// G5: serialized `stream:loop` operator state captured after a
+    /// continuous window cycle (the executor's `peek_snapshot_bytes`). The
+    /// coordinator persists it as the job's `ContinuousSnapshot` so the
+    /// checkpoint endpoint returns live state and a restore can rehydrate a
+    /// recreated job. `None` for non-stateful/non-streaming tasks.
+    state_snapshot: Option<Vec<u8>>,
 }
 
 impl TaskOutputMetadata {
@@ -184,6 +190,7 @@ impl TaskOutputMetadata {
             watermark_ms: None,
             hot_key_reports: Vec::new(),
             sink_staged_files: Vec::new(),
+            state_snapshot: None,
         }
     }
 
@@ -277,6 +284,18 @@ impl TaskOutputMetadata {
     /// Maximum event-time watermark (ms) emitted by this streaming window task.
     pub fn watermark_ms(&self) -> Option<i64> {
         self.watermark_ms
+    }
+
+    /// Attach serialized `stream:loop` operator state from a continuous cycle.
+    #[must_use]
+    pub fn with_state_snapshot(mut self, bytes: Vec<u8>) -> Self {
+        self.state_snapshot = Some(bytes);
+        self
+    }
+
+    /// Serialized continuous operator state, when this was a stateful cycle.
+    pub fn state_snapshot(&self) -> Option<&[u8]> {
+        self.state_snapshot.as_deref()
     }
 }
 

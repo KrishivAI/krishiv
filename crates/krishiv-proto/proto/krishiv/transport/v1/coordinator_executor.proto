@@ -345,6 +345,12 @@ message TaskOutputMetadata {
   // base_dir). Populated by object-parquet sink tasks running the Phase 2.3
   // staged commit protocol; the coordinator publishes them on job success.
   repeated string sink_staged_files = 19;
+  // G5: serialized `stream:loop` operator state captured after a continuous
+  // window cycle (the executor's `peek_snapshot_bytes`). The coordinator
+  // persists it as the job's `ContinuousSnapshot` so `POST
+  // /api/v1/continuous/{id}/checkpoint` returns live state and a restore can
+  // rehydrate a recreated job. Empty = not a stateful streaming cycle.
+  bytes state_snapshot = 20;
 }
 
 message TaskCancellationRequest {

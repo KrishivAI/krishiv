@@ -283,8 +283,14 @@ pub async fn api_continuous_deregister(
     let mut coord = coordinator.write().await;
     // Confirm it exists and is a streaming job (404 if unknown, 409 otherwise).
     continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?;
+    // push_cancel_job (not plain cancel_job): the assigned executor must hear
+    // about the teardown so it retires the job identity — drops the stateful
+    // `stream:loop` executor and the inbox dedupe entries. Without the RPC, a
+    // recreated job reusing the same deterministic ids has its first cycle
+    // silently swallowed as an at-least-once duplicate.
     coord
-        .cancel_job(&job_id)
+        .push_cancel_job(&job_id)
+        .await
         .map_err(|error| scheduler_status(&error))?;
     // Cancel is terminal → evict removes it from `job_coordinators`, freeing the id.
     coord.evict_completed_job(&job_id);

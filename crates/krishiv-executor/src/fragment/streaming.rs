@@ -578,23 +578,30 @@ async fn execute_loop_fragment(
         (batches, wm)
     };
 
+    // Capture the post-cycle operator state once via `snapshot()` — the
+    // documented restore counterpart (`checkpoint()` first, so the state
+    // backend actually contains the live window panes; `peek_snapshot_bytes`
+    // alone serializes a backend the panes were never written into). The
+    // cycle just completed, so this is a consistent boundary. The bytes feed
+    // the queryable-state store below AND travel to the coordinator in the
+    // task output as the job's restorable checkpoint (G5).
+    let state_snapshot = executor_arc
+        .lock()
+        .ok()
+        .and_then(|mut exec| exec.snapshot().ok())
+        .filter(|bytes| !bytes.is_empty());
+
     // Fix #2: after each drain cycle, push a read-only snapshot into the
     // queryable-state store so REST point-lookups can serve the latest state
     // without contending with the hot processing path.
-    if let Some(qs) = runner.queryable_state.as_ref() {
+    if let (Some(qs), Some(bytes)) = (runner.queryable_state.as_ref(), state_snapshot.as_ref()) {
         use krishiv_state::StateBackend as _;
-        // Use peek_snapshot_bytes (no checkpoint() side-effect) so the normal
-        // checkpoint lifecycle is not disturbed by queryable-state observation.
-        executor_arc
-            .lock()
-            .ok()
-            .and_then(|exec| exec.peek_snapshot_bytes().ok())
-            .and_then(|bytes| {
-                let mut backend = krishiv_state::RocksDbStateBackend::ephemeral().ok()?;
-                backend.load_snapshot(&bytes).ok()?;
-                qs.register(job_id, "window-exec", std::sync::Arc::new(backend));
-                Some(())
-            });
+        let _ = (|| {
+            let mut backend = krishiv_state::RocksDbStateBackend::ephemeral().ok()?;
+            backend.load_snapshot(bytes).ok()?;
+            qs.register(job_id, "window-exec", std::sync::Arc::new(backend));
+            Some(())
+        })();
     }
 
     let total_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
@@ -621,6 +628,11 @@ async fn execute_loop_fragment(
     output.hot_key_reports = hot_key_reports;
     if loop_watermark_ms > i64::MIN {
         output = output.with_watermark_ms(loop_watermark_ms);
+    }
+    // G5: ship the post-cycle operator state to the coordinator so the job
+    // has a restorable checkpoint after every completed cycle.
+    if let Some(bytes) = state_snapshot {
+        output = output.with_state_snapshot(bytes);
     }
     Ok(output)
 }

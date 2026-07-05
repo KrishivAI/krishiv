@@ -8,6 +8,33 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **G5: restorable checkpoints for continuous windowed jobs, exercised live on
+  a cluster.** Every completed continuous cycle now ships the executor's
+  post-cycle `stream:loop` operator state back to the coordinator
+  (`TaskOutputMetadata.state_snapshot`, wire field 20; captured via
+  `ContinuousWindowExecutor::snapshot()` — the `checkpoint()`-first variant, as
+  `peek_snapshot_bytes` serializes a backend the live panes were never written
+  into), and the coordinator persists it as the job's `ContinuousSnapshot`. As
+  a result `POST /api/v1/continuous/{id}/checkpoint` returns real live state
+  and `…/restore` rehydrates a recreated job. Verified live on k8s: seed a
+  partial window → checkpoint → deregister → re-register + restore → closing
+  the window emits the exact pre-kill accumulations.
+
+### Fixed
+
+- Deregistering a continuous job now actually reaches its executor: the
+  teardown uses `push_cancel_job` (broadened to cancel *assigned* streaming
+  tasks — a `stream:loop` task is only `Running` inside a cycle), and the
+  executor retires the job's identity on cancel — drops the stateful window
+  executor + buffered inputs, purges the assignment inbox's
+  `(job, task, attempt)` dedupe entries (`forget_job`), and clears the task
+  tombstone. Without this, a recreated job reusing the same deterministic ids
+  (`task-streaming`, attempts from 1) had its first cycle silently swallowed
+  as an at-least-once duplicate, wedging the cycle fence so every later push
+  409'd forever.
+- A `Cancelled` continuous-cycle task now releases the input-cycle fence like
+  a `Failed` one (previously only Succeeded/Failed cleared it).
+
 - Coordinator HTTP `POST /api/v1/continuous-register-sql`: register a continuous
   windowed streaming job from **SQL** (`SELECT key, AGG(col) FROM TUMBLE/HOP/
   SESSION(TABLE src, DESCRIPTOR(ts), <ms>) GROUP BY …`). The coordinator compiles
