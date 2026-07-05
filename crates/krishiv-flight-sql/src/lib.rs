@@ -30,7 +30,8 @@ mod tests {
 
     use super::*;
     use crate::actions::{
-        build_param_schema, count_sql_params, schema_to_ipc_bytes, substitute_sql_params,
+        build_param_schema, count_sql_params, normalize_question_mark_params, schema_to_ipc_bytes,
+        substitute_sql_params,
     };
 
     fn make_auth_service() -> KrishivFlightSqlService {
@@ -678,6 +679,60 @@ mod tests {
         assert_eq!(count_sql_params("SELECT 1"), 0);
         assert_eq!(count_sql_params("WHERE x = $10 AND y = $2"), 10);
         assert_eq!(count_sql_params("$1 AND $1"), 1);
+    }
+
+    // ── G12: JDBC/ADBC `?` ordinal parameter normalization ──────────────────
+
+    #[test]
+    fn normalize_question_mark_converts_single_placeholder() {
+        assert_eq!(
+            normalize_question_mark_params("SELECT * FROM t WHERE id = ?"),
+            "SELECT * FROM t WHERE id = $1"
+        );
+    }
+
+    #[test]
+    fn normalize_question_mark_numbers_sequentially_left_to_right() {
+        assert_eq!(
+            normalize_question_mark_params("SELECT * FROM t WHERE a = ? AND b = ? AND c = ?"),
+            "SELECT * FROM t WHERE a = $1 AND b = $2 AND c = $3"
+        );
+    }
+
+    #[test]
+    fn normalize_question_mark_leaves_string_literal_contents_untouched() {
+        assert_eq!(
+            normalize_question_mark_params("SELECT 'a?b' FROM t WHERE x = ?"),
+            "SELECT 'a?b' FROM t WHERE x = $1"
+        );
+    }
+
+    #[test]
+    fn normalize_question_mark_handles_escaped_quote_in_string_with_question_mark() {
+        // The literal is `it''s a ?` (SQL-escaped `''` for a literal `'`),
+        // containing a `?` that must not be treated as a placeholder, followed
+        // by a real placeholder outside the string.
+        assert_eq!(
+            normalize_question_mark_params("SELECT 'it''s a ?' FROM t WHERE x = ?"),
+            "SELECT 'it''s a ?' FROM t WHERE x = $1"
+        );
+    }
+
+    #[test]
+    fn normalize_question_mark_no_placeholders_is_unchanged() {
+        assert_eq!(
+            normalize_question_mark_params("SELECT * FROM t WHERE id = $1"),
+            "SELECT * FROM t WHERE id = $1"
+        );
+        assert_eq!(normalize_question_mark_params("SELECT 1"), "SELECT 1");
+    }
+
+    #[test]
+    fn normalize_question_mark_leaves_quoted_identifier_contents_untouched() {
+        assert_eq!(
+            normalize_question_mark_params(r#"SELECT "weird?col" FROM t WHERE x = ?"#),
+            r#"SELECT "weird?col" FROM t WHERE x = $1"#
+        );
     }
 
     #[test]

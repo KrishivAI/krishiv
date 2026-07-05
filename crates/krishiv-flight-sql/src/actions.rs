@@ -71,6 +71,66 @@ pub(crate) fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, Status> {
     Ok(buf)
 }
 
+/// Normalize JDBC/ODBC `?` positional placeholders to `$N` (G12).
+///
+/// JDBC and ADBC clients bind prepared-statement parameters as ordinal `?`
+/// marks (`SELECT * FROM t WHERE id = ?`), but the engine's substitution path
+/// (`count_sql_params`/`substitute_sql_params`) only recognizes `$N`. Without
+/// this normalization every `?`-bound query counts zero parameters and fails
+/// with a DataFusion placeholder error or "parameter ordinal out of range."
+///
+/// Single-pass, quote-aware: a `?` inside a single-quoted string literal
+/// (`'...'`, with `''` as an escaped quote) or a double-quoted identifier
+/// (`"..."`, same escaping) is verbatim text, not a placeholder, and is left
+/// untouched. Placeholders are numbered `$1, $2, …` in left-to-right order of
+/// appearance — the same order JDBC's `PreparedStatement.setObject(1, …)`,
+/// `setObject(2, …)` etc. assumes.
+///
+/// A SQL text that already uses `$N` (and contains no `?` at all) round-trips
+/// unchanged, since there is nothing to rewrite.
+pub(crate) fn normalize_question_mark_params(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.char_indices().peekable();
+    let mut next_param = 1usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '\'' if !in_double_quote => {
+                out.push(c);
+                // `''` inside a string literal is an escaped quote, not the
+                // closing quote — consume it as a literal pair.
+                if in_single_quote
+                    && chars.peek().map(|&(_, c)| c) == Some('\'')
+                    && let Some((_, escaped)) = chars.next()
+                {
+                    out.push(escaped);
+                } else {
+                    in_single_quote = !in_single_quote;
+                }
+            }
+            '"' if !in_single_quote => {
+                out.push(c);
+                if in_double_quote
+                    && chars.peek().map(|&(_, c)| c) == Some('"')
+                    && let Some((_, escaped)) = chars.next()
+                {
+                    out.push(escaped);
+                } else {
+                    in_double_quote = !in_double_quote;
+                }
+            }
+            '?' if !in_single_quote && !in_double_quote => {
+                out.push('$');
+                out.push_str(&next_param.to_string());
+                next_param += 1;
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Substitute `$N` placeholders in `sql` with SQL literal values from `batch`
 /// row 0.
 ///

@@ -358,8 +358,22 @@ impl LakehouseTable for IcebergFsTable {
                     .unwrap_or(1);
                 // Attempt-unique, not just snapshot-id-unique: two racing
                 // attempts can compute the same `next_id` from the same
-                // stale read, and must not write the same file path.
-                let attempt_tag = uuid::Uuid::new_v4().simple().to_string();
+                // stale read, and must not write the same file path. No new
+                // dependency needed for this — `iceberg_fs` compiles under
+                // the base `lakehouse` feature, not the narrower `iceberg`
+                // one that pulls in `uuid`. Wall-clock nanoseconds already
+                // make same-path collisions astronomically unlikely; the
+                // atomic counter closes the gap entirely for two attempts
+                // racing within the same nanosecond (e.g. two threads on a
+                // coarser-clock platform).
+                static ATTEMPT_COUNTER: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let count = ATTEMPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let attempt_tag = format!("{nanos:x}-{count:x}");
                 let file_name = format!("snap-{next_id:05}-{attempt_tag}.parquet");
                 let path = root.join("data").join(&file_name);
                 Self::write_parquet_file(&path, &batches)?;

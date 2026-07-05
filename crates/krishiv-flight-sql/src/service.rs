@@ -14,9 +14,8 @@ use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
     ActionCreatePreparedStatementResult, ActionEndTransactionRequest, CommandGetCatalogs,
     CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables,
-    CommandPreparedStatementQuery,
-    CommandStatementQuery, DoPutPreparedStatementResult, EndTransaction, ProstMessageExt, SqlInfo,
-    TicketStatementQuery,
+    CommandPreparedStatementQuery, CommandStatementQuery, DoPutPreparedStatementResult,
+    EndTransaction, ProstMessageExt, SqlInfo, TicketStatementQuery,
 };
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
@@ -33,7 +32,7 @@ use krishiv_plan::governance::{AuthProvider, PolicyHook, StaticApiKeyAuthProvide
 
 use crate::actions::{
     KrishivActionError, build_param_schema, count_sql_params, encode_batches_ipc,
-    schema_to_ipc_bytes, substitute_sql_params,
+    normalize_question_mark_params, schema_to_ipc_bytes, substitute_sql_params,
 };
 use crate::host::FlightExecutionHost;
 
@@ -532,6 +531,12 @@ impl FlightSqlService for KrishivFlightSqlService {
     ///
     /// G16: The response includes a `parameter_schema` derived from `$N`
     /// positional placeholders found in the SQL text.
+    ///
+    /// G12: JDBC/ADBC clients bind parameters as ordinal `?` marks, not the
+    /// engine's native `$N` — the SQL text is normalized to `$N` once here
+    /// (before counting params, planning `dataset_schema`, or caching), so
+    /// every downstream step (this handler, `do_put_prepared_statement_query`,
+    /// `do_get_statement`) only ever sees `$N`.
     async fn do_action_create_prepared_statement(
         &self,
         query: ActionCreatePreparedStatementRequest,
@@ -540,7 +545,8 @@ impl FlightSqlService for KrishivFlightSqlService {
         let subject = self.authenticate_request(&request)?;
         let subject_key = subject.as_deref().unwrap_or("__anon__").to_owned();
         let handle = Uuid::new_v4().to_string();
-        let n_params = count_sql_params(&query.query);
+        let sql = normalize_question_mark_params(&query.query);
+        let n_params = count_sql_params(&sql);
         let param_schema = build_param_schema(n_params);
         let parameter_schema = schema_to_ipc_bytes(&param_schema)?;
         // Best-effort result schema (G1: the JDBC driver routes
@@ -548,7 +554,7 @@ impl FlightSqlService for KrishivFlightSqlService {
         // it empty sent every SELECT down the unimplemented update path).
         // Empty bytes remain the honest "unknown" for statements the host
         // cannot plan.
-        let dataset_schema = match self.host.sql_query_schema(&query.query).await {
+        let dataset_schema = match self.host.sql_query_schema(&sql).await {
             Some(schema) => schema_to_ipc_bytes(schema.as_ref())?,
             None => Vec::new(),
         };
@@ -557,7 +563,7 @@ impl FlightSqlService for KrishivFlightSqlService {
             let cache = map
                 .entry(subject_key)
                 .or_insert_with(|| lru::LruCache::new(read_prepared_stmt_capacity()));
-            cache.put(handle.clone(), query.query);
+            cache.put(handle.clone(), sql);
         }
         Ok(ActionCreatePreparedStatementResult {
             prepared_statement_handle: handle.into_bytes().into(),
