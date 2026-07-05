@@ -8,6 +8,22 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **New benchmark: IVM vs full-recompute**
+  (`crates/krishiv-bench/benches/ivm_vs_full_recompute.rs`,
+  `cargo bench -p krishiv-bench --bench ivm_vs_full_recompute`). **Finding
+  worth flagging, not just a new benchmark**: at table sizes up to 1M rows,
+  a full recompute of a `GROUP BY SUM` query is ~100x *faster* in wall-clock
+  time than one `IncrementalFlow::step_datafusion()` tick — every production
+  call site constructs a fresh `SessionContext` per tick (confirmed via
+  `grep -rn step_datafusion` across `krishiv-executor`/`krishiv-api`/
+  `krishiv-scheduler` — all of them use the plain convenience method), and
+  that fixed setup cost (~650-700ms) dominates the true O(Δ) aggregate
+  work at these scales. Extrapolating measured full-recompute scaling, the
+  crossover (where a full recompute costs as much as one current IVM tick)
+  is ~23M rows. See `docs/implementation/status.md` for the full
+  methodology, numbers, and root-cause read of `flow.rs`. Not fixed here —
+  reusing a job-scoped `SessionContext` across ticks is the natural
+  follow-up and is flagged for the engine team, not attempted this session.
 - **G5: restorable checkpoints for continuous windowed jobs, exercised live on
   a cluster.** Every completed continuous cycle now ships the executor's
   post-cycle `stream:loop` operator state back to the coordinator

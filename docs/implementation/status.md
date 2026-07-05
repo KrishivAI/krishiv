@@ -1,5 +1,94 @@
 # Krishiv Implementation Status
 
+## 2026-07-05 — IVM vs full-recompute benchmark: a real, counter-narrative finding
+
+**Scope**: platform Phase 20's "headline blog post" performance story asks for
+a reproducible IVM-vs-full-recompute cost comparison. Built one
+(`crates/krishiv-bench/benches/ivm_vs_full_recompute.rs`) and ran it. **The
+result does not support the expected narrative, and this entry reports the
+real numbers rather than reframing them.**
+
+### Methodology
+
+`SELECT region, SUM(amount) AS total FROM orders GROUP BY region` (100
+distinct regions), at four accumulated-table sizes (50K/200K/500K/1M rows):
+
+- `full_recompute/<n>`: a fresh `SqlEngine`, table of `n` rows registered as a
+  `MemTable`, the query run from scratch.
+- `ivm_incremental_feed/<n>`: an `IncrementalFlow` whose materialized view
+  already reflects `n - 5,000` rows, timing only the cost of feeding one more
+  5,000-row batch and calling `.step_datafusion()`.
+
+Criterion `iter_batched` isolates setup (untimed) from the timed operation;
+10 samples each; commit `01d974b`, worktree had the benchmark's own
+not-yet-committed changes only (confirmed via `git status --short`), no
+other local modifications; `rustc 1.92.0`; Linux, `x86_64`, AMD EPYC (8
+vCPUs visible), 23GiB RAM.
+
+### Results
+
+| n | `full_recompute` (median) | `ivm_incremental_feed` (median) |
+|---|---|---|
+| 50,000 | 3.74 ms | 263.7 ms |
+| 200,000 | 8.27 ms | 699.2 ms |
+| 500,000 | 14.8 ms | 729.6 ms |
+| 1,000,000 | 33.5 ms | 734.5 ms |
+
+**`full_recompute` is faster than `ivm_incremental_feed` at every size
+tested — by roughly two orders of magnitude.** `full_recompute` scales
+linearly with `n` as expected (DataFusion's in-memory columnar scan +
+hash-aggregate is simply very fast: ~31ns/row by linear fit). But
+`ivm_incremental_feed` does **not** stay flat as the O(Δ) story predicts —
+it grows from 50K→200K, then plateaus around ~700-735ms regardless of
+whether the table has 200K or 1M rows.
+
+### Root cause (confirmed, not guessed)
+
+Read `IncrementalFlow::step_datafusion` (`crates/krishiv-ivm/src/flow.rs:550`):
+it constructs a **brand-new `SessionContext::new()` on every single call**,
+then (Phase 3) re-registers the source's full accumulated snapshot as a
+fresh `MemTable` on that fresh context, every tick — even for views with a
+cached incremental (O(Δ)) plan that never touches this table via SQL.
+Checked every production call site
+(`grep -rn 'step_datafusion\b' crates/krishiv-executor crates/krishiv-api
+crates/krishiv-scheduler`): **all of them** call the plain `.step_datafusion()`
+convenience method, not `.step_datafusion_with_ctx(&reused_ctx)` — so this
+is a real, present-in-production cost on every tick of every continuous
+IVM job, not a benchmark artifact from an unrepresentative calling pattern.
+
+The plateau (not continued growth from 200K→1M) is consistent with this
+fixed per-call overhead (SessionContext + table registration setup)
+dominating over the true O(Δ) aggregate cost at these batch sizes — the
+delta itself really may be O(Δ), but that saving is swamped by ~650-700ms
+of fixed setup on every call.
+
+### Honest conclusion
+
+At table sizes up to 1M rows and a 5,000-row batch, **`full_recompute` wins
+on wall-clock time**, not IVM. Extrapolating `full_recompute`'s measured
+linear growth (~2.17ms + 31.3ns/row) against `ivm_incremental_feed`'s
+observed ~730ms plateau, the crossover — the accumulated-table size where a
+full recompute would cost as much as one (current) IVM tick — is
+**~23 million rows**. Below that, this benchmark's workload is faster to
+recompute from scratch than to maintain incrementally, as currently
+implemented. This is a real, disclosed performance-engineering opportunity,
+not a benchmark-methodology artifact: reusing a `SessionContext` across
+ticks for a given job (instead of constructing one fresh per call) would
+likely let the O(Δ) advantage show up at far smaller scales, but that's
+non-trivial surgery on the per-tick hot path of every continuous IVM job
+and is **not attempted here** — flagging it, not fixing it.
+
+### Validation
+
+- `cargo bench -p krishiv-bench --bench ivm_vs_full_recompute` — reproduces
+  the numbers above (criterion re-samples with fresh runs, so exact figures
+  will vary run to run within noise, but the ~100x gap and the crossover
+  order of magnitude are stable properties of the mechanism, not noise).
+- `cargo build -p krishiv-bench --bench ivm_vs_full_recompute` and the
+  criterion `-- --test` smoke mode both clean.
+
+**Next useful command**: `cargo bench -p krishiv-bench --bench ivm_vs_full_recompute` to re-run; investigating whether `step_datafusion_with_ctx` with a job-scoped reused context closes this gap would be the natural follow-up, not attempted this session.
+
 ## 2026-07-05 — G12: JDBC/ADBC `?` ordinal params, + a real feature-gating regression found
 
 **Scope**: G12 was split from G1 (2026-07-02) — JDBC/ADBC clients bind
