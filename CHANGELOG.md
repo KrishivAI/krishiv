@@ -22,6 +22,17 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **G3 (Iceberg concurrent-commit lost updates)**: `IcebergFsTable::append`
+  committed metadata via an unconditional tmp-write + rename to a single
+  `metadata.json`, so two concurrent committers — even two tasks sharing
+  one instance in a single process, not just two separate processes —
+  could last-write-win and silently drop one another's commit. Replaced
+  with Iceberg-style versioned commits (`metadata-v{N}.json`, created
+  atomically via `create_new`/O_EXCL; losers re-read and retry) and removed
+  the in-memory state cache entirely — every read now reflects whatever's
+  truly latest on disk. New test
+  `concurrent_writers_with_independent_table_handles_lose_no_commits`
+  proves 8 independently-instanced concurrent writers all survive.
 - **G2 (memory-constrained sort spill)**: a `SqlEngine` configured with a
   memory limit under ~15MB had every sort fail immediately with "Not enough
   memory to continue external sort" — DataFusion's `sort_spill_reservation_bytes`

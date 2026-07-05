@@ -1,5 +1,63 @@
 # Krishiv Implementation Status
 
+## 2026-07-05 — G3: IcebergFsTable concurrent commits were last-write-wins
+
+**Scope**: the platform's engine gap register lists G3 ("Iceberg
+concurrent-commit conflict handling") as scoped-but-unattempted:
+`krishiv-connectors/src/lakehouse/iceberg_fs.rs` committed metadata via an
+unconditional tmp-write + rename to a single `metadata.json`, so two
+concurrent committers last-write-win. The original scoping note called this
+"multi-session engine work; not attempted piecemeal" pending coordination
+with the Phase D coordinator-owned commit path — but the filesystem-level
+commit primitive itself turned out to be a self-contained, correctly
+bounded fix independent of that broader integration.
+
+### Found
+
+The race was worse than "two processes racing": `append()`'s in-memory
+`Mutex<Vec<FsLayer>>` was only held for the initial read and the final
+overwrite, not across the write+rename in between — so even two concurrent
+`.append()` calls sharing one `IcebergFsTable` instance in a single process
+could compute the same next snapshot id and clobber each other's commit.
+
+### Completed
+
+- Replaced the single `metadata.json` + unconditional overwrite with
+  Iceberg-style versioned commits: `metadata-v{N}.json`, committed by
+  atomically creating the next version via `OpenOptions::create_new`
+  (`O_EXCL` on Unix) — the OS guarantees exactly one concurrent creator of
+  the same path wins. Losers re-read the fresh latest state and retry
+  (bounded at 64 attempts); their already-written data file becomes
+  harmless orphaned garbage.
+- Removed the in-memory state cache entirely — `scan`, `append`, and
+  `current_snapshot_id` all read whatever's highest on disk right now, so
+  readers always see the true latest commit regardless of which process
+  made it.
+- New test `concurrent_writers_with_independent_table_handles_lose_no_commits`:
+  8 writers, each with its **own** `IcebergFsTable` instance (no shared
+  `Arc` — the same topology two separate processes would have), commit
+  concurrently; a fresh reader afterward sees all 8 rows and snapshot id 8.
+
+### Validation
+
+- `cargo test -p krishiv-connectors --features iceberg` — 337 + 11 tests
+  green, including the new concurrent-writer test and all 14 existing
+  `iceberg_fs` tests (one, `iceberg_fs_data_files_on_disk`, updated for the
+  new versioned filename scheme; behavior unchanged).
+- `cargo clippy -p krishiv-connectors --features iceberg -- -D warnings` —
+  clean.
+- `cargo fmt --check -p krishiv-connectors` — clean.
+
+### Remaining gap
+
+This closes the filesystem-level commit primitive the gap register asked
+for. It does **not** address broader integration with the Phase D
+coordinator-owned commit path — if this table format ever needs to be
+driven through the coordinator rather than used standalone, that's a
+separate, larger design question, unchanged by this fix.
+
+**Next useful command**: `cargo test -p krishiv-connectors --features iceberg concurrent_writers_with_independent_table_handles_lose_no_commits -- --nocapture` to re-run the regression test directly.
+
 ## 2026-07-05 — G2: memory-constrained sort spill was reservation-starved
 
 **Scope**: the platform's engine gap register lists G2 ("memory accounting +
