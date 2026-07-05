@@ -1,5 +1,57 @@
 # Krishiv Implementation Status
 
+## 2026-07-05 — G12: JDBC/ADBC `?` ordinal params, + a real feature-gating regression found
+
+**Scope**: G12 was split from G1 (2026-07-02) — JDBC/ADBC clients bind
+prepared-statement parameters as ordinal `?` marks, but the engine's
+substitution path only recognizes `$N`, so every `?`-bound query counted
+zero parameters and failed with a placeholder error.
+
+### Completed
+
+- New `normalize_question_mark_params` (`krishiv-flight-sql/src/actions.rs`)
+  rewrites `?` to `$1, $2, …` in left-to-right order, quote-aware (a `?`
+  inside a single-quoted string literal or double-quoted identifier is
+  untouched). Wired into `do_action_create_prepared_statement` before param
+  counting, `dataset_schema` planning, and caching.
+- 6 new unit tests: single/multiple placeholders, string-literal contents
+  untouched, escaped-quote handling, no-op on already-`$N` SQL,
+  quoted-identifier contents untouched.
+
+### A real regression found along the way
+
+Building `krishiv-flight-sql` for this work failed to compile —
+unrelated to G12 itself. This session's earlier G3 fix
+(`iceberg_fs.rs`, commit 985e238) used `uuid::Uuid::new_v4()`, but that
+file compiles under the base `lakehouse` Cargo feature, not the narrower
+`iceberg` feature that actually declares `uuid` as an optional dependency.
+Any build enabling `lakehouse` without `iceberg` — which is exactly
+`krishiv-flight-sql`'s dependency graph — failed with an unresolved-crate
+error. `cargo build -p krishiv-connectors --features iceberg` (what I'd
+verified G3 with) never exercised this path, since it always had `iceberg`
+on. Fixed by replacing the `uuid` call with a std-only nanosecond-timestamp
++ atomic-counter tag — no new dependency needed, and it closes the gap for
+good since `iceberg_fs.rs` no longer depends on anything outside its own
+always-available feature.
+
+### Validation
+
+- `cargo test -p krishiv-flight-sql` — 70 tests green (was already 70
+  before this change; net new coverage from the 6 new tests, existing
+  tests unaffected).
+- `cargo test -p krishiv-connectors --features iceberg iceberg_fs` — 14
+  tests green (reconfirms the regression fix didn't disturb G3's fix).
+- `cargo build -p krishiv-connectors --features lakehouse` — clean (this
+  is the exact configuration that was broken; confirms the fix).
+- `cargo clippy -p krishiv-flight-sql -p krishiv-connectors -- -D
+  warnings` — clean (the repo's real gate; caught and required fixing an
+  `unwrap_used` violation in my first draft of the quote-escape handling
+  in `normalize_question_mark_params`, since production code is held to
+  the workspace's `deny(unwrap_used)` lint unlike `#[cfg(test)]` code).
+- `cargo fmt --check` — clean on both crates.
+
+**Next useful command**: `cargo test -p krishiv-flight-sql normalize_question_mark` to re-run just the new tests.
+
 ## 2026-07-05 — G3: IcebergFsTable concurrent commits were last-write-wins
 
 **Scope**: the platform's engine gap register lists G3 ("Iceberg

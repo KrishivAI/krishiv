@@ -22,6 +22,17 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **G12 (JDBC/ADBC `?` parameter binding)**: JDBC/ADBC clients bind
+  prepared-statement parameters as ordinal `?` marks, but the engine only
+  recognized `$N` — every `?`-bound query counted zero parameters and
+  failed with a placeholder error. New `normalize_question_mark_params`
+  rewrites `?` to `$1, $2, …` (quote-aware — literal `?`s inside strings
+  or quoted identifiers are untouched), wired into prepared-statement
+  creation. Also fixes a real feature-gating regression found while
+  building this: the G3 fix below used `uuid`, gated behind a narrower
+  Cargo feature than the file it's in actually compiles under — any build
+  enabling `lakehouse` without `iceberg` failed outright. Replaced with a
+  std-only nanosecond+atomic-counter tag.
 - **G3 (Iceberg concurrent-commit lost updates)**: `IcebergFsTable::append`
   committed metadata via an unconditional tmp-write + rename to a single
   `metadata.json`, so two concurrent committers — even two tasks sharing
