@@ -521,6 +521,49 @@ impl SharedCoordinator {
                 }
             }
 
+            // G5 follow-up (found live via the Phase-20 executor fault loop):
+            // a continuous job's per-cycle input fence
+            // (`continuous_input_cycles`) is normally cleared when its task
+            // reports a terminal status (Succeeded/Failed/Cancelled) back to
+            // `apply_task_update`. An executor that is hard-killed *while* it
+            // holds that task never sends one, so the fence is never
+            // released that way — and every future `continuous-push` 409s
+            // forever. `reset_running_tasks_for_lost_executor` (called
+            // earlier this tick, inside `advance_heartbeat_clock`) already
+            // cleared the task's `assigned_executor` for us — by the time we
+            // reach this loop it typically reads `None` again (which is also
+            // why `jc.handle_executor_loss`'s own `affected` count above is
+            // frequently 0 here: the same clearing already happened once).
+            // Check that resulting state directly rather than depend on the
+            // (redundant, order-sensitive) `affected` counter: whenever this
+            // tick evicted at least one executor and a streaming job's cycle
+            // fence is still set while its task now has no assigned
+            // executor, the cycle can never complete on its own — release
+            // the fence so the next explicit push can proceed.
+            if !lost.is_empty() {
+                let is_streaming_with_unassigned_task = {
+                    let record = jc.read_record();
+                    record.spec.kind() == JobKind::Streaming
+                        && record
+                            .stages()
+                            .iter()
+                            .flat_map(|s| s.tasks())
+                            .any(|t| t.assigned_executor().is_none())
+                };
+                if is_streaming_with_unassigned_task {
+                    let mut coord = self.inner.write().await;
+                    if coord.continuous_input_cycles.remove(&job_id) {
+                        coord.job_input_partitions.remove(&job_id);
+                        tracing::warn!(
+                            job_id = %job_id,
+                            "continuous input-cycle fence released after executor loss \
+                             left its task unassigned mid-cycle (was stuck without \
+                             this — every push would 409)"
+                        );
+                    }
+                }
+            }
+
             tracing::debug!(
                 job_id = %job_id,
                 in_flight,

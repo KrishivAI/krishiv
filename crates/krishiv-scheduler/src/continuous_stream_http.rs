@@ -1295,4 +1295,56 @@ mod tests {
             Some(vec![output_ipc])
         );
     }
+
+    /// G5 follow-up (found live via the Phase-20 executor fault loop): if the
+    /// executor holding a continuous job's task is lost *mid-cycle* — the
+    /// task never reports a terminal status, so `apply_task_update`'s
+    /// Succeeded/Failed/Cancelled cleanup of `continuous_input_cycles` never
+    /// runs — `advance_heartbeat_tick` must release the fence itself, or
+    /// every future push 409s forever. Advances the deterministic heartbeat
+    /// clock past the default timeout (`CoordinatorConfig::default()` = 3
+    /// ticks) without ever re-heartbeating the sole executor, so it is
+    /// evicted while the cycle it was assigned is still open.
+    #[tokio::test]
+    async fn heartbeat_tick_releases_input_cycle_fence_after_executor_lost_mid_cycle() {
+        let coordinator = make_coordinator_with_executor("lost-mid-cycle").await;
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-lost-job".into(),
+                spec: tumbling_spec(),
+            }),
+        )
+        .await
+        .unwrap();
+        // Assigns the task and inserts the job into `continuous_input_cycles`
+        // (task_assignment.rs::prepare_continuous_input_cycle) — a cycle is
+        // now "in flight" exactly as it is between a live push and its
+        // eventual Succeeded/Failed/Cancelled status update.
+        let _assignment = prepare_cycle(&coordinator, "cs-lost-job").await;
+
+        let job_id = krishiv_proto::JobId::try_new("cs-lost-job").unwrap();
+        assert!(
+            coordinator
+                .read()
+                .await
+                .continuous_input_cycles
+                .contains(&job_id),
+            "prepare_cycle must mark the cycle in flight"
+        );
+
+        // Never heartbeat the executor again; advance past the default
+        // timeout so the next tick evicts it as lost.
+        for _ in 0..5 {
+            coordinator.advance_heartbeat_tick().await.unwrap();
+        }
+
+        let coord = coordinator.read().await;
+        assert!(
+            !coord.continuous_input_cycles.contains(&job_id),
+            "the input-cycle fence must be released when the executor \
+             holding the task is lost mid-cycle, or every future push 409s"
+        );
+        assert!(!coord.job_input_partitions.contains_key(&job_id));
+    }
 }
