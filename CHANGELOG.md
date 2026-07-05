@@ -8,6 +8,42 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **G5: restorable checkpoints for continuous windowed jobs, exercised live on
+  a cluster.** Every completed continuous cycle now ships the executor's
+  post-cycle `stream:loop` operator state back to the coordinator
+  (`TaskOutputMetadata.state_snapshot`, wire field 20; captured via
+  `ContinuousWindowExecutor::snapshot()` — the `checkpoint()`-first variant, as
+  `peek_snapshot_bytes` serializes a backend the live panes were never written
+  into), and the coordinator persists it as the job's `ContinuousSnapshot`. As
+  a result `POST /api/v1/continuous/{id}/checkpoint` returns real live state
+  and `…/restore` rehydrates a recreated job. Verified live on k8s: seed a
+  partial window → checkpoint → deregister → re-register + restore → closing
+  the window emits the exact pre-kill accumulations.
+
+### Fixed
+
+- Deregistering a continuous job now actually reaches its executor: the
+  teardown uses `push_cancel_job` (broadened to cancel *assigned* streaming
+  tasks — a `stream:loop` task is only `Running` inside a cycle), and the
+  executor retires the job's identity on cancel — drops the stateful window
+  executor + buffered inputs, purges the assignment inbox's
+  `(job, task, attempt)` dedupe entries (`forget_job`), and clears the task
+  tombstone. Without this, a recreated job reusing the same deterministic ids
+  (`task-streaming`, attempts from 1) had its first cycle silently swallowed
+  as an at-least-once duplicate, wedging the cycle fence so every later push
+  409'd forever.
+- A `Cancelled` continuous-cycle task now releases the input-cycle fence like
+  a `Failed` one (previously only Succeeded/Failed cleared it).
+
+- Coordinator HTTP `POST /api/v1/continuous-register-sql`: register a continuous
+  windowed streaming job from **SQL** (`SELECT key, AGG(col) FROM TUMBLE/HOP/
+  SESSION(TABLE src, DESCRIPTOR(ts), <ms>) GROUP BY …`). The coordinator compiles
+  the window TVF to a `WindowExecutionSpec` itself (`krishiv_sql::
+  streaming_window_plan`), so callers pass SQL and stay decoupled from the
+  operator spec type; the response returns the fed source table. Verified live on
+  k8s: register → push timestamped Arrow IPC via `continuous-push` → `continuous-
+  drain` emits exact per-region tumbling-window `SUM`/`COUNT` as the watermark
+  closes each window.
 - IVM incremental-operator state (per-group SUM/COUNT/AVG/MIN-MAX accumulators
   and DISTINCT multiplicities) is now serialized by `checkpoint_full` and
   reapplied on `restore_full`, so a maintained view is restored **losslessly**
@@ -15,10 +51,26 @@ Semantic Versioning as described in `docs/RELEASE.md`.
   which the materialized source snapshot (a set, not a multiset) cannot capture.
   Verified live on k8s: `spike_b_ivm_kill.py --recreate` converges over 50
   destroy→rebuild→restore cycles (G6/F4).
+- Coordinator HTTP `DELETE /api/v1/continuous/{job_id}`: deregister (cancel and
+  tear down) a continuous windowed streaming job by id. Mirrors the IVM
+  view-drop endpoint so an external reconciler can converge a windowed streaming
+  table by removing it. Verified live on k8s as part of the pipeline reconcile
+  Drop path (`streams: []` after drop).
 
 ### Changed
 
 ### Fixed
+
+- Coordinator `submit_job` now **replaces** a terminal (Cancelled/Failed/
+  Succeeded) job that shares the incoming job id instead of rejecting it as a
+  `DuplicateJob`. `cancel_job` marks a job GC-ready but keeps it in the registry
+  until the next GC tick, so a delete-then-recreate flow (e.g. a reconciler
+  Replace: `DELETE /api/v1/continuous/{id}` then re-register the same id) raced
+  the GC and hit `409 Conflict`, leaving the replacement job `Cancelled`.
+  `submit_job` now evicts the terminal same-id job up front; a still-live same-id
+  job is still rejected as a duplicate. Regression test
+  `submit_job_replaces_a_terminal_job_with_the_same_id`; verified live on k8s
+  (reconcile Replace converges to a `Running` job with the new window spec).
 
 - IVM: a checkpoint-restored flow no longer loses its incremental aggregate
   accumulator, which previously made the second recreate-recovery cycle diverge

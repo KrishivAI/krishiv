@@ -119,6 +119,10 @@ pub struct ExecutorTaskOutput {
     /// as a single raw blob (not decoded as Arrow IPC — the coordinator unpacks
     /// it via `decode_batch_map`).
     pub(crate) ivm_output: Option<Vec<u8>>,
+    /// G5: serialized `stream:loop` operator state after a continuous window
+    /// cycle (`peek_snapshot_bytes`). The coordinator persists it as the
+    /// job's `ContinuousSnapshot`. `None` for non-streaming tasks.
+    pub(crate) state_snapshot: Option<Vec<u8>>,
 }
 
 impl ExecutorTaskOutput {
@@ -137,6 +141,7 @@ impl ExecutorTaskOutput {
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
+            state_snapshot: None,
         }
     }
 
@@ -160,6 +165,7 @@ impl ExecutorTaskOutput {
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
+            state_snapshot: None,
         }
     }
 
@@ -178,6 +184,7 @@ impl ExecutorTaskOutput {
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
+            state_snapshot: None,
         }
     }
 
@@ -199,6 +206,7 @@ impl ExecutorTaskOutput {
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
+            state_snapshot: None,
         }
     }
 
@@ -223,6 +231,7 @@ impl ExecutorTaskOutput {
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
+            state_snapshot: None,
         }
     }
 
@@ -241,6 +250,7 @@ impl ExecutorTaskOutput {
             advisory_buckets: None,
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
+            state_snapshot: None,
         }
     }
 
@@ -374,7 +384,19 @@ impl ExecutorTaskOutput {
         if let Some(blob) = &self.ivm_output {
             meta = meta.with_inline_record_batch_ipc(vec![blob.clone()]);
         }
+        // G5: carry the continuous operator state so the coordinator can
+        // persist a restorable checkpoint of the cycle that just completed.
+        if let Some(snapshot) = &self.state_snapshot {
+            meta = meta.with_state_snapshot(snapshot.clone());
+        }
         meta
+    }
+
+    /// Attach serialized continuous operator state from this cycle (G5).
+    #[must_use]
+    pub(crate) fn with_state_snapshot(mut self, bytes: Vec<u8>) -> Self {
+        self.state_snapshot = Some(bytes);
+        self
     }
 
     /// Shuffle partition outputs produced by this task (empty for non-shuffle tasks).

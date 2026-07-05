@@ -74,6 +74,13 @@ impl SeenSet {
     ) -> bool {
         self.entries.shift_remove(key)
     }
+
+    /// Remove every entry belonging to `job_id`; returns how many were removed.
+    fn remove_job(&mut self, job_id: &krishiv_proto::JobId) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|(job, _, _)| job != job_id);
+        before - self.entries.len()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +261,28 @@ impl ExecutorAssignmentInbox {
         Ok(removed)
     }
 
+    /// Retire a job's identity from this inbox: drop its queued assignments
+    /// and every `(job, task, attempt)` dedupe entry. Called when a job is
+    /// torn down (continuous deregister/cancel) so a *recreated* job reusing
+    /// the same deterministic ids (`stage-streaming`/`task-streaming`,
+    /// attempts from 1) is a new incarnation, not an at-least-once duplicate
+    /// to be silently swallowed. Returns how many dedupe entries were purged.
+    ///
+    /// Lock order matches [`push_with_outcome`]: `seen` → `assignments`.
+    pub fn forget_job(&self, job_id: &krishiv_proto::JobId) -> ExecutorResult<usize> {
+        let mut seen = self
+            .seen
+            .write()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
+        let mut assignments = self
+            .assignments
+            .write()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
+        assignments.retain(|assignment| assignment.job_id() != job_id);
+        let purged = seen.remove_job(job_id);
+        Ok(purged)
+    }
+
     /// Whether a task id has been cancelled.
     pub fn is_task_cancelled(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<bool> {
         Ok(self
@@ -355,6 +384,53 @@ mod tests {
     fn pop_next_returns_none_on_empty() {
         let inbox = ExecutorAssignmentInbox::new();
         assert!(inbox.pop_next().unwrap().is_none());
+    }
+
+    /// G5: retiring a job's identity purges its queued assignments and dedupe
+    /// entries — a recreated job reusing the same deterministic
+    /// (job, task, attempt) is a fresh incarnation, not a swallowed duplicate.
+    /// Other jobs' state is untouched.
+    #[test]
+    fn forget_job_allows_a_recreated_job_to_repush_the_same_attempt() {
+        let inbox = ExecutorAssignmentInbox::new();
+        inbox
+            .push(make_assignment_for_job("g5-job", "task-streaming"))
+            .unwrap();
+        inbox
+            .push(make_assignment_for_job("other", "task-streaming"))
+            .unwrap();
+        // Same triple again: swallowed as an at-least-once duplicate.
+        assert_eq!(
+            inbox
+                .push_with_outcome(make_assignment_for_job("g5-job", "task-streaming"))
+                .unwrap(),
+            AssignmentPushOutcome::Duplicate
+        );
+
+        let purged = inbox
+            .forget_job(&JobId::try_new("g5-job").unwrap())
+            .unwrap();
+        assert_eq!(purged, 1);
+
+        // The recreated incarnation's identical triple is accepted…
+        assert_eq!(
+            inbox
+                .push_with_outcome(make_assignment_for_job("g5-job", "task-streaming"))
+                .unwrap(),
+            AssignmentPushOutcome::Enqueued
+        );
+        // …while the other job's dedupe entry survived.
+        assert_eq!(
+            inbox
+                .push_with_outcome(make_assignment_for_job("other", "task-streaming"))
+                .unwrap(),
+            AssignmentPushOutcome::Duplicate
+        );
+        // The queue only holds the other job's original + the recreated push.
+        let queued: Vec<String> = std::iter::from_fn(|| inbox.pop_next().unwrap())
+            .map(|a| a.job_id().to_string())
+            .collect();
+        assert_eq!(queued, vec!["other".to_string(), "g5-job".to_string()]);
     }
 
     #[test]

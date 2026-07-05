@@ -470,7 +470,8 @@ pub fn coordinator_http_router(
         )
         .route(
             "/api/v1/continuous/{job_id}",
-            get(crate::continuous_stream_http::api_continuous_get),
+            get(crate::continuous_stream_http::api_continuous_get)
+                .delete(crate::continuous_stream_http::api_continuous_deregister),
         )
         .route(
             "/api/v1/continuous/{job_id}/checkpoint",
@@ -483,6 +484,10 @@ pub fn coordinator_http_router(
         .route(
             "/api/v1/continuous-register",
             post(crate::continuous_stream_http::api_continuous_register),
+        )
+        .route(
+            "/api/v1/continuous-register-sql",
+            post(crate::continuous_stream_http::api_continuous_register_sql),
         )
         .route(
             "/api/v1/continuous-push",

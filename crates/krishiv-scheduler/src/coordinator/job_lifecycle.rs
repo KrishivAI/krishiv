@@ -20,10 +20,21 @@ impl Coordinator {
         self.ensure_active()?;
         validate_job(&spec)?;
 
-        if self.job_coordinators.contains_key(spec.job_id()) {
-            return Err(SchedulerError::DuplicateJob {
-                job_id: spec.job_id().clone(),
-            });
+        if let Some(existing) = self.job_coordinators.get(spec.job_id()) {
+            // A terminal (Cancelled/Failed/Succeeded) job with this id is being
+            // replaced: evict it now so the id is immediately reusable instead
+            // of waiting for the background GC tick. This is what a pipeline
+            // reconcile does when it re-registers a streaming job it just
+            // deregistered (cancel marks the job GC-ready but keeps it in the
+            // registry). A live job is still a genuine duplicate.
+            if existing.read_record().state().is_terminal() {
+                let job_id = spec.job_id().clone();
+                self.evict_completed_job(&job_id);
+            } else {
+                return Err(SchedulerError::DuplicateJob {
+                    job_id: spec.job_id().clone(),
+                });
+            }
         }
 
         // Admission control: queued jobs are persisted as visible job records
@@ -343,6 +354,14 @@ impl Coordinator {
             .output_metadata()
             .map(|meta| meta.inline_record_batch_ipc().to_vec())
             .unwrap_or_default();
+        // G5: post-cycle continuous operator state + its watermark (persisted
+        // below once the update is applied successfully).
+        let state_snapshot = update
+            .output_metadata()
+            .and_then(|meta| meta.state_snapshot().map(<[u8]>::to_vec));
+        let task_watermark_ms = update
+            .output_metadata()
+            .and_then(|meta| meta.watermark_ms());
         let terminal_state = update.state();
         let executor_id_for_circuit = update.executor_id().clone();
         // Save before update is moved.
@@ -471,6 +490,24 @@ impl Coordinator {
                 .extend(inline_ipc);
         }
 
+        // G5: a completed continuous cycle carries the executor's post-cycle
+        // operator state — persist it as the job's restorable checkpoint, so
+        // `POST /api/v1/continuous/{id}/checkpoint` returns live state and a
+        // recreated job can be rehydrated via the restore endpoint.
+        if terminal_state == TaskState::Succeeded
+            && is_continuous_cycle
+            && let Some(snapshot_bytes) = state_snapshot
+        {
+            let watermark_ms = task_watermark_ms.unwrap_or(i64::MIN);
+            self.save_continuous_snapshot(
+                job_id.as_str(),
+                crate::ContinuousSnapshot {
+                    snapshot_bytes,
+                    watermark_ms,
+                },
+            );
+        }
+
         // AQE stage-boundary re-optimization (Phase 2.9).
         //
         // When a shuffle stage completes, collect per-task serialized_bytes and
@@ -587,7 +624,12 @@ impl Coordinator {
 
         if is_continuous_cycle && terminal_state == TaskState::Succeeded {
             self.complete_continuous_input_cycle(&job_id, &task_id);
-        } else if is_continuous_cycle && terminal_state == TaskState::Failed {
+        } else if is_continuous_cycle
+            && matches!(terminal_state, TaskState::Failed | TaskState::Cancelled)
+        {
+            // A cancelled cycle (e.g. an executor-side tombstone from a prior
+            // incarnation of this job id) must release the fence too —
+            // otherwise every later push 409s forever.
             self.continuous_input_cycles.remove(&job_id);
             self.job_input_partitions.remove(&job_id);
         }

@@ -196,6 +196,31 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             .inbox
             .cancel_task(request.task_id())
             .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        // A cancel for a job with a registered `stream:loop` executor is a
+        // continuous-job teardown (the only producer of continuous cancels is
+        // job-level deregister/cancel). Retire the whole job identity on this
+        // process: drop the stateful window executor and buffered inputs,
+        // purge the inbox's dedupe entries, and clear the task tombstone — a
+        // later *recreated* job legitimately reuses the same deterministic
+        // ids (`task-streaming`, attempts from 1) and must be treated as a
+        // fresh incarnation, not swallowed as an at-least-once duplicate or
+        // insta-cancelled by the stale tombstone.
+        let job_id = request.job_id();
+        if self.loop_executors.remove(job_id.as_str()).is_some() {
+            self.continuous_inputs.remove(job_id.as_str());
+            let purged = self
+                .inbox
+                .forget_job(job_id)
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            self.inbox
+                .clear_cancelled_task(request.task_id())
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            tracing::debug!(
+                job_id = %job_id,
+                purged_dedupe_entries = purged,
+                "continuous job cancelled — loop executor dropped and inbox identity retired"
+            );
+        }
         let response = if removed {
             TaskStatusResponse::new(TransportDisposition::Accepted)
         } else {

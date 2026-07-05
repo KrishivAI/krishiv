@@ -194,6 +194,46 @@ pub async fn api_continuous_register(
     Ok(Json(ContinuousRegisterResponse { success: true }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ContinuousRegisterSqlRequest {
+    pub job_id: String,
+    /// A windowed streaming query:
+    /// `SELECT key, AGG(col) FROM TUMBLE(TABLE src, DESCRIPTOR(ts), <ms>) GROUP BY key`.
+    pub sql: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContinuousRegisterSqlResponse {
+    pub success: bool,
+    /// The source table the window reads from (feed pushes target it).
+    pub source: String,
+}
+
+/// Register a continuous streaming job from **SQL**: the coordinator compiles
+/// the windowed query to a [`WindowExecutionSpec`] itself
+/// (`krishiv_sql::streaming_window_plan`), so callers (the platform pipeline
+/// reconciler) pass SQL and stay decoupled from the operator spec type.
+pub async fn api_continuous_register_sql(
+    State(coordinator): State<SharedCoordinator>,
+    Json(body): Json<ContinuousRegisterSqlRequest>,
+) -> Result<Json<ContinuousRegisterSqlResponse>, StatusCode> {
+    let plan = krishiv_sql::streaming_window_plan::compile_streaming_window_sql(&body.sql)
+        .map_err(|error| {
+            tracing::warn!(error = %error, "continuous-register-sql: compile failed");
+            StatusCode::BAD_REQUEST
+        })?;
+    register_continuous_stream_coordinated(&coordinator, &body.job_id, &plan.spec)
+        .await
+        .map_err(|error| match error {
+            ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    Ok(Json(ContinuousRegisterSqlResponse {
+        success: true,
+        source: plan.source,
+    }))
+}
+
 pub async fn api_continuous_list(
     State(coordinator): State<SharedCoordinator>,
 ) -> Result<Json<ContinuousListResponse>, StatusCode> {
@@ -221,6 +261,40 @@ pub async fn api_continuous_get(
         continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?
     };
     Ok(Json(view))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContinuousDeregisterResponse {
+    pub cancelled: bool,
+}
+
+/// Tear down a continuous streaming job: cancel it (stops the loop and pushes
+/// the cancel RPC to the executor), then evict it from the registry so its
+/// `job_id` is freed for re-registration — cancel alone leaves a terminal
+/// tombstone that would make a later register of the same id conflict. This is
+/// the teardown leg the pipeline reconciler drives when a windowed streaming
+/// table is dropped or replaced. Verifies the job is a streaming job before
+/// cancelling, so an errant DELETE cannot cancel a batch/IVM job.
+pub async fn api_continuous_deregister(
+    State(coordinator): State<SharedCoordinator>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ContinuousDeregisterResponse>, StatusCode> {
+    let job_id = JobId::try_new(&job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut coord = coordinator.write().await;
+    // Confirm it exists and is a streaming job (404 if unknown, 409 otherwise).
+    continuous_job_view(&coord, &job_id).map_err(|error| scheduler_status(&error))?;
+    // push_cancel_job (not plain cancel_job): the assigned executor must hear
+    // about the teardown so it retires the job identity — drops the stateful
+    // `stream:loop` executor and the inbox dedupe entries. Without the RPC, a
+    // recreated job reusing the same deterministic ids has its first cycle
+    // silently swallowed as an at-least-once duplicate.
+    coord
+        .push_cancel_job(&job_id)
+        .await
+        .map_err(|error| scheduler_status(&error))?;
+    // Cancel is terminal → evict removes it from `job_coordinators`, freeing the id.
+    coord.evict_completed_job(&job_id);
+    Ok(Json(ContinuousDeregisterResponse { cancelled: true }))
 }
 
 pub async fn api_continuous_checkpoint(
@@ -1220,5 +1294,57 @@ mod tests {
             coord.take_job_inline_results(&job_id),
             Some(vec![output_ipc])
         );
+    }
+
+    /// G5 follow-up (found live via the Phase-20 executor fault loop): if the
+    /// executor holding a continuous job's task is lost *mid-cycle* — the
+    /// task never reports a terminal status, so `apply_task_update`'s
+    /// Succeeded/Failed/Cancelled cleanup of `continuous_input_cycles` never
+    /// runs — `advance_heartbeat_tick` must release the fence itself, or
+    /// every future push 409s forever. Advances the deterministic heartbeat
+    /// clock past the default timeout (`CoordinatorConfig::default()` = 3
+    /// ticks) without ever re-heartbeating the sole executor, so it is
+    /// evicted while the cycle it was assigned is still open.
+    #[tokio::test]
+    async fn heartbeat_tick_releases_input_cycle_fence_after_executor_lost_mid_cycle() {
+        let coordinator = make_coordinator_with_executor("lost-mid-cycle").await;
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-lost-job".into(),
+                spec: tumbling_spec(),
+            }),
+        )
+        .await
+        .unwrap();
+        // Assigns the task and inserts the job into `continuous_input_cycles`
+        // (task_assignment.rs::prepare_continuous_input_cycle) — a cycle is
+        // now "in flight" exactly as it is between a live push and its
+        // eventual Succeeded/Failed/Cancelled status update.
+        let _assignment = prepare_cycle(&coordinator, "cs-lost-job").await;
+
+        let job_id = krishiv_proto::JobId::try_new("cs-lost-job").unwrap();
+        assert!(
+            coordinator
+                .read()
+                .await
+                .continuous_input_cycles
+                .contains(&job_id),
+            "prepare_cycle must mark the cycle in flight"
+        );
+
+        // Never heartbeat the executor again; advance past the default
+        // timeout so the next tick evicts it as lost.
+        for _ in 0..5 {
+            coordinator.advance_heartbeat_tick().await.unwrap();
+        }
+
+        let coord = coordinator.read().await;
+        assert!(
+            !coord.continuous_input_cycles.contains(&job_id),
+            "the input-cycle fence must be released when the executor \
+             holding the task is lost mid-cycle, or every future push 409s"
+        );
+        assert!(!coord.job_input_partitions.contains_key(&job_id));
     }
 }

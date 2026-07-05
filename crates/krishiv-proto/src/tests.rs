@@ -295,6 +295,47 @@ mod proto_tests {
         assert_eq!(round_trip.output_metadata().unwrap().row_count(), 2);
     }
 
+    /// G5: the continuous operator-state snapshot travels the wire intact —
+    /// present when attached, absent (not an empty blob) when it wasn't.
+    #[test]
+    fn task_output_state_snapshot_round_trips_through_wire_contract() {
+        let ids = TaskAttemptRef::new(
+            JobId::try_new("job-1").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        let meta = TaskOutputMetadata::new("streaming-window", 3, 1, 2)
+            .with_watermark_ms(42_000)
+            .with_state_snapshot(vec![1, 2, 3, 4]);
+        let request = TaskStatusRequest::new(
+            ids.clone(),
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            TaskState::Succeeded,
+        )
+        .with_output_metadata(meta);
+
+        let wire = crate::wire::task_status_request_to_wire(request.clone());
+        let round_trip = crate::wire::task_status_request_from_wire(wire).unwrap();
+        assert_eq!(round_trip, request);
+        let meta = round_trip.output_metadata().unwrap();
+        assert_eq!(meta.state_snapshot(), Some(&[1u8, 2, 3, 4][..]));
+        assert_eq!(meta.watermark_ms(), Some(42_000));
+
+        // Without a snapshot the field stays absent through the round trip.
+        let bare = TaskStatusRequest::new(
+            ids,
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            TaskState::Succeeded,
+        )
+        .with_output_metadata(TaskOutputMetadata::new("streaming-window", 0, 0, 0));
+        let wire = crate::wire::task_status_request_to_wire(bare);
+        let round_trip = crate::wire::task_status_request_from_wire(wire).unwrap();
+        assert_eq!(round_trip.output_metadata().unwrap().state_snapshot(), None);
+    }
+
     #[test]
     fn task_cancellation_round_trips_through_wire_contract() {
         let ids = TaskAttemptRef::new(
