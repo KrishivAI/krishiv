@@ -1,13 +1,13 @@
 import type { JSX } from 'react';
 
-const gold = '#F59E0B';
-const goldBright = '#FFB52A';
-const goldSoft = 'rgba(245,158,11,.18)';
-const border = '#2A2A2A';
-const text = '#F5F5F5';
-const muted = '#A3A3A3';
-const surface = '#101010';
-const surfaceHi = '#151515';
+const gold = '#7aa7d9';
+const goldBright = '#7aa7d9';
+const goldSoft = 'rgba(122,167,217,.16)';
+const border = '#26262c';
+const text = '#efeff1';
+const muted = '#adadb8';
+const surface = '#0e0e10';
+const surfaceHi = '#18181b';
 
 function Box({
   x,
@@ -113,7 +113,7 @@ function Defs(): JSX.Element {
       </marker>
       <linearGradient id="bandGrad" x1="0" x2="0" y1="0" y2="1">
         <stop offset="0%" stopColor={goldSoft} />
-        <stop offset="100%" stopColor="rgba(245,158,11,0)" />
+        <stop offset="100%" stopColor="rgba(122,167,217,0)" />
       </linearGradient>
     </defs>
   );

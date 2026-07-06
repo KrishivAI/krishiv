@@ -66,11 +66,7 @@ export function Footer() {
         <div className="footer-brand">
           <strong>Krishiv</strong>
           <p>Rust-native compute for batch SQL, streaming pipelines, and incremental processing. Apache&nbsp;Arrow · DataFusion · Tokio.</p>
-          <div className="footer-badges">
-            <span className="badge badge-green">Open Source</span>
-            <span className="badge badge-orange">Rust Native</span>
-            <span className="badge badge-blue">Apache Arrow</span>
-          </div>
+          <p className="footer-facts">Open source · Apache 2.0 · Rust native · no JVM</p>
         </div>
         <div className="footer-col">
           <h4>Product</h4>

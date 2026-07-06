@@ -56,11 +56,20 @@ export function CodeTabs({ tabs }: { tabs: CodeTab[] }) {
       </button>
       <pre aria-label={`${current.label} example`}><code>
         {lines.map((line, i) => (
-          <span className="line" key={i}><span className="num">{i + 1}</span><span>{highlight(line, current.language)}</span></span>
+          <span className="line" key={i}>
+            <span className="num">{i + 1}</span>
+            {/* Trusted literals from page.tsx, HTML-escaped before the
+                highlight regexes wrap them in <b>/<i>/<mark> markup. */}
+            <span dangerouslySetInnerHTML={{ __html: highlight(escapeHtml(line), current.language) }} />
+          </span>
         ))}
       </code></pre>
     </>
   );
+}
+
+function escapeHtml(line: string) {
+  return line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function highlight(line: string, language: string) {
@@ -84,7 +93,7 @@ function highlight(line: string, language: string) {
       .replace(/\b(ks|krishiv|pyarrow|pa|pa\.|pd|pandas|numpy|np)\b/g, '<i>$1</i>')
       .replace(/("""[\s\S]*?""")/g, '<em>$1</em>')
       .replace(/(#[^\n]*)/g, '<em>$1</em>')
-      .replace(/('[^']*'|"[^"]*")/g, '<mark>$1</mark>');
+      .replace(/('[^']*'|&quot;(?:[^&]|&(?!quot;))*&quot;|"[^"]*")/g, '<mark>$1</mark>');
   }
   return line;
 }

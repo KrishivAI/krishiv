@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
 import './global.css';
+import './docs.css';
 
 const siteUrl = 'https://krishiv.ai';
 const siteName = 'Krishiv';
@@ -84,8 +85,8 @@ export const metadata: Metadata = {
   },
   manifest: '/manifest.json',
   other: {
-    'theme-color': '#050505',
-    'msapplication-TileColor': '#050505',
+    'theme-color': '#000000',
+    'msapplication-TileColor': '#000000',
   },
 };
 

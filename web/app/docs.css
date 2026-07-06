@@ -29,17 +29,17 @@
   letter-spacing: .04em;
 }
 .docs-box-warn {
-  background: rgba(245,158,11,.08);
-  border: 1px solid rgba(245,158,11,.3);
-  color: #ffd28a;
+  background: rgba(217,161,59,.08);
+  border: 1px solid rgba(217,161,59,.3);
+  color: #d9a13b;
 }
 .docs-box-note {
-  background: rgba(59,130,246,.08);
-  border: 1px solid rgba(59,130,246,.3);
-  color: #93c5fd;
+  background: rgba(88,166,218,.08);
+  border: 1px solid rgba(88,166,218,.3);
+  color: #58a6da;
 }
 .docs-box-info {
-  background: rgba(16,16,16,.6);
+  background: var(--surface);
   border: 1px solid var(--border);
   color: var(--muted-strong);
 }
@@ -68,11 +68,11 @@
   padding: 16px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: rgba(16,16,16,.4);
+  background: var(--surface);
   transition: border-color .15s;
 }
 .docs-next-card:hover {
-  border-color: rgba(245,158,11,.3);
+  border-color: var(--border-strong);
 }
 .docs-next-card strong {
   font-size: 14px;
@@ -112,8 +112,8 @@
   transition: border-color .15s, color .15s;
 }
 .docs-related li a:hover {
-  border-color: rgba(245,158,11,.3);
-  color: var(--gold-bright);
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
 /* API signature block */
@@ -122,16 +122,16 @@
   padding: 8px 14px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: rgba(10,10,10,.6);
+  background: var(--background-soft);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
-  color: var(--gold-bright);
+  color: var(--text);
   margin: 8px 0 16px;
 }
 
-/* Role cards in introduction */
+/* Inline code inside callouts */
 .docs-box code {
-  background: rgba(245,158,11,.08);
+  background: var(--surface-elevated);
   padding: 1px 5px;
   border-radius: 4px;
   font-size: 12px;

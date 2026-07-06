@@ -97,7 +97,7 @@ function Hero() {
           </div>
         </div>
         <div className="hero-new-viz">
-          <ExecutionGraphViz />
+          <HeroTerminal />
         </div>
       </div>
     </section>
@@ -108,61 +108,31 @@ function GithubIcon() {
   return <svg viewBox="0 0 20 20" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M10 .9a9.1 9.1 0 0 0-2.9 17.7c.46.08.63-.2.63-.44v-1.6c-2.57.56-3.11-1.1-3.11-1.1-.42-1.07-1.03-1.03-1.03-1.03-.84-.58.06-.57.06-.57.93.07 1.42.96 1.42.96.83 1.41 2.18 1 2.71.77.08-.6.32-1 .59-1.23-2.05-.23-4.2-1.02-4.2-4.55 0-1 .36-1.83.95-2.47-.1-.24-.41-1.18.09-2.44 0 0 .78-.25 2.5.94A8.7 8.7 0 0 1 10 5.2c.77 0 1.54.1 2.27.3 1.72-1.19 2.5-.94 2.5-.94.5 1.26.19 2.2.1 2.44.59.64.94 1.46.94 2.47 0 3.54-2.16 4.31-4.21 4.54.33.29.63.85.63 1.72v2.55c0 .25.17.53.64.44A9.1 9.1 0 0 0 10 .9Z"/></svg>;
 }
 
-/* ── Execution Graph Visualization ────────────────────────────────────────── */
+/* ── Hero terminal ────────────────────────────────────────────────────────── */
 
-function ExecutionGraphViz() {
-  const nodes = [
-    { x: 50, y: 16, w: 100, h: 32, label: 'SQL', type: 'input' as const },
-    { x: 170, y: 16, w: 100, h: 32, label: 'Python', type: 'input' as const },
-    { x: 290, y: 16, w: 100, h: 32, label: 'Rust', type: 'input' as const },
-    { x: 130, y: 72, w: 180, h: 36, label: 'Unified Planner', type: 'core' as const },
-    { x: 130, y: 128, w: 180, h: 36, label: 'Arrow + DataFusion', type: 'core' as const },
-    { x: 30, y: 190, w: 80, h: 30, label: 'Batch', type: 'mode' as const },
-    { x: 130, y: 190, w: 80, h: 30, label: 'Streaming', type: 'mode' as const },
-    { x: 230, y: 190, w: 100, h: 30, label: 'Incremental', type: 'mode' as const },
-    { x: 20, y: 248, w: 70, h: 26, label: 'Iceberg', type: 'connector' as const },
-    { x: 100, y: 248, w: 60, h: 26, label: 'Kafka', type: 'connector' as const },
-    { x: 170, y: 248, w: 70, h: 26, label: 'Parquet', type: 'connector' as const },
-    { x: 250, y: 248, w: 50, h: 26, label: 'S3', type: 'connector' as const },
-    { x: 310, y: 248, w: 70, h: 26, label: 'ADLS', type: 'connector' as const },
-  ];
-
-  const edges: Array<[number, number]> = [
-    [0, 3], [1, 3], [2, 3],
-    [3, 4], [4, 5], [4, 6], [4, 7],
-    [5, 8], [5, 9], [5, 10], [6, 8], [6, 9], [6, 11], [7, 8], [7, 9], [7, 10], [7, 11], [7, 12],
-  ];
-
-  const typeColors = {
-    input: { fill: '#151515', stroke: '#2A2A2A', text: '#D4D4D4' },
-    core: { fill: 'rgba(245,158,11,.10)', stroke: 'rgba(245,158,11,.45)', text: '#FFB52A' },
-    mode: { fill: '#101010', stroke: '#343434', text: '#A3A3A3' },
-    connector: { fill: '#0A0A0A', stroke: '#2A2A2A', text: '#A3A3A3' },
-  };
-
+function HeroTerminal() {
   return (
-    <div className="exec-graph" aria-label="Krishiv execution pipeline visualization">
-      <svg viewBox="0 0 400 290" width="100%" role="img" aria-label="Execution graph showing SQL, Python, and Rust inputs flowing through unified planner and Arrow execution to batch, streaming, and incremental outputs">
-        <defs>
-          <marker id="eg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="#F59E0B" opacity=".5" />
-          </marker>
-        </defs>
-        {edges.map(([from, to], i) => {
-          const f = nodes[from];
-          const t = nodes[to];
-          return <line key={i} x1={f.x + f.w / 2} y1={f.y + f.h} x2={t.x + t.w / 2} y2={t.y} stroke="#F59E0B" strokeWidth=".7" opacity=".25" markerEnd="url(#eg-arrow)" />;
-        })}
-        {nodes.map((n, i) => {
-          const c = typeColors[n.type];
-          return (
-            <g key={i}>
-              <rect x={n.x} y={n.y} width={n.w} height={n.h} rx={n.type === 'connector' ? 6 : 8} fill={c.fill} stroke={c.stroke} strokeWidth={n.type === 'core' ? 1.2 : 1} />
-              <text x={n.x + n.w / 2} y={n.y + n.h / 2 + 4} textAnchor="middle" fontSize={n.type === 'connector' ? 10 : 12} fontWeight={n.type === 'core' ? 700 : 600} fill={c.text}>{n.label}</text>
-            </g>
-          );
-        })}
-      </svg>
+    <div className="hero-terminal" aria-label="Krishiv quickstart in a terminal">
+      <div className="hero-terminal-bar" aria-hidden="true">
+        <i /><i /><i />
+        <span>python</span>
+      </div>
+      <div className="hero-terminal-body">
+        <span className="t-line"><span className="t-prompt">$ </span><span className="t-cmd">pip install krishiv</span></span>
+        <span className="t-line"><span className="t-prompt">$ </span><span className="t-cmd">python</span></span>
+        <span className="t-line"><span className="t-prompt">&gt;&gt;&gt; </span><span className="t-kw">import</span><span className="t-cmd"> krishiv </span><span className="t-kw">as</span><span className="t-cmd"> ks</span></span>
+        <span className="t-line"><span className="t-prompt">&gt;&gt;&gt; </span><span className="t-cmd">session = ks.Session.embedded()</span></span>
+        <span className="t-line"><span className="t-prompt">&gt;&gt;&gt; </span><span className="t-cmd">session.sql(</span><span className="t-str">{'"""'}SELECT customer_id,</span></span>
+        <span className="t-line"><span className="t-str">...   SUM(amount) FROM orders</span></span>
+        <span className="t-line"><span className="t-str">...   GROUP BY customer_id{'"""'}</span><span className="t-cmd">).show()</span></span>
+        <span className="t-line t-out">┌─────────────┬─────────────┐</span>
+        <span className="t-line t-out">│ customer_id │ sum(amount) │</span>
+        <span className="t-line t-out">├─────────────┼─────────────┤</span>
+        <span className="t-line t-out">│         104 │     8421.50 │</span>
+        <span className="t-line t-out">│         117 │     6390.00 │</span>
+        <span className="t-line t-out">└─────────────┴─────────────┘</span>
+        <span className="t-line"><span className="t-dim"># same session runs streaming & incremental jobs</span></span>
+      </div>
     </div>
   );
 }
@@ -182,24 +152,9 @@ function WhyKrishiv() {
       desc: 'DeltaBatch and IncrementalFlow maintain views incrementally. No full recomputation on every tick.',
     },
     {
-      icon: 'cpu' as IconName,
-      title: 'Rust performance',
-      desc: 'Native Rust with Tokio async. Zero-copy Arrow batches between operators. Lower latency, smaller footprint.',
-    },
-    {
-      icon: 'iceberg' as IconName,
-      title: 'Lakehouse native',
-      desc: 'Apache Iceberg is the primary lakehouse target. REST, Hive, and Glue catalogs. Parquet + manifest atomic commits.',
-    },
-    {
       icon: 'server' as IconName,
       title: 'Embedded to distributed',
       desc: 'One API. Start in-process, scale to a coordinator-plus-executors cluster. No rewrite when you outgrow your laptop.',
-    },
-    {
-      icon: 'code' as IconName,
-      title: 'Three APIs, one engine',
-      desc: 'SQL for analysts, Python for data engineers, Rust for platform teams. Same planning, same execution, same results.',
     },
   ];
 
@@ -435,6 +390,7 @@ function Ecosystem() {
     { icon: 'parquet', name: 'Parquet' },
     { icon: 's3', name: 'S3 / ADLS / GCS' },
     { icon: 'tokio', name: 'Tokio' },
+    { icon: 'shield', name: 'Apache 2.0' },
   ];
 
   return (
@@ -479,37 +435,6 @@ function Audience() {
               <h3>{r.title}</h3>
               <p>{r.desc}</p>
             </article>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ── Trust Signals ────────────────────────────────────────────────────────── */
-
-function TrustSignals() {
-  const signals = [
-    { icon: 'shield' as IconName, label: 'Open Source', sub: 'Apache 2.0' },
-    { icon: 'rust' as IconName, label: 'Rust Native', sub: 'No JVM' },
-    { icon: 'arrow-icon' as IconName, label: 'Arrow Ecosystem', sub: 'Zero-copy' },
-    { icon: 'database' as IconName, label: 'DataFusion', sub: 'SQL engine' },
-    { icon: 'iceberg' as IconName, label: 'Iceberg First', sub: 'Lakehouse' },
-    { icon: 'clock' as IconName, label: 'Benchmarks', sub: 'Coming Soon' },
-  ];
-
-  return (
-    <section className="section-dark" aria-label="Trust signals">
-      <div className="section-container">
-        <div className="trust-grid">
-          {signals.map((s) => (
-            <div className="trust-item" key={s.label}>
-              <Icon name={s.icon} />
-              <div>
-                <strong>{s.label}</strong>
-                <span>{s.sub}</span>
-              </div>
-            </div>
           ))}
         </div>
       </div>
@@ -611,7 +536,6 @@ export default function Home() {
         <DeploymentModes />
         <Ecosystem />
         <Audience />
-        <TrustSignals />
         <FaqSection />
         <FinalCTA />
       </main>
