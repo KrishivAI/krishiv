@@ -360,8 +360,10 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
             }
         }
         if !to_delete.is_empty() {
-            let batch: Vec<(&Namespace, &[u8])> =
-                to_delete.iter().map(|(ns, k)| (*ns, k.as_slice())).collect();
+            let batch: Vec<(&Namespace, &[u8])> = to_delete
+                .iter()
+                .map(|(ns, k)| (*ns, k.as_slice()))
+                .collect();
             self.inner.delete_batch(&batch)?;
         }
         Ok(())
