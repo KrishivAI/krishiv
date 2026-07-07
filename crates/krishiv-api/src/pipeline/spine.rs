@@ -393,6 +393,8 @@ mod tests {
             name: "v".into(),
             sql: "SELECT 1 AS a".into(),
             materialized: true,
+            lateness: vec![],
+            is_recursive: false,
         }];
         assert_eq!(compose_query(&views, "v", &[]), "SELECT 1 AS a");
     }
@@ -404,11 +406,15 @@ mod tests {
                 name: "v1".into(),
                 sql: "SELECT k, v FROM t".into(),
                 materialized: true,
+                lateness: vec![],
+                is_recursive: false,
             },
             ViewDef {
                 name: "v2".into(),
                 sql: "SELECT k, v FROM v1".into(),
                 materialized: true,
+                lateness: vec![],
+                is_recursive: false,
             },
         ];
         let q = compose_query(&views, "v2", &["v >= 5".into()]);
