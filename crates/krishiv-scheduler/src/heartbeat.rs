@@ -185,9 +185,7 @@ impl ExecutorRegistry {
             // Draining executor persisted in the registry forever.
             if matches!(
                 executor.state(),
-                ExecutorState::Registered
-                    | ExecutorState::Healthy
-                    | ExecutorState::Draining
+                ExecutorState::Registered | ExecutorState::Healthy | ExecutorState::Draining
             ) && self
                 .current_tick
                 .saturating_sub(executor.last_heartbeat_tick)

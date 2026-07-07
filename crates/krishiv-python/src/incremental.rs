@@ -157,11 +157,8 @@ impl PyDeltaBatch {
     /// ``-1``, ``after`` rows get weight ``+1``. Schemas must match.
     #[staticmethod]
     pub fn from_update(before: &PyBatch, after: &PyBatch) -> PyResult<Self> {
-        let db = DeltaBatch::from_update(
-            before.record_batch(),
-            after.record_batch(),
-        )
-        .map_err(map_delta_error)?;
+        let db = DeltaBatch::from_update(before.record_batch(), after.record_batch())
+            .map_err(map_delta_error)?;
         Ok(Self { inner: db })
     }
 
