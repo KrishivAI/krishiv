@@ -257,10 +257,37 @@ message MemoryKafkaRecord {
 
 message PlanFragment {
   string description = 1;
-  // Explicit execution model — true for streaming (continuous) tasks, false for
-  // batch (terminal) tasks. When absent (false), the executor falls back to
-  // description-based detection for backward compatibility.
   bool is_streaming = 2;
+  // Optional typed payload: when present, the executor can deserialize it
+  // directly without parsing the description string.
+  DeltaBatchPayload delta_batch_payload = 3;
+}
+
+// Typed transport for DeltaBatch in distributed IVM. Replaces the legacy
+// base64-in-JSON-in-base64 fragment string with a direct Arrow IPC binary
+// payload, avoiding the 33%+ encoding overhead of the text-based path.
+message DeltaBatchPayload {
+  // Full checkpoint state bytes (same as IncrementalFlow::checkpoint_full()).
+  bytes checkpoint_state = 1;
+  // Pending source deltas, one entry per source.
+  repeated PendingDeltaEntry deltas = 2;
+  // View specifications for the executor to register.
+  repeated DeltaBatchViewSpec view_specs = 3;
+}
+
+message PendingDeltaEntry {
+  string source_name = 1;
+  // Arrow IPC stream of the DeltaBatch (with DLT1 magic prefix).
+  bytes delta_ipc = 2;
+}
+
+message DeltaBatchViewSpec {
+  string name = 1;
+  string body_sql = 2;
+  // Output schema serialized as Arrow IPC schema bytes.
+  bytes output_schema_ipc = 3;
+  bool is_materialized = 4;
+  bool is_recursive = 5;
 }
 
 message OutputContract {

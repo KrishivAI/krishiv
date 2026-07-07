@@ -1676,13 +1676,27 @@ impl SqlEngine {
         }
 
         // ── Intercept CREATE/DECLARE/REFRESH/DROP INCREMENTAL VIEW ───────────
-        if incremental_view::execute_incremental_view_ddl(&self.incremental_view_registry, query)?
-            .is_some()
-        {
-            let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-            return Ok(
-                self.attach_query_metadata(self.make_sql_df("incremental-view-ddl", empty), query)
-            );
+        match incremental_view::execute_incremental_view_ddl(
+            &self.incremental_view_registry,
+            query,
+        )? {
+            Some(incremental_view::IncrementalViewResult::Refresh(_name)) => {
+                // REFRESH requires the caller (Session) to re-run the pipeline.
+                // Return a sentinel empty result so the caller knows to refresh.
+                let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+                return Ok(self.attach_query_metadata(
+                    self.make_sql_df("incremental-view-refresh", empty),
+                    query,
+                ));
+            }
+            Some(_) => {
+                let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+                return Ok(self.attach_query_metadata(
+                    self.make_sql_df("incremental-view-ddl", empty),
+                    query,
+                ));
+            }
+            None => {}
         }
 
         // ── Intercept CREATE/DROP SOURCE / SINK (pipeline DDL) ───────────────

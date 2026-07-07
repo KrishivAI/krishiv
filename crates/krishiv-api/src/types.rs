@@ -143,6 +143,36 @@ impl QueryResult {
     pub fn into_batches(self) -> Vec<RecordBatch> {
         self.batches
     }
+
+    /// Convert the query result into a ``DeltaBatch`` with all rows as
+    /// insertions (weight +1). This bridges the SQL/DataFrame API to the
+    /// IVM engine: feed the result into ``IvmJob::feed()``.
+    ///
+    /// If the result spans multiple batches, they are concatenated into
+    /// one DeltaBatch.
+    pub fn into_delta_batch(self) -> Result<krishiv_delta::DeltaBatch, crate::error::KrishivError> {
+        let combined = if self.batches.len() <= 1 {
+            self.batches.first().cloned().unwrap_or_else(|| {
+                RecordBatch::new_empty(std::sync::Arc::new(arrow::datatypes::Schema::empty()))
+            })
+        } else {
+            let schema = self
+                .batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+            arrow::compute::concat_batches(&schema, &self.batches).map_err(|e| {
+                crate::error::KrishivError::Runtime {
+                    message: format!("failed to concat batches for DeltaBatch: {e}"),
+                }
+            })?
+        };
+        krishiv_delta::DeltaBatch::from_inserts(combined).map_err(|e| {
+            crate::error::KrishivError::Runtime {
+                message: e.to_string(),
+            }
+        })
+    }
 }
 
 impl IntoIterator for QueryResult {

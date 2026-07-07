@@ -128,20 +128,19 @@ pub async fn run_incremental_job_via_ivm(
     use crate::FeedableJob;
     use krishiv_ivm::IncrementalViewSpec;
 
-    // Drain each source as a CDC changelog via the file connectors.
+    // API-3: Stream per-batch instead of buffering the entire source.
+    // The embedded path (engines.rs IVM-8) was rewritten to feed+step per
+    // batch for O(1 batch) peak memory; this distributed path gets the same
+    // treatment to avoid OOM on large CDC sources.
+
+    // Phase 1: Open each source briefly to capture the schema.
     let source_provider = ConnectorSourceProvider;
-    let mut buffered: Vec<(String, Vec<ChangelogBatch>)> = Vec::new();
     let mut source_schemas: Vec<(String, arrow::datatypes::SchemaRef)> = Vec::new();
     for spec in &job.sources {
         let mut reader = source_provider.open(spec).await?;
-        let mut changes = Vec::new();
-        while let Some(cl) = reader.next_changelog().await? {
-            changes.push(cl);
-        }
-        if let Some(first) = changes.first() {
+        if let Some(first) = reader.next_changelog().await? {
             source_schemas.push((spec.name.clone(), first.batch().schema()));
         }
-        buffered.push((spec.name.clone(), changes));
     }
 
     let output_schema = crate::engines::infer_output_schema(&source_schemas, &job.query).await?;
@@ -157,14 +156,15 @@ pub async fn run_incremental_job_via_ivm(
     })
     .await?;
 
-    // Feed each input delta and advance the view.
-    for (name, changes) in buffered {
-        for cl in changes {
+    // Phase 2: Re-open each source and feed+step per batch (streaming, O(1) memory).
+    for spec in &job.sources {
+        let mut reader = source_provider.open(spec).await?;
+        while let Some(cl) = reader.next_changelog().await? {
             if cl.num_rows() == 0 {
                 continue;
             }
             let delta = crate::engines::delta_from_changelog(&cl)?;
-            ivm.feed(&name, &delta).await?;
+            ivm.feed(&spec.name, &delta).await?;
             ivm.step().await?;
         }
     }
@@ -328,11 +328,25 @@ impl QueryExecutor for RuntimeQueryExecutor {
                 .iter()
                 .map(|s| BatchTableRegistration::new(s.name.clone(), PathBuf::from(&s.uri)))
                 .collect();
+            // BATCH-2: The runtime materializes the full result into a Vec
+            // before we wrap it in a stream. This is an architectural limitation
+            // — a true streaming path requires changing
+            // `collect_batch_sql_async` to return a stream. Until then, large
+            // results are fully buffered in coordinator/client memory.
             let batches = self
                 .runtime
                 .collect_batch_sql_async(&job.query, &tables, false)
                 .await
                 .map_err(|e| EngineError::Runtime(e.to_string()))?;
+            let total_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+            if total_bytes > 256 * 1024 * 1024 {
+                tracing::warn!(
+                    bytes = total_bytes,
+                    batches = batches.len(),
+                    "distributed batch query materialized {total_bytes} bytes in memory \
+                     before streaming; consider adding LIMIT or partitioning the query"
+                );
+            }
 
             enforce_result_size_limit(&batches, "all-parquet batch query")?;
 

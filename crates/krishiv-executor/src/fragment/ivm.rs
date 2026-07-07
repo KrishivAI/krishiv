@@ -180,10 +180,10 @@ pub async fn execute_ivm_fragment(
     }
     flow.restore_full(&state_bytes)
         .map_err(|e| format!("restore_full: {e}"))?;
-    // Force DiffBased: the transient flow's incremental-plan accumulators are
-    // empty (not transferable), so only full SQL recompute + diff is correct.
-    flow.force_diff_based()
-        .map_err(|e| format!("force_diff_based: {e}"))?;
+    // Operator accumulator state is included in checkpoint_full (plan-state
+    // section) and restored via pending_plan_state. The restored flow can use
+    // incremental plans without force_diff_based. The flow's accumulators are
+    // seeded from the checkpointed bytes in Phase 5 of step_datafusion.
 
     // Feed pending deltas (input dedup / zero-drop mirror the coordinator path).
     for pd in &pending_deltas {

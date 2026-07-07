@@ -510,6 +510,14 @@ Execution statistics:
         krishiv_common::async_util::block_on(self.collect_async())
     }
 
+    /// Collect results and convert to a ``DeltaBatch`` (all rows as insertions,
+    /// weight +1). Convenience bridge from the SQL/DataFrame API to the IVM
+    /// engine: use this to feed SQL query output into an incremental view.
+    pub fn collect_as_delta_batch(&self) -> Result<krishiv_delta::DeltaBatch> {
+        let result = self.collect()?;
+        result.into_delta_batch()
+    }
+
     /// Asynchronously collect results.
     pub async fn collect_async(&self) -> Result<QueryResult> {
         let job_id = self.start_job("local-dataframe");

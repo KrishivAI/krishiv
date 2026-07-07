@@ -88,6 +88,17 @@ impl BlockingSession {
         &self.inner
     }
 
+    /// API-11: Close the underlying session, clearing all registries and
+    /// aborting background tasks. Because `BlockingSession` holds the session
+    /// in an `Arc`, this attempts to unwrap it. If other references exist,
+    /// the registries are cleared but the session object survives.
+    pub fn close(self) {
+        if let Ok(session) = Arc::try_unwrap(self.inner) {
+            session.close();
+        }
+        // Runtime is dropped when `self` goes out of scope.
+    }
+
     /// Borrow the underlying Tokio [`Runtime`].
     pub fn runtime(&self) -> &Runtime {
         &self.rt

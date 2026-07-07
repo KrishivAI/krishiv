@@ -83,6 +83,24 @@ pub trait FeedableJob: Job {
 
     /// Read the current materialized snapshot of a view (`None` if not yet produced).
     async fn snapshot(&self, view: &str) -> Result<Option<RecordBatch>>;
+
+    /// Feed a DeltaBatch and step in one call. Equivalent to `feed` + `step`.
+    /// Returns the step summary.
+    async fn feed_and_step(&self, source: &str, delta: &DeltaBatch) -> Result<StepReport> {
+        self.feed(source, delta).await?;
+        self.step().await
+    }
+
+    /// Feed a plain RecordBatch as insertions and step in one call.
+    /// Convenience wrapper: creates a `DeltaBatch::from_inserts` automatically.
+    async fn feed_inserts_and_step(&self, source: &str, batch: &RecordBatch) -> Result<StepReport> {
+        let delta = DeltaBatch::from_inserts(batch.clone()).map_err(|e| {
+            crate::error::KrishivError::Runtime {
+                message: e.to_string(),
+            }
+        })?;
+        self.feed_and_step(source, &delta).await
+    }
 }
 
 /// A job whose state can be checkpointed and restored.

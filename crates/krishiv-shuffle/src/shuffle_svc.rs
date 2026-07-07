@@ -79,7 +79,8 @@ pub(crate) struct ShuffleSvcState {
     /// T12: push-based shuffle store — accumulates per-partition IPC payloads
     /// pushed by map tasks, served merged via `/ess/merged/…`.
     pub(crate) push_store: PushShuffleStore,
-    pub(crate) token: Option<String>,
+    /// DIST-6: Token stored behind a RwLock so it can be reloaded at runtime.
+    pub(crate) token: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 // ── Service launch ────────────────────────────────────────────────────────────
@@ -105,7 +106,23 @@ pub async fn run_shuffle_svc(
     let store: Arc<dyn ShuffleStore + Send + Sync> = Arc::new(
         LocalDiskShuffleStore::new(base_dir.as_ref())?.with_compression(ShuffleCompression::Lz4),
     );
-    let token = std::env::var("KRISHIV_SHUFFLE_TOKEN").ok();
+    // DIST-6: Store token in a RwLock for runtime reload.
+    let token_val = std::env::var("KRISHIV_SHUFFLE_TOKEN").ok();
+    // Also read from file if set.
+    let token_val = if token_val.is_none() {
+        if let Ok(token_file) = std::env::var("KRISHIV_SHUFFLE_TOKEN_FILE") {
+            tokio::fs::read_to_string(&token_file)
+                .await
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        }
+    } else {
+        token_val
+    };
+    let token = Arc::new(std::sync::RwLock::new(token_val));
     let ess_index = SortShuffleIndex::new();
     let state = ShuffleSvcState {
         store,
@@ -113,7 +130,30 @@ pub async fn run_shuffle_svc(
         push_store: PushShuffleStore::new(),
         token,
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
+
+    // DIST-6: Spawn a background reload task if a token file is configured.
+    if let Ok(token_file) = std::env::var("KRISHIV_SHUFFLE_TOKEN_FILE") {
+        let reload_token = state.token.clone();
+        let reload_secs = std::env::var("KRISHIV_SHUFFLE_TOKEN_RELOAD_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(reload_secs));
+            loop {
+                interval.tick().await;
+                if let Ok(content) = tokio::fs::read_to_string(&token_file).await {
+                    let trimmed = content.trim().to_string();
+                    if !trimmed.is_empty()
+                        && let Ok(mut guard) = reload_token.write()
+                    {
+                        *guard = Some(trimmed);
+                    }
+                }
+            }
+        });
+    }
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(
         addr = %listener.local_addr()?,
@@ -150,6 +190,12 @@ pub(crate) fn build_router(state: ShuffleSvcState) -> Router {
         )
         // T12 push-based shuffle: GC push store for a job.
         .route("/ess/push-gc/{job_id}", post(ess_push_gc))
+        // DIST-4: Set expected map-task push count for a partition so
+        // merged reads wait until all expected pushes have arrived.
+        .route(
+            "/ess/expect/{job_id}/{stage_id}/{partition}",
+            post(ess_set_expected_pushes),
+        )
         .route("/healthz", get(|| async { "ok\n" }))
         .with_state(state)
 }
@@ -229,10 +275,16 @@ async fn ess_read_partition(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let offsets = files.read_offsets().map_err(|e| {
-        tracing::error!(error = %e, "ESS read index failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // DIST-3: read_offsets opens the index file synchronously — offload
+    // to spawn_blocking so the async handler doesn't block the reactor.
+    let files_clone = files.clone();
+    let offsets = tokio::task::spawn_blocking(move || files_clone.read_offsets())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            tracing::error!(error = %e, "ESS read index failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let start = offsets.get(partition as usize).copied().ok_or_else(|| {
         tracing::error!(partition, "partition index out of range for offsets");
@@ -257,29 +309,39 @@ async fn ess_read_partition(
         ));
     }
 
-    // Read just the partition's byte slice from the data file.
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(&files.data_path).map_err(|e| {
-        tracing::error!(error = %e, "ESS open data file failed");
+    // DIST-3: Move synchronous filesystem I/O to spawn_blocking so the async
+    // handler doesn't stall the Tokio reactor for large partition reads.
+    let data_path = files.data_path.clone();
+    let read_result = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&data_path).map_err(|e| {
+            tracing::error!(error = %e, "ESS open data file failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        f.seek(SeekFrom::Start(start)).map_err(|e| {
+            tracing::error!(error = %e, "ESS seek failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let len = (end - start) as usize;
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf).map_err(|e| {
+            tracing::error!(error = %e, "ESS read_exact failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        Ok::<Vec<u8>, StatusCode>(buf)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "ESS spawn_blocking join failed");
         StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    f.seek(SeekFrom::Start(start)).map_err(|e| {
-        tracing::error!(error = %e, "ESS seek failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let len = (end - start) as usize;
-    let mut buf = vec![0u8; len];
-    f.read_exact(&mut buf).map_err(|e| {
-        tracing::error!(error = %e, "ESS read_exact failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    })??;
 
     Ok((
         [(
             axum::http::header::CONTENT_TYPE,
             "application/vnd.apache.arrow.stream",
         )],
-        buf,
+        read_result,
     ))
 }
 
@@ -357,13 +419,45 @@ async fn ess_push_gc(
     StatusCode::NO_CONTENT
 }
 
+/// DIST-4: `POST /ess/expect/{job_id}/{stage_id}/{partition}?count=N`
+///
+/// Sets the expected number of map-task pushes for a partition so that
+/// merge_read returns None until all expected pushes have arrived.
+/// Called by the coordinator when assigning shuffle-stage tasks.
+async fn ess_set_expected_pushes(
+    headers: axum::http::HeaderMap,
+    State(state): State<ShuffleSvcState>,
+    AxumPath((job_id, stage_id, partition)): AxumPath<(String, String, u32)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> StatusCode {
+    if let Err(status) = check_bearer_token(&headers, &state.token) {
+        return status;
+    }
+    let count: usize = params
+        .get("count")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if count > 0 {
+        state
+            .push_store
+            .set_expected_pushes(&job_id, &stage_id, partition, count);
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
 fn check_bearer_token(
     headers: &axum::http::HeaderMap,
-    token: &Option<String>,
+    token: &Arc<std::sync::RwLock<Option<String>>>,
 ) -> Result<(), StatusCode> {
-    if let Some(tok) = token {
+    // DIST-6: Read through the RwLock so the token can be reloaded at runtime.
+    let guard = token
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(tok) = guard.as_ref() {
         let auth_header = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())

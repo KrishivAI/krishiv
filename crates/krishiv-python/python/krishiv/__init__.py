@@ -4,6 +4,10 @@ from .krishiv import (  # noqa: F401
     AuthorizationError,
     BlockingSession,
     RustScalarUdf,
+    DeltaBatch,
+    IvmJob,
+    StepSummary,
+    ViewError,
     QueryResult,
     JobStatus,
     CheckpointError,
@@ -203,6 +207,10 @@ Session.register_arrow_stream = _register_arrow_stream
 
 
 __all__ = [
+    "DeltaBatch",
+    "IvmJob",
+    "StepSummary",
+    "ViewError",
     "KrishivError",
     "QueryError",
     "SchemaError",

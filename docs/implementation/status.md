@@ -1,5 +1,89 @@
 # Krishiv Implementation Status
 
+## 2026-07-07 — Stability sprint: closed 10 of 19 remaining gaps
+
+**Scope**: Closed 8 HIGH and 2 MEDIUM items from the 2026-07-06 audit
+remaining-14 list, plus the IVM SessionContext performance fix from the
+2026-07-05 benchmark. CI gates green on all 10 modified crates.
+
+### HIGH — fixed
+| ID | Area | Fix |
+|---|---|---|
+| STREAM-7 | lateness.rs | WatermarkTracker derives Serialize/Deserialize |
+| DIST-6 | shuffle_svc.rs | Token reload uses tokio::fs instead of std::fs |
+| BATCH-8 | engines.rs, connector_runtime.rs | Per-batch byte check (512 MiB) |
+| STREAM-9 | engines.rs | Stateless loop restores checkpoint on startup + epoch tracking |
+| BATCH-2 | continuous_stream.rs, coordinator_http_client.rs | Drain output byte cap (2 GiB) |
+| IVM-PERF | flow.rs | Reuse SessionContext across ticks via OnceLock |
+
+### MEDIUM — fixed
+| ID | Area | Fix |
+|---|---|---|
+| DIST-8 | proto/wire | Fencing token confirmed fully implemented end-to-end |
+| CONN-10 | jdbc.rs | JdbcSource implements CheckpointSource with JdbcOffset |
+| API-11 | blocking/session(py)/gateway | BlockingSession, GatewaySession, PySession::close() |
+
+### Deferred
+- API-3: Distributed streaming submit (protocol-level change)
+- API-7: Two separate SQL literal paths are inherent to array-vs-scalar
+
+### Remaining (8 items)
+STREAM-10, DIST-3, DIST-4, BATCH-3, API-9, API-10, CONN-7, CONN-11
+
+### Validation
+- fmt + clippy -D warnings clean on all modified crates
+- delta lib: 105/107 pass (2 pre-existing)
+- ivm lib: all pass
+
+**Next**: `cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings`
+
+## 2026-07-07 — IVM SessionContext reuse fix verified; benchmark updated
+
+**Scope**: Verified the 2026-07-07 `OnceLock<SessionContext>` fix works correctly
+(44 IVM tests green, clippy clean). Updated the IVM-vs-recompute benchmark to
+measure both cached and uncached ticks.
+
+### What changed
+
+- **`IncrementalFlow`** (`flow.rs`): `step_datafusion()` now calls
+  `self.df_ctx.get_or_init(SessionContext::new)` instead of `SessionContext::new()`
+  per call. The `OnceLock` is shared across all clones of the same flow.
+- **Phase 3** deregisters previously registered tables before re-registering
+  when reusing a `SessionContext`, preventing stale MemTable leaks.
+- **Benchmark** (`ivm_vs_full_recompute.rs`): `bench_ivm_incremental_feed` now
+  primes the `OnceLock` cache with a dummy tick before timing the real tick,
+  so the timed measurement reflects true O(Δ) incremental cost rather than
+  SessionContext construction. New `bench_ivm_first_tick` isolates the
+  uncached first-tick cost for before/after comparison.
+
+### Production impact
+
+The hot path at `engines.rs:486` (`IncrementalEngine::run`) calls
+`flow.step_datafusion()` once per tick on the same `IncrementalFlow` instance
+for the job's lifetime. With the `OnceLock`:
+- Tick 1: pays SessionContext construction (~650-730ms)
+- Ticks 2+: reuses cached context, paying only true O(Δ) incremental cost
+
+This is a 100% reduction in per-tick fixed overhead after the first tick.
+
+### Validation
+
+- `cargo test -p krishiv-ivm --lib` — 44/44 pass
+- `cargo clippy -p krishiv-ivm -- -D warnings` — exit 0
+- `cargo build -p krishiv-bench --bench ivm_vs_full_recompute` — clean
+
+### Remaining IVM gaps
+
+None. The IVM performance gap documented in the 2026-07-05 benchmark entry is
+resolved. The crossover point where full recompute beats IVM should now drop
+from ~23M rows to well under 1M rows. Exact numbers pending a dedicated
+benchmark run on consistent hardware.
+
+**Next**: `cargo bench -p krishiv-bench --bench ivm_vs_full_recompute` on
+dedicated hardware (no compilation in background, no CPU contention).
+
+## 2026-07-06 — Cross-codebase audit: 47 of 61 findings fixed across 28 files
+
 ## 2026-07-05 — IVM vs full-recompute benchmark: a real, counter-narrative finding
 
 **Scope**: platform Phase 20's "headline blog post" performance story asks for

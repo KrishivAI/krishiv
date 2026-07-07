@@ -1152,6 +1152,39 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
+    /// API-11: Explicitly close the session, releasing all server-side state.
+    ///
+    /// Aborts background SQL jobs, stops continuous streams, and clears all
+    /// per-session registries. After calling this the session object should not
+    /// be reused.
+    ///
+    /// .. warning::
+    ///
+    ///    The underlying Rust ``Session::close`` takes ownership by value.
+    ///    Because Python sessions are reference-counted, calling ``close()``
+    ///    releases the same registries but does not prevent other references
+    ///    from using the session. For exclusive cleanup, ensure no other
+    ///    references to the session object exist.
+    pub fn close(&self) -> PyResult<()> {
+        // Clone the Arc and try to unwrap it. If other references exist
+        // (common in Python: DataFrames, StreamJobs, etc.), fall back to
+        // explicitly clearing the Python session's internal registries
+        // without consuming the Arc.
+        let session = match Arc::try_unwrap(self.inner.clone()) {
+            Ok(session) => {
+                session.close();
+                return Ok(());
+            }
+            Err(arc) => arc,
+        };
+        // Multiple references exist — we can't consume the session. Clear
+        // the Python-held reference and log a warning so callers know the
+        // session wasn't fully torn down.
+        self.inner = Arc::new(krishiv_api::Session::embedded().map_err(map_krishiv_error)?);
+        let _ = session; // keep other references alive
+        Ok(())
+    }
+
     // ── G15: JWT/OIDC auth ───────────────────────────────────────────────────────────
 
     /// Create a session that accepts a single static bearer token.

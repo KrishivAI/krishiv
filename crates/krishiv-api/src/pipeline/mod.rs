@@ -199,6 +199,10 @@ pub struct ViewDef {
     pub name: String,
     pub sql: String,
     pub materialized: bool,
+    /// LATENESS annotations parsed from DDL (if any). Empty if no LATENESS clause.
+    pub lateness: Vec<krishiv_sql::incremental_view::LatenessAnnotation>,
+    /// True if the view was declared as DECLARE RECURSIVE VIEW.
+    pub is_recursive: bool,
 }
 
 /// What to do when a row violates an [`Expectation`] (Spark SDP / DLT parity).
@@ -310,6 +314,27 @@ impl PipelineBuilder {
             name: name.into(),
             sql: sql.into(),
             materialized,
+            lateness: vec![],
+            is_recursive: false,
+        });
+        self
+    }
+
+    /// Declare a view with explicit LATENESS annotations and recursive flag.
+    pub fn view_with_lateness(
+        mut self,
+        name: impl Into<String>,
+        sql: impl Into<String>,
+        materialized: bool,
+        lateness: Vec<krishiv_sql::incremental_view::LatenessAnnotation>,
+        is_recursive: bool,
+    ) -> Self {
+        self.views.push(ViewDef {
+            name: name.into(),
+            sql: sql.into(),
+            materialized,
+            lateness,
+            is_recursive,
         });
         self
     }
@@ -392,6 +417,8 @@ impl PipelineBuilder {
                 name: target,
                 sql: union_sql,
                 materialized: true,
+                lateness: vec![],
+                is_recursive: false,
             });
         }
         Pipeline {

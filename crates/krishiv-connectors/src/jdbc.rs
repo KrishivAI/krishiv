@@ -58,6 +58,11 @@ pub struct JdbcSource {
     table: String,
     batch_size: u32,
     offset: u64,
+    /// CONN-5: Optional key column for keyset pagination (stable under concurrent
+    /// writes). When set, uses `WHERE key > $last_key` instead of OFFSET.
+    key_column: Option<String>,
+    /// Last seen key value for keyset pagination.
+    last_key: Option<i64>,
     schema: Option<SchemaRef>,
     exhausted: bool,
 }
@@ -78,6 +83,8 @@ impl JdbcSource {
             table: table.into(),
             batch_size: DEFAULT_BATCH_SIZE,
             offset: 0,
+            key_column: None,
+            last_key: None,
             schema: None,
             exhausted: false,
         })
@@ -87,6 +94,15 @@ impl JdbcSource {
     #[must_use]
     pub fn with_batch_size(mut self, n: u32) -> Self {
         self.batch_size = n.max(1);
+        self
+    }
+
+    /// CONN-5: Set the key column for keyset pagination. When set, the source
+    /// uses `WHERE key > $last_key ORDER BY key LIMIT N` instead of
+    /// `OFFSET`-based pagination, which is unstable under concurrent writes.
+    #[must_use]
+    pub fn with_key_column(mut self, col: impl Into<String>) -> Self {
+        self.key_column = Some(col.into());
         self
     }
 
@@ -116,18 +132,41 @@ impl Source for JdbcSource {
         ConnectorCapabilities::new()
             .with_bounded()
             .with_rewindable()
+            .with_checkpoint()
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
         if self.exhausted {
             return Ok(None);
         }
-        let sql = format!(
-            "SELECT * FROM {} LIMIT {} OFFSET {}",
-            quote_qualified(&self.table),
-            self.batch_size,
-            self.offset
-        );
+        // CONN-5: Use keyset pagination when a key column is configured
+        // (stable under concurrent writes); fall back to OFFSET otherwise.
+        let sql = if let Some(ref key_col) = self.key_column {
+            let quoted_key = quote_pg_ident(key_col);
+            match self.last_key {
+                Some(k) => format!(
+                    "SELECT * FROM {} WHERE {} > {} ORDER BY {} LIMIT {}",
+                    quote_qualified(&self.table),
+                    quoted_key,
+                    k,
+                    quoted_key,
+                    self.batch_size
+                ),
+                None => format!(
+                    "SELECT * FROM {} ORDER BY {} LIMIT {}",
+                    quote_qualified(&self.table),
+                    quoted_key,
+                    self.batch_size
+                ),
+            }
+        } else {
+            format!(
+                "SELECT * FROM {} LIMIT {} OFFSET {}",
+                quote_qualified(&self.table),
+                self.batch_size,
+                self.offset
+            )
+        };
         let rows: Vec<PgRow> = sqlx::query(&sql)
             .fetch_all(&self.pool)
             .await
@@ -136,7 +175,15 @@ impl Source for JdbcSource {
             self.exhausted = true;
             return Ok(None);
         }
-        self.offset += rows.len() as u64;
+        // CONN-5: Track the last key for keyset pagination.
+        if let Some(ref key_col) = self.key_column {
+            if let Some(last_row) = rows.last() {
+                if let Ok(val) = last_row.try_get::<i64, _>(key_col.as_str()) {
+                    self.last_key = Some(val);
+                }
+            }
+        }
+        self.offset = self.offset.saturating_add(rows.len() as u64);
         let schema = match &self.schema {
             Some(s) => Arc::clone(s),
             None => {
@@ -156,7 +203,138 @@ impl Source for JdbcSource {
 
     fn reset(&mut self) {
         self.offset = 0;
+        self.last_key = None;
         self.exhausted = false;
+    }
+}
+
+// ── JdbcOffset & CheckpointSource ─────────────────────────────────────────────
+
+/// CONN-10: Typed checkpoint offset for JDBC pagination.
+///
+/// Captures the pagination mode (OFFSET vs keyset) so a checkpoint saves enough
+/// state to resume from the exact row boundary, even if the table has concurrent
+/// writes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JdbcOffset {
+    /// Traditional OFFSET-based pagination: resume at this row offset.
+    Offset(u64),
+    /// Keyset pagination: resume after this key value.
+    Keyset {
+        /// Column name used for keyset pagination.
+        column: String,
+        /// Last observed key value.
+        last_key: i64,
+    },
+}
+
+impl crate::offset::Offset for JdbcOffset {
+    fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        match self {
+            JdbcOffset::Offset(v) => {
+                buf.push(0); // tag: offset mode
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            JdbcOffset::Keyset { column, last_key } => {
+                buf.push(1); // tag: keyset mode
+                let col_bytes = column.as_bytes();
+                buf.extend_from_slice(&(col_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(col_bytes);
+                buf.extend_from_slice(&last_key.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    fn decode(bytes: &[u8]) -> ConnectorResult<Self>
+    where
+        Self: Sized,
+    {
+        if bytes.is_empty() {
+            return Err(ConnectorError::Config {
+                message: "empty JDBC offset bytes".into(),
+            });
+        }
+        match bytes[0] {
+            0 => {
+                if bytes.len() < 9 {
+                    return Err(ConnectorError::Config {
+                        message: "truncated JDBC offset (Offset)".into(),
+                    });
+                }
+                let v = u64::from_le_bytes(bytes[1..9].try_into().map_err(|_| {
+                    ConnectorError::Config {
+                        message: "offset decode failed".into(),
+                    }
+                })?);
+                Ok(JdbcOffset::Offset(v))
+            }
+            1 => {
+                if bytes.len() < 5 {
+                    return Err(ConnectorError::Config {
+                        message: "truncated JDBC offset (Keyset)".into(),
+                    });
+                }
+                let col_len = u32::from_le_bytes(bytes[1..5].try_into().map_err(|_| {
+                    ConnectorError::Config {
+                        message: "keyset col_len decode failed".into(),
+                    }
+                })?) as usize;
+                let key_start = 5 + col_len;
+                if bytes.len() < key_start + 8 {
+                    return Err(ConnectorError::Config {
+                        message: "truncated JDBC offset (Keyset key)".into(),
+                    });
+                }
+                let column = String::from_utf8(bytes[5..5 + col_len].to_vec()).map_err(|e| {
+                    ConnectorError::Config {
+                        message: format!("keyset column not valid utf-8: {e}"),
+                    }
+                })?;
+                let last_key =
+                    i64::from_le_bytes(bytes[key_start..key_start + 8].try_into().map_err(
+                        |_| ConnectorError::Config {
+                            message: "keyset key decode failed".into(),
+                        },
+                    )?);
+                Ok(JdbcOffset::Keyset { column, last_key })
+            }
+            tag => Err(ConnectorError::Config {
+                message: format!("unknown JDBC offset tag: {tag}"),
+            }),
+        }
+    }
+}
+
+impl crate::source::CheckpointSource for JdbcSource {
+    type Offset = JdbcOffset;
+
+    fn checkpoint_offset(&self) -> ConnectorResult<JdbcOffset> {
+        if let Some(ref col) = self.key_column {
+            Ok(JdbcOffset::Keyset {
+                column: col.clone(),
+                last_key: self.last_key.unwrap_or(-1),
+            })
+        } else {
+            Ok(JdbcOffset::Offset(self.offset))
+        }
+    }
+
+    fn restore_offset(&mut self, offset: &JdbcOffset) -> ConnectorResult<()> {
+        match offset {
+            JdbcOffset::Offset(v) => {
+                self.offset = *v;
+                self.last_key = None;
+            }
+            JdbcOffset::Keyset { column, last_key } => {
+                self.key_column = Some(column.clone());
+                self.last_key = Some(*last_key);
+                self.offset = 0;
+            }
+        }
+        self.exhausted = false;
+        Ok(())
     }
 }
 

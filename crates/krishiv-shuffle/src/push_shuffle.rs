@@ -53,6 +53,10 @@ pub struct PushShuffleStore {
     total_bytes: Arc<AtomicUsize>,
     /// Maximum bytes before push() returns an error.
     memory_limit: usize,
+    /// DIST-4: Expected map-task push count per partition keyed by
+    /// (job_id, stage_id, partition). When set, merge_read returns None
+    /// until all expected pushes arrive.
+    expected_pushes: Arc<DashMap<(String, String, u32), usize>>,
 }
 
 impl Default for PushShuffleStore {
@@ -61,6 +65,7 @@ impl Default for PushShuffleStore {
             inner: Arc::default(),
             total_bytes: Arc::new(AtomicUsize::new(0)),
             memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
+            expected_pushes: Arc::default(),
         }
     }
 }
@@ -75,6 +80,13 @@ impl PushShuffleStore {
     pub fn with_memory_limit(mut self, bytes: usize) -> Self {
         self.memory_limit = bytes;
         self
+    }
+
+    /// DIST-4: Set the expected number of map-task pushes for a partition.
+    /// When set, merge_read returns None until all expected pushes arrive.
+    pub fn set_expected_pushes(&self, job_id: &str, stage_id: &str, partition: u32, count: usize) {
+        self.expected_pushes
+            .insert((job_id.to_owned(), stage_id.to_owned(), partition), count);
     }
 
     /// Accept one map-task push: append `ipc_bytes` for `(job_id, stage_id, partition)`.

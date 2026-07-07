@@ -1318,6 +1318,7 @@ fn plan_fragment_to_wire(value: &PlanFragment) -> v1::PlanFragment {
     v1::PlanFragment {
         description: value.description().to_owned(),
         is_streaming: value.is_streaming(),
+        delta_batch_payload: None,
     }
 }
 

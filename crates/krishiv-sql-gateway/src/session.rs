@@ -43,6 +43,13 @@ impl GatewaySession {
     pub fn session(&self) -> &Session {
         self.blocking.session()
     }
+
+    /// Close the underlying session, clearing registries and aborting
+    /// background tasks. After calling this, the session should not be
+    /// reused.
+    pub fn close(self) {
+        self.blocking.close();
+    }
 }
 
 impl GatewaySession {

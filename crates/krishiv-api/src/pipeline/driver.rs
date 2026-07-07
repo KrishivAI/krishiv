@@ -217,8 +217,12 @@ pub(super) async fn run_incremental(pipeline: Pipeline, policy: RunPolicy) -> Re
             body_sql: v.sql.clone(),
             output_schema: out_schema,
             is_materialized: v.materialized,
-            is_recursive: false,
-            lateness: vec![],
+            is_recursive: v.is_recursive,
+            lateness: v
+                .lateness
+                .iter()
+                .map(|a| krishiv_delta::LatenessSpec::new(&a.column, a.lateness_ms as i64))
+                .collect(),
         })
         .await?;
     }
@@ -692,8 +696,12 @@ pub(super) async fn run_streaming(pipeline: Pipeline, config: StreamingConfig) -
             body_sql: v.sql.clone(),
             output_schema: out_schema,
             is_materialized: v.materialized,
-            is_recursive: false,
-            lateness: vec![],
+            is_recursive: v.is_recursive,
+            lateness: v
+                .lateness
+                .iter()
+                .map(|a| krishiv_delta::LatenessSpec::new(&a.column, a.lateness_ms as i64))
+                .collect(),
         })
         .await?;
     }

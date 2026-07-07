@@ -114,6 +114,23 @@ impl Default for ContinuousStreamRegistry {
     }
 }
 
+fn check_drain_output_size(output: &[RecordBatch]) -> RuntimeResult<()> {
+    const MAX_DRAIN_OUTPUT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+    let total: usize = output.iter().map(|b| b.get_array_memory_size()).sum();
+    if total > MAX_DRAIN_OUTPUT_BYTES {
+        return Err(ContinuousStreamError::Execution {
+            job_id: String::new(),
+            message: format!(
+                "drain output of {} bytes exceeds the {MAX_DRAIN_OUTPUT_BYTES}-byte limit; \
+                 reduce drain batch count or split the job",
+                total,
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 impl ContinuousStreamRegistry {
     pub fn new() -> Self {
         Self {
@@ -323,6 +340,10 @@ impl ContinuousStreamRegistry {
                     job_id: job_id.to_owned(),
                     message: error.to_string(),
                 })?;
+
+        // BATCH-2: Reject drain outputs that exceed the byte limit to prevent
+        // OOM in the caller and Flight/HTTP transport overflows.
+        check_drain_output_size(&output)?;
 
         let mut queued = entry
             .input

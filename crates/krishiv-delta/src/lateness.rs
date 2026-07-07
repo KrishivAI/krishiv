@@ -52,7 +52,7 @@ impl LatenessSpec {
 }
 
 /// Tracks the high-water mark for one source's timestamp column.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WatermarkTracker {
     spec: LatenessSpec,
     /// Maximum timestamp (ms) observed across all ingested records.

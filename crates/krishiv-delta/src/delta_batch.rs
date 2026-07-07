@@ -145,6 +145,12 @@ impl DeltaBatch {
         self.inner.num_rows()
     }
 
+    /// Returns `true` if all rows have weight >= 0 (no retractions).
+    /// Insert-only workloads use this for an O(delta) fast path in `apply_delta`.
+    pub fn is_insert_only(&self) -> bool {
+        self.weights().iter().all(|w| w.unwrap_or(0) >= 0)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.num_rows() == 0
     }
@@ -338,6 +344,40 @@ impl std::fmt::Display for DeltaBatch {
                 .collect::<Vec<_>>()
                 .join(", ")
         )
+    }
+}
+
+// ── Conversions ────────────────────────────────────────────────────────────────
+
+impl TryFrom<RecordBatch> for DeltaBatch {
+    type Error = DeltaError;
+
+    /// Wrap a plain `RecordBatch` as a `DeltaBatch` with all rows as insertions
+    /// (weight +1). Fails if the schema cannot be cloned into the weighted form.
+    fn try_from(batch: RecordBatch) -> DeltaResult<Self> {
+        Self::from_inserts(batch)
+    }
+}
+
+impl std::convert::TryFrom<Vec<RecordBatch>> for DeltaBatch {
+    type Error = DeltaError;
+
+    /// Concatenate multiple batches and wrap as a single `DeltaBatch`.
+    fn try_from(batches: Vec<RecordBatch>) -> DeltaResult<Self> {
+        let combined = if batches.len() == 1 {
+            batches
+                .into_iter()
+                .next()
+                .ok_or_else(|| DeltaError::Operator("empty batch list".into()))?
+        } else {
+            let schema = batches
+                .first()
+                .map(|b| b.schema())
+                .ok_or_else(|| DeltaError::Operator("empty batch list".into()))?;
+            arrow::compute::concat_batches(&schema, &batches)
+                .map_err(|e| DeltaError::Operator(format!("concat failed: {e}")))?
+        };
+        Self::from_inserts(combined)
     }
 }
 

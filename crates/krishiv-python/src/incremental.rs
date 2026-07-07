@@ -35,6 +35,10 @@ fn rt_err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+fn map_delta_error(e: krishiv_delta::DeltaError) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
 // ── PyDeltaBatch ─────────────────────────────────────────────────────────────
 
 /// A record batch annotated with per-row integer weights.
@@ -100,6 +104,74 @@ impl PyDeltaBatch {
     /// Return ``True`` if the batch contains no rows.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Return ``True`` if all weights are >= 0 (no retractions).
+    pub fn is_insert_only(&self) -> bool {
+        self.inner.is_insert_only()
+    }
+
+    /// Return the data columns only (without the ``_weight`` column).
+    pub fn data_batch(&self) -> PyBatch {
+        PyBatch::from_record_batch(self.inner.data_batch())
+    }
+
+    /// Return rows with positive weight (insertions only, weight column stripped).
+    pub fn filter_positive(&self) -> PyResult<PyBatch> {
+        let batch = self.inner.filter_positive().map_err(map_delta_error)?;
+        Ok(PyBatch::from_record_batch(batch))
+    }
+
+    /// Return rows with negative weight (retractions only, weight column stripped).
+    pub fn filter_negative(&self) -> PyResult<PyBatch> {
+        let batch = self.inner.filter_negative().map_err(map_delta_error)?;
+        Ok(PyBatch::from_record_batch(batch))
+    }
+
+    /// Negate all weights (insert ↔ retract).
+    pub fn negate(&self) -> PyResult<Self> {
+        let negated = self.inner.negate().map_err(map_delta_error)?;
+        Ok(Self { inner: negated })
+    }
+
+    /// Drop rows with net-zero weight after consolidation.
+    pub fn drop_zeros(&self) -> PyResult<Self> {
+        let dropped = self.inner.drop_zeros().map_err(map_delta_error)?;
+        Ok(Self { inner: dropped })
+    }
+
+    /// Serialize to Arrow IPC bytes with ``DLT1`` magic prefix.
+    /// Can be deserialized via :meth:`DeltaBatch.deserialize`.
+    pub fn serialize(&self) -> PyResult<Vec<u8>> {
+        krishiv_delta::serialize_delta_batch(&self.inner).map_err(map_delta_error)
+    }
+
+    /// Deserialize from Arrow IPC bytes (with or without DLT1 prefix).
+    #[staticmethod]
+    pub fn deserialize(bytes: Vec<u8>) -> PyResult<Self> {
+        let db = krishiv_delta::deserialize_delta_batch(&bytes).map_err(map_delta_error)?;
+        Ok(Self { inner: db })
+    }
+
+    /// Build a ``DeltaBatch`` encoding an update: ``before`` rows get weight
+    /// ``-1``, ``after`` rows get weight ``+1``. Schemas must match.
+    #[staticmethod]
+    pub fn from_update(before: &PyBatch, after: &PyBatch) -> PyResult<Self> {
+        let db = DeltaBatch::from_update(
+            before.record_batch(),
+            after.record_batch(),
+        )
+        .map_err(map_delta_error)?;
+        Ok(Self { inner: db })
+    }
+
+    /// Build a ``DeltaBatch`` from an already-weighted ``RecordBatch`` (last
+    /// column must be ``_weight: Int64``).
+    #[staticmethod]
+    pub fn from_weighted(batch: &PyBatch) -> PyResult<Self> {
+        let db =
+            DeltaBatch::from_weighted(batch.record_batch().clone()).map_err(map_delta_error)?;
+        Ok(Self { inner: db })
     }
 
     pub fn __repr__(&self) -> String {
@@ -324,6 +396,38 @@ impl PyIvmJob {
         py.detach(|| {
             crate::RUNTIME
                 .block_on(self.inner.step())
+                .map(PyStepSummary::from)
+                .map_err(rt_err)
+        })
+    }
+
+    /// Feed a ``DeltaBatch`` and step in one call. Equivalent to ``feed`` +
+    /// ``step``. Returns a ``StepSummary``.
+    pub fn feed_and_step(
+        &self,
+        py: Python<'_>,
+        source: String,
+        delta: PyRef<'_, PyDeltaBatch>,
+    ) -> PyResult<PyStepSummary> {
+        self.feed(py, source, delta)?;
+        self.step(py)
+    }
+
+    /// Feed a plain ``Batch`` as insertions and step in one call. Creates a
+    /// ``DeltaBatch`` automatically — no need to call ``DeltaBatch.from_inserts``.
+    pub fn feed_inserts_and_step(
+        &self,
+        py: Python<'_>,
+        source: String,
+        batch: PyRef<'_, PyBatch>,
+    ) -> PyResult<PyStepSummary> {
+        let delta = krishiv_delta::DeltaBatch::from_inserts(batch.record_batch().clone())
+            .map_err(map_delta_error)?;
+        let delta_batch = PyDeltaBatch { inner: delta };
+        let inner = self.inner.clone();
+        py.detach(move || {
+            crate::RUNTIME
+                .block_on(inner.feed_and_step(&source, &delta_batch.inner))
                 .map(PyStepSummary::from)
                 .map_err(rt_err)
         })

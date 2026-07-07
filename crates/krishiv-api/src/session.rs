@@ -18,6 +18,7 @@ use krishiv_runtime::{
 };
 use krishiv_sql::{ContinuousTableInput, SqlEngine};
 
+use crate::compute::job::{FeedableJob, StepReport};
 use crate::dataframe::DataFrame;
 use crate::error::{KrishivError, Result};
 use crate::stream::Stream;
@@ -1058,6 +1059,31 @@ impl Session {
     /// Start building a session.
     pub fn builder() -> SessionBuilder {
         SessionBuilder::new()
+    }
+
+    /// API-11: Explicitly close the session, releasing all server-side state.
+    ///
+    /// Aborts background SQL jobs, stops continuous streams, and clears all
+    /// per-session registries.  Without this, continuous stream registrations
+    /// can outlive the session object via cloned `Arc<dyn ExecutionRuntime>`
+    /// handles held by spawned DataFrames.
+    pub fn close(self) {
+        // Abort submitted SQL job tasks.
+        for entry in self.submitted_sql_job_aborts.iter() {
+            entry.value().abort();
+        }
+        self.submitted_sql_job_aborts.clear();
+        self.submitted_sql_jobs.clear();
+        // Clear stream jobs.
+        self.stream_jobs.clear();
+        self.unbounded_streams.clear();
+        // Clear other registries.
+        self.registered_parquet.clear();
+        self.registered_sources.clear();
+        self.registered_sinks.clear();
+        self.memory_streams.clear();
+        self.config.clear();
+        tracing::debug!("Session closed: all registries cleared and background tasks aborted");
     }
 
     /// Build a session from environment variables.
@@ -2323,7 +2349,13 @@ impl Session {
             .map_err(KrishivError::from)?;
         for vname in &ordered {
             if let Some(entry) = view_reg.get(vname).map_err(KrishivError::from)? {
-                builder = builder.view(vname.clone(), entry.body_sql.clone(), true);
+                builder = builder.view_with_lateness(
+                    vname.clone(),
+                    entry.body_sql.clone(),
+                    true,
+                    entry.lateness.clone(),
+                    entry.is_recursive,
+                );
             }
         }
 
@@ -2358,15 +2390,17 @@ impl Session {
         if out.is_empty() {
             return self.sql_plain("SELECT 1 WHERE FALSE").await;
         }
-        let temp = format!("__pipeline_result_{sink_name}");
+        // GAP 1: Register incremental view output as a queryable DataFusion
+        // table so `SELECT * FROM <view_name>` works after START PIPELINE.
+        // The table persists for the session lifetime and is updated on each
+        // pipeline run. Use the backing view name as the table name.
+        let view_table_name = sink_spec.view.clone();
         self.sql_engine
-            .register_record_batches(&temp, out)
+            .register_record_batches(&view_table_name, out)
             .await
             .map_err(KrishivError::from)?;
-        let result = self.sql_plain(&format!("SELECT * FROM \"{temp}\"")).await;
-        // Clean up the temporary table to prevent accumulation across calls.
-        let _ = self.sql_engine.deregister_table(&temp);
-        result
+        self.sql_plain(&format!("SELECT * FROM \"{view_table_name}\""))
+            .await
     }
 
     /// Execute SQL after API-key authentication and table-level policy checks.
@@ -2740,6 +2774,31 @@ impl Session {
     /// `true` if a job existed.
     pub fn reset_ivm_job(&self, name: &str) -> bool {
         self.ivm_registry.delete(name)
+    }
+
+    /// Execute a SQL query and feed its result as insertions into an IVM job,
+    /// then step the view. Returns the step summary.
+    ///
+    /// This is the one-call bridge from batch SQL to incremental maintenance:
+    ///
+    /// ```rust,ignore
+    /// let summary = session
+    ///     .feed_ivm_from_sql("revenue_job", "orders",
+    ///         "SELECT region, amount FROM staging")
+    ///     .await?;
+    /// ```
+    pub async fn feed_ivm_from_sql(
+        &self,
+        ivm_job_name: &str,
+        source_name: &str,
+        query: impl AsRef<str> + Send,
+    ) -> Result<StepReport> {
+        let df = self.sql_async(query).await?;
+        let delta = df.collect_as_delta_batch()?;
+        let job = self.ivm(ivm_job_name).await?;
+        job.feed(source_name, &delta).await?;
+        let step = job.step().await?;
+        Ok(step)
     }
 
     /// Execute a SQL query with a wall-clock timeout.

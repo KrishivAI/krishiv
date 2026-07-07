@@ -666,7 +666,20 @@ pub async fn execute_coordinator_continuous_drain(
         RuntimeError::transport(format!("continuous-drain response decode failed: {e}"))
     })?;
 
-    decode_inline_record_batches(&payload.inline_record_batch_ipc).map_err(RuntimeError::transport)
+    decode_inline_record_batches(&payload.inline_record_batch_ipc)
+        .map_err(RuntimeError::transport)
+        .and_then(|batches| {
+            const MAX_DRAIN_OUTPUT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+            let total: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+            if total > MAX_DRAIN_OUTPUT_BYTES {
+                return Err(RuntimeError::transport(format!(
+                    "coordinator continuous-drain response of {} bytes exceeds the \
+                     {MAX_DRAIN_OUTPUT_BYTES}-byte limit",
+                    total
+                )));
+            }
+            Ok(batches)
+        })
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

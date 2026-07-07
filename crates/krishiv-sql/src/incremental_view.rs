@@ -212,10 +212,22 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
 /// Returns `Some(name)` if the statement was an incremental-view DDL (so the
 /// caller knows to return an empty DDL result rather than forwarding to
 /// DataFusion), or `None` if the SQL was not an incremental-view DDL.
+/// Result of executing an incremental view DDL statement.
+pub enum IncrementalViewResult {
+    /// View was created or replaced.
+    Created(String),
+    /// View was dropped.
+    Dropped(String),
+    /// REFRESH was called — the caller should re-run the pipeline for this view.
+    Refresh(String),
+    /// A recursive view was created.
+    Recursive(String),
+}
+
 pub fn execute_incremental_view_ddl(
     registry: &IncrementalViewRegistry,
     sql: &str,
-) -> SqlResult<Option<String>> {
+) -> SqlResult<Option<IncrementalViewResult>> {
     let Some(stmt) = parse_incremental_view_statement(sql)? else {
         return Ok(None);
     };
@@ -236,7 +248,7 @@ pub fn execute_incremental_view_ddl(
                     lateness: lateness.clone(),
                 },
             )?;
-            Ok(Some(name.clone()))
+            Ok(Some(IncrementalViewResult::Created(name.clone())))
         }
 
         IncrementalViewStatement::DeclareRecursive {
@@ -252,7 +264,7 @@ pub fn execute_incremental_view_ddl(
                     lateness: vec![],
                 },
             )?;
-            Ok(Some(name.clone()))
+            Ok(Some(IncrementalViewResult::Recursive(name.clone())))
         }
 
         IncrementalViewStatement::Refresh { ref name } => {
@@ -261,12 +273,12 @@ pub fn execute_incremental_view_ddl(
                     feature: format!("REFRESH INCREMENTAL VIEW: view '{name}' is not registered"),
                 });
             }
-            Ok(Some(name.clone()))
+            Ok(Some(IncrementalViewResult::Refresh(name.clone())))
         }
 
         IncrementalViewStatement::Drop { ref name } => {
             registry.remove(name)?;
-            Ok(Some(name.clone()))
+            Ok(Some(IncrementalViewResult::Dropped(name.clone())))
         }
     }
 }
@@ -527,13 +539,21 @@ mod tests {
     #[test]
     fn execute_ddl_create_and_drop() {
         let reg = IncrementalViewRegistry::new();
-        let name =
+        let result =
             execute_incremental_view_ddl(&reg, "CREATE INCREMENTAL VIEW v AS SELECT 1").unwrap();
-        assert_eq!(name.as_deref(), Some("v"));
+        assert!(matches!(result, Some(IncrementalViewResult::Created(_))));
         assert!(reg.contains("v"));
 
         execute_incremental_view_ddl(&reg, "DROP INCREMENTAL VIEW v").unwrap();
         assert!(!reg.contains("v"));
+    }
+
+    #[test]
+    fn execute_ddl_refresh_returns_refresh_variant() {
+        let reg = IncrementalViewRegistry::new();
+        execute_incremental_view_ddl(&reg, "CREATE INCREMENTAL VIEW v AS SELECT 1").unwrap();
+        let result = execute_incremental_view_ddl(&reg, "REFRESH INCREMENTAL VIEW v").unwrap();
+        assert!(matches!(result, Some(IncrementalViewResult::Refresh(_))));
     }
 
     #[test]

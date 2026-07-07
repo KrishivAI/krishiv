@@ -41,6 +41,14 @@ impl PreparedStatement {
         }
         self.session.sql(bind_parameters(&self.sql, parameters)?)
     }
+
+    /// API-9: Bind a batch of parameter sets and execute each.
+    ///
+    /// Each element of `parameter_sets` is one row's parameters. Returns one
+    /// execution per set. Equivalent to JDBC `addBatch()` / `executeBatch()`.
+    pub fn bind_many(&self, parameter_sets: &[Vec<ScalarValue>]) -> Result<Vec<DataFrame>> {
+        parameter_sets.iter().map(|p| self.bind(p)).collect()
+    }
 }
 
 impl Session {
