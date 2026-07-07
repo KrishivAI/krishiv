@@ -735,7 +735,8 @@ fn g6_view_total(reg: &IvmJobRegistry, job: &str) -> f64 {
 /// Register the view, feed the seed batch (total 185), and step once.
 async fn g6_seed(reg: &IvmJobRegistry, job: &str) {
     reg.create(job.to_string()).expect("create job");
-    reg.register_view(job, g6_revenue_spec()).expect("register view");
+    reg.register_view(job, g6_revenue_spec())
+        .expect("register view");
     reg.get(job)
         .expect("job")
         .feed(
