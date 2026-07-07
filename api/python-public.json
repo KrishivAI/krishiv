@@ -4009,14 +4009,14 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-python/src/incremental.rs#L185",
+      "documentation": "crates/krishiv-python/src/incremental.rs#L182",
       "id": "crates/krishiv-python/src/incremental.rs::StepSummary",
       "kind": "class",
       "methods": [
         {
           "async": false,
           "deprecated": false,
-          "documentation": "crates/krishiv-python/src/incremental.rs#L209",
+          "documentation": "crates/krishiv-python/src/incremental.rs#L206",
           "id": "StepSummary.__repr__",
           "kind": "method",
           "name": "__repr__",

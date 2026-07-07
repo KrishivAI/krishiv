@@ -258,19 +258,23 @@ impl Trace {
                         arr.iter()
                             .map(|v| Some(v.unwrap_or(i64::MIN / 1000) < watermark_ms * 1000))
                             .collect()
-                    } else if let Some(arr) =
-                        ts_col.as_any().downcast_ref::<TimestampSecondArray>()
+                    } else if let Some(arr) = ts_col.as_any().downcast_ref::<TimestampSecondArray>()
                     {
                         arr.iter()
                             .map(|v| {
-                                Some(v.unwrap_or(i64::MIN / 1000).saturating_mul(1000) < watermark_ms)
+                                Some(
+                                    v.unwrap_or(i64::MIN / 1000).saturating_mul(1000)
+                                        < watermark_ms,
+                                )
                             })
                             .collect()
                     } else if let Some(arr) =
                         ts_col.as_any().downcast_ref::<TimestampNanosecondArray>()
                     {
                         arr.iter()
-                            .map(|v| Some(v.unwrap_or(i64::MIN / 1_000_000) < watermark_ms * 1_000_000))
+                            .map(|v| {
+                                Some(v.unwrap_or(i64::MIN / 1_000_000) < watermark_ms * 1_000_000)
+                            })
                             .collect()
                     } else if let Some(arr) = ts_col.as_any().downcast_ref::<Date32Array>() {
                         arr.iter()

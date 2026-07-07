@@ -882,8 +882,7 @@ mod tests {
             input_col: "amount".into(),
             output_col: "total".into(),
         }];
-        let mut op =
-            IncrementalAggOp::new(&order_schema(), group.clone(), sum.clone()).unwrap();
+        let mut op = IncrementalAggOp::new(&order_schema(), group.clone(), sum.clone()).unwrap();
         // Two *identical* rows (c1, 5.0) — a set-based snapshot would collapse
         // these; the accumulator must remember both (sum = 10, count = 2).
         op.apply(DeltaBatch::from_inserts(order_batch(&["c1", "c1"], &[5.0, 5.0])).unwrap())
