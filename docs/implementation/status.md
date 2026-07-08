@@ -1,5 +1,25 @@
 # Krishiv Implementation Status
 
+## 2026-07-08 — rest-catalog missing from deployed builds (found via platform BI cert)
+
+**Found**: the platform's 07b BI certification hit "table not found" for
+governed `krishiv.<ns>.<table>` SQL — the dist/deployed binaries were built
+without the `rest-catalog` feature, so `register_rest_catalog_from_env` was
+compiled out and `KRISHIV_ICEBERG_REST_*` silently ignored.
+
+**Fixed**: `justfile` `build-k8s`/`build-bare-metal` now include the feature.
+**Validated**: `cargo build -p krishiv --no-default-features --features
+k8s,rest-catalog --release` builds clean; live `krishiv flight-server` logs
+"iceberg REST catalog registered" and ADBC/Superset aggregates over a
+PyIceberg-written platform-catalog table return correct results through the
+platform gateway.
+
+**Open (recorded as platform gap G15)**: registration is InProcess-only —
+`FlightExecutionHost` with a Coordinator backend warns and skips, so the
+coordinator-mode topologies (compose/Helm) still can't attach the platform
+catalog. Next engine task: register the REST catalog on the coordinator's
+session factory so distributed deployments resolve governed tables.
+
 ## 2026-07-07 — Stability sprint: closed 10 of 19 remaining gaps
 
 **Scope**: Closed 8 HIGH and 2 MEDIUM items from the 2026-07-06 audit

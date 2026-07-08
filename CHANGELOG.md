@@ -6,6 +6,20 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Deployed builds now include `rest-catalog`** (2026-07-08): `just
+  build-k8s` / `build-bare-metal` compiled without the feature, so
+  `KRISHIV_ICEBERG_REST_URI`/`_TOKEN`/`_WAREHOUSE`/`_NAME` were silently
+  ignored (both `register_rest_catalog_from_env` call sites are
+  `#[cfg(feature = "rest-catalog")]`) and governed `krishiv.<ns>.<table>`
+  SQL failed with "table not found" from every deployed image. Both recipes
+  now build with the feature. Known remaining limitation (platform gap
+  G15): registration only works on the InProcess Flight host — a
+  coordinator-delegated Flight host still warns and skips; run
+  `krishiv flight-server` beside the coordinator until coordinator-side
+  registration lands.
+
 ### Added
 
 - **New benchmark: IVM vs full-recompute**

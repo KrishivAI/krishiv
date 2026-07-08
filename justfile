@@ -69,16 +69,20 @@ build-single-node:
     {{ cargo }} build -p krishiv --no-default-features --features single-node
 
 # Build release binary for bare-metal / VM distributed clusters
+# (rest-catalog: same rationale as build-k8s — deployed daemons must be able
+# to attach a platform Iceberg REST catalog from KRISHIV_ICEBERG_REST_*.)
 build-bare-metal:
     {{ sccache_env }} {{ cargo }} build -p krishiv \
-        --no-default-features --features bare-metal \
+        --no-default-features --features bare-metal,rest-catalog \
         --profile release
 
 # Build release binaries for Kubernetes (krishiv + krishiv-operator)
 # Outputs: target/{{ target }}/release/{krishiv,krishiv-operator}
+# rest-catalog is required in deployed images: without it the daemon silently
+# ignores KRISHIV_ICEBERG_REST_* and governed Iceberg tables never resolve.
 build-k8s:
     {{ sccache_env }} {{ cargo }} build -p krishiv -p krishiv-operator \
-        --no-default-features --features k8s \
+        --no-default-features --features k8s,rest-catalog \
         --profile release \
         --target {{ target }}
 
