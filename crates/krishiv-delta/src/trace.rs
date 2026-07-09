@@ -120,12 +120,19 @@ impl Trace {
             Some(l) => std::mem::take(l),
             None => return,
         };
+        // Row count before consolidation — used to keep `total_rows` honest
+        // (AUD-10: consolidation drops cancelled/zero-weight rows, so the metric
+        // must shrink by however many rows the merge removed).
+        let before_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         // If we're at the top level, consolidate in place instead of discarding.
         // Without this, the top level grows without bound and probe latency
         // degrades linearly with total history.
         if level + 1 >= NUM_LEVELS {
             if let Ok(merged) = DeltaBatch::concat(&batches) {
                 if let Ok(consolidated) = consolidate_batch(merged, &[], &self.data_schema) {
+                    self.total_rows = self
+                        .total_rows
+                        .saturating_sub(before_rows.saturating_sub(consolidated.num_rows()));
                     if let Some(l) = self.levels.get_mut(level) {
                         l.push(consolidated);
                     }
@@ -141,6 +148,9 @@ impl Trace {
             && let Ok(consolidated) = consolidate_batch(merged, &[], &self.data_schema)
             && let Some(next) = self.levels.get_mut(level + 1)
         {
+            self.total_rows = self
+                .total_rows
+                .saturating_sub(before_rows.saturating_sub(consolidated.num_rows()));
             next.push(consolidated);
             self.cascade_merge(level + 1);
             return;
@@ -234,59 +244,46 @@ impl Trace {
                 // column.  Previously only Int64 was handled, so a Timestamp
                 // lateness column (the natural event-time type) hit `continue`
                 // and skipped every batch, making GC a universal no-op.
+                //
+                // AUD-2: this is a *keep* mask. `filter_mask` retains rows whose
+                // mask entry is `true`, so a row is kept iff its lateness value
+                // (normalized to epoch-ms) is `>= watermark_ms` — i.e. still
+                // live. Rows strictly below the watermark are expired and
+                // dropped. A null lateness value is always kept (never silently
+                // GC'd). The previous mask compared `< watermark_ms` and thus
+                // deleted every live row while retaining expired state.
                 let mask: BooleanArray = {
-                    let make_mask = |extract: &dyn Fn(&dyn Array, usize) -> Option<i64>| {
+                    // Build a keep mask from a per-row extractor that returns the
+                    // value normalized to epoch-ms (None for null → keep).
+                    let keep_ge = |to_ms: &dyn Fn(usize) -> Option<i64>| -> BooleanArray {
                         (0..data.num_rows())
-                            .map(|r| Some(extract(ts_col, r)? < watermark_ms))
-                            .collect::<Option<Vec<_>>>()
+                            .map(|r| Some(to_ms(r).map(|ms| ms >= watermark_ms).unwrap_or(true)))
+                            .collect()
                     };
                     if let Some(arr) = ts_col.as_any().downcast_ref::<Int64Array>() {
-                        let m: BooleanArray = arr
-                            .iter()
-                            .map(|v| Some(v.unwrap_or(i64::MIN) < watermark_ms))
-                            .collect();
-                        m
+                        keep_ge(&|r| (!arr.is_null(r)).then(|| arr.value(r)))
                     } else if let Some(arr) =
                         ts_col.as_any().downcast_ref::<TimestampMillisecondArray>()
                     {
-                        arr.iter()
-                            .map(|v| Some(v.unwrap_or(i64::MIN) < watermark_ms))
-                            .collect()
+                        keep_ge(&|r| (!arr.is_null(r)).then(|| arr.value(r)))
                     } else if let Some(arr) =
                         ts_col.as_any().downcast_ref::<TimestampMicrosecondArray>()
                     {
-                        arr.iter()
-                            .map(|v| Some(v.unwrap_or(i64::MIN / 1000) < watermark_ms * 1000))
-                            .collect()
+                        keep_ge(&|r| (!arr.is_null(r)).then(|| arr.value(r) / 1_000))
                     } else if let Some(arr) = ts_col.as_any().downcast_ref::<TimestampSecondArray>()
                     {
-                        arr.iter()
-                            .map(|v| {
-                                Some(
-                                    v.unwrap_or(i64::MIN / 1000).saturating_mul(1000)
-                                        < watermark_ms,
-                                )
-                            })
-                            .collect()
+                        keep_ge(&|r| (!arr.is_null(r)).then(|| arr.value(r).saturating_mul(1_000)))
                     } else if let Some(arr) =
                         ts_col.as_any().downcast_ref::<TimestampNanosecondArray>()
                     {
-                        arr.iter()
-                            .map(|v| {
-                                Some(v.unwrap_or(i64::MIN / 1_000_000) < watermark_ms * 1_000_000)
-                            })
-                            .collect()
+                        keep_ge(&|r| (!arr.is_null(r)).then(|| arr.value(r) / 1_000_000))
                     } else if let Some(arr) = ts_col.as_any().downcast_ref::<Date32Array>() {
-                        arr.iter()
-                            .map(|v| Some(v.unwrap_or(i32::MIN) as i64 * 86_400 < watermark_ms))
-                            .collect()
+                        // Date32 = days since epoch.
+                        keep_ge(&|r| (!arr.is_null(r)).then(|| arr.value(r) as i64 * 86_400_000))
                     } else if let Some(arr) = ts_col.as_any().downcast_ref::<Date64Array>() {
-                        arr.iter()
-                            .map(|v| Some(v.unwrap_or(i64::MIN) * 86_400_000 < watermark_ms))
-                            .collect()
+                        // Date64 = milliseconds since epoch already.
+                        keep_ge(&|r| (!arr.is_null(r)).then(|| arr.value(r)))
                     } else {
-                        // Suppress unused-variable warning for the helper closure.
-                        let _ = make_mask;
                         continue;
                     }
                 };

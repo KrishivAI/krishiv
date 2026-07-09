@@ -1,5 +1,195 @@
 # Krishiv Implementation Status
 
+## 2026-07-09 — audit fixes landed: AUD-1..4 + AUD-10 fixed & tested; 2 new gaps found
+
+Fixed the four correctness bugs and the sizing-metric leak from the audit
+below, each with a regression test; full `krishiv-delta`/`krishiv-ivm`/
+`krishiv-executor` lib+test+lib-clippy green.
+
+- **AUD-1 (WHERE silently ignored) — FIXED.** `source_of_plan`
+  (`plan.rs`) now refuses to peel `Filter` nodes (and a `TableScan` with
+  pushed-down `filters`), so a dropped predicate can never resolve to a plain
+  aggregate. A new `SourceFilter` compiles the `WHERE` predicate (type-coerced
+  via `TypeCoercionRewriter`, lowered with `create_physical_expr`) and applies
+  it to the source delta before the operator — keeping filtered single-source
+  aggregates **O(Δ)**, not degrading them. `resolve_source_with_filters`
+  handles the clean `Aggregate → [Filter…] → [SubqueryAlias] → Scan` chain;
+  anything else → DiffBased (correct). Applied at the live apply-site AND in
+  `seed_from_snapshots` (so restored state is filtered identically). Filtered
+  DISTINCT / non-clean chains → DiffBased. Tests:
+  `where_clause_is_honored_by_incremental_aggregate` (the 680-vs-600 repro),
+  `filtered_group_by_matches_batch` (8-round batch parity).
+- **AUD-2 (inverted GC mask) — FIXED.** `gc_below_watermark` is now a correct
+  **keep-mask** (`>= watermark` retained, `< watermark` expired, null kept),
+  also fixed the Date32/Date64 unit bugs and removed the dead `make_mask`
+  closure. Restored the two `gap_tests` to correct expectations (commit
+  467f3df had aligned them to the bug). GC errors in `flow.rs` are now logged,
+  not swallowed. **NOTE (new gap):** `register_lateness` has **zero callers**
+  workspace-wide — `watermark_trackers` is never populated, so lateness GC has
+  never actually run in any path. Carrying the correct mask matters the moment
+  activation is wired; activation itself is a separate follow-up.
+- **AUD-3 (AVG string-sniffing / SUM type) — FIXED.** Accumulation strategy is
+  decided **once from the input column's Arrow type** (`NumKind`), never by
+  per-row string parsing (`10.0_f64` renders `"10"` and used to latch the i64
+  AVG path). Integer SUM accumulates exactly in i64; output is a typed
+  `AggScalar` (I64/F64). Aggregates over non-numeric columns now **error from
+  `new`** → DiffBased instead of silent `0.0`. Output types honor the view's
+  **declared** `output_schema` via `new_with_output_schema` (SUM(Int64)→Int64
+  unless the view declares otherwise) — fixes the pre-existing
+  `ivm_with_updates_matches_batch` failure and keeps the partitioned/checkpoint
+  tests green. Tests: `avg_over_float_column_with_integral_values_is_exact`,
+  `sum_over_integer_column_emits_int64`, `sum_over_non_numeric_column_errors`.
+- **AUD-4 (offloaded ticks drop lateness) — FIXED (narrow).** Lateness now
+  travels through `encode_ivm_step_fragment` → `ViewSpecJson.lateness` →
+  executor spec (was hardcoded `vec![]`). Full activation is gated on the
+  register_lateness wiring gap noted under AUD-2.
+- **AUD-10 (total_rows leak) — FIXED.** `cascade_merge` now decrements
+  `total_rows` by the rows consolidation removes; dead `make_mask` removed as
+  part of AUD-2.
+
+**Second bug found & FIXED this session — `krishiv-python` did not compile.**
+`PySession::close` (added in `1694143`) called `krishiv_api::Session::embedded()`
+which does not exist (the embedded constructor is `SessionBuilder::new().build()`;
+`Session::embedded` only ever existed on `BlockingSession`), and — masked behind
+that resolution error — `close(&self)` illegally reassigned `self.inner`
+(`Arc<Session>`, no interior mutability). Fixed: `close` now fully tears down
+when it is the sole `Arc` owner and is a best-effort no-op (with a warning) when
+other references are alive — matching its own docstring, instead of silently
+swapping the handle onto a fresh empty session. Crate now compiles under both
+default and `extension-module` features. The `pyo3 0.29` `with_gil` calls in
+`arrow_fast.rs` compile as deprecation warnings (not errors — the LSP's hard
+errors were an `--all-features` artifact); a `with_gil`→`Python::attach`
+cleanup is optional tidy-up, not a blocker. NOTE: engine CI's per-PR
+`test-python` job (`maturin develop` + pytest) would have caught this — it was
+presumably red on `1694143`; worth confirming it is required/blocking.
+
+Still open from the register: **AUD-5** (SessionContext-per-tick),
+**AUD-6** (distributed full-state per tick), **AUD-7** (string-tuple keys),
+**AUD-8** (source snapshots grow forever), **AUD-9** (O(Δ) coverage — WHERE now
+covered by AUD-1; HAVING/agg-over-join/UNION still DiffBased).
+
+## 2026-07-09 — core-component audit: batch / delta-batch / streaming / distributed — 2 confirmed correctness bugs, perf register
+
+Code-grounded audit of the engine's core execution components across all
+four modes (batch SQL, delta-batch IVM, continuous streaming, distributed
+deployment). Every finding below cites the exact code; AUD-1 was proven with
+a live failing test (written, run, reverted — the fix is a task, not this
+session's change). These are the **next tasks**, in priority order.
+
+### Correctness bugs (must fix before relying on the O(Δ) path)
+
+- [ ] **AUD-1 (critical, REPRODUCED): incremental view plans silently ignore
+  WHERE clauses.** `source_of_plan`
+  (`crates/krishiv-ivm/src/plan.rs:439`) recurses through *any*
+  single-input node — including `Filter` — when resolving an
+  Aggregate/Distinct/Join source, and `step_datafusion_with_ctx` then feeds
+  the **raw unfiltered source delta** to the operator
+  (`crates/krishiv-ivm/src/flow.rs:993`); `seed_from_snapshots`
+  (`plan.rs:137`) seeds from the unfiltered snapshot too. Repro (run this
+  session): `SELECT SUM(amount) AS total FROM sales WHERE amount > 100`,
+  ticks `[50,200]` then `[30,400]` → returns **680** (sum of everything),
+  expected 600. Any filtered single-source GROUP-BY view — the most common
+  view shape — returns silently wrong results the moment it pattern-matches
+  an O(Δ) plan. Fix: capture the `Filter` predicate chain during plan
+  building and apply it to deltas before `op.apply` (an
+  `operators/filter.rs` op already exists), or refuse to peel anything but
+  `SubqueryAlias`/trivial `Projection` and fall back to DiffBased. Add
+  WHERE-coverage tests — `grep WHERE crates/krishiv-ivm/src` has zero hits
+  today.
+- [ ] **AUD-2 (critical): `Trace::gc_below_watermark` mask is inverted —
+  deletes live state, keeps expired state.** The mask marks rows
+  `< watermark` as `true` (`crates/krishiv-delta/src/trace.rs:238-295`)
+  and `filter_mask` → arrow `filter_record_batch`
+  (`delta_batch.rs:305`) **keeps** true rows. With the watermark below all
+  data it deletes every live row (silent data loss in join traces). In-repo
+  evidence: commit 467f3df *aligned the tests to the buggy behavior*
+  instead of fixing it (`gap_tests.rs:103-137`). This runs **every tick**
+  for lateness-configured sources (`flow.rs:1136-1146`), where errors are
+  also swallowed (`let _ = plan.gc_watermark(..)`). Fix: keep
+  `>= watermark`, restore the original test expectations, stop swallowing
+  the error, and count GC'd rows in a metric.
+- [ ] **AUD-3 (major): AVG splits accumulation per-row between i64/f64 paths
+  by string-sniffing.** `apply_delta_for_agg`
+  (`crates/krishiv-delta/src/operators/aggregate.rs:154-171`): a value
+  whose *string form* parses as i64 (Float64 `10.0` stringifies to `"10"`)
+  goes to `avg_sum_i64` and latches `avg_is_integer`; other rows accumulate
+  `self.sum` — but `current_value` (`aggregate.rs:207`) divides **one**
+  accumulator by the combined count. AVG over `[10.0, 10.5]` is wrong.
+  Related in the same function: SUM parses everything as f64 (i64 >2^53
+  silently loses precision), unparseable values become `0.0`
+  (`unwrap_or(0.0)`), and MIN/MAX collapse non-numeric columns to `0.0`
+  (`OrdF64` keys). Fix: decide accumulation strategy **once from the input
+  schema type**, not per-row string sniffing; unsupported types must fall
+  back to DiffBased or error, never silently zero.
+- [ ] **AUD-4 (major, distributed): offloaded IVM ticks drop lateness
+  specs.** `execute_ivm_fragment` rebuilds view specs with
+  `lateness: vec![]` (`crates/krishiv-executor/src/fragment/ivm.rs:177`),
+  so an offloaded tick applies different retention/GC semantics than a
+  central tick of the same job — a correctness divergence that becomes
+  visible the moment AUD-2 is fixed. Fix: carry lateness through
+  `ViewSpecJson`.
+
+### Performance register (ranked by impact)
+
+- [ ] **AUD-5: G14 SessionContext-per-tick** (maintainer-ruled fix-first,
+  pre-registered): `step_datafusion` builds a fresh context per tick
+  (`flow.rs:586`), and every distributed tick builds a whole transient
+  flow (`fragment/ivm.rs`). Benchmarked at ~650-700 ms fixed cost/tick —
+  full recompute beats IVM ~100x below ~23M rows. Fix: one long-lived
+  ctx per flow; note flow Phase 3 re-registers source MemTables each tick
+  and only views are deregistered (`flow.rs:839`) — stale source tables
+  must be swapped, not leaked.
+- [ ] **AUD-6: distributed IVM ships full state per tick, both
+  directions.** Per dispatched tick: `checkpoint_full` O(state) + base64
+  into a string fragment (`crates/krishiv-scheduler/src/ivm_http.rs:395-460`),
+  executor restores all of it, then returns **full view outputs** (not
+  deltas); state >16 MiB silently falls back to central compute (warn
+  only) — so "distributed" streaming never scales past 16 MiB of state.
+  The coordinator additionally persists the full post-cycle snapshot to
+  the store **every cycle** (`coordinator/job_lifecycle.rs:502`). Task:
+  executor-resident state (state lives on the executor keyed by job;
+  coordinator ships deltas + fences; periodic/incremental checkpoints
+  instead of per-cycle full snapshots). This is the engine milestone that
+  makes distributed streaming real.
+- [ ] **AUD-7: string-tuple keys throughout the delta layer.** Every join
+  probe, aggregate group lookup, and trace probe stringifies every key of
+  every row per tick: `extract_key` → `Vec<Option<String>>`
+  (`operators/join.rs:627`, `operators/aggregate.rs:223`),
+  `make_key_match_mask` re-stringifies **every trace row** per probe
+  (`trace.rs:389`), `probe_by_keys` scans every batch of every level
+  (O(trace) per tick), and post-probe matching is a nested
+  O(candidates×delta) loop (`join.rs:231-246`). Task: arrow-row-format
+  keys + a persistent key→row-location hash index on the trace, making
+  join ticks O(Δ).
+- [ ] **AUD-8: source snapshots are copied every tick and grow forever.**
+  `apply_delta`'s insert-only "fast path"
+  (`crates/krishiv-delta/src/operators/stream.rs:134`) does
+  `concat_batches(prev, delta)` — a full copy of the accumulated snapshot
+  per tick (O(n)/tick, O(n²) cumulative), and `source_snapshots`
+  (`flow.rs:99`) retains full source history in memory with **no
+  retention** (`register_lateness` only GCs operator traces). A long-run
+  streaming source grows RSS without bound. Task: chunked snapshots
+  (`Vec<RecordBatch>` — MemTable accepts multi-batch partitions; no
+  recopy) + watermark-tied retention for insert-only sources.
+- [ ] **AUD-9: O(Δ) plan coverage cliff.** `try_build_from_logical`
+  (`plan.rs:310-345`) recognizes only bare Aggregate / 2-way equi-Join /
+  Distinct; WHERE (post-AUD-1), HAVING, agg-over-join, UNION, subqueries
+  all silently degrade to DiffBased full recompute + full-output diff
+  per tick (the diff itself stringifies every row — `stream.rs:113`).
+  Minimum next step: Filter support (the correct AUD-1 fix), then
+  expression Projections; document honest coverage.
+- [ ] **AUD-10 (minor):** `Trace::total_rows` never decremented by
+  `cascade_merge` consolidation (`trace.rs:98-152`) — the sizing metric
+  drifts upward; dead `make_mask` closure in `gc_below_watermark`.
+
+Cross-referenced, already tracked elsewhere: `checkpoint_barrier_integration`
+pre-existing failure (2026-07-09 entry below); executor-loss-near-cycle-
+boundary double/lost-window race (platform phase-20 disclosure); prod
+engine↔warehouse shared storage (platform G15b/G7). Audited-clean this pass:
+tumbling/sliding/session window eviction (`krishiv-dataflow/src/window/`),
+batch fragment memory budget + spill (`fragment/batch.rs:190-292`),
+continuous-push single-cycle fencing (`coordinator/task_assignment.rs:285`).
+
 ## 2026-07-09 — heartbeat/lease audit landed + deployed to krishiv-prod mid-soak
 
 Companion fixes to the 2026-07-08 lease-churn entry (below), from the

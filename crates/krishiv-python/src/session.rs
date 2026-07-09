@@ -1170,18 +1170,24 @@ impl PySession {
         // (common in Python: DataFrames, StreamJobs, etc.), fall back to
         // explicitly clearing the Python session's internal registries
         // without consuming the Arc.
-        let session = match Arc::try_unwrap(self.inner.clone()) {
+        match Arc::try_unwrap(self.inner.clone()) {
             Ok(session) => {
+                // Sole owner — consume and fully tear down server-side state.
                 session.close();
-                return Ok(());
             }
-            Err(arc) => arc,
-        };
-        // Multiple references exist — we can't consume the session. Clear
-        // the Python-held reference and log a warning so callers know the
-        // session wasn't fully torn down.
-        self.inner = Arc::new(krishiv_api::Session::embedded().map_err(map_krishiv_error)?);
-        let _ = session; // keep other references alive
+            Err(_arc) => {
+                // Multiple references exist (DataFrames, StreamJobs, …). The Rust
+                // `Session::close` takes ownership by value, so we cannot fully
+                // close while other handles are live, and `&self` cannot rebind
+                // `self.inner`. Best-effort: leave the shared session intact for
+                // the other references (as the docstring warns) rather than
+                // silently swapping this handle onto a fresh empty session.
+                tracing::warn!(
+                    "Session.close() called while other references are alive; \
+                     server-side state was not fully released"
+                );
+            }
+        }
         Ok(())
     }
 

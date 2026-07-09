@@ -15,15 +15,23 @@
 //! Subqueries, multi-way joins, window functions, OUTER joins, and other
 //! complex patterns fall through to full SQL re-execution + diff.
 
+use std::sync::Arc;
+
 use ahash::AHashMap;
+use arrow::array::BooleanArray;
 use arrow::datatypes::SchemaRef;
+use datafusion::common::DFSchema;
+use datafusion::common::tree_node::TreeNode;
+use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Aggregate, Expr, Join, JoinType, LogicalPlan, Projection, Window};
+use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::prelude::SessionContext;
 
 use arrow::record_batch::RecordBatch;
 use krishiv_delta::{
-    Aggregation, DeltaBatch, DeltaResult, IncrJoinType, IncrementalAggOp, IncrementalDistinctOp,
-    IncrementalJoinOp,
+    Aggregation, DeltaBatch, DeltaError, DeltaResult, IncrJoinType, IncrementalAggOp,
+    IncrementalDistinctOp, IncrementalJoinOp,
 };
 
 // ── ViewPlan enum ─────────────────────────────────────────────────────────────
@@ -38,20 +46,79 @@ pub enum ViewPlan {
     Aggregate {
         source: String,
         op: IncrementalAggOp,
+        /// `WHERE` predicate applied to the source delta before aggregation.
+        filter: Option<SourceFilter>,
     },
     /// Bilinear inner join: `ΔA ⋈ B_trace + A_trace ⋈ ΔB`.
     Join {
         left_source: String,
         right_source: String,
         op: IncrementalJoinOp,
+        /// Predicate applied to the left source delta before probing.
+        left_filter: Option<SourceFilter>,
+        /// Predicate applied to the right source delta before probing.
+        right_filter: Option<SourceFilter>,
     },
     /// Threshold-tracking DISTINCT: emits ±1 only at crossing the 0-threshold.
     Distinct {
         source: String,
         op: IncrementalDistinctOp,
+        /// `WHERE` predicate applied to the source delta before de-duplication.
+        filter: Option<SourceFilter>,
     },
     /// Fallback: full SQL re-execution + diff against previous output (O(state)).
     DiffBased,
+}
+
+/// A compiled `WHERE` predicate applied to a source's delta before it reaches
+/// an incremental operator.
+///
+/// Filter is *linear* (`filter(ΔA) = Δ(filter(A))`), so it composes with any
+/// O(Δ) operator with no state of its own: apply the predicate to the incoming
+/// delta (and to the snapshot replayed during seeding) and the operator sees
+/// exactly the rows the view's `WHERE` admits.
+///
+/// AUD-1: before this, `source_of_plan` peeled `Filter` nodes transparently and
+/// the raw *unfiltered* delta was fed to the operator, so any filtered
+/// single-source aggregate returned silently wrong results.
+#[derive(Clone)]
+pub struct SourceFilter {
+    predicate: Arc<dyn PhysicalExpr>,
+}
+
+impl SourceFilter {
+    /// Keep only the delta rows for which the predicate evaluates to `true`.
+    pub fn apply(&self, delta: DeltaBatch) -> DeltaResult<DeltaBatch> {
+        let predicate = self.predicate.clone();
+        krishiv_delta::operators::filter::filter_batch(delta, move |batch| {
+            let n = batch.num_rows();
+            let value = predicate
+                .evaluate(batch)
+                .map_err(|e| DeltaError::Operator(format!("filter predicate eval: {e}")))?;
+            let array = value
+                .into_array(n)
+                .map_err(|e| DeltaError::Operator(format!("filter predicate to_array: {e}")))?;
+            let mask = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DeltaError::Operator("filter predicate did not evaluate to Boolean".into())
+                })?;
+            Ok(mask.clone())
+        })
+    }
+}
+
+/// Apply an optional source filter to an optional delta (helper for both the
+/// live apply path and snapshot seeding).
+pub fn apply_side_filter(
+    filter: &Option<SourceFilter>,
+    delta: Option<DeltaBatch>,
+) -> DeltaResult<Option<DeltaBatch>> {
+    match (filter, delta) {
+        (Some(f), Some(d)) => Ok(Some(f.apply(d)?)),
+        (_, d) => Ok(d),
+    }
 }
 
 /// Lightweight discriminant for inter-phase communication without borrowing the
@@ -134,13 +201,15 @@ impl ViewPlan {
             }
         };
         match self {
-            ViewPlan::Aggregate { source, op } => {
-                if let Some(delta) = seed_delta(source)? {
+            ViewPlan::Aggregate { source, op, filter } => {
+                // AUD-1: the replayed snapshot must pass the same WHERE filter,
+                // otherwise the seeded state includes rows the view excludes.
+                if let Some(delta) = apply_side_filter(filter, seed_delta(source)?)? {
                     let _ = op.apply(delta)?;
                 }
             }
-            ViewPlan::Distinct { source, op } => {
-                if let Some(delta) = seed_delta(source)? {
+            ViewPlan::Distinct { source, op, filter } => {
+                if let Some(delta) = apply_side_filter(filter, seed_delta(source)?)? {
                     let _ = op.apply(delta)?;
                 }
             }
@@ -148,9 +217,11 @@ impl ViewPlan {
                 left_source,
                 right_source,
                 op,
+                left_filter,
+                right_filter,
             } => {
-                let left = seed_delta(left_source)?;
-                let right = seed_delta(right_source)?;
+                let left = apply_side_filter(left_filter, seed_delta(left_source)?)?;
+                let right = apply_side_filter(right_filter, seed_delta(right_source)?)?;
                 if left.is_some() || right.is_some() {
                     let _ = op.apply(left, right)?;
                 }
@@ -174,6 +245,7 @@ impl ViewPlan {
                 left_source,
                 right_source,
                 op,
+                ..
             } => {
                 let wm_left = watermarks
                     .get(left_source.as_str())
@@ -190,7 +262,7 @@ impl ViewPlan {
                     Ok(0)
                 }
             }
-            ViewPlan::Aggregate { source, op } => {
+            ViewPlan::Aggregate { source, op, .. } => {
                 let wm = watermarks.get(source.as_str()).copied().unwrap_or(i64::MIN);
                 if wm > i64::MIN {
                     op.gc_watermark(wm)
@@ -198,7 +270,7 @@ impl ViewPlan {
                     Ok(0)
                 }
             }
-            ViewPlan::Distinct { source, op } => {
+            ViewPlan::Distinct { source, op, .. } => {
                 let wm = watermarks.get(source.as_str()).copied().unwrap_or(i64::MIN);
                 if wm > i64::MIN {
                     op.gc_watermark(wm)
@@ -329,6 +401,10 @@ fn try_build_from_logical(
             Some(ViewPlan::Distinct {
                 source,
                 op: IncrementalDistinctOp::new(),
+                // AUD-1: a filtered DISTINCT falls back to DiffBased because
+                // `source_of_plan` now refuses to peel `Filter` nodes (returns
+                // None → DiffBased). O(Δ) filtered DISTINCT is future work.
+                filter: None,
             })
         }
         // Window functions (ROW_NUMBER, RANK, rolling aggregates) cannot be
@@ -347,7 +423,21 @@ fn build_agg_plan(
     output_schema: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
 ) -> Option<ViewPlan> {
-    let source = source_of_plan(&agg.input)?;
+    // AUD-1: resolve the source *and* any WHERE predicate between the aggregate
+    // and it. A clean `Aggregate → [Filter…] → [SubqueryAlias] → Scan` chain
+    // keeps O(Δ) with the predicate applied to each delta; a compile failure
+    // bails to DiffBased (never silently drops the predicate). Chains the strict
+    // resolver can't read (e.g. a projection with computed columns) fall through
+    // to `source_of_plan`, which now refuses to peel `Filter` — so a dropped
+    // WHERE can never slip through as a plain aggregate.
+    let (source, filter) = match resolve_source_with_filters(&agg.input) {
+        Some((source, preds)) => {
+            let schema = available_schemas.get(&source)?;
+            let filter = compile_source_filter(&preds, &source, schema).ok()?;
+            (source, filter)
+        }
+        None => (source_of_plan(&agg.input)?, None),
+    };
     let input_schema = available_schemas.get(&source)?;
 
     // Extract GROUP BY column names.
@@ -370,8 +460,13 @@ fn build_agg_plan(
         aggregations.push(expr_to_aggregation(expr, out_col)?);
     }
 
-    let op = IncrementalAggOp::new(input_schema, group_by, aggregations).ok()?;
-    Some(ViewPlan::Aggregate { source, op })
+    // AUD-3: honor the view's declared output column types (SUM(Int64)→Int64
+    // unless the view declares otherwise) so the incremental snapshot matches
+    // the registered contract.
+    let op =
+        IncrementalAggOp::new_with_output_schema(input_schema, group_by, aggregations, output_schema)
+            .ok()?;
+    Some(ViewPlan::Aggregate { source, op, filter })
 }
 
 // ── Join plan builder ─────────────────────────────────────────────────────────
@@ -395,8 +490,14 @@ fn build_join_plan(
         }
     };
 
-    let left_source = source_of_plan(&join.left)?;
-    let right_source = source_of_plan(&join.right)?;
+    // AUD-1: resolve each side's source plus any WHERE predicate on that side
+    // (e.g. a filtered subquery join input). A predicate that fails to compile
+    // bails the whole join to DiffBased rather than dropping the filter.
+    let (left_source, left_filter, right_source, right_filter) = {
+        let (ls, lf) = resolve_side_with_filter(&join.left, available_schemas)?;
+        let (rs, rf) = resolve_side_with_filter(&join.right, available_schemas)?;
+        (ls, lf, rs, rf)
+    };
     let left_schema = available_schemas.get(&left_source)?;
     let right_schema = available_schemas.get(&right_source)?;
 
@@ -425,16 +526,48 @@ fn build_join_plan(
         left_source,
         right_source,
         op,
+        left_filter,
+        right_filter,
     })
+}
+
+/// Resolve one join side to `(source, optional filter)`, mirroring the
+/// aggregate resolution: strict `Filter`/`SubqueryAlias`/`Scan` chains keep the
+/// predicate O(Δ); otherwise fall back to `source_of_plan` (which refuses to
+/// peel `Filter`, so a filtered side that isn't a clean chain → DiffBased).
+fn resolve_side_with_filter(
+    plan: &LogicalPlan,
+    available_schemas: &AHashMap<String, SchemaRef>,
+) -> Option<(String, Option<SourceFilter>)> {
+    match resolve_source_with_filters(plan) {
+        Some((source, preds)) => {
+            let schema = available_schemas.get(&source)?;
+            let filter = compile_source_filter(&preds, &source, schema).ok()?;
+            Some((source, filter))
+        }
+        None => Some((source_of_plan(plan)?, None)),
+    }
 }
 
 // ── Source resolution ─────────────────────────────────────────────────────────
 
 /// Walk a plan tree to find the single base table scan, returning its name.
 /// Returns `None` for multi-input plans (joins, unions) or unsupported nodes.
+///
+/// AUD-1: this **refuses to peel `Filter` nodes** (and a `TableScan` carrying
+/// pushed-down `filters`). Previously it peeled any single-input node including
+/// `Filter`, so the operator was built against a source whose `WHERE` was
+/// silently discarded. The filter-aware `resolve_source_with_filters` handles
+/// the clean-chain case in O(Δ); anything that reaches a `Filter` here returns
+/// `None`, correctly degrading the view to DiffBased full recompute.
 fn source_of_plan(plan: &LogicalPlan) -> Option<String> {
     match plan {
-        LogicalPlan::TableScan(ts) => Some(ts.table_name.table().to_string()),
+        LogicalPlan::TableScan(ts) if ts.filters.is_empty() => {
+            Some(ts.table_name.table().to_string())
+        }
+        // A scan with pushed-down predicates or a Filter node would mean a
+        // dropped WHERE — never resolve through it.
+        LogicalPlan::TableScan(_) | LogicalPlan::Filter(_) => None,
         LogicalPlan::SubqueryAlias(sa) => source_of_plan(&sa.input),
         _ => {
             let inputs = plan.inputs();
@@ -445,6 +578,58 @@ fn source_of_plan(plan: &LogicalPlan) -> Option<String> {
             }
         }
     }
+}
+
+/// Resolve the single base source under `plan`, collecting the `Filter`
+/// predicates between the operator and that source. Only `SubqueryAlias` and
+/// `Filter` nodes are peeled; a clean `Scan` (with no pushed-down filters) ends
+/// the walk. Any other node (a projection with computed columns, sort, limit,
+/// nested aggregate, multi-input) returns `None`, so the caller falls back to
+/// `source_of_plan` or DiffBased.
+fn resolve_source_with_filters(plan: &LogicalPlan) -> Option<(String, Vec<Expr>)> {
+    match plan {
+        LogicalPlan::TableScan(ts) if ts.filters.is_empty() => {
+            Some((ts.table_name.table().to_string(), Vec::new()))
+        }
+        LogicalPlan::SubqueryAlias(sa) => resolve_source_with_filters(&sa.input),
+        LogicalPlan::Filter(f) => {
+            let (src, mut preds) = resolve_source_with_filters(&f.input)?;
+            preds.push(f.predicate.clone());
+            Some((src, preds))
+        }
+        _ => None,
+    }
+}
+
+/// Compile collected predicates (AND-combined) into a [`SourceFilter`] against
+/// the source's data schema.
+///
+/// - `Ok(None)`  — no predicates, no filtering needed.
+/// - `Ok(Some)`  — compiled successfully.
+/// - `Err(())`   — the predicate could not be compiled; the caller must fall
+///   back to DiffBased rather than silently drop it.
+fn compile_source_filter(
+    preds: &[Expr],
+    source: &str,
+    source_schema: &SchemaRef,
+) -> Result<Option<SourceFilter>, ()> {
+    if preds.is_empty() {
+        return Ok(None);
+    }
+    let combined = preds.iter().cloned().reduce(|a, b| a.and(b)).ok_or(())?;
+    // Qualify the schema with the source name so predicate column references of
+    // either `source.col` or bare `col` resolve to the right column index.
+    let df_schema =
+        DFSchema::try_from_qualified_schema(source, source_schema.as_ref()).map_err(|_| ())?;
+    // The unoptimized logical predicate is not type-coerced, so a `Float64 >
+    // Int64` literal comparison would fail the Arrow comparison kernel at eval.
+    // Run type coercion against the source schema to insert the needed casts
+    // before lowering to a physical expression.
+    let mut coercion = TypeCoercionRewriter::new(&df_schema);
+    let coerced = combined.rewrite(&mut coercion).map_err(|_| ())?.data;
+    let props = ExecutionProps::new();
+    let predicate = create_physical_expr(&coerced, &df_schema, &props).map_err(|_| ())?;
+    Ok(Some(SourceFilter { predicate }))
 }
 
 // ── Expr helpers ─────────────────────────────────────────────────────────────

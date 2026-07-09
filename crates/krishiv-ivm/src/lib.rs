@@ -28,6 +28,6 @@ pub use vector_sink::{IvmVectorSink, VectorFuture, VectorViewSpec, spawn_vector_
 
 // Re-export the key delta types so callers need only `krishiv-ivm`.
 pub use krishiv_delta::{
-    DeltaBatch, IncrementalViewRegistry, IncrementalViewSpec, apply_delta, deserialize_delta_batch,
-    differentiate, serialize_delta_batch,
+    DeltaBatch, IncrementalViewRegistry, IncrementalViewSpec, LatenessSpec, apply_delta,
+    deserialize_delta_batch, differentiate, serialize_delta_batch,
 };

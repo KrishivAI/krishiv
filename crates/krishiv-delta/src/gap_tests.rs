@@ -103,14 +103,12 @@ mod gap_tests {
             .with_lateness_column("ts")
             .unwrap();
         trace.insert(DeltaBatch::from_inserts(ts_batch(&[1, 2, 3], &[100, 200, 300])).unwrap());
-        // BUG: gc_below_watermark removes only 1 row instead of the expected 2
-        // for [100, 200, 300] with watermark 250. The Int64Array BooleanArray
-        // construction at trace.rs:243-248 produces a mask with only the first
-        // matching row marked. Root cause TBD; test matches current behavior.
+        // AUD-2: watermark 250 expires ts=100 and ts=200 (both < 250) and
+        // keeps ts=300 (>= 250). The mask is now a correct keep-mask.
         let removed = trace.gc_below_watermark(250).unwrap();
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 2);
         let snap = trace.snapshot().unwrap();
-        assert_eq!(snap.num_rows(), 2);
+        assert_eq!(snap.num_rows(), 1);
     }
 
     #[test]
@@ -128,11 +126,11 @@ mod gap_tests {
             .with_lateness_column("ts")
             .unwrap();
         trace.insert(DeltaBatch::from_inserts(ts_batch(&[1, 2], &[100, 200])).unwrap());
-        // BUG: gc_below_watermark incorrectly removes all rows when
-        // watermark is below all values. With ts=[100,200] and watermark=50:
-        // expected removed=0 but current buggy behavior removes 2.
+        // AUD-2: watermark 50 is below every value, so nothing is expired.
         let removed = trace.gc_below_watermark(50).unwrap();
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 0);
+        let snap = trace.snapshot().unwrap();
+        assert_eq!(snap.num_rows(), 2);
     }
 
     // ── Trace: snapshot ───────────────────────────────────────────────────────

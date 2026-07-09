@@ -990,11 +990,33 @@ impl IncrementalFlow {
             let output_delta = if plan_kind == ViewPlanKind::Incremental {
                 // O(Δ) path: apply stateful operator.
                 match inner.view_plans.get_mut(view_name) {
-                    Some(ViewPlan::Aggregate { source, op }) => {
+                    Some(ViewPlan::Aggregate { source, op, filter }) => {
                         let src = source.clone();
                         let delta = match available_deltas.get(&src).cloned() {
                             Some(d) => d,
                             None => continue,
+                        };
+                        // AUD-1: apply the view's WHERE predicate to the source
+                        // delta before aggregation.
+                        let delta = if let Some(f) = filter {
+                            match f.apply(delta) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        view = %view_name,
+                                        error = %e,
+                                        "incremental view filter apply failed; skipping view"
+                                    );
+                                    errored_views.push(ViewError {
+                                        view: view_name.clone(),
+                                        kind: ViewErrorKind::OperatorApply,
+                                        message: e.to_string(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        } else {
+                            delta
                         };
                         match op.apply(delta) {
                             Ok(d) => d,
@@ -1017,12 +1039,34 @@ impl IncrementalFlow {
                         left_source,
                         right_source,
                         op,
+                        left_filter,
+                        right_filter,
                     }) => {
                         let left = available_deltas.get(left_source.as_str()).cloned();
                         let right = available_deltas.get(right_source.as_str()).cloned();
                         if left.is_none() && right.is_none() {
                             continue;
                         }
+                        // AUD-1: apply per-side WHERE predicates before probing.
+                        let (left, right) = match (
+                            crate::plan::apply_side_filter(left_filter, left),
+                            crate::plan::apply_side_filter(right_filter, right),
+                        ) {
+                            (Ok(l), Ok(r)) => (l, r),
+                            (Err(e), _) | (_, Err(e)) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view join filter apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
+                        };
                         match op.apply(left, right) {
                             Ok(d) => d,
                             Err(e) => {
@@ -1040,11 +1084,30 @@ impl IncrementalFlow {
                             }
                         }
                     }
-                    Some(ViewPlan::Distinct { source, op }) => {
+                    Some(ViewPlan::Distinct { source, op, filter }) => {
                         let src = source.clone();
                         let delta = match available_deltas.get(&src).cloned() {
                             Some(d) => d,
                             None => continue,
+                        };
+                        // AUD-1: filter is None today (filtered DISTINCT falls
+                        // back to DiffBased) but apply it for forward-compat.
+                        let delta = match crate::plan::apply_side_filter(filter, Some(delta)) {
+                            Ok(Some(d)) => d,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view distinct filter apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
                         };
                         match op.apply(delta) {
                             Ok(d) => d,
@@ -1140,8 +1203,17 @@ impl IncrementalFlow {
             .map(|(k, v)| (k.clone(), v.watermark()))
             .collect();
         if !watermarks.is_empty() {
-            for plan in inner.view_plans.values_mut() {
-                let _ = plan.gc_watermark(&watermarks);
+            for (view_name, plan) in inner.view_plans.iter_mut() {
+                // AUD-2: GC failures were silently swallowed. A failing GC
+                // means join/aggregate traces keep growing without bound, so
+                // surface it (non-fatal for the tick) instead of hiding it.
+                if let Err(e) = plan.gc_watermark(&watermarks) {
+                    tracing::warn!(
+                        view = %view_name,
+                        error = %e,
+                        "watermark GC failed for view plan"
+                    );
+                }
             }
         }
 
@@ -1963,7 +2035,10 @@ pub fn encode_ivm_step_fragment(
                 "body_sql": s.body_sql,
                 "output_schema_fields": fields,
                 "is_materialized": s.is_materialized,
-                "is_recursive": s.is_recursive
+                "is_recursive": s.is_recursive,
+                // AUD-4: carry lateness so an offloaded tick applies the same
+                // retention/GC semantics as a central tick of the same job.
+                "lateness": s.lateness,
             })
         })
         .collect();

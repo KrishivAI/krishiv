@@ -219,3 +219,151 @@ async fn consistent_across_many_small_feeds() {
         }
     }
 }
+
+fn f64_total(snap: &RecordBatch, col: &str) -> f64 {
+    snap.column_by_name(col)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0)
+}
+
+/// AUD-1 regression: a WHERE clause on a single-source aggregate must be
+/// honored by the O(Δ) plan. Before the fix, `source_of_plan` peeled the
+/// `Filter` node and fed the *raw unfiltered* delta to the aggregate, so this
+/// returned 680 (sum of everything) instead of 600 (sum of rows > 100).
+#[tokio::test]
+async fn where_clause_is_honored_by_incremental_aggregate() {
+    let flow = IncrementalFlow::new();
+    let spec = IncrementalViewSpec {
+        name: "total".into(),
+        body_sql: "SELECT SUM(amount) AS total FROM sales WHERE amount > 100".into(),
+        output_schema: Arc::new(Schema::new(vec![Field::new(
+            "total",
+            DataType::Float64,
+            true,
+        )])),
+        is_materialized: true,
+        is_recursive: false,
+        lateness: vec![],
+    };
+    flow.register_view(spec).unwrap();
+
+    // Tick 1: [50, 200] → only 200 passes the filter.
+    flow.feed(
+        "sales",
+        DeltaBatch::from_inserts(revenue_batch(&[(0, 50.0), (0, 200.0)])).unwrap(),
+    )
+    .unwrap();
+    let s1 = flow.step_datafusion().await.unwrap();
+    assert!(
+        !s1.degraded_views.contains(&"total".to_string()),
+        "filtered aggregate must stay on the O(Δ) path, not degrade to DiffBased"
+    );
+    assert_eq!(f64_total(&flow.snapshot("total").unwrap().unwrap(), "total"), 200.0);
+
+    // Tick 2: [30, 400] → only 400 passes → cumulative 600 (NOT 680).
+    flow.feed(
+        "sales",
+        DeltaBatch::from_inserts(revenue_batch(&[(0, 30.0), (0, 400.0)])).unwrap(),
+    )
+    .unwrap();
+    let s2 = flow.step_datafusion().await.unwrap();
+    assert!(!s2.degraded_views.contains(&"total".to_string()));
+    assert_eq!(
+        f64_total(&flow.snapshot("total").unwrap().unwrap(), "total"),
+        600.0,
+        "WHERE amount > 100 must exclude 50 and 30"
+    );
+}
+
+/// AUD-1: a filtered GROUP BY must match batch recompute of the same query,
+/// tick by tick, while staying incremental.
+#[tokio::test]
+async fn filtered_group_by_matches_batch() {
+    let flow = IncrementalFlow::new();
+    let spec = IncrementalViewSpec {
+        name: "revenue".into(),
+        body_sql: "SELECT region, SUM(amount) AS total FROM sales WHERE amount > 100 GROUP BY region"
+            .into(),
+        output_schema: Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("total", DataType::Float64, true),
+        ])),
+        is_materialized: true,
+        is_recursive: false,
+        lateness: vec![],
+    };
+    flow.register_view(spec).unwrap();
+
+    let mut accumulated: Vec<(i64, f64)> = Vec::new();
+    for round in 0..8 {
+        let offset = round * 50;
+        // Spread amounts across 30..=279 so every round has some rows on each
+        // side of the WHERE amount > 100 threshold (mix of kept and dropped).
+        let rows: Vec<(i64, f64)> = (0..50)
+            .map(|i| (i % 5, (((i * 7 + offset) % 250) + 30) as f64))
+            .collect();
+        accumulated.extend_from_slice(&rows);
+        flow.feed(
+            "sales",
+            DeltaBatch::from_inserts(revenue_batch(&rows)).unwrap(),
+        )
+        .unwrap();
+        let summary = flow.step_datafusion().await.unwrap();
+        assert!(
+            !summary.degraded_views.contains(&"revenue".to_string()),
+            "round {round}: filtered GROUP BY degraded to DiffBased"
+        );
+
+        let full = revenue_batch(&accumulated);
+        let batch_result = batch_query(
+            "SELECT region, SUM(amount) AS total FROM sales WHERE amount > 100 GROUP BY region",
+            "sales",
+            &full,
+        )
+        .await;
+        // An empty filtered view legitimately snapshots to None → 0 rows.
+        let snap = flow
+            .snapshot("revenue")
+            .unwrap()
+            .unwrap_or_else(|| RecordBatch::new_empty(revenue_batch(&[]).schema()));
+        let batch_rows: usize = batch_result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            snap.num_rows(),
+            batch_rows,
+            "round {round}: filtered ivm={} vs batch={}",
+            snap.num_rows(),
+            batch_rows
+        );
+
+        // Sum of totals must match too (row count alone is weak).
+        let ivm_sum: f64 = (0..snap.num_rows())
+            .map(|r| {
+                snap.column_by_name("total")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(r)
+            })
+            .sum();
+        let batch_sum: f64 = batch_result
+            .iter()
+            .flat_map(|b| {
+                let c = b
+                    .column_by_name("total")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                (0..b.num_rows()).map(|r| c.value(r)).collect::<Vec<_>>()
+            })
+            .sum();
+        assert!(
+            (ivm_sum - batch_sum).abs() < 1e-6,
+            "round {round}: filtered total sum ivm={ivm_sum} vs batch={batch_sum}"
+        );
+    }
+}

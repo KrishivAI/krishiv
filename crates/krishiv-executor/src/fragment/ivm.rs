@@ -57,6 +57,11 @@ pub struct ViewSpecJson {
     pub is_materialized: bool,
     #[serde(default)]
     pub is_recursive: bool,
+    /// AUD-4: lateness retention specs, carried so an offloaded tick applies
+    /// the same watermark GC as a central tick. Defaults to empty for
+    /// backward-compatible fragments produced before this field existed.
+    #[serde(default)]
+    pub lateness: Vec<krishiv_ivm::LatenessSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,7 +178,9 @@ pub async fn execute_ivm_fragment(
                 output_schema: schema,
                 is_materialized: vs.is_materialized,
                 is_recursive: vs.is_recursive,
-                lateness: vec![],
+                // AUD-4: preserve lateness so an offloaded tick applies the same
+                // retention/GC semantics as a central tick (was hardcoded empty).
+                lateness: vs.lateness.clone(),
             };
             flow.register_view(spec).map_err(|e| e.to_string())?;
         }
