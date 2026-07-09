@@ -55,6 +55,24 @@ pub use management::{
     TriggerSavepointRequest, TriggerSavepointResponse,
 };
 pub use services::{CoordinatorExecutorService, ExecutorTaskService};
+
+/// Maximum gRPC message size (bytes) for the coordinator↔executor task
+/// transport, applied as both the encode and decode limit on every generated
+/// client and server in that path.
+///
+/// Tonic's default decode limit is 4 MiB — far below a batch task's collected
+/// result. A distributed join over a real Iceberg table (a 10M-row NYC-taxi
+/// join ships ~350 MB back as one message) otherwise fails the task with
+/// `decoded message length too large: found N bytes, the limit is 4194304`.
+/// Override with `KRISHIV_GRPC_MAX_MESSAGE_BYTES`; defaults to 1 GiB.
+pub fn max_grpc_message_bytes() -> usize {
+    const DEFAULT: usize = 1024 * 1024 * 1024; // 1 GiB
+    std::env::var("KRISHIV_GRPC_MAX_MESSAGE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
 pub use task::{
     CheckpointCompleteCommand, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse,
     ExecutorTaskAssignment, InitiateCheckpointCommand, InputPartition, InputPartitionDescriptor,

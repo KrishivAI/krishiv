@@ -794,9 +794,12 @@ pub fn coordinator_executor_grpc_server(
     coordinator: SharedCoordinator,
 ) -> wire::v1::coordinator_executor_server::CoordinatorExecutorServer<CoordinatorExecutorGrpcService>
 {
+    let max = krishiv_proto::max_grpc_message_bytes();
     wire::v1::coordinator_executor_server::CoordinatorExecutorServer::new(
         CoordinatorExecutorGrpcService::new(coordinator),
     )
+    .max_decoding_message_size(max)
+    .max_encoding_message_size(max)
 }
 
 /// Build the coordinator management gRPC service (GAP-RT-04).

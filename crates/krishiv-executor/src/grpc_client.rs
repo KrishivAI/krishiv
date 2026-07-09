@@ -176,12 +176,15 @@ impl CoordinatorGrpcPool {
             endpoint = endpoint.tls_config(tls)?;
         }
         let channel = endpoint.connect().await?;
+        let max = krishiv_proto::max_grpc_message_bytes();
         let client =
             wire::v1::coordinator_executor_client::CoordinatorExecutorClient::with_interceptor(
                 channel,
                 inject_coordinator_request_context
                     as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-            );
+            )
+            .max_decoding_message_size(max)
+            .max_encoding_message_size(max);
         *guard = Some(client.clone());
         Ok(client)
     }

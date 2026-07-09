@@ -653,11 +653,14 @@ impl SharedCoordinator {
                             return;
                         }
                     };
+                let max = krishiv_proto::max_grpc_message_bytes();
                 let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
                     channel,
                     inject_executor_task_request_context
                         as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-                );
+                )
+                .max_decoding_message_size(max)
+                .max_encoding_message_size(max);
                 if let Err(err) = client
                     .cancel_task(wire::task_cancellation_request_to_wire(req))
                     .await

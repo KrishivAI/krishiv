@@ -495,7 +495,10 @@ impl wire::v1::executor_task_server::ExecutorTask for ExecutorTaskGrpcService {
 pub fn executor_task_grpc_server(
     inbox: ExecutorAssignmentInbox,
 ) -> wire::v1::executor_task_server::ExecutorTaskServer<ExecutorTaskGrpcService> {
+    let max = krishiv_proto::max_grpc_message_bytes();
     wire::v1::executor_task_server::ExecutorTaskServer::new(ExecutorTaskGrpcService::new(inbox))
+        .max_decoding_message_size(max)
+        .max_encoding_message_size(max)
 }
 
 /// Build the generated tonic server sharing continuous-streaming state with a runner.
@@ -529,5 +532,8 @@ pub fn executor_task_grpc_server_with_continuous(
         required_bearer_token: auth.bearer_token().map(ToOwned::to_owned),
         auth_misconfiguration,
     };
+    let max = krishiv_proto::max_grpc_message_bytes();
     wire::v1::executor_task_server::ExecutorTaskServer::new(service)
+        .max_decoding_message_size(max)
+        .max_encoding_message_size(max)
 }
