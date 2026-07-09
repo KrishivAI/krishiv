@@ -8,6 +8,37 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **Heartbeats no longer stall behind checkpoint work** (2026-07-09):
+  coordinator-issued restore/checkpoint commands ran inline in the
+  executor's heartbeat loop, so a multi-second restore or checkpoint upload
+  delayed the next heartbeat past the coordinator's timeout — evicting the
+  healthy, mid-restore executor and triggering another rollback+restore
+  livelock. Commands now run on a dedicated ordered worker (restores first
+  within a batch) while heartbeats keep flowing.
+- **Executor registry no longer grows without bound** (2026-07-09):
+  Lost/Removed executor records are retained long enough for zombie fencing
+  (40× the heartbeat timeout, ≥30 min) and then pruned; previously every
+  k8s pod restart left a corpse the heartbeat tick iterated forever.
+- `tick_period_ms` default corrected to the daemon's real 5 s cadence —
+  checkpoint interval timers and ack timeouts convert ticks → ms with it and
+  ran 5× slow under the old 1 000 default; the heartbeat clock's quiet-path
+  per-job walk is also skipped when no executor was lost and debug logging
+  is off (2026-07-09).
+- **Healthy executors no longer lose their tasks to heartbeat-timeout lease
+  churn** (2026-07-08): the default `heartbeat_timeout_ticks` (3 ticks =
+  15 s at the daemon's 5 s tick) left one delayed heartbeat between a
+  healthy executor and eviction against the executor's 10 s default
+  interval; the eviction was silent (no log, no
+  `krishiv_executor_lost_total` increment), and running tasks kept
+  reporting the lease frozen into their assignment, so after the executor
+  re-registered every status RPC was fenced `stale_lease` and the task
+  runner aborted healthy work — the recurring "assigned but not running"
+  stuck state, ending in a circuit-breaker launch loop. Timeout default is
+  now 9 ticks (≈45 s, ≥3× the heartbeat interval), timeout evictions log
+  and count like `mark_executor_lost`, and `send_task_status` stamps the
+  freshest of the assignment lease and the live shared lease (B10
+  precedent), letting a re-registered executor's tasks self-heal.
+
 - **Deployed builds now include `rest-catalog`** (2026-07-08): `just
   build-k8s` / `build-bare-metal` compiled without the feature, so
   `KRISHIV_ICEBERG_REST_URI`/`_TOKEN`/`_WAREHOUSE`/`_NAME` were silently

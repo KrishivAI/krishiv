@@ -434,19 +434,48 @@ impl Coordinator {
             && self.exec.ticks_since_restart <= self.config.streaming_reattach_grace_ticks();
 
         let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
-        let lost = self.exec.executors.advance_clock(ticks);
+        // The grace-period protection must be applied BEFORE the registry
+        // advances the clock: `advance_clock` marks timed-out executors Lost
+        // and bumps their lease generation in the same pass, so filtering the
+        // returned `lost` list afterwards (the previous shape of this code)
+        // still fenced the protected executor's lease — its re-attach then
+        // failed lease validation and the grace window never actually worked.
+        // Mirror the recovery path (recovery.rs) and hand the protected set to
+        // `advance_clock_excluding` instead.
+        let protected: std::collections::HashSet<ExecutorId> = if in_grace_period {
+            self.exec
+                .executors
+                .executors
+                .keys()
+                .filter(|id| self.executor_has_streaming_running_tasks(id))
+                .cloned()
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let lost = self.exec.executors.advance_clock_excluding(ticks, &protected);
         let mut evicted: Vec<ExecutorId> = Vec::new();
         for lost_id in &lost {
-            // During the re-attach grace period, skip evicting executors that own
-            // Running tasks in streaming jobs so they can re-register.
-            if in_grace_period && self.executor_has_streaming_running_tasks(lost_id) {
-                continue;
-            }
             self.handle_executor_loss_for_checkpoints(lost_id);
             self.reset_running_tasks_for_lost_executor(lost_id);
             self.prune_executor_channel(lost_id);
+            // Same cleanup as `mark_executor_lost`: without it a dead
+            // executor's last reported watermark stays in the per-job map and
+            // holds back `compute_global_watermarks`' minimum forever.
+            self.executor_job_watermarks.remove(lost_id);
+            self.pending_source_throttles.remove(lost_id);
             // SC11: record the eviction in the cascade circuit breaker window.
             self.record_cascade_loss(now_ms);
+            // Same accounting as `mark_executor_lost`: without the metric and
+            // log line a timeout eviction is invisible — the executor keeps
+            // heartbeating (and re-registers on the stale-lease response)
+            // while its in-flight task statuses are silently fenced off.
+            krishiv_metrics::global_metrics().inc_executor_lost();
+            tracing::warn!(
+                executor_id = %lost_id,
+                heartbeat_timeout_ticks = self.config.heartbeat_timeout_ticks(),
+                "executor evicted by heartbeat timeout; lease fenced, running tasks reset"
+            );
             evicted.push(lost_id.clone());
         }
 

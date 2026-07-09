@@ -98,7 +98,12 @@ impl CoordinatorConfig {
             heartbeat_timeout_ticks: heartbeat_timeout_ticks.max(1),
             memory_threshold_bytes: None,
             streaming_reattach_grace_ticks: 5,
-            tick_period_ms: 1_000,
+            // Must equal the wall-clock period of the daemon heartbeat loop —
+            // the loop reads this value for its interval, and checkpoint
+            // interval timers / ack timeouts convert ticks → ms with it.
+            // 5 000 matches the historic 5 s daemon tick (the old 1 000
+            // default silently made those timers run 5× slow).
+            tick_period_ms: 5_000,
             checkpoint_ack_timeout_ms: 30_000,
             circuit_breaker_failure_threshold: 5,
             inline_partition_limit_bytes: 3 * 1024 * 1024,
@@ -275,7 +280,13 @@ impl CoordinatorConfig {
 
 impl Default for CoordinatorConfig {
     fn default() -> Self {
-        Self::new(1, 3)
+        // Heartbeat budget: the daemon advances one tick every 5 s and the
+        // executor default heartbeat interval is 10 s, so 3 ticks (15 s) left
+        // a healthy executor one delayed heartbeat away from eviction — any
+        // >5 s hiccup (CPU-bound tick decode, RPC latency) fenced its lease
+        // and killed its running tasks. 9 ticks ≈ 45 s keeps the standard
+        // ≥3× interval margin.
+        Self::new(1, 9)
     }
 }
 // ── TLS configuration ─────────────────────────────────────────────────────────

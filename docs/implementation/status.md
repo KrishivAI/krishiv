@@ -1,5 +1,77 @@
 # Krishiv Implementation Status
 
+## 2026-07-09 — heartbeat/lease audit landed + deployed to krishiv-prod mid-soak
+
+Companion fixes to the 2026-07-08 lease-churn entry (below), from the
+coordinator/scheduler/executor audit; committed together and running on
+krishiv-prod since ~01:45Z as the engine under the 72h #101 soak:
+
+1. **Executor command worker**: restore/checkpoint commands ran inline in the
+   heartbeat loop — a slow restore stalled heartbeats past the coordinator
+   timeout, evicting the healthy executor mid-restore (rollback→restore
+   livelock). Now a dedicated ordered worker executes command batches
+   (restores first) while heartbeats keep their cadence.
+2. **Registry pruning**: Lost/Removed executors are pruned after 40× the
+   heartbeat timeout (≥30 min — far beyond any in-flight RPC, so zombie
+   fencing still sees the bumped lease); previously every pod restart left a
+   record iterated by every tick, forever.
+3. **`tick_period_ms` = 5 000** (was 1 000): the value must equal the daemon
+   loop's real 5 s period — checkpoint interval timers and ack timeouts
+   convert ticks→ms with it and ran 5× slow.
+4. **Quiet-path skip**: the heartbeat tick's per-job JCP walk (N jobs ×
+   several async locks) only feeds debug logs when nothing was lost — skipped
+   unless an eviction happened or debug logging is enabled.
+
+Deployment evidence (prod): fresh executor registration at lease gen 1, no
+stale_lease cycles since; the pre-fix binary had climbed to gen 6 in 13 h
+with `stale_lease` re-registers at 22:16/00:17 and a wedged streaming leg.
+Validated: `cargo test --release -p krishiv-scheduler -p krishiv-executor`
+green except `checkpoint_barrier_integration` (verdict pending: fails
+identically on the pre-audit tree — see the session log — so pre-existing,
+not introduced; tracked separately).
+
+## 2026-07-08 (evening) — heartbeat-timeout lease churn killed healthy executors' tasks
+
+**Found (live, via the platform's G17 batch-refresh work)**: the recurring
+"assigned but not running" stuck state — streaming tasks and dispatched IVM
+`delta:step:` ticks dying while the executor stayed Healthy — root-caused to
+a lease-fencing spiral:
+
+1. The coordinator daemon ticks the heartbeat clock every **5 s** and the
+   default `heartbeat_timeout_ticks` was **3** (15 s budget), while the
+   executor default heartbeat interval is **10 s** — one heartbeat delayed
+   >5 s (CPU-bound tick decode on the executor runtime, RPC latency, tick
+   phase) evicted a healthy executor: state → Lost, lease bumped, running
+   tasks reset.
+2. The timeout-evict path in `advance_clock_excluding` did this **silently**
+   — no log line and no `krishiv_executor_lost_total` increment (only
+   `mark_executor_lost` had them), so the eviction was invisible while its
+   consequences (`stale_lease` on every task-status RPC) surfaced far away.
+3. Task-status reports stamped `assignment.lease_generation()` — the lease
+   frozen at push time. After the executor re-registered (heartbeat path
+   recovers fine), its still-running tasks kept reporting the stale lease,
+   got fenced, and `ensure_status_accepted_or_duplicate` aborted the healthy
+   task runner. Reassignment then repeated the cycle; 5 aborts tripped the
+   consecutive-failure circuit breaker and launches looped on
+   "unknown executor".
+
+**Fixed** (`krishiv-scheduler`, `krishiv-executor`):
+- `CoordinatorConfig` default `heartbeat_timeout_ticks` 3 → **9** (≈45 s at
+  the daemon's 5 s tick; ≥3× the executor's 10 s interval).
+- Timeout evictions now log a warn and increment
+  `krishiv_executor_lost_total` (same accounting as `mark_executor_lost`).
+- `send_task_status` stamps `max(assignment lease, live shared lease)` —
+  matching the B10 checkpoint-fanout precedent — so a re-registered
+  executor's running tasks self-heal instead of being fenced; cross-process
+  zombie fencing is unaffected (a zombie's live lease is still behind).
+
+**Validated**: rebuilt `krishiv`, restarted coordinator + executor; IVM
+create-job → register view + view-over-view → `stream-bridge` snapshot →
+`step` completes with correct aggregates (previously the dispatched step
+died on `stale_lease` and the job hung "assigned but not running").
+Also found en route: deployed binary predated `delta:step:` executor
+support — rebuilt from workspace HEAD.
+
 ## 2026-07-08 — rest-catalog missing from deployed builds (found via platform BI cert)
 
 **Found**: the platform's 07b BI certification hit "table not found" for

@@ -793,13 +793,18 @@ impl ExecutorTaskRunner {
             assignment.attempt_id(),
         );
         let message = message.into();
-        let mut request = TaskStatusRequest::new(
-            ids,
-            assignment.executor_id().clone(),
-            assignment.lease_generation(),
-            state,
-        )
-        .with_message(message);
+        // Stamp the freshest lease we hold: the assignment embeds the lease at
+        // push time, but a heartbeat-timeout eviction + re-register bumps the
+        // registry's generation while the task keeps running — reporting the
+        // frozen assignment lease then gets fenced as stale and aborts healthy
+        // work (B10 already made checkpoint-fanout use the live lease). `max`
+        // keeps the assignment stamp when the shared handle was never attached
+        // (it defaults to `initial()`); cross-process zombie fencing is
+        // unaffected — a zombie's live lease is behind the registry either way.
+        let lease = assignment.lease_generation().max(self.live_lease.get());
+        let mut request =
+            TaskStatusRequest::new(ids, assignment.executor_id().clone(), lease, state)
+                .with_message(message);
         if let Some(output_metadata) = output_metadata {
             request = request.with_output_metadata(output_metadata);
         }

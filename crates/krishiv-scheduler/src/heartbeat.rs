@@ -176,6 +176,21 @@ impl ExecutorRegistry {
         self.current_tick = self.current_tick.saturating_add(ticks);
         let mut lost = Vec::new();
 
+        // Terminal records (Lost / Removed) are kept for a retention window so
+        // zombie-fencing still sees the bumped lease generation, then pruned.
+        // Without this the registry grows without bound under executor churn
+        // (every k8s pod restart is a new executor id) and every tick iterates
+        // the corpses. 40× the heartbeat timeout (≥ 360 ticks ≈ 30 min at the
+        // 5 s daemon tick) is far longer than any in-flight RPC can survive.
+        let retention_ticks = self.heartbeat_timeout_ticks.saturating_mul(40).max(360);
+        let current_tick = self.current_tick;
+        self.executors.retain(|_, executor| {
+            !(matches!(
+                executor.state,
+                ExecutorState::Lost | ExecutorState::Removed
+            ) && current_tick.saturating_sub(executor.last_heartbeat_tick) >= retention_ticks)
+        });
+
         for executor in self.executors.values_mut() {
             if protected.contains(executor.executor_id()) {
                 continue;

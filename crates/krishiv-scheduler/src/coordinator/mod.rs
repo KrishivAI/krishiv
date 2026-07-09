@@ -492,6 +492,15 @@ impl SharedCoordinator {
             lost
         };
 
+        // The per-job JCP consultation below is only load-bearing when an
+        // executor was lost this tick; the launch-work summaries feed nothing
+        // but the debug log. Skip the whole per-job walk (N jobs × several
+        // async lock acquisitions each, every tick) on the common quiet path.
+        let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        if lost.is_empty() && !debug_enabled {
+            return Ok(lost);
+        }
+
         // Clone JCP Arcs outside the read guard so .await calls do not hold the lock.
         let jc_snapshots: Vec<(JobId, Arc<crate::job_coordinator::JobCoordinator>)> = {
             let coord = self.inner.read().await;
@@ -502,10 +511,6 @@ impl SharedCoordinator {
                 .collect()
         };
         for (job_id, jc) in jc_snapshots {
-            let in_flight = jc.has_in_flight_tasks().await;
-            let eligible = jc.has_tasks_eligible_for_launch().await;
-            let (launch_eligible, stages_with_work) = jc.get_launch_work_summary().await;
-
             for lost in &lost {
                 let ts = krishiv_common::async_util::unix_now_ms() as u64;
                 let stale = jc.record_heartbeat_and_detect_stale(lost, ts);
@@ -564,14 +569,19 @@ impl SharedCoordinator {
                 }
             }
 
-            tracing::debug!(
-                job_id = %job_id,
-                in_flight,
-                eligible_for_launch = eligible,
-                launch_eligible_tasks = launch_eligible,
-                stages_with_pending_work = stages_with_work,
-                "JCP consulted during heartbeat tick (full per-job delegation)"
-            );
+            if debug_enabled {
+                let in_flight = jc.has_in_flight_tasks().await;
+                let eligible = jc.has_tasks_eligible_for_launch().await;
+                let (launch_eligible, stages_with_work) = jc.get_launch_work_summary().await;
+                tracing::debug!(
+                    job_id = %job_id,
+                    in_flight,
+                    eligible_for_launch = eligible,
+                    launch_eligible_tasks = launch_eligible,
+                    stages_with_pending_work = stages_with_work,
+                    "JCP consulted during heartbeat tick (full per-job delegation)"
+                );
+            }
         }
 
         for lost_exec in &lost {
@@ -729,25 +739,29 @@ impl SharedCoordinator {
             id_pairs.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
         };
 
-        for job_id in &job_ids {
-            let jc = {
-                let coord = self.inner.read().await;
-                coord.job_coordinator(job_id).clone()
-            };
-            if let Some(jc) = jc {
-                let has_in_flight = jc.has_in_flight_tasks().await;
-                let stage_count = jc.stage_count().await;
-                let eligible_for_launch = jc.has_tasks_eligible_for_launch().await;
-                let (eligible_tasks, stages_with_work) = jc.get_launch_work_summary().await;
-                tracing::debug!(
-                    job_id = %job_id,
-                    has_in_flight,
-                    stage_count,
-                    eligible_for_launch,
-                    eligible_tasks,
-                    stages_with_work,
-                    "JCP consulted for launch decision (full per-job summary)"
-                );
+        // Purely observability: several async JCP lock acquisitions per job
+        // per 500 ms launch tick — only pay for them when debug logging is on.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for job_id in &job_ids {
+                let jc = {
+                    let coord = self.inner.read().await;
+                    coord.job_coordinator(job_id).clone()
+                };
+                if let Some(jc) = jc {
+                    let has_in_flight = jc.has_in_flight_tasks().await;
+                    let stage_count = jc.stage_count().await;
+                    let eligible_for_launch = jc.has_tasks_eligible_for_launch().await;
+                    let (eligible_tasks, stages_with_work) = jc.get_launch_work_summary().await;
+                    tracing::debug!(
+                        job_id = %job_id,
+                        has_in_flight,
+                        stage_count,
+                        eligible_for_launch,
+                        eligible_tasks,
+                        stages_with_work,
+                        "JCP consulted for launch decision (full per-job summary)"
+                    );
+                }
             }
         }
 
@@ -894,7 +908,15 @@ impl SharedCoordinator {
             let span = tracing::info_span!("coordinator.heartbeat_loop");
             join_handles.push(tokio::spawn(
                 async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                    // One loop iteration == one heartbeat tick, so the loop
+                    // period MUST be `config.tick_period_ms()` — checkpoint
+                    // interval timers and ack timeouts convert ticks to
+                    // elapsed time with that constant. A hard-coded 5 s here
+                    // against the old 1 000 ms default made every checkpoint
+                    // interval and ack timeout run 5× slower than configured.
+                    let period_ms = { coord.inner.read().await.config.tick_period_ms() };
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_millis(period_ms));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         tokio::select! {

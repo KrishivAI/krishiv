@@ -21,7 +21,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use dashmap::DashMap;
 use krishiv_common::durability::DurabilityProfile;
-use krishiv_proto::{CheckpointAlignment, InitiateCheckpointRequest, JobId, TaskAttemptRef};
+use krishiv_proto::{CheckpointAlignment, InitiateCheckpointRequest, TaskAttemptRef};
 use krishiv_shuffle::{
     InMemoryShuffleStore, LocalDiskShuffleStore, ShuffleBackend, open_shuffle_backend_from_uri,
     open_tiered_shuffle_backend,
@@ -31,6 +31,15 @@ use krishiv_state::checkpoint::{CheckpointStorage, open_checkpoint_storage_from_
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tonic::transport::Server;
+
+/// One heartbeat response's coordinator commands, handed to the dedicated
+/// command worker so restore/checkpoint execution never blocks the heartbeat
+/// cadence (a stalled heartbeat loop gets the executor evicted).
+struct CoordinatorCommandBatch {
+    restores: Vec<krishiv_proto::RestoreFromCheckpointCommand>,
+    completes: Vec<krishiv_proto::CheckpointCompleteCommand>,
+    checkpoints: Vec<krishiv_proto::InitiateCheckpointCommand>,
+}
 
 /// Run the executor CLI (blocking async runtime).
 pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::ExecutorResult<()> {
@@ -595,6 +604,84 @@ async fn heartbeat_loop(
     let runner = Arc::new(runner_builder);
     readiness.mark_backends_ready();
 
+    // Coordinator-issued restore/checkpoint commands run on a dedicated
+    // single worker instead of inline in the heartbeat loop. Inline execution
+    // meant a multi-second state restore or checkpoint upload stalled the
+    // heartbeat cadence past the coordinator's timeout — the coordinator then
+    // evicted the (healthy, mid-restore) executor, fenced its lease, and
+    // triggered another rollback+restore: a livelock. One worker consuming an
+    // ordered channel preserves the same execution order the inline code had
+    // (batch arrival order; restores before checkpoint work within a batch)
+    // while heartbeats keep flowing.
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<CoordinatorCommandBatch>();
+    {
+        let runner = Arc::clone(&runner);
+        let state_backend = state_backend.clone();
+        let checkpoint_storage = Arc::clone(&checkpoint_storage);
+        let coord_service = Arc::clone(&coord_service);
+        tokio::spawn(async move {
+            while let Some(batch) = cmd_rx.recv().await {
+                // Restore directives first: state/offset rollback must land
+                // before any new barrier or completion work.
+                for cmd in batch.restores {
+                    let runner_for_restore = Arc::clone(&runner);
+                    let state_for_restore = state_backend.clone();
+                    let storage_for_restore = Arc::clone(&checkpoint_storage);
+                    let restore_result = tokio::task::spawn_blocking(move || {
+                        runner_for_restore.restore_job_from_checkpoint(
+                            &cmd,
+                            &state_for_restore,
+                            storage_for_restore.as_ref(),
+                        )
+                    })
+                    .await;
+                    match restore_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::error!(
+                            error = %error,
+                            "restore command failed; job state may be stale until \
+                             the next restore directive"
+                        ),
+                        Err(join_error) => tracing::error!(
+                            error = %join_error,
+                            "restore command task panicked"
+                        ),
+                    }
+                }
+                // Completion notifications: commit transactional-sink output
+                // for durably committed epochs.
+                for cmd in batch.completes {
+                    runner.handle_checkpoint_complete(&cmd).await;
+                }
+                for cmd in batch.checkpoints {
+                    let req = InitiateCheckpointRequest {
+                        job_id: cmd.job_id.clone(),
+                        epoch: cmd.epoch,
+                        fencing_token: cmd.fencing_token,
+                        alignment: CheckpointAlignment::default(),
+                    };
+                    if let Err(error) = runner
+                        .initiate_checkpoint_for_job(
+                            &req,
+                            state_backend.clone(),
+                            Arc::clone(&checkpoint_storage)
+                                as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
+                            coord_service.as_ref().clone(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            job_id = %cmd.job_id,
+                            epoch = cmd.epoch,
+                            error = %error,
+                            "checkpoint command failed"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     // Spawn `slots` concurrent runner tasks all reading from the same inbox;
     // without this the executor processes one task at a time regardless
     // of the advertised slot count.
@@ -718,64 +805,24 @@ async fn heartbeat_loop(
                         apply_non_stale_heartbeat_lease(runtime, &shared_lease, &heartbeat);
                         readiness.mark_registered(true);
                         readiness.mark_heartbeat_ok(true);
-                        // Restore directives first: state/offset rollback must
-                        // land before any new barrier or completion work.
-                        for cmd in heartbeat.restore_commands() {
-                            let runner_for_restore = Arc::clone(&runner);
-                            let state_for_restore = state_backend.clone();
-                            let storage_for_restore = Arc::clone(&checkpoint_storage);
-                            let cmd = cmd.clone();
-                            let restore_result = tokio::task::spawn_blocking(move || {
-                                runner_for_restore.restore_job_from_checkpoint(
-                                    &cmd,
-                                    &state_for_restore,
-                                    storage_for_restore.as_ref(),
-                                )
-                            })
-                            .await;
-                            match restore_result {
-                                Ok(Ok(())) => {}
-                                Ok(Err(error)) => tracing::error!(
-                                    error = %error,
-                                    "restore command failed; job state may be stale until \
-                                     the next restore directive"
-                                ),
-                                Err(join_error) => tracing::error!(
-                                    error = %join_error,
-                                    "restore command task panicked"
-                                ),
-                            }
-                        }
-                        // Completion notifications: commit transactional-sink
-                        // output for durably committed epochs.
-                        for cmd in heartbeat.checkpoint_complete_commands() {
-                            runner.handle_checkpoint_complete(cmd).await;
-                        }
-                        for cmd in heartbeat.checkpoint_commands() {
-                            if let Ok(job_id) = JobId::try_new(cmd.job_id.as_str()) {
-                                let req = InitiateCheckpointRequest {
-                                    job_id,
-                                    epoch: cmd.epoch,
-                                    fencing_token: cmd.fencing_token,
-                                    alignment: CheckpointAlignment::default(),
-                                };
-                                if let Err(error) = runner
-                                    .initiate_checkpoint_for_job(
-                                        &req,
-                                        state_backend.clone(),
-                                        Arc::clone(&checkpoint_storage) as Arc<dyn krishiv_state::checkpoint::CheckpointStorage>,
-                                        coord_service.as_ref().clone(),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        job_id = %cmd.job_id,
-                                        epoch = cmd.epoch,
-                                        error = %error,
-                                        "checkpoint command failed"
-                                    );
-                                }
-                            }
+                        // Hand restore/checkpoint work to the dedicated
+                        // command worker — never execute it inline here, the
+                        // heartbeat cadence must not depend on data-plane
+                        // durations (see the worker's comment above).
+                        let batch = CoordinatorCommandBatch {
+                            restores: heartbeat.restore_commands().to_vec(),
+                            completes: heartbeat.checkpoint_complete_commands().to_vec(),
+                            checkpoints: heartbeat.checkpoint_commands().to_vec(),
+                        };
+                        if !(batch.restores.is_empty()
+                            && batch.completes.is_empty()
+                            && batch.checkpoints.is_empty())
+                            && cmd_tx.send(batch).is_err()
+                        {
+                            tracing::error!(
+                                "coordinator command worker exited; \
+                                 restore/checkpoint commands dropped"
+                            );
                         }
                         // R7.2: Apply source throttle limits from the coordinator heartbeat
                         // response.  The `SourceThrottleTable` is shared between the heartbeat
