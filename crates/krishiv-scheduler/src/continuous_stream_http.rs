@@ -1324,6 +1324,39 @@ mod tests {
         assert_eq!(error, StatusCode::CONFLICT);
     }
 
+    /// Deregistering a registered-but-never-pushed streaming job must free the
+    /// id. Its task is at attempt 0 (no cycle ever ran); push_cancel_job used to
+    /// `?`-fail on `AttemptId::try_new(0)` → 409 → the job could never be torn
+    /// down (a teardown-leg limbo). Regression guard for that fix.
+    #[tokio::test]
+    async fn deregister_never_pushed_streaming_job_frees_id() {
+        let coordinator = make_coordinator_with_executor("dereg-fresh").await;
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-dereg-fresh".into(),
+                spec: tumbling_spec(),
+            }),
+        )
+        .await
+        .unwrap();
+        // Deregister immediately, before any push (task attempt is still 0).
+        let resp = api_continuous_deregister(
+            State(coordinator.clone()),
+            Path("cs-dereg-fresh".to_string()),
+        )
+        .await
+        .expect("deregister of a never-pushed streaming job must succeed, not 409");
+        assert!(resp.0.cancelled);
+        // The id is freed from the registry, so it can be reused.
+        let coord = coordinator.read().await;
+        let job_id = krishiv_proto::JobId::try_new("cs-dereg-fresh").unwrap();
+        assert!(
+            coord.job_coordinator(&job_id).is_none(),
+            "deregister must free the id from the registry"
+        );
+    }
+
     #[tokio::test]
     async fn push_and_drain_unknown_job_return_not_found() {
         let coordinator = make_coordinator_with_executor("unknown").await;

@@ -783,11 +783,15 @@ impl Coordinator {
                         && let Ok(record) = self.exec.executors.find_executor(executor_id)
                         && let Some(endpoint) = record.descriptor().task_endpoint()
                     {
-                        let attempt_id = AttemptId::try_new(task.attempt()).map_err(|e| {
-                            SchedulerError::InvalidJob {
-                                message: e.to_string(),
-                            }
-                        })?;
+                        // A never-attempted task (attempt 0) has no in-flight
+                        // cycle on the executor to cancel, so skip it rather than
+                        // failing the whole teardown. Previously this `?`-propagated
+                        // `AttemptId::try_new`'s zero-rejection, so deregistering a
+                        // registered-but-never-pushed streaming job 409'd here and
+                        // the job could never be freed (a teardown-leg limbo).
+                        let Ok(attempt_id) = AttemptId::try_new(task.attempt()) else {
+                            continue;
+                        };
                         let req = TaskCancellationRequest::new(TaskAttemptRef::new(
                             job_id.clone(),
                             stage.stage_id().clone(),
