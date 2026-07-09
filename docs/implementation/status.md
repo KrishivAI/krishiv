@@ -1,5 +1,47 @@
 # Krishiv Implementation Status
 
+## 2026-07-09 — streaming conditional aggregates (FILTER/CASE) + two real correctness fixes
+
+Closes the wiki-example gap (TUMBLE compiler 409-rejected `SUM(CASE WHEN…)` /
+`COUNT(*) FILTER`): conditional aggregates now compile and execute across
+TUMBLE/HOP/SESSION.
+
+- **krishiv-plan**: `WindowAgg.filter: Option<WindowAggFilter>` — typed,
+  serde predicate AST (Compare col-vs-literal {Int,Float(bitwise-Eq),Utf8,
+  Bool}, IsNull/IsNotNull, And/Or/Not). Unfiltered aggs serialize
+  byte-identically (wire compat, tested); filtered specs force the lossless
+  JSON fragment format (compact text format has no filter syntax).
+- **krishiv-sql** (`streaming_window_plan.rs`): lowers `FILTER (WHERE …)`
+  (incl. bare boolean columns), `AGG(CASE WHEN c THEN col [ELSE NULL] END)`,
+  `SUM(CASE WHEN c THEN 1 ELSE 0 END)` → conditional COUNT,
+  `COUNT(CASE WHEN c THEN col END)` → COUNT + implied IS NOT NULL; FILTER +
+  CASE combine with AND; non-identity ELSE branches and multi-WHEN are
+  rejected with typed Unsupported. 7 new compiler tests.
+- **krishiv-dataflow**: `PreparedAggInputs` bundles the pre-downcast columns
+  with per-aggregate boolean masks evaluated ONCE per batch via arrow cmp /
+  kleene kernels (`eval_agg_filter`); the per-row hot loop consults the mask
+  (NULL ⇒ excluded, SQL FILTER semantics). Windows keep per-key running
+  accumulators — no row buffering (the "pre-aggregated window state" half of
+  this leg was already the architecture; verified). Operator-level test
+  covers filtered SUM/COUNT + unfiltered SUM side by side.
+- **Real bug #1 (fixed)**: the accumulate paths read `value(row)` without a
+  null check — NULL inputs entered SUM/MIN/MAX/AVG/STDDEV as 0-defaults.
+  NULLs are now skipped (SQL semantics), covered by the operator test.
+- **Real bug #2 (fixed)**: 8 krishiv-api pipeline tests were failing on main
+  since this morning's AUD-3 typed-SUM rework (4a882d6 emitted exact Int64
+  sums but that session never ran the krishiv-api suite). The engine
+  behavior is correct (matches batch SQL); test expectations updated
+  Float64→Int64. Verified pre-existing at 7e687f0 in a worktree before
+  touching anything.
+- Conversion sites carry the filter end-to-end (operator_runtime both
+  directions, runtime plan/local/in-process-cluster specs) — the
+  mechanical-fixer `filter: None` defaults at three conversion seams would
+  have silently dropped filters on the local-streaming path; caught in
+  review, fixed, and covered by the fragment round-trip test.
+
+Validation: plan/dataflow/sql/api/executor/runtime/ivm suites all green;
+clippy `-D warnings` clean on all six touched crates.
+
 ## 2026-07-09 — G14 CLOSED (measured): per-flow SessionContext reuse; IVM ticks 650ms → 13-18ms
 
 `IncrementalFlow` now carries `tick_ctx: Arc<tokio::sync::Mutex<CachedTickContext>>`

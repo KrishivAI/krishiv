@@ -1982,14 +1982,14 @@ async fn pipeline_ivm_cdc_source_to_memory_sink() {
 
     let out = sink.lock().unwrap();
     assert_eq!(out.len(), 1, "sink should receive one snapshot batch");
-    // IncrementalAggOp emits SUM as Float64.
+    // SUM over an Int64 column is Int64 (exact integer sums, as in batch SQL).
     let total = out[0]
         .column(0)
         .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .expect("SUM output column is Float64")
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("SUM output column is Int64")
         .value(0);
-    assert_eq!(total, 150.0, "SUM(amount) over the two CDC inserts");
+    assert_eq!(total, 150, "SUM(amount) over the two CDC inserts");
 }
 
 #[tokio::test]
@@ -2072,10 +2072,10 @@ fn sql_pipeline_create_source_view_sink_start() {
     let total = batches[0]
         .column(0)
         .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .expect("SUM is Float64")
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("SUM over Int64 is Int64")
         .value(0);
-    assert_eq!(total, 150.0);
+    assert_eq!(total, 150);
 }
 
 // ── Connector-backed pipeline + streaming-mode inference ────────────────────
@@ -2230,10 +2230,10 @@ async fn pipeline_stream_connector_source_to_connector_sink() {
     let total = out[0]
         .column(0)
         .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .expect("SUM is Float64")
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("SUM over Int64 is Int64")
         .value(0);
-    assert_eq!(total, 150.0);
+    assert_eq!(total, 150);
 }
 
 #[tokio::test]
@@ -2257,12 +2257,12 @@ async fn pipeline_stream_connector_source_steps_without_pre_draining() {
         .unwrap()
     }
 
-    fn total(batch: &RecordBatch) -> f64 {
+    fn total(batch: &RecordBatch) -> i64 {
         batch
             .column(0)
             .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
-            .expect("SUM is Float64")
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("SUM over Int64 is Int64")
             .value(0)
     }
 
@@ -2290,8 +2290,8 @@ async fn pipeline_stream_connector_source_steps_without_pre_draining() {
         2,
         "stream connector should publish after each coalesced step, not only after source exhaustion"
     );
-    assert_eq!(total(&out[0]), 100.0);
-    assert_eq!(total(&out[1]), 150.0);
+    assert_eq!(total(&out[0]), 100);
+    assert_eq!(total(&out[1]), 150);
 }
 
 #[test]
@@ -2346,10 +2346,10 @@ fn sql_pipeline_parquet_source_and_sink() {
     let total = batches[0]
         .column(0)
         .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .expect("SUM is Float64")
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("SUM over Int64 is Int64")
         .value(0);
-    assert_eq!(total, 150.0);
+    assert_eq!(total, 150);
 }
 
 // ── SDP parity: expectations + validation ───────────────────────────────────
@@ -2544,13 +2544,13 @@ async fn pipeline_persistent_incremental_and_refresh() {
     use crate::{PipelineMode, RunPolicy};
     use std::sync::{Arc as StdArc, Mutex};
 
-    fn sum_of(sink: &StdArc<Mutex<Vec<RecordBatch>>>) -> f64 {
+    fn sum_of(sink: &StdArc<Mutex<Vec<RecordBatch>>>) -> i64 {
         let out = sink.lock().unwrap();
         out[0]
             .column(0)
             .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
-            .expect("SUM is Float64")
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("SUM over Int64 is Int64")
             .value(0)
     }
 
@@ -2567,7 +2567,7 @@ async fn pipeline_persistent_incremental_and_refresh() {
         .run(RunPolicy::Once)
         .await
         .unwrap();
-    assert_eq!(sum_of(&s1), 10.0);
+    assert_eq!(sum_of(&s1), 10);
 
     // Run 2 (same pipeline name): feed only the NEW row [5] → accumulates to 15.
     let s2: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
@@ -2582,7 +2582,7 @@ async fn pipeline_persistent_incremental_and_refresh() {
         .unwrap();
     assert_eq!(
         sum_of(&s2),
-        15.0,
+        15,
         "persistent run accumulates across invocations"
     );
 
@@ -2597,5 +2597,5 @@ async fn pipeline_persistent_incremental_and_refresh() {
         .refresh(RunPolicy::Once)
         .await
         .unwrap();
-    assert_eq!(sum_of(&s3), 100.0, "refresh resets to a fresh state");
+    assert_eq!(sum_of(&s3), 100, "refresh resets to a fresh state");
 }

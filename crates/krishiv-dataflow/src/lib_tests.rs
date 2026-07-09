@@ -60,7 +60,7 @@ fn local_agg_count_per_group() {
     let batch = make_agg_batch(vec!["a", "a", "b", "b", "b"], vec![1, 2, 3, 4, 5]);
     let agg = LocalAggregator::new(
         vec!["grp".into()],
-        vec![AggExpr {
+        vec![AggExpr { filter: None,
             function: AggFunction::Count,
             input_column: "".into(),
             output_column: "cnt".into(),
@@ -95,7 +95,7 @@ fn local_agg_sum_per_group() {
     let batch = make_agg_batch(vec!["a", "a", "b"], vec![1, 2, 5]);
     let agg = LocalAggregator::new(
         vec!["grp".into()],
-        vec![AggExpr {
+        vec![AggExpr { filter: None,
             function: AggFunction::Sum,
             input_column: "val".into(),
             output_column: "total".into(),
@@ -130,12 +130,12 @@ fn local_agg_min_max_int32_per_group() {
     let agg = LocalAggregator::new(
         vec!["grp".into()],
         vec![
-            AggExpr {
+            AggExpr { filter: None,
                 function: AggFunction::Min,
                 input_column: "val".into(),
                 output_column: "min_val".into(),
             },
-            AggExpr {
+            AggExpr { filter: None,
                 function: AggFunction::Max,
                 input_column: "val".into(),
                 output_column: "max_val".into(),
@@ -175,7 +175,7 @@ fn local_agg_single_group_produces_one_row() {
     let batch = make_agg_batch(vec!["x", "x", "x"], vec![1, 2, 3]);
     let agg = LocalAggregator::new(
         vec!["grp".into()],
-        vec![AggExpr {
+        vec![AggExpr { filter: None,
             function: AggFunction::Count,
             input_column: "".into(),
             output_column: "cnt".into(),
@@ -197,17 +197,17 @@ fn local_agg_empty_group_min_max_avg_semantics() {
     use crate::aggregate::AggState;
     use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode, lower_to_physical};
     let exprs = vec![
-        AggExpr {
+        AggExpr { filter: None,
             function: AggFunction::Min,
             input_column: "v".into(),
             output_column: "min_v".into(),
         },
-        AggExpr {
+        AggExpr { filter: None,
             function: AggFunction::Max,
             input_column: "v".into(),
             output_column: "max_v".into(),
         },
-        AggExpr {
+        AggExpr { filter: None,
             function: AggFunction::Avg,
             input_column: "v".into(),
             output_column: "avg_v".into(),
@@ -236,7 +236,7 @@ fn local_agg_one_row_per_unique_key() {
     let batch = make_agg_batch(vec!["a", "b", "c", "a", "b"], vec![1, 2, 3, 4, 5]);
     let agg = LocalAggregator::new(
         vec!["grp".into()],
-        vec![AggExpr {
+        vec![AggExpr { filter: None,
             function: AggFunction::Sum,
             input_column: "val".into(),
             output_column: "total".into(),
@@ -307,7 +307,7 @@ fn count_window_spec() -> TumblingWindowSpec {
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
         window_size_ms: 1000, // 1-second windows
-        agg_exprs: vec![AggExpr {
+        agg_exprs: vec![AggExpr { filter: None,
             function: AggFunction::Count,
             input_column: String::new(),
             output_column: "count".into(),
@@ -403,7 +403,7 @@ fn window_sum_aggregation() {
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
         window_size_ms: 1000,
-        agg_exprs: vec![AggExpr {
+        agg_exprs: vec![AggExpr { filter: None,
             function: AggFunction::Sum,
             input_column: "val".into(),
             output_column: "sum_val".into(),
@@ -430,7 +430,7 @@ fn window_avg_aggregation() {
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
         window_size_ms: 1000,
-        agg_exprs: vec![AggExpr {
+        agg_exprs: vec![AggExpr { filter: None,
             function: AggFunction::Avg,
             input_column: "val".into(),
             output_column: "avg_val".into(),
@@ -570,7 +570,7 @@ fn sliding_spec() -> SlidingWindowSpec {
         event_time_column: "ts".into(),
         window_size_ms: 1000,
         slide_ms: 500,
-        agg_exprs: vec![AggExpr {
+        agg_exprs: vec![AggExpr { filter: None,
             function: AggFunction::Count,
             input_column: "val".into(),
             output_column: "cnt".into(),
@@ -657,7 +657,7 @@ fn sliding_window_avg_aggregation() {
         event_time_column: "ts".into(),
         window_size_ms: 1000,
         slide_ms: 500,
-        agg_exprs: vec![AggExpr {
+        agg_exprs: vec![AggExpr { filter: None,
             function: AggFunction::Avg,
             input_column: "val".into(),
             output_column: "avg_val".into(),
@@ -685,7 +685,7 @@ fn session_spec() -> SessionWindowSpec {
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
         session_gap_ms: 500,
-        agg_exprs: vec![AggExpr {
+        agg_exprs: vec![AggExpr { filter: None,
             function: AggFunction::Count,
             input_column: "val".into(),
             output_column: "cnt".into(),
@@ -740,7 +740,7 @@ fn session_window_avg_aggregation() {
         key_column_type: "utf8".into(),
         event_time_column: "ts".into(),
         session_gap_ms: 500,
-        agg_exprs: vec![AggExpr {
+        agg_exprs: vec![AggExpr { filter: None,
             function: AggFunction::Avg,
             input_column: "val".into(),
             output_column: "avg_val".into(),

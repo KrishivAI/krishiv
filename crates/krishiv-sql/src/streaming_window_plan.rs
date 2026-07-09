@@ -17,11 +17,15 @@
 use std::collections::HashMap;
 
 use datafusion::sql::sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, Statement,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr,
+    Statement, Value,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
-use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec, WindowKind};
+use krishiv_plan::window::{
+    AggFilterCompareOp, AggFilterValue, FloatLiteral, WindowAgg, WindowAggFilter, WindowAggKind,
+    WindowExecutionSpec, WindowKind,
+};
 
 use crate::streaming_tvf::{WindowTvf, find_window_tvf, rewrite_window_tvfs};
 use crate::{SqlError, SqlResult};
@@ -187,7 +191,7 @@ fn maybe_set_key(key: &mut Option<String>, name: &str) {
 
 fn function_to_agg(f: &Function, alias: Option<String>) -> SqlResult<WindowAgg> {
     let fname = f.name.to_string().to_ascii_lowercase();
-    let kind = match fname.as_str() {
+    let mut kind = match fname.as_str() {
         "count" => WindowAggKind::Count,
         "sum" => WindowAggKind::Sum,
         "min" => WindowAggKind::Min,
@@ -201,7 +205,38 @@ fn function_to_agg(f: &Function, alias: Option<String>) -> SqlResult<WindowAgg> 
             )));
         }
     };
-    let input_column = first_arg_column(f);
+
+    // `AGG(x) FILTER (WHERE …)`.
+    let mut filter = match &f.filter {
+        Some(predicate) => Some(lower_filter_expr(predicate)?),
+        None => None,
+    };
+
+    // The aggregate argument: a bare column, or the `CASE WHEN cond THEN x
+    // [ELSE 0|NULL] END` conditional idiom, which lowers to a row filter.
+    let mut input_column = None;
+    if let Some(arg) = first_arg_expr(f) {
+        match arg {
+            Expr::Identifier(id) => input_column = Some(id.value.clone()),
+            Expr::CompoundIdentifier(parts) => {
+                input_column = parts.last().map(|p| p.value.clone());
+            }
+            Expr::Case { .. } => {
+                let lowered = lower_case_arg(arg, kind, &fname)?;
+                kind = lowered.kind;
+                input_column = lowered.input_column;
+                filter = Some(match filter {
+                    Some(existing) => {
+                        WindowAggFilter::And(Box::new(existing), Box::new(lowered.filter))
+                    }
+                    None => lowered.filter,
+                });
+            }
+            // COUNT(*) and other wildcard forms fall through with no column.
+            _ => {}
+        }
+    }
+
     let output_column = alias.unwrap_or_else(|| match &input_column {
         Some(col) => format!("{fname}_{col}"),
         None => fname.clone(),
@@ -210,25 +245,247 @@ fn function_to_agg(f: &Function, alias: Option<String>) -> SqlResult<WindowAgg> 
         kind,
         input_column: input_column.unwrap_or_default(),
         output_column,
+        filter,
     })
 }
 
-fn first_arg_column(f: &Function) -> Option<String> {
+/// The lowering of a `CASE WHEN cond THEN value [ELSE …] END` aggregate
+/// argument: the effective aggregate kind (SUM-of-1 collapses to COUNT), the
+/// value column when the branch yields one, and the row filter.
+struct LoweredCaseArg {
+    kind: WindowAggKind,
+    input_column: Option<String>,
+    filter: WindowAggFilter,
+}
+
+fn lower_case_arg(
+    case: &Expr,
+    kind: WindowAggKind,
+    fname: &str,
+) -> SqlResult<LoweredCaseArg> {
+    let Expr::Case {
+        operand,
+        conditions,
+        else_result,
+        ..
+    } = case
+    else {
+        return Err(unsupported("expected a CASE aggregate argument"));
+    };
+    if operand.is_some() {
+        return Err(unsupported(
+            "CASE <operand> WHEN … aggregate arguments are not supported in streaming \
+             windows; use a searched CASE WHEN <predicate> THEN …",
+        ));
+    }
+    let [when] = conditions.as_slice() else {
+        return Err(unsupported(
+            "streaming windows support exactly one WHEN branch in a CASE aggregate argument",
+        ));
+    };
+    let filter = lower_filter_expr(&when.condition)?;
+
+    // ELSE must be the aggregate's identity (absent, NULL, or 0 for SUM/COUNT).
+    match else_result.as_deref() {
+        None => {}
+        Some(Expr::Value(v)) if matches!(&v.value, Value::Null) => {}
+        Some(Expr::Value(v))
+            if matches!(kind, WindowAggKind::Sum | WindowAggKind::Count)
+                && matches!(&v.value, Value::Number(n, _) if n == "0") => {}
+        Some(other) => {
+            return Err(unsupported(format!(
+                "CASE aggregate argument ELSE branch '{other}' is not the {fname} identity; \
+                 use ELSE NULL (or ELSE 0 for SUM/COUNT)"
+            )));
+        }
+    }
+
+    match &when.result {
+        // SUM(CASE WHEN c THEN 1 …) / COUNT(CASE WHEN c THEN <literal> …):
+        // a conditional row count.
+        Expr::Value(v) => match (&v.value, kind) {
+            (Value::Number(n, _), WindowAggKind::Sum) if n == "1" => Ok(LoweredCaseArg {
+                kind: WindowAggKind::Count,
+                input_column: None,
+                filter,
+            }),
+            (Value::Number(_, _), WindowAggKind::Count) => Ok(LoweredCaseArg {
+                kind: WindowAggKind::Count,
+                input_column: None,
+                filter,
+            }),
+            _ => Err(unsupported(format!(
+                "CASE aggregate argument THEN branch must be a column (or the literal 1 \
+                 for a conditional count); got a literal under {fname}"
+            ))),
+        },
+        // AGG(CASE WHEN c THEN col …): filter + plain column aggregate. For
+        // COUNT, SQL counts non-null results, so add the column null-check.
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let column = match &when.result {
+                Expr::Identifier(id) => id.value.clone(),
+                Expr::CompoundIdentifier(parts) => parts
+                    .last()
+                    .map(|p| p.value.clone())
+                    .ok_or_else(|| unsupported("empty compound identifier in CASE THEN"))?,
+                _ => unreachable!("outer match restricts to identifiers"),
+            };
+            let filter = if kind == WindowAggKind::Count {
+                WindowAggFilter::And(
+                    Box::new(filter),
+                    Box::new(WindowAggFilter::IsNotNull {
+                        column: column.clone(),
+                    }),
+                )
+            } else {
+                filter
+            };
+            let input_column = (kind != WindowAggKind::Count).then_some(column);
+            Ok(LoweredCaseArg {
+                kind,
+                input_column,
+                filter,
+            })
+        }
+        other => Err(unsupported(format!(
+            "CASE aggregate argument THEN branch '{other}' is not supported in streaming \
+             windows; use a column or literal 1"
+        ))),
+    }
+}
+
+/// Lower a SQL predicate to the typed [`WindowAggFilter`] AST the dataflow
+/// operators evaluate. Supports column-vs-literal comparisons, AND/OR/NOT,
+/// and IS [NOT] NULL — the shapes `FILTER (WHERE …)` clauses use in practice.
+fn lower_filter_expr(expr: &Expr) -> SqlResult<WindowAggFilter> {
+    use datafusion::sql::sqlparser::ast::BinaryOperator;
+    match expr {
+        Expr::Nested(inner) => lower_filter_expr(inner),
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => Ok(WindowAggFilter::And(
+                Box::new(lower_filter_expr(left)?),
+                Box::new(lower_filter_expr(right)?),
+            )),
+            BinaryOperator::Or => Ok(WindowAggFilter::Or(
+                Box::new(lower_filter_expr(left)?),
+                Box::new(lower_filter_expr(right)?),
+            )),
+            _ => lower_comparison(left, op, right),
+        },
+        Expr::IsNull(inner) => Ok(WindowAggFilter::IsNull {
+            column: expr_column(inner)?,
+        }),
+        Expr::IsNotNull(inner) => Ok(WindowAggFilter::IsNotNull {
+            column: expr_column(inner)?,
+        }),
+        Expr::UnaryOp {
+            op: datafusion::sql::sqlparser::ast::UnaryOperator::Not,
+            expr,
+        } => Ok(WindowAggFilter::Not(Box::new(lower_filter_expr(expr)?))),
+        // A bare boolean column used as the predicate (`WHERE is_bot`).
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Ok(WindowAggFilter::Compare {
+            column: expr_column(expr)?,
+            op: AggFilterCompareOp::Eq,
+            value: AggFilterValue::Bool(true),
+        }),
+        other => Err(unsupported(format!(
+            "aggregate filter predicate '{other}' is not supported in streaming windows; \
+             use column-vs-literal comparisons combined with AND/OR/NOT and IS [NOT] NULL"
+        ))),
+    }
+}
+
+fn lower_comparison(
+    left: &Expr,
+    op: &datafusion::sql::sqlparser::ast::BinaryOperator,
+    right: &Expr,
+) -> SqlResult<WindowAggFilter> {
+    use datafusion::sql::sqlparser::ast::BinaryOperator;
+    let mapped = match op {
+        BinaryOperator::Eq => AggFilterCompareOp::Eq,
+        BinaryOperator::NotEq => AggFilterCompareOp::NotEq,
+        BinaryOperator::Lt => AggFilterCompareOp::Lt,
+        BinaryOperator::LtEq => AggFilterCompareOp::LtEq,
+        BinaryOperator::Gt => AggFilterCompareOp::Gt,
+        BinaryOperator::GtEq => AggFilterCompareOp::GtEq,
+        other => {
+            return Err(unsupported(format!(
+                "aggregate filter operator '{other}' is not supported in streaming windows"
+            )));
+        }
+    };
+    // `column <op> literal` or the mirrored `literal <op> column`.
+    if let (Ok(column), Some(value)) = (expr_column(left), expr_literal(right)) {
+        Ok(WindowAggFilter::Compare {
+            column,
+            op: mapped,
+            value,
+        })
+    } else if let (Some(value), Ok(column)) = (expr_literal(left), expr_column(right)) {
+        let mirrored = match mapped {
+            AggFilterCompareOp::Lt => AggFilterCompareOp::Gt,
+            AggFilterCompareOp::LtEq => AggFilterCompareOp::GtEq,
+            AggFilterCompareOp::Gt => AggFilterCompareOp::Lt,
+            AggFilterCompareOp::GtEq => AggFilterCompareOp::LtEq,
+            symmetric => symmetric,
+        };
+        Ok(WindowAggFilter::Compare {
+            column,
+            op: mirrored,
+            value,
+        })
+    } else {
+        Err(unsupported(
+            "aggregate filter comparisons must be column-vs-literal in streaming windows",
+        ))
+    }
+}
+
+fn expr_column(expr: &Expr) -> SqlResult<String> {
+    match expr {
+        Expr::Identifier(id) => Ok(id.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| p.value.clone())
+            .ok_or_else(|| unsupported("empty compound identifier in aggregate filter")),
+        Expr::Nested(inner) => expr_column(inner),
+        other => Err(unsupported(format!(
+            "aggregate filter expected a column, got '{other}'"
+        ))),
+    }
+}
+
+fn expr_literal(expr: &Expr) -> Option<AggFilterValue> {
+    let Expr::Value(v) = expr else {
+        return None;
+    };
+    match &v.value {
+        Value::Number(n, _) => {
+            if let Ok(i) = n.parse::<i64>() {
+                Some(AggFilterValue::Int(i))
+            } else {
+                n.parse::<f64>().ok().map(|f| AggFilterValue::Float(FloatLiteral(f)))
+            }
+        }
+        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+            Some(AggFilterValue::Utf8(s.clone()))
+        }
+        Value::Boolean(b) => Some(AggFilterValue::Bool(*b)),
+        _ => None,
+    }
+}
+
+fn first_arg_expr(f: &Function) -> Option<&Expr> {
     let FunctionArguments::List(list) = &f.args else {
         return None;
     };
     for fa in &list.args {
-        let expr = match fa {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+        match fa {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => return Some(e),
             FunctionArg::Named {
                 arg: FunctionArgExpr::Expr(e),
                 ..
-            } => Some(e),
-            _ => None,
-        };
-        match expr {
-            Some(Expr::Identifier(id)) => return Some(id.value.clone()),
-            Some(Expr::CompoundIdentifier(parts)) => return parts.last().map(|p| p.value.clone()),
+            } => return Some(e),
             _ => {}
         }
     }
@@ -305,6 +562,111 @@ mod tests {
                    GROUP BY k, window_start, window_end";
         let err = compile_streaming_window_sql(sql).unwrap_err();
         assert!(matches!(err, SqlError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn compiles_count_filter_where() {
+        let sql = "SELECT domain, COUNT(*) FILTER (WHERE kind = 'edit') AS edits \
+                   FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
+                   GROUP BY domain, window_start, window_end";
+        let plan = compile_streaming_window_sql(sql).unwrap();
+        let agg = &plan.spec.agg_exprs[0];
+        assert_eq!(agg.kind, WindowAggKind::Count);
+        assert_eq!(agg.output_column, "edits");
+        assert_eq!(
+            agg.filter,
+            Some(WindowAggFilter::Compare {
+                column: "kind".into(),
+                op: AggFilterCompareOp::Eq,
+                value: AggFilterValue::Utf8("edit".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn compiles_sum_case_when_column() {
+        let sql = "SELECT domain, SUM(CASE WHEN kind = 'edit' THEN size END) AS edit_bytes \
+                   FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
+                   GROUP BY domain, window_start, window_end";
+        let plan = compile_streaming_window_sql(sql).unwrap();
+        let agg = &plan.spec.agg_exprs[0];
+        assert_eq!(agg.kind, WindowAggKind::Sum);
+        assert_eq!(agg.input_column, "size");
+        assert_eq!(agg.output_column, "edit_bytes");
+        assert!(agg.filter.is_some());
+    }
+
+    #[test]
+    fn sum_case_when_one_lowers_to_conditional_count() {
+        let sql = "SELECT domain, SUM(CASE WHEN is_bot = true THEN 1 ELSE 0 END) AS bots \
+                   FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
+                   GROUP BY domain, window_start, window_end";
+        let plan = compile_streaming_window_sql(sql).unwrap();
+        let agg = &plan.spec.agg_exprs[0];
+        assert_eq!(agg.kind, WindowAggKind::Count, "SUM of 1s is a count");
+        assert_eq!(
+            agg.filter,
+            Some(WindowAggFilter::Compare {
+                column: "is_bot".into(),
+                op: AggFilterCompareOp::Eq,
+                value: AggFilterValue::Bool(true),
+            })
+        );
+    }
+
+    #[test]
+    fn bare_boolean_filter_predicate_compiles() {
+        let sql = "SELECT domain, COUNT(*) FILTER (WHERE is_bot) AS bots \
+                   FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
+                   GROUP BY domain, window_start, window_end";
+        let plan = compile_streaming_window_sql(sql).unwrap();
+        assert_eq!(
+            plan.spec.agg_exprs[0].filter,
+            Some(WindowAggFilter::Compare {
+                column: "is_bot".into(),
+                op: AggFilterCompareOp::Eq,
+                value: AggFilterValue::Bool(true),
+            })
+        );
+    }
+
+    #[test]
+    fn filter_and_case_combine_with_and() {
+        let sql = "SELECT domain, \
+                   SUM(CASE WHEN kind = 'edit' THEN size END) FILTER (WHERE size > 100) AS big \
+                   FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
+                   GROUP BY domain, window_start, window_end";
+        let plan = compile_streaming_window_sql(sql).unwrap();
+        let agg = &plan.spec.agg_exprs[0];
+        assert_eq!(agg.kind, WindowAggKind::Sum);
+        assert_eq!(agg.input_column, "size");
+        assert!(
+            matches!(agg.filter, Some(WindowAggFilter::And(_, _))),
+            "FILTER clause and CASE condition must both apply: {:?}",
+            agg.filter
+        );
+    }
+
+    #[test]
+    fn rejects_case_with_multiple_when_branches() {
+        let sql = "SELECT domain, \
+                   SUM(CASE WHEN a = 1 THEN x WHEN b = 2 THEN y END) AS s \
+                   FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
+                   GROUP BY domain, window_start, window_end";
+        let err = compile_streaming_window_sql(sql).unwrap_err();
+        assert!(matches!(err, SqlError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn rejects_non_identity_else_branch() {
+        let sql = "SELECT domain, MAX(CASE WHEN a = 1 THEN x ELSE 0 END) AS m \
+                   FROM TUMBLE(TABLE events, DESCRIPTOR(ts), 60000) \
+                   GROUP BY domain, window_start, window_end";
+        let err = compile_streaming_window_sql(sql).unwrap_err();
+        assert!(
+            matches!(err, SqlError::Unsupported { .. }),
+            "ELSE 0 under MAX changes semantics and must be rejected"
+        );
     }
 
     #[test]

@@ -1541,15 +1541,16 @@ mod tests {
         }
         let table = upsert.table(&schema).unwrap();
         assert_eq!(table.num_rows(), 2);
-        // The incremental aggregate computes SUM as Float64.
+        // SUM over an Int64 column is Int64 (AUD-3: exact integer sums,
+        // matching batch SQL).
         let totals = table
             .column(1)
             .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
+            .downcast_ref::<arrow::array::Int64Array>()
             .unwrap();
         // Keys sort a < b.
-        assert_eq!(totals.value(0), 11.0, "a's net total after the update");
-        assert_eq!(totals.value(1), 2.0, "b unchanged");
+        assert_eq!(totals.value(0), 11, "a's net total after the update");
+        assert_eq!(totals.value(1), 2, "b unchanged");
     }
 
     #[tokio::test]
@@ -1587,14 +1588,14 @@ mod tests {
         );
         let net: usize = out.iter().map(ChangelogBatch::num_rows).sum();
         assert_eq!(net, 2, "net table is {{a: 11, b: 2}} — two rows");
-        let totals: Vec<f64> = out
+        let totals: Vec<i64> = out
             .iter()
             .flat_map(|cl| {
                 let col = cl
                     .batch()
                     .column(1)
                     .as_any()
-                    .downcast_ref::<arrow::array::Float64Array>()
+                    .downcast_ref::<arrow::array::Int64Array>()
                     .unwrap()
                     .clone();
                 (0..col.len()).map(move |i| col.value(i))
@@ -1602,7 +1603,7 @@ mod tests {
             .collect();
         let mut sorted = totals.clone();
         sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        assert_eq!(sorted, vec![2.0, 11.0], "a updated to 11, b stays 2");
+        assert_eq!(sorted, vec![2, 11], "a updated to 11, b stays 2");
     }
 
     #[tokio::test]

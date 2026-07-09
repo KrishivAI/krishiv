@@ -346,7 +346,7 @@ mod sliding_state_tests {
             event_time_column: "ts".into(),
             window_size_ms: 2000,
             slide_ms: 1000,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
@@ -381,7 +381,7 @@ mod sliding_state_tests {
             event_time_column: "ts".into(),
             window_size_ms: 2000,
             slide_ms: 1000,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
@@ -466,7 +466,7 @@ mod sliding_state_tests {
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             slide_ms: 0,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,

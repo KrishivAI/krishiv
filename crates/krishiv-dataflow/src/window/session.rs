@@ -604,7 +604,7 @@ mod session_state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             session_gap_ms: 500,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: "v".into(),
                 output_column: "cnt".into(),
                 function: AggFunction::Count,
@@ -638,7 +638,7 @@ mod session_state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             session_gap_ms: 500,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: "v".into(),
                 output_column: "cnt".into(),
                 function: AggFunction::Count,
@@ -691,7 +691,7 @@ mod session_state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             session_gap_ms: u64::MAX,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: String::new(),
                 output_column: "cnt".into(),
                 function: AggFunction::Count,
@@ -747,7 +747,7 @@ mod session_state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             session_gap_ms: 1000,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: String::new(),
                 output_column: "cnt".into(),
                 function: AggFunction::Count,

@@ -2,13 +2,132 @@ use ahash::AHashMap as HashMap;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use smallvec::SmallVec;
 
+use krishiv_plan::window::{AggFilterCompareOp, AggFilterValue, WindowAggFilter};
+
 use crate::join::AggKey;
 use crate::{ExecError, ExecResult};
+
+// ── Aggregate filter masks ────────────────────────────────────────────────────
+
+/// Evaluate a [`WindowAggFilter`] over a whole batch as a boolean mask.
+///
+/// NULL results (NULL column values under comparison, Kleene combinators)
+/// stay NULL in the mask; consumers must treat NULL as "row excluded", which
+/// matches SQL `FILTER (WHERE …)` semantics.
+pub(crate) fn eval_agg_filter(
+    filter: &WindowAggFilter,
+    batch: &RecordBatch,
+) -> ExecResult<BooleanArray> {
+    use arrow::compute::kernels::boolean::{and_kleene, not, or_kleene};
+    match filter {
+        WindowAggFilter::Compare { column, op, value } => {
+            eval_compare(batch, column, *op, value)
+        }
+        WindowAggFilter::IsNull { column } => {
+            let col = filter_column(batch, column)?;
+            arrow::compute::is_null(col.as_ref()).map_err(filter_arrow_err)
+        }
+        WindowAggFilter::IsNotNull { column } => {
+            let col = filter_column(batch, column)?;
+            arrow::compute::is_not_null(col.as_ref()).map_err(filter_arrow_err)
+        }
+        WindowAggFilter::And(a, b) => {
+            let (a, b) = (eval_agg_filter(a, batch)?, eval_agg_filter(b, batch)?);
+            and_kleene(&a, &b).map_err(filter_arrow_err)
+        }
+        WindowAggFilter::Or(a, b) => {
+            let (a, b) = (eval_agg_filter(a, batch)?, eval_agg_filter(b, batch)?);
+            or_kleene(&a, &b).map_err(filter_arrow_err)
+        }
+        WindowAggFilter::Not(inner) => {
+            let inner = eval_agg_filter(inner, batch)?;
+            not(&inner).map_err(filter_arrow_err)
+        }
+    }
+}
+
+fn filter_arrow_err(e: arrow::error::ArrowError) -> ExecError {
+    ExecError::InvalidInput(format!("aggregate filter evaluation failed: {e}"))
+}
+
+fn filter_column<'a>(batch: &'a RecordBatch, name: &str) -> ExecResult<&'a ArrayRef> {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .map_err(|_| ExecError::ColumnNotFound(name.to_string()))?;
+    Ok(batch.column(idx))
+}
+
+fn eval_compare(
+    batch: &RecordBatch,
+    column: &str,
+    op: AggFilterCompareOp,
+    value: &AggFilterValue,
+) -> ExecResult<BooleanArray> {
+    use arrow::array::Scalar;
+    use arrow::compute::kernels::cmp;
+    use arrow::datatypes::DataType;
+
+    fn cmp_datum(
+        op: AggFilterCompareOp,
+        lhs: &dyn arrow::array::Datum,
+        rhs: &dyn arrow::array::Datum,
+    ) -> Result<BooleanArray, arrow::error::ArrowError> {
+        match op {
+            AggFilterCompareOp::Eq => cmp::eq(lhs, rhs),
+            AggFilterCompareOp::NotEq => cmp::neq(lhs, rhs),
+            AggFilterCompareOp::Lt => cmp::lt(lhs, rhs),
+            AggFilterCompareOp::LtEq => cmp::lt_eq(lhs, rhs),
+            AggFilterCompareOp::Gt => cmp::gt(lhs, rhs),
+            AggFilterCompareOp::GtEq => cmp::gt_eq(lhs, rhs),
+        }
+    }
+
+    let col = filter_column(batch, column)?;
+    let result = match (col.data_type(), value) {
+        (DataType::Utf8, AggFilterValue::Utf8(s)) => cmp_datum(
+            op,
+            col,
+            &Scalar::new(StringArray::from(vec![s.as_str()])),
+        ),
+        (DataType::Boolean, AggFilterValue::Bool(b)) => cmp_datum(
+            op,
+            col,
+            &Scalar::new(BooleanArray::from(vec![*b])),
+        ),
+        (DataType::Int32 | DataType::Int64, AggFilterValue::Int(v)) => {
+            let cast = arrow::compute::cast(col, &DataType::Int64).map_err(filter_arrow_err)?;
+            cmp_datum(op, &cast, &Scalar::new(Int64Array::from(vec![*v])))
+        }
+        // Any numeric/float mix compares in f64.
+        (
+            DataType::Int32 | DataType::Int64 | DataType::Float64,
+            AggFilterValue::Int(_) | AggFilterValue::Float(_),
+        ) => {
+            let lit = match value {
+                AggFilterValue::Int(v) => *v as f64,
+                AggFilterValue::Float(f) => f.0,
+                _ => unreachable!("outer match restricts to numeric literals"),
+            };
+            let cast = arrow::compute::cast(col, &DataType::Float64).map_err(filter_arrow_err)?;
+            cmp_datum(op, &cast, &Scalar::new(Float64Array::from(vec![lit])))
+        }
+        (other, value) => {
+            return Err(ExecError::UnsupportedType(format!(
+                "aggregate filter cannot compare column '{column}' of type {other} \
+                 against literal {value:?}"
+            )));
+        }
+    };
+    result.map_err(filter_arrow_err)
+}
 
 /// Pre-downcasted Arrow array reference for fast per-row value extraction.
 pub(crate) enum PreDowncastCol<'a> {
@@ -55,6 +174,19 @@ impl<'a> PreDowncastCol<'a> {
             other => Err(ExecError::UnsupportedType(format!(
                 "unsupported column type for pre-downcast: {other}"
             ))),
+        }
+    }
+
+    /// True when the row's value is NULL. SQL aggregates skip NULL inputs;
+    /// without this check `value(row)` reads the type's default (0) into the
+    /// accumulator.
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Int32(arr) => arr.is_null(row),
+            Self::Int64(arr) => arr.is_null(row),
+            Self::Float64(arr) => arr.is_null(row),
+            Self::Utf8(arr) => arr.is_null(row),
+            Self::Bool(arr) => arr.is_null(row),
         }
     }
 
@@ -121,6 +253,10 @@ pub struct AggExpr {
     pub input_column: String,
     /// Output column name in the result batch.
     pub output_column: String,
+    /// Optional row predicate (SQL `FILTER (WHERE …)` / `CASE WHEN` lowering).
+    /// Rows failing it (or where it evaluates to NULL) do not feed this
+    /// aggregate. Evaluated once per batch as a boolean mask.
+    pub filter: Option<WindowAggFilter>,
 }
 
 /// Per-expression accumulator within one group.
@@ -218,6 +354,13 @@ impl AggState {
         row: usize,
     ) -> ExecResult<()> {
         for (entry, expr) in self.entries.iter_mut().zip(agg_exprs.iter()) {
+            if let Some(filter) = &expr.filter {
+                // Reference path: evaluate the mask per call (tests only).
+                let mask = eval_agg_filter(filter, batch)?;
+                if !(mask.is_valid(row) && mask.value(row)) {
+                    continue;
+                }
+            }
             match expr.function {
                 AggFunction::Count => {
                     entry.value = entry.value.checked_add(1).ok_or_else(|| {
@@ -231,6 +374,10 @@ impl AggState {
                         .index_of(&expr.input_column)
                         .map_err(|_| ExecError::ColumnNotFound(expr.input_column.clone()))?;
                     let col = batch.column(col_idx);
+                    if col.is_null(row) {
+                        // SQL semantics: NULL inputs do not feed the aggregate.
+                        continue;
+                    }
                     match col.data_type() {
                         DataType::Float64 => {
                             let v = Self::numeric_value(col, row, &expr.input_column)?;
@@ -309,6 +456,10 @@ impl AggState {
                         .index_of(&expr.input_column)
                         .map_err(|_| ExecError::ColumnNotFound(expr.input_column.clone()))?;
                     let col = batch.column(col_idx);
+                    if col.is_null(row) {
+                        // SQL semantics: NULL inputs do not feed the aggregate.
+                        continue;
+                    }
                     let v = Self::numeric_value(col, row, &expr.input_column)?;
                     entry.avg_sum += v;
                     entry.avg_count += 1;
@@ -327,10 +478,10 @@ impl AggState {
     pub(crate) fn update_pre(
         &mut self,
         agg_exprs: &[AggExpr],
-        pre_cols: &[Option<PreDowncastCol>],
+        pre: &PreparedAggInputs,
         row: usize,
     ) -> ExecResult<()> {
-        update_agg_state_pre(self, agg_exprs, pre_cols, row)
+        update_agg_state_pre(self, agg_exprs, pre, row)
     }
 
     pub(crate) fn finalized_value(&self, i: usize, expr: &AggExpr) -> ExecResult<i64> {
@@ -412,46 +563,71 @@ impl AggState {
     }
 }
 
-/// Pre-downcast the aggregate **input** columns of `batch` once per batch.
+/// Per-batch prepared aggregate inputs: pre-downcast value columns plus the
+/// evaluated filter mask for each aggregate expression.
+pub(crate) struct PreparedAggInputs<'a> {
+    pub(crate) cols: Vec<Option<PreDowncastCol<'a>>>,
+    /// `Some(mask)` for filtered aggregates. A NULL mask slot excludes the
+    /// row, matching SQL `FILTER (WHERE …)` semantics.
+    pub(crate) masks: Vec<Option<BooleanArray>>,
+}
+
+impl PreparedAggInputs<'_> {
+    #[inline]
+    fn row_included(&self, i: usize, row: usize) -> bool {
+        match self.masks.get(i).and_then(|m| m.as_ref()) {
+            Some(mask) => mask.is_valid(row) && mask.value(row),
+            None => true,
+        }
+    }
+}
+
+/// Prepare the aggregate **inputs** of `batch` once per batch.
 ///
 /// This hoists the per-row `schema().index_of()` lookup and the per-row
-/// `as_any().downcast_ref()` out of the hot per-row loop: the window operators
-/// call this once before iterating rows, then call [`AggState::update_pre`] per
-/// row against the cached columns. `Count` aggregates need no input column and
-/// map to `None`. Column-resolution errors (missing column / wrong type)
-/// surface here, at batch setup, instead of on every row.
+/// `as_any().downcast_ref()` out of the hot per-row loop, and evaluates each
+/// aggregate's filter predicate once as a batch-level boolean mask: the window
+/// operators call this once before iterating rows, then call
+/// [`AggState::update_pre`] per row against the cached columns/masks. `Count`
+/// aggregates need no input column and map to `None`. Column-resolution errors
+/// (missing column / wrong type) surface here, at batch setup, instead of on
+/// every row.
 pub(crate) fn downcast_agg_input_cols<'a>(
     batch: &'a RecordBatch,
     agg_exprs: &[AggExpr],
-) -> ExecResult<Vec<Option<PreDowncastCol<'a>>>> {
-    let mut pre = Vec::with_capacity(agg_exprs.len());
+) -> ExecResult<PreparedAggInputs<'a>> {
+    let mut cols = Vec::with_capacity(agg_exprs.len());
+    let mut masks = Vec::with_capacity(agg_exprs.len());
     for expr in agg_exprs {
         if matches!(expr.function, AggFunction::Count) {
-            pre.push(None);
+            cols.push(None);
         } else {
             let idx = batch
                 .schema()
                 .index_of(&expr.input_column)
                 .map_err(|_| ExecError::ColumnNotFound(expr.input_column.clone()))?;
-            pre.push(Some(PreDowncastCol::downcast(batch.column(idx))?));
+            cols.push(Some(PreDowncastCol::downcast(batch.column(idx))?));
         }
+        masks.push(match &expr.filter {
+            Some(filter) => Some(eval_agg_filter(filter, batch)?),
+            None => None,
+        });
     }
-    Ok(pre)
+    Ok(PreparedAggInputs { cols, masks })
 }
 
 /// Fast per-row aggregate state update using pre-downcasted columns.
 fn update_agg_state_pre(
     state: &mut AggState,
     agg_exprs: &[AggExpr],
-    pre_cols: &[Option<PreDowncastCol>],
+    pre: &PreparedAggInputs,
     row: usize,
 ) -> ExecResult<()> {
-    for (i, (entry, (expr, pre_col))) in state
-        .entries
-        .iter_mut()
-        .zip(agg_exprs.iter().zip(pre_cols.iter()))
-        .enumerate()
-    {
+    for (i, (entry, expr)) in state.entries.iter_mut().zip(agg_exprs.iter()).enumerate() {
+        if !pre.row_included(i, row) {
+            continue;
+        }
+        let pre_col = pre.cols.get(i).and_then(|c| c.as_ref());
         match expr.function {
             AggFunction::Count => {
                 entry.value = entry.value.checked_add(1).ok_or_else(|| {
@@ -460,11 +636,15 @@ fn update_agg_state_pre(
                 entry.has_value = true;
             }
             AggFunction::Sum | AggFunction::Min | AggFunction::Max => {
-                let col = pre_col.as_ref().ok_or_else(|| {
+                let col = pre_col.ok_or_else(|| {
                     ExecError::Arrow(format!(
                         "Sum/Min/Max aggregate expr {i} missing input column"
                     ))
                 })?;
+                if col.is_null(row) {
+                    // SQL semantics: NULL inputs do not feed the aggregate.
+                    continue;
+                }
                 if matches!(col, PreDowncastCol::Float64(_)) {
                     let v = col.float64_value(row)?;
                     match expr.function {
@@ -507,11 +687,15 @@ fn update_agg_state_pre(
                 }
             }
             AggFunction::Avg | AggFunction::Stddev => {
-                let col = pre_col.as_ref().ok_or_else(|| {
+                let col = pre_col.ok_or_else(|| {
                     ExecError::Arrow(format!(
                         "Avg/Stddev aggregate expr {i} missing input column"
                     ))
                 })?;
+                if col.is_null(row) {
+                    // SQL semantics: NULL inputs do not feed the aggregate.
+                    continue;
+                }
                 let v = col.float64_value(row)?;
                 entry.avg_sum += v;
                 entry.avg_count += 1;
@@ -776,7 +960,7 @@ mod tests {
 
     #[test]
     fn count_overflow_returns_error() {
-        let exprs = vec![AggExpr {
+        let exprs = vec![AggExpr { filter: None,
             function: AggFunction::Count,
             input_column: String::new(),
             output_column: "cnt".into(),
@@ -785,7 +969,11 @@ mod tests {
         state.entries[0].value = i64::MAX;
         state.entries[0].has_value = true;
 
-        let result = update_agg_state_pre(&mut state, &exprs, &[None], 0);
+        let pre = PreparedAggInputs {
+            cols: vec![None],
+            masks: vec![None],
+        };
+        let result = update_agg_state_pre(&mut state, &exprs, &pre, 0);
         assert!(
             matches!(result, Err(ExecError::InvalidInput(_))),
             "count at i64::MAX must return Err(InvalidInput), got {result:?}"
@@ -794,7 +982,7 @@ mod tests {
 
     #[test]
     fn sum_overflow_returns_error() {
-        let exprs = vec![AggExpr {
+        let exprs = vec![AggExpr { filter: None,
             function: AggFunction::Sum,
             input_column: "v".into(),
             output_column: "sum_v".into(),
@@ -815,7 +1003,7 @@ mod tests {
     }
 
     fn stddev_state_over(values: Vec<i64>) -> AggState {
-        let exprs = vec![AggExpr {
+        let exprs = vec![AggExpr { filter: None,
             function: AggFunction::Stddev,
             input_column: "v".into(),
             output_column: "sd_v".into(),

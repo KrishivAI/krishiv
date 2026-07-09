@@ -17,7 +17,7 @@ fn agg_descriptor_to_expr(desc: &AggDescriptor) -> AggExpr {
         AggKind::Max => AggFunction::Max,
         AggKind::Mean => AggFunction::Avg,
     };
-    AggExpr {
+    AggExpr { filter: None,
         function,
         input_column: desc.input_column.clone().unwrap_or_default(),
         output_column: desc.output_name.clone(),

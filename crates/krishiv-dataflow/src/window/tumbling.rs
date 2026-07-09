@@ -491,7 +491,7 @@ mod state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
@@ -525,7 +525,7 @@ mod state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
@@ -547,7 +547,7 @@ mod state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 0,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
@@ -582,7 +582,7 @@ mod state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
@@ -679,12 +679,12 @@ mod aggregation_proptests {
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![
-                AggExpr {
+                AggExpr { filter: None,
                     function: AggFunction::Count,
                     input_column: String::new(),
                     output_column: "cnt".into(),
                 },
-                AggExpr {
+                AggExpr { filter: None,
                     function: AggFunction::Sum,
                     input_column: "v".into(),
                     output_column: "sum_v".into(),
@@ -786,8 +786,8 @@ mod aggregation_proptests {
                 event_time_column: "ts".into(),
                 window_size_ms: 1000,
                 agg_exprs: vec![
-                    AggExpr { function: AggFunction::Min, input_column: "v".into(), output_column: "min_v".into() },
-                    AggExpr { function: AggFunction::Max, input_column: "v".into(), output_column: "max_v".into() },
+                    AggExpr { filter: None, function: AggFunction::Min, input_column: "v".into(), output_column: "min_v".into() },
+                    AggExpr { filter: None, function: AggFunction::Max, input_column: "v".into(), output_column: "max_v".into() },
                 ],
                 agg_is_float: vec![false, false],
             };
@@ -821,7 +821,7 @@ mod aggregation_proptests {
                 key_column_type: "utf8".into(),
                 event_time_column: "ts".into(),
                 window_size_ms: 1000,
-                agg_exprs: vec![AggExpr {
+                agg_exprs: vec![AggExpr { filter: None,
                     function: AggFunction::Count,
                     input_column: String::new(),
                     output_column: "cnt".into(),
@@ -868,5 +868,99 @@ mod aggregation_proptests {
                 "late_events_dropped counter must equal number of late events"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use krishiv_plan::window::{AggFilterCompareOp, AggFilterValue, WindowAggFilter};
+
+    fn kind_is_edit() -> WindowAggFilter {
+        WindowAggFilter::Compare {
+            column: "kind".into(),
+            op: AggFilterCompareOp::Eq,
+            value: AggFilterValue::Utf8("edit".into()),
+        }
+    }
+
+    /// SQL `FILTER (WHERE …)` semantics on the window accumulators: filtered
+    /// SUM only sees matching rows, filtered COUNT counts matching rows, an
+    /// unfiltered SUM still sees everything — and NULL inputs feed no
+    /// aggregate (they used to enter the accumulator as 0-defaults).
+    #[test]
+    fn filtered_aggregates_and_null_inputs() {
+        let spec = TumblingWindowSpec {
+            key_column: "k".into(),
+            key_column_type: "utf8".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            agg_exprs: vec![
+                AggExpr {
+                    function: AggFunction::Sum,
+                    input_column: "v".into(),
+                    output_column: "edit_bytes".into(),
+                    filter: Some(kind_is_edit()),
+                },
+                AggExpr {
+                    function: AggFunction::Count,
+                    input_column: String::new(),
+                    output_column: "edits".into(),
+                    filter: Some(kind_is_edit()),
+                },
+                AggExpr {
+                    function: AggFunction::Sum,
+                    input_column: "v".into(),
+                    output_column: "all_bytes".into(),
+                    filter: None,
+                },
+            ],
+            agg_is_float: vec![false, false, false],
+        };
+        let mut op = TumblingWindowOperator::new(spec);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("kind", DataType::Utf8, false),
+        ]));
+        // Window [0, 1000): edit/10, log/5, edit/NULL, edit/7.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a", "a", "a"])),
+                Arc::new(Int64Array::from(vec![100, 200, 300, 400])),
+                Arc::new(Int64Array::from(vec![Some(10), Some(5), None, Some(7)])),
+                Arc::new(StringArray::from(vec!["edit", "log", "edit", "edit"])),
+            ],
+        )
+        .unwrap();
+        assert!(op.process_batch(&batch, 400).unwrap().is_empty());
+
+        // A later event advances the watermark past window_end and closes it.
+        let closer = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![5000])),
+                Arc::new(Int64Array::from(vec![Some(1)])),
+                Arc::new(StringArray::from(vec!["log"])),
+            ],
+        )
+        .unwrap();
+        let closed = op.process_batch(&closer, 5000).unwrap();
+        assert_eq!(closed.len(), 1, "exactly the [0,1000) window closes");
+        let out = &closed[0];
+        let col = |name: &str| -> i64 {
+            let idx = out.schema().index_of(name).unwrap();
+            out.column(idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(col("edit_bytes"), 17, "10 + 7; log row filtered, NULL skipped");
+        assert_eq!(col("edits"), 3, "all kind='edit' rows count, NULL v included");
+        assert_eq!(col("all_bytes"), 22, "10 + 5 + 7; NULL skipped, no filter");
     }
 }

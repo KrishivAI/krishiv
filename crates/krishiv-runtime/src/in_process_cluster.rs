@@ -262,6 +262,7 @@ impl From<&LocalWindowExecutionSpec> for WindowExecutionSpec {
                         AggFunction::Stddev => WindowAggKind::Stddev,
                     };
                     WindowAgg {
+                        filter: a.filter.clone(),
                         kind,
                         input_column: a.input_column.clone(),
                         output_column: a.output_column.clone(),
@@ -319,6 +320,7 @@ impl From<&WindowExecutionSpec> for LocalWindowExecutionSpec {
                         WindowAggKind::Stddev => AggFunction::Stddev,
                     };
                     AggExpr {
+                        filter: a.filter.clone(),
                         function,
                         input_column: a.input_column.clone(),
                         output_column: a.output_column.clone(),

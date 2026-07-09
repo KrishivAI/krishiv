@@ -6,6 +6,21 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **Conditional aggregates in streaming windows** (2026-07-09):
+  `AGG(x) FILTER (WHERE …)` and the `AGG(CASE WHEN cond THEN x [ELSE
+  0|NULL] END)` idiom now compile for TUMBLE/HOP/SESSION windows instead
+  of 409-ing (`SUM(CASE WHEN c THEN 1 ELSE 0 END)` lowers to a
+  conditional COUNT; `COUNT(CASE WHEN c THEN col END)` adds the implied
+  IS NOT NULL). Predicates lower to a typed, serialized filter AST on
+  `WindowAgg` (column-vs-literal comparisons, AND/OR/NOT, IS [NOT] NULL,
+  bare boolean columns) that the dataflow operators evaluate once per
+  batch as Arrow boolean masks — the window state stays per-key running
+  accumulators, no row buffering. Wire-compatible: unfiltered specs
+  serialize byte-identically; filtered specs use the lossless JSON
+  fragment format.
+
 ### Changed
 
 - **IVM ticks reuse one spill-capable `SessionContext` per flow** (G14,
@@ -22,6 +37,16 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **Window aggregates no longer feed NULL inputs into accumulators as
+  zeros** (2026-07-09): the per-row accumulate path read `value(row)`
+  without a null check, so a NULL in a SUM/MIN/MAX/AVG/STDDEV input
+  column entered the aggregate as the Arrow default (0). NULL inputs are
+  now skipped, matching SQL semantics.
+- **8 stale krishiv-api pipeline tests** (2026-07-09): they asserted the
+  pre-AUD-3 behavior that IVM `SUM(Int64)` outputs Float64; the typed
+  aggregate rework (4a882d6) correctly emits Int64 (matching batch SQL),
+  and that session did not run the krishiv-api suite. Expectations
+  updated to Int64.
 - **Chained DiffBased views no longer read stale upstream output within a
   tick** (2026-07-09): `SessionContext::register_table` errors on duplicate
   names, and the per-view upstream registration swallowed that error with

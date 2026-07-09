@@ -331,7 +331,7 @@ mod tests {
             key_column_type: "int32".into(),
             size,
             slide,
-            agg_exprs: vec![AggExpr {
+            agg_exprs: vec![AggExpr { filter: None,
                 function: AggFunction::Count,
                 input_column: String::new(),
                 output_column: "cnt".into(),

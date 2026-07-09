@@ -124,6 +124,7 @@ fn window_aggs_to_exec(aggs: &[krishiv_plan::window::WindowAgg]) -> Vec<AggExpr>
                 WindowAggKind::Stddev => AggFunction::Stddev,
             };
             AggExpr {
+                filter: agg.filter.clone(),
                 function,
                 input_column: agg.input_column.clone(),
                 output_column: agg.output_column.clone(),

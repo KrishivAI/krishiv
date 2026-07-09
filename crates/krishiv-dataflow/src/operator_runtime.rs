@@ -106,6 +106,7 @@ pub(crate) fn window_agg_to_expr(agg: &WindowAgg) -> AggExpr {
         function,
         input_column: agg.input_column.clone(),
         output_column: agg.output_column.clone(),
+        filter: agg.filter.clone(),
     }
 }
 
@@ -598,6 +599,7 @@ pub fn local_spec_to_window_execution(params: LocalWindowParams) -> WindowExecut
                     kind,
                     input_column: a.input_column.clone(),
                     output_column: a.output_column.clone(),
+                    filter: a.filter.clone(),
                 }
             })
             .collect(),

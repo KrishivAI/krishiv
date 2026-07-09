@@ -29,12 +29,88 @@ pub enum WindowAggKind {
     Stddev,
 }
 
+/// Comparison operator inside a [`WindowAggFilter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggFilterCompareOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+/// A float literal with bitwise equality so filter ASTs stay `Eq`-comparable.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FloatLiteral(pub f64);
+
+impl PartialEq for FloatLiteral {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+impl Eq for FloatLiteral {}
+
+/// Literal value a filter compares a column against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggFilterValue {
+    Int(i64),
+    Float(FloatLiteral),
+    Utf8(String),
+    Bool(bool),
+}
+
+/// Typed per-aggregate row predicate for streaming windows.
+///
+/// This is the engine-internal lowering target for SQL
+/// `AGG(x) FILTER (WHERE …)` and the `AGG(CASE WHEN … THEN x END)` idiom: a
+/// small, serializable predicate AST the dataflow operators can evaluate with
+/// plain Arrow compute kernels (the dataflow crate deliberately has no SQL or
+/// DataFusion dependency). Rows failing the predicate (or where it evaluates
+/// to NULL) do not feed the aggregate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowAggFilter {
+    /// `column <op> literal`. NULL column values compare as "no match".
+    Compare {
+        column: String,
+        op: AggFilterCompareOp,
+        value: AggFilterValue,
+    },
+    IsNull { column: String },
+    IsNotNull { column: String },
+    And(Box<WindowAggFilter>, Box<WindowAggFilter>),
+    Or(Box<WindowAggFilter>, Box<WindowAggFilter>),
+    Not(Box<WindowAggFilter>),
+}
+
+impl WindowAggFilter {
+    /// Every column name the predicate references (for validation).
+    pub fn columns(&self) -> Vec<&str> {
+        match self {
+            WindowAggFilter::Compare { column, .. }
+            | WindowAggFilter::IsNull { column }
+            | WindowAggFilter::IsNotNull { column } => vec![column.as_str()],
+            WindowAggFilter::And(a, b) | WindowAggFilter::Or(a, b) => {
+                let mut cols = a.columns();
+                cols.extend(b.columns());
+                cols
+            }
+            WindowAggFilter::Not(inner) => inner.columns(),
+        }
+    }
+}
+
 /// One aggregate in a windowed stream plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowAgg {
     pub kind: WindowAggKind,
     pub input_column: String,
     pub output_column: String,
+    /// Optional row predicate (`FILTER (WHERE …)` / `CASE WHEN` lowering);
+    /// rows failing it do not feed this aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<WindowAggFilter>,
 }
 
 impl WindowAgg {
@@ -43,7 +119,15 @@ impl WindowAgg {
             kind: WindowAggKind::Count,
             input_column: String::new(),
             output_column: output_column.into(),
+            filter: None,
         }
+    }
+
+    /// Attach a row predicate to this aggregate.
+    #[must_use]
+    pub fn with_filter(mut self, filter: WindowAggFilter) -> Self {
+        self.filter = Some(filter);
+        self
     }
 }
 
@@ -288,6 +372,14 @@ pub fn validate_window_execution_spec(spec: &WindowExecutionSpec) -> Result<(), 
                 aggregate.output_column
             )));
         }
+        if let Some(filter) = &aggregate.filter
+            && filter.columns().iter().any(|c| c.trim().is_empty())
+        {
+            return Err(PlanError::Validation(format!(
+                "window aggregate '{}' filter references an empty column name",
+                aggregate.output_column
+            )));
+        }
     }
 
     if let Some(source_id_column) = &spec.source_id_column
@@ -345,7 +437,9 @@ fn unescape_compact_value(s: &str) -> String {
 /// format because the compact format's `:` field delimiter conflicts with
 /// agg parameter syntax (`agg=sum:col=amount`).
 pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> Result<String, PlanError> {
-    if spec.agg_exprs.len() > 1 {
+    // Filtered aggregates also need the lossless JSON format: the compact
+    // text format has no filter syntax.
+    if spec.agg_exprs.len() > 1 || spec.agg_exprs.iter().any(|a| a.filter.is_some()) {
         return encode_window_execution_spec(spec);
     }
     let agg = if spec.agg_exprs.is_empty() {
@@ -559,7 +653,7 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
 
     let agg = match agg_kind.as_deref() {
         None | Some("count") => WindowAgg::count("count"),
-        Some("sum") => WindowAgg {
+        Some("sum") => WindowAgg { filter: None,
             kind: WindowAggKind::Sum,
             input_column: agg_col.clone().ok_or_else(|| {
                 PlanError::Parse(String::from(
@@ -568,7 +662,7 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             })?,
             output_column: format!("sum_{}", agg_col.as_deref().unwrap_or("val")),
         },
-        Some("min") => WindowAgg {
+        Some("min") => WindowAgg { filter: None,
             kind: WindowAggKind::Min,
             input_column: agg_col.clone().ok_or_else(|| {
                 PlanError::Parse(String::from(
@@ -577,7 +671,7 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             })?,
             output_column: format!("min_{}", agg_col.as_deref().unwrap_or("val")),
         },
-        Some("max") => WindowAgg {
+        Some("max") => WindowAgg { filter: None,
             kind: WindowAggKind::Max,
             input_column: agg_col.clone().ok_or_else(|| {
                 PlanError::Parse(String::from(
@@ -586,7 +680,7 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             })?,
             output_column: format!("max_{}", agg_col.as_deref().unwrap_or("val")),
         },
-        Some("avg") => WindowAgg {
+        Some("avg") => WindowAgg { filter: None,
             kind: WindowAggKind::Avg,
             input_column: agg_col.clone().ok_or_else(|| {
                 PlanError::Parse(String::from(
@@ -595,7 +689,7 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             })?,
             output_column: format!("avg_{}", agg_col.as_deref().unwrap_or("val")),
         },
-        Some("stddev") => WindowAgg {
+        Some("stddev") => WindowAgg { filter: None,
             kind: WindowAggKind::Stddev,
             input_column: agg_col.clone().ok_or_else(|| {
                 PlanError::Parse(String::from(
@@ -706,6 +800,45 @@ fn split_stream_fields(payload: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn filtered_agg_fragment_round_trips_via_json() {
+        let mut spec = WindowExecutionSpec::tumbling("k", "ts", 60_000);
+        spec.agg_exprs = vec![
+            WindowAgg {
+                kind: WindowAggKind::Sum,
+                input_column: "size".into(),
+                output_column: "edit_bytes".into(),
+                filter: Some(WindowAggFilter::And(
+                    Box::new(WindowAggFilter::Compare {
+                        column: "kind".into(),
+                        op: AggFilterCompareOp::Eq,
+                        value: AggFilterValue::Utf8("edit".into()),
+                    }),
+                    Box::new(WindowAggFilter::IsNotNull {
+                        column: "size".into(),
+                    }),
+                )),
+            },
+        ];
+        let encoded = encode_stream_fragment(&spec).unwrap();
+        assert!(
+            encoded.starts_with(WINDOW_EXECUTION_SPEC_PREFIX),
+            "filtered aggregates must take the lossless JSON fragment format, got: {encoded}"
+        );
+        let decoded = decode_window_execution_spec(&encoded).unwrap();
+        assert_eq!(decoded, spec, "filter survives the fragment round trip");
+    }
+
+    #[test]
+    fn unfiltered_agg_json_omits_filter_field_for_wire_compat() {
+        let spec = WindowExecutionSpec::tumbling("k", "ts", 60_000);
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(
+            !json.contains("\"filter\""),
+            "unfiltered aggregates must serialize byte-identically to the pre-filter format"
+        );
+    }
     use super::*;
 
     #[test]
@@ -750,7 +883,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![
                 WindowAgg::count("event_count"),
-                WindowAgg {
+                WindowAgg { filter: None,
                     kind: WindowAggKind::Sum,
                     input_column: String::from("amount"),
                     output_column: String::from("gross_amount"),
@@ -966,7 +1099,7 @@ mod tests {
 
         fn arb_agg() -> impl Strategy<Value = WindowAgg> {
             (arb_agg_kind(), "[a-zA-Z0-9_ ]{0,8}", "[a-zA-Z0-9_ ]{0,8}").prop_map(
-                |(kind, input_column, output_column)| WindowAgg {
+                |(kind, input_column, output_column)| WindowAgg { filter: None,
                     kind,
                     input_column,
                     output_column,
