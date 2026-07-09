@@ -1,5 +1,27 @@
 # Krishiv Implementation Status
 
+## 2026-07-09 — Iceberg scan audit: multi-file snapshots read ALL files (real data-loss bug fixed)
+
+Audited the governed-Iceberg batch scan path (taxi trips/zones shape) for
+pruning/late-materialization. Findings:
+
+- **Real bug (fixed)**: `iceberg_table_provider` built the DataFusion listing
+  from `plan_files()`'s FIRST path only ("For multiple files with different
+  parents, we use the first file directly") — a multi-file snapshot silently
+  scanned one Parquet file and returned a subset of rows. Prod taxi tables
+  were seeded as single files, which is the only reason results were complete.
+  Now `ListingTableConfig::new_with_multi_paths` over exactly the snapshot's
+  files (never a directory glob → orphaned files from superseded snapshots
+  are never picked up). Regression test: 3-file table, COUNT+SUM over all
+  files.
+- **Already correct**: projection pushdown + Parquet row-group predicate
+  pruning are active (`ParquetFormat::with_enable_pruning(true)`,
+  `with_collect_stat(true)`); per-key window state is accumulator-based.
+- **Scoped follow-up (not done)**: manifest-level file pruning via
+  `scan().with_filter(...)` needs a per-query custom TableProvider (the
+  provider is built at catalog-resolution time, before predicates are
+  known). Worth doing with the G7 leg.
+
 ## 2026-07-09 — streaming conditional aggregates (FILTER/CASE) + two real correctness fixes
 
 Closes the wiki-example gap (TUMBLE compiler 409-rejected `SUM(CASE WHEN…)` /

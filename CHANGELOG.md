@@ -37,6 +37,14 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **Multi-file Iceberg snapshots no longer scan only their first data
+  file** (2026-07-09): the DataFusion provider built its listing from
+  `plan_files()`'s first path only, so any governed Iceberg table whose
+  snapshot has more than one Parquet file silently returned a subset of
+  its rows (single-file seeds masked this in prod). The listing is now
+  multi-path over exactly the snapshot's files — every live file is
+  scanned, orphaned files from superseded snapshots never are, and
+  projection + Parquet row-group pruning still apply per file.
 - **Window aggregates no longer feed NULL inputs into accumulators as
   zeros** (2026-07-09): the per-row accumulate path read `value(row)`
   without a null check, so a NULL in a SUM/MIN/MAX/AVG/STDDEV input

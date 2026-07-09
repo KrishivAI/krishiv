@@ -150,7 +150,7 @@ pub mod iceberg_scan {
         }
     }
 
-    async fn listing_provider_from_paths(
+    pub(crate) async fn listing_provider_from_paths(
         paths: Vec<String>,
         arrow_schema: SchemaRef,
     ) -> DfResult<Arc<dyn TableProvider>> {
@@ -161,9 +161,15 @@ pub mod iceberg_scan {
             return Ok(Arc::new(MemTable::try_new(arrow_schema, vec![vec![]])?));
         };
 
-        // Use the first file path as the listing root; DataFusion globs for *.parquet.
-        // For multiple files with different parents, we use the first file directly.
-        let listing_url = ListingTableUrl::parse(first_path)?;
+        // One listing URL per snapshot data file. `plan_files()` is the
+        // authority on the snapshot's contents: scanning exactly these paths
+        // reads every live file (a single-path config silently dropped every
+        // file after the first) and never picks up orphaned files from
+        // superseded snapshots the way a directory glob would.
+        let listing_urls = paths
+            .iter()
+            .map(ListingTableUrl::parse)
+            .collect::<DfResult<Vec<_>>>()?;
 
         let format = Arc::new(ParquetFormat::default().with_enable_pruning(true));
         let listing_options = ListingOptions::new(format)
@@ -175,20 +181,23 @@ pub mod iceberg_scan {
         // env — otherwise `infer_schema` fails with "no object store for s3://"
         // before the query's own (S3-registered) context ever scans the table.
         let state = SessionStateBuilder::new().with_default_features().build();
-        if first_path.starts_with("s3://") || first_path.starts_with("s3a://") {
-            if let Ok(url) = url::Url::parse(first_path) {
-                let bucket = url.host_str().unwrap_or_default();
-                let store_url = url::Url::parse(&format!("s3://{bucket}")).map_err(|e| {
-                    DataFusionError::External(format!("invalid s3 bucket url: {e}").into())
-                })?;
-                let store = crate::build_s3_object_store(bucket)
-                    .map_err(|e| DataFusionError::External(format!("s3 store init: {e}").into()))?;
-                state.runtime_env().register_object_store(&store_url, store);
-            }
+        if (first_path.starts_with("s3://") || first_path.starts_with("s3a://"))
+            && let Ok(url) = url::Url::parse(first_path)
+        {
+            let bucket = url.host_str().unwrap_or_default();
+            let store_url = url::Url::parse(&format!("s3://{bucket}")).map_err(|e| {
+                DataFusionError::External(format!("invalid s3 bucket url: {e}").into())
+            })?;
+            let store = crate::build_s3_object_store(bucket)
+                .map_err(|e| DataFusionError::External(format!("s3 store init: {e}").into()))?;
+            state.runtime_env().register_object_store(&store_url, store);
         }
-        let schema = listing_options.infer_schema(&state, &listing_url).await?;
+        let first_url = listing_urls
+            .first()
+            .ok_or_else(|| DataFusionError::Internal("non-empty paths checked above".into()))?;
+        let schema = listing_options.infer_schema(&state, first_url).await?;
 
-        let config = ListingTableConfig::new(listing_url)
+        let config = ListingTableConfig::new_with_multi_paths(listing_urls)
             .with_listing_options(listing_options)
             .with_schema(schema);
 
@@ -250,5 +259,67 @@ mod tests {
         let provider = iceberg_table_provider(table).await.unwrap();
         // Empty table returns an empty-schema MemTable — just check it's Some.
         let _ = datafusion::catalog::TableProvider::schema(&*provider);
+    }
+
+    /// Regression: a snapshot with multiple data files must scan ALL of them.
+    /// The provider previously built the listing from `paths.first()` only,
+    /// silently dropping every file after the first.
+    #[tokio::test]
+    async fn multi_file_snapshot_scans_every_file() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Int64,
+            false,
+        )]));
+        let mut paths = Vec::new();
+        for (i, vals) in [vec![1_i64, 2], vec![10], vec![100, 200, 300]]
+            .into_iter()
+            .enumerate()
+        {
+            let path = dir.path().join(format!("part-{i}.parquet"));
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vals))],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            paths.push(path.to_str().unwrap().to_string());
+        }
+
+        let provider = super::iceberg_scan::listing_provider_from_paths(paths, schema)
+            .await
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT COUNT(*) AS n, SUM(v) AS s FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let s = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 6, "all three files' rows must be scanned");
+        assert_eq!(s, 613, "1+2+10+100+200+300 across the three files");
     }
 }
