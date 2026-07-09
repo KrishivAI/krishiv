@@ -60,6 +60,14 @@ impl TypedTaskFragment {
         if fragment.starts_with("stream:") {
             return ExecutionKind::Streaming;
         }
+        // Stateless IVM tick shipped by the coordinator's distributed dispatch
+        // (`submit_distributed_ivm_step`). The body is a raw
+        // `delta:step:{job}|{deltas}|{specs}|{state}` string; without this the
+        // executor infers Batch and the batch dispatcher rejects it as an
+        // "unsupported batch fragment type", forcing central-compute fallback.
+        if fragment.starts_with("delta:step:") {
+            return ExecutionKind::DeltaBatch;
+        }
         if let Some(op) = crate::lowering::decode_task_fragment(fragment) {
             return match op {
                 NodeOp::Window { .. }
@@ -174,6 +182,16 @@ mod tests {
         assert_eq!(
             execution_kind_from_fragment("stream:tw:key=u"),
             ExecutionKind::Streaming
+        );
+    }
+
+    #[test]
+    fn legacy_delta_step_prefix_is_delta_batch() {
+        // Distributed IVM tick fragment must classify as DeltaBatch so the
+        // executor routes it to the IVM handler, not the batch dispatcher.
+        assert_eq!(
+            execution_kind_from_fragment("delta:step:orders|d|s|st"),
+            ExecutionKind::DeltaBatch
         );
     }
 
