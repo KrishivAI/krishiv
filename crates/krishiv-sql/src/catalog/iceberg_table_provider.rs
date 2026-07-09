@@ -170,8 +170,22 @@ pub mod iceberg_scan {
             .with_file_extension(".parquet")
             .with_collect_stat(true);
 
-        // Build a temporary session state to infer the schema.
+        // Build a temporary session state to infer the schema. For an object-store
+        // data path, register the S3/MinIO store on this transient state's runtime
+        // env — otherwise `infer_schema` fails with "no object store for s3://"
+        // before the query's own (S3-registered) context ever scans the table.
         let state = SessionStateBuilder::new().with_default_features().build();
+        if first_path.starts_with("s3://") || first_path.starts_with("s3a://") {
+            if let Ok(url) = url::Url::parse(first_path) {
+                let bucket = url.host_str().unwrap_or_default();
+                let store_url = url::Url::parse(&format!("s3://{bucket}")).map_err(|e| {
+                    DataFusionError::External(format!("invalid s3 bucket url: {e}").into())
+                })?;
+                let store = crate::build_s3_object_store(bucket)
+                    .map_err(|e| DataFusionError::External(format!("s3 store init: {e}").into()))?;
+                state.runtime_env().register_object_store(&store_url, store);
+            }
+        }
         let schema = listing_options.infer_schema(&state, &listing_url).await?;
 
         let config = ListingTableConfig::new(listing_url)

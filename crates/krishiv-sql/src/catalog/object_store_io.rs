@@ -41,7 +41,6 @@ use iceberg::io::{
     StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
-use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
@@ -93,25 +92,7 @@ impl KrishivStorage {
             return Ok(store.clone());
         }
 
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-        if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
-            if !endpoint.is_empty() {
-                // MinIO / S3-compatible: path-style access over plain HTTP.
-                builder = builder.with_endpoint(endpoint).with_allow_http(true);
-            }
-        }
-        if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
-            builder = builder.with_access_key_id(key);
-        }
-        if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
-            builder = builder.with_secret_access_key(secret);
-        }
-        let region = std::env::var("AWS_REGION")
-            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|_| "us-east-1".to_string());
-        builder = builder.with_region(region);
-
-        let store: Arc<dyn ObjectStore> = Arc::new(builder.build().map_err(os_err)?);
+        let store = crate::build_s3_object_store(bucket).map_err(os_err)?;
         stores.insert(bucket.to_string(), store.clone());
         Ok(store)
     }

@@ -25,6 +25,38 @@ use object_store::aws::AmazonS3Builder;
 use krishiv_plan::optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
+/// Build an `object_store` S3 client for `bucket` from the ambient AWS
+/// environment (`AWS_ENDPOINT_URL` for MinIO, credentials, region).
+///
+/// Shared by the Iceberg FileIO [`catalog::object_store_io::KrishivStorage`]
+/// (metadata reads/writes) *and* DataFusion's object-store registry (Parquet
+/// data scans via `ListingTable`) so both hit the *same* S3/MinIO backend.
+/// Reading `AWS_ENDPOINT_URL` here — the AWS-SDK convention prod sets — is what
+/// makes MinIO reachable; `AmazonS3Builder::from_env` alone honours only
+/// `AWS_ENDPOINT` and would silently target real AWS.
+pub(crate) fn build_s3_object_store(
+    bucket: &str,
+) -> object_store::Result<std::sync::Arc<dyn object_store::ObjectStore>> {
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
+        if !endpoint.is_empty() {
+            // MinIO / S3-compatible: path-style access over plain HTTP.
+            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        }
+    }
+    if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+        builder = builder.with_access_key_id(key);
+    }
+    if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+        builder = builder.with_secret_access_key(secret);
+    }
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+    builder = builder.with_region(region);
+    Ok(std::sync::Arc::new(builder.build()?))
+}
+
 pub mod analyze;
 pub mod catalog;
 pub mod cep_sql;
@@ -1295,8 +1327,18 @@ impl SqlEngine {
             };
             let warehouse = std::env::var("KRISHIV_ICEBERG_REST_WAREHOUSE").unwrap_or_default();
             let token = std::env::var("KRISHIV_ICEBERG_REST_TOKEN").ok();
+            // The platform's canonical governed catalog is `main` (every pipeline
+            // SQL, guard, and permission references `main.<ns>.<table>`). Default
+            // to that so coordinator-mode `SELECT … FROM main.…` resolves without
+            // per-deploy env; `KRISHIV_ICEBERG_REST_NAME` still overrides.
             let name = std::env::var("KRISHIV_ICEBERG_REST_NAME")
-                .unwrap_or_else(|_| String::from("krishiv"));
+                .unwrap_or_else(|_| String::from("main"));
+            // When the warehouse is object-store-backed, register an S3 store on
+            // this engine's DataFusion runtime so the `ListingTable` the catalog
+            // bridge builds can *scan* the Parquet data files (iceberg FileIO
+            // only covers metadata reads). Without this a correctly-named S3
+            // table resolves but fails at scan with "no object store for s3://".
+            self.register_s3_object_store_for_warehouse(&warehouse)?;
             let catalog =
                 catalog::unified::KrishivCatalog::rest(&uri, &warehouse, token.as_deref())
                     .await
@@ -1443,6 +1485,26 @@ impl SqlEngine {
         Ok(())
     }
 
+    /// Register an S3/MinIO object store on this engine's DataFusion runtime for
+    /// an `s3://`/`s3a://`-scheme `path` (a warehouse root or a data-file URI), so
+    /// `ListingTable` scans — including those the Iceberg catalog bridge builds
+    /// for governed tables — can read Parquet from object storage. No-op for
+    /// non-object-store paths. Idempotent: re-registering a bucket replaces the
+    /// prior store.
+    pub(crate) fn register_s3_object_store_for_warehouse(&self, path: &str) -> Result<(), String> {
+        if !(path.starts_with("s3://") || path.starts_with("s3a://")) {
+            return Ok(());
+        }
+        let url = url::Url::parse(path).map_err(|e| format!("invalid s3 url {path}: {e}"))?;
+        let bucket = url.host_str().unwrap_or_default();
+        // DataFusion keys object stores by scheme+authority (`s3://bucket`).
+        let store_url = url::Url::parse(&format!("s3://{bucket}"))
+            .map_err(|e| format!("invalid s3 bucket url: {e}"))?;
+        let store = build_s3_object_store(bucket).map_err(|e| format!("s3 store init: {e}"))?;
+        self.context.register_object_store(&store_url, store);
+        Ok(())
+    }
+
     /// Register a local Parquet path as a table.
     pub async fn register_parquet(
         &self,
@@ -1458,24 +1520,8 @@ impl SqlEngine {
 
         // Register an S3 ObjectStore when the path is an s3:// URL so DataFusion
         // can read remote Parquet files transparently.
-        if path.starts_with("s3://") {
-            let url = url::Url::parse(&path).map_err(|e| SqlError::DataFusion {
-                message: format!("invalid s3 url {path}: {e}"),
-            })?;
-            let bucket = url.host_str().unwrap_or_default();
-            let store_url =
-                url::Url::parse(&format!("s3://{bucket}")).map_err(|e| SqlError::DataFusion {
-                    message: format!("invalid s3 bucket url: {e}"),
-                })?;
-            let store = AmazonS3Builder::from_env()
-                .with_bucket_name(bucket)
-                .build()
-                .map_err(|e| SqlError::DataFusion {
-                    message: format!("s3 store init: {e}"),
-                })?;
-            self.context
-                .register_object_store(&store_url, Arc::new(store));
-        }
+        self.register_s3_object_store_for_warehouse(&path)
+            .map_err(|message| SqlError::DataFusion { message })?;
 
         if self
             .context

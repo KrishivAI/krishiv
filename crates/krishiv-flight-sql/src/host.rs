@@ -415,7 +415,7 @@ impl FlightExecutionHost {
     /// Env: `KRISHIV_ICEBERG_REST_URI` (activates when set),
     /// `KRISHIV_ICEBERG_REST_WAREHOUSE`, `KRISHIV_ICEBERG_REST_TOKEN`
     /// (bearer, e.g. a platform PAT), `KRISHIV_ICEBERG_REST_NAME`
-    /// (catalog name, default `krishiv`).
+    /// (catalog name, default `main` — the platform's canonical catalog).
     ///
     /// Returns `Ok(false)` when the env var is unset or the backend is
     /// coordinator-delegated (registration must happen on the coordinator's
@@ -428,7 +428,7 @@ impl FlightExecutionHost {
         let warehouse = std::env::var("KRISHIV_ICEBERG_REST_WAREHOUSE").unwrap_or_default();
         let token = std::env::var("KRISHIV_ICEBERG_REST_TOKEN").ok();
         let name =
-            std::env::var("KRISHIV_ICEBERG_REST_NAME").unwrap_or_else(|_| String::from("krishiv"));
+            std::env::var("KRISHIV_ICEBERG_REST_NAME").unwrap_or_else(|_| String::from("main"));
         match self.backend.as_ref() {
             FlightHostBackend::InProcess(cluster) => {
                 let catalog = krishiv_sql::catalog::unified::KrishivCatalog::rest(
