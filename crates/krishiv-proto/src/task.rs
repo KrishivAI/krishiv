@@ -1722,6 +1722,150 @@ impl TaskStatusResponse {
     }
 }
 
+/// One chunk of a spooled task result (raw Arrow IPC stream bytes).
+///
+/// The executor delivers a large task result to the coordinator as an
+/// ordered `PushTaskResult` stream of these chunks BEFORE reporting the
+/// terminal `TaskStatusRequest` (whose metadata sets
+/// `spooled_result_total_bytes`). The concatenation of all chunk `data`
+/// payloads is exactly one Arrow IPC stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskResultChunk {
+    version: TransportVersion,
+    job_id: JobId,
+    stage_id: StageId,
+    task_id: TaskId,
+    attempt_id: AttemptId,
+    data: Vec<u8>,
+    last: bool,
+    total_bytes: u64,
+}
+
+impl TaskResultChunk {
+    /// Create a non-final chunk using the current transport version.
+    pub fn new(ids: TaskAttemptRef, data: Vec<u8>) -> Self {
+        Self {
+            version: TransportVersion::CURRENT,
+            job_id: ids.job_id,
+            stage_id: ids.stage_id,
+            task_id: ids.task_id,
+            attempt_id: ids.attempt_id,
+            data,
+            last: false,
+            total_bytes: 0,
+        }
+    }
+
+    /// Mark this as the final chunk, carrying the total byte count across
+    /// every chunk of the stream (integrity check on the receiving side).
+    #[must_use]
+    pub fn with_last(mut self, total_bytes: u64) -> Self {
+        self.last = true;
+        self.total_bytes = total_bytes;
+        self
+    }
+
+    /// Override the transport version when mapping from a wire message.
+    #[must_use]
+    pub fn with_version(mut self, version: TransportVersion) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Transport version.
+    pub fn version(&self) -> TransportVersion {
+        self.version
+    }
+
+    /// Job id.
+    pub fn job_id(&self) -> &JobId {
+        &self.job_id
+    }
+
+    /// Stage id.
+    pub fn stage_id(&self) -> &StageId {
+        &self.stage_id
+    }
+
+    /// Task id.
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    /// Attempt id.
+    pub fn attempt_id(&self) -> AttemptId {
+        self.attempt_id
+    }
+
+    /// Raw Arrow IPC stream bytes carried by this chunk.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Consume the chunk, returning its data payload.
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+
+    /// True when this is the final chunk of the stream.
+    pub fn last(&self) -> bool {
+        self.last
+    }
+
+    /// Total bytes across all chunks (set on the final chunk).
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+}
+
+/// Response to a completed `PushTaskResult` stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushTaskResultResponse {
+    version: TransportVersion,
+    disposition: TransportDisposition,
+    message: Option<String>,
+}
+
+impl PushTaskResultResponse {
+    /// Create a push-task-result response using the current transport version.
+    pub fn new(disposition: TransportDisposition) -> Self {
+        Self {
+            version: TransportVersion::CURRENT,
+            disposition,
+            message: None,
+        }
+    }
+
+    /// Override the transport version when mapping from a wire response.
+    #[must_use]
+    pub fn with_version(mut self, version: TransportVersion) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Attach a human-readable response message.
+    #[must_use]
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Transport version.
+    pub fn version(&self) -> TransportVersion {
+        self.version
+    }
+
+    /// Response disposition.
+    pub fn disposition(&self) -> TransportDisposition {
+        self.disposition
+    }
+
+    /// Optional response message.
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushContinuousInputRequest {
     pub version: TransportVersion,

@@ -582,8 +582,13 @@ impl IncrementalFlow {
     }
 
     /// Advance one tick using DataFusion to execute view SQL.
+    ///
+    /// Runs on a spill-capable context (memory pool sized from
+    /// `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` or the container cgroup limit) so
+    /// large recomputes spill to disk instead of exhausting process memory.
     pub async fn step_datafusion(&self) -> IvmResult<StepSummary> {
-        self.step_datafusion_with_ctx(&SessionContext::new()).await
+        self.step_datafusion_with_ctx(&crate::spill::spill_session_context())
+            .await
     }
 
     /// Advance one tick using the supplied `SessionContext`.

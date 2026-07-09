@@ -260,6 +260,27 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         Ok(tonic::Response::new(response))
     }
 
+    async fn push_task_result(
+        &self,
+        request: tonic::Request<krishiv_proto::services::TaskResultChunkStream>,
+    ) -> Result<tonic::Response<krishiv_proto::PushTaskResultResponse>, tonic::Status> {
+        {
+            let coordinator = lock_coord(&self.coordinator)?;
+            coordinator
+                .ensure_active()
+                .map_err(status_from_scheduler_error)?;
+        }
+        // Spool to disk without the coordinator lock; register briefly after.
+        let (key, spool) =
+            crate::result_spool::receive_task_result_spool(request.into_inner()).await?;
+        lock_coord(&self.coordinator)?.store_pending_task_result_spool(key, spool);
+        Ok(tonic::Response::new(
+            krishiv_proto::PushTaskResultResponse::new(
+                krishiv_proto::TransportDisposition::Accepted,
+            ),
+        ))
+    }
+
     async fn checkpoint_ack(
         &self,
         request: tonic::Request<CheckpointAckRequest>,

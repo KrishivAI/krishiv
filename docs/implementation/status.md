@@ -1,5 +1,58 @@
 # Krishiv Implementation Status
 
+## 2026-07-09 — disk-backed large results (PushTaskResult spool) + spill armed across batch/delta-batch/streaming
+
+Root-cause fix for the soak #101 blocker: the taxi `clean_trips` 10.2M-row
+join OOM-killed the 2 Gi shared engine pod every 15 min because the collected
+result was held in memory O(result) at every hop. Implemented Phase 2.10:
+
+- **Executor**: `fragment/batch.rs` inline path now uses
+  `execute_stream_with_stats` (new in `krishiv-sql`) →
+  `drain_stream_with_spool` (`runner/result_spool.rs`): results ≤
+  `KRISHIV_INLINE_RESULT_MAX_BYTES` (8 MiB default) stay inline; larger go to
+  one Arrow IPC stream file (self-deleting `SpooledTaskResult`). Object-parquet
+  sink contract unchanged.
+- **Transport**: new client-streaming `PushTaskResult` RPC
+  (`TaskResultChunk` × N, 3 MiB chunks, last chunk carries declared total)
+  sent BEFORE the terminal `TaskStatus`; metadata field
+  `spooled_result_total_bytes = 21`. Chunk-stream delivery failure fails the
+  task honestly.
+- **Coordinator**: `krishiv-scheduler/src/result_spool.rs` receives chunks to
+  disk (`KRISHIV_RESULT_SPOOL_DIR`, cap `KRISHIV_RESULT_SPOOL_MAX_BYTES`
+  8 GiB default) without holding the coordinator lock; `job_lifecycle` claims
+  the pending spool on Applied+Succeeded and **cancels the job on
+  missing/size-mismatched spool** (a Succeeded-but-missing-result task would
+  otherwise complete the job with silently missing rows). All job-cleanup
+  paths drop spools.
+- **Consumers**: runtime `run_terminal_task` decodes claimed spools before
+  eviction; flight-sql host extends decoded batches; batch_sql_http re-encodes
+  spool files for HTTP polling; Flight `do_get_statement` now encodes
+  incrementally via `FlightDataEncoderBuilder` (was: full
+  `batches_to_flight_data` buffer).
+- **Spill completeness**: `krishiv-ivm/src/spill.rs` — IVM/delta-batch ticks
+  now run on `FairSpillPool` contexts (`flow.rs::step_datafusion`);
+  `query_memory_limit_from_env` falls back to cgroup-limit/4 (new
+  `krishiv_common::cgroup_memory_limit_bytes`, v2+v1) when the env is unset,
+  explicit `0` disables. Executor process budget stays env-only
+  (`KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES`) — set it in prod deploys.
+- **Also fixed**: stale `checkpoint_barrier_integration` test (predates
+  ack-registry gating; failed deterministically at HEAD — now simulates the
+  runner completing the checkpoint); pre-existing `collapsible_if` lint in
+  `krishiv-sql` `build_s3_object_store` that broke `just lint` on main.
+
+Validation: `cargo test -p krishiv-proto -p krishiv-common -p krishiv-sql
+-p krishiv-ivm -p krishiv-executor -p krishiv-scheduler -p krishiv-flight-sql
+-p krishiv-runtime` all green (incl. new
+`krishiv-runtime/tests/spooled_results.rs` end-to-end: 10k rows forced through
+the spool path via the coordinator, content-verified); same-crates
+`cargo clippy -- -D warnings` clean.
+
+Next: release build → new prod engine image → verify `clean_trips` completes
+without OOM; watch for the two known next hazards (platformd `land_refresh`
+base64-JSON land path and the IVM stream-bridge full-snapshot diff, both still
+O(result) platform-side / bridge-side — G7 staged sink is the architecture
+leg).
+
 ## 2026-07-09 — audit fixes landed: AUD-1..4 + AUD-10 fixed & tested; 2 new gaps found
 
 Fixed the four correctness bugs and the sizing-metric leak from the audit

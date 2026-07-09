@@ -3,6 +3,7 @@
 
 mod executor_task_runner;
 mod partition;
+pub(crate) mod result_spool;
 mod task_output;
 mod task_runner;
 
@@ -10,6 +11,9 @@ mod task_runner;
 mod runner_tests;
 
 pub use executor_task_runner::ExecutorTaskRunner;
+pub use result_spool::{
+    INLINE_RESULT_MAX_BYTES_ENV, SpooledTaskResult, set_inline_result_max_bytes_for_tests,
+};
 pub use task_output::{
     CheckpointStateHandle, ExecutorTaskOutput, ExecutorTaskOutputKind, ExecutorTaskRunReport,
     RestoredJobCheckpoint, RestoredSourceOffset, ShuffleContext, kafka_offsets_from_source_records,

@@ -8,6 +8,36 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **Large batch results no longer OOM the engine pod** (2026-07-09): a
+  collected batch result was materialized wholesale at every hop —
+  executor `collect` → one giant unary `TaskStatus` gRPC message →
+  coordinator in-memory job results → Flight encode — so the 10.2M-row
+  NYC-taxi `clean_trips` join (~354 MB) killed the 2 Gi shared engine pod
+  (exit 137) on every 15-minute schedule. Executors now stream query
+  output and keep results inline only up to
+  `KRISHIV_INLINE_RESULT_MAX_BYTES` (default 8 MiB); anything larger is
+  written to one Arrow IPC spool file and delivered to the coordinator in
+  3 MiB chunks over a new client-streaming `PushTaskResult` RPC before the
+  terminal status (which carries `spooled_result_total_bytes`). The
+  coordinator spools to disk (`KRISHIV_RESULT_SPOOL_DIR`, capped by
+  `KRISHIV_RESULT_SPOOL_MAX_BYTES`, default 8 GiB), verifies size on
+  claim (mismatch/missing → job cancelled, never silent missing rows),
+  and consumers decode from the file; Flight `do_get` now encodes result
+  batches incrementally instead of buffering the full IPC payload.
+- **Disk spill now covers all three SQL modes** (2026-07-09): IVM /
+  delta-batch ticks (diff-based recompute, plan fallback, `delta:step:`
+  fragments) ran on unbounded `SessionContext`s; they now execute on
+  `FairSpillPool` contexts sized by `KRISHIV_QUERY_MEMORY_LIMIT_BYTES`.
+  When that env is unset, the per-query limit defaults to cgroup
+  memory-limit/4 (explicit `0` still disables), so spill is armed by
+  default inside memory-limited containers for batch, streaming, and
+  delta-batch alike.
+- `checkpoint_barrier_integration` test was stale against the
+  ack-registry contract (acks are gated on checkpoint completion since
+  the phantom-timeout fix) and failed deterministically; it now simulates
+  the runner side (drain injector → `complete()`) and asserts the state
+  handle round-trip (2026-07-09).
+
 - **Heartbeats no longer stall behind checkpoint work** (2026-07-09):
   coordinator-issued restore/checkpoint commands ran inline in the
   executor's heartbeat loop, so a multi-second restore or checkpoint upload

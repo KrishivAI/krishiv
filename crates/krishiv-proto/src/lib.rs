@@ -79,6 +79,6 @@ pub use task::{
     KeyGroupRange, MemoryKafkaRecord, MissingShufflePartition, OutputContract,
     OutputContractDescriptor, OutputContractKind, PlanFragment, RegisterExecutorRequest,
     RegisterExecutorResponse, RestoreFromCheckpointCommand, TaskAssignment, TaskAttemptRef,
-    TaskCancellationRequest, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate,
-    TransportDisposition,
+    PushTaskResultResponse, TaskCancellationRequest, TaskResultChunk, TaskStatusRequest,
+    TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
 };

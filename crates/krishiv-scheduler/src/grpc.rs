@@ -155,6 +155,36 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         Ok(tonic::Response::new(response))
     }
 
+    async fn push_task_result(
+        &self,
+        request: tonic::Request<krishiv_proto::services::TaskResultChunkStream>,
+    ) -> Result<tonic::Response<krishiv_proto::PushTaskResultResponse>, tonic::Status> {
+        // defense-in-depth: redundant when server-level interceptor is active
+        let auth = extract_auth_context(request.metadata());
+        validate_grpc_writer(&auth)?;
+        tracing::debug!(subject = %auth.subject(), "push_task_result");
+        ensure_shared_coordinator_active(&self.coordinator).await?;
+
+        // Spool the chunk stream to disk WITHOUT the coordinator lock; only
+        // the final registration takes a brief write lock.
+        let (key, spool) = crate::result_spool::receive_task_result_spool(request.into_inner())
+            .await?;
+        tracing::debug!(
+            job_id = %key.job_id,
+            task_id = %key.task_id,
+            attempt = key.attempt_id,
+            total_bytes = spool.total_bytes(),
+            "task result spool received"
+        );
+        self.coordinator
+            .write()
+            .await
+            .store_pending_task_result_spool(key, spool);
+        Ok(tonic::Response::new(
+            krishiv_proto::PushTaskResultResponse::new(TransportDisposition::Accepted),
+        ))
+    }
+
     async fn task_status(
         &self,
         request: tonic::Request<TaskStatusRequest>,
@@ -634,6 +664,29 @@ impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorE
         Ok(tonic::Response::new(wire::checkpoint_ack_response_to_wire(
             response,
         )))
+    }
+
+    async fn push_task_result(
+        &self,
+        request: tonic::Request<tonic::Streaming<wire::v1::TaskResultChunk>>,
+    ) -> Result<tonic::Response<wire::v1::PushTaskResultResponse>, tonic::Status> {
+        use futures::StreamExt as _;
+
+        let metadata = request.metadata().clone();
+        let typed: krishiv_proto::services::TaskResultChunkStream =
+            Box::pin(request.into_inner().map(|item| {
+                item.and_then(|chunk| {
+                    wire::task_result_chunk_from_wire(chunk).map_err(status_from_wire_error)
+                })
+            }));
+        let response = self
+            .inner
+            .push_task_result(request_with_metadata(typed, metadata))
+            .await?
+            .into_inner();
+        Ok(tonic::Response::new(
+            wire::push_task_result_response_to_wire(response),
+        ))
     }
 }
 

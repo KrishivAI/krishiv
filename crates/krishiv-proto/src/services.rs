@@ -5,9 +5,15 @@ use crate::executor::{DeregisterExecutorRequest, DeregisterExecutorResponse};
 use crate::task::{
     DrainContinuousOutputRequest, DrainContinuousOutputResponse, ExecutorHeartbeatRequest,
     ExecutorHeartbeatResponse, ExecutorTaskAssignment, PushContinuousInputRequest,
-    RegisterExecutorRequest, RegisterExecutorResponse, TaskCancellationRequest, TaskStatusRequest,
-    TaskStatusResponse,
+    PushTaskResultResponse, RegisterExecutorRequest, RegisterExecutorResponse,
+    TaskCancellationRequest, TaskResultChunk, TaskStatusRequest, TaskStatusResponse,
 };
+
+/// Ordered stream of task-result chunks delivered to `push_task_result`.
+///
+/// Boxed so the trait stays object-safe across the in-process and gRPC
+/// transports; items are already-decoded domain chunks.
+pub type TaskResultChunkStream = tonic::codegen::BoxStream<TaskResultChunk>;
 
 /// Tonic-shaped coordinator service implemented by the active job coordinator.
 ///
@@ -45,6 +51,15 @@ pub trait CoordinatorExecutorService: Send + Sync + 'static {
         &self,
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status>;
+
+    /// Receive a spooled task result as an ordered chunk stream, delivered
+    /// BEFORE the terminal `TaskStatus` report whose metadata sets
+    /// `spooled_result_total_bytes`. The receiver spools chunks to disk so
+    /// peak memory stays at ~one chunk on both sides.
+    async fn push_task_result(
+        &self,
+        request: tonic::Request<TaskResultChunkStream>,
+    ) -> Result<tonic::Response<PushTaskResultResponse>, tonic::Status>;
 }
 
 /// Tonic-shaped executor service implemented by executor processes.

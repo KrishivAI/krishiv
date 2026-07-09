@@ -392,6 +392,20 @@ impl InProcessStreamingRuntime {
         self.run_terminal_task(&fragment, kind, tables, Vec::new(), None)
     }
 
+    /// Test/diagnostic hook: run a batch SQL query through the coordinator
+    /// job lifecycle even when it is eligible for the inline fast path.
+    /// Exercises the full runner → transport → coordinator result path
+    /// (including Phase 2.10 result spooling) inside one process.
+    #[doc(hidden)]
+    pub fn execute_batch_sql_via_coordinator(
+        &self,
+        query: &str,
+        tables: &[BatchSqlTable],
+    ) -> RuntimeResult<Vec<RecordBatch>> {
+        let fragment = format!("sql: {query}");
+        self.run_terminal_task(&fragment, JobKind::Batch, tables, Vec::new(), None)
+    }
+
     /// Execute a batch SQL write whose terminal task writes through a sink
     /// contract (Phase 2.3 distributed writes) instead of returning rows.
     ///
@@ -746,6 +760,27 @@ impl InProcessStreamingRuntime {
                 }
             }
         })?;
+
+        // Phase 2.10: results that exceeded the inline threshold were spooled
+        // to disk and pushed through the coordinator bridge instead of riding
+        // the report's record_batches. Claim and decode them before eviction
+        // (eviction drops unclaimed spools).
+        {
+            let spools = {
+                let mut coord = self
+                    .coordinator
+                    .lock()
+                    .map_err(|_| RuntimeError::InvalidState {
+                        message: "coordinator lock poisoned during result spool claim".into(),
+                    })?;
+                coord.take_job_result_spools(&job_id)
+            };
+            for spool in &spools {
+                output_batches.extend(spool.decode_record_batches().map_err(|e| {
+                    RuntimeError::transport(format!("decode result spool: {e}"))
+                })?);
+            }
+        }
 
         // Evict the completed job from the coordinator's in-memory registry.
         // The embedded runtime has no background GC loop; without this, every

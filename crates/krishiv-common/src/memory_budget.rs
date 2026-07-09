@@ -106,6 +106,30 @@ impl MemoryBudget {
     }
 }
 
+/// Read this process's cgroup memory limit in bytes (v2 first, then v1).
+///
+/// Returns `None` when no limit applies: file absent (not in a container),
+/// v2 `max`, or a v1 sentinel of effectively-unlimited (≥ 2^60).
+pub fn cgroup_memory_limit_bytes() -> Option<u64> {
+    const V1_UNLIMITED_FLOOR: u64 = 1 << 60;
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            let trimmed = raw.trim();
+            if trimmed == "max" {
+                return None;
+            }
+            return trimmed
+                .parse::<u64>()
+                .ok()
+                .filter(|&n| n > 0 && n < V1_UNLIMITED_FLOOR);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

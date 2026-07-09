@@ -130,6 +130,28 @@ impl Coordinator {
         self.job_inline_results.remove(job_id)
     }
 
+    /// Take disk-backed result spools for a completed job (large terminal
+    /// SQL results delivered via `PushTaskResult`). Spool files delete
+    /// themselves when the returned handles drop.
+    pub fn take_job_result_spools(
+        &mut self,
+        job_id: &JobId,
+    ) -> Vec<crate::result_spool::TaskResultSpool> {
+        self.job_result_spools.remove(job_id).unwrap_or_default()
+    }
+
+    /// Store a fully received task result spool until the task's terminal
+    /// status report claims it (`spooled_result_total_bytes` > 0).
+    pub fn store_pending_task_result_spool(
+        &mut self,
+        key: crate::result_spool::TaskResultKey,
+        spool: crate::result_spool::TaskResultSpool,
+    ) {
+        // A retried attempt may re-push; the newest spool wins and the old
+        // one deletes itself on drop.
+        self.pending_task_result_spools.insert(key, spool);
+    }
+
     /// Track B (two-tier): Returns the JobCoordinator for a job if present.
     /// This is the seam for delegating per-job decisions (launch, recovery, heartbeat windows).
     pub fn job_coordinator(

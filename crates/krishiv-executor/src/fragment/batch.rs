@@ -270,23 +270,62 @@ pub(crate) async fn execute_batch_fragment(
             .map_err(|error| ExecutorError::LocalExecution {
                 message: error.to_string(),
             })?;
-        let (batches, sql_stats) = dataframe.collect_with_stats().await.map_err(|error| {
-            ExecutorError::LocalExecution {
-                message: error.to_string(),
-            }
-        })?;
-        let mut sink_staged_files = Vec::new();
-        if assignment.output_contract().kind() == krishiv_proto::OutputContractKind::Sink
+
+        let is_object_sink = assignment.output_contract().kind()
+            == krishiv_proto::OutputContractKind::Sink
             && assignment
                 .output_contract()
                 .description()
                 .trim()
-                .starts_with(OBJECT_PARQUET_SINK_PREFIX)
-        {
-            sink_staged_files = write_object_parquet_sink_for_task(assignment, &batches).await?;
+                .starts_with(OBJECT_PARQUET_SINK_PREFIX);
+
+        if is_object_sink {
+            // Sink writes need the full batch set for partition splitting;
+            // the staged-commit write path owns its own memory profile.
+            let (batches, sql_stats) = dataframe.collect_with_stats().await.map_err(|error| {
+                ExecutorError::LocalExecution {
+                    message: error.to_string(),
+                }
+            })?;
+            let sink_staged_files =
+                write_object_parquet_sink_for_task(assignment, &batches).await?;
+            let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
+            let column_count = batches.first().map_or(0, |batch| batch.num_columns());
+            if sql_stats.spill_bytes > 0 {
+                krishiv_metrics::global_metrics()
+                    .record_spill(sql_stats.spill_bytes, sql_stats.spill_count);
+            }
+            let runtime_stats = TaskRuntimeStats {
+                input_rows: 0,
+                output_rows: sql_stats.output_rows,
+                cpu_nanos: sql_stats.cpu_nanos,
+                memory_bytes: 0,
+                spill_bytes: sql_stats.spill_bytes,
+                serialized_bytes: 0,
+            };
+            return Ok(
+                ExecutorTaskOutput::sql(row_count, batches.len(), column_count)
+                    .with_record_batches(batches)
+                    .with_runtime_stats(runtime_stats)
+                    .with_sink_staged_files(sink_staged_files),
+            );
         }
-        let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
-        let column_count = batches.first().map_or(0, |batch| batch.num_columns());
+
+        // Inline results stream through the spool decision (Phase 2.10):
+        // small results stay in memory; large ones overflow to disk and are
+        // delivered to the coordinator in bounded PushTaskResult chunks, so
+        // executor memory never holds the whole result.
+        let (stream, stats_handle) = dataframe.execute_stream_with_stats().await.map_err(
+            |error| ExecutorError::LocalExecution {
+                message: error.to_string(),
+            },
+        )?;
+        let (drained, shape) = crate::runner::result_spool::drain_stream_with_spool(
+            stream,
+            crate::runner::result_spool::inline_result_max_bytes(),
+        )
+        .await?;
+        let sql_stats = stats_handle.stats();
         if sql_stats.spill_bytes > 0 {
             krishiv_metrics::global_metrics()
                 .record_spill(sql_stats.spill_bytes, sql_stats.spill_count);
@@ -299,12 +338,21 @@ pub(crate) async fn execute_batch_fragment(
             spill_bytes: sql_stats.spill_bytes,
             serialized_bytes: 0,
         };
-        return Ok(
-            ExecutorTaskOutput::sql(row_count, batches.len(), column_count)
-                .with_record_batches(batches)
-                .with_runtime_stats(runtime_stats)
-                .with_sink_staged_files(sink_staged_files),
-        );
+        let output = ExecutorTaskOutput::sql(shape.row_count, shape.batch_count, shape.column_count)
+            .with_runtime_stats(runtime_stats);
+        return Ok(match drained {
+            crate::runner::result_spool::DrainedResult::Inline(batches) => {
+                output.with_record_batches(batches)
+            }
+            crate::runner::result_spool::DrainedResult::Spooled(spool) => {
+                tracing::info!(
+                    total_bytes = spool.total_bytes(),
+                    rows = shape.row_count,
+                    "task result exceeded inline threshold; spooled to disk"
+                );
+                output.with_spooled_result(std::sync::Arc::new(spool))
+            }
+        });
     }
 
     if let Some(rest) = fragment.strip_prefix(WINDOW_PREFIX) {

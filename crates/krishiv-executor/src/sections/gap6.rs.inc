@@ -775,6 +775,22 @@ async fn checkpoint_ack_delivered() {
 
     #[tonic::async_trait]
     impl CoordinatorExecutorService for RecordingCoordinator {
+        async fn push_task_result(
+            &self,
+            request: tonic::Request<krishiv_proto::services::TaskResultChunkStream>,
+        ) -> Result<tonic::Response<krishiv_proto::PushTaskResultResponse>, tonic::Status> {
+            use futures::StreamExt as _;
+            let mut stream = request.into_inner();
+            while let Some(chunk) = stream.next().await {
+                chunk?;
+            }
+            Ok(tonic::Response::new(
+                krishiv_proto::PushTaskResultResponse::new(
+                    krishiv_proto::TransportDisposition::Accepted,
+                ),
+            ))
+        }
+
         async fn register_executor(
             &self,
             request: tonic::Request<RegisterExecutorRequest>,
@@ -875,6 +891,22 @@ async fn checkpoint_ack_delivery_retries_transient_failure() {
 
     #[tonic::async_trait]
     impl CoordinatorExecutorService for FlakyCoordinator {
+        async fn push_task_result(
+            &self,
+            request: tonic::Request<krishiv_proto::services::TaskResultChunkStream>,
+        ) -> Result<tonic::Response<krishiv_proto::PushTaskResultResponse>, tonic::Status> {
+            use futures::StreamExt as _;
+            let mut stream = request.into_inner();
+            while let Some(chunk) = stream.next().await {
+                chunk?;
+            }
+            Ok(tonic::Response::new(
+                krishiv_proto::PushTaskResultResponse::new(
+                    krishiv_proto::TransportDisposition::Accepted,
+                ),
+            ))
+        }
+
         async fn register_executor(
             &self,
             request: tonic::Request<RegisterExecutorRequest>,
@@ -982,6 +1014,22 @@ async fn checkpoint_fanout_uses_running_attempts_without_preexisting_task_runner
 
     #[tonic::async_trait]
     impl CoordinatorExecutorService for RecordingCoordinator {
+        async fn push_task_result(
+            &self,
+            request: tonic::Request<krishiv_proto::services::TaskResultChunkStream>,
+        ) -> Result<tonic::Response<krishiv_proto::PushTaskResultResponse>, tonic::Status> {
+            use futures::StreamExt as _;
+            let mut stream = request.into_inner();
+            while let Some(chunk) = stream.next().await {
+                chunk?;
+            }
+            Ok(tonic::Response::new(
+                krishiv_proto::PushTaskResultResponse::new(
+                    krishiv_proto::TransportDisposition::Accepted,
+                ),
+            ))
+        }
+
         async fn register_executor(
             &self,
             request: tonic::Request<RegisterExecutorRequest>,

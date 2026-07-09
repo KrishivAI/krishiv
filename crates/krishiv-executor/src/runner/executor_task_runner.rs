@@ -724,6 +724,48 @@ impl ExecutorTaskRunner {
             "executor completed stage-local fragment"
         };
 
+        // Phase 2.10: a disk-spooled result must reach the coordinator BEFORE
+        // the terminal status report that announces it — the coordinator
+        // claims the spool while applying the update. Push failure fails the
+        // task (silently dropping the result would corrupt the job output).
+        if terminal_state == TaskState::Succeeded
+            && let Some(spool) = output.spooled_result()
+        {
+            let ids = TaskAttemptRef::new(
+                assignment.job_id().clone(),
+                assignment.stage_id().clone(),
+                assignment.task_id().clone(),
+                assignment.attempt_id(),
+            );
+            let chunks = crate::runner::result_spool::spool_chunk_stream(
+                ids,
+                spool.path().to_path_buf(),
+                spool.total_bytes(),
+            );
+            let push_result = coordinator
+                .push_task_result(tonic::Request::new(chunks))
+                .await;
+            if let Err(error) = push_result {
+                let message = format!("spooled result delivery failed: {error}");
+                let failed = self
+                    .send_task_status(
+                        &assignment,
+                        TaskState::Failed,
+                        message.clone(),
+                        coordinator,
+                        None,
+                        Vec::new(),
+                    )
+                    .await?;
+                crate::fragment::common::ensure_status_accepted_or_duplicate(
+                    failed.disposition(),
+                    TaskState::Failed,
+                )?;
+                self.clear_running_attempt(&assignment);
+                return Err(tonic::Status::internal(message));
+            }
+        }
+
         let terminal = self
             .send_task_status(
                 &assignment,

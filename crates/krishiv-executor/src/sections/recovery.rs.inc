@@ -24,6 +24,22 @@ mod phase3_recovery {
 
     #[tonic::async_trait]
     impl CoordinatorExecutorService for P3RecordingCoordinator {
+        async fn push_task_result(
+            &self,
+            request: tonic::Request<krishiv_proto::services::TaskResultChunkStream>,
+        ) -> Result<tonic::Response<krishiv_proto::PushTaskResultResponse>, tonic::Status> {
+            use futures::StreamExt as _;
+            let mut stream = request.into_inner();
+            while let Some(chunk) = stream.next().await {
+                chunk?;
+            }
+            Ok(tonic::Response::new(
+                krishiv_proto::PushTaskResultResponse::new(
+                    krishiv_proto::TransportDisposition::Accepted,
+                ),
+            ))
+        }
+
         async fn register_executor(
             &self,
             request: tonic::Request<RegisterExecutorRequest>,

@@ -41,6 +41,7 @@ pub mod ivm_http;
 pub mod job;
 pub mod job_coordinator;
 pub mod queryable_state_http;
+pub mod result_spool;
 pub mod rpc_drain;
 pub mod store;
 pub mod transport;
@@ -73,6 +74,7 @@ pub use batch_sql::{
     execute_batch_sql_coordinated, execute_batch_sql_sink_coordinated, submit_batch_sql_job,
 };
 pub use bounded_window::execute_bounded_window_coordinated;
+pub use result_spool::{TaskResultKey, TaskResultSpool};
 pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use config::{CoordinatorConfig, JobSubmitter, TlsConfig};

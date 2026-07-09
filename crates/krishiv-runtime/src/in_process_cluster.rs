@@ -34,6 +34,18 @@ impl InProcessCluster {
         self.inner.execute_batch_sql(query, tables, is_streaming)
     }
 
+    /// Test/diagnostic hook: force the coordinator job path (no inline
+    /// fast-path bypass) so the full runner→coordinator result delivery is
+    /// exercised, including Phase 2.10 disk spooling.
+    #[doc(hidden)]
+    pub fn collect_batch_sql_via_coordinator(
+        &self,
+        query: &str,
+        tables: &[crate::in_process::BatchSqlTable],
+    ) -> RuntimeResult<Vec<RecordBatch>> {
+        self.inner.execute_batch_sql_via_coordinator(query, tables)
+    }
+
     /// Execute a batch SQL write through the coordinator with a sink output
     /// contract (Phase 2.3 staged distributed write). Blocks until the job
     /// has succeeded and its staged output has been published.

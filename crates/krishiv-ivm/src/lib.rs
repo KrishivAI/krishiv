@@ -11,6 +11,7 @@ pub mod partitioned;
 pub mod plan;
 pub mod provenance;
 pub mod snapshot_store;
+pub mod spill;
 pub mod vector_sink;
 
 pub use error::{IvmError, IvmResult};
@@ -23,6 +24,7 @@ pub use plan::{
     ViewPlan, ViewPlanKind, build_view_plan, partition_key_for_view, partition_key_from_sql,
 };
 pub use provenance::{ProvenanceIndex, hash_all_rows, hash_batch_row};
+pub use spill::{spill_session_context, spill_session_context_with_limit};
 pub use vector_sink::testing::InMemoryVectorSink;
 pub use vector_sink::{IvmVectorSink, VectorFuture, VectorViewSpec, spawn_vector_view};
 

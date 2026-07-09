@@ -15,8 +15,9 @@ use crate::task::{
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment, InputPartition,
     InputPartitionDescriptor, KeyGroupRange, MemoryKafkaRecord, MissingShufflePartition,
     OutputContract, OutputContractDescriptor, OutputContractKind, PlanFragment,
-    RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest,
-    TaskStatusRequest, TaskStatusResponse, TransportDisposition,
+    PushTaskResultResponse, RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef,
+    TaskCancellationRequest, TaskResultChunk, TaskStatusRequest, TaskStatusResponse,
+    TransportDisposition,
 };
 
 pub mod v1 {
@@ -835,6 +836,60 @@ pub fn task_status_response_from_wire(
     Ok(response)
 }
 
+/// Convert a domain task result chunk to protobuf.
+pub fn task_result_chunk_to_wire(value: TaskResultChunk) -> v1::TaskResultChunk {
+    v1::TaskResultChunk {
+        version: Some(transport_version_to_wire(value.version())),
+        job_id: value.job_id().as_str().to_owned(),
+        stage_id: value.stage_id().as_str().to_owned(),
+        task_id: value.task_id().as_str().to_owned(),
+        attempt_id: value.attempt_id().as_u32(),
+        last: value.last(),
+        total_bytes: value.total_bytes(),
+        data: value.into_data(),
+    }
+}
+
+/// Convert a protobuf task result chunk to the domain contract.
+pub fn task_result_chunk_from_wire(value: v1::TaskResultChunk) -> WireResult<TaskResultChunk> {
+    let version = transport_version_from_wire(required(value.version, "version")?)?;
+    let ids = TaskAttemptRef::new(
+        JobId::try_new(value.job_id).map_err(WireError::from_id)?,
+        StageId::try_new(value.stage_id).map_err(WireError::from_id)?,
+        TaskId::try_new(value.task_id).map_err(WireError::from_id)?,
+        AttemptId::try_new(value.attempt_id).map_err(WireError::from_id)?,
+    );
+    let mut chunk = TaskResultChunk::new(ids, value.data).with_version(version);
+    if value.last {
+        chunk = chunk.with_last(value.total_bytes);
+    }
+    Ok(chunk)
+}
+
+/// Convert a domain push-task-result response to protobuf.
+pub fn push_task_result_response_to_wire(
+    value: PushTaskResultResponse,
+) -> v1::PushTaskResultResponse {
+    v1::PushTaskResultResponse {
+        version: Some(transport_version_to_wire(value.version())),
+        disposition: transport_disposition_to_wire(value.disposition()) as i32,
+        message: value.message().unwrap_or_default().to_owned(),
+    }
+}
+
+/// Convert a protobuf push-task-result response to the domain contract.
+pub fn push_task_result_response_from_wire(
+    value: v1::PushTaskResultResponse,
+) -> WireResult<PushTaskResultResponse> {
+    let version = transport_version_from_wire(required(value.version, "version")?)?;
+    let disposition = transport_disposition_from_wire(value.disposition)?;
+    let mut response = PushTaskResultResponse::new(disposition).with_version(version);
+    if !value.message.is_empty() {
+        response = response.with_message(value.message);
+    }
+    Ok(response)
+}
+
 fn task_output_metadata_to_wire(value: &TaskOutputMetadata) -> v1::TaskOutputMetadata {
     v1::TaskOutputMetadata {
         output_kind: value.output_kind().to_owned(),
@@ -885,6 +940,7 @@ fn task_output_metadata_to_wire(value: &TaskOutputMetadata) -> v1::TaskOutputMet
             .state_snapshot()
             .map(<[u8]>::to_vec)
             .unwrap_or_default(),
+        spooled_result_total_bytes: value.spooled_result_total_bytes(),
     }
 }
 
@@ -967,6 +1023,9 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
     }
     if !value.state_snapshot.is_empty() {
         meta = meta.with_state_snapshot(value.state_snapshot);
+    }
+    if value.spooled_result_total_bytes > 0 {
+        meta = meta.with_spooled_result_total_bytes(value.spooled_result_total_bytes);
     }
     Ok(meta)
 }

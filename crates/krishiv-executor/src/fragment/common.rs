@@ -702,8 +702,10 @@ const MIN_TASK_ENGINE_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Process-wide memory budget shared by every task slot in this executor.
 ///
-/// `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES` unset or unparseable → unlimited
-/// (per-task limits still apply individually).
+/// `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES` unset or unparseable → unlimited.
+/// Per-task engine limits still apply individually — and their fallback
+/// (`query_memory_limit_from_env`) is cgroup-derived, so task-level spill is
+/// armed in containers even without this process-wide layer.
 static EXECUTOR_PROCESS_BUDGET: std::sync::LazyLock<Arc<krishiv_common::MemoryBudget>> =
     std::sync::LazyLock::new(|| {
         let limit = std::env::var(EXECUTOR_MEMORY_LIMIT_ENV)

@@ -44,6 +44,7 @@ pub use grpc::{
 pub use runner::{
     CheckpointStateHandle, ContinuousJobDrainer, ExecutorTaskOutput, ExecutorTaskOutputKind,
     ExecutorTaskRunReport, ExecutorTaskRunner, ShuffleContext, TaskRunner,
+    set_inline_result_max_bytes_for_tests,
 };
 pub use source_throttle::SourceThrottleTable;
 pub use transactions::{SharedSinkParticipant, TwoPhaseSinkRegistry};

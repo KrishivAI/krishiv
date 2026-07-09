@@ -201,8 +201,21 @@ impl FlightExecutionHost {
                 let outcome = execute_batch_sql_coordinated(coordinator, query, inline_tables)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
-                krishiv_scheduler::decode_inline_record_batches(&outcome.inline_record_batch_ipc)
-                    .map_err(|e| Status::internal(e.to_string()))
+                let mut batches = krishiv_scheduler::decode_inline_record_batches(
+                    &outcome.inline_record_batch_ipc,
+                )
+                .map_err(|e| Status::internal(e.to_string()))?;
+                // Phase 2.10: large task results arrive as disk spools instead
+                // of inline bytes; decode them straight from the spool files
+                // (files delete themselves when the outcome drops).
+                for spool in &outcome.result_spools {
+                    batches.extend(
+                        spool
+                            .decode_record_batches()
+                            .map_err(|e| Status::internal(e.to_string()))?,
+                    );
+                }
+                Ok(batches)
             }
         }
     }

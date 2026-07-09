@@ -307,6 +307,9 @@ impl Coordinator {
         }
         self.ckpt.coordinators.remove(job_id);
         self.job_inline_results.remove(job_id);
+        self.job_result_spools.remove(job_id);
+        self.pending_task_result_spools
+            .retain(|key, _| key.job_id != *job_id);
         self.job_input_partitions.remove(job_id);
         self.job_task_input_partitions.remove(job_id);
         self.continuous_input_cycles.remove(job_id);
@@ -354,6 +357,10 @@ impl Coordinator {
             .output_metadata()
             .map(|meta| meta.inline_record_batch_ipc().to_vec())
             .unwrap_or_default();
+        let spooled_result_total_bytes = update
+            .output_metadata()
+            .map(|meta| meta.spooled_result_total_bytes())
+            .unwrap_or(0);
         // G5: post-cycle continuous operator state + its watermark (persisted
         // below once the update is applied successfully).
         let state_snapshot = update
@@ -488,6 +495,46 @@ impl Coordinator {
                 .entry(job_id.clone())
                 .or_default()
                 .extend(inline_ipc);
+        }
+
+        // Claim a spooled result delivered via PushTaskResult ahead of this
+        // terminal report. Missing or size-mismatched spools fail the WHOLE
+        // JOB, not just this update: the task is already recorded Succeeded
+        // above, so a plain error here would let the job complete with this
+        // task's rows silently missing (a retried report would come back
+        // Duplicate and skip this block).
+        if terminal_state == TaskState::Succeeded && spooled_result_total_bytes > 0 {
+            let key = crate::result_spool::TaskResultKey {
+                job_id: job_id.clone(),
+                task_id: task_id.clone(),
+                attempt_id: attempt,
+            };
+            match self.pending_task_result_spools.remove(&key) {
+                Some(spool) if spool.total_bytes() == spooled_result_total_bytes => {
+                    self.job_result_spools
+                        .entry(job_id.clone())
+                        .or_default()
+                        .push(spool);
+                }
+                Some(spool) => {
+                    let message = format!(
+                        "task {task_id} spooled result size mismatch: status declares \
+                         {spooled_result_total_bytes} bytes, spool holds {}; cancelling job",
+                        spool.total_bytes()
+                    );
+                    let _ = self.cancel_job(&job_id);
+                    return Err(SchedulerError::Transport { message });
+                }
+                None => {
+                    let message = format!(
+                        "task {task_id} declared a spooled result of \
+                         {spooled_result_total_bytes} bytes but no spool was received; \
+                         cancelling job"
+                    );
+                    let _ = self.cancel_job(&job_id);
+                    return Err(SchedulerError::Transport { message });
+                }
+            }
         }
 
         // G5: a completed continuous cycle carries the executor's post-cycle
@@ -681,8 +728,11 @@ impl Coordinator {
             self.continuous_input_cycles.remove(&job_id);
             self.pending_continuous_restores.remove(&job_id);
             self.batch_sql_job_tables.remove(&job_id);
+            self.pending_task_result_spools
+                .retain(|key, _| key.job_id != job_id);
             if state != JobState::Succeeded {
                 self.job_inline_results.remove(&job_id);
+                self.job_result_spools.remove(&job_id);
             }
             self.queue_manager.on_job_complete(&job_id, &usage);
 
@@ -849,6 +899,9 @@ impl Coordinator {
         }
         self.job_coordinators.remove(job_id);
         self.job_inline_results.remove(job_id);
+        self.job_result_spools.remove(job_id);
+        self.pending_task_result_spools
+            .retain(|key, _| key.job_id != *job_id);
         self.job_input_partitions.remove(job_id);
         self.job_task_input_partitions.remove(job_id);
         self.continuous_input_cycles.remove(job_id);

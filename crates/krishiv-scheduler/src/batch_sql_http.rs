@@ -81,11 +81,23 @@ pub async fn api_batch_sql_poll(
 
     let resp = match state {
         JobState::Succeeded => {
-            let batches = coordinator
-                .write()
-                .await
-                .take_job_inline_results(&job_id)
-                .unwrap_or_default();
+            let (mut batches, spools) = {
+                let mut coord = coordinator.write().await;
+                (
+                    coord.take_job_inline_results(&job_id).unwrap_or_default(),
+                    coord.take_job_result_spools(&job_id),
+                )
+            };
+            // Phase 2.10: re-encode disk-spooled results as inline IPC for
+            // this HTTP polling surface (the spool file IS one IPC stream).
+            for spool in &spools {
+                match std::fs::read(spool.path()) {
+                    Ok(bytes) => batches.push(bytes),
+                    Err(e) => {
+                        tracing::error!(error = %e, "cannot read result spool for HTTP poll");
+                    }
+                }
+            }
             BatchSqlPollResponse {
                 job_id: job_id_str,
                 state: "Succeeded".into(),

@@ -38,11 +38,11 @@ pub(crate) fn build_s3_object_store(
     bucket: &str,
 ) -> object_store::Result<std::sync::Arc<dyn object_store::ObjectStore>> {
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-    if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
-        if !endpoint.is_empty() {
-            // MinIO / S3-compatible: path-style access over plain HTTP.
-            builder = builder.with_endpoint(endpoint).with_allow_http(true);
-        }
+    if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL")
+        && !endpoint.is_empty()
+    {
+        // MinIO / S3-compatible: path-style access over plain HTTP.
+        builder = builder.with_endpoint(endpoint).with_allow_http(true);
     }
     if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
         builder = builder.with_access_key_id(key);
@@ -323,14 +323,27 @@ pub fn resolve_query_memory_limit_bytes(raw: Option<&str>) -> Option<usize> {
 }
 
 /// Resolve the default per-engine memory limit from the
-/// `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` environment variable.
+/// `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` environment variable, falling back to
+/// a cgroup-derived default when the variable is unset.
+///
+/// Fallback: 25% of the container's cgroup memory limit (v2 `memory.max`,
+/// v1 `memory.limit_in_bytes`). Several engines can be live in one process
+/// (executor task slots, the Flight SQL host, IVM ticks), so a single
+/// engine's pool must not claim the whole container. Explicit `0` disables
+/// the limit entirely (DataFusion's default unbounded pool); an unlimited
+/// cgroup (no limit / `max`) also yields `None`.
 pub fn query_memory_limit_from_env() -> Option<usize> {
-    resolve_query_memory_limit_bytes(
-        std::env::var("KRISHIV_QUERY_MEMORY_LIMIT_BYTES")
-            .ok()
-            .as_deref(),
-    )
+    match std::env::var("KRISHIV_QUERY_MEMORY_LIMIT_BYTES").ok() {
+        // Set (including "0" and garbage): explicit-config semantics — no
+        // cgroup fallback, unparseable/zero means unlimited.
+        Some(raw) => resolve_query_memory_limit_bytes(Some(&raw)),
+        None => cgroup_memory_limit_bytes()
+            .map(|limit| (limit / 4) as usize)
+            .filter(|&n| n > 0),
+    }
 }
+
+pub use krishiv_common::cgroup_memory_limit_bytes;
 
 /// Resolve the batch size from `KRISHIV_BATCH_SIZE` env var.
 ///
@@ -3027,6 +3040,70 @@ impl SqlDataFrame {
                 spill_count,
             },
         ))
+    }
+
+    /// Execute this DataFrame as a record-batch stream, returning a stats
+    /// handle that reads the same runtime metrics as [`collect_with_stats`]
+    /// once the stream has been fully drained.
+    ///
+    /// Unlike `collect_with_stats`, the caller never holds more than one
+    /// batch in memory — the intended path for large results that are
+    /// spooled to disk or written straight into a sink.
+    ///
+    /// [`collect_with_stats`]: Self::collect_with_stats
+    pub async fn execute_stream_with_stats(&self) -> SqlResult<(SqlStream, SqlStatsHandle)> {
+        use futures::StreamExt;
+
+        let df = self.dataframe.clone();
+        let task_ctx = df.task_ctx();
+        let physical_plan = df.create_physical_plan().await?;
+        let df_stream = datafusion::physical_plan::execute_stream(
+            physical_plan.clone(),
+            std::sync::Arc::new(task_ctx),
+        )?;
+        let mapped = df_stream.map(|res| {
+            res.map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })
+        });
+        Ok((
+            Box::pin(mapped),
+            SqlStatsHandle {
+                plan: physical_plan,
+            },
+        ))
+    }
+}
+
+/// Handle onto a streamed execution's physical plan; reads runtime metrics
+/// (output rows, CPU time, spill totals) after the stream is drained.
+pub struct SqlStatsHandle {
+    plan: std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+}
+
+impl SqlStatsHandle {
+    /// Aggregate execution statistics from the plan's runtime metrics.
+    ///
+    /// Only meaningful once the associated stream has been fully consumed;
+    /// calling earlier reports the metrics accumulated so far.
+    pub fn stats(&self) -> SqlExecutionStats {
+        let mut output_rows: u64 = 0;
+        let mut cpu_nanos: u64 = 0;
+        if let Some(metrics) = self.plan.metrics() {
+            if let Some(v) = metrics.output_rows() {
+                output_rows = v as u64;
+            }
+            if let Some(t) = metrics.elapsed_compute() {
+                cpu_nanos = t as u64;
+            }
+        }
+        let (spill_bytes, spill_count) = aggregate_spill_metrics(self.plan.as_ref());
+        SqlExecutionStats {
+            output_rows,
+            cpu_nanos,
+            spill_bytes,
+            spill_count,
+        }
     }
 }
 

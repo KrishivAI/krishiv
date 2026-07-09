@@ -150,6 +150,12 @@ pub struct Coordinator {
         Arc<DashMap<String, Arc<tokio::sync::OnceCell<tonic::transport::Channel>>>>,
     /// Inline Arrow IPC result batches keyed by job id (terminal SQL/window collect).
     pub(crate) job_inline_results: HashMap<JobId, Vec<Vec<u8>>>,
+    /// Spooled task results received via `PushTaskResult` and not yet claimed
+    /// by their task's terminal status report.
+    pub(crate) pending_task_result_spools:
+        HashMap<crate::result_spool::TaskResultKey, crate::result_spool::TaskResultSpool>,
+    /// Disk-backed result spools keyed by job id (large terminal SQL results).
+    pub(crate) job_result_spools: HashMap<JobId, Vec<crate::result_spool::TaskResultSpool>>,
     /// Parquet tables registered for coordinated `batch-sql` jobs.
     pub(crate) batch_sql_job_tables: HashMap<JobId, Vec<crate::batch_sql::BatchSqlTable>>,
     /// Inline input partitions registered for coordinated batch-sql and bounded-window jobs.
@@ -1111,6 +1117,8 @@ impl Coordinator {
             streaming_job_task_index: HashMap::new(),
             executor_channels: Arc::new(DashMap::new()),
             job_inline_results: HashMap::new(),
+            pending_task_result_spools: HashMap::new(),
+            job_result_spools: HashMap::new(),
             batch_sql_job_tables: HashMap::new(),
             job_input_partitions: HashMap::new(),
             job_task_input_partitions: HashMap::new(),

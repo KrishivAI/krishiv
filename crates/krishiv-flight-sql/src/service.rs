@@ -510,13 +510,16 @@ impl FlightSqlService for KrishivFlightSqlService {
             .map(|b| b.schema())
             .unwrap_or_else(|| Arc::new(Schema::empty()));
 
-        let flight_data = batches_to_flight_data(&schema, batches)
-            .map_err(|e| Status::internal(e.to_string()))?
-            .into_iter()
-            .map(Ok::<FlightData, Status>);
+        // Encode incrementally: FlightDataEncoder emits one message per batch
+        // as the client drains do_get, instead of materializing the whole
+        // encoded result up front (a second full copy for large results).
+        let encoded = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(stream::iter(batches.into_iter().map(Ok)))
+            .map_err(Status::from);
 
         let stream: Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>> =
-            Box::pin(stream::iter(flight_data));
+            Box::pin(encoded);
         Ok(Response::new(stream))
     }
 

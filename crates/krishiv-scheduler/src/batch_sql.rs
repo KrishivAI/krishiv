@@ -45,10 +45,14 @@ pub struct BatchSqlInlineTable {
 }
 
 /// Outcome of a coordinated batch SQL job.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BatchSqlOutcome {
     pub job_id: JobId,
     pub inline_record_batch_ipc: Vec<Vec<u8>>,
+    /// Disk-backed result spools for tasks whose output exceeded the inline
+    /// threshold (delete themselves on drop). Decode via
+    /// [`crate::result_spool::TaskResultSpool::decode_record_batches`].
+    pub result_spools: Vec<crate::result_spool::TaskResultSpool>,
 }
 
 /// Execute SQL on registered executors via the active coordinator.
@@ -88,14 +92,17 @@ pub async fn execute_batch_sql_coordinated(
 
         match state {
             JobState::Succeeded => {
-                let batches = coordinator
-                    .write()
-                    .await
-                    .take_job_inline_results(&job_id)
-                    .unwrap_or_default();
+                let (batches, result_spools) = {
+                    let mut coord = coordinator.write().await;
+                    (
+                        coord.take_job_inline_results(&job_id).unwrap_or_default(),
+                        coord.take_job_result_spools(&job_id),
+                    )
+                };
                 return Ok(BatchSqlOutcome {
                     job_id,
                     inline_record_batch_ipc: batches,
+                    result_spools,
                 });
             }
             JobState::Failed | JobState::Cancelled => {
@@ -163,8 +170,13 @@ pub async fn execute_batch_sql_sink_coordinated(
         match state {
             JobState::Succeeded => {
                 // Sink jobs do not return inline results; drop any that the
-                // executor reported alongside the staged write.
-                let _ = coordinator.write().await.take_job_inline_results(&job_id);
+                // executor reported alongside the staged write (spools
+                // delete their files on drop).
+                {
+                    let mut coord = coordinator.write().await;
+                    let _ = coord.take_job_inline_results(&job_id);
+                    let _ = coord.take_job_result_spools(&job_id);
+                }
                 return Ok(job_id);
             }
             JobState::Failed | JobState::Cancelled => {

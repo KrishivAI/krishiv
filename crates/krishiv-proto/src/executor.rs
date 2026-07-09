@@ -169,6 +169,10 @@ pub struct TaskOutputMetadata {
     /// checkpoint endpoint returns live state and a restore can rehydrate a
     /// recreated job. `None` for non-stateful/non-streaming tasks.
     state_snapshot: Option<Vec<u8>>,
+    /// Total bytes of a result spool (one Arrow IPC stream) delivered via
+    /// `PushTaskResult` ahead of this status report. 0 = no spooled result;
+    /// small results still ride `inline_record_batch_ipc`.
+    spooled_result_total_bytes: u64,
 }
 
 impl TaskOutputMetadata {
@@ -191,6 +195,7 @@ impl TaskOutputMetadata {
             hot_key_reports: Vec::new(),
             sink_staged_files: Vec::new(),
             state_snapshot: None,
+            spooled_result_total_bytes: 0,
         }
     }
 
@@ -296,6 +301,20 @@ impl TaskOutputMetadata {
     /// Serialized continuous operator state, when this was a stateful cycle.
     pub fn state_snapshot(&self) -> Option<&[u8]> {
         self.state_snapshot.as_deref()
+    }
+
+    /// Mark this task's result as spooled: `total_bytes` of Arrow IPC stream
+    /// bytes were delivered via `PushTaskResult` before this status report.
+    #[must_use]
+    pub fn with_spooled_result_total_bytes(mut self, total_bytes: u64) -> Self {
+        self.spooled_result_total_bytes = total_bytes;
+        self
+    }
+
+    /// Total bytes of the spooled result delivered via `PushTaskResult`
+    /// (0 = the result was not spooled).
+    pub fn spooled_result_total_bytes(&self) -> u64 {
+        self.spooled_result_total_bytes
     }
 }
 

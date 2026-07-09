@@ -123,6 +123,11 @@ pub struct ExecutorTaskOutput {
     /// cycle (`peek_snapshot_bytes`). The coordinator persists it as the
     /// job's `ContinuousSnapshot`. `None` for non-streaming tasks.
     pub(crate) state_snapshot: Option<Vec<u8>>,
+    /// Disk spool holding this task's result when it exceeded the inline
+    /// threshold (Phase 2.10). Delivered to the coordinator via
+    /// `PushTaskResult` chunks before the terminal status report; the file
+    /// deletes itself when the last handle drops. `None` = inline result.
+    pub(crate) spooled_result: Option<std::sync::Arc<super::result_spool::SpooledTaskResult>>,
 }
 
 impl ExecutorTaskOutput {
@@ -142,6 +147,7 @@ impl ExecutorTaskOutput {
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
             state_snapshot: None,
+            spooled_result: None,
         }
     }
 
@@ -166,6 +172,7 @@ impl ExecutorTaskOutput {
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
             state_snapshot: None,
+            spooled_result: None,
         }
     }
 
@@ -185,6 +192,7 @@ impl ExecutorTaskOutput {
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
             state_snapshot: None,
+            spooled_result: None,
         }
     }
 
@@ -207,6 +215,7 @@ impl ExecutorTaskOutput {
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
             state_snapshot: None,
+            spooled_result: None,
         }
     }
 
@@ -232,6 +241,7 @@ impl ExecutorTaskOutput {
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
             state_snapshot: None,
+            spooled_result: None,
         }
     }
 
@@ -251,6 +261,7 @@ impl ExecutorTaskOutput {
             backpressure: krishiv_common::BackpressureSignal::None,
             ivm_output: None,
             state_snapshot: None,
+            spooled_result: None,
         }
     }
 
@@ -389,6 +400,11 @@ impl ExecutorTaskOutput {
         if let Some(snapshot) = &self.state_snapshot {
             meta = meta.with_state_snapshot(snapshot.clone());
         }
+        // Phase 2.10: announce a disk-spooled result (delivered separately
+        // via PushTaskResult chunks) instead of shipping bytes inline.
+        if let Some(spool) = &self.spooled_result {
+            meta = meta.with_spooled_result_total_bytes(spool.total_bytes());
+        }
         meta
     }
 
@@ -397,6 +413,24 @@ impl ExecutorTaskOutput {
     pub(crate) fn with_state_snapshot(mut self, bytes: Vec<u8>) -> Self {
         self.state_snapshot = Some(bytes);
         self
+    }
+
+    /// Attach a disk-spooled result (Phase 2.10 large-result delivery).
+    #[must_use]
+    pub(crate) fn with_spooled_result(
+        mut self,
+        spool: std::sync::Arc<super::result_spool::SpooledTaskResult>,
+    ) -> Self {
+        self.spooled_result = Some(spool);
+        self
+    }
+
+    /// Disk spool holding this task's result, when it exceeded the inline
+    /// threshold.
+    pub(crate) fn spooled_result(
+        &self,
+    ) -> Option<&std::sync::Arc<super::result_spool::SpooledTaskResult>> {
+        self.spooled_result.as_ref()
     }
 
     /// Shuffle partition outputs produced by this task (empty for non-shuffle tasks).

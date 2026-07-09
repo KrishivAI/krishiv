@@ -630,6 +630,47 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
                 .map_err(|e| tonic::Status::internal(e.to_string()))?,
         ))
     }
+
+    async fn push_task_result(
+        &self,
+        request: tonic::Request<krishiv_proto::services::TaskResultChunkStream>,
+    ) -> Result<tonic::Response<krishiv_proto::PushTaskResultResponse>, tonic::Status> {
+        use futures::StreamExt as _;
+
+        let mut client = self.client().await?;
+        let mut typed_stream = request.into_inner();
+        // Forward typed chunks into an mpsc channel and hand the tonic client
+        // a concrete ReceiverStream: a `dyn Stream` request type trips rustc's
+        // higher-ranked Send inference inside the generated client. The small
+        // channel bound keeps at most a few chunks in flight.
+        let (tx, rx) = tokio::sync::mpsc::channel::<wire::v1::TaskResultChunk>(4);
+        let forwarder = tokio::spawn(async move {
+            while let Some(item) = typed_stream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        if tx.send(wire::task_result_chunk_to_wire(chunk)).await.is_err() {
+                            break; // receiver dropped: call already failed
+                        }
+                    }
+                    Err(status) => {
+                        // Truncate the stream; the server rejects it as
+                        // "ended without a final chunk".
+                        tracing::error!(%status, "task result chunk stream error; aborting push");
+                        break;
+                    }
+                }
+            }
+        });
+        let result = client
+            .push_task_result(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await;
+        let _ = forwarder.await;
+        let response = result?.into_inner();
+        Ok(tonic::Response::new(
+            wire::push_task_result_response_from_wire(response)
+                .map_err(|e| tonic::Status::internal(e.to_string()))?,
+        ))
+    }
 }
 
 /// Serve the executor task-assignment gRPC API on a socket address.

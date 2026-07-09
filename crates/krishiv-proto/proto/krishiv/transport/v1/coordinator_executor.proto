@@ -8,6 +8,11 @@ service CoordinatorExecutor {
   rpc ExecutorHeartbeat(ExecutorHeartbeatRequest) returns (ExecutorHeartbeatResponse);
   rpc TaskStatus(TaskStatusRequest) returns (TaskStatusResponse);
   rpc CheckpointAck(CheckpointAckRequest) returns (CheckpointAckResponse);
+  // Large-result delivery: the executor streams a spooled task result to the
+  // coordinator in bounded chunks BEFORE reporting the terminal TaskStatus
+  // (whose metadata sets spooled_result_total_bytes). Keeps peak memory on
+  // both sides at ~one chunk instead of one message per whole result.
+  rpc PushTaskResult(stream TaskResultChunk) returns (PushTaskResultResponse);
 }
 
 service ExecutorTask {
@@ -378,6 +383,31 @@ message TaskOutputMetadata {
   // /api/v1/continuous/{id}/checkpoint` returns live state and a restore can
   // rehydrate a recreated job. Empty = not a stateful streaming cycle.
   bytes state_snapshot = 20;
+  // Total bytes of the task's result spool (one Arrow IPC stream) delivered
+  // via PushTaskResult ahead of this status report. 0 = no spooled result
+  // (small results still ride inline_record_batch_ipc). When set,
+  // inline_record_batch_ipc is empty.
+  uint64 spooled_result_total_bytes = 21;
+}
+
+// One chunk of a spooled task result (raw Arrow IPC stream bytes, delivered
+// in order; the concatenation of all chunks is exactly one IPC stream).
+message TaskResultChunk {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string stage_id = 3;
+  string task_id = 4;
+  uint32 attempt_id = 5;
+  bytes data = 6;
+  // Set on the final chunk: total bytes across all chunks (integrity check).
+  bool last = 7;
+  uint64 total_bytes = 8;
+}
+
+message PushTaskResultResponse {
+  TransportVersion version = 1;
+  TransportDisposition disposition = 2;
+  string message = 3;
 }
 
 message TaskCancellationRequest {

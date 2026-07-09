@@ -35,7 +35,7 @@ pub mod write_commit;
 
 pub use backpressure::BackpressureSignal;
 pub use durability::{CheckpointDurability, DurabilityProfile, ShuffleDurability, StateDurability};
-pub use memory_budget::MemoryBudget;
+pub use memory_budget::{MemoryBudget, cgroup_memory_limit_bytes};
 pub use panic_util::panic_payload_to_string;
 pub use production::{
     ALLOW_ANONYMOUS_HTTP_ENV, NativeScalarUdfPolicy, PRODUCTION_ENV, allow_anonymous_http_override,
