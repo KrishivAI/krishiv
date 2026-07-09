@@ -36,6 +36,8 @@ url = { workspace = true }
 uuid = { workspace = true }
 futures.workspace = true
 object_store = { workspace = true, features = ["aws"] }
+bytes = { workspace = true }
+typetag = "0.2"
 tokio.workspace = true
 tokio-stream.workspace = true
 

@@ -49,10 +49,13 @@ impl KrishivRestCatalog {
         if let Some(t) = token {
             props.insert(String::from("token"), t.to_string());
         }
-        // v1 platform warehouses are file:// paths; the S3 factory arrives
-        // with object-store deployments (platform Phase 14).
+        // Dispatch storage by URI scheme so the catalog serves both `file://`
+        // (laptop) and `s3://` (shared object-store) warehouses. S3 config is
+        // read from the AWS environment by KrishivStorage.
         let inner = RestCatalogBuilder::default()
-            .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
+            .with_storage_factory(Arc::new(
+                crate::catalog::object_store_io::KrishivStorageFactory,
+            ))
             .load("rest", props)
             .await
             .map_err(|e| CatalogError::Iceberg(e.to_string()))?;

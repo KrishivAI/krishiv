@@ -6016,6 +6016,7 @@ version = "0.1.0"
 dependencies = [
  "arrow 58.3.0",
  "async-trait",
+ "bytes",
  "chrono",
  "dashmap",
  "datafusion 53.1.0",
@@ -6038,6 +6039,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "typetag",
  "url",
  "uuid",
  "wiremock",

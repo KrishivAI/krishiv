@@ -19,6 +19,8 @@ pub mod iceberg_catalog_bridge;
 pub mod iceberg_table_provider;
 #[cfg(feature = "local-catalog")]
 pub mod local_catalog;
+
+pub mod object_store_io;
 #[cfg(feature = "postgres-catalog")]
 pub mod postgres_catalog;
 #[cfg(feature = "rest-catalog")]
