@@ -942,6 +942,17 @@ enum ExecutorMode {
     Connect,
 }
 
+/// Default task-placement capacity for this executor: its available CPU
+/// parallelism. `available_parallelism` respects cgroup CPU limits (Linux
+/// 5.13+) and container CPU pinning, so a pod capped at N cores advertises N —
+/// no operator tuning of `KRISHIV_TASK_SLOTS` required. Falls back to 1 when the
+/// count is unavailable.
+fn default_task_capacity() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 impl ExecutorCliConfig {
     pub fn parse(args: impl IntoIterator<Item = String>) -> crate::ExecutorResult<Self> {
         let mut config = Self {
@@ -953,10 +964,19 @@ impl ExecutorCliConfig {
             host: env::var("POD_IP")
                 .or_else(|_| env::var("HOSTNAME"))
                 .unwrap_or_else(|_| String::from("localhost")),
+            // Task capacity is a property of the machine, not an operator guess:
+            // it defaults to the executor's available CPU parallelism
+            // (`available_parallelism`, which honors cgroup CPU limits and
+            // container pinning). This is the greedy-placement load-balancing
+            // weight across executors — never a hard admission gate (placement
+            // resets its budget when exhausted; real overload protection is the
+            // coordinator's memory-estimate admission). `KRISHIV_TASK_SLOTS`
+            // remains an optional override for advanced oversubscribe/cap, but is
+            // no longer required to be set.
             slots: env::var("KRISHIV_TASK_SLOTS")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(1),
+                .unwrap_or_else(default_task_capacity),
             coordinator_endpoint: env::var("KRISHIV_COORDINATOR_ENDPOINT")
                 .unwrap_or_else(|_| String::from("http://127.0.0.1:2001")),
             mode: ExecutorMode::DryRun,
@@ -1195,7 +1215,7 @@ impl ExecutorCliConfig {
          Options:\n\
            --executor-id <ID>           Executor id, defaults to KRISHIV_EXECUTOR_ID or exec-local\n\
            --host <HOST>                Host or pod name, defaults to HOSTNAME or localhost\n\
-           --slots <N>                  Task slots, defaults to KRISHIV_TASK_SLOTS or 1\n\
+           --slots <N>                  Task placement capacity; defaults to CPU parallelism (KRISHIV_TASK_SLOTS overrides)\n\
            --coordinator <URL>          Coordinator endpoint, defaults to KRISHIV_COORDINATOR_ENDPOINT or http://127.0.0.1:2001\n\
            --register-once              Register with the coordinator, send one heartbeat, then exit\n\
            --connect                    Register with the coordinator and continue heartbeating\n\
@@ -1480,7 +1500,18 @@ mod tests {
             .unwrap_or_else(|_| String::from("localhost"));
         assert_eq!(config.executor_id, "exec-local");
         assert_eq!(config.host, expected_host);
-        assert_eq!(config.slots, 1);
+        // Task capacity auto-derives from CPU parallelism when unset (no longer a
+        // hardcoded 1); an explicit KRISHIV_TASK_SLOTS override still wins.
+        let expected_slots = std::env::var("KRISHIV_TASK_SLOTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            });
+        assert_eq!(config.slots, expected_slots);
+        assert!(config.slots >= 1);
         assert_eq!(config.coordinator_endpoint, "http://127.0.0.1:2001");
         assert_eq!(config.mode, ExecutorMode::DryRun);
         assert_eq!(config.heartbeat_interval_secs, 10);

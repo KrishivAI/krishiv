@@ -11,10 +11,8 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use krishiv_plan::window::{
-    WindowExecutionSpec, decode_window_execution_spec, encode_window_execution_spec,
-};
-use krishiv_plan::{ExecutionKind, TypedTaskFragment};
+use krishiv_plan::window::{WindowExecutionSpec, decode_window_execution_spec};
+use krishiv_plan::TypedTaskFragment;
 use krishiv_proto::{InputPartition, InputPartitionDescriptor, JobId, JobKind};
 use serde::{Deserialize, Serialize};
 
@@ -157,19 +155,15 @@ pub async fn api_continuous_register(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousRegisterRequest>,
 ) -> Result<Json<ContinuousRegisterResponse>, StatusCode> {
+    use krishiv_plan::window::encode_window_execution_spec;
+    use krishiv_plan::ExecutionKind;
     use krishiv_proto::{JobSpec, StageId, StageSpec, TaskId, TaskSpec};
     let job_id = JobId::try_new(&body.job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
     let stage_id = StageId::try_new("stage-streaming").map_err(|_| StatusCode::BAD_REQUEST)?;
-    // The task_id is unique per job_id so per-task lease fencing, per-task
-    // ack waiters, and apply_barrier_acks cannot collide between concurrent
-    // continuous-streaming jobs. The fragment body already carries the
-    // job_id for routing; this just gives the per-task bookkeeping its own
-    // identity.
-    let task_id = TaskId::try_new(format!("task-streaming-{}", body.job_id))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let task_id = TaskId::try_new("task-streaming").map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Preserve the registered operation in a typed fragment. Each push
-    // dispatches one bounded input cycle to a stateful stream:loop executor.
+    // Encode/spec errors are a client fault -> 400 (unlike the SQL entrypoint,
+    // whose caller already compiled a valid spec).
     let encoded_spec =
         encode_window_execution_spec(&body.spec).map_err(|_| StatusCode::BAD_REQUEST)?;
     let loop_fragment = format!("stream:loop:{}|{encoded_spec}", body.job_id);
@@ -181,15 +175,15 @@ pub async fn api_continuous_register(
     let spec =
         JobSpec::new(job_id.clone(), "continuous-streaming", JobKind::Streaming).with_stage(stage);
 
-    {
-        let mut coord = coordinator.write().await;
-        coord
-            .ensure_active()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        coord
-            .submit_job(spec)
-            .map_err(|error| scheduler_status(&error))?;
-    }
+    // Same convergent (upsert) path as the SQL entrypoint: re-register is
+    // idempotent when the spec matches and self-heals a limbo job of the same id.
+    let mut coord = coordinator.write().await;
+    coord
+        .ensure_active()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    upsert_continuous_streaming_job(&mut coord, &job_id, &body.spec, spec)
+        .await
+        .map_err(|error| scheduler_status(&error))?;
 
     Ok(Json(ContinuousRegisterResponse { success: true }))
 }
@@ -598,9 +592,72 @@ pub async fn register_continuous_stream_coordinated(
     coord
         .ensure_active()
         .map_err(ContinuousStreamError::Scheduler)?;
-    coord
-        .submit_job(job_spec)
+    upsert_continuous_streaming_job(&mut coord, &job_id_typed, spec, job_spec)
+        .await
         .map_err(ContinuousStreamError::Scheduler)?;
+    Ok(())
+}
+
+/// Convergent (upsert) submission of a continuous streaming job.
+///
+/// A continuous streaming job is a declarative, desired-state object keyed by
+/// `job_id`: the pipeline reconciler re-drives registration to make the running
+/// job match `desired_spec`. Registration is therefore an UPSERT, not an insert —
+/// unlike generic `submit_job`, which (correctly) rejects a duplicate batch/delta
+/// job with `DuplicateJob`.
+///
+///   - same id, same spec, healthy (non-terminal + decodable) -> idempotent
+///     no-op. This preserves streaming continuity; a steady-state reconcile must
+///     NOT tear a healthy stream down and recreate it (that would reset window
+///     state + watermarks).
+///   - same id, but terminal / undecodable (limbo) / different spec -> retire the
+///     old job and submit fresh. This heals a wedged entry and applies a genuine
+///     spec change.
+///   - same id, non-streaming job -> genuine id collision -> `DuplicateJob`.
+///
+/// `job_spec` is the already-built `JobSpec` for `desired_spec` (both call sites
+/// construct it, differing only in how they surface encode errors).
+async fn upsert_continuous_streaming_job(
+    coord: &mut Coordinator,
+    job_id: &JobId,
+    desired_spec: &WindowExecutionSpec,
+    job_spec: krishiv_proto::JobSpec,
+) -> crate::SchedulerResult<()> {
+    let existing = coord.job_coordinator(job_id).map(|jc| {
+        let record = jc.read_record();
+        let is_streaming = record.spec.kind() == JobKind::Streaming;
+        let terminal = record.state().is_terminal();
+        let decoded = decode_continuous_job_spec(&record).ok();
+        (is_streaming, terminal, decoded)
+    });
+    if let Some((is_streaming, terminal, decoded)) = existing {
+        if !is_streaming {
+            return Err(crate::SchedulerError::DuplicateJob {
+                job_id: job_id.clone(),
+            });
+        }
+        let healthy = !terminal && decoded.is_some();
+        if healthy && decoded.as_ref() == Some(desired_spec) {
+            // Already running the desired spec — nothing to do.
+            return Ok(());
+        }
+        // Terminal, limbo, or spec changed: retire the old incarnation so the id
+        // is free for a clean re-submit.
+        //   1. push_cancel_job best-effort notifies the executor to retire the
+        //      stateful stream:loop identity (and cancels in scheduler state).
+        //   2. cancel_job unconditionally marks the job terminal — push_cancel_job
+        //      can bail during target collection (e.g. a limbo task with no valid
+        //      cancel attempt) BEFORE it cancels, which would otherwise leave the
+        //      job non-terminal and evict a no-op.
+        //   3. evict frees the registry slot; snapshot is cleared so the fresh job
+        //      starts clean instead of inheriting a stale watermark/state.
+        let _ = coord.push_cancel_job(job_id).await;
+        let _ = coord.cancel_job(job_id);
+        coord.evict_completed_job(job_id);
+        coord.remove_continuous_snapshot(job_id.as_str());
+    }
+
+    coord.submit_job(job_spec)?;
     Ok(())
 }
 
@@ -787,9 +844,28 @@ mod tests {
     use crate::{Coordinator, SharedCoordinator};
 
     async fn make_coordinator_with_executor(suffix: &str) -> SharedCoordinator {
+        make_coordinator_with_executor_hb(suffix, None).await
+    }
+
+    /// Build a coordinator + one in-process executor, optionally pinning the
+    /// heartbeat timeout. Eviction-timing tests MUST pin it: the production
+    /// default (`CoordinatorConfig::default()`) was deliberately raised to 9
+    /// ticks by the heartbeat/lease reliability audit so a healthy executor
+    /// survives a delayed heartbeat, and tests that hardcode a tick budget must
+    /// not silently rot when that default moves.
+    async fn make_coordinator_with_executor_hb(
+        suffix: &str,
+        heartbeat_timeout_ticks: Option<u64>,
+    ) -> SharedCoordinator {
         use krishiv_proto::{ExecutorDescriptor, ExecutorId};
         let coord_id = CoordinatorId::try_new(format!("coord-cs-{suffix}")).unwrap();
-        let coordinator = SharedCoordinator::new(Coordinator::active(coord_id));
+        let coordinator = match heartbeat_timeout_ticks {
+            Some(ticks) => {
+                let config = crate::CoordinatorConfig::new(1, ticks);
+                SharedCoordinator::new(Coordinator::active_with_config(coord_id, config))
+            }
+            None => SharedCoordinator::new(Coordinator::active(coord_id)),
+        };
         let exec_id = ExecutorId::try_new(format!("exec-cs-{suffix}")).unwrap();
         let desc = ExecutorDescriptor::new(exec_id, "localhost", 4)
             .with_task_endpoint(crate::IN_PROCESS_TASK_ENDPOINT);
@@ -1149,19 +1225,102 @@ mod tests {
         ));
     }
 
+    /// A continuous stream is a declarative desired-state object: re-registering
+    /// the SAME id with the SAME spec is an idempotent no-op (success), not a
+    /// conflict. This is what a steady-state pipeline reconcile does, and it must
+    /// NOT tear the running job down (which would reset window state).
     #[tokio::test]
-    async fn duplicate_register_returns_conflict_without_replacing_job() {
-        let coordinator = make_coordinator_with_executor("duplicate").await;
+    async fn reregister_same_spec_is_idempotent() {
+        let coordinator = make_coordinator_with_executor("idempotent").await;
         let request = || ContinuousRegisterRequest {
-            job_id: "cs-duplicate-job".to_string(),
+            job_id: "cs-idempotent-job".to_string(),
             spec: tumbling_spec(),
         };
-        let _ = api_continuous_register(State(coordinator.clone()), Json(request()))
+        let first = api_continuous_register(State(coordinator.clone()), Json(request()))
             .await
-            .unwrap();
-        let error = api_continuous_register(State(coordinator), Json(request()))
+            .expect("first register succeeds");
+        assert!(first.0.success);
+        let second = api_continuous_register(State(coordinator.clone()), Json(request()))
             .await
-            .expect_err("duplicate job must fail");
+            .expect("re-register with same spec is idempotent, not a conflict");
+        assert!(second.0.success);
+
+        // Exactly one streaming job with this id remains registered.
+        let coord = coordinator.read().await;
+        let streaming = coord
+            .job_snapshots()
+            .into_iter()
+            .filter(|job| {
+                job.kind() == JobKind::Streaming && job.job_id().as_str() == "cs-idempotent-job"
+            })
+            .count();
+        assert_eq!(streaming, 1, "re-register must not create a duplicate job");
+    }
+
+    /// Re-registering the same id with a CHANGED spec converges: the old job is
+    /// torn down and a fresh one created carrying the new window spec.
+    #[tokio::test]
+    async fn reregister_with_changed_spec_replaces_job() {
+        let coordinator = make_coordinator_with_executor("replace").await;
+        let first = ContinuousRegisterRequest {
+            job_id: "cs-replace-job".to_string(),
+            spec: tumbling_spec(),
+        };
+        let _ = api_continuous_register(State(coordinator.clone()), Json(first))
+            .await
+            .expect("first register succeeds");
+
+        let mut changed = tumbling_spec();
+        changed.window_size_ms = 30_000; // different desired spec
+        let second = ContinuousRegisterRequest {
+            job_id: "cs-replace-job".to_string(),
+            spec: changed.clone(),
+        };
+        let resp = api_continuous_register(State(coordinator.clone()), Json(second))
+            .await
+            .expect("changed-spec re-register converges");
+        assert!(resp.0.success);
+
+        // The registered job now carries the NEW spec, and there is still exactly one.
+        let coord = coordinator.read().await;
+        let job_id = krishiv_proto::JobId::try_new("cs-replace-job").unwrap();
+        let view = continuous_job_view(&coord, &job_id).expect("job present and renderable");
+        assert_eq!(view.spec, changed, "replaced job must carry the new window spec");
+    }
+
+    /// A non-streaming job holding the same id is a genuine collision -> 409.
+    #[tokio::test]
+    async fn register_over_non_streaming_id_conflicts() {
+        use krishiv_proto::{JobSpec, StageSpec, TaskId, TaskSpec};
+        let coordinator = make_coordinator_with_executor("collision").await;
+        // Submit a plain batch job under the target id.
+        {
+            let mut coord = coordinator.write().await;
+            let stage = StageSpec::new(
+                krishiv_proto::StageId::try_new("s1").unwrap(),
+                "batch",
+            )
+            .with_task(TaskSpec::new(
+                TaskId::try_new("t1").unwrap(),
+                "batch-task-body",
+            ));
+            let spec = JobSpec::new(
+                krishiv_proto::JobId::try_new("cs-collision-id").unwrap(),
+                "batch-job",
+                JobKind::Batch,
+            )
+            .with_stage(stage);
+            coord.submit_job(spec).expect("batch submit");
+        }
+        let error = api_continuous_register(
+            State(coordinator),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-collision-id".to_string(),
+                spec: tumbling_spec(),
+            }),
+        )
+        .await
+        .expect_err("continuous register over a batch id must conflict");
         assert_eq!(error, StatusCode::CONFLICT);
     }
 
@@ -1312,7 +1471,9 @@ mod tests {
     /// evicted while the cycle it was assigned is still open.
     #[tokio::test]
     async fn heartbeat_tick_releases_input_cycle_fence_after_executor_lost_mid_cycle() {
-        let coordinator = make_coordinator_with_executor("lost-mid-cycle").await;
+        // Pin the timeout to 3 ticks so the fixed tick budget below is
+        // deterministic and independent of the production default.
+        let coordinator = make_coordinator_with_executor_hb("lost-mid-cycle", Some(3)).await;
         let _ = api_continuous_register(
             State(coordinator.clone()),
             Json(ContinuousRegisterRequest {
@@ -1374,7 +1535,9 @@ mod tests {
     async fn heartbeat_tick_reassigns_task_to_already_registered_executor_after_loss() {
         use krishiv_proto::{ExecutorDescriptor, ExecutorId, TaskState};
 
-        let coordinator = make_coordinator_with_executor("reassign").await;
+        // Pin the timeout to 3 ticks: the relative-timing math below (original
+        // evicted while the replacement survives) assumes a 3-tick window.
+        let coordinator = make_coordinator_with_executor_hb("reassign", Some(3)).await;
 
         let _ = api_continuous_register(
             State(coordinator.clone()),
