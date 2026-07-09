@@ -194,6 +194,13 @@ pub(crate) async fn execute_batch_fragment(
             krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
                 .with_udf_limits(udf_limits),
         );
+        // Resolve governed `catalog.namespace.table` references (coordinator-mode
+        // catalog support): register the platform Iceberg REST catalog from
+        // KRISHIV_ICEBERG_REST_* if configured. Non-fatal — a query that does not
+        // reference the catalog still runs if the catalog is unreachable.
+        if let Err(error) = engine.register_iceberg_rest_catalog_from_env().await {
+            tracing::warn!(%error, "iceberg REST catalog registration from env failed");
+        }
         for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
             engine
                 .register_parquet(partition.table_name(), partition.path())
@@ -453,6 +460,11 @@ async fn execute_shuffle_write_fragment(
         krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
             .with_udf_limits(udf_limits),
     );
+    // Coordinator-mode catalog support: register the platform Iceberg REST
+    // catalog from KRISHIV_ICEBERG_REST_* so governed tables resolve. Non-fatal.
+    if let Err(error) = limited_engine.register_iceberg_rest_catalog_from_env().await {
+        tracing::warn!(%error, "iceberg REST catalog registration from env failed");
+    }
     load_input_tables(
         &limited_engine,
         assignment,
@@ -682,6 +694,11 @@ async fn execute_inmem_shuffle_write(
         krishiv_sql::SqlEngine::new_with_memory_limit(engine_memory_limit)
             .with_udf_limits(udf_limits),
     );
+    // Coordinator-mode catalog support: register the platform Iceberg REST
+    // catalog from KRISHIV_ICEBERG_REST_* so governed tables resolve. Non-fatal.
+    if let Err(error) = limited_engine.register_iceberg_rest_catalog_from_env().await {
+        tracing::warn!(%error, "iceberg REST catalog registration from env failed");
+    }
     let num_partitions = write_cfg.num_partitions as u32;
     let lease_token = write_cfg.lease_token;
     let job_id = assignment.job_id().as_str();

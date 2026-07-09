@@ -1275,6 +1275,41 @@ impl SqlEngine {
         self.invalidate_plan_cache();
     }
 
+    /// Register a platform Iceberg REST catalog from the `KRISHIV_ICEBERG_REST_*`
+    /// environment (URI / WAREHOUSE / TOKEN / NAME) when `KRISHIV_ICEBERG_REST_URI`
+    /// is set, so governed `catalog.namespace.table` references resolve on *this*
+    /// engine. Returns whether a catalog was registered.
+    ///
+    /// Unlike the Flight host's registration (which only fires in InProcess mode),
+    /// this is callable from the per-task engines the executor builds for
+    /// coordinated batch SQL — closing the coordinator-mode catalog gap so
+    /// `SELECT … FROM krishiv.<ns>.<table>` works on the split (coordinator +
+    /// platformd) topology. `s3://` warehouses are read through `KrishivStorage`.
+    /// No-op returning `Ok(false)` when built without the `rest-catalog` feature.
+    pub async fn register_iceberg_rest_catalog_from_env(&self) -> Result<bool, String> {
+        #[cfg(feature = "rest-catalog")]
+        {
+            let uri = match std::env::var("KRISHIV_ICEBERG_REST_URI") {
+                Ok(uri) => uri,
+                Err(_) => return Ok(false),
+            };
+            let warehouse = std::env::var("KRISHIV_ICEBERG_REST_WAREHOUSE").unwrap_or_default();
+            let token = std::env::var("KRISHIV_ICEBERG_REST_TOKEN").ok();
+            let name = std::env::var("KRISHIV_ICEBERG_REST_NAME")
+                .unwrap_or_else(|_| String::from("krishiv"));
+            let catalog =
+                catalog::unified::KrishivCatalog::rest(&uri, &warehouse, token.as_deref())
+                    .await
+                    .map_err(|e| format!("iceberg REST catalog at {uri}: {e}"))?;
+            self.register_iceberg_catalog(std::sync::Arc::new(catalog), name);
+            Ok(true)
+        }
+        #[cfg(not(feature = "rest-catalog"))]
+        {
+            Ok(false)
+        }
+    }
+
     /// Share a session UDF registry so scalar UDFs are visible in SQL.
     #[must_use]
     pub fn with_udf_registry(
