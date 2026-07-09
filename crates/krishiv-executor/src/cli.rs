@@ -499,6 +499,15 @@ async fn heartbeat_loop(
     if let Some(ref dir) = state_dir {
         runner_builder = runner_builder.with_state_dir(dir.clone());
     }
+    // Register the platform Iceberg REST catalog (KRISHIV_ICEBERG_REST_*) on the
+    // shared SQL engine once, so governed `catalog.namespace.table` references
+    // resolve in local-stage fragment execution (coordinator-mode catalog gap).
+    // Non-fatal: a catalog-less query still runs if the catalog is unreachable.
+    match runner_builder.register_catalog_from_env().await {
+        Ok(true) => tracing::info!("iceberg REST catalog registered from KRISHIV_ICEBERG_REST_*"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "iceberg REST catalog registration from env failed"),
+    }
     if let Some(uri) = shuffle_uri {
         // When both a local shuffle-dir and an s3:// URI are set, build a tiered
         // backend: local disk for fast P2P reads, object store for durability.

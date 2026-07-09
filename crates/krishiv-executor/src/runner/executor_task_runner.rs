@@ -434,6 +434,16 @@ impl ExecutorTaskRunner {
         self
     }
 
+    /// Register the platform Iceberg REST catalog from `KRISHIV_ICEBERG_REST_*`
+    /// on the shared SQL engine (once, at startup), so governed
+    /// `catalog.namespace.table` references resolve during local-stage fragment
+    /// execution — the coordinator-mode catalog gap for gateway SELECTs. Returns
+    /// whether a catalog was registered. Call after `with_udf_limits`, which
+    /// replaces the engine.
+    pub async fn register_catalog_from_env(&self) -> Result<bool, String> {
+        self.sql_engine.register_iceberg_rest_catalog_from_env().await
+    }
+
     /// Attach a streaming progress callback (GAP-OB-04).
     ///
     /// Streaming operators call this periodically to report watermark advance,
