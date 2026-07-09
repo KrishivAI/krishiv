@@ -1339,11 +1339,20 @@ impl SqlEngine {
             // only covers metadata reads). Without this a correctly-named S3
             // table resolves but fails at scan with "no object store for s3://".
             self.register_s3_object_store_for_warehouse(&warehouse)?;
-            let catalog =
+            let catalog = std::sync::Arc::new(
                 catalog::unified::KrishivCatalog::rest(&uri, &warehouse, token.as_deref())
                     .await
-                    .map_err(|e| format!("iceberg REST catalog at {uri}: {e}"))?;
-            self.register_iceberg_catalog(std::sync::Arc::new(catalog), name);
+                    .map_err(|e| format!("iceberg REST catalog at {uri}: {e}"))?,
+            );
+            self.register_iceberg_catalog(std::sync::Arc::clone(&catalog), &name);
+            // Back-compat alias: parts of the surface (console sample queries,
+            // some example jobs, older docs) still qualify governed tables as
+            // `krishiv.<ns>.<table>` from a half-finished `krishiv`→`main` rename.
+            // Register the same catalog under `krishiv` too so both resolve.
+            // Harmless when the primary name already is `krishiv`.
+            if name != "krishiv" {
+                self.register_iceberg_catalog(catalog, "krishiv");
+            }
             Ok(true)
         }
         #[cfg(not(feature = "rest-catalog"))]
