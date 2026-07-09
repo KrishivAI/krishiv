@@ -6,7 +6,28 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ## [Unreleased]
 
+### Changed
+
+- **IVM ticks reuse one spill-capable `SessionContext` per flow** (G14,
+  2026-07-09): `step_datafusion()` built a fresh context every tick, a
+  fixed cost that dominated true O(Δ) work — the 2026-07-05 benchmark
+  measured full recompute ~100× *faster* than an IVM tick, with the
+  crossover extrapolated at ~23M rows. The flow now caches the context
+  (async-mutex-guarded; discarded on tick error) and reconciles the
+  table catalog each tick to exactly what a fresh context would hold.
+  Re-benchmarked (same workload/hardware): ticks dropped to ~13–18 ms
+  nearly flat across 50K–1M-row tables; the crossover is now ~500K rows
+  and IVM wins at 1M (17.8 ms vs 24.3 ms). Remaining tick slope is the
+  O(n) snapshot apply — tracked as the incremental-state follow-up.
+
 ### Fixed
+
+- **Chained DiffBased views no longer read stale upstream output within a
+  tick** (2026-07-09): `SessionContext::register_table` errors on duplicate
+  names, and the per-view upstream registration swallowed that error with
+  `let _ =`, so a downstream DiffBased view executing after its upstream in
+  the same tick kept the upstream's previous-tick MemTable. Registration now
+  deregisters first (replace semantics).
 
 - **Large batch results no longer OOM the engine pod** (2026-07-09): a
   collected batch result was materialized wholesale at every hop —

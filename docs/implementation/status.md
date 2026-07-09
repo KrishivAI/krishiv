@@ -1,5 +1,44 @@
 # Krishiv Implementation Status
 
+## 2026-07-09 — G14 CLOSED (measured): per-flow SessionContext reuse; IVM ticks 650ms → 13-18ms
+
+`IncrementalFlow` now carries `tick_ctx: Arc<tokio::sync::Mutex<CachedTickContext>>`
+— one spill-capable context reused across `step_datafusion()` ticks, with a
+tracked registered-table set reconciled each tick (dropped sources/views
+deregistered, empty snapshots absent) so reuse is observationally identical
+to per-tick construction; the cache is invalidated on tick error. The
+external-context API (`step_datafusion_with_ctx`, used by `delta:step:`
+executor fragments) is unchanged.
+
+**Real bug found & fixed while wiring this**: `register_table` errors on
+duplicates (no overwrite), and the DiffBased upstream-registration loop
+swallowed that with `let _ =` — so within one tick, a DiffBased view
+downstream of another DiffBased view read the upstream's *previous-tick*
+snapshot. Registration now deregisters first. (An earlier status entry
+described an `OnceLock`-based G14 fix + benchmark priming; that code does not
+exist anywhere in history — it was evidently lost in the 1694143 squash. This
+entry supersedes it with a measured, committed implementation.)
+
+**Re-benchmark** (`cargo bench -p krishiv-bench --bench ivm_vs_full_recompute`,
+this sandbox, 100-region GROUP BY SUM, 5K-row delta):
+
+| accumulated rows | IVM tick | full recompute |
+|---|---|---|
+| 50K | 12.8 ms | 3.5 ms |
+| 200K | 13.6 ms | 7.0 ms |
+| 500K | 15.6 ms | 15.2 ms |
+| 1M | 17.8 ms | 24.3 ms |
+
+2026-07-05 baseline: tick ≈ 650–730 ms flat (context construction), recompute
+~100× faster everywhere, crossover ≈ 23M rows. Now: ticks ~40× faster,
+crossover ≈ 500K rows, IVM wins at 1M. Remaining tick slope = O(n)
+`apply_delta` snapshot concat + MemTable rebuild → next leg is true
+incremental operator state (no full-snapshot re-registration).
+
+Validation: krishiv-ivm 47+5 tests green (incl. strengthened
+`apply_computed_tick_matches_central_step` — now actually asserts the central
+summary it computed); scheduler/runtime/executor suites green; clippy clean.
+
 ## 2026-07-09 — disk-backed large results (PushTaskResult spool) + spill armed across batch/delta-batch/streaming
 
 Root-cause fix for the soak #101 blocker: the taxi `clean_trips` 10.2M-row

@@ -166,6 +166,69 @@ struct IncrementalFlowInner {
 #[derive(Clone)]
 pub struct IncrementalFlow {
     inner: Arc<Mutex<IncrementalFlowInner>>,
+    /// Spill-capable `SessionContext` reused across `step_datafusion` ticks
+    /// (G14): building a fresh context per tick dominated tick latency in the
+    /// IVM-vs-recompute benchmark. Guarded by an async mutex so cached-path
+    /// ticks serialize; `step_datafusion_with_ctx` callers are unaffected.
+    tick_ctx: Arc<tokio::sync::Mutex<CachedTickContext>>,
+}
+
+/// Cached tick execution context plus the table names currently registered in
+/// it. The set lets each tick reconcile the catalog to exactly what a fresh
+/// context would contain (dropped sources/views deregistered, empty snapshots
+/// absent), so reuse is observationally identical to per-tick construction.
+#[derive(Default)]
+struct CachedTickContext {
+    ctx: Option<SessionContext>,
+    registered: AHashSet<String>,
+}
+
+/// Per-tick view of the tick `SessionContext`'s table catalog. Registration
+/// and removal go through this so the cached-context path can track what is
+/// registered; with `tracked: None` (external caller's context) it degrades
+/// to the plain register/deregister calls the per-tick path always made.
+struct TickTables<'a> {
+    ctx: &'a SessionContext,
+    tracked: Option<&'a mut AHashSet<String>>,
+}
+
+impl TickTables<'_> {
+    /// Replace-register: `SessionContext::register_table` errors on a
+    /// duplicate name (it does not overwrite), so deregister first. Besides
+    /// enabling cross-tick context reuse, this fixes a latent same-tick bug:
+    /// a downstream DiffBased view re-registering an upstream view's fresh
+    /// output hit the duplicate error (swallowed by `let _ =`) and kept
+    /// reading the upstream's previous-tick snapshot.
+    fn register(&mut self, name: &str, batch: &RecordBatch) -> datafusion::error::Result<()> {
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])?;
+        let _ = self.ctx.deregister_table(name);
+        self.ctx.register_table(name, Arc::new(table))?;
+        if let Some(reg) = self.tracked.as_deref_mut() {
+            reg.insert(name.to_owned());
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, name: &str) {
+        let _ = self.ctx.deregister_table(name);
+        if let Some(reg) = self.tracked.as_deref_mut() {
+            reg.remove(name);
+        }
+    }
+
+    /// Deregister every tracked table that a fresh context would not contain
+    /// this tick (dropped sources, dropped views). No-op for untracked
+    /// (fresh) contexts.
+    fn reconcile(&mut self, expected: &AHashSet<String>) {
+        let Some(reg) = self.tracked.as_deref_mut() else {
+            return;
+        };
+        let stale: Vec<String> = reg.iter().filter(|n| !expected.contains(*n)).cloned().collect();
+        for name in stale {
+            let _ = self.ctx.deregister_table(name.as_str());
+            reg.remove(&name);
+        }
+    }
 }
 
 impl IncrementalFlow {
@@ -199,6 +262,7 @@ impl IncrementalFlow {
                 last_step_outputs: AHashMap::new(),
                 pending_plan_state: HashMap::new(),
             })),
+            tick_ctx: Arc::new(tokio::sync::Mutex::new(CachedTickContext::default())),
         }
     }
 
@@ -586,9 +650,30 @@ impl IncrementalFlow {
     /// Runs on a spill-capable context (memory pool sized from
     /// `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` or the container cgroup limit) so
     /// large recomputes spill to disk instead of exhausting process memory.
+    ///
+    /// The context is built once and reused across ticks (G14): per-tick
+    /// `SessionContext` construction dominated tick latency in the
+    /// IVM-vs-recompute benchmark. The catalog is reconciled every tick so
+    /// reuse is observationally identical to a fresh context; on a tick
+    /// error the cached context is discarded so partial registrations can
+    /// never leak into the next tick.
     pub async fn step_datafusion(&self) -> IvmResult<StepSummary> {
-        self.step_datafusion_with_ctx(&crate::spill::spill_session_context())
-            .await
+        let mut cache = self.tick_ctx.lock().await;
+        let ctx = cache
+            .ctx
+            .get_or_insert_with(crate::spill::spill_session_context)
+            .clone();
+        let mut registered = std::mem::take(&mut cache.registered);
+        let result = self
+            .step_datafusion_inner(&ctx, Some(&mut registered))
+            .await;
+        if result.is_ok() {
+            cache.registered = registered;
+        } else {
+            cache.ctx = None;
+            cache.registered = AHashSet::new();
+        }
+        result
     }
 
     /// Advance one tick using the supplied `SessionContext`.
@@ -600,7 +685,19 @@ impl IncrementalFlow {
     /// `Distinct`) are executed O(Δ) without running DataFusion SQL. Views
     /// with `ViewPlan::DiffBased` (or no cached plan yet) fall back to full
     /// SQL re-execution + diff.
+    ///
+    /// The context is treated as tick-scoped: pass a fresh (or otherwise
+    /// tick-exclusive) context. For the cached, reused-context path use
+    /// [`Self::step_datafusion`].
     pub async fn step_datafusion_with_ctx(&self, ctx: &SessionContext) -> IvmResult<StepSummary> {
+        self.step_datafusion_inner(ctx, None).await
+    }
+
+    async fn step_datafusion_inner(
+        &self,
+        ctx: &SessionContext,
+        tracked: Option<&mut AHashSet<String>>,
+    ) -> IvmResult<StepSummary> {
         // ── Phase 1 (lock): drain pending + snapshot state ────────────────────
         let (
             raw_pending,
@@ -690,14 +787,26 @@ impl IncrementalFlow {
         }
 
         // ── Phase 3 (no lock): register source MemTables ─────────────────────
+        let mut tables = TickTables { ctx, tracked };
+        {
+            // Reconcile a reused catalog to this tick's expected contents
+            // first: drop tables for sources/views a fresh context would not
+            // contain (dropped sources, dropped views).
+            let expected: AHashSet<String> = new_snapshots
+                .keys()
+                .cloned()
+                .chain(view_specs.iter().map(|s| s.name.clone()))
+                .collect();
+            tables.reconcile(&expected);
+        }
         for (name, snapshot) in &new_snapshots {
             if snapshot.num_rows() == 0 {
+                // A fresh context would have no table for an empty source.
+                tables.remove(name.as_str());
                 continue;
             }
-            let schema = snapshot.schema();
-            let table = MemTable::try_new(schema, vec![vec![snapshot.clone()]])
-                .map_err(|e| IvmError::execution(e.to_string()))?;
-            ctx.register_table(name.as_str(), Arc::new(table))
+            tables
+                .register(name.as_str(), snapshot)
                 .map_err(|e| IvmError::execution(e.to_string()))?;
         }
 
@@ -776,24 +885,22 @@ impl IncrementalFlow {
 
             if plan_is_incremental {
                 // Register the previous snapshot for downstream DiffBased views.
-                if let Some(prev) = view_full_outputs.get(view_name)
-                    && prev.num_rows() > 0
-                {
-                    let schema = prev.schema();
-                    if let Ok(table) = MemTable::try_new(schema, vec![vec![prev.clone()]]) {
-                        let _ = ctx.register_table(view_name.as_str(), Arc::new(table));
+                match view_full_outputs.get(view_name) {
+                    Some(prev) if prev.num_rows() > 0 => {
+                        let _ = tables.register(view_name.as_str(), prev);
                     }
+                    // Empty/missing: a fresh context would have no such table.
+                    _ => tables.remove(view_name.as_str()),
                 }
             } else {
                 // DiffBased: register all upstream outputs, then execute SQL.
                 for (up_name, up_batch) in &view_full_outputs {
                     if up_batch.num_rows() == 0 {
+                        // Keep parity with a fresh context: no table at all.
+                        tables.remove(up_name.as_str());
                         continue;
                     }
-                    let schema = up_batch.schema();
-                    if let Ok(table) = MemTable::try_new(schema, vec![vec![up_batch.clone()]]) {
-                        let _ = ctx.register_table(up_name.as_str(), Arc::new(table));
-                    }
+                    let _ = tables.register(up_name.as_str(), up_batch);
                 }
 
                 macro_rules! make_empty_batch {
@@ -840,29 +947,15 @@ impl IncrementalFlow {
                             break;
                         }
                         // Register updated self-view for the next iteration.
-                        if new_full.num_rows() > 0 {
-                            let _ = ctx.deregister_table(view_name.as_str());
-                            match MemTable::try_new(new_full.schema(), vec![vec![new_full]]) {
-                                Ok(tbl) => {
-                                    if let Err(e) =
-                                        ctx.register_table(view_name.as_str(), Arc::new(tbl))
-                                    {
-                                        tracing::warn!(
-                                            view = %view_name,
-                                            error = %e,
-                                            "fixpoint: failed to register updated view; \
-                                             next iteration will use stale data"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        view = %view_name,
-                                        error = %e,
-                                        "fixpoint: failed to build MemTable for updated view"
-                                    );
-                                }
-                            }
+                        if new_full.num_rows() > 0
+                            && let Err(e) = tables.register(view_name.as_str(), &new_full)
+                        {
+                            tracing::warn!(
+                                view = %view_name,
+                                error = %e,
+                                "fixpoint: failed to register updated view; \
+                                 next iteration will use stale data"
+                            );
                         }
                         iter += 1;
                     }
@@ -2453,6 +2546,10 @@ mod integration_tests {
         assert_eq!(
             remote_summary.total_output_rows, applied_summary.total_output_rows,
             "applied summary must reflect the real remote output row count"
+        );
+        assert_eq!(
+            central_summary.total_output_rows, applied_summary.total_output_rows,
+            "offloaded tick summary must match the central tick summary"
         );
     }
 
