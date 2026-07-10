@@ -774,11 +774,38 @@ pub async fn land_ctas_with_target(
     // Where the part files go, and the FileIO to write them with. For a
     // replace we write under the existing location before touching metadata;
     // for a new table we create it first so the catalog assigns a location.
+    // The old snapshot's data files are collected up front: drop+recreate is
+    // metadata-only, so without explicit cleanup every replace would orphan
+    // the previous snapshot's Parquet in the object store (a 15-minute batch
+    // refresh of a multi-GB table fills a small warehouse within hours).
+    let mut replaced_files: Vec<String> = Vec::new();
     let (table_location, file_io, created_fresh) = if exists {
         let old = catalog
             .load_table(ident)
             .await
             .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        if old.metadata().current_snapshot().is_some() {
+            match old.scan().build() {
+                Ok(scan) => match scan.plan_files().await {
+                    Ok(stream) => {
+                        let tasks: Vec<iceberg::scan::FileScanTask> =
+                            stream.try_collect().await.unwrap_or_default();
+                        replaced_files = tasks
+                            .iter()
+                            .map(|t| t.data_file_path().to_string())
+                            .collect();
+                    }
+                    Err(e) => {
+                        tracing::warn!(table = %ident, error = %e,
+                            "cannot enumerate replaced data files; they will be orphaned");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(table = %ident, error = %e,
+                        "cannot plan replaced table scan; old data files will be orphaned");
+                }
+            }
+        }
         (
             old.metadata().location().to_string(),
             old.file_io().clone(),
@@ -905,6 +932,25 @@ pub async fn land_ctas_with_target(
             .map(|s| s.snapshot_id())
             .unwrap_or(-1)
     };
+
+    // The new snapshot is committed and visible: remove the replaced
+    // snapshot's data files (best-effort — a failed delete only leaves an
+    // orphan, never corrupts the new table). The list was captured from the
+    // old snapshot before any new part existed, so it cannot name new files.
+    if !replaced_files.is_empty() {
+        let mut removed = 0usize;
+        for path in &replaced_files {
+            match file_io.delete(path).await {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    tracing::warn!(table = %ident, path, error = %e,
+                        "failed to delete replaced data file (orphaned)");
+                }
+            }
+        }
+        tracing::info!(table = %ident, removed, total = replaced_files.len(),
+            "removed replaced snapshot's data files");
+    }
 
     Ok(CtasLandingReport {
         rows: total_rows,
@@ -1147,6 +1193,61 @@ mod tests {
             .map(RecordBatch::num_rows)
             .sum();
         assert_eq!(rows, 10_000, "all parts must be committed and readable");
+    }
+
+    #[tokio::test]
+    async fn land_ctas_replace_deletes_old_data_files() {
+        let (catalog, dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "cycled".into());
+
+        let parquet_count = |root: &std::path::Path| -> usize {
+            walkdir(root)
+                .iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+                .count()
+        };
+        fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut out = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(root) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        out.extend(walkdir(&p));
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+            out
+        }
+
+        let first = stream_of(&ctx, "SELECT * FROM (VALUES (1), (2)) AS t(id)").await;
+        land_ctas(Arc::clone(&catalog), &ident, false, first)
+            .await
+            .unwrap();
+        assert_eq!(parquet_count(dir.path()), 1);
+
+        // Each replace must leave exactly the new snapshot's files on disk —
+        // no orphan accumulation across refresh cycles.
+        for round in 0..3 {
+            let stream = stream_of(&ctx, "SELECT * FROM (VALUES (10), (20)) AS t(id)").await;
+            land_ctas(Arc::clone(&catalog), &ident, true, stream)
+                .await
+                .unwrap();
+            assert_eq!(
+                parquet_count(dir.path()),
+                1,
+                "round {round}: replaced data files must be deleted"
+            );
+        }
+
+        let rows: usize = table_rows(&catalog, &ident, &ctx)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 2, "table still reads correctly after cleanup");
     }
 
     #[tokio::test]
