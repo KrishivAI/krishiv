@@ -222,6 +222,46 @@ CTAS/DML no longer stream full results over Flight SQL (#162). G2's
 mechanism is verified; the TPC-H-at-RAM benchmark remains blocked on
 hardware headroom. This area needs *benchmark proof*, not rework.
 
+## 7b. Partitioning across the three engines (sixth pass, 2026-07-10)
+
+- **Shuffle-layer partitioners are rich and mostly parked** (the §2/§3
+  pattern again): `HashPartitioner`, `SaltedHashPartitioner` (hot-bucket
+  splitting with correct scoping — never keyed streaming),
+  `RangePartitioner` with a reservoir-sampling boundary builder (E2.4,
+  for GlobalSort/SortMergeJoin), and a full `Partitioning` enum
+  (Unpartitioned/Hash/RoundRobin/Broadcast/Range) in `krishiv-plan` —
+  but SQL lowers `DfPlan::Repartition` → `Unpartitioned` (§2), so none
+  of it is reachable from a query. Phase 52 wires it.
+- **"Dynamic partitioning" today = the R7.2 hot-key path**:
+  `HeavyHittersTracker` heat reports → source throttle + a one-shot
+  `skew_repartition_overrides.insert(job, executor_count)`
+  (`executor_ops.rs:233`) that switches the *whole job* to round-robin
+  over all executors — batch only, correctly skipped for streaming
+  (keyed-state pinning, documented in code). Inversion worth noting: the
+  blunt round-robin override is wired while the purpose-built
+  `SaltedHashPartitioner` is not. Phase 54 (skew-split on the salted
+  partitioner, coalescing, runtime filters) is the fix.
+- **The engine can read partitioned Iceberg tables but can never write
+  one — the biggest gap found this pass.** Every data file written
+  carries `.partition(Struct::empty()).partition_spec_id(0)`
+  (`iceberg_native.rs:175`); `PARTITIONED BY` has zero hits in the tree;
+  there is no partition-aware fanout writer. Everything Krishiv
+  materializes (durable CTAS/G17, the G7/G8 streaming sink, live tables)
+  is unpartitioned files — scan pruning (#158) only ever benefits
+  externally-written tables, and pruning/compaction degrade with table
+  size. → Phase 52 (partitioned table writes task), Phase 60
+  (`PARTITIONED BY` grammar), Phase 55 (streaming sink adopts the
+  writer), Phase 54 (dynamic partition pruning once tables can be
+  partitioned).
+- **Streaming source partitions**: single-node picks up new Kafka
+  partitions via consumer-group rebalance (C6, `kafka.rs:1116`); the
+  coordinator-fed distributed path has no dynamic split discovery —
+  a topic that grows partitions needs a restart. → Phase 55.
+- **IVM has no partitioning dimension at all** — and Phase 57
+  deliberately keeps one executor per IVM job (executor-resident state
+  is the step that pays). Key-group-sharded IVM is recorded in Phase 57
+  as an explicit post-phase follow-on, not a GA requirement.
+
 ## 8. API surfaces
 
 - **SQL**: DataFusion pinned at 53.1 / arrow 58.3 / iceberg 0.9.1
