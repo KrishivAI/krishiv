@@ -246,6 +246,28 @@ hardware headroom. This area needs *benchmark proof*, not rework.
   marked Partial after G17), and only ~17 engine-side UDF registrations
   exist — the function library is essentially DataFusion's builtin set.
   → Phase 60 (measured Spark-reference parity).
+- **SQL across the three engines** (fifth pass, 2026-07-10): the language
+  has **three front doors**. Batch = full DataFusion planner +
+  extensions; streaming = `compile_streaming_window_sql`
+  (`streaming_window_plan.rs`, a hand-written AST matcher: plain SELECT
+  only, exactly one TUMBLE/HOP/SESSION TVF, whitelisted aggregates, no
+  joins/HAVING/subqueries); IVM = `IncrementalViewSpec.sql` into the
+  delta planner (AUD-9 coverage, silent DiffBased fallback). The same
+  window-TVF syntax is implemented **twice** (batch rewrites to scalar
+  UDFs in `streaming_tvf.rs`; streaming hand-compiles) — the
+  `SUM(CASE WHEN)` 409 (fixed `7b720ea`) was this divergence class in
+  prod, and it recurs per construct until the front door is shared. No
+  SQL DDL reaches streaming or IVM (no `CREATE MATERIALIZED VIEW`, no
+  streaming `CREATE TABLE`/`INSERT INTO … SELECT`; continuous jobs are
+  API/HTTP-only via `continuous_stream_http.rs`) — a Flight SQL/JDBC/BI
+  client can never touch two of the three engines. `grammar.rs`'s
+  `FeatureEntry` has a single `status`, so "supported-batch,
+  partial-streaming" is unrepresentable and measured coverage silently
+  means batch. No differential tests assert batch(q) ≡ streaming(bounded
+  replay) ≡ IVM snapshot for the shared subset, though the oracle is
+  free (DiffBased fallback *is* batch recompute). → Phase 60
+  (engine-dimensioned matrix, one parser front door, cross-engine DDL,
+  differential corpus), operator execution coverage in 55/57.
 - **API fragmentation across the three engines** (third pass, 2026-07-10):
   the Python surface has a strong PySpark-shaped base — `PyDataFrame`
   with ~60 methods (select/filter/group_by/join/pivot/cube/rollup/
