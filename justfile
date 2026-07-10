@@ -99,6 +99,12 @@ docker-fast:
         -t {{ image }} .
     @echo "✓ loaded {{ image }} into local docker (use k3s ctr images import for k3s)"
 
+# Prod fast image: release binary in an isolated target dir, verified before
+# imaging (guards against parallel-build artifact clobbering). Optional arg
+# overrides the tag (default localhost/krishiv:fast-<sha>).
+docker-fast-prod tag="":
+    scripts/build-fast-engine.sh {{ tag }}
+
 # Build the k8s image locally and load into the local docker daemon.
 # For single-node dev use: just docker-single-node (faster, smaller)
 docker-local:
