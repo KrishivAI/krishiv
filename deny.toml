@@ -83,6 +83,17 @@ ignore = [
     { id = "RUSTSEC-2026-0104" },
     { id = "RUSTSEC-2026-0099" },
     { id = "RUSTSEC-2026-0098" },
+    # RUSTSEC-2026-0194/0195: quick-xml 0.39.4 DoS (quadratic duplicate-attribute
+    # scan / unbounded namespace-declaration allocation on malicious XML). Fixed
+    # in quick-xml >= 0.41, but the only consumer is `object_store 0.13.2` (S3
+    # ListBucket XML parsing), whose `^0.39` requirement is pinned transitively
+    # by datafusion 53.1.0 — 0.41 is unreachable until the datafusion/object_store
+    # train advances (tracked with the iceberg-rust 0.10 / DF 54 bump, task #163).
+    # The XML source is the configured object store (trusted S3/MinIO we operate),
+    # not an external caller, so the DoS exposure is not reachable by untrusted
+    # input in the certified deployment.
+    { id = "RUSTSEC-2026-0194" },
+    { id = "RUSTSEC-2026-0195" },
 ]
 
 # ── Allowed crate sources ─────────────────────────────────────────────────────

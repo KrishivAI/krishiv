@@ -40,6 +40,21 @@ jobs:
       - run: just fmt
       - run: just lint
 
+  # ── Supply-chain gate: advisories, bans, licenses, sources (blocking) ────────
+  # cargo-deny reads Cargo.lock + the RustSec advisory DB — no compilation — so
+  # it runs in parallel and fails a PR fast when a dependency introduces a known
+  # vulnerability, a banned crate, a disallowed license, or an unknown source.
+  # security.yml re-runs this on push-to-main and weekly; this job is the
+  # pre-merge gate (SEC-4, Phase 63).
+  deny:
+    name: Supply-chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
   # ── Feature-mode compilation matrix ─────────────────────────────────────────
   check-modes:
     name: check (${{ matrix.mode }})
