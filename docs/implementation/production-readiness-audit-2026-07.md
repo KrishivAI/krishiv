@@ -194,6 +194,89 @@ style disaggregated state (DFS-primary + local cache — `dfs_backend.rs`
 is the seed) with incremental checkpoints; savepoint compatibility
 windows; unaligned checkpoints later (roadmap already names them).
 
+## 4b. Streaming execution flow: the latency gap vs Flink/Arroyo (ninth pass, 2026-07-10)
+
+Traced end-to-end on the production path: Kafka → platformd
+`kafka_bridge` → HTTP `continuous-push` → coordinator task assignment
+(gRPC) → executor cycle → per-cycle Iceberg commit → coordinator inline
+result store → HTTP `continuous-drain` poll.
+
+**The distributed path is stop-and-wait micro-batch through the control
+plane; end-to-end latency is seconds by construction:**
+
+- Nothing in the engine drives cycles. `should_consider_for_launch`
+  explicitly excludes streaming jobs (`job_coordinator.rs:208` — a
+  deliberate fix for the Phase-20 double-cycle race), so every cycle —
+  including for engine-native registry sources — exists only because an
+  external client POSTed `continuous-push`. The production driver is the
+  platform bridge, which lingers up to **2 s** per cycle
+  (`MAX_BATCH_LINGER`, platform `kafka_bridge/imp.rs:45`).
+- Each cycle pays the full task-assignment machinery: coordinator write
+  lock, launch, gRPC dispatch, dispatch-response bookkeeping
+  (`api_continuous_push`, `continuous_stream_http.rs:510-596`); input
+  rides base64 JSON over HTTP.
+- Strict stop-and-wait fencing: one cycle in flight AND undrained output
+  each 409 the next push (`prepare_continuous_input_cycle`,
+  `task_assignment.rs:285-306`). Output sits in coordinator memory until
+  the same external client polls `continuous-drain` — a consumer that
+  stops draining halts the stream (the known bridge-wedge class).
+- O(state) twice per cycle on the hot path: the full operator
+  `snapshot()` ships in the task output and is persisted by the
+  coordinator every cycle (§4), and a **fresh ephemeral RocksDB is
+  built and loaded from those same bytes for queryable state each
+  cycle** (`fragment/streaming.rs:594-604`).
+- One Iceberg commit per cycle (`commit_cycle`,
+  `fragment/streaming.rs:740`): catalog commit latency lands on the
+  cycle path, and snapshot/small-file growth is per-cycle (feeds the
+  §7c maintenance gap).
+
+**Liveness/latency bugs (new this pass):**
+
+- **The distributed loop has no idle tick.**
+  `ContinuousWindowExecutor::tick()` (ST-4) has exactly one caller — the
+  **embedded** loop (`krishiv-api/engines.rs:1185`). In distributed
+  mode windows fire only when the *next* push advances the watermark: a
+  topic that goes quiet never emits its final windows, and session
+  windows never close on inactivity. Latency bug and a correctness/
+  liveness bug in one.
+- **`KRISHIV_STREAM_EARLY_FIRE_MS` is a silent no-op**:
+  `emit_open_windows_speculative` returns `None` for the production
+  state-backed operators by design (stub, `continuous.rs:589-614`) — a
+  documented knob that does nothing. Wire-or-delete.
+- Platform-side: the bridge **drops oldest buffered messages** at its
+  hard cap (`imp.rs:196-204`) — at-most-once under backpressure until
+  the certified feeder protocol lands (platform task #171).
+
+**The low-latency architecture already exists in this codebase —
+embedded placement only.** `run_streaming_continuous`
+(`krishiv-api/engines.rs:1139`) is the Arroyo-shaped loop: long-running
+task that owns its source, notify-driven wakeup (µs-class when the
+source implements `data_notify()`), 50 µs idle floor / 5 ms fallback
+tick, ST-4 idle tick, S-3 background checkpoints off the hot path, and
+a `StreamProfile` latency-vs-throughput knob. The distributed
+`stream:loop` path uses none of it — it replaced the loop with
+coordinator round-trips.
+
+**SOTA reference.** Flink: pipelined per-record dataflow; the latency
+dial is the network buffer timeout (100 ms default), not a job restart;
+a per-key timer service fires windows with no input required;
+credit-based flow control; checkpoints incremental and off the hot
+path. Arroyo (Rust/Arrow/DataFusion — Krishiv's own base): millisecond
+latency; workers exchange Arrow batches over TCP; `BATCH_SIZE` /
+`BATCH_LINGER_MS` is the explicit latency/throughput dial; Chandy-
+Lamport checkpoints; the controller is control-plane-only. Krishiv's
+embedded loop is architecturally equivalent to Arroyo's model; the
+distributed cycle model is not, and no knob can fix it — the driver has
+to move from external HTTP pushes to a source-owning executor loop.
+
+**Direction (Phase 55, folded in as the low-latency-loop task):**
+promote the embedded loop to the distributed runtime — the stream:loop
+task launches once and runs, owns its source splits, wakes on data;
+checkpoints happen at barrier epochs only; sink commits happen at epoch
+boundaries on a configured interval; results stream to consumers
+instead of parking in the coordinator; push/drain remains only as an
+ingest/egress API, never the execution driver.
+
 ## 5. Delta-batch / IVM: correct now, doesn't scale yet
 
 Re-confirmed open (post-AUD fixes):
@@ -557,7 +640,14 @@ Phase detail, gates, and platform-side seams live in the platform repo:
   streaming-end-to-end, no-per-query-setup discipline (§2b) is where the
   headroom is for an engine already on Rust/Arrow/DataFusion.
 - Flink 2.0 disaggregated state / ForSt (VLDB'25) + async execution model;
-  credit-based flow control (FLINK-7282) as the streaming data-plane model.
+  credit-based flow control (FLINK-7282) as the streaming data-plane model;
+  buffer-timeout + per-key timer service as the low-latency model (§4b).
+- Arroyo (arroyo.dev): Rust/Arrow/DataFusion streaming engine,
+  millisecond-latency; Arrow batches over TCP between workers,
+  `BATCH_SIZE`/`BATCH_LINGER_MS` as the latency/throughput dial,
+  Chandy-Lamport checkpoints, control-plane-only controller — the
+  external proof that Krishiv's embedded continuous loop (§4b) is the
+  right architecture to promote into the distributed runtime.
 - Spark AQE (coalesce/skew-split/dynamic broadcast) + runtime filters;
   push-based/remote shuffle (Magnet, Celeborn, Uniffle) as the shuffle
   service end-state — `krishiv-shuffle`'s ESS/push/tiered stores map to it.
