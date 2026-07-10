@@ -336,6 +336,85 @@ security posture was adequate). Verified against the tree:
 → **Phase 63 (Track 6 GATE 0, P0)** — runs first, gates GA, precedes
 Phase 31. Tasks SEC-1/SEC-2/DUR-1/DUR-2.
 
+## 5c. Delta-batch execution flow: tick mechanics + the Feldera/RisingWave lessons (tenth pass, 2026-07-10)
+
+Traced a tick end-to-end: `feed` → pending deltas → `step_datafusion`
+(5-phase: drain/snapshot → dirty-bit toposort → plan-or-DiffBased per
+view → apply → publish) and the distributed `delta:step` offload
+(`fragment/ivm.rs`).
+
+**The foundation is genuinely DBSP-shaped — better than §5's summary
+implies:**
+
+- `DeltaBatch` is a real weighted Z-set (Int64 weights, negate/concat/
+  normalize/consolidate); `Trace` is an 8-level spine with cascade
+  merge + consolidation (O(log N) amortized, `trace.rs:12`) — the same
+  data structures Feldera's DBSP runtime uses.
+- The DiffBased differ is **not** stringify-based (stale impression):
+  `differentiate` uses Arrow `RowConverter` canonical rows
+  (`operators/stream.rs:63`). It does allocate a `Vec<u8>` per row per
+  side per tick (`.to_vec()` on every row key) — borrowable, worth
+  fixing inside the AUD-7 row-format work.
+- Central ticks reuse a cached per-flow `SessionContext` (G14) that is
+  spill-configured by default (`tick_ctx` +
+  `spill::spill_session_context`, `flow.rs:715-720`); dirty-bit
+  scheduling skips clean views.
+
+**New bugs (code-verified):**
+
+- **Silent numeric coercion in aggregates**: the accumulator parses the
+  stringified input value with `.unwrap_or(0.0)`
+  (`operators/aggregate.rs:235`) — an unparseable/non-numeric value
+  contributes **0 to SUM/AVG instead of erroring**. Wrong answers, no
+  diagnostic.
+- **AUD-7 is understated**: not only group keys — **aggregate input
+  values** are stringified and re-parsed per row per tick
+  (`input_val_str.parse::<f64>()`), and MIN/MAX keep an in-RAM
+  multiset of every distinct value per group (`min_max_set`,
+  BTreeMap<OrdF64, i64>) — correct retraction semantics, unbounded
+  memory, no state backend, invisible to any budget.
+- **The offloaded tick rebuilds the world**: the executor builds a
+  transient flow per tick — re-registers views, `restore_full`
+  (O(state) in), **fresh SessionContext per tick**
+  (`fragment/ivm.rs:209` calls `step_datafusion()` on a brand-new flow,
+  so the per-flow ctx cache never hits — the exact overhead G14
+  removed centrally), **recompiles every view plan per tick**
+  (`build_view_plan`, transient `view_plans` starts empty), and ships
+  **every view's full materialized output back** (`flow.snapshot` per
+  view → `encode_batch_map`) even when the plan executed O(Δ). Wire +
+  compute cost is O(state + output) per tick regardless of delta size.
+  AUD-6's executor-resident refactor kills all four at once — the exit
+  criterion must include "executor returns deltas, not snapshots."
+- **No O(Δ) view-on-view cascade**: a downstream view of an
+  incremental view always executes DiffBased over the upstream's
+  **full output** (the incremental branch registers only the previous
+  snapshot for downstream consumers, `flow.rs:940-958`); output deltas
+  never propagate down the view DAG. Every extra DAG level costs
+  O(state), so composed views — the thing pipelines produce — defeat
+  the engine's own differentiator.
+- `enable_disk_spill` has zero callers outside the crate (the tick ctx
+  is spill-configured anyway) — wire-or-delete the knob (Phase 51).
+
+**SOTA reference.** Feldera (DBSP — the formal basis this crate already
+declares): incrementalizes *arbitrary* SQL programs including deeply
+nested view hierarchies — delta cascades are free by construction
+because the whole program is one circuit; spills state to NVMe for
+larger-than-RAM operation; millions of events/s single-node.
+RisingWave: **shared arrangements** — indexes are materialized views
+shared by all downstream operators, so N views over the same join key
+keep one copy of state; **delta joins** — Δ(A⋈B⋈C) evaluated as a
+union of N lookup terms against shared indexes, no per-join state
+duplication; state lives in Hummock (disaggregated LSM) with two-phase
+aggregation. Krishiv's per-view private traces + DiffBased cascades
+are the opposite of both on exactly these axes.
+
+**Direction (folded into Phases 57/64):** AUD-7 grows to cover value
+stringification + the 0.0 coercion bug + differentiate allocations;
+AUD-9 grows the delta cascade (view-on-view O(Δ)) with shared upstream
+traces; AUD-6's exit adds deltas-not-snapshots; MIN/MAX multisets move
+behind the Phase-56 state/arbiter seam; Phase 64 evaluates the
+delta-join form for multi-way joins at shard scale.
+
 ## 6. Fault tolerance & HA
 
 - Coordinator HA: etcd leader election exists behind `feature = "etcd"`
@@ -654,4 +733,10 @@ Phase detail, gates, and platform-side seams live in the platform repo:
 - Delay scheduling (Zaharia et al., EuroSys'10) for the locality tier;
   speculative execution per MapReduce/Spark for stragglers.
 - DBSP/Feldera (already the delta crate's declared basis) for IVM
-  operator coverage direction.
+  operator coverage direction; specifically (§5c): whole-program
+  circuits make view-on-view delta cascades free, NVMe-spilled state
+  for larger-than-RAM operation, millions of events/s single-node.
+- RisingWave (§5c): shared arrangements (one indexed state serving all
+  downstream MVs), delta joins (Δ(A⋈B⋈C) as a union of lookup terms —
+  no per-join state duplication), Hummock disaggregated LSM state,
+  two-phase aggregation, MV-on-MV as first-class.
