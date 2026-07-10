@@ -10,7 +10,6 @@ pub mod flow;
 pub mod partitioned;
 pub mod plan;
 pub mod provenance;
-pub mod snapshot_store;
 pub mod spill;
 pub mod vector_sink;
 

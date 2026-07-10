@@ -2,6 +2,10 @@
 
 //! E4.1 — Incremental RocksDB checkpoint via the rocksdb::Checkpoint API.
 //!
+//! Wire-or-delete disposition (Phase 51): **keep, currently unwired** — the
+//! live-caller wiring (SST-delta checkpoints) is claimed by Phase 56
+//! (state v2). See `docs/implementation/wire-or-delete-2026-07.md`.
+//!
 //! Each epoch creates a hard-linked local snapshot, lists SST files, and
 //! uploads only the files not present in the previous epoch. Non-SST metadata
 //! files (MANIFEST-*, CURRENT, OPTIONS-*) are small and always uploaded.

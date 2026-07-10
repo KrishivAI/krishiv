@@ -137,10 +137,6 @@ struct IncrementalFlowInner {
     pending: HashMap<String, Vec<DeltaBatch>>,
     tick: u64,
     source_snapshots: HashMap<String, RecordBatch>,
-    /// Optional disk-backed snapshot store for datasets larger than RAM.
-    /// When set, large source snapshots are spilled to Arrow IPC files on disk
-    /// and loaded on demand, keeping only an LRU cache in memory.
-    snapshot_store: Option<crate::snapshot_store::SnapshotStore>,
 
     // Content-addressed dedup: opt-in per-source insertion row dedup.
     // Each entry is (insertion-order FIFO queue, fast-lookup set).
@@ -288,7 +284,6 @@ impl IncrementalFlow {
                 pending: HashMap::new(),
                 tick: 0,
                 source_snapshots: HashMap::new(),
-                snapshot_store: None,
                 input_dedup_enabled: false,
                 seen_input_hashes: AHashMap::new(),
                 delta_checkpoint_enabled: false,
@@ -377,18 +372,6 @@ impl IncrementalFlow {
     pub fn force_diff_based(&self) -> IvmResult<()> {
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.force_diff_based = true;
-        Ok(())
-    }
-
-    /// Enable disk-backed storage for source snapshots. Batches exceeding
-    /// 16 MiB are serialized to Arrow IPC files in `spill_dir` and loaded
-    /// on demand, keeping an in-memory LRU cache of recently used batches
-    /// (256 MiB default). Useful for datasets larger than available RAM.
-    pub fn enable_disk_spill(&self, spill_dir: impl AsRef<std::path::Path>) -> IvmResult<()> {
-        let store = crate::snapshot_store::SnapshotStore::with_disk_spill(spill_dir)
-            .map_err(|e| IvmError::execution(format!("snapshot store init: {e}")))?;
-        let mut inner = self.inner.lock().map_err(lock_err)?;
-        inner.snapshot_store = Some(store);
         Ok(())
     }
 

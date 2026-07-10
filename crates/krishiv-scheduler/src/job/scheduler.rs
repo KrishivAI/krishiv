@@ -242,6 +242,10 @@ impl SlotAwareScheduler {
 ///
 /// The current implementation focuses on the `PROCESS_LOCAL` /
 /// `NODE_LOCAL` tier; rack-aware placement is a follow-up.
+///
+/// Wire-or-delete disposition (Phase 51): **keep** — promotion to the live
+/// placement path is claimed by Phase 53 (scheduler v2). See
+/// `docs/implementation/wire-or-delete-2026-07.md`.
 #[cfg(test)]
 pub struct LocalityScheduler;
 
@@ -335,6 +339,10 @@ impl LocalityScheduler {
 /// This is a single-pass, fair-by-weight scheduler; the full Spark
 /// `FairSchedulableBuilder` with `minShare`, `weight`, and `pools`
 /// is a follow-up.
+///
+/// Wire-or-delete disposition (Phase 51): **keep** — "fair pools GA" is
+/// claimed by Phase 53 (scheduler v2). See
+/// `docs/implementation/wire-or-delete-2026-07.md`.
 #[cfg(test)]
 pub struct FairScheduler;
 

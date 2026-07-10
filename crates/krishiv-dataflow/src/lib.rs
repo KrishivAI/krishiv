@@ -65,7 +65,6 @@ pub mod dedup_operator;
 /// P8: Delta Join — stateless stream-stream join for append-only streams.
 pub mod delta_join;
 pub mod envelope;
-pub mod fusion;
 pub mod group_state;
 pub mod interval_join;
 pub mod join;
