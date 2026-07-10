@@ -5,7 +5,7 @@ Code-grounded audit of the engine across components, execution flow
 the three placements (embedded / single-node / distributed), and every API
 surface (SQL, Rust, Python, Flight SQL, gateway, MCP, connectors). Every
 claim cites code, not docs. This audit is the evidence base for the
-platform plan's **Track 6 (phases 51–60): engine production readiness** —
+platform plan's **Track 6 (phases 51–61): engine production readiness** —
 the arc that takes the engine from "certified single-path" to a credible
 Spark/Flink alternative for community adoption.
 
@@ -193,6 +193,24 @@ hardware headroom. This area needs *benchmark proof*, not rework.
   (`Cargo.toml`); upgrade train tracked (#163 for iceberg 0.10 + DF 54
   alignment). Session layer, prepared statements ($N + JDBC `?` G12),
   SQLSTATE taxonomy (`krishiv-sql/src/sqlstate`).
+- **SQL language coverage** (second pass, 2026-07-10): broader than
+  typical — `krishiv-sql` ships a machine-readable ~90-entry feature
+  matrix (`grammar.rs`), Spark extensions (`spark_sql_ext.rs`: LATERAL
+  VIEW [OUTER], TABLESAMPLE, TRANSFORM, DESCRIBE EXTENDED, SHOW
+  TBLPROPERTIES), PIVOT/UNPIVOT rewrites, recursive CTEs,
+  ROLLUP/CUBE/GROUPING SETS, Spark 4 pipe syntax, a MATCH_RECOGNIZE
+  subset (no DEFINE/MEASURES), Iceberg MERGE/DELETE/UPDATE and durable
+  CTAS (G17), `CREATE FUNCTION … LANGUAGE SQL|PYTHON`. **Verified
+  missing**: the entire JSON function family (`get_json_object`,
+  `from_json`/`to_json`, `json_tuple` — zero hits in the tree),
+  higher-order array/map lambdas (`transform`, `filter`, `aggregate`,
+  `zip_with`), Spark session statements (`SET`/`RESET`, `USE`,
+  `TRUNCATE`, `CACHE`), most of the `SHOW` family, `DESCRIBE
+  FUNCTION|DATABASE|QUERY`, join hints beyond BROADCAST, Spark
+  date-format patterns. The matrix itself has **drifted** (CTAS still
+  marked Partial after G17), and only ~17 engine-side UDF registrations
+  exist — the function library is essentially DataFusion's builtin set.
+  → Phase 60 (measured Spark-reference parity).
 - **Flight SQL**: metadata RPCs + JDBC/ADBC verified (G1);
   `krishiv-sql-gateway` is explicitly **not** a wire server (API-12
   header) — an in-process SQLSTATE facade. There is no Postgres/JDBC
@@ -238,10 +256,11 @@ dependency order:
 | 57 | IVM scale-out: executor-resident state, arrow-row keys, retention, coverage | §5 AUD-6/7/8/9 |
 | 58 | Fault tolerance GA: coordinator HA, shuffle recovery, history server, chaos matrix | §6 |
 | 59 | Interfaces: progress/cancel, wire protocol decision, Python parity, CI honesty | §8 |
-| 60 | Production GA gate: certified matrix, public benchmarks + history, soak | the launch |
+| 60 | SQL surface completeness: measured Spark-reference parity (JSON/lambda functions, SET/SHOW/USE, matrix drift) | §8 SQL coverage |
+| 61 | Production GA gate: certified matrix, public benchmarks + history, soak | the launch |
 
 Phase detail, gates, and platform-side seams live in the platform repo:
-`docs/implementation/phases/phase-5N-*.md` and `plan.md` (Track 6).
+`docs/implementation/phases/phase-NN-*.md` and `plan.md` (Track 6).
 
 ### SOTA references consulted (2026-07-10)
 

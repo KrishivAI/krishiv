@@ -1,5 +1,23 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 (day, follow-up 2) — SQL-coverage audit leg → Track 6 gains Phase 60 (GA gate renumbered 61)
+
+User asked how SQL coverage compares to the Spark SQL reference. Second
+audit pass over `krishiv-sql` (appended to the audit doc §8): coverage is
+broader than the first pass credited — ~90-entry machine-readable feature
+matrix (`grammar.rs`), `spark_sql_ext.rs` (LATERAL VIEW, TABLESAMPLE,
+TRANSFORM), PIVOT/UNPIVOT, recursive CTEs, ROLLUP/CUBE, pipe syntax,
+MATCH_RECOGNIZE subset, Iceberg MERGE/DELETE/UPDATE/CTAS — but with
+verified holes: **zero JSON functions** (`get_json_object`/`from_json`/
+`json_tuple`), no higher-order array/map lambdas, no Spark
+`SET`/`USE`/`TRUNCATE`/`CACHE`/most-`SHOW` statements, hints beyond
+BROADCAST unhandled, and the feature matrix has drifted (CTAS still
+Partial after G17). Platform plan updated: new **Phase 60 — SQL surface
+completeness, measured** (Spark-checklist corpus + auto-generated
+function-parity matrix as the KPI; ≥95%/90%/85% gates with itemized
+shortfalls; exact-or-absent alias rule), GA gate renumbered **61**.
+Docs-only change.
+
 ## 2026-07-10 (day, follow-up) — production-readiness audit → Track 6 plan (platform phases 51–60)
 
 User-directed pivot before Phase 31: full code-grounded audit of the engine
