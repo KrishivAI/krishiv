@@ -606,6 +606,12 @@ pub struct ContinuousDrainResponse {
 ///
 /// Results are written by the executor after processing a fenced `stream:loop`
 /// cycle and are consumed once from the coordinator's in-memory result store.
+///
+/// **Delivery guarantee (DUR-5): best-effort, not durable.** The inline result
+/// store is coordinator RAM; a restart before the client drains loses those
+/// windows permanently (input already consumed). This holds even under a
+/// durable profile — see [`drain_continuous_stream_coordinated`] for the full
+/// note and the durable alternatives (transactional sink / queryable state).
 pub async fn api_continuous_drain(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousDrainRequest>,
@@ -909,6 +915,18 @@ pub async fn push_continuous_input_coordinated(
 ///
 /// Returns IPC byte payloads (one per completed window), or an empty vec if no
 /// results are available yet.
+///
+/// # Delivery guarantee (DUR-5): best-effort, NOT durable
+///
+/// Undrained windows live only in coordinator RAM (`job_inline_results`). A
+/// coordinator restart between cycle completion and drain loses those windows
+/// permanently — the input was already consumed, so they are not regenerated.
+/// **This path is best-effort even under a durable profile.** A durable profile
+/// does not imply drained output survives a restart. For at-least-once /
+/// exactly-once delivery that survives coordinator loss, consume via the
+/// transactional Iceberg sink or queryable-state snapshots (both durable), not
+/// this drain endpoint. (The Phase 55 streamed-results work is the structural
+/// retirement of this in-RAM path.)
 pub async fn drain_continuous_stream_coordinated(
     coordinator: &SharedCoordinator,
     job_id: &str,

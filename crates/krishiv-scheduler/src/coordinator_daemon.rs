@@ -200,6 +200,10 @@ pub fn build_shared_coordinator_sync(
                 }
                 let mut store = RocksDbMetadataStore::open(path.as_path())
                     .map_err(|e| format!("rocksdb store '{}': {e}", path.display()))?;
+                // DUR-6: fail-closed profiles fsync metadata writes.
+                store.set_sync_writes(krishiv_common::profile_requires_fail_closed_metadata(
+                    config.durability_profile,
+                ));
                 coord
                     .recover_from_store(&mut store)
                     .map_err(|e| format!("coordinator recovery failed: {e}"))?;
@@ -241,6 +245,10 @@ pub fn build_shared_coordinator_sync(
         (Some("rocksdb" | "redb"), Some(path)) => {
             let mut store = RocksDbMetadataStore::open(path.as_path())
                 .map_err(|e| format!("rocksdb store '{}': {e}", path.display()))?;
+            // DUR-6: fail-closed profiles fsync metadata writes.
+            store.set_sync_writes(krishiv_common::profile_requires_fail_closed_metadata(
+                config.durability_profile,
+            ));
             coord
                 .recover_from_store(&mut store)
                 .map_err(|e| format!("coordinator recovery failed: {e}"))?;

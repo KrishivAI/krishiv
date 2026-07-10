@@ -78,6 +78,10 @@ impl KubernetesControllerRuntime {
                     ),
                 }
             })?;
+            // DUR-6: fail-closed profiles fsync metadata writes.
+            store.set_sync_writes(krishiv_common::profile_requires_fail_closed_metadata(
+                config.durability_profile,
+            ));
             coordinator
                 .recover_from_store(&mut store)
                 .map_err(OperatorError::from)?;

@@ -5,7 +5,7 @@ use crate::store::{
     PersistedExecutorDescriptor, PersistedJobRecord,
 };
 use krishiv_proto::{ExecutorDescriptor, ExecutorId};
-use rocksdb::{ColumnFamilyDescriptor, DB, Options};
+use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteOptions};
 use std::path::Path;
 
 const CF_EVENTS: &str = "events";
@@ -41,6 +41,12 @@ pub struct RocksDbMetadataStore {
     continuous_snapshots: std::collections::HashMap<String, ContinuousSnapshot>,
     next_event_id: u64,
     history: Vec<JobHistoryRecord>,
+    /// DUR-6: when true, state-advancing writes issue `WriteOptions::set_sync`
+    /// so the RocksDB WAL is `fsync`'d before the write is acknowledged. Set on
+    /// fail-closed durability profiles, whose contract is that an acknowledged
+    /// metadata write survives host/power loss (default `put_cf` only survives a
+    /// process crash, not a machine crash).
+    sync_writes: bool,
 }
 
 impl RocksDbMetadataStore {
@@ -187,7 +193,29 @@ impl RocksDbMetadataStore {
             continuous_snapshots,
             next_event_id,
             history,
+            sync_writes: false,
         })
+    }
+
+    /// DUR-6: enable synchronous (fsync'd) metadata writes. Set on fail-closed
+    /// durability profiles so an acknowledged write survives host/power loss.
+    /// The default (`false`) keeps the faster WAL-only durability that survives
+    /// a process crash but not a machine crash.
+    pub fn set_sync_writes(&mut self, sync: bool) {
+        self.sync_writes = sync;
+    }
+
+    /// Whether synchronous metadata writes are enabled.
+    pub fn sync_writes(&self) -> bool {
+        self.sync_writes
+    }
+
+    /// Write options for a state-advancing put: `set_sync(true)` when running a
+    /// fail-closed profile so the WAL is fsync'd before the write is acked.
+    fn write_opts(&self) -> WriteOptions {
+        let mut opts = WriteOptions::default();
+        opts.set_sync(self.sync_writes);
+        opts
     }
 }
 
@@ -201,7 +229,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .ok_or_else(|| Self::store_err("missing events CF"))?;
         let id = self.next_event_id;
         self.db
-            .put_cf(&cf, id.to_le_bytes(), bytes)
+            .put_cf_opt(&cf, id.to_le_bytes(), bytes, &self.write_opts())
             .map_err(Self::store_err)?;
         self.next_event_id += 1;
         self.events.push(event);
@@ -220,7 +248,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .cf_handle(CF_JOBS)
             .ok_or_else(|| Self::store_err("missing jobs CF"))?;
         self.db
-            .put_cf(&cf, record.job_id().as_str(), bytes)
+            .put_cf_opt(&cf, record.job_id().as_str(), bytes, &self.write_opts())
             .map_err(Self::store_err)?;
         if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
             *existing = record.clone();
@@ -242,7 +270,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .cf_handle(CF_EXECUTORS)
             .ok_or_else(|| Self::store_err("missing executors CF"))?;
         self.db
-            .put_cf(&cf, descriptor.executor_id().as_str(), bytes)
+            .put_cf_opt(&cf, descriptor.executor_id().as_str(), bytes, &self.write_opts())
             .map_err(Self::store_err)?;
         if let Some(existing) = self
             .executors
@@ -283,7 +311,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .cf_handle(CF_CONTINUOUS)
             .ok_or_else(|| Self::store_err("missing continuous_snapshots CF"))?;
         self.db
-            .put_cf(&cf, job_id, encoded)
+            .put_cf_opt(&cf, job_id, encoded, &self.write_opts())
             .map_err(Self::store_err)?;
         self.continuous_snapshots
             .insert(job_id.to_owned(), snapshot);
@@ -311,7 +339,7 @@ impl MetadataStore for RocksDbMetadataStore {
             .cf_handle(CF_HISTORY)
             .ok_or_else(|| Self::store_err("missing job_history CF"))?;
         self.db
-            .put_cf(&cf, record.job_id.as_str(), bytes)
+            .put_cf_opt(&cf, record.job_id.as_str(), bytes, &self.write_opts())
             .map_err(Self::store_err)?;
         self.history.retain(|r| r.job_id != record.job_id);
         self.history.insert(0, record);
@@ -394,6 +422,28 @@ mod tests {
         assert_eq!(reopened.events(), &[event]);
         assert_eq!(reopened.jobs(), &[job]);
         assert_eq!(reopened.executors(), vec![exec]);
+    }
+
+    /// DUR-6: with synchronous writes enabled (fail-closed profiles), writes
+    /// still succeed and are durable across a reopen. The flag is opt-in and
+    /// off by default.
+    #[test]
+    fn rocksdb_metadata_sync_writes_persist_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scheduler.rocksdb");
+        let job = job_record("job-sync");
+
+        {
+            let mut store = RocksDbMetadataStore::open(&path).unwrap();
+            assert!(!store.sync_writes(), "sync writes are off by default");
+            store.set_sync_writes(true);
+            assert!(store.sync_writes());
+            // Every state-advancing write now goes through fsync'd WriteOptions.
+            store.save_job(&job).unwrap();
+        }
+
+        let reopened = RocksDbMetadataStore::open(&path).unwrap();
+        assert_eq!(reopened.jobs(), &[job]);
     }
 
     #[test]
