@@ -8,6 +8,20 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **Per-view delta statistics on IVM jobs** (#94, 2026-07-10). Every IVM
+  tick path (structural `step_with`, the DataFusion publish loop, and the
+  coordinator-authoritative `apply_computed_tick` offload) now counts each
+  view's logical multiset changes — weight +3 is 3 inserts, −2 is 2
+  retracts. `StepSummary` gains `total_inserted_rows`/`total_retracted_rows`,
+  `IncrementalFlow`/`PartitionedIncrementalFlow`/`IvmJob` gain
+  `view_delta_stats(view)` returning the new `ViewDeltaStats` (cumulative
+  totals + last-tick counts; partitioned = summed across shards), and the
+  coordinator exposes it at
+  `GET /api/v1/ivm/jobs/{job_id}/views/{view_name}/stats` — a lightweight
+  poll target (row count + counters) that avoids `/snap`'s full-snapshot
+  base64 serialization. Counters are in-memory and reset on engine restart;
+  pollers must diff consecutive reads and tolerate resets.
+
 - **Delivery-guarantee metadata on the continuous registry** (#92,
   2026-07-10). `ContinuousJobView` (GET `/api/v1/continuous[/{job_id}]`)
   gains a `delivery` block derived from the job's sink contract and the

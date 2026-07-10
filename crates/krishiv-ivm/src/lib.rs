@@ -16,8 +16,8 @@ pub mod vector_sink;
 
 pub use error::{IvmError, IvmResult};
 pub use flow::{
-    IncrementalFlow, StepSummary, ViewError, ViewErrorKind, coalesce_pending, decode_batch_map,
-    encode_batch_map, encode_ivm_step_fragment,
+    IncrementalFlow, StepSummary, ViewDeltaStats, ViewError, ViewErrorKind, coalesce_pending,
+    decode_batch_map, encode_batch_map, encode_ivm_step_fragment,
 };
 pub use partitioned::PartitionedIncrementalFlow;
 pub use plan::{

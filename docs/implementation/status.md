@@ -1,5 +1,28 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 (night, follow-up 2) — #94: per-view delta statistics on IVM jobs
+
+Same session, on top of #92. Every IVM tick path — structural `step_with`,
+the DataFusion publish loop (`step_datafusion_inner`), and the
+coordinator-authoritative executor offload (`apply_computed_tick`, the prod
+path) — now counts each view's logical multiset changes from the delta's
+`_weight` column (+3 = 3 inserts, −2 = 2 retracts). `StepSummary` gains
+`total_inserted_rows`/`total_retracted_rows`; new `ViewDeltaStats`
+(cumulative totals + last-tick counts) is queryable via
+`IncrementalFlow::view_delta_stats`, summed across shards on
+`PartitionedIncrementalFlow`, delegated on `IvmJob`, and served at
+`GET /api/v1/ivm/jobs/{job_id}/views/{view_name}/stats` (row count +
+counters; deliberately avoids `/snap`'s full-snapshot b64 cost on sampler
+polls). Counters are in-memory, monotonic until engine restart — pollers
+diff consecutive reads and must tolerate resets. Platform twin: freshness
+sampler prefers `/stats`, falls back to `/snap` for older engines;
+insert/retract fields surface on `PipelineTableStatus` + console "Δ last
+tick" column (transient, never persisted in `FreshnessSample`).
+
+Validation: `cargo test -p krishiv-ivm` 53+6 green (new
+`view_delta_stats_count_inserts_and_retracts` exercises both tick shapes),
+`cargo test -p krishiv-scheduler --lib` green, clippy clean on both crates.
+
 ## 2026-07-10 (night, follow-up) — #92: delivery-guarantee metadata on the continuous registry
 
 Same session, on top of G7 (b2dec7b). `ContinuousJobView` now carries a

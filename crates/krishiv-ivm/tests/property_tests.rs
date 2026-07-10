@@ -367,3 +367,49 @@ async fn filtered_group_by_matches_batch() {
         );
     }
 }
+
+/// #94: per-view insert/retract counters accumulate across ticks and track
+/// the multiset weights (a changed aggregate group = retract(old) +
+/// insert(new)), and the tick summary carries the same totals.
+#[tokio::test]
+async fn view_delta_stats_count_inserts_and_retracts() {
+    let flow = revenue_view_flow();
+
+    // No output yet -> no stats.
+    assert_eq!(flow.view_delta_stats("revenue").unwrap(), None);
+
+    // Tick 1: fresh groups appear - inserts only.
+    let rows: Vec<(i64, f64)> = (0..10).map(|i| (i % 2, i as f64)).collect();
+    flow.feed(
+        "sales",
+        DeltaBatch::from_inserts(revenue_batch(&rows)).unwrap(),
+    )
+    .unwrap();
+    let s1 = flow.step_datafusion().await.unwrap();
+    let stats1 = flow.view_delta_stats("revenue").unwrap().unwrap();
+    assert!(stats1.rows_inserted_total > 0, "aggregate rows inserted");
+    assert_eq!(stats1.rows_retracted_total, 0, "no groups changed yet");
+    assert_eq!(s1.total_inserted_rows, stats1.rows_inserted_total);
+    assert_eq!(s1.total_retracted_rows, 0);
+
+    // Tick 2: both groups change value - each emits retract(old) + insert(new).
+    flow.feed(
+        "sales",
+        DeltaBatch::from_inserts(revenue_batch(&[(0, 100.0), (1, 100.0)])).unwrap(),
+    )
+    .unwrap();
+    let s2 = flow.step_datafusion().await.unwrap();
+    let stats2 = flow.view_delta_stats("revenue").unwrap().unwrap();
+    assert!(
+        stats2.rows_retracted_total > 0,
+        "changed groups must retract their old aggregate rows"
+    );
+    assert!(stats2.rows_inserted_total > stats1.rows_inserted_total);
+    assert_eq!(stats2.last_tick_inserts, s2.total_inserted_rows);
+    assert_eq!(stats2.last_tick_retracts, s2.total_retracted_rows);
+    // Cumulative = tick1 + tick2.
+    assert_eq!(
+        stats2.rows_inserted_total,
+        stats1.rows_inserted_total + stats2.last_tick_inserts
+    );
+}

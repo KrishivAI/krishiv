@@ -61,6 +61,13 @@ const MAX_FIXPOINT_ITERS: usize = 100;
 #[derive(Debug, Default, Clone)]
 pub struct StepSummary {
     pub total_output_rows: usize,
+    /// Logical rows inserted this tick across all views (sum of positive
+    /// delta weights). `total_output_rows` counts physical delta rows;
+    /// these two count the multiset changes (#94 freshness rates).
+    pub total_inserted_rows: u64,
+    /// Logical rows retracted this tick across all views (sum of negative
+    /// delta weight magnitudes).
+    pub total_retracted_rows: u64,
     pub active_views: usize,
     /// View names that emitted a non-Apply output (degraded to DiffBased) during
     /// this step. Useful for surfacing join-type degradations to operators.
@@ -69,6 +76,39 @@ pub struct StepSummary {
     /// error and were silently skipped. The error message is the same string
     /// the operator logged. Step did not panic; subsequent ticks re-evaluate.
     pub errored_views: Vec<ViewError>,
+}
+
+/// Cumulative insert/retract counters for one view (#94).
+///
+/// Counts are logical multiset changes: a delta row with weight `+3` counts
+/// as 3 inserts, `-2` as 2 retracts. Monotonic for the life of the flow
+/// (reset only when the process restarts), so a poller can diff two reads
+/// to derive a rate.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ViewDeltaStats {
+    /// Total logical rows inserted since registration.
+    pub rows_inserted_total: u64,
+    /// Total logical rows retracted since registration.
+    pub rows_retracted_total: u64,
+    /// Inserts in the most recent tick that produced output for this view.
+    pub last_tick_inserts: u64,
+    /// Retracts in the most recent tick that produced output for this view.
+    pub last_tick_retracts: u64,
+}
+
+/// Count logical inserts/retracts in a delta (sum of positive weights,
+/// sum of negative weight magnitudes).
+fn delta_insert_retract_counts(delta: &DeltaBatch) -> (u64, u64) {
+    let mut inserts = 0u64;
+    let mut retracts = 0u64;
+    for weight in delta.weights().iter().flatten() {
+        if weight > 0 {
+            inserts += weight as u64;
+        } else {
+            retracts += weight.unsigned_abs();
+        }
+    }
+    (inserts, retracts)
 }
 
 /// One incremental view's failure during a step.
@@ -149,6 +189,8 @@ struct IncrementalFlowInner {
     // consume the O(Δ) changelog the flow already computed (`take_step_output`)
     // instead of re-materializing the full view and diffing snapshots.
     last_step_outputs: AHashMap<String, DeltaBatch>,
+    /// Per-view cumulative insert/retract counters (#94); keyed by view name.
+    view_delta_stats: AHashMap<String, ViewDeltaStats>,
 
     // Operator accumulator state captured by `checkpoint_full`, awaiting the
     // (lazy) rebuild of each view's plan. `restore_full` stashes it here; the
@@ -260,6 +302,7 @@ impl IncrementalFlow {
                 force_diff_based: false,
                 view_deps: AHashMap::new(),
                 last_step_outputs: AHashMap::new(),
+                view_delta_stats: AHashMap::new(),
                 pending_plan_state: HashMap::new(),
             })),
             tick_ctx: Arc::new(tokio::sync::Mutex::new(CachedTickContext::default())),
@@ -627,18 +670,30 @@ impl IncrementalFlow {
         let inputs = coalesce_pending(raw)?;
         let output_deltas = compute(inputs)?;
         let mut total_output_rows = 0usize;
+        let mut total_inserted_rows = 0u64;
+        let mut total_retracted_rows = 0u64;
         let mut active_views = 0usize;
         for (view_name, delta) in output_deltas {
             if let Ok(view) = inner.view_registry.get(&view_name) {
                 if !delta.is_empty() {
                     total_output_rows += delta.num_rows();
                     active_views += 1;
+                    let (inserts, retracts) = delta_insert_retract_counts(&delta);
+                    total_inserted_rows += inserts;
+                    total_retracted_rows += retracts;
+                    let stats = inner.view_delta_stats.entry(view_name.clone()).or_default();
+                    stats.rows_inserted_total += inserts;
+                    stats.rows_retracted_total += retracts;
+                    stats.last_tick_inserts = inserts;
+                    stats.last_tick_retracts = retracts;
                 }
                 let _ = view.publish_output(delta);
             }
         }
         Ok(StepSummary {
             total_output_rows,
+            total_inserted_rows,
+            total_retracted_rows,
             active_views,
             degraded_views: Vec::new(),
             errored_views: Vec::new(),
@@ -986,6 +1041,8 @@ impl IncrementalFlow {
         inner.last_step_outputs.clear();
         inner.tick += 1;
         let mut total_output_rows = 0usize;
+        let mut total_inserted_rows = 0u64;
+        let mut total_retracted_rows = 0u64;
         let mut active_views = 0usize;
         let mut errored_views: Vec<ViewError> = pre_lock_view_errors;
         let mut degraded_views: Vec<String> = Vec::new();
@@ -1255,6 +1312,16 @@ impl IncrementalFlow {
             }
             total_output_rows += output_delta.num_rows();
             active_views += 1;
+            let (inserts, retracts) = delta_insert_retract_counts(&output_delta);
+            total_inserted_rows += inserts;
+            total_retracted_rows += retracts;
+            {
+                let stats = inner.view_delta_stats.entry(view_name.clone()).or_default();
+                stats.rows_inserted_total += inserts;
+                stats.rows_retracted_total += retracts;
+                stats.last_tick_inserts = inserts;
+                stats.last_tick_retracts = retracts;
+            }
 
             // Provenance (DiffBased only).
             //
@@ -1317,10 +1384,19 @@ impl IncrementalFlow {
 
         Ok(StepSummary {
             total_output_rows,
+            total_inserted_rows,
+            total_retracted_rows,
             active_views,
             degraded_views,
             errored_views,
         })
+    }
+
+    /// Cumulative insert/retract counters for one view (#94), if it has
+    /// produced any output.
+    pub fn view_delta_stats(&self, view: &str) -> IvmResult<Option<ViewDeltaStats>> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner.view_delta_stats.get(view).copied())
     }
 
     // ── Subscriptions / snapshots ─────────────────────────────────────────────
@@ -1492,6 +1568,8 @@ impl IncrementalFlow {
 
         inner.tick += 1;
         let mut total_output_rows = 0usize;
+        let mut total_inserted_rows = 0u64;
+        let mut total_retracted_rows = 0u64;
         let mut active_views = 0usize;
         for (name, full) in view_full_outputs {
             if let Ok(view) = inner.view_registry.get(&name) {
@@ -1499,11 +1577,21 @@ impl IncrementalFlow {
                 if !delta.is_empty() {
                     total_output_rows += delta.num_rows();
                     active_views += 1;
+                    let (inserts, retracts) = delta_insert_retract_counts(&delta);
+                    total_inserted_rows += inserts;
+                    total_retracted_rows += retracts;
+                    let stats = inner.view_delta_stats.entry(name.clone()).or_default();
+                    stats.rows_inserted_total += inserts;
+                    stats.rows_retracted_total += retracts;
+                    stats.last_tick_inserts = inserts;
+                    stats.last_tick_retracts = retracts;
                 }
             }
         }
         Ok(StepSummary {
             total_output_rows,
+            total_inserted_rows,
+            total_retracted_rows,
             active_views,
             degraded_views: Vec::new(),
             errored_views: Vec::new(),

@@ -153,6 +153,24 @@ impl PartitionedIncrementalFlow {
         for r in results {
             merged.active_views = merged.active_views.max(r.active_views);
             merged.total_output_rows += r.total_output_rows;
+            merged.total_inserted_rows += r.total_inserted_rows;
+            merged.total_retracted_rows += r.total_retracted_rows;
+        }
+        Ok(merged)
+    }
+
+    /// Cumulative insert/retract counters for one view (#94), summed across
+    /// shards. `None` when no shard has produced output for the view.
+    pub fn view_delta_stats(&self, view: &str) -> IvmResult<Option<crate::flow::ViewDeltaStats>> {
+        let mut merged: Option<crate::flow::ViewDeltaStats> = None;
+        for shard in &self.shards {
+            if let Some(stats) = shard.view_delta_stats(view)? {
+                let m = merged.get_or_insert_with(Default::default);
+                m.rows_inserted_total += stats.rows_inserted_total;
+                m.rows_retracted_total += stats.rows_retracted_total;
+                m.last_tick_inserts += stats.last_tick_inserts;
+                m.last_tick_retracts += stats.last_tick_retracts;
+            }
         }
         Ok(merged)
     }

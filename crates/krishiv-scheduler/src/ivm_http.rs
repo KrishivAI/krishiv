@@ -643,6 +643,52 @@ pub async fn api_ivm_view_output(
     }
 }
 
+// ── GET /api/v1/ivm/jobs/{job_id}/views/{view_name}/stats ───────────────────
+
+/// Lightweight per-view maintenance stats (#94): row count plus cumulative
+/// and last-tick insert/retract counters. Unlike `/snap` this never
+/// serializes the snapshot, so pollers (the platform freshness sampler) can
+/// hit it every few seconds regardless of table size. Counters are logical
+/// multiset changes and reset on process restart — a poller derives rates by
+/// diffing consecutive reads and must tolerate the counters going backwards.
+#[derive(Debug, Serialize)]
+pub struct ViewStatsResponse {
+    pub num_rows: usize,
+    pub rows_inserted_total: u64,
+    pub rows_retracted_total: u64,
+    pub last_tick_inserts: u64,
+    pub last_tick_retracts: u64,
+}
+
+pub async fn api_ivm_view_stats(
+    State(registry): State<SharedIvmJobRegistry>,
+    Path((job_id, view_name)): Path<(String, String)>,
+) -> Result<Json<ViewStatsResponse>, StatusCode> {
+    let job = registry
+        .get(&job_id)
+        .ok_or_else(|| ivm_not_found(&job_id))?;
+    // 404 for a view that isn't registered (matches /debug-info semantics).
+    job.view_spec(&view_name)
+        .map_err(ivm_err)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let num_rows = job
+        .snapshot(&view_name)
+        .map_err(ivm_err)?
+        .map(|rb| rb.num_rows())
+        .unwrap_or(0);
+    let stats = job
+        .view_delta_stats(&view_name)
+        .map_err(ivm_err)?
+        .unwrap_or_default();
+    Ok(Json(ViewStatsResponse {
+        num_rows,
+        rows_inserted_total: stats.rows_inserted_total,
+        rows_retracted_total: stats.rows_retracted_total,
+        last_tick_inserts: stats.last_tick_inserts,
+        last_tick_retracts: stats.last_tick_retracts,
+    }))
+}
+
 // ── GET /api/v1/ivm/jobs/{job_id}/views/{view_name}/debug-info ──────────────
 
 #[derive(Debug, Serialize)]
@@ -937,6 +983,10 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
         .route(
             "/api/v1/ivm/jobs/{job_id}/views/{view_name}/output",
             get(api_ivm_view_output),
+        )
+        .route(
+            "/api/v1/ivm/jobs/{job_id}/views/{view_name}/stats",
+            get(api_ivm_view_stats),
         )
         .route(
             "/api/v1/ivm/jobs/{job_id}/views/{view_name}/debug-info",

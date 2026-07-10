@@ -117,6 +117,15 @@ impl IvmJob {
         }
     }
 
+    /// Cumulative insert/retract counters for a view (#94); summed across
+    /// shards when partitioned.
+    pub fn view_delta_stats(&self, view: &str) -> IvmResult<Option<krishiv_ivm::ViewDeltaStats>> {
+        match self {
+            IvmJob::Single(f) => f.view_delta_stats(view),
+            IvmJob::Partitioned(p) => p.view_delta_stats(view),
+        }
+    }
+
     /// Enable delta-checkpoint accumulation (every shard when partitioned).
     pub fn enable_delta_checkpoints(&self) -> IvmResult<()> {
         match self {
