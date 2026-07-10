@@ -17,6 +17,9 @@ jemalloc = ["dep:tikv-jemallocator"]
 [dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
+# Coordinator-side connector capability metadata (#92 delivery-guarantee
+# labels); the default feature set is lean (no connector implementations).
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0" }
 krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
 uuid = { workspace = true }
 arrow = { workspace = true }
@@ -51,7 +54,6 @@ urlencoding = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
-krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0" }
 tempfile = { workspace = true }
 
 [lib]

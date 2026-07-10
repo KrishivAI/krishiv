@@ -138,13 +138,11 @@ impl IcebergStreamingSink {
     }
 
     /// Capabilities of this sink (feeds the engine capability metadata that
-    /// the platform surfaces as delivery-guarantee labels).
+    /// the platform surfaces as delivery-guarantee labels). Delegates to the
+    /// shared, feature-independent metadata so the coordinator's advertised
+    /// guarantees cannot diverge from the implementation.
     pub fn sink_capabilities() -> ConnectorCapabilities {
-        ConnectorCapabilities::new()
-            .with_unbounded()
-            .with_transactional()
-            .with_checkpoint()
-            .with_two_phase_commit()
+        crate::capabilities::iceberg_streaming_sink_capabilities()
     }
 
     // `runtime` is `Some` for the sink's whole life; the `Option` exists only

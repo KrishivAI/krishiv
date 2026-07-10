@@ -110,7 +110,70 @@ pub struct ContinuousJobView {
     pub persisted_watermark_ms: Option<i64>,
     pub snapshot_available: bool,
     pub cycle_in_flight: bool,
+    /// Delivery-guarantee metadata derived from the job's sink contract and
+    /// the connector capability registry (#92) — the platform surfaces this
+    /// as delivery-guarantee labels instead of hardcoding claims.
+    pub delivery: ContinuousDeliveryView,
     pub spec: WindowExecutionSpec,
+}
+
+/// Delivery-guarantee metadata for one continuous job.
+///
+/// `effective` is the end-to-end label: the weakest guarantee across the
+/// checkpointed push source, the sink, and whether the source offsets ride in
+/// the sink's commit transaction. It intentionally reports capabilities the
+/// coordinator can actually see — never an aspirational claim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuousDeliveryView {
+    /// Sink kind (`"iceberg"`) when the job writes through a two-phase sink;
+    /// absent when results are only drained from coordinator memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink: Option<String>,
+    /// Strongest guarantee the sink's capabilities support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink_guarantee: Option<String>,
+    /// Whether source offsets are committed atomically with the sink epoch
+    /// (they are staged into every checkpoint whenever a sink is attached).
+    pub source_offsets_in_sink_transaction: bool,
+    /// Effective end-to-end delivery guarantee label:
+    /// `best-effort | at-least-once | effectively-once | exactly-once`.
+    pub effective: String,
+}
+
+fn continuous_delivery_view(record: &crate::JobRecord) -> ContinuousDeliveryView {
+    use krishiv_connectors::{DeliveryGuarantee, iceberg_streaming_sink_capabilities};
+    let iceberg_sink = record
+        .spec
+        .stages()
+        .first()
+        .and_then(|stage| stage.tasks().first())
+        .and_then(|task| task.sink_contract())
+        .and_then(|contract| {
+            match krishiv_proto::OutputContractDescriptor::parse_iceberg_sink(contract) {
+                Some(Ok(descriptor)) => Some(descriptor),
+                // A malformed contract would already fail the task on the
+                // executor; report it as "no sink" rather than guessing.
+                _ => None,
+            }
+        });
+    if iceberg_sink.is_some() {
+        let guarantee = iceberg_streaming_sink_capabilities().delivery_guarantee();
+        ContinuousDeliveryView {
+            sink: Some("iceberg".into()),
+            sink_guarantee: Some(guarantee.as_str().into()),
+            source_offsets_in_sink_transaction: true,
+            effective: guarantee.as_str().into(),
+        }
+    } else {
+        ContinuousDeliveryView {
+            sink: None,
+            sink_guarantee: None,
+            source_offsets_in_sink_transaction: false,
+            // Checkpointed replay can re-emit a drained cycle after restore;
+            // without a transactional sink the honest label stops here.
+            effective: DeliveryGuarantee::AtLeastOnce.as_str().into(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -202,6 +265,7 @@ fn continuous_job_view(
         persisted_watermark_ms: persisted.as_ref().map(|snapshot| snapshot.watermark_ms),
         snapshot_available: persisted.is_some(),
         cycle_in_flight: coordinator.continuous_input_cycles.contains(job_id),
+        delivery: continuous_delivery_view(&record),
         spec,
     })
 }
@@ -1137,6 +1201,64 @@ mod tests {
             checkpoint.0.snapshot_b64,
             Some(base64::engine::general_purpose::STANDARD.encode("checkpoint"))
         );
+    }
+
+    /// #92: the view's delivery block is derived from the sink contract and
+    /// connector capability metadata — never hardcoded platform-side.
+    #[tokio::test]
+    async fn delivery_view_reflects_sink_capability_metadata() {
+        let coordinator = make_coordinator_with_executor("delivery").await;
+
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-delivery-drain".into(),
+                spec: tumbling_spec(),
+                sink: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-delivery-iceberg".into(),
+                spec: tumbling_spec(),
+                sink: Some(ContinuousSinkSpec {
+                    root: "/tmp/warehouse".into(),
+                    table: "cycles".into(),
+                    mode: "append".into(),
+                    key_columns: Vec::new(),
+                    op_column: None,
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let drain_only = api_continuous_get(
+            State(coordinator.clone()),
+            Path(String::from("cs-delivery-drain")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(drain_only.0.delivery.sink, None);
+        assert_eq!(drain_only.0.delivery.effective, "at-least-once");
+        assert!(!drain_only.0.delivery.source_offsets_in_sink_transaction);
+
+        let with_sink = api_continuous_get(
+            State(coordinator),
+            Path(String::from("cs-delivery-iceberg")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(with_sink.0.delivery.sink.as_deref(), Some("iceberg"));
+        assert_eq!(
+            with_sink.0.delivery.sink_guarantee.as_deref(),
+            Some("exactly-once")
+        );
+        assert_eq!(with_sink.0.delivery.effective, "exactly-once");
+        assert!(with_sink.0.delivery.source_offsets_in_sink_transaction);
     }
 
     #[tokio::test]

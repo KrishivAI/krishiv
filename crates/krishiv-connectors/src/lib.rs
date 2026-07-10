@@ -71,7 +71,10 @@ mod tests;
 pub mod certification;
 
 // Root re-exports for perfect compatibility
-pub use capabilities::{ConnectorCapabilities, ConnectorMaturity, DeliveryGuarantee};
+pub use capabilities::{
+    ConnectorCapabilities, ConnectorMaturity, DeliveryGuarantee,
+    iceberg_streaming_sink_capabilities,
+};
 pub use config::ConnectorConfig;
 pub use error::{ConnectorError, ConnectorResult};
 #[cfg(feature = "kafka")]

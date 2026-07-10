@@ -8,6 +8,20 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **Delivery-guarantee metadata on the continuous registry** (#92,
+  2026-07-10). `ContinuousJobView` (GET `/api/v1/continuous[/{job_id}]`)
+  gains a `delivery` block derived from the job's sink contract and the
+  connector capability registry — `sink`, `sink_guarantee`,
+  `source_offsets_in_sink_transaction`, and the effective end-to-end label
+  (`exactly-once` with an Iceberg two-phase sink, `at-least-once` for
+  drain-only jobs whose replayed cycles can re-emit). `DeliveryGuarantee`
+  gains `as_str()`/`Display`, and the Iceberg sink's capability metadata
+  moved to the feature-independent
+  `capabilities::iceberg_streaming_sink_capabilities()` (the sink delegates
+  to it), so coordinators report guarantees without compiling the sink.
+  `krishiv-connectors` is now a regular (lean, default-feature)
+  `krishiv-scheduler` dependency.
+
 - **G7: checkpoint-aligned streaming Iceberg sink** (#89, 2026-07-10).
   Continuous (`stream:loop:`) jobs can now land cycle output in an Iceberg
   table under two-phase commit aligned to the G5 checkpoint boundary:

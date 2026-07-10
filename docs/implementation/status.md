@@ -1,5 +1,29 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 (night, follow-up) — #92: delivery-guarantee metadata on the continuous registry
+
+Same session, on top of G7 (b2dec7b). `ContinuousJobView` now carries a
+`delivery` block derived from the job's sink contract + connector capability
+metadata: `sink` / `sink_guarantee` / `source_offsets_in_sink_transaction` /
+`effective` (`exactly-once` when an Iceberg two-phase sink is attached,
+`at-least-once` for drain-only jobs — replayed cycles can re-emit after
+restore). The Iceberg sink's capabilities moved to feature-independent
+`capabilities::iceberg_streaming_sink_capabilities()` (sink delegates to it;
+they cannot diverge), `DeliveryGuarantee` gained `as_str()`/`Display`, and
+`krishiv-connectors` (lean default features) became a regular
+krishiv-scheduler dependency — it was dev-only, which compiled under `cargo
+test` but not the lib. Platform twin: `delivery_guarantee` on
+`PipelineTableStatus` + console Delivery column (never invented
+platform-side; absent unless the engine reports it).
+
+Validation: `cargo test -p krishiv-scheduler --lib` 385 green (new
+`delivery_view_reflects_sink_capability_metadata`), connectors 350 green,
+`cargo clippy -p krishiv-connectors -p krishiv-scheduler` clean. Also fixed
+this leg: `#[allow(clippy::expect_used)]` justification on the sink's `rt()`
+accessor (workspace denies expect_used; precedent vortex.rs), and exported
+`ContinuousSinkSpec`/`register_continuous_stream_with_sink` from the
+scheduler crate root.
+
 ## 2026-07-10 (night) — G7 CLOSED: checkpoint-aligned streaming Iceberg sink + row-level ops (#89); G8 wiring certified single-executor
 
 Session 70fb3928, same leg as #160 below. Continuous `stream:loop:` jobs can

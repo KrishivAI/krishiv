@@ -19,6 +19,38 @@ pub enum DeliveryGuarantee {
     ExactlyOnce,
 }
 
+impl DeliveryGuarantee {
+    /// Stable label for manifests, status APIs, and documentation generation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BestEffort => "best-effort",
+            Self::AtLeastOnce => "at-least-once",
+            Self::EffectivelyOnce => "effectively-once",
+            Self::ExactlyOnce => "exactly-once",
+        }
+    }
+}
+
+impl std::fmt::Display for DeliveryGuarantee {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Capability metadata for the streaming Iceberg sink (G7).
+///
+/// Lives here — not behind the `iceberg` feature — so a coordinator can
+/// report delivery guarantees for registered jobs without compiling the sink
+/// implementation. `IcebergStreamingSink::sink_capabilities` delegates to
+/// this function, so the metadata and the implementation cannot diverge.
+pub fn iceberg_streaming_sink_capabilities() -> ConnectorCapabilities {
+    ConnectorCapabilities::new()
+        .with_unbounded()
+        .with_transactional()
+        .with_checkpoint()
+        .with_two_phase_commit()
+}
+
 /// Published support level for a connector implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ConnectorMaturity {
