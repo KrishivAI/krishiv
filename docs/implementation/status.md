@@ -43,6 +43,16 @@ CTAS end-to-end.
 - Follow-ups: IVM flows reading Iceberg tables as sources directly (G7
   leg — removes the propagation cap), manifest-level pruning provider,
   column stats on written parts (currently none, like the DML path).
+- **Same-day follow-up fix**: the first prod run of the platform's
+  post-CTAS downstream feed hit the keyed partitioner's type gate —
+  `partition_record_batches_by_key` rejected `Utf8View` key columns
+  ("key column 'region' has unsupported type Utf8View"), which
+  DataFusion emits for strings by default. `krishiv-common::partition`
+  now accepts `Utf8`/`LargeUtf8`/`Utf8View` keys and hashes all three
+  under the same `utf8` domain tag, so shard assignment is a function of
+  the logical value, not the producer's physical encoding (regression
+  tests pin the known mapping across encodings). 20 partition tests +
+  clippy green.
 
 ## 2026-07-09 — Iceberg scan audit: multi-file snapshots read ALL files (real data-loss bug fixed)
 

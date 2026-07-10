@@ -6,6 +6,18 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Keyed partitioner accepts `Utf8View`/`LargeUtf8` string keys**
+  (2026-07-10). `partition_record_batches_by_key` rejected any key
+  column outside `Int32/Int64/Float64/Utf8/Boolean`, but DataFusion
+  emits `Utf8View` for string columns by default — so the IVM
+  stream-bridge refused whole feeds ("key column 'region' has
+  unsupported type Utf8View") and downstream live views silently
+  stayed empty. All three Arrow string encodings now hash under the
+  same domain tag, so a key lands in the same shard regardless of the
+  producer's physical encoding.
+
 ### Added
 
 - **Durable CTAS: `CREATE [OR REPLACE] TABLE <iceberg-table> AS SELECT`

@@ -3,7 +3,8 @@
 use std::num::NonZeroUsize;
 
 use arrow::array::{
-    Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, UInt64Array,
+    Array, BooleanArray, Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+    StringViewArray, UInt64Array,
 };
 use arrow::compute::take_record_batch;
 use arrow::datatypes::DataType;
@@ -103,7 +104,13 @@ impl PartitionError {
 fn supported_key_type(data_type: &DataType) -> bool {
     matches!(
         data_type,
-        DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Boolean
+        DataType::Int32
+            | DataType::Int64
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Boolean
     )
 }
 
@@ -152,11 +159,36 @@ fn digest_for_key(array: &dyn Array, row: usize) -> Result<[u8; 32], PartitionEr
                 &canonical_bits.to_le_bytes(),
             ]))
         }
+        // The three string encodings share one hash tag: a key must land in
+        // the same shard whether the producer emitted Utf8, LargeUtf8, or
+        // Utf8View (DataFusion's default string representation).
         DataType::Utf8 => {
             let values = array
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| downcast_error("Utf8"))?;
+            Ok(sha256_bytes_multi(&[
+                PARTITION_KEY_HASH_DOMAIN,
+                b"utf8\0",
+                values.value(row).as_bytes(),
+            ]))
+        }
+        DataType::LargeUtf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| downcast_error("LargeUtf8"))?;
+            Ok(sha256_bytes_multi(&[
+                PARTITION_KEY_HASH_DOMAIN,
+                b"utf8\0",
+                values.value(row).as_bytes(),
+            ]))
+        }
+        DataType::Utf8View => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| downcast_error("Utf8View"))?;
             Ok(sha256_bytes_multi(&[
                 PARTITION_KEY_HASH_DOMAIN,
                 b"utf8\0",
@@ -406,6 +438,18 @@ mod tests {
     }
 
     #[test]
+    fn string_encodings_hash_identically() {
+        // DataFusion emits Utf8View (and can emit LargeUtf8) for string
+        // columns; the shard a key lands in must depend on the logical value,
+        // never the physical Arrow encoding.
+        let shards = NonZeroUsize::new(17).unwrap();
+        let view = StringViewArray::from(vec!["customer-42"]);
+        let large = LargeStringArray::from(vec!["customer-42"]);
+        assert_eq!(shard_index(&view, 0, shards).unwrap(), KeyedShard(13));
+        assert_eq!(shard_index(&large, 0, shards).unwrap(), KeyedShard(13));
+    }
+
+    #[test]
     fn partitioning_is_deterministic_and_lossless() {
         let batches = vec![
             batch_with_key(
@@ -446,6 +490,8 @@ mod tests {
             Arc::new(Int64Array::from(vec![1, 2])),
             Arc::new(Float64Array::from(vec![1.5, 2.5])),
             Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(StringViewArray::from(vec!["a", "b"])),
+            Arc::new(LargeStringArray::from(vec!["a", "b"])),
             Arc::new(BooleanArray::from(vec![true, false])),
         ];
 
