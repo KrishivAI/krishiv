@@ -647,21 +647,52 @@ impl JwtAuthProvider {
     }
 
     /// Parse a JWKS JSON document and build a provider.
+    ///
+    /// SEC-6 (Phase 63): the accepted signature algorithms are pinned from the
+    /// key material itself — an RSA key admits only the RSA signing family
+    /// (RS*/PS*), an EC key only ES* for its curve, an Ed25519 key only EdDSA;
+    /// symmetric (`oct`) keys are refused and `none` can never appear. This
+    /// fixes the previous `Validation::default()`, whose `algorithms` was
+    /// `[HS256]` — so every real RS256/ES256 OIDC token was rejected and the
+    /// path was effectively broken for mainstream IdPs — and it closes the
+    /// JWKS algorithm-confusion class (an HS256 token forged with the public
+    /// key as the HMAC secret is never accepted).
     pub fn from_jwks_json(json: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_str(json)?;
         let mut keys = Vec::new();
+        let mut algorithms: Vec<jsonwebtoken::Algorithm> = Vec::new();
         for jwk in &jwks.keys {
+            let algs = match jwk_signing_algorithms(jwk) {
+                Ok(algs) => algs,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "skipping JWK unusable for JWT signature verification"
+                    );
+                    continue;
+                }
+            };
             match jsonwebtoken::DecodingKey::from_jwk(jwk) {
-                Ok(key) => keys.push(key),
+                Ok(key) => {
+                    keys.push(key);
+                    for alg in algs {
+                        if !algorithms.contains(&alg) {
+                            algorithms.push(alg);
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "skipping undecodable JWK");
                 }
             }
         }
-        if keys.is_empty() {
-            return Err("JWKS contained no usable verification keys".into());
+        if keys.is_empty() || algorithms.is_empty() {
+            return Err("JWKS contained no usable asymmetric verification keys".into());
         }
-        let mut validation = jsonwebtoken::Validation::default();
+        // By construction `algorithms` holds only asymmetric variants — HS* and
+        // `none` can never enter it.
+        let mut validation = jsonwebtoken::Validation::new(algorithms[0]);
+        validation.algorithms = algorithms;
         if let Ok(aud) = std::env::var(OIDC_AUDIENCE_ENV) {
             validation.set_audience(&[aud]);
         } else if krishiv_common::is_production_mode() {
@@ -673,6 +704,44 @@ impl JwtAuthProvider {
             validation.validate_aud = false;
         }
         Ok(Self { keys, validation })
+    }
+}
+
+/// SEC-6 (Phase 63): derive the permitted JWT signature algorithms for a JWK
+/// from its key material. Never returns an HMAC (HS*) algorithm and refuses
+/// symmetric keys, so a JWKS can never widen verification to an algorithm the
+/// key type does not support (the algorithm-confusion class).
+fn jwk_signing_algorithms(
+    jwk: &jsonwebtoken::jwk::Jwk,
+) -> Result<Vec<jsonwebtoken::Algorithm>, Box<dyn std::error::Error + Send + Sync>> {
+    use jsonwebtoken::Algorithm;
+    use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve};
+    match &jwk.algorithm {
+        // An RSA public key verifies the whole RSA signing family; the token's
+        // own header `alg` selects which. Every one requires the RSA key — none
+        // admit an HMAC secret.
+        AlgorithmParameters::RSA(_) => Ok(vec![
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+        ]),
+        AlgorithmParameters::EllipticCurve(ec) => match &ec.curve {
+            EllipticCurve::P256 => Ok(vec![Algorithm::ES256]),
+            EllipticCurve::P384 => Ok(vec![Algorithm::ES384]),
+            other => Err(format!("unsupported EC curve for JWT verification: {other:?}").into()),
+        },
+        AlgorithmParameters::OctetKeyPair(okp) => match &okp.curve {
+            EllipticCurve::Ed25519 => Ok(vec![Algorithm::EdDSA]),
+            other => Err(format!("unsupported OKP curve for JWT verification: {other:?}").into()),
+        },
+        AlgorithmParameters::OctetKey(_) => Err(
+            "symmetric (oct) key in OIDC JWKS refused for JWT verification \
+             (algorithm-confusion protection)"
+                .into(),
+        ),
     }
 }
 
@@ -735,6 +804,31 @@ mod tests {
     #[test]
     fn static_provider_rejects_empty_token() {
         assert!(static_grpc_auth_provider_from_bearer_token(" ").is_none());
+    }
+
+    /// SEC-6 (Phase 63): a JWKS must pin verification to the key's own
+    /// asymmetric algorithm family — RS256 for an RSA key — and must never
+    /// admit HS256. The old `Validation::default()` pinned `[HS256]`, which
+    /// both rejected every real RS256 OIDC token and left the door to the
+    /// algorithm-confusion attack. (RFC 7517 §A.1 example RSA public key.)
+    #[test]
+    fn sec6_jwks_pins_asymmetric_algorithms_not_hs256() {
+        let jwks = r#"{"keys":[{"kty":"RSA","kid":"test","use":"sig","alg":"RS256","n":"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw","e":"AQAB"}]}"#;
+        let provider = JwtAuthProvider::from_jwks_json(jwks).expect("RSA JWKS builds a provider");
+        assert!(
+            provider
+                .validation
+                .algorithms
+                .contains(&jsonwebtoken::Algorithm::RS256),
+            "RS256 must be accepted for an RSA JWKS (the old HS256 default rejected it)"
+        );
+        assert!(
+            !provider
+                .validation
+                .algorithms
+                .contains(&jsonwebtoken::Algorithm::HS256),
+            "HS256 must never be accepted from a JWKS (algorithm confusion)"
+        );
     }
 
     /// SEC-5 (Phase 63): the raw bearer token must never be exposed by the
