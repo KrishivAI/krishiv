@@ -157,9 +157,81 @@ admission `QueueManager` with namespace quota snapshots, one-shot hot-key
 `skew_repartition_overrides`, R7.2 adaptive governance types
 (hot-key-split / repartition / source-throttle / slow-sink).
 
-Missing entirely: delay scheduling, speculative execution for stragglers,
-priority/preemption, task-level retry budgets distinct from stage retry
-(P1.24 exists).
+Missing entirely: delay scheduling, priority/preemption, task-level
+retry budgets distinct from stage retry (P1.24 exists). ~~Speculative
+execution~~ — **correction (§3b, 2026-07-10): a speculation pass DOES
+exist live** (median-based straggler preemption on the heartbeat tick,
+config-gated) — but with a real defect; see §3b.
+
+## 3b. Control-plane execution flow: coordinator → scheduler → executor (thirteenth pass, 2026-07-10)
+
+Traced submission → assignment → dispatch → heartbeat → completion/
+retry end-to-end.
+
+**Live and healthier than §3 recorded** (credit where due): the launch
+loop is Notify-driven with a 500 ms fallback and priority-sorted
+(`drive_pending_task_launches`); placement is slot-aware load balancing
+with per-stage resource-profile filtering (SC10); a per-executor
+circuit breaker clears assignments synchronously under the write lock
+(a previous notify race, found and fixed); a **cascade** circuit
+breaker (SC11) guards against correlated executor loss; consumer-
+reported missing shuffle partitions requeue the producer stage; stalled
+tasks (>30 min no progress) are cancelled with RPCs sent outside locks;
+the heartbeat budget was already fixed once from a real false-eviction
+hazard (3 ticks → 9 ticks ≈ 45 s, `config.rs`); gRPC channels are
+cached per endpoint (DashMap + OnceCell); the lock hierarchy is
+documented (4 levels, per-job record locks, sharded executor/checkpoint
+shards); task terminal states feed a persisted event log + job history.
+
+**Bugs/defects (new this pass):**
+
+- **Speculation runs two copies under ONE attempt id.**
+  `apply_speculation_preempts` resets a straggler to `Pending` without
+  incrementing the attempt and **without cancelling the running
+  original** (`coordinator/mod.rs:1588-1596` — contrast the stall path,
+  which sends `CancelTask`). The relaunched copy carries the same
+  `(task_id, attempt)`, so two executors run an identical attempt
+  concurrently and result submission cannot tell them apart — whichever
+  reports first wins state, the second report is
+  indistinguishable from a duplicate, and metrics/event-log entries
+  collide. Spark's model (new attempt id, first-completion wins, loser
+  cancelled — what Phase 53 already specifies) is the fix; until then
+  `speculative_execution_enabled` should be treated as unsafe-with-
+  side-effects.
+- **Slot exhaustion → silent oversubscription.**
+  `place_task_ids_with_load` resets the slot budget to *full* capacity
+  and keeps assigning when every executor's free slots hit zero
+  (`job/scheduler.rs:214-216`) — tasks pile onto busy executors instead
+  of staying `Pending`, and once `Assigned` nothing rebalances them
+  (reassignment happens only on executor loss / circuit breaker). A
+  burst pins queues to whatever placement looked like at a bad moment.
+  Fix: leave overflow tasks `Pending` for the next tick + rebalance
+  assigned-but-unlaunched tasks when slots free elsewhere.
+- **Retry budget is one.** `max_stage_retries` defaults to **1**
+  (`config.rs`, `Self::new(1, 9)`) with no backoff and no task-level
+  attempt budget distinct from the stage count — one transient
+  infrastructure hiccup past the circuit breaker fails the job.
+
+**Scale ceilings (optimization, Phase 53):**
+
+- `drive_pending_task_launches` iterates **every** job coordinator per
+  500 ms tick, and `should_consider_for_launch` scans every stage/task
+  per job; `executor_has_streaming_running_tasks` is O(all jobs ×
+  stages × tasks) and runs per candidate executor on the recovery and
+  executor-ops paths (`coordinator/streaming.rs:95`,
+  `recovery.rs:199`, `executor_ops.rs:450`). The `streaming_task_index`
+  (P1.1) proves the fix pattern — dirty-job and executor→running-task
+  indexes make the launch tick O(work), not O(cluster state).
+- Slot accounting freshness: free-slot counts update on heartbeat
+  (10 s default), so a launch burst between heartbeats over-assigns
+  the same "free" slots — a dispatch-time in-flight counter closes it.
+
+**Reframe for Phase 53:** speculation is not greenfield — the pass,
+config knobs (`speculative_slowdown_factor`,
+`speculative_min_completed_tasks`), and preempt machinery exist; the
+work is attempt fencing + loser cancel + sink-contract gating, then
+proving it. Locality and fair pools remain the wire-the-parked-code
+items §3 describes.
 
 ## 4. Distributed streaming: one task per job, cycles over RPC
 
