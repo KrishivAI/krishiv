@@ -43,6 +43,11 @@ CTAS end-to-end.
 - Follow-ups: IVM flows reading Iceberg tables as sources directly (G7
   leg — removes the propagation cap), manifest-level pruning provider,
   column stats on written parts (currently none, like the DML path).
+- **PROD PASS 2026-07-10 04:15Z** (engine cf5e3ac + platformd 2f44557):
+  the */15 clean_trips tick Succeeded in 38.7s — 10,121,967 rows landed
+  as 171 MB of Parquet across 3 files via `fast_append`, landing report
+  decoded platform-side, zero engine restarts, MinIO warehouse steady at
+  759M/30G across replace cycles (replace orphan cleanup verified live).
 - **Same-day follow-up fix**: the first prod run of the platform's
   post-CTAS downstream feed hit the keyed partitioner's type gate —
   `partition_record_batches_by_key` rejected `Utf8View` key columns
