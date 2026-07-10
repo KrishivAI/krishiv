@@ -232,6 +232,29 @@ hardware headroom. This area needs *benchmark proof*, not rework.
   spine promises one contract across engines; the API layer doesn't
   deliver it yet. → Phase 61 (unified DataFrame API, PySpark parity,
   delta-batch demoted to an internal protocol).
+- **Sync/async: three calling conventions, none complete** (fourth pass,
+  2026-07-10). Rust is **sync-first** (`Session::sql` at
+  `session.rs:2165`, `DataFrame::collect` at `dataframe.rs:509` — both
+  cross the `block_on` bridge), with ~20 `_async` twin methods
+  (`sql_async`, `collect_async`, `read_*_async`, …) AND a partial
+  8-method `BlockingSession` facade (`blocking.rs`, 151 lines) — three
+  ways to run one query. The bridge itself
+  (`krishiv-common/src/async_util.rs`) is well-engineered — it correctly
+  handles multi-thread (`block_in_place`), current-thread (fresh-OS-
+  thread hop around Tokio's per-thread nesting guard), and no-runtime
+  (lazy fallback runtime, B3 thread cap) contexts — but every "sync"
+  call inside an embedder's async app borrows a runtime worker. Python
+  mirrors it: `Session` mixes sync methods (27 GIL-release sites — good
+  discipline, not total) with method-by-method coroutines via
+  `pyo3-async-runtimes` (`sql_async`, the B-1 fix) plus a separate
+  `BlockingSession` pyclass. Engine internals are largely disciplined
+  (`spawn_blocking` for storage I/O in shuffle/executor; sharded
+  coordinator bypasses hot-path locks) but the GAP-4 hazard class (locks
+  held across await) is policed by comments, not lints. → Phase 61
+  (single sync/async contract: async-first Rust core + one complete
+  blocking facade; Python sync-by-default + systematic async mirror) and
+  Phase 51 (async hygiene as clippy lints: `await_holding_lock`,
+  `disallowed-methods` for `block_on` in async contexts).
 - **Flight SQL**: metadata RPCs + JDBC/ADBC verified (G1);
   `krishiv-sql-gateway` is explicitly **not** a wire server (API-12
   header) — an in-process SQLSTATE facade. There is no Postgres/JDBC
@@ -278,7 +301,7 @@ dependency order:
 | 58 | Fault tolerance GA: coordinator HA, shuffle recovery, history server, chaos matrix | §6 |
 | 59 | Interfaces: progress/cancel, wire protocol decision, Python parity, CI honesty | §8 |
 | 60 | SQL surface completeness: measured Spark-reference parity (JSON/lambda functions, SET/SHOW/USE, matrix drift) | §8 SQL coverage |
-| 61 | Unified DataFrame API: one surface, three engines, PySpark parity; delta-batch demoted to internal protocol | §8 API fragmentation |
+| 61 | Unified DataFrame API: one surface, three engines, PySpark parity; delta-batch demoted to internal protocol; single sync/async contract | §8 API fragmentation + sync/async |
 | 62 | Production GA gate: certified matrix, public benchmarks + history, soak | the launch |
 
 Phase detail, gates, and platform-side seams live in the platform repo:

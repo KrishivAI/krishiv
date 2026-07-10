@@ -1,5 +1,27 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 (day, follow-up 4) — sync/async audit leg → folded into Phases 61 (contract) + 51 (hygiene lints)
+
+User asked about sync/async patterns across engine and API. Fourth audit
+pass (audit doc §8): **three calling conventions, none complete** — Rust
+is sync-first (`Session::sql` session.rs:2165, `DataFrame::collect`
+dataframe.rs:509, both crossing the `block_on` bridge) with ~20 `_async`
+twins AND a partial 8-method `BlockingSession`; the bridge
+(`krishiv-common/src/async_util.rs`) is well-engineered (multi-thread
+`block_in_place` / current-thread OS-thread hop around Tokio's per-thread
+nesting guard / lazy fallback runtime) but every sync call in an
+embedder's async app borrows a worker. Python mirrors it: 27 GIL-release
+sites (good, not total) + method-by-method coroutines
+(`pyo3-async-runtimes`, B-1) + a separate `BlockingSession` pyclass.
+Internals largely disciplined (`spawn_blocking` on storage I/O; sharded
+coordinator) but GAP-4 lock-across-await is comment-policed. **No new
+phase**: Phase 61 gains the sync/async-contract leg (async-first Rust
+core + one complete blocking facade w/ completeness test; Python
+sync-by-default + systematic generated async mirror; identical
+cancellation propagation) and Phase 51 gains async-hygiene-as-lints
+(`clippy::await_holding_lock`, `disallowed-methods` for `block_on` in
+async contexts). Docs-only change.
+
 ## 2026-07-10 (day, follow-up 3) — API-fragmentation audit leg → Track 6 gains Phase 61 unified DataFrame API (GA gate → 62)
 
 User flagged the Python/Rust API variation across batch / delta-batch /
