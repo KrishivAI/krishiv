@@ -1,5 +1,52 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 (day) — G8 CERTIFIED live on prod k3s: Kafka → continuous TUMBLE → Iceberg sink, exactly-once through a mid-commit kill (+2 real bugs fixed)
+
+Session 70fb3928 continuation. The G8 live certification leg (platform task
+#90) ran the full combination on the prod 3-node k3s cluster: Redpanda topic
+→ bridge-pattern continuous push (`stream:loop` TUMBLE, 10s windows) →
+`iceberg-sink` upsert (`keys=key,window_start_ms`) on a Longhorn PVC →
+force-kill (`--grace-period=0`) mid-commit → restore → redeliver →
+exact-rows verification. **PASS on image g8-9dd1fdf**: final table exactly
+`{a:2, b:1, m:1, c:1, n:1}` (5 rows, correct windows), broker group at
+offset 7, zero duplicates after unconditional redelivery from the restored
+snapshot's offset (upsert keys make re-emitted windows idempotent).
+
+The kill test caught two real engine bugs, both fixed this leg:
+
+- **`9b6ca63`** — sink-attached continuous jobs never committed their
+  epochs in daemon mode (nothing drove the two-phase commit; table stuck at
+  creation snapshot). Fix: cycle-aligned commit —
+  `TwoPhaseSinkRegistry::commit_cycle` at the end of
+  `stage_iceberg_sink_output`; commit failure fails the cycle. See
+  CHANGELOG.
+- **`9dd1fdf`** — upsert `overwrite_commit` corrupted the table when killed
+  mid-commit (drop-before-durable-replacement left `version-hint.text`
+  dangling at purged metadata; observed live on the g8-cert3 root). Fix:
+  replacement generation fully durable under a scratch `MemoryCatalog`
+  BEFORE the atomic hint flip; `fast_append_via` extracted as the shared
+  txn core. Regression test covers both crash states.
+
+Also fixed en route: `scripts/build-fast-engine.sh` false-FATAL
+(`strings | grep -q` SIGPIPE under pipefail → `grep -c`), and the prod
+deploy needed `fsGroup: 999` (engine runs uid 999; fresh PVC mounts
+root:root — sink mkdir EACCES; helm fix lands platform-side).
+
+**Certified protocol (what a feeder must do for exactly-once)**: register
+with `sink.mode=upsert` + window-identifying key columns; after each
+verified cycle, persist the engine checkpoint (`POST
+/api/v1/continuous/{id}/checkpoint` → `snapshot_b64`) alongside the broker
+offset commit; on recovery, re-register → `POST …/restore` with the
+persisted snapshot → unconditionally redeliver from the snapshot's offset.
+Kafka offsets ride in the Iceberg snapshot summary
+(`krishiv.kafka.offset.*`) as the sink-side source of truth. The platformd
+kafka_bridge does not implement this persistence protocol yet —
+platform-side follow-up task filed.
+
+Validation: full leg live on prod (evidence roots `g8-cert2..4` on the
+PVC); `cargo test -p krishiv-executor -p krishiv-connectors` green; clippy
+clean. Deployed image: `localhost/krishiv:g8-9dd1fdf` (all 3 nodes).
+
 ## 2026-07-10 (night, follow-up 2) — #94: per-view delta statistics on IVM jobs
 
 Same session, on top of #92. Every IVM tick path — structural `step_with`,

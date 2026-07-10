@@ -75,6 +75,31 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **Continuous-cycle Iceberg sink epochs commit at cycle end** (G8,
+  2026-07-10). Sink-attached continuous (`stream:loop:`) jobs staged every
+  cycle's output into the two-phase registry but nothing ever drove the
+  commit in daemon mode — continuous tasks are transient (one task per
+  pushed cycle), so the barrier/complete checkpoint lifecycle never targets
+  them (`JobSpec` has no `checkpoint_interval_ms`, and the coordinator's
+  delivery predicates require a *running* task in the job). The table never
+  advanced past its creation snapshot; found live during the G8
+  certification leg on the prod cluster. The cycle is now the checkpoint
+  boundary: new `TwoPhaseSinkRegistry::commit_cycle` (per-job monotonic
+  epoch; prepare + commit in one step) runs at the end of
+  `stage_iceberg_sink_output`, and a commit failure fails the cycle so the
+  coordinator never persists a snapshot claiming uncommitted output.
+- **Crash-safe Iceberg upsert overwrite** (CONN-3, 2026-07-10). The
+  upsert sink's `overwrite_commit` was drop-table → create-table → commit →
+  hint-flip: a process kill between the drop and the flip left
+  `version-hint.text` pointing at purged metadata — the table unreadable
+  until manual repair (observed live: the G8 kill test landed exactly in
+  that window). New ordering: build the full replacement generation
+  (creation metadata + `fast_append` snapshot) under a throwaway
+  `MemoryCatalog` over the same root, then flip the hint atomically
+  (temp + fsync + rename — the durable commit point), then rebind the live
+  catalog and purge only the superseded generation. Every kill point now
+  leaves the table readable at either the old or the new committed
+  generation; regression test covers both crash states.
 - **IVM joins actually run incrementally from SQL** (#160, 2026-07-10).
   The plan matcher read equi-join keys only from the logical plan's
   `join.on` — but the SQL planner leaves the ON condition in
