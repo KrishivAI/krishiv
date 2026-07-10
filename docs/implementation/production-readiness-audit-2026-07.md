@@ -1041,6 +1041,103 @@ observability-instrumentation-completeness task (e2e latency metric,
 per-metric buckets, duration layer on all servers, error-taxonomy hygiene).
 **Phase 51** gains a credential-redaction lint + a log-format option.
 
+## 12. Feature-flag & configuration sweep (sixteenth pass, 2026-07-10)
+
+A sweep of every build-time Cargo feature and every runtime `KRISHIV_*`
+env-var flag (134 distinct, read ad-hoc across 57 non-test files). The
+Cargo feature tree is well-designed; the runtime flag surface has
+concrete bugs, an inconsistency class, and a systemic gap.
+
+**Verified strong (credit, no action):**
+- **The Cargo feature tree is coherent.** Features gate *optional
+  dependency families*, never runtime behavior (`krishiv/Cargo.toml`
+  header): execution mode (embedded/single-node/distributed) is always a
+  runtime choice, and all three backends compile in every preset. The
+  `local`/`full`/`extended` presets and the connector feature graph
+  (`krishiv-connectors`) are clean, and `just lint-features` already
+  exists (Phase 51 folds it into the required set).
+- **Durability/production flags ARE centralized and typed.**
+  `KRISHIV_DURABILITY_PROFILE` and `KRISHIV_PRODUCTION` resolve through
+  `krishiv-common::production` (`resolve_durability_profile`,
+  `is_production_mode`, cached) and correctly drive fail-closed behavior.
+  This is the model the rest of the flag surface should follow.
+
+**Gaps found (code-cited):**
+
+- **FLAG-1 (bug) — the operator hardcodes `KRISHIV_TASK_SLOTS=2` into
+  every executor pod**, defeating CPU-derived capacity. `ClusterConfig`
+  defaults `task_slots: 2` (`cluster_manager.rs:261`) and *always* injects
+  `KRISHIV_TASK_SLOTS=<that>` into the executor pod env
+  (`cluster_manager.rs:233-234`); the executor treats the env var as an
+  override that wins over `default_task_capacity()` = CPU parallelism
+  (`executor/cli.rs:976`). So on k8s — the deployment surface where it
+  matters most — a 16-core executor pod runs **2 placement slots**
+  regardless of cores, silently overriding the capacity-derivation that is
+  now the canonical default (task-slots auto-derive was the whole point of
+  dropping the flag from the prod deploy). Fix: the operator makes
+  `task_slots` an `Option` and injects the env var only when an operator
+  explicitly sets it; otherwise omit it so the executor derives from cores.
+- **FLAG-2 (security-relevant correctness) — inconsistent boolean-flag
+  parsing.** At least **four** truthiness definitions coexist:
+  `truthy_env` (`production.rs`) accepts `1|true|yes|on` case-insensitive;
+  the executor's `parse_bool_env` (`executor/grpc.rs:124`) accepts a
+  case-*sensitive* list `1|true|TRUE|yes|YES|on|ON` (so `True` fails);
+  the operator reads `KRISHIV_ALLOW_ANONYMOUS` as `"1" ||
+  eq_ignore_ascii_case("true")` (`operator/main.rs:86`); the coordinator
+  daemon reads the **same** `KRISHIV_ALLOW_ANONYMOUS` as exact `"true" ||
+  "1"` (`coordinator_daemon.rs:837`). The same security flag therefore
+  behaves differently by site and capitalization: `=TRUE` enables the
+  operator's anonymous path but not the coordinator daemon's `insecure`
+  flag; `=yes`/`=on` enable neither despite `truthy_env` accepting them
+  elsewhere. Consolidate every boolean flag on one `truthy_env`.
+- **FLAG-3 (consistency gap) — the coordinator gRPC endpoint has three
+  unaliased names.** `KRISHIV_COORDINATOR_URL` (+ bare
+  `KRISHIV_COORDINATOR`) in the API/CLI (`api/session.rs:624-625`,
+  `query_cli.rs:183`), but `KRISHIV_COORDINATOR_ENDPOINT` in the
+  executor and operator (`executor/cli.rs:980`, `operator/main.rs:353`) —
+  three names for one logical value, none aliased, plus the distinct
+  `KRISHIV_COORDINATOR_HTTP` for the HTTP control plane. A user who sets
+  `KRISHIV_COORDINATOR_URL` for an embedder and expects the executor to
+  inherit it gets silent failure — the executor only reads `_ENDPOINT`.
+  Pick one canonical name, accept the others as deprecated aliases with a
+  startup warning.
+- **FLAG-4 (systemic gap) — no typed, validated, central flag registry.**
+  134 `KRISHIV_*` flags are read ad-hoc via `std::env::var` scattered
+  across 57 files; there is **no unknown-flag detection** (a misspelled
+  `KRISHIV_QUERY_MEMORY_LIMIT_BYTE` is silently ignored, the query runs
+  unbounded), no single `--help`/reference listing (`doctor_cmd` documents
+  only ~37 of 134), no startup validation, and no schema. Deliver a typed
+  config layer (extend the `krishiv-common::production` pattern): every
+  flag declared once with type + default + doc; parsed and **validated at
+  startup**; a warning on any unrecognized `KRISHIV_*` var in the
+  environment; the reference doc and `doctor` output generated from the
+  registry, never hand-maintained.
+- **FLAG-5 (cleanup) — dead / disabled / no-op flags & features.**
+  `KRISHIV_STREAM_EARLY_FIRE_MS` is a documented knob whose
+  `emit_open_windows_speculative` returns `None` — a silent no-op (already
+  §4b, Phase 51 wire-or-delete). The `__disabled_flight_test` Cargo
+  feature permanently disables a whole distributed-Flight integration test
+  (`runtime/lib.rs:439`, `runtime/tests/integration_distributed.rs:1`) —
+  dead coverage on exactly the distributed path Track 6 is hardening.
+  `krishiv-runtime`'s `kafka = []` is an **empty feature** that gates
+  `#[cfg(feature = "kafka")]` code but enables no dependency of its own
+  (relies on workspace feature-unification to supply the connector — a
+  latent footgun if that ever breaks). And `KRISHIV_STREAM_PROFILE` is
+  wired **embedded-only** (`api/engines.rs:742`); the distributed
+  `stream:loop` fragment never consults it — the same
+  embedded-vs-distributed asymmetry §9b found for the operator tier,
+  reinforcing the Phase 55 low-latency-loop task.
+
+→ **Phase 51** gains a **feature-flag & config hygiene** task (typed
+registry + unknown-flag warning + one boolean parser + coordinator-name
+aliasing + operator task-slots fix + enable-or-delete
+`__disabled_flight_test` + fold the no-op flags into wire-or-delete).
+**Phase 63**'s negative-test harness asserts security flags
+(`KRISHIV_ALLOW_ANONYMOUS`, `KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH`,
+`KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS`) parse identically across every site
+that reads them. **Phase 55** notes `KRISHIV_STREAM_PROFILE` must reach
+the distributed loop.
+
 ## 10. Verdict → Track 6 (platform phases 51–63)
 
 The engine's architecture (spine, seams, hygiene, certification
