@@ -861,7 +861,11 @@ release skill with signed checksums, BENCHMARKING.md discipline. Gaps: no
 SQL correctness corpus (sqllogictest-style), no distributed-scale CI
 (single machine), `test-python` not blocking, no benchmark **history**
 publication (roadmap item 5), no soak gate in engine CI (soaks are
-platform-driven).
+platform-driven). The eighteenth pass (§14) sharpened this: the main gate
+runs `--lib` only — every integration test (24 files / 134 fns), doctests,
+python, and chaos are outside the PR gate — plus no coverage measurement,
+no property tests on the delta/state/IVM algebra, and sleep-based flakiness
+in the coordination crates.
 
 ## 9b. Unintegrated-components sweep (fourteenth pass, 2026-07-10)
 
@@ -1212,6 +1216,90 @@ hygiene. **Phase 61** gains an **engine-core-as-real-spine** rider: the
 engine crates depend on and implement the `ComputeEngine`/`CompiledJob`
 contract, and `krishiv-api` shrinks to a facade over it. DUP-3 stays with
 the Phase 59/60 connector-reachability task.
+
+## 14. Test-coverage gaps & flakiness sweep (eighteenth pass, 2026-07-10)
+
+A sweep of the 3,911 test functions: what runs in CI, what's silently
+skipped, and where flakiness is structurally likely. The suite is *large*;
+the problem is **what the gate actually executes** and **where the tests
+that exist point**.
+
+**Verified strong (credit, no action):**
+- **3,911 test fns** across the workspace, dense in the compiler-shaped
+  crates (connectors 562, sql 452, plan 450, state 332). Per-mode recipes
+  (`test-embedded`/`test-single-node`/`test-k8s`), the `krishiv-chaos`
+  kill-loop gate, conformance suites, and the api-surface freeze are real.
+- **Property testing exists** for the windowing/watermark algebra
+  (`proptest` in `dataflow/window/tumbling.rs`, `plan/window.rs`,
+  `proto`, `connectors/kafka`).
+
+**Gaps found (code-cited):**
+
+- **TEST-1 (the big one) — the main CI gate runs `--lib` only, skipping
+  every integration test.** `just test` is `cargo test --workspace **--lib**
+  --exclude krishiv-python --exclude krishiv-chaos` (`justfile:167`). `--lib`
+  runs unit tests in lib targets only — so **all 24 `crates/*/tests/*.rs`
+  integration files (134 test fns) are skipped**, doctests are not run (no
+  `--doc`), and `krishiv-python` + `krishiv-chaos` are excluded entirely.
+  The separate `e2e.yml` workflow cherry-picks **three** things
+  (`failover_stale_coordinator`, `--test distributed_e2e`, `--lib barrier`).
+  So the cross-component integration surface — the flows most likely to
+  break on a refactor — is almost entirely outside the PR gate. This is
+  the sharp form of the §9 "`test-python` not blocking" note: it isn't
+  just python, it's every integration test.
+- **TEST-2 — "distributed e2e" is in-process, not multi-node.**
+  `scheduler/tests/distributed_e2e.rs` is 3 tests, all named
+  `in_process_*` (plan lowering, fragment shape, endpoint constant) — no
+  real executors, no network. True multi-executor distributed execution
+  has **no automated coverage**: `__disabled_flight_test` is a permanently
+  disabled integration file (§12), the chaos matrix at N≥25 is unbuilt
+  (#98), and multi-node is blocked on hardware. The engine's headline
+  capability is the least CI-covered.
+- **TEST-3 — no property tests on the correctness-critical algebra.**
+  `krishiv-delta` (weighted Z-set / `Trace` spine), `krishiv-state`
+  (2PC / checkpoint durability), and `krishiv-ivm` have **zero** `proptest`
+  references — only example-based tests. The DBSP-shaped delta algebra and
+  the two-phase-commit durability path are exactly where property/model
+  tests pay off (algebraic laws: `differentiate`∘`integrate` = id,
+  commit-or-abort atomicity across kill points).
+- **TEST-4 — no coverage measurement anywhere.** Zero
+  tarpaulin/llvm-cov/codecov/grcov in the tree or CI. With 3,911 tests but
+  no measured number, "coverage" is a vibe — the same measure-first gap the
+  audit flags for SQL parity (Phase 60) and benchmarks (Phase 51). Thin
+  spots are visible by density: `krishiv-mcp` 3.3 t/KLOC (the agent surface,
+  security-relevant), `krishiv-python` 3.9, `krishiv-ui` 5.4, and — most
+  concerning — `krishiv-scheduler` 6.0 and `krishiv-shuffle` 6.0, the
+  control and data planes, the *least*-tested core crates.
+- **TEST-5 (flakiness) — sleep-based synchronization in the coordination
+  tests.** 55 `sleep` calls across 27 test files, concentrated in exactly
+  the async-coordination crates: scheduler (16), executor (13), api (10),
+  shuffle (8). Timing-based test synchronization on executor-loss /
+  checkpoint / streaming-cycle paths is the classic flaky-test source; and
+  there is **no nextest retry/quarantine config** to contain or surface
+  intermittent failures. Replace sleeps with event/notify/`await`-on-
+  condition sync; add a nextest profile with retries + a flaky quarantine
+  list as the stopgap that also *names* the flakes.
+- **TEST-6 (false green) — 7 tests silently ignored for missing services.**
+  `#[ignore = "requires …"]` on Postgres (`KRISHIV_TEST_DATABASE_URL` ×2),
+  S3/MinIO (`KRISHIV_TEST_S3_BUCKET`), a live coordinator (:9090), a local
+  cluster (:50051), an OTLP collector, and a TCP listener. The JDBC/
+  Postgres-catalog, S3-warehouse, distributed-coordinator, and OTLP paths
+  therefore have tests that **never run in normal CI** → green means
+  "the tests that ran passed," not "these paths work." Stand these up as a
+  services-CI tier (testcontainers) so they actually execute. Also the bare
+  `#[ignore]` at `state/dfs_backend.rs:783` parks a known design limitation
+  (DFS snapshot stores key hashes, not keys) behind a skipped test — make
+  it an explicit asserted limitation or a tracked gap, not a silent skip.
+
+→ **Phase 51** gains a **test-gate honesty** expansion (integration tests
++ doctests in the required gate or an explicitly-documented tier; coverage
+measurement publishing a number; property tests for the delta/state/IVM
+algebra; sleep→event de-flake + nextest retry/quarantine; the
+external-service tests promoted to a real services tier). **Phase 58**'s
+chaos matrix graduates `distributed_e2e` from in-process to real
+multi-executor and re-enables `__disabled_flight_test`. **Phase 62**'s GA
+exit gate adds a published coverage number and "zero `#[ignore]` without a
+running tier."
 
 ## 10. Verdict → Track 6 (platform phases 51–63)
 
