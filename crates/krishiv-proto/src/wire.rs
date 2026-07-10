@@ -1,6 +1,8 @@
 //! Generated protobuf wire conversions.
 
-use crate::checkpoint::{CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset};
+use crate::checkpoint::{
+    CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset, SinkTransactionRef,
+};
 use crate::executor::TraceContext;
 use crate::executor::{
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
@@ -1663,6 +1665,18 @@ pub fn checkpoint_ack_request_to_wire(value: CheckpointAckRequest) -> v1::Checkp
             })
             .collect(),
         snapshot_path: value.snapshot_path.unwrap_or_default(),
+        // DUR-2: carry prepared-sink transaction refs so the coordinator can
+        // persist participant identity + prepared paths into the checkpoint.
+        sink_transactions: value
+            .sink_transactions
+            .into_iter()
+            .map(|s| v1::SinkTransactionRef {
+                sink_id: s.sink_id,
+                epoch: s.epoch,
+                prepare_path: s.prepare_path,
+                committed: s.committed,
+            })
+            .collect(),
     }
 }
 
@@ -1700,7 +1714,17 @@ pub fn checkpoint_ack_request_from_wire(
         source_offsets,
         snapshot_path,
         unaligned_buffers: Vec::new(),
-        sink_transactions: Vec::new(),
+        // DUR-2: recover prepared-sink transaction refs from the wire.
+        sink_transactions: value
+            .sink_transactions
+            .into_iter()
+            .map(|s| SinkTransactionRef {
+                sink_id: s.sink_id,
+                epoch: s.epoch,
+                prepare_path: s.prepare_path,
+                committed: s.committed,
+            })
+            .collect(),
     })
 }
 

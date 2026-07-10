@@ -941,6 +941,35 @@ mod wire_fuzz {
         assert_eq!(restored, request);
     }
 
+    /// DUR-2: prepared-sink transaction refs must survive the wire round-trip
+    /// (previously `from_wire` hard-coded `sink_transactions: Vec::new()`, so
+    /// the executor's prepared transactions never reached the coordinator).
+    #[test]
+    fn checkpoint_ack_sink_transactions_roundtrip() {
+        let request = CheckpointAckRequest {
+            job_id: JobId::try_new("job-tx").unwrap(),
+            operator_id: OperatorId::try_new("operator-tx").unwrap(),
+            task_id: TaskId::try_new("task-tx").unwrap(),
+            epoch: 9,
+            fencing_token: FencingToken::initial(),
+            source_offsets: vec![],
+            snapshot_path: None,
+            unaligned_buffers: Vec::new(),
+            sink_transactions: vec![crate::SinkTransactionRef {
+                sink_id: "iceberg-sink".to_owned(),
+                epoch: 9,
+                prepare_path: "job-tx/checkpoints/009/iceberg-sink.prepare".to_owned(),
+                committed: false,
+            }],
+        };
+
+        let wire = checkpoint_ack_request_to_wire(request.clone());
+        assert_eq!(wire.sink_transactions.len(), 1);
+        assert_eq!(wire.sink_transactions[0].sink_id, "iceberg-sink");
+        let restored = checkpoint_ack_request_from_wire(wire).unwrap();
+        assert_eq!(restored, request);
+    }
+
     fn arb_descriptor() -> impl Strategy<Value = Option<v1::ExecutorDescriptor>> {
         prop::option::of(
             (
@@ -1203,6 +1232,7 @@ mod wire_fuzz {
                 fencing_token,
                 source_offsets: vec![],
                 snapshot_path,
+                sink_transactions: vec![],
             };
             let _ = checkpoint_ack_request_from_wire(wire);
         }

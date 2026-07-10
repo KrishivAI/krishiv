@@ -710,7 +710,9 @@ impl Coordinator {
             iceberg_snapshot_id: source.iceberg_snapshot_id,
             kafka_offsets: source.kafka_offsets.clone(),
             unaligned_buffer_refs: Vec::new(),
-            sink_transactions: Vec::new(),
+            // DUR-2: carry the prepared-sink transaction refs across rescale —
+            // they belong to the epoch being redistributed.
+            sink_transactions: source.sink_transactions.clone(),
             streaming_profile: None,
         };
         let meta_json = serde_json::to_vec_pretty(&metadata)

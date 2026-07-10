@@ -81,6 +81,32 @@ impl fmt::Debug for CheckpointCoordinator {
     }
 }
 
+/// DUR-2: aggregate the prepared-sink transaction refs reported by a set of
+/// checkpoint acks into the durable checkpoint form, deduplicated by
+/// `(sink_id, epoch)` (a committed status wins over a not-yet-committed one).
+fn collect_sink_transactions<'a>(
+    acks: impl Iterator<Item = &'a CheckpointAckRequest>,
+) -> Vec<krishiv_state::checkpoint::SinkTransactionRef> {
+    let mut by_key: std::collections::BTreeMap<(String, u64), krishiv_state::checkpoint::SinkTransactionRef> =
+        std::collections::BTreeMap::new();
+    for ack in acks {
+        for tx in &ack.sink_transactions {
+            let key = (tx.sink_id.clone(), tx.epoch);
+            let entry = by_key
+                .entry(key)
+                .or_insert_with(|| krishiv_state::checkpoint::SinkTransactionRef {
+                    sink_id: tx.sink_id.clone(),
+                    epoch: tx.epoch,
+                    prepare_path: tx.prepare_path.clone(),
+                    committed: tx.committed,
+                });
+            // A committed report is authoritative over a prepared-only one.
+            entry.committed = entry.committed || tx.committed;
+        }
+    }
+    by_key.into_values().collect()
+}
+
 impl CheckpointCoordinator {
     /// Create a new checkpoint coordinator for `job_id`.
     pub fn new(
@@ -363,6 +389,11 @@ impl CheckpointCoordinator {
             })
             .collect();
 
+        // DUR-2: collect the prepared-sink transaction refs acked by the tasks
+        // so the durable checkpoint records participant identity + prepare
+        // paths. Recovery uses these to commit-or-abort deterministically.
+        let sink_transactions = collect_sink_transactions(self.pending_acks.values());
+
         let is_savepoint = self.pending_is_savepoint;
         let savepoint_label = self.pending_savepoint_label.clone();
         let metadata = CheckpointMetadata {
@@ -379,7 +410,7 @@ impl CheckpointCoordinator {
             iceberg_snapshot_id: None,
             kafka_offsets: None,
             unaligned_buffer_refs: Vec::new(),
-            sink_transactions: Vec::new(),
+            sink_transactions,
             streaming_profile: None,
         };
 
@@ -579,6 +610,9 @@ impl CheckpointCoordinator {
             })
             .collect();
 
+        // DUR-2: persist prepared-sink transaction refs acked this epoch.
+        let sink_transactions = collect_sink_transactions(self.pending_acks.values());
+
         let is_savepoint = self.pending_is_savepoint;
         let savepoint_label = self.pending_savepoint_label.take();
         let metadata = CheckpointMetadata {
@@ -595,7 +629,7 @@ impl CheckpointCoordinator {
             iceberg_snapshot_id: None,
             kafka_offsets: None,
             unaligned_buffer_refs: Vec::new(),
-            sink_transactions: Vec::new(),
+            sink_transactions,
             streaming_profile: None,
         };
 
@@ -842,6 +876,53 @@ mod tests {
             unaligned_buffers: Vec::new(),
             sink_transactions: Vec::new(),
         }
+    }
+
+    /// DUR-2: prepared-sink transaction refs reported by tasks are aggregated
+    /// into the durable checkpoint form — deduplicated by `(sink_id, epoch)`
+    /// with a committed report winning over a prepared-only one.
+    #[test]
+    fn dur2_collect_sink_transactions_dedups_and_commit_wins() {
+        use krishiv_proto::SinkTransactionRef;
+        let job_id = JobId::try_new("dur2-job").unwrap();
+        let token = FencingToken::try_new(1).unwrap();
+
+        let mut ack_a = make_ack(&job_id, "task-a", 5, token);
+        ack_a.sink_transactions = vec![SinkTransactionRef {
+            sink_id: "sink-1".to_owned(),
+            epoch: 5,
+            prepare_path: "epoch-5/sink-1.prepare".to_owned(),
+            committed: false,
+        }];
+        // A second task reports the same sink prepared+committed for the epoch.
+        let mut ack_b = make_ack(&job_id, "task-b", 5, token);
+        ack_b.sink_transactions = vec![
+            SinkTransactionRef {
+                sink_id: "sink-1".to_owned(),
+                epoch: 5,
+                prepare_path: "epoch-5/sink-1.prepare".to_owned(),
+                committed: true,
+            },
+            SinkTransactionRef {
+                sink_id: "sink-2".to_owned(),
+                epoch: 5,
+                prepare_path: "epoch-5/sink-2.prepare".to_owned(),
+                committed: false,
+            },
+        ];
+
+        let acks = [ack_a, ack_b];
+        let collected = super::collect_sink_transactions(acks.iter());
+
+        assert_eq!(collected.len(), 2, "deduped to one ref per (sink_id, epoch)");
+        let sink1 = collected.iter().find(|t| t.sink_id == "sink-1").unwrap();
+        assert!(
+            sink1.committed,
+            "committed report must win over prepared-only for the same sink+epoch"
+        );
+        let sink2 = collected.iter().find(|t| t.sink_id == "sink-2").unwrap();
+        assert!(!sink2.committed);
+        assert_eq!(sink2.prepare_path, "epoch-5/sink-2.prepare");
     }
 
     /// C2/C22 regression: try_tick must process timeout for awaiting-acks epochs
