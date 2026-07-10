@@ -1,4 +1,3 @@
-#![cfg(feature = "__disabled_flight_test")]
 
 //! End-to-end integration tests for distributed execution (InProcessCluster, Flight SQL, coordinator lifecycle).
 

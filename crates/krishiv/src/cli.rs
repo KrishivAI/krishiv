@@ -26,10 +26,11 @@ pub enum CoordinatorMode {
 }
 
 impl CoordinatorMode {
-    /// Parse `--coordinator`/`-c` from `args`, consulting `KRISHIV_COORDINATOR`
-    /// env var as a fallback. Returns the mode and the remaining args.
+    /// Parse `--coordinator`/`-c` from `args`, consulting
+    /// `KRISHIV_COORDINATOR_URL` (or its deprecated aliases) as a fallback.
+    /// Returns the mode and the remaining args.
     pub fn from_args_and_env<'a>(args: &'a [&'a str]) -> (CoordinatorMode, Vec<&'a str>) {
-        let env_value = std::env::var("KRISHIV_COORDINATOR").ok();
+        let env_value = krishiv_common::coordinator_url_env();
         Self::from_args_with_env_override(args, env_value.as_deref())
     }
 

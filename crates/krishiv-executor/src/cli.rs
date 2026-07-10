@@ -48,6 +48,7 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
         print!("{}", ExecutorCliConfig::help());
         return Ok(());
     }
+    krishiv_common::log_env_issues();
     config.validate_task_auth_startup(&ExecutorTaskAuthConfig::from_env())?;
     config.validate_durable_startup()?;
 
@@ -977,8 +978,8 @@ impl ExecutorCliConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_else(default_task_capacity),
-            coordinator_endpoint: env::var("KRISHIV_COORDINATOR_ENDPOINT")
-                .unwrap_or_else(|_| String::from("http://127.0.0.1:2001")),
+            coordinator_endpoint: krishiv_common::coordinator_url_env()
+                .unwrap_or_else(|| String::from("http://127.0.0.1:2001")),
             mode: ExecutorMode::DryRun,
             heartbeat_interval_secs: env::var("KRISHIV_HEARTBEAT_INTERVAL_SECS")
                 .ok()

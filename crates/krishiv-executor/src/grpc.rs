@@ -122,14 +122,7 @@ impl ExecutorTaskAuthConfig {
 }
 
 fn parse_bool_env(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.as_str(),
-                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-            )
-        })
-        .unwrap_or(false)
+    krishiv_common::truthy_env(name)
 }
 
 fn configured_executor_task_bearer_token() -> Option<String> {

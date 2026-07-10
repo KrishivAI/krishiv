@@ -44,8 +44,10 @@ pub struct KubernetesClusterManagerConfig {
     /// Maximum total workers the manager will create.  Requests beyond this
     /// cap are silently dropped (returns 0 for the excess).
     pub max_workers: usize,
-    /// Number of task slots each executor Pod advertises.
-    pub task_slots: usize,
+    /// Task slots each executor Pod advertises. `None` (recommended) omits
+    /// the env var so the executor derives capacity from its CPU allocation;
+    /// `Some(n)` pins an explicit override.
+    pub task_slots: Option<usize>,
 }
 
 /// Messages sent from the synchronous trait surface to the async background
@@ -229,12 +231,14 @@ fn build_pool_pod(
                         value: Some(executor_id.to_owned()),
                         ..Default::default()
                     },
-                    EnvVar {
-                        name: "KRISHIV_TASK_SLOTS".to_owned(),
-                        value: Some(config.task_slots.to_string()),
-                        ..Default::default()
-                    },
-                ]),
+                ]
+                .into_iter()
+                .chain(config.task_slots.map(|slots| EnvVar {
+                    name: "KRISHIV_TASK_SLOTS".to_owned(),
+                    value: Some(slots.to_string()),
+                    ..Default::default()
+                }))
+                .collect()),
                 ..Default::default()
             }],
             ..Default::default()
@@ -258,8 +262,32 @@ mod tests {
             image: "krishiv:latest".to_owned(),
             coordinator_endpoint: "http://localhost:9090".to_owned(),
             max_workers: 5,
-            task_slots: 2,
+            task_slots: None,
         };
+
+        // task_slots: None must omit the env var entirely so the executor
+        // derives capacity from CPU (the audit FLAG-hardcode bug); Some(n)
+        // must inject exactly n.
+        let pod = build_pool_pod(&config, "pod-0", "exec-0");
+        let env = pod.spec.as_ref().unwrap().containers[0].env.clone().unwrap();
+        assert!(
+            !env.iter().any(|e| e.name == "KRISHIV_TASK_SLOTS"),
+            "task_slots: None must not inject KRISHIV_TASK_SLOTS"
+        );
+        let pinned = KubernetesClusterManagerConfig {
+            task_slots: Some(3),
+            ..config.clone()
+        };
+        let pod = build_pool_pod(&pinned, "pod-0", "exec-0");
+        let env = pod.spec.as_ref().unwrap().containers[0].env.clone().unwrap();
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == "KRISHIV_TASK_SLOTS")
+                .and_then(|e| e.value.clone())
+                .as_deref(),
+            Some("3"),
+        );
+
         // Use a deliberately tiny buffer so try_send fills up quickly.
         let (tx, _rx) = mpsc::channel(2);
         let current = Arc::new(AtomicUsize::new(0));

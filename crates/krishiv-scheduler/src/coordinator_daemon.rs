@@ -847,9 +847,7 @@ pub fn parse_coordinator_daemon_config(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(15),
-        insecure: env::var("KRISHIV_ALLOW_ANONYMOUS")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
+        insecure: krishiv_common::truthy_env("KRISHIV_ALLOW_ANONYMOUS"),
         flight_addr: env::var("KRISHIV_FLIGHT_ADDR")
             .ok()
             .and_then(|value| value.parse().ok()),
@@ -1138,6 +1136,7 @@ pub async fn run_standalone_coordinator(
     extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
     extra_sidecars: Vec<CoordinatorSidecarFn>,
 ) -> Result<(), Box<dyn Error>> {
+    krishiv_common::log_env_issues();
     let grpc_auth_configured = configure_coordinator_grpc_auth(&config).await;
     validate_runtime_security_config(
         &config,
@@ -1227,6 +1226,7 @@ pub async fn run_clusterd_daemon(
     extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
     extra_sidecars: Vec<CoordinatorSidecarFn>,
 ) -> Result<(), Box<dyn Error>> {
+    krishiv_common::log_env_issues();
     let grpc_auth_configured = configure_coordinator_grpc_auth(&config).await;
     validate_runtime_security_config(
         &config,
@@ -1347,6 +1347,7 @@ struct JcpJobStatusResponse {
 pub async fn run_job_coordinator_daemon(
     jcp_config: JobCoordinatorDaemonConfig,
 ) -> Result<(), Box<dyn Error>> {
+    krishiv_common::log_env_issues();
     if jcp_config.job_id.is_empty() {
         return Err("--job-id is required".into());
     }

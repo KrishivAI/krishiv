@@ -436,7 +436,7 @@ impl ExecutionBackend for DistributedBackend {
     }
 }
 
-#[cfg(all(test, feature = "__disabled_flight_test"))]
+#[cfg(test)]
 mod distributed_flight_tests {
     use std::net::SocketAddr;
 

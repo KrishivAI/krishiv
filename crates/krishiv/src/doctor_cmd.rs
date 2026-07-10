@@ -1,6 +1,7 @@
 //! `krishiv doctor` — resolve and print the effective deployment configuration.
 //!
-//! Krishiv is configured by ~100 `KRISHIV_*` environment variables plus the
+//! Krishiv is configured by the `KRISHIV_*` flags declared in
+//! `krishiv_common::env_registry` (see `docs/reference/env-flags.md`) plus the
 //! `--coordinator` flag. `doctor` is a **read-only** reporter: it resolves the
 //! deployment mode and the knobs that matter for it, groups them, and flags
 //! misconfigurations (e.g. a distributed mode with no coordinator URL) without
@@ -156,8 +157,32 @@ fn render_report(lookup: &dyn Fn(&str) -> Option<String>, coordinator: &Coordina
         out.push('\n');
     }
 
+    // ── All set flags (registry-driven; covers every declared knob) ──────────
+    let mut set_rows: Vec<String> = Vec::new();
+    for spec in krishiv_common::env_registry::FLAGS {
+        if let Some(val) = get(spec.name) {
+            let shown = if matches!(spec.kind, krishiv_common::FlagKind::Secret) {
+                "(set, redacted)".to_string()
+            } else {
+                val
+            };
+            set_rows.push(format!("  {:<40} {}\n", spec.name, shown));
+        }
+    }
+    if !set_rows.is_empty() {
+        out.push_str("All set KRISHIV_* flags (from the flag registry)\n");
+        for row in &set_rows {
+            out.push_str(row);
+        }
+        out.push('\n');
+    }
+
     // ── Validation ────────────────────────────────────────────────────────────
     let mut warnings: Vec<String> = Vec::new();
+    // Registry validation: unknown flags, type mismatches, deprecated aliases.
+    for issue in krishiv_common::validate_env() {
+        warnings.push(issue.to_string());
+    }
     if mode == Mode::Unknown {
         warnings.push(format!(
             "KRISHIV_MODE='{}' is not recognized; valid: embedded, single-node, \
@@ -176,30 +201,6 @@ fn render_report(lookup: &dyn Fn(&str) -> Option<String>, coordinator: &Coordina
             "embedded mode ignores the coordinator URL; set KRISHIV_MODE for remote execution"
                 .to_string(),
         );
-    }
-    if let Some(profile) = get("KRISHIV_DURABILITY_PROFILE") {
-        let p = profile.trim().to_ascii_lowercase();
-        if !matches!(
-            p.as_str(),
-            "dev-local"
-                | "dev_local"
-                | "devlocal"
-                | "single-node"
-                | "single_node"
-                | "distributed"
-                | "production"
-        ) {
-            warnings.push(format!(
-                "KRISHIV_DURABILITY_PROFILE='{profile}' is not a known profile"
-            ));
-        }
-    }
-    if let Some(cap) = get("KRISHIV_INLINE_IPC_MAX_BYTES")
-        && cap.trim().parse::<u64>().ok().filter(|v| *v > 0).is_none()
-    {
-        warnings.push(format!(
-            "KRISHIV_INLINE_IPC_MAX_BYTES='{cap}' is not a positive integer; the default is used"
-        ));
     }
 
     if warnings.is_empty() {

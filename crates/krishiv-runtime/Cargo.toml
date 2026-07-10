@@ -38,13 +38,17 @@ webpki-root-certs = { workspace = true }
 krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["vector-sinks"], optional = true }
 
 [features]
+# cfg-only gate (no deps by design): enables the Kafka source-registration
+# runtime hooks; krishiv-flight-sql/kafka and krishiv-api/kafka forward here.
 kafka = []
 vector-sinks = ["dep:krishiv-connectors"]
-__disabled_flight_test = []
 
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+# dev-only cycle (flight-sql depends on runtime); Cargo permits dev-dep cycles.
+# Gives the distributed Flight integration tests a live server to hit.
+krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.0" }
 
 [lib]
 path = "src/lib.rs"

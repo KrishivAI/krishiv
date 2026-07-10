@@ -176,11 +176,12 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
 
 pub fn build_session(command: &QueryCommand) -> Result<Session, String> {
     let mut builder = Session::builder().with_execution_mode(command.mode);
-    // The explicit `-c/--coordinator` flag wins over the `KRISHIV_COORDINATOR` env var.
+    // The explicit `-c/--coordinator` flag wins over the env var
+    // (`KRISHIV_COORDINATOR_URL`, or its deprecated aliases).
     let coordinator = command
         .coordinator_url
         .clone()
-        .or_else(|| std::env::var("KRISHIV_COORDINATOR").ok())
+        .or_else(krishiv_common::coordinator_url_env)
         .filter(|url| !url.trim().is_empty());
     if command.mode == ExecutionMode::SingleNode
         && let Some(url) = coordinator.clone()

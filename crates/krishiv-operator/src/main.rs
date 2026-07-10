@@ -82,10 +82,7 @@ fn install_rustls_crypto_provider() {
 
 #[cfg(feature = "k8s")]
 fn configure_grpc_auth_for_startup(exposes_coordinator_grpc: bool) -> Result<bool, Box<dyn Error>> {
-    if std::env::var("KRISHIV_ALLOW_ANONYMOUS")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
+    if krishiv_common::truthy_env("KRISHIV_ALLOW_ANONYMOUS") {
         krishiv_scheduler::set_allow_anonymous().map_err(|error| error.to_string())?;
         return Ok(false);
     }
@@ -123,6 +120,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 process::exit(1);
             });
 
+        krishiv_common::log_env_issues();
         let result = rt.block_on(run_k8s_operator());
         rt.shutdown_timeout(std::time::Duration::from_secs(5));
         result
@@ -350,8 +348,8 @@ impl OperatorCliConfig {
                 std::net::Ipv4Addr::UNSPECIFIED,
                 2002,
             )),
-            coordinator_endpoint: std::env::var("KRISHIV_COORDINATOR_ENDPOINT")
-                .unwrap_or_else(|_| String::from("http://krishiv-coordinator:2001")),
+            coordinator_endpoint: krishiv_common::coordinator_url_env()
+                .unwrap_or_else(|| String::from("http://krishiv-coordinator:2001")),
             help: false,
         };
         let mut args = args.into_iter();

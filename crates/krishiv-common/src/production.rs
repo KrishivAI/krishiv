@@ -56,17 +56,7 @@ pub fn is_production_mode() -> bool {
     *CACHED.get_or_init(|| truthy_env(PRODUCTION_ENV))
 }
 
-fn truthy_env(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
+use crate::env_registry::truthy_env;
 
 /// Whether untyped legacy task fragments (`stream:*`, raw SQL strings) are permitted.
 pub fn allow_legacy_task_fragments(profile: DurabilityProfile) -> bool {

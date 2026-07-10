@@ -621,9 +621,7 @@ impl SessionBuilder {
     /// hard-coded in source.
     pub fn from_env() -> Result<Self> {
         let mode_raw = std::env::var("KRISHIV_MODE").unwrap_or_default();
-        let coordinator_url = std::env::var("KRISHIV_COORDINATOR_URL")
-            .or_else(|_| std::env::var("KRISHIV_COORDINATOR"))
-            .ok();
+        let coordinator_url = krishiv_common::coordinator_url_env();
 
         let mut builder = SessionBuilder::new();
 
