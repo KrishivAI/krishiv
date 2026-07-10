@@ -261,8 +261,11 @@ per-subsystem islands, not one arbiter (see §7c).
   a topic that grows partitions needs a restart. → Phase 55.
 - **IVM has no partitioning dimension at all** — and Phase 57
   deliberately keeps one executor per IVM job (executor-resident state
-  is the step that pays). Key-group-sharded IVM is recorded in Phase 57
-  as an explicit post-phase follow-on, not a GA requirement.
+  is the step that pays). Key-group-sharded IVM (DBSP multi-worker) is
+  **Phase 64** — post-GA, demand-triggered, reusing Phase 55's
+  key-group/exchange/barrier machinery. Note: source-table partition
+  pruning and (post-#191) partitioned output tables work for IVM
+  regardless — this bullet is about sharding the *computation*.
 
 ## 7c. Shuffle lifecycle, memory arbitration, watermarks, table maintenance (seventh pass, 2026-07-10)
 
