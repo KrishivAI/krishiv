@@ -627,7 +627,7 @@ fn recovery_clears_persisted_in_flight_launch_guards() {
 
     let mut restarted =
         Coordinator::active(CoordinatorId::try_new("coord-recover-inflight-2").unwrap());
-    restarted.recover_from_store(&store).unwrap();
+    restarted.recover_from_store(&mut store).unwrap();
 
     assert_eq!(
         restarted
@@ -721,7 +721,7 @@ fn restart_audit_invalidates_shuffle_from_unknown_executor() {
     coordinator.persist_jobs_to_store(&mut store).unwrap();
 
     let mut restarted = Coordinator::active(CoordinatorId::try_new("coord-audit-1b").unwrap());
-    restarted.recover_from_store(&store).unwrap();
+    restarted.recover_from_store(&mut store).unwrap();
 
     // The audit inside recover_from_store must have reset the producer to
     // Pending because its shuffle host no longer exists.
@@ -751,7 +751,7 @@ fn restart_audit_keeps_shuffle_from_restored_executor() {
         .unwrap();
 
     let mut restarted = Coordinator::active(CoordinatorId::try_new("coord-audit-2b").unwrap());
-    restarted.recover_from_store(&store).unwrap();
+    restarted.recover_from_store(&mut store).unwrap();
 
     // The executor descriptor was restored: the grace period applies and
     // the producer's output must stay Succeeded.

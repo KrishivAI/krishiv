@@ -251,8 +251,17 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
                 for work in sink_work {
                     let job_id = work.job_id.clone();
                     let publish_ok = work.execute();
-                    if !publish_ok && let Ok(mut coordinator) = lock_coord(&self.coordinator) {
-                        coordinator.mark_sink_publish_failed(&job_id);
+                    // DUR-1: resolve the job that `finalize_staged_sink_outputs`
+                    // left in `Committing`. On success promote to `Succeeded`
+                    // and persist *now* (after publish); on failure fail it.
+                    // Both are no-ops for cleanup-intent work whose job is
+                    // already terminal.
+                    if let Ok(mut coordinator) = lock_coord(&self.coordinator) {
+                        if publish_ok {
+                            coordinator.mark_sink_publish_committed(&job_id);
+                        } else {
+                            coordinator.mark_sink_publish_failed(&job_id);
+                        }
                     }
                 }
             });

@@ -309,7 +309,14 @@ impl SinkFinalizeWork {
                         );
                     }
                 }
-                JobState::Queued | JobState::Accepted | JobState::Planning | JobState::Running => {}
+                // `Committing` is never carried in the work item itself (the
+                // work records the publish *intent* — `Succeeded` → publish);
+                // the job record holds `Committing` while this runs.
+                JobState::Queued
+                | JobState::Accepted
+                | JobState::Planning
+                | JobState::Running
+                | JobState::Committing => {}
             }
         }
         all_ok
@@ -1670,49 +1677,73 @@ impl Coordinator {
     /// Both operations are idempotent; re-entry on duplicate terminal updates
     /// converges.
     pub(crate) fn finalize_staged_sink_outputs(&mut self, job_id: &JobId) {
-        use krishiv_common::write_commit::SinkWriteSpec;
-
-        const SINK_PREFIX: &str = "object-parquet-sink:";
-
-        let (state, contracts): (JobState, Vec<String>) = {
-            let Some(jc) = self.job_coordinators.get(job_id) else {
-                return;
-            };
-            let record = jc.read_record();
-            let contracts = record
-                .spec
-                .stages()
-                .iter()
-                .flat_map(|stage| stage.tasks())
-                .filter_map(|task| task.sink_contract())
-                .filter_map(|contract| contract.trim().strip_prefix(SINK_PREFIX).map(str::to_owned))
-                .collect();
-            (record.state(), contracts)
+        let state = match self.job_coordinators.get(job_id) {
+            Some(jc) => jc.read_record().state(),
+            None => return,
         };
-        if contracts.is_empty() || !state.is_terminal() {
+        if !state.is_terminal() {
+            return;
+        }
+        let specs = self.staged_sink_specs(job_id);
+        if specs.is_empty() {
             return;
         }
 
-        let mut specs = Vec::with_capacity(contracts.len());
-        for payload in contracts {
-            let spec = match SinkWriteSpec::parse(&payload) {
-                Ok(spec) => spec,
+        // DUR-1: a `Succeeded` job with staged output must not be persisted
+        // `Succeeded` until the publish durably completes. Demote it to the
+        // non-terminal `Committing` state now — *before* the caller persists
+        // this record in `apply_task_update` — so a crash in the publish window
+        // recovers as `Committing` and re-drives the (idempotent) publish rather
+        // than trusting a false success. The caller resolves it via
+        // `mark_sink_publish_committed` (→ `Succeeded`) or
+        // `mark_sink_publish_failed` (→ `Failed`). `Failed`/`Cancelled` jobs
+        // only clean up staging and stay terminal, so they are not demoted.
+        if state == JobState::Succeeded
+            && let Ok(mut record) = self.find_job_mut(job_id)
+        {
+            record.state = JobState::Committing;
+        }
+        self.pending_sink_finalize.push(SinkFinalizeWork {
+            job_id: job_id.clone(),
+            // Publish *intent*, not the job's live state: `Succeeded` → publish,
+            // `Failed`/`Cancelled` → cleanup. The record now holds `Committing`.
+            state,
+            specs,
+        });
+    }
+
+    /// Parse the staged object-sink specs declared by a job's tasks. Shared by
+    /// the live finalize path and the `Committing` re-drive on recovery so both
+    /// reconstruct exactly the same publish set from the persisted job spec.
+    pub(crate) fn staged_sink_specs(
+        &self,
+        job_id: &JobId,
+    ) -> Vec<krishiv_common::write_commit::SinkWriteSpec> {
+        use krishiv_common::write_commit::SinkWriteSpec;
+        const SINK_PREFIX: &str = "object-parquet-sink:";
+
+        let Some(jc) = self.job_coordinators.get(job_id) else {
+            return Vec::new();
+        };
+        let record = jc.read_record();
+        let mut specs = Vec::new();
+        for payload in record
+            .spec
+            .stages()
+            .iter()
+            .flat_map(|stage| stage.tasks())
+            .filter_map(|task| task.sink_contract())
+            .filter_map(|contract| contract.trim().strip_prefix(SINK_PREFIX).map(str::to_owned))
+        {
+            match SinkWriteSpec::parse(&payload) {
+                Ok(spec) if spec.staged => specs.push(spec),
+                Ok(_) => {}
                 Err(error) => {
                     tracing::error!(job_id = %job_id, error = %error, "invalid sink contract during finalize");
-                    continue;
                 }
-            };
-            if spec.staged {
-                specs.push(spec);
             }
         }
-        if !specs.is_empty() {
-            self.pending_sink_finalize.push(SinkFinalizeWork {
-                job_id: job_id.clone(),
-                state,
-                specs,
-            });
-        }
+        specs
     }
 
     /// Drain all pending sink finalization work. Callers release the coordinator
@@ -1721,10 +1752,113 @@ impl Coordinator {
         std::mem::take(&mut self.pending_sink_finalize)
     }
 
-    /// Mark a job `Failed` after a publish step failed outside the write lock.
+    /// Promote a `Committing` job to `Succeeded` after its staged sink output
+    /// has durably published (DUR-1). Persists the terminal state
+    /// **synchronously** — the durable `Succeeded` write happens only now, after
+    /// the publish — then runs the terminal bookkeeping deferred at
+    /// `Committing` time. No-op if the job is not `Committing` (e.g. a duplicate
+    /// finalize, or a job that never staged output).
+    pub(crate) fn mark_sink_publish_committed(&mut self, job_id: &JobId) {
+        {
+            let Ok(mut job) = self.find_job_mut(job_id) else {
+                return;
+            };
+            if job.state() != JobState::Committing {
+                return;
+            }
+            job.state = JobState::Succeeded;
+        }
+        if let Err(e) = self.persist_job_record(job_id, true) {
+            tracing::error!(
+                job_id = %job_id,
+                error = %e,
+                "failed to persist Succeeded after sink publish; job remains recoverable as Committing"
+            );
+        }
+        self.on_job_terminal(job_id);
+    }
+
+    /// Mark a job `Failed` after a publish step failed outside the write lock
+    /// (DUR-1). Persists the terminal state synchronously and runs terminal
+    /// bookkeeping. No-op if the job is already terminal.
     pub(crate) fn mark_sink_publish_failed(&mut self, job_id: &JobId) {
-        if let Ok(mut job) = self.find_job_mut(job_id) {
+        {
+            let Ok(mut job) = self.find_job_mut(job_id) else {
+                return;
+            };
+            if job.state().is_terminal() {
+                return;
+            }
             job.state = JobState::Failed;
+        }
+        if let Err(e) = self.persist_job_record(job_id, true) {
+            tracing::error!(
+                job_id = %job_id,
+                error = %e,
+                "failed to persist Failed after sink publish failure"
+            );
+        }
+        self.on_job_terminal(job_id);
+    }
+
+    /// Re-drive jobs found in the non-terminal `Committing` state after a
+    /// coordinator restart (DUR-1). Their staged output may or may not have been
+    /// published before the crash; `publish_staged_outputs` is idempotent (it
+    /// skips already-present destination files), so re-running it is safe. Each
+    /// job is then resolved to a terminal state and persisted via the recovery
+    /// `store` (which is not yet installed as `self.store` at recovery time).
+    ///
+    /// Runs synchronously at startup, before the coordinator serves traffic, so
+    /// the blocking filesystem publish is acceptable here.
+    pub(crate) fn redrive_committing_jobs(&mut self, store: &mut dyn MetadataStore) {
+        use krishiv_common::write_commit::publish_staged_outputs;
+
+        let committing: Vec<JobId> = self
+            .job_coordinators
+            .iter()
+            .filter(|(_, jc)| jc.read_record().state() == JobState::Committing)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for job_id in committing {
+            let specs = self.staged_sink_specs(&job_id);
+            let mut all_ok = true;
+            for spec in &specs {
+                if let Err(error) = publish_staged_outputs(spec, job_id.as_str()) {
+                    tracing::error!(
+                        job_id = %job_id,
+                        dest = %spec.dest_path,
+                        error = %error,
+                        "DUR-1 recovery: failed to re-publish staged sink output; failing job"
+                    );
+                    all_ok = false;
+                }
+            }
+            let resolved = if all_ok {
+                JobState::Succeeded
+            } else {
+                JobState::Failed
+            };
+            if let Ok(mut job) = self.find_job_mut(&job_id) {
+                job.state = resolved;
+            }
+            // Persist the resolved terminal state via the recovery store.
+            if let Some(jc) = self.job_coordinators.get(&job_id) {
+                let record = jc.read_record();
+                if let Err(e) = store.save_job(&record) {
+                    tracing::error!(
+                        job_id = %job_id,
+                        error = %e,
+                        "DUR-1 recovery: failed to persist resolved state for Committing job"
+                    );
+                }
+            }
+            self.on_job_terminal(&job_id);
+            tracing::warn!(
+                job_id = %job_id,
+                resolved = %resolved,
+                "DUR-1 recovery: re-drove Committing job to terminal state after restart"
+            );
         }
     }
 

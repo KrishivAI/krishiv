@@ -110,7 +110,11 @@ pub async fn execute_batch_sql_coordinated(
                     message: format!("batch SQL job {job_id} finished in state {state:?}"),
                 });
             }
-            JobState::Queued | JobState::Accepted | JobState::Planning | JobState::Running => {
+            JobState::Queued
+            | JobState::Accepted
+            | JobState::Planning
+            | JobState::Running
+            | JobState::Committing => {
                 let state_changed = notify.notified();
                 let recheck_state = {
                     let coord = coordinator.read().await;
@@ -118,7 +122,11 @@ pub async fn execute_batch_sql_coordinated(
                 };
                 if matches!(
                     recheck_state,
-                    JobState::Queued | JobState::Accepted | JobState::Planning | JobState::Running
+                    JobState::Queued
+            | JobState::Accepted
+            | JobState::Planning
+            | JobState::Running
+            | JobState::Committing
                 ) {
                     tokio::select! {
                         _ = state_changed => {}
@@ -184,7 +192,11 @@ pub async fn execute_batch_sql_sink_coordinated(
                     message: format!("batch SQL sink job {job_id} finished in state {state:?}"),
                 });
             }
-            JobState::Queued | JobState::Accepted | JobState::Planning | JobState::Running => {
+            JobState::Queued
+            | JobState::Accepted
+            | JobState::Planning
+            | JobState::Running
+            | JobState::Committing => {
                 let state_changed = notify.notified();
                 let recheck_state = {
                     let coord = coordinator.read().await;
@@ -192,7 +204,11 @@ pub async fn execute_batch_sql_sink_coordinated(
                 };
                 if matches!(
                     recheck_state,
-                    JobState::Queued | JobState::Accepted | JobState::Planning | JobState::Running
+                    JobState::Queued
+            | JobState::Accepted
+            | JobState::Planning
+            | JobState::Running
+            | JobState::Committing
                 ) {
                     tokio::select! {
                         _ = state_changed => {}

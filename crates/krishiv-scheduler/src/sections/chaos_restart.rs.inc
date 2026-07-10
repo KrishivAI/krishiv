@@ -81,7 +81,7 @@ fn chaos_restart_converges_at_every_lifecycle_point() {
 
         let mut restarted =
             Coordinator::active(CoordinatorId::try_new("coord-chaos-r").unwrap());
-        restarted.recover_from_store(&store).unwrap();
+        restarted.recover_from_store(&mut store).unwrap();
 
         // Convergence assertions: job is tracked, snapshot is readable, and
         // the orchestration tick runs without error.

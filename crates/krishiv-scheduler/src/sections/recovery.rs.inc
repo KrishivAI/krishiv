@@ -46,7 +46,7 @@ fn recover_from_store_removes_phantom_stale_jobs() {
         .unwrap();
 
     // Recovery must discard the stale in-memory job and load only the stored one.
-    coordinator.recover_from_store(&store).unwrap();
+    coordinator.recover_from_store(&mut store).unwrap();
     assert!(
         coordinator.job_snapshot(&stale_job_id).is_err(),
         "stale phantom job must be removed after recovery"
@@ -166,7 +166,7 @@ fn coordinator_recovers_submitted_job_from_store() {
 
     // Second coordinator: recover from the external store.
     let mut c2 = Coordinator::active(coord_id.clone());
-    c2.recover_from_store(&external_store).unwrap();
+    c2.recover_from_store(&mut external_store).unwrap();
 
     let snap = c2.job_snapshot(&job_id).unwrap();
     assert_eq!(snap.job_id(), &job_id);
@@ -198,10 +198,10 @@ fn rocksdb_metadata_store_recovers_after_reopen() {
             .unwrap();
     }
 
-    let reopened = crate::rocksdb_metadata::RocksDbMetadataStore::open(&path).unwrap();
+    let mut reopened = crate::rocksdb_metadata::RocksDbMetadataStore::open(&path).unwrap();
     assert_eq!(reopened.events().len(), 1);
     let mut recovered = Coordinator::active(CoordinatorId::try_new("coord-rocksdb-2").unwrap());
-    recovered.recover_from_store(&reopened).unwrap();
+    recovered.recover_from_store(&mut reopened).unwrap();
     let snapshot = recovered.job_snapshot(&job_id).unwrap();
     assert_eq!(snapshot.task_count(), 1);
     assert_eq!(snapshot.assigned_task_count(), 1);

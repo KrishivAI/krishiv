@@ -173,7 +173,7 @@ fn coordinator_recovers_jobs_from_store() {
         .unwrap();
 
     let mut coordinator = Coordinator::active(coord_id);
-    coordinator.recover_from_store(&store).unwrap();
+    coordinator.recover_from_store(&mut store).unwrap();
     let snapshot = coordinator.job_snapshot(&job_id).unwrap();
     assert_eq!(snapshot.state(), JobState::Running);
 }

@@ -52,6 +52,13 @@ pub enum JobState {
     Planning,
     /// At least one stage or task is active.
     Running,
+    /// All stages completed, but a staged distributed-sink publish is still in
+    /// flight (DUR-1). A job in this state is **not** terminal: its output has
+    /// not yet been durably published, so it must never be observed as
+    /// `Succeeded`. The coordinator promotes it to `Succeeded` only after the
+    /// publish durably completes, or to `Failed` if the publish fails; restart
+    /// recovery re-drives the publish rather than trusting a false success.
+    Committing,
     /// All stages completed successfully.
     Succeeded,
     /// One or more tasks failed and no retry is active.
@@ -74,6 +81,7 @@ impl fmt::Display for JobState {
             Self::Accepted => f.write_str("accepted"),
             Self::Planning => f.write_str("planning"),
             Self::Running => f.write_str("running"),
+            Self::Committing => f.write_str("committing"),
             Self::Succeeded => f.write_str("succeeded"),
             Self::Failed => f.write_str("failed"),
             Self::Cancelled => f.write_str("cancelled"),

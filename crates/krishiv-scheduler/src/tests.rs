@@ -113,4 +113,5 @@ mod scheduler_tests {
     include!("sections/placement.rs.inc");
     include!("sections/chaos_restart.rs.inc");
     include!("sections/streaming_recovery.rs.inc");
+    include!("sections/dur1.rs.inc");
 }

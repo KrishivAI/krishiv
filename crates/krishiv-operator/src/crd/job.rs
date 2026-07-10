@@ -212,6 +212,10 @@ impl From<JobState> for KrishivJobPhase {
             JobState::Accepted => Self::Accepted,
             JobState::Planning => Self::Planning,
             JobState::Running => Self::Running,
+            // DUR-1: the sink publish is still in flight — surface it as
+            // Running (not yet Succeeded) so the CRD phase never reports
+            // success before output is durably published.
+            JobState::Committing => Self::Running,
             JobState::Succeeded => Self::Succeeded,
             JobState::Failed => Self::Failed,
             JobState::Cancelled => Self::Cancelled,

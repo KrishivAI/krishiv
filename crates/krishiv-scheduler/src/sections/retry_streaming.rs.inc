@@ -251,7 +251,7 @@ fn streaming_executor_not_evicted_within_grace_period() {
                 .unwrap(),
         )
         .unwrap();
-    coordinator.recover_from_store(&store).unwrap();
+    coordinator.recover_from_store(&mut store).unwrap();
 
     // Advance 3 ticks (> timeout of 2, but < grace period of 10).
     let evicted = coordinator.advance_heartbeat_clock(3).unwrap();
@@ -303,8 +303,8 @@ fn streaming_executor_evicted_after_grace_period() {
     // Recover from an empty store: the streaming job is not restored, so after
     // recovery the executor owns no streaming task and is therefore *not*
     // protected by the reattach grace window — it must be evicted.
-    let store = crate::store::InMemoryMetadataStore::default();
-    coordinator.recover_from_store(&store).unwrap();
+    let mut store = crate::store::InMemoryMetadataStore::default();
+    coordinator.recover_from_store(&mut store).unwrap();
 
     // Drive the heartbeat clock well past the grace period (2) + heartbeat
     // timeout (2). The eviction may land during recovery's stale-executor sweep
@@ -392,7 +392,7 @@ fn streaming_reattach_updates_task_watermark_and_offset() {
                 .unwrap(),
         )
         .unwrap();
-    coordinator.recover_from_store(&store).unwrap();
+    coordinator.recover_from_store(&mut store).unwrap();
 
     // After a coordinator restart the executor re-registers (as the test comment
     // describes), which advances its lease generation. Stale, pre-restart leases

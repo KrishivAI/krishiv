@@ -198,10 +198,10 @@ pub fn build_shared_coordinator_sync(
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("create metadata dir '{}': {e}", parent.display()))?;
                 }
-                let store = RocksDbMetadataStore::open(path.as_path())
+                let mut store = RocksDbMetadataStore::open(path.as_path())
                     .map_err(|e| format!("rocksdb store '{}': {e}", path.display()))?;
                 coord
-                    .recover_from_store(&store)
+                    .recover_from_store(&mut store)
                     .map_err(|e| format!("coordinator recovery failed: {e}"))?;
                 SharedCoordinator::new(attach_metadata_store(coord, store, config))
             }
@@ -222,12 +222,12 @@ pub fn build_shared_coordinator_sync(
                         .into(),
                 );
             }
-            let store = krishiv_common::async_util::block_on(EtcdMetadataStore::connect(
+            let mut store = krishiv_common::async_util::block_on(EtcdMetadataStore::connect(
                 config.etcd_endpoints.clone(),
             ))
             .map_err(|e| format!("etcd metadata store: {e}"))?;
             coord
-                .recover_from_store(&store)
+                .recover_from_store(&mut store)
                 .map_err(|e| format!("coordinator recovery failed: {e}"))?;
             SharedCoordinator::new(attach_metadata_store(coord, store, config))
         }
@@ -239,10 +239,10 @@ pub fn build_shared_coordinator_sync(
         }
         // "rocksdb" is the canonical name; "redb" is accepted as a legacy alias.
         (Some("rocksdb" | "redb"), Some(path)) => {
-            let store = RocksDbMetadataStore::open(path.as_path())
+            let mut store = RocksDbMetadataStore::open(path.as_path())
                 .map_err(|e| format!("rocksdb store '{}': {e}", path.display()))?;
             coord
-                .recover_from_store(&store)
+                .recover_from_store(&mut store)
                 .map_err(|e| format!("coordinator recovery failed: {e}"))?;
             SharedCoordinator::new(attach_metadata_store(coord, store, config))
         }

@@ -261,8 +261,15 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             let publish_ok = tokio::task::spawn_blocking(move || work.execute())
                 .await
                 .unwrap_or(false);
-            if !publish_ok {
-                let mut coordinator = self.coordinator.write().await;
+            // DUR-1: resolve the job that `finalize_staged_sink_outputs` left in
+            // `Committing`. On success promote to `Succeeded` and persist the
+            // terminal state *now* — only after the publish durably completed;
+            // on failure persist `Failed`. Both are no-ops for cleanup-intent
+            // work whose job is already terminal.
+            let mut coordinator = self.coordinator.write().await;
+            if publish_ok {
+                coordinator.mark_sink_publish_committed(&job_id);
+            } else {
                 coordinator.mark_sink_publish_failed(&job_id);
             }
         }

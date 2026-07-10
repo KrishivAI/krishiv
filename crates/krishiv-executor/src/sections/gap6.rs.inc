@@ -437,7 +437,7 @@ async fn streaming_e2e_coordinator_reattach_preserves_watermark() {
         let mut coordinator = shared.write().await;
         let mut store = InMemoryMetadataStore::default();
         coordinator.persist_jobs_to_store(&mut store).unwrap();
-        coordinator.recover_from_store(&store).unwrap();
+        coordinator.recover_from_store(&mut store).unwrap();
     }
 
     // Read the lease AFTER recover_from_store: the recovery path calls

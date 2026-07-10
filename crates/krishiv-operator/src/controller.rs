@@ -70,7 +70,7 @@ impl KubernetesControllerRuntime {
         }
 
         if let Some(path) = &config.metadata_path {
-            let store = krishiv_scheduler::RocksDbMetadataStore::open(path).map_err(|error| {
+            let mut store = krishiv_scheduler::RocksDbMetadataStore::open(path).map_err(|error| {
                 OperatorError::InvalidResource {
                     message: format!(
                         "failed to open metadata store at {}: {error}",
@@ -79,7 +79,7 @@ impl KubernetesControllerRuntime {
                 }
             })?;
             coordinator
-                .recover_from_store(&store)
+                .recover_from_store(&mut store)
                 .map_err(OperatorError::from)?;
             let fail_closed =
                 krishiv_common::profile_requires_fail_closed_metadata(config.durability_profile);

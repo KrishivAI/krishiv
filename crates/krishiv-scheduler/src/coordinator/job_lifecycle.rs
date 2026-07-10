@@ -688,107 +688,13 @@ impl Coordinator {
         // persistence and GC bookkeeping.
         self.finalize_staged_sink_outputs(&job_id);
 
-        // Snapshot the job's current state and resource usage after the update.
-        let (is_terminal, usage, state, _job_name, _namespace) = self
-            .job_coordinators
-            .get(&job_id)
-            .map(|jc| {
-                let r = jc.read_record();
-                (
-                    r.state().is_terminal(),
-                    r.resource_usage.clone(),
-                    r.state(),
-                    r.spec.name().to_owned(),
-                    r.spec
-                        .namespace_id()
-                        .map(|s| s.to_owned())
-                        .unwrap_or_default(),
-                )
-            })
-            .unwrap_or((
-                false,
-                ResourceUsage::default(),
-                JobState::Accepted,
-                String::new(),
-                String::new(),
-            ));
-
-        if is_terminal && !self.gc_ready_jobs.contains(&job_id) {
-            const MAX_GC_JOBS: usize = 1000;
-            if self.gc_ready_jobs.len() >= MAX_GC_JOBS {
-                self.gc_ready_jobs.pop_front();
-            }
-            self.gc_ready_jobs.push_back(job_id.clone());
-            self.ckpt.coordinators.remove(&job_id);
-            // Free inline input data (InlineIpc partitions for batch-sql and
-            // bounded-window jobs) — executors have already consumed this by the
-            // time the job reaches a terminal state.
-            self.job_input_partitions.remove(&job_id);
-            self.job_task_input_partitions.remove(&job_id);
-            self.continuous_input_cycles.remove(&job_id);
-            self.pending_continuous_restores.remove(&job_id);
-            self.batch_sql_job_tables.remove(&job_id);
-            self.pending_task_result_spools
-                .retain(|key, _| key.job_id != job_id);
-            if state != JobState::Succeeded {
-                self.job_inline_results.remove(&job_id);
-                self.job_result_spools.remove(&job_id);
-            }
-            self.queue_manager.on_job_complete(&job_id, &usage);
-
-            // SC13: append a `JobCompleted` event to the event log so the
-            // History Server can render a complete lifecycle. The
-            // `final_state` is a serialised string so the History
-            // Server doesn't have to re-resolve `JobState` variants.
-            if let Some(store) = &self.store {
-                let mut guard = store.inner();
-                if let Err(e) = guard.append_event(EventLogEvent::JobCompleted {
-                    job_id: job_id.clone(),
-                    final_state: state.to_string(),
-                }) {
-                    tracing::warn!(job_id = %job_id, error = %e, "failed to append JobCompleted event");
-                }
-            }
-
-            // Archive an immutable history record before the job is evicted.
-            if let Some(jc) = self.job_coordinators.get(&job_id) {
-                let r = jc.read_record();
-                let history = crate::store::JobHistoryRecord {
-                    job_id: job_id.as_str().to_owned(),
-                    job_kind: r.spec.kind().to_string(),
-                    final_state: state.to_string(),
-                    completed_at_ms: krishiv_common::async_util::unix_now_ms() as u64,
-                    stage_count: r.stages.len(),
-                    task_count: r.stages.iter().map(|s| s.tasks.len()).sum(),
-                    succeeded_task_count: r
-                        .stages
-                        .iter()
-                        .flat_map(|s| s.tasks.iter())
-                        .filter(|t| t.state == TaskState::Succeeded)
-                        .count() as u32,
-                    failed_task_count: r
-                        .stages
-                        .iter()
-                        .flat_map(|s| s.tasks.iter())
-                        .filter(|t| t.state == TaskState::Failed)
-                        .count() as u32,
-                    cpu_nanos: usage.cpu_nanos,
-                    memory_peak_task_bytes: usage.memory_peak_task_bytes,
-                    namespace_id: r.spec.namespace_id().map(str::to_owned),
-                    priority: r.spec.priority(),
-                };
-                if let Some(store) = &self.store {
-                    let mut guard = store.inner();
-                    if let Err(e) = guard.save_job_history(history) {
-                        tracing::warn!(
-                            job_id = %job_id,
-                            error = %e,
-                            "failed to persist job history record"
-                        );
-                    }
-                }
-            }
-        }
+        // Terminal-state bookkeeping (GC queueing, resource release, history
+        // archival). Self-gates on the job's terminal state, so a job that
+        // `finalize_staged_sink_outputs` just demoted to the non-terminal
+        // `Committing` state (DUR-1) is a no-op here — its bookkeeping is
+        // deferred until `mark_sink_publish_committed`/`_failed` resolves the
+        // publish.
+        self.on_job_terminal(&job_id);
         if let Some(record) = self
             .job_coordinators
             .get(&job_id)
@@ -864,6 +770,106 @@ impl Coordinator {
             self.remove_streaming_task_index(&job_id);
         }
         Ok(outcome)
+    }
+
+    /// One-time bookkeeping that fires when a job reaches a **terminal** state
+    /// (`Succeeded`/`Failed`/`Cancelled`): queue it for shuffle GC, free its
+    /// inline input/result state, release its admission-control resources, and
+    /// archive an immutable history record + `JobCompleted` event.
+    ///
+    /// Self-gating: a no-op unless the job's current record state is terminal
+    /// and it has not already been queued for GC (idempotent). This lets the
+    /// DUR-1 `Committing` path defer the bookkeeping — `apply_task_update` calls
+    /// it eagerly (no-op while `Committing`) and again from
+    /// `mark_sink_publish_committed`/`mark_sink_publish_failed` once the publish
+    /// resolves the job to a terminal state.
+    pub(crate) fn on_job_terminal(&mut self, job_id: &JobId) {
+        let (is_terminal, usage, state) = self
+            .job_coordinators
+            .get(job_id)
+            .map(|jc| {
+                let r = jc.read_record();
+                (r.state().is_terminal(), r.resource_usage.clone(), r.state())
+            })
+            .unwrap_or((false, ResourceUsage::default(), JobState::Accepted));
+
+        if !is_terminal || self.gc_ready_jobs.contains(job_id) {
+            return;
+        }
+        const MAX_GC_JOBS: usize = 1000;
+        if self.gc_ready_jobs.len() >= MAX_GC_JOBS {
+            self.gc_ready_jobs.pop_front();
+        }
+        self.gc_ready_jobs.push_back(job_id.clone());
+        self.ckpt.coordinators.remove(job_id);
+        // Free inline input data (InlineIpc partitions for batch-sql and
+        // bounded-window jobs) — executors have already consumed this by the
+        // time the job reaches a terminal state.
+        self.job_input_partitions.remove(job_id);
+        self.job_task_input_partitions.remove(job_id);
+        self.continuous_input_cycles.remove(job_id);
+        self.pending_continuous_restores.remove(job_id);
+        self.batch_sql_job_tables.remove(job_id);
+        self.pending_task_result_spools
+            .retain(|key, _| key.job_id != *job_id);
+        if state != JobState::Succeeded {
+            self.job_inline_results.remove(job_id);
+            self.job_result_spools.remove(job_id);
+        }
+        self.queue_manager.on_job_complete(job_id, &usage);
+
+        // SC13: append a `JobCompleted` event to the event log so the
+        // History Server can render a complete lifecycle. The
+        // `final_state` is a serialised string so the History
+        // Server doesn't have to re-resolve `JobState` variants.
+        if let Some(store) = &self.store {
+            let mut guard = store.inner();
+            if let Err(e) = guard.append_event(EventLogEvent::JobCompleted {
+                job_id: job_id.clone(),
+                final_state: state.to_string(),
+            }) {
+                tracing::warn!(job_id = %job_id, error = %e, "failed to append JobCompleted event");
+            }
+        }
+
+        // Archive an immutable history record before the job is evicted.
+        if let Some(jc) = self.job_coordinators.get(job_id) {
+            let r = jc.read_record();
+            let history = crate::store::JobHistoryRecord {
+                job_id: job_id.as_str().to_owned(),
+                job_kind: r.spec.kind().to_string(),
+                final_state: state.to_string(),
+                completed_at_ms: krishiv_common::async_util::unix_now_ms() as u64,
+                stage_count: r.stages.len(),
+                task_count: r.stages.iter().map(|s| s.tasks.len()).sum(),
+                succeeded_task_count: r
+                    .stages
+                    .iter()
+                    .flat_map(|s| s.tasks.iter())
+                    .filter(|t| t.state == TaskState::Succeeded)
+                    .count() as u32,
+                failed_task_count: r
+                    .stages
+                    .iter()
+                    .flat_map(|s| s.tasks.iter())
+                    .filter(|t| t.state == TaskState::Failed)
+                    .count() as u32,
+                cpu_nanos: usage.cpu_nanos,
+                memory_peak_task_bytes: usage.memory_peak_task_bytes,
+                namespace_id: r.spec.namespace_id().map(str::to_owned),
+                priority: r.spec.priority(),
+            };
+            if let Some(store) = &self.store {
+                let mut guard = store.inner();
+                if let Err(e) = guard.save_job_history(history) {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        error = %e,
+                        "failed to persist job history record"
+                    );
+                }
+            }
+        }
     }
 
     /// Drain the list of jobs that have reached a terminal state and need shuffle GC.

@@ -16,7 +16,7 @@ impl Coordinator {
     /// For streaming jobs with checkpoint config, checkpoint state is recovered
     /// via `CheckpointCoordinator::recover_from_storage`.
     #[tracing::instrument(skip(self, store), name = "recover_from_store")]
-    pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
+    pub fn recover_from_store(&mut self, store: &mut dyn MetadataStore) -> SchedulerResult<()> {
         // P1.23: Clear in-memory state first so stale phantom jobs cannot survive.
         // Always prefer the persisted store as the authoritative source of truth.
         self.job_coordinators.clear();
@@ -226,6 +226,14 @@ impl Coordinator {
                 "post-restart shuffle audit invalidated unavailable partitions; producers re-queued"
             );
         }
+
+        // DUR-1: re-drive any job persisted in the non-terminal `Committing`
+        // state — its staged sink output was mid-publish when the coordinator
+        // died. Re-publish idempotently and persist the resolved terminal state
+        // so a false `Succeeded` is never surfaced and the job is not re-driven
+        // again after its staging is consumed.
+        self.redrive_committing_jobs(store);
+
         Ok(())
     }
 
