@@ -238,6 +238,18 @@ impl KrishivFlightSqlService {
     /// valid, `Ok(None)` when no [`AuthProvider`] is attached, and
     /// `Err(Status::unauthenticated(...))` when the token is missing or invalid.
     fn authenticate_request<B>(&self, req: &Request<B>) -> Result<Option<String>, Status> {
+        // SEC-2 default-deny (Phase 63): an operator who configures
+        // authentication expects authorization too. If auth is set but no
+        // policy engine is attached, refuse on EVERY path uniformly — not just
+        // the statement paths. Folding the guard here closes the asymmetry
+        // where prepared-statement updates, DoAction, and metadata handlers
+        // authenticated without ever consulting a policy.
+        if self.auth.is_some() && self.policy.is_none() {
+            return Err(Status::permission_denied(
+                "auth is configured but no policy engine is set; \
+                 configure a PolicyHook or use an unauthenticated service",
+            ));
+        }
         let Some(auth) = &self.auth else {
             if krishiv_common::profile_requires_authenticated_flight(
                 krishiv_common::resolve_durability_profile(),
@@ -366,16 +378,8 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        // Default deny: if auth is configured but no policy engine is set,
-        // operators who configure authentication expect policy enforcement too.
-        if self.auth.is_some() && self.policy.is_none() {
-            return Err(Status::permission_denied(
-                "auth is configured but no policy engine is set; \
-                 configure a PolicyHook or use an unauthenticated service",
-            ));
-        }
-
-        // Authenticate if an auth provider is configured.
+        // Authenticate if an auth provider is configured (default-deny for
+        // auth-without-policy is enforced inside authenticate_request, SEC-2).
         let subject = self.authenticate_request(&request)?;
         let transaction_id = query.transaction_id.unwrap_or_default();
         self.validate_transaction_id(Some(&transaction_id), subject.as_deref())
@@ -413,16 +417,8 @@ impl FlightSqlService for KrishivFlightSqlService {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        // Default deny: if auth is configured but no policy engine is set,
-        // operators who configure authentication expect policy enforcement too.
-        if self.auth.is_some() && self.policy.is_none() {
-            return Err(Status::permission_denied(
-                "auth is configured but no policy engine is set; \
-                 configure a PolicyHook or use an unauthenticated service",
-            ));
-        }
-
-        // Authenticate if an auth provider is configured.
+        // Authenticate if an auth provider is configured (default-deny for
+        // auth-without-policy is enforced inside authenticate_request, SEC-2).
         let subject = self.authenticate_request(&request)?;
 
         // Decode the ticket. Two encodings are supported:
@@ -621,14 +617,8 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        // Default deny, same as the statement path: auth configured without
-        // a policy engine means the operator expects policy enforcement.
-        if self.auth.is_some() && self.policy.is_none() {
-            return Err(Status::permission_denied(
-                "auth is configured but no policy engine is set; \
-                 configure a PolicyHook or use an unauthenticated service",
-            ));
-        }
+        // Default-deny for auth-without-policy is enforced inside
+        // authenticate_request (SEC-2).
         let subject = self.authenticate_request(&request)?;
         let subject_key = subject.as_deref().unwrap_or("__anon__").to_owned();
         let handle = std::str::from_utf8(&query.prepared_statement_handle)
@@ -1694,6 +1684,67 @@ mod metadata_rpc_tests {
             info.schema.len()
         );
         assert_eq!(info.endpoint.len(), 1, "one endpoint with the ticket");
+    }
+
+    /// SEC-2 (Phase 63) regression: the fail-closed default-deny —
+    /// auth-configured-without-a-policy-engine — must be enforced on EVERY
+    /// path, not just statements. Before the fix, `do_action_fallback` and the
+    /// prepared-statement handlers authenticated without ever consulting the
+    /// default-deny guard, so an operator who turned on auth but forgot the
+    /// policy engine ran actions and prepared updates unauthorized. Folding
+    /// the guard into `authenticate_request` closes the asymmetry; it fires
+    /// before token validation, so even a credential-less request is denied.
+    #[tokio::test]
+    async fn sec2_auth_without_policy_default_denies_actions_and_prepared_paths() {
+        use std::collections::HashMap;
+
+        let mut keys = HashMap::new();
+        keys.insert("k1".to_owned(), "alice".to_owned());
+        let auth: Arc<dyn AuthProvider> = Arc::new(StaticApiKeyAuthProvider::new(keys));
+        // Auth attached, policy engine deliberately absent.
+        let svc = KrishivFlightSqlService::with_host(
+            FlightExecutionHost::embedded().expect("embedded host"),
+        )
+        .with_auth(auth);
+
+        // DoAction — the formerly-asymmetric action path. Its Ok variant is a
+        // non-Debug stream Response, so match instead of expect_err.
+        match svc
+            .do_action_fallback(Request::new(arrow_flight::Action {
+                r#type: String::new(),
+                body: Default::default(),
+            }))
+            .await
+        {
+            Err(status) => assert_eq!(status.code(), tonic::Code::PermissionDenied),
+            Ok(_) => panic!("DoAction must default-deny when auth has no policy"),
+        }
+
+        // Prepared-statement info — the formerly-asymmetric prepared path.
+        let prepared_err = svc
+            .get_flight_info_prepared_statement(
+                CommandPreparedStatementQuery {
+                    prepared_statement_handle: b"h".to_vec().into(),
+                },
+                descriptor_request(),
+            )
+            .await
+            .expect_err("prepared-statement info must default-deny when auth has no policy");
+        assert_eq!(prepared_err.code(), tonic::Code::PermissionDenied);
+
+        // Statement path — always had the guard; behaves identically now that
+        // the single enforcement point lives in authenticate_request.
+        let stmt_err = svc
+            .get_flight_info_statement(
+                CommandStatementQuery {
+                    query: "SELECT 1".to_string(),
+                    transaction_id: None,
+                },
+                descriptor_request(),
+            )
+            .await
+            .expect_err("statement info must default-deny when auth has no policy");
+        assert_eq!(stmt_err.code(), tonic::Code::PermissionDenied);
     }
 
     /// G1b regression: `GetSqlInfo` is implemented (the stock JDBC driver

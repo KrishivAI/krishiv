@@ -535,11 +535,26 @@ impl AuthContext {
         matches!(self, Self::Bearer { .. })
     }
 
-    /// Subject string, or `"anonymous"` for unauthenticated callers.
-    pub fn subject(&self) -> &str {
+    /// Log/identity-safe subject string (SEC-5, Phase 63).
+    ///
+    /// For a bearer context this is a short **stable, non-reversible
+    /// fingerprint** of the token — never the raw credential. The raw token is
+    /// only ever read internally, by `validate_grpc_auth_with_provider`, which
+    /// destructures the `Bearer.subject` field directly. Every logging site
+    /// goes through here, so a token can never be written to logs even at
+    /// `RUST_LOG=debug` or on a rejected request.
+    pub fn subject(&self) -> String {
         match self {
-            Self::Anonymous => "anonymous",
-            Self::Bearer { subject } => subject.as_str(),
+            Self::Anonymous => "anonymous".to_owned(),
+            Self::Bearer { subject } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                subject.hash(&mut hasher);
+                // 16 hex chars of a keyed hash: enough to correlate a caller
+                // across log lines, far too little to recover a high-entropy
+                // bearer token.
+                format!("bearer:{:016x}", hasher.finish())
+            }
         }
     }
 }
@@ -720,6 +735,48 @@ mod tests {
     #[test]
     fn static_provider_rejects_empty_token() {
         assert!(static_grpc_auth_provider_from_bearer_token(" ").is_none());
+    }
+
+    /// SEC-5 (Phase 63): the raw bearer token must never be exposed by the
+    /// value that every logging site records. `subject()` returns a stable
+    /// fingerprint, not the credential, and `extract_auth_context` still holds
+    /// the raw token internally (for validation) but never surfaces it.
+    #[test]
+    fn sec5_subject_never_exposes_raw_bearer_token() {
+        let raw = "super-secret-coordinator-token-0xABCDEF";
+        let ctx = AuthContext::Bearer {
+            subject: raw.to_owned(),
+        };
+        let logged = ctx.subject();
+        assert!(
+            !logged.contains(raw),
+            "subject() must not contain the raw token, got {logged}"
+        );
+        assert!(
+            logged.starts_with("bearer:"),
+            "bearer subject must be a fingerprint, got {logged}"
+        );
+        // Stable: the same token always fingerprints identically (log
+        // correlation), and different tokens differ.
+        assert_eq!(logged, ctx.subject());
+        let other = AuthContext::Bearer {
+            subject: "a-different-token".to_owned(),
+        };
+        assert_ne!(logged, other.subject());
+        assert_eq!(AuthContext::Anonymous.subject(), "anonymous");
+
+        // The raw token is still recoverable internally for validation via the
+        // field, but never through the public accessor.
+        let extracted = {
+            let mut md = tonic::metadata::MetadataMap::new();
+            md.insert("authorization", format!("Bearer {raw}").parse().unwrap());
+            extract_auth_context(&md)
+        };
+        assert!(!extracted.subject().contains(raw));
+        match extracted {
+            AuthContext::Bearer { subject } => assert_eq!(subject, raw),
+            AuthContext::Anonymous => panic!("expected a bearer context"),
+        }
     }
 
     #[test]
