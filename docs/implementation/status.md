@@ -1,5 +1,28 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 (day, follow-up 3) — API-fragmentation audit leg → Track 6 gains Phase 61 unified DataFrame API (GA gate → 62)
+
+User flagged the Python/Rust API variation across batch / delta-batch /
+streaming — delta-batch especially unfriendly — and asked for unification
++ PySpark-parity coverage. Third audit pass (appended to audit doc §8):
+strong PySpark-shaped base (`PyDataFrame` ~60 methods, `col()`,
+`read_stream()`/`write_stream()`) but **five parallel idioms** — batch
+DataFrame, structured-streaming reader/writer, Flink-style
+KeyedStream/WindowedStream layer, the raw IVM protocol
+(`session.ivm()` → `register_view` → `feed(DeltaBatch.from_inserts)` →
+`step()` → `snapshot()`, user-visible `_weight` columns —
+`krishiv-python/src/incremental.rs`), and live-tables/pipelines — plus
+method-variant sprawl (`filter`/`filter_column`,
+`select`/`select_columns`/`select_exprs`, `*_with_options` twins).
+`krishiv-api` mirrors the fragmentation. Platform plan updated: new
+**Phase 61 — unified DataFrame API** (one DataFrame drives all three
+engines: boundedness from the read side, compute engine from the write
+side `to_table(refresh=…)`; delta-batch usable end-to-end without ever
+touching `DeltaBatch`/`_weight`/`step()`; auto-generated PySpark parity
+matrix ≥80% + `F.*` namespace off Phase 60's registry; variant collapse
+via deprecation windows, v1 freeze respected), GA gate renumbered **62**.
+Docs-only change.
+
 ## 2026-07-10 (day, follow-up 2) — SQL-coverage audit leg → Track 6 gains Phase 60 (GA gate renumbered 61)
 
 User asked how SQL coverage compares to the Spark SQL reference. Second

@@ -5,7 +5,7 @@ Code-grounded audit of the engine across components, execution flow
 the three placements (embedded / single-node / distributed), and every API
 surface (SQL, Rust, Python, Flight SQL, gateway, MCP, connectors). Every
 claim cites code, not docs. This audit is the evidence base for the
-platform plan's **Track 6 (phases 51–61): engine production readiness** —
+platform plan's **Track 6 (phases 51–62): engine production readiness** —
 the arc that takes the engine from "certified single-path" to a credible
 Spark/Flink alternative for community adoption.
 
@@ -211,6 +211,27 @@ hardware headroom. This area needs *benchmark proof*, not rework.
   marked Partial after G17), and only ~17 engine-side UDF registrations
   exist — the function library is essentially DataFusion's builtin set.
   → Phase 60 (measured Spark-reference parity).
+- **API fragmentation across the three engines** (third pass, 2026-07-10):
+  the Python surface has a strong PySpark-shaped base — `PyDataFrame`
+  with ~60 methods (select/filter/group_by/join/pivot/cube/rollup/
+  sample/cache/…), `col()`/`Column` expressions, `session.read_stream()`
+  + `df.write_stream()` — but a user faces **five parallel idioms**:
+  (1) batch `DataFrame`; (2) structured-streaming
+  `DataStreamReader/Writer`; (3) a Flink-style DataStream layer
+  (`KeyedStream`/`WindowedStream`/`ConnectedStreams`/process functions +
+  state types); (4) the raw IVM job protocol — `session.ivm()` →
+  `register_view(sql, SchemaClass)` → `feed(DeltaBatch.from_inserts(…))`
+  → `step()` → `snapshot()`, with user-visible `_weight` columns
+  (`krishiv-python/src/incremental.rs`) — the least friendly path for
+  the differentiator engine; (5) live-tables/pipelines. Method-variant
+  sprawl compounds it (`filter`/`filter_column`,
+  `select`/`select_columns`/`select_exprs`, `except_`/`except_all`/
+  `except_distinct`, `*_with_options` twins). The Rust `krishiv-api`
+  mirrors the same fragmentation (Session / DataFrame / StreamingBuilder
+  / StreamingDataFrame / MaterializedTable / IvmJob). The engine-core
+  spine promises one contract across engines; the API layer doesn't
+  deliver it yet. → Phase 61 (unified DataFrame API, PySpark parity,
+  delta-batch demoted to an internal protocol).
 - **Flight SQL**: metadata RPCs + JDBC/ADBC verified (G1);
   `krishiv-sql-gateway` is explicitly **not** a wire server (API-12
   header) — an in-process SQLSTATE facade. There is no Postgres/JDBC
@@ -257,7 +278,8 @@ dependency order:
 | 58 | Fault tolerance GA: coordinator HA, shuffle recovery, history server, chaos matrix | §6 |
 | 59 | Interfaces: progress/cancel, wire protocol decision, Python parity, CI honesty | §8 |
 | 60 | SQL surface completeness: measured Spark-reference parity (JSON/lambda functions, SET/SHOW/USE, matrix drift) | §8 SQL coverage |
-| 61 | Production GA gate: certified matrix, public benchmarks + history, soak | the launch |
+| 61 | Unified DataFrame API: one surface, three engines, PySpark parity; delta-batch demoted to internal protocol | §8 API fragmentation |
+| 62 | Production GA gate: certified matrix, public benchmarks + history, soak | the launch |
 
 Phase detail, gates, and platform-side seams live in the platform repo:
 `docs/implementation/phases/phase-NN-*.md` and `plan.md` (Track 6).
