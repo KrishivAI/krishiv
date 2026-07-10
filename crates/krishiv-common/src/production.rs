@@ -216,6 +216,14 @@ pub fn profile_requires_authenticated_ui(profile: DurabilityProfile) -> bool {
     requires_http_auth(profile)
 }
 
+/// The shuffle data plane carries intermediate query results (real user data)
+/// between executors. Under durable profiles it MUST be authenticated — a
+/// missing shuffle token is a fail-closed startup error, not an open service
+/// (SEC-3, Phase 63). Same rule as Flight/HTTP/task auth.
+pub fn profile_requires_authenticated_shuffle(profile: DurabilityProfile) -> bool {
+    requires_http_auth(profile)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
