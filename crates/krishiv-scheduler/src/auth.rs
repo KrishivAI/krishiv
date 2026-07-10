@@ -686,12 +686,15 @@ impl JwtAuthProvider {
                 }
             }
         }
-        if keys.is_empty() || algorithms.is_empty() {
+        if keys.is_empty() {
             return Err("JWKS contained no usable asymmetric verification keys".into());
         }
         // By construction `algorithms` holds only asymmetric variants — HS* and
         // `none` can never enter it.
-        let mut validation = jsonwebtoken::Validation::new(algorithms[0]);
+        let Some(&first_alg) = algorithms.first() else {
+            return Err("JWKS contained no usable asymmetric verification keys".into());
+        };
+        let mut validation = jsonwebtoken::Validation::new(first_alg);
         validation.algorithms = algorithms;
         if let Ok(aud) = std::env::var(OIDC_AUDIENCE_ENV) {
             validation.set_audience(&[aud]);
