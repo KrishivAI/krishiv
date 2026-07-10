@@ -27,6 +27,7 @@ pub mod spillable;
 pub mod storage_uri;
 pub mod store;
 pub mod tiered_store;
+pub(crate) mod token_auth;
 
 /// Validate that an identifier (job_id, stage_id, etc.) is safe for use in a
 /// filesystem path.  Rejects empty strings and strings containing path

@@ -127,7 +127,7 @@ pub async fn run_shuffle_svc(
     // profile, refuse to start an unauthenticated service — a missing token is a
     // fail-closed startup error, mirroring the executor task-auth startup guard,
     // not a silently-open endpoint that `check_bearer_token` would wave through.
-    require_shuffle_token_or_fail(
+    crate::token_auth::require_shuffle_token_or_fail(
         token_val.is_some(),
         krishiv_common::resolve_durability_profile(),
     )?;
@@ -458,25 +458,6 @@ async fn ess_set_expected_pushes(
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
-/// SEC-3 (Phase 63) startup guard: refuse to run an unauthenticated shuffle
-/// data plane under a profile that requires shuffle auth. Extracted from
-/// [`run_shuffle_svc`] so the fail-closed rule is unit-testable without binding
-/// a socket.
-fn require_shuffle_token_or_fail(
-    token_present: bool,
-    profile: krishiv_common::durability::DurabilityProfile,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !token_present && krishiv_common::profile_requires_authenticated_shuffle(profile) {
-        return Err(format!(
-            "shuffle auth is required under durability profile '{profile}' but no shuffle \
-             token is configured; set KRISHIV_SHUFFLE_TOKEN or KRISHIV_SHUFFLE_TOKEN_FILE. \
-             Refusing to start an unauthenticated shuffle data plane (SEC-3)."
-        )
-        .into());
-    }
-    Ok(())
-}
-
 fn check_bearer_token(
     headers: &axum::http::HeaderMap,
     token: &Arc<std::sync::RwLock<Option<String>>>,
@@ -498,27 +479,5 @@ fn check_bearer_token(
     Ok(())
 }
 
-#[cfg(test)]
-mod sec3_tests {
-    use super::require_shuffle_token_or_fail;
-    use krishiv_common::durability::DurabilityProfile;
-
-    /// SEC-3 (Phase 63): under durable profiles a missing shuffle token is a
-    /// fail-closed startup error; DevLocal stays permissive; a present token is
-    /// always fine.
-    #[test]
-    fn shuffle_startup_fails_closed_without_token_under_durable_profiles() {
-        // No token + durable profile ⇒ refuse to start.
-        assert!(
-            require_shuffle_token_or_fail(false, DurabilityProfile::SingleNodeDurable).is_err()
-        );
-        assert!(
-            require_shuffle_token_or_fail(false, DurabilityProfile::DistributedDurable).is_err()
-        );
-        // DevLocal without a token is allowed (eval/loopback).
-        assert!(require_shuffle_token_or_fail(false, DurabilityProfile::DevLocal).is_ok());
-        // A configured token is always accepted, every profile.
-        assert!(require_shuffle_token_or_fail(true, DurabilityProfile::DistributedDurable).is_ok());
-        assert!(require_shuffle_token_or_fail(true, DurabilityProfile::DevLocal).is_ok());
-    }
-}
+// SEC-3 (Phase 63) startup fail-closed guard now lives in [`crate::token_auth`]
+// and is shared with the Flight shuffle server; its unit tests live there.

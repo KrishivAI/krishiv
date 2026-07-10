@@ -387,17 +387,64 @@ impl<S: ShuffleStore + Send + Sync + 'static> FlightService for ShuffleFlightSer
 ///
 /// Returns the bound local address and a join handle.  Aborting the handle
 /// stops the server.
+///
+/// SEC-3 (Phase 63): the shuffle data plane carries intermediate query results
+/// (real user data) between executors. The token is resolved from
+/// `KRISHIV_SHUFFLE_TOKEN` / `KRISHIV_SHUFFLE_TOKEN_FILE`; under a
+/// durable/production profile a missing token is a fail-closed startup error,
+/// mirroring the HTTP shuffle service and the executor task-auth guard. When a
+/// token is configured, every RPC must present `authorization: Bearer <token>`.
 pub async fn serve<S: ShuffleStore + Send + Sync + 'static>(
     addr: SocketAddr,
     store: Arc<S>,
+) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    let token = crate::token_auth::resolve_shuffle_token();
+    crate::token_auth::require_shuffle_token_or_fail(
+        token.is_some(),
+        krishiv_common::resolve_durability_profile(),
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
+    serve_with_token(addr, store, token).await
+}
+
+/// Start the shuffle Flight server with an explicit auth token.
+///
+/// Factored out of [`serve`] so tests can drive the interceptor hermetically
+/// without mutating process-global environment state. `token == None` disables
+/// the per-request check (only reachable under `DevLocal`, enforced by the
+/// startup guard in [`serve`]).
+pub(crate) async fn serve_with_token<S: ShuffleStore + Send + Sync + 'static>(
+    addr: SocketAddr,
+    store: Arc<S>,
+    token: Option<String>,
 ) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     let service = ShuffleFlightService::new(store);
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
+    // One interceptor type for both auth-on and auth-off so `add_service`
+    // receives a single concrete service type. When `token` is `None` the
+    // interceptor is a pass-through.
+    let intercepted = FlightServiceServer::with_interceptor(
+        service,
+        move |req: Request<()>| -> Result<Request<()>, Status> {
+            let provided = req
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if crate::token_auth::bearer_ok(provided, token.as_deref()) {
+                Ok(req)
+            } else {
+                Err(Status::unauthenticated(
+                    "shuffle: missing or invalid bearer token (SEC-3)",
+                ))
+            }
+        },
+    );
     let handle = tokio::spawn(async move {
         if let Err(error) = Server::builder()
-            .add_service(FlightServiceServer::new(service))
+            .add_service(intercepted)
             .serve_with_incoming(incoming)
             .await
         {
@@ -405,6 +452,23 @@ pub async fn serve<S: ShuffleStore + Send + Sync + 'static>(
         }
     });
     Ok((local_addr, handle))
+}
+
+/// Attach `authorization: Bearer <token>` to an outgoing shuffle RPC when a
+/// shuffle token is configured for this process (SEC-3). No-op under `DevLocal`
+/// with no token set.
+fn attach_shuffle_auth<T>(request: &mut Request<T>) -> io::Result<()> {
+    if let Some(tok) = crate::token_auth::cached_shuffle_token() {
+        let value: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
+            format!("Bearer {tok}").parse().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid shuffle token (not a valid header value): {e}"),
+                )
+            })?;
+        request.metadata_mut().insert("authorization", value);
+    }
+    Ok(())
 }
 
 /// Default number of fetch attempts (1 initial try + 3 retries).
@@ -522,8 +586,10 @@ impl FlightShuffleClient {
         let ticket = Ticket {
             ticket: ticket_text.into_bytes().into(),
         };
+        let mut do_get_req = Request::new(ticket);
+        attach_shuffle_auth(&mut do_get_req)?;
         let stream = client
-            .do_get(Request::new(ticket))
+            .do_get(do_get_req)
             .await
             .map_err(|e| {
                 if e.code() == tonic::Code::NotFound {
@@ -673,8 +739,10 @@ impl FlightShuffleClient {
             .await
             .map_err(|e| io::Error::other(format!("Arrow IPC encoding error: {e}")))?;
         let flight_stream = futures::stream::iter(flight_data);
+        let mut do_put_req = Request::new(flight_stream);
+        attach_shuffle_auth(&mut do_put_req)?;
         client
-            .do_put(Request::new(flight_stream))
+            .do_put(do_put_req)
             .await
             .map_err(|e: tonic::Status| io::Error::other(e.to_string()))?;
 
@@ -762,6 +830,89 @@ mod tests {
             matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
             "expected NotFound, got: {result:?}"
         );
+    }
+
+    /// SEC-3 (Phase 63): when a shuffle token is configured, the Flight shuffle
+    /// server must reject RPCs that carry no `Authorization` header or the wrong
+    /// token, and accept only the exact `Bearer <token>`. Driven through a raw
+    /// Flight client so the test sets headers explicitly and never mutates the
+    /// process-global token cache used by [`FlightShuffleClient`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sec3_flight_shuffle_enforces_bearer_token() {
+        use arrow_flight::flight_service_client::FlightServiceClient;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let batch = make_test_batch();
+        let id = PartitionId {
+            job_id: "job-auth".to_owned(),
+            stage_id: "s0".to_owned(),
+            partition: 0,
+        };
+        store.register_partition_lease(id.clone(), 1).await.unwrap();
+        store
+            .write_partition(
+                ShufflePartition {
+                    id: id.clone(),
+                    schema: batch.schema(),
+                    batches: vec![batch.clone()],
+                },
+                1,
+            )
+            .await
+            .unwrap();
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (local_addr, server_handle) =
+            serve_with_token(addr, Arc::clone(&store), Some("s3cret".to_owned()))
+                .await
+                .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let url = format!("http://{local_addr}");
+        let ticket = Ticket {
+            ticket: b"job-auth/s0/0".to_vec().into(),
+        };
+
+        let connect = || {
+            let url = url.clone();
+            async move {
+                let channel = tonic::transport::Endpoint::from_shared(url)
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+                FlightServiceClient::new(channel)
+            }
+        };
+
+        // 1) No credentials → Unauthenticated.
+        let mut client = connect().await;
+        let unauth = client.do_get(Request::new(ticket.clone())).await;
+        assert_eq!(
+            unauth.err().map(|e| e.code()),
+            Some(tonic::Code::Unauthenticated),
+            "missing token must be rejected"
+        );
+
+        // 2) Wrong token → Unauthenticated.
+        let mut client = connect().await;
+        let mut req = Request::new(ticket.clone());
+        req.metadata_mut()
+            .insert("authorization", "Bearer wrong".parse().unwrap());
+        assert_eq!(
+            client.do_get(req).await.err().map(|e| e.code()),
+            Some(tonic::Code::Unauthenticated),
+            "wrong token must be rejected"
+        );
+
+        // 3) Correct token → accepted.
+        let mut client = connect().await;
+        let mut req = Request::new(ticket);
+        req.metadata_mut()
+            .insert("authorization", "Bearer s3cret".parse().unwrap());
+        let ok = client.do_get(req).await;
+        server_handle.abort();
+        assert!(ok.is_ok(), "valid token must be accepted: {ok:?}");
     }
 
     #[test]
