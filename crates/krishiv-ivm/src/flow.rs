@@ -866,7 +866,6 @@ impl IncrementalFlow {
                 false
             } else if views_needing_plans.contains(view_name) {
                 let plan = crate::plan::build_view_plan(
-                    ctx,
                     &spec.body_sql,
                     &spec.output_schema,
                     &available_schemas,
@@ -1017,10 +1016,11 @@ impl IncrementalFlow {
         // pre-tick state of its source(s). Precedence:
         //   1. A checkpoint-restored operator accumulator (lossless, incl.
         //      duplicate-valued sources) stashed in `pending_plan_state` by
-        //      `restore_full` — the correct path for Aggregate/Distinct.
+        //      `restore_full` — Aggregate/Distinct accumulators and (#160)
+        //      join traces.
         //   2. Otherwise seed from the restored source/view snapshots — the
-        //      fallback for operators without serializable state (Join) and the
-        //      no-op normal first-build case (empty source).
+        //      fallback for pre-#160 checkpoints, failed state decodes, and
+        //      the no-op normal first-build case (empty source).
         // Without either, the first post-restore delta emits a non-retracting
         // insertion and corrupts the materialized view on the next restore
         // cycle (G6/F4).
@@ -1435,7 +1435,8 @@ impl IncrementalFlow {
             let data = bytes.get(pos..pos + data_len).ok_or_else(slice_err)?;
             pos += data_len;
             let delta = deserialize_delta_batch(data).map_err(delta_err)?;
-            let snapshot = delta.filter_positive().map_err(delta_err)?;
+            // Multiset materialization (#160): keep duplicate-row copies.
+            let snapshot = delta.filter_positive_expanded().map_err(delta_err)?;
             source_snapshots.insert(name, snapshot);
         }
         let mut inner = self.inner.lock().map_err(lock_err)?;
@@ -1679,6 +1680,12 @@ impl IncrementalFlow {
             let schema = updated.schema();
             let as_delta = DeltaBatch::from_inserts(updated).map_err(delta_err)?;
             let consolidated = consolidate_batch(as_delta, &[], &schema).map_err(delta_err)?;
+            // Deliberately SET-materialized (no #160 multiset expansion):
+            // stacked restores are made idempotent by this collapse (G2) —
+            // re-applying the same slice dedupes instead of doubling. The
+            // trade: duplicate-row sources restored through *delta*
+            // checkpoints collapse to one copy (the modern `checkpoint_full`
+            // path restores multiplicity losslessly via operator state).
             let snapshot = consolidated.filter_positive().map_err(delta_err)?;
             inner.source_snapshots.insert(name, snapshot);
         }
@@ -2451,6 +2458,140 @@ mod integration_tests {
             (sum_total(&remote) - 385.0).abs() < 1e-9,
             "restored-flow total must match central after one tick"
         );
+    }
+
+    /// #160: `checkpoint_full` → `restore_full` round-trips **join trace
+    /// state** losslessly. The probe: a right-side row with multiplicity 2
+    /// (duplicate customer). After restore, retracting ONE copy must leave the
+    /// joined row alive (net weight 1). Snapshot seeding — the pre-#160
+    /// fallback — replays the materialized snapshot, a set, so the trace would
+    /// hold weight 1 and the same retraction would wrongly kill the row.
+    #[tokio::test]
+    async fn checkpoint_full_restore_full_preserves_join_traces() {
+        use arrow::array::{Int32Array, StringArray};
+
+        let orders_schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int32, false),
+            Field::new("customer_id", DataType::Int32, false),
+        ]));
+        let customers_schema = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let orders = RecordBatch::try_new(
+            orders_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![100])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        // Customer 1 twice: weight 2 in the right trace.
+        let customers = RecordBatch::try_new(
+            customers_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(StringArray::from(vec!["Alice", "Alice"])),
+            ],
+        )
+        .unwrap();
+        let one_customer = RecordBatch::try_new(
+            customers_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["Alice"])),
+            ],
+        )
+        .unwrap();
+        let join_spec = || krishiv_delta::IncrementalViewSpec {
+            name: "order_names".into(),
+            body_sql: "SELECT orders.order_id, orders.customer_id, customers.name \
+                       FROM orders JOIN customers \
+                       ON orders.customer_id = customers.customer_id"
+                .into(),
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("order_id", DataType::Int32, false),
+                Field::new("customer_id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, false),
+            ])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        };
+        let view_rows = |flow: &IncrementalFlow| -> usize {
+            flow.snapshot("order_names")
+                .unwrap()
+                .map(|rb| rb.num_rows())
+                .unwrap_or(0)
+        };
+
+        // Original flow: seed both sides, tick (builds the incremental plan).
+        let flow = IncrementalFlow::new();
+        flow.register_view(join_spec()).unwrap();
+        flow.feed("orders", DeltaBatch::from_inserts(orders).unwrap())
+            .unwrap();
+        flow.feed("customers", DeltaBatch::from_inserts(customers).unwrap())
+            .unwrap();
+        flow.step_datafusion().await.unwrap();
+        // SQL multiset semantics: one order x duplicate customer = 2 rows.
+        assert_eq!(view_rows(&flow), 2, "both joined copies materialize");
+
+        // Checkpoint (now carries the join traces) → restore into a new flow.
+        let state = flow.checkpoint_full().unwrap();
+        let restored = IncrementalFlow::new();
+        restored.register_view(join_spec()).unwrap();
+        restored.restore_full(&state).unwrap();
+
+        // Retract ONE duplicate on both flows.
+        let del = DeltaBatch::from_deletes(one_customer).unwrap();
+        flow.feed("customers", del.clone()).unwrap();
+        restored.feed("customers", del).unwrap();
+        let summary_orig = flow.step_datafusion().await.unwrap();
+        let summary_rest = restored.step_datafusion().await.unwrap();
+        // Both ran the O(Δ) plan, not DiffBased (the restored flow restored
+        // trace state rather than degrading).
+        assert!(
+            !summary_orig.degraded_views.contains(&"order_names".into()),
+            "original must run incrementally"
+        );
+        assert!(
+            !summary_rest.degraded_views.contains(&"order_names".into()),
+            "restored flow must run incrementally from restored traces"
+        );
+
+        assert_eq!(
+            view_rows(&flow),
+            1,
+            "one customer copy remains; one joined row survives (central)"
+        );
+        assert_eq!(
+            view_rows(&restored),
+            1,
+            "restored traces must remember multiplicity 2 — retracting one \
+             copy may not kill the row"
+        );
+
+        // Retract the second copy: now the row must disappear on both.
+        let del2 = DeltaBatch::from_deletes(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("customer_id", DataType::Int32, false),
+                    Field::new("name", DataType::Utf8, false),
+                ])),
+                vec![
+                    Arc::new(Int32Array::from(vec![1])),
+                    Arc::new(StringArray::from(vec!["Alice"])),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        flow.feed("customers", del2.clone()).unwrap();
+        restored.feed("customers", del2).unwrap();
+        flow.step_datafusion().await.unwrap();
+        restored.step_datafusion().await.unwrap();
+        assert_eq!(view_rows(&flow), 0);
+        assert_eq!(view_rows(&restored), 0);
     }
 
     /// The coordinator-authoritative offload protocol (drain → checkpoint_full →

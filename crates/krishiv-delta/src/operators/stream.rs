@@ -125,24 +125,28 @@ pub fn differentiate(
 /// Apply `delta` on top of `current` snapshot, returning the updated snapshot.
 ///
 /// Positive-weight rows in `delta` are insertions; negative-weight rows are
-/// retractions. The result contains only rows with net positive weight.
+/// retractions. The result is the **multiset** with net positive weights — a
+/// row with net weight k appears k times, matching what the equivalent SQL
+/// over the relation returns (#160).
 ///
-/// For insert-only deltas (all weights ≥ 0), uses a fast path that concatenates
+/// For unit-weight insert-only deltas, uses a fast path that concatenates
 /// batches via `arrow::compute::concat_batches` instead of the full consolidate-
 /// based merge, making source snapshot maintenance truly O(delta) for
 /// append-only workloads.
 pub fn apply_delta(current: Option<RecordBatch>, delta: &DeltaBatch) -> DeltaResult<RecordBatch> {
     match current {
-        None => delta.filter_positive(),
+        None => delta.filter_positive_expanded(),
         Some(prev) => {
             if prev.num_rows() == 0 {
-                return delta.filter_positive();
+                return delta.filter_positive_expanded();
             }
-            // Fast path: insert-only delta (no retractions). Simply append the
-            // new rows to the accumulated snapshot without the full O(n) stringify-
-            // consolidate roundtrip. This is the common case for append-only
-            // sources and the IVM benchmark.
-            if delta.is_insert_only() {
+            // Fast path: every weight exactly +1. Simply append the new rows
+            // to the accumulated snapshot without the full O(n) stringify-
+            // consolidate roundtrip — the common case for append-only sources.
+            // (#160: the previous `is_insert_only` condition also admitted
+            // weight-0 rows — wrongly kept — and weight>1 rows, whose extra
+            // copies were silently dropped.)
+            if delta.weights().iter().all(|w| w == Some(1)) {
                 let new_rows = delta.data_batch();
                 let combined = arrow::compute::concat_batches(&prev.schema(), &[prev, new_rows])
                     .map_err(|e| {
@@ -150,11 +154,14 @@ pub fn apply_delta(current: Option<RecordBatch>, delta: &DeltaBatch) -> DeltaRes
                     })?;
                 return Ok(combined);
             }
-            // Now handle full case (has retractions — e.g., CDC sources).
+            // Full case (retractions and/or non-unit weights). Multiset
+            // materialization: previously this path collapsed duplicate rows
+            // to one (while the fast path above kept them — inconsistent), so
+            // a single retraction deleted every copy.
             let prev_db = DeltaBatch::from_inserts(prev)?;
             let merged = DeltaBatch::concat(&[prev_db, delta.clone()])?;
             let consolidated = consolidate_batch(merged, &[], delta.data_schema())?;
-            consolidated.filter_positive()
+            consolidated.filter_positive_expanded()
         }
     }
 }

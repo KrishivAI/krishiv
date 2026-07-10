@@ -619,6 +619,114 @@ impl IncrementalJoinOp {
 
         Ok(results)
     }
+
+    // ── Checkpoint serialization ─────────────────────────────────────────────
+
+    /// Serialize the operator's accumulated state losslessly: both traces (as
+    /// weighted Z-sets) plus the LEFT OUTER `right_key_group_weights` map.
+    ///
+    /// Format: `u8 version (1) || u64 len || left trace || u64 len || right
+    /// trace || u32 n_groups || (u32 n_parts || (u8 present || u32 len ||
+    /// utf8)* || i64 weight)*`. Structural shape (schemas, key columns, join
+    /// type) is rebuilt from the view SQL, so only the running state transfers
+    /// — same contract as the aggregate/distinct operators.
+    pub fn state_bytes(&self) -> DeltaResult<Vec<u8>> {
+        let mut out = Vec::new();
+        out.push(1u8);
+        for trace in [&self.left_trace, &self.right_trace] {
+            let bytes = trace.state_bytes()?;
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        let n_groups = u32::try_from(self.right_key_group_weights.len())
+            .map_err(|_| DeltaError::Serialization("join group count overflows u32".into()))?;
+        out.extend_from_slice(&n_groups.to_le_bytes());
+        for (key, weight) in &self.right_key_group_weights {
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            for part in key {
+                match part {
+                    Some(s) => {
+                        out.push(1u8);
+                        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        out.extend_from_slice(s.as_bytes());
+                    }
+                    None => out.push(0u8),
+                }
+            }
+            out.extend_from_slice(&weight.to_le_bytes());
+        }
+        Ok(out)
+    }
+
+    /// Restore state produced by [`state_bytes`](Self::state_bytes) into an
+    /// operator rebuilt with the same structural shape. Row multiplicities in
+    /// the traces are preserved exactly (seeding from a materialized snapshot
+    /// cannot do this — a snapshot is a set).
+    pub fn restore_state_bytes(&mut self, bytes: &[u8]) -> DeltaResult<()> {
+        let truncated = || DeltaError::Serialization("join state truncated".into());
+        let mut pos = 0usize;
+        let version = *bytes.first().ok_or_else(truncated)?;
+        if version != 1 {
+            return Err(DeltaError::Serialization(format!(
+                "unsupported join state version {version}"
+            )));
+        }
+        pos += 1;
+        let read_section = |pos: &mut usize| -> DeltaResult<&[u8]> {
+            let raw = bytes.get(*pos..*pos + 8).ok_or_else(truncated)?;
+            *pos += 8;
+            let len = u64::from_le_bytes(raw.try_into().map_err(|_| truncated())?) as usize;
+            let section = bytes.get(*pos..*pos + len).ok_or_else(truncated)?;
+            *pos += len;
+            Ok(section)
+        };
+        let left_section = read_section(&mut pos)?;
+        let right_section = read_section(&mut pos)?;
+
+        let read_u32 = |bytes: &[u8], pos: &mut usize| -> DeltaResult<u32> {
+            let raw = bytes.get(*pos..*pos + 4).ok_or_else(truncated)?;
+            *pos += 4;
+            Ok(u32::from_le_bytes(raw.try_into().map_err(|_| truncated())?))
+        };
+        let n_groups = read_u32(bytes, &mut pos)? as usize;
+        let mut groups: AHashMap<Vec<Option<String>>, i64> = AHashMap::with_capacity(n_groups);
+        for _ in 0..n_groups {
+            let n_parts = read_u32(bytes, &mut pos)? as usize;
+            let mut key: Vec<Option<String>> = Vec::with_capacity(n_parts);
+            for _ in 0..n_parts {
+                let present = *bytes.get(pos).ok_or_else(truncated)?;
+                pos += 1;
+                if present == 1 {
+                    let len = read_u32(bytes, &mut pos)? as usize;
+                    let raw = bytes.get(pos..pos + len).ok_or_else(truncated)?;
+                    pos += len;
+                    key.push(Some(
+                        std::str::from_utf8(raw)
+                            .map_err(|e| DeltaError::Serialization(e.to_string()))?
+                            .to_string(),
+                    ));
+                } else {
+                    key.push(None);
+                }
+            }
+            let raw = bytes.get(pos..pos + 8).ok_or_else(truncated)?;
+            pos += 8;
+            groups.insert(
+                key,
+                i64::from_le_bytes(raw.try_into().map_err(|_| truncated())?),
+            );
+        }
+
+        // Decode everything before mutating anything: a corrupt right section
+        // must not leave a half-restored operator for the seeding fallback to
+        // pile deltas onto.
+        let left_batches = crate::trace::Trace::decode_state(left_section)?;
+        let right_batches = crate::trace::Trace::decode_state(right_section)?;
+        self.left_trace.replace_batches(left_batches);
+        self.right_trace.replace_batches(right_batches);
+        self.right_key_group_weights = groups;
+        Ok(())
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1105,5 +1213,111 @@ mod tests {
             .filter(|&i| out.weights().value(i) > 0)
             .collect();
         assert_eq!(pos.len(), 1);
+    }
+
+    /// #160: checkpoint/restore round-trips the traces losslessly — a restored
+    /// operator behaves identically to the original on the next delta,
+    /// including duplicate-row multiplicity that snapshot seeding (a set)
+    /// cannot reconstruct.
+    #[test]
+    fn inner_join_state_round_trip_preserves_multiplicity() {
+        let build = || {
+            IncrementalJoinOp::new(
+                orders_schema(),
+                customers_schema(),
+                vec!["customer_id".into()],
+                vec!["customer_id".into()],
+                IncrJoinType::Inner,
+            )
+            .unwrap()
+        };
+        let mut original = build();
+        // Customer 1 twice (weight 2 in the right trace) + one order.
+        let c = DeltaBatch::from_inserts(customers_batch(&[1, 1], &["Alice", "Alice"])).unwrap();
+        original.apply(None, Some(c)).unwrap();
+        let o = DeltaBatch::from_inserts(orders_batch(&[100], &[1])).unwrap();
+        original.apply(Some(o), None).unwrap();
+
+        let state = original.state_bytes().unwrap();
+        let mut restored = build();
+        restored.restore_state_bytes(&state).unwrap();
+
+        // Retract ONE duplicate customer on both ops: the output must retract
+        // the join pair exactly once (net weight −1), which requires the trace
+        // to still know the row had weight 2.
+        let del = DeltaBatch::from_deletes(customers_batch(&[1], &["Alice"])).unwrap();
+        let out_orig = original.apply(None, Some(del.clone())).unwrap();
+        let out_rest = restored.apply(None, Some(del)).unwrap();
+        let net = |d: &DeltaBatch| -> i64 { d.weights().iter().flatten().sum() };
+        assert_eq!(net(&out_orig), -1, "original retracts one pair");
+        assert_eq!(
+            net(&out_rest),
+            net(&out_orig),
+            "restored operator must match the original exactly"
+        );
+        // And the next probe still finds the surviving duplicate.
+        let o2 = DeltaBatch::from_inserts(orders_batch(&[101], &[1])).unwrap();
+        let out2 = restored.apply(Some(o2), None).unwrap();
+        assert_eq!(net(&out2), 1, "one customer copy remains in the trace");
+    }
+
+    /// #160: LEFT OUTER state includes `right_key_group_weights` — after a
+    /// restore, emptying a right key group must emit null-padded rows exactly
+    /// as the original operator would.
+    #[test]
+    fn left_outer_state_round_trip_preserves_group_weights() {
+        let mut original = left_outer_op();
+        let c = DeltaBatch::from_inserts(customers_batch(&[1], &["Alice"])).unwrap();
+        original.apply(None, Some(c)).unwrap();
+        let o = DeltaBatch::from_inserts(orders_batch(&[100], &[1])).unwrap();
+        original.apply(Some(o), None).unwrap();
+
+        let state = original.state_bytes().unwrap();
+        let mut restored = left_outer_op();
+        restored.restore_state_bytes(&state).unwrap();
+
+        // Deleting the only customer must retract the join pair AND emit the
+        // null-padded left row (positive→0 crossing) — this depends on the
+        // restored group-weight map, not just the traces.
+        let del = DeltaBatch::from_deletes(customers_batch(&[1], &["Alice"])).unwrap();
+        let out = restored.apply(None, Some(del)).unwrap();
+        let data = out.data_batch();
+        let name_col = data.column_by_name("name").expect("name column");
+        let mut retracted_pair = false;
+        let mut emitted_null = false;
+        for i in 0..data.num_rows() {
+            let w = out.weights().value(i);
+            if name_col.is_null(i) && w > 0 {
+                emitted_null = true;
+            }
+            if !name_col.is_null(i) && w < 0 {
+                retracted_pair = true;
+            }
+        }
+        assert!(retracted_pair, "restored op must retract the joined row");
+        assert!(
+            emitted_null,
+            "restored op must emit the null-padded row on the positive→0 crossing"
+        );
+    }
+
+    /// A truncated payload must fail cleanly without mutating the operator.
+    #[test]
+    fn join_state_restore_rejects_truncated_payload() {
+        let mut op = left_outer_op();
+        let c = DeltaBatch::from_inserts(customers_batch(&[1], &["Alice"])).unwrap();
+        op.apply(None, Some(c)).unwrap();
+        let mut state = op.state_bytes().unwrap();
+        state.truncate(state.len() - 3);
+        let mut fresh = left_outer_op();
+        assert!(fresh.restore_state_bytes(&state).is_err());
+        // The failed restore left the fresh op untouched: an order for
+        // customer 1 finds no match and emits a null-padded row.
+        let o = DeltaBatch::from_inserts(orders_batch(&[100], &[1])).unwrap();
+        let out = fresh.apply(Some(o), None).unwrap();
+        let data = out.data_batch();
+        let name_col = data.column_by_name("name").expect("name column");
+        assert_eq!(data.num_rows(), 1);
+        assert!(name_col.is_null(0), "fresh op state must be empty");
     }
 }

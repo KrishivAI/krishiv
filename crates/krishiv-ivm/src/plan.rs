@@ -8,12 +8,16 @@
 //!
 //! # Supported patterns (O(Δ))
 //! - Single-source GROUP BY aggregate → `IncrementalAggOp`
-//! - Two-source INNER JOIN → `IncrementalJoinOp` (bilinear probe)
+//! - Two-source INNER / LEFT OUTER equi-JOIN → `IncrementalJoinOp` (bilinear
+//!   probe), including a `WHERE` above the join whose conjuncts each touch
+//!   only one side (pushed onto that side's delta; right-side pushdown is
+//!   inner-join only — under LEFT OUTER it would change null-padding)
 //! - Single-source DISTINCT → `IncrementalDistinctOp`
 //!
 //! # DiffBased fallback
-//! Subqueries, multi-way joins, window functions, OUTER joins, and other
-//! complex patterns fall through to full SQL re-execution + diff.
+//! Subqueries, multi-way joins, window functions, non-equi or cross-side
+//! join predicates, RIGHT/FULL OUTER joins, and other complex patterns fall
+//! through to full SQL re-execution + diff.
 
 use std::sync::Arc;
 
@@ -138,20 +142,35 @@ impl ViewPlan {
     }
 
     /// Serialize the operator's internal accumulator state, or `None` when the
-    /// operator has no losslessly-serializable state (`Join`, whose traces carry
-    /// Arrow data, and `DiffBased`, which is stateless). A caller that gets
-    /// `None` falls back to [`seed_from_snapshots`](Self::seed_from_snapshots).
+    /// operator has none (`DiffBased` is stateless). A caller that gets `None`
+    /// falls back to [`seed_from_snapshots`](Self::seed_from_snapshots).
     ///
     /// This is what makes an incremental view survive a coordinator restart
     /// *losslessly*, including sources with genuinely duplicate rows: the
     /// materialized source snapshot is a set (multiplicity dropped by
     /// `filter_positive`), so the accumulator cannot be rebuilt from it — only
-    /// the operator itself holds the ground truth (G6/F4).
+    /// the operator itself holds the ground truth (G6/F4). Join traces
+    /// serialize their Z-sets via Arrow IPC (#160), which also spares the
+    /// distributed `delta:step:` path from rebuilding join hash state from
+    /// full source snapshots on every offloaded tick.
     pub fn checkpoint_state(&self) -> Option<Vec<u8>> {
         match self {
             ViewPlan::Aggregate { op, .. } => Some(op.state_bytes()),
             ViewPlan::Distinct { op, .. } => Some(op.state_bytes()),
-            ViewPlan::Join { .. } | ViewPlan::DiffBased => None,
+            // Trace serialization is fallible (IPC); on failure fall back to
+            // snapshot seeding rather than failing the whole checkpoint.
+            ViewPlan::Join { op, .. } => match op.state_bytes() {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "join trace checkpoint failed; restore will re-seed \
+                         from source snapshots (multiplicity-lossy)"
+                    );
+                    None
+                }
+            },
+            ViewPlan::DiffBased => None,
         }
     }
 
@@ -168,20 +187,28 @@ impl ViewPlan {
                 op.restore_state_bytes(bytes)?;
                 Ok(true)
             }
-            ViewPlan::Join { .. } | ViewPlan::DiffBased => Ok(false),
+            ViewPlan::Join { op, .. } => {
+                op.restore_state_bytes(bytes)?;
+                Ok(true)
+            }
+            ViewPlan::DiffBased => Ok(false),
         }
     }
 
     /// Seed a freshly built incremental operator's internal state from the
     /// current full snapshot(s) of its source(s).
     ///
-    /// A checkpoint restore rebuilds the flow's operators **empty** — the
-    /// per-group accumulator / join traces / distinct multiplicities live only
-    /// in the operator and are not serialized by `checkpoint_full`. Without
-    /// seeding, the first delta after a restore is applied against empty state,
-    /// so the operator emits an *insertion* for a group that already exists in
-    /// the restored view snapshot (no matching retraction), corrupting the
-    /// materialized output on the next restore cycle (G6/F4 recreate path).
+    /// This is the **fallback** path: `checkpoint_full` serializes operator
+    /// state (aggregates/distinct accumulators and, since #160, join traces),
+    /// and restore prefers those bytes. Seeding covers checkpoints written
+    /// before join-state serialization existed, a failed state decode, and the
+    /// normal first-build case. Without either, the first delta after a
+    /// restore is applied against empty state, so the operator emits an
+    /// *insertion* for a group that already exists in the restored view
+    /// snapshot (no matching retraction), corrupting the materialized output
+    /// on the next restore cycle (G6/F4 recreate path). Note seeding replays
+    /// the *materialized* snapshot — a set — so duplicate-row multiplicity is
+    /// not recoverable on this path; the checkpointed bytes are.
     ///
     /// `lookup(source)` returns the restored full snapshot of a base source or
     /// upstream view (pre-tick, i.e. before this tick's delta). Replaying it as
@@ -289,12 +316,25 @@ impl ViewPlan {
 ///
 /// `available_schemas` maps each known source / upstream view name to its data
 /// schema (no `_weight` column). This is needed to construct operators.
+///
+/// Planning runs against an **ephemeral schema-only context**: the plan is
+/// determined by the SQL's structure, never by which sources happen to hold
+/// rows this tick. Planning against the tick's data context made an
+/// empty/emptied source fail `ctx.sql` and pin the view to DiffBased — fatal
+/// after a checkpoint restore, which rebuilds plans lazily (#160).
 pub async fn build_view_plan(
-    ctx: &SessionContext,
     body_sql: &str,
     output_schema: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
 ) -> ViewPlan {
+    use datafusion::datasource::MemTable;
+    let ctx = SessionContext::new();
+    for (name, schema) in available_schemas {
+        let empty = RecordBatch::new_empty(schema.clone());
+        if let Ok(table) = MemTable::try_new(schema.clone(), vec![vec![empty]]) {
+            let _ = ctx.register_table(name.as_str(), Arc::new(table));
+        }
+    }
     let df = match ctx.sql(body_sql).await {
         Ok(d) => d,
         Err(_) => return ViewPlan::DiffBased,
@@ -391,8 +431,22 @@ fn try_build_from_logical(
         LogicalPlan::Join(join) => {
             // Only 2-source joins (source_of_plan returns None for multi-way joins
             // where one side is itself a Join node with 2 inputs).
-            build_join_plan(join, available_schemas)
+            build_join_plan(join, None, available_schemas)
         }
+        // #160: `WHERE` above a join (`SELECT … FROM a JOIN b ON … WHERE …`)
+        // plans as `Filter → Join`. Filter is linear, so conjuncts that touch
+        // only one side push onto that side's delta filter; anything
+        // cross-side (or right-side under LEFT OUTER, where pushdown changes
+        // null-padding semantics) bails to DiffBased inside the builder.
+        // Non-join inputs keep the previous behavior (single-source WHERE
+        // shapes are resolved inside the aggregate/distinct builders; a bare
+        // filtered scan stays DiffBased).
+        LogicalPlan::Filter(f) => match f.input.as_ref() {
+            LogicalPlan::Join(join) => {
+                build_join_plan(join, Some(&f.predicate), available_schemas)
+            }
+            _ => None,
+        },
         // DISTINCT — the inner plan is the first (and only) input.
         LogicalPlan::Distinct(_) => {
             let inputs = plan.inputs();
@@ -473,6 +527,7 @@ fn build_agg_plan(
 
 fn build_join_plan(
     join: &Join,
+    outer_filter: Option<&Expr>,
     available_schemas: &AHashMap<String, SchemaRef>,
 ) -> Option<ViewPlan> {
     let incr_join_type = match join.join_type {
@@ -493,11 +548,10 @@ fn build_join_plan(
     // AUD-1: resolve each side's source plus any WHERE predicate on that side
     // (e.g. a filtered subquery join input). A predicate that fails to compile
     // bails the whole join to DiffBased rather than dropping the filter.
-    let (left_source, left_filter, right_source, right_filter) = {
-        let (ls, lf) = resolve_side_with_filter(&join.left, available_schemas)?;
-        let (rs, rf) = resolve_side_with_filter(&join.right, available_schemas)?;
-        (ls, lf, rs, rf)
-    };
+    let (left_source, left_side_preds) = resolve_source_with_filters(&join.left)
+        .or_else(|| source_of_plan(&join.left).map(|s| (s, Vec::new())))?;
+    let (right_source, right_side_preds) = resolve_source_with_filters(&join.right)
+        .or_else(|| source_of_plan(&join.right).map(|s| (s, Vec::new())))?;
     let left_schema = available_schemas.get(&left_source)?;
     let right_schema = available_schemas.get(&right_source)?;
 
@@ -509,9 +563,86 @@ fn build_join_plan(
         right_key_cols.push(expr_col_name(right_expr)?);
     }
 
+    // #160: the SQL planner leaves the ON condition in `join.filter` (the
+    // optimizer pass that lifts equi-pairs into `join.on` never runs on the
+    // unoptimized plan inspected here) — so before this, every SQL-registered
+    // join silently degraded to DiffBased. Accept a conjunction of plain
+    // column equalities, classifying each side by the join input schemas; any
+    // other shape (non-equi residual, expressions over keys) bails.
+    if let Some(filter) = &join.filter {
+        for conjunct in datafusion::logical_expr::utils::split_conjunction(filter) {
+            let Expr::BinaryExpr(be) = strip_alias(conjunct) else {
+                return None;
+            };
+            if be.op != datafusion::logical_expr::Operator::Eq {
+                return None;
+            }
+            let (Expr::Column(a), Expr::Column(b)) =
+                (strip_alias(&be.left), strip_alias(&be.right))
+            else {
+                return None;
+            };
+            let a_left = join.left.schema().index_of_column(a).is_ok();
+            let b_left = join.left.schema().index_of_column(b).is_ok();
+            match (a_left, b_left) {
+                (true, false) => {
+                    left_key_cols.push(a.name.clone());
+                    right_key_cols.push(b.name.clone());
+                }
+                (false, true) => {
+                    left_key_cols.push(b.name.clone());
+                    right_key_cols.push(a.name.clone());
+                }
+                // Same-side equality or unresolvable column: not an equi-join
+                // pair this operator can key on.
+                _ => return None,
+            }
+        }
+    }
+
     if left_key_cols.is_empty() {
         return None;
     }
+
+    // #160: decompose a `WHERE` above the join by side. Filter is linear, so
+    // a conjunct over one side's columns filters that side's delta before the
+    // probe. Cross-side conjuncts cannot be pushed; under LEFT OUTER a
+    // right-side conjunct would change null-padding semantics (it makes the
+    // join effectively inner) — both bail to DiffBased.
+    let mut left_preds = left_side_preds;
+    let mut right_preds = right_side_preds;
+    if let Some(filter) = outer_filter {
+        for conjunct in datafusion::logical_expr::utils::split_conjunction(filter) {
+            let cols = conjunct.column_refs();
+            if cols.is_empty() {
+                return None;
+            }
+            let all_left = cols
+                .iter()
+                .all(|c| join.left.schema().index_of_column(c).is_ok());
+            let all_right = cols
+                .iter()
+                .all(|c| join.right.schema().index_of_column(c).is_ok());
+            if all_left {
+                left_preds.push((*conjunct).clone());
+            } else if all_right && incr_join_type == IncrJoinType::Inner {
+                right_preds.push((*conjunct).clone());
+            } else {
+                return None;
+            }
+        }
+    }
+    // Outer-filter columns are qualified by the join-side relation (a table
+    // alias, e.g. `t.dist`), which the source-schema compile below cannot
+    // resolve — strip qualifiers so they bind by bare name.
+    let left_filter =
+        compile_source_filter(&unqualify_columns(&left_preds)?, &left_source, left_schema).ok()?;
+    let right_filter = compile_source_filter(
+        &unqualify_columns(&right_preds)?,
+        &right_source,
+        right_schema,
+    )
+    .ok()?;
 
     let op = IncrementalJoinOp::new(
         left_schema.clone(),
@@ -531,22 +662,36 @@ fn build_join_plan(
     })
 }
 
-/// Resolve one join side to `(source, optional filter)`, mirroring the
-/// aggregate resolution: strict `Filter`/`SubqueryAlias`/`Scan` chains keep the
-/// predicate O(Δ); otherwise fall back to `source_of_plan` (which refuses to
-/// peel `Filter`, so a filtered side that isn't a clean chain → DiffBased).
-fn resolve_side_with_filter(
-    plan: &LogicalPlan,
-    available_schemas: &AHashMap<String, SchemaRef>,
-) -> Option<(String, Option<SourceFilter>)> {
-    match resolve_source_with_filters(plan) {
-        Some((source, preds)) => {
-            let schema = available_schemas.get(&source)?;
-            let filter = compile_source_filter(&preds, &source, schema).ok()?;
-            Some((source, filter))
-        }
-        None => Some((source_of_plan(plan)?, None)),
+/// Peel `Alias` wrappers off an expression (planners wrap freely).
+fn strip_alias(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Alias(alias) => strip_alias(&alias.expr),
+        other => other,
     }
+}
+
+/// Rewrite every column reference to its bare (unqualified) name so a
+/// predicate lifted from above the join compiles against the source's data
+/// schema regardless of the SQL-side table alias.
+fn unqualify_columns(preds: &[Expr]) -> Option<Vec<Expr>> {
+    use datafusion::common::Column;
+    use datafusion::common::tree_node::{Transformed, TreeNode as _};
+    preds
+        .iter()
+        .map(|p| {
+            p.clone()
+                .transform(|e| {
+                    Ok(match e {
+                        Expr::Column(c) => {
+                            Transformed::yes(Expr::Column(Column::new_unqualified(c.name)))
+                        }
+                        other => Transformed::no(other),
+                    })
+                })
+                .map(|t| t.data)
+                .ok()
+        })
+        .collect()
 }
 
 // ── Source resolution ─────────────────────────────────────────────────────────
@@ -688,5 +833,145 @@ fn expr_to_aggregation(expr: &Expr, output_col: &str) -> Option<Aggregation> {
             }
         }
         _ => None,
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+
+    fn join_ctx_and_schemas() -> (SessionContext, AHashMap<String, SchemaRef>, SchemaRef) {
+        let orders_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int32, false),
+            Field::new("customer_id", DataType::Int32, false),
+        ]));
+        let customers_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let orders = RecordBatch::try_new(
+            orders_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![100])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let customers = RecordBatch::try_new(
+            customers_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["Alice"])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "orders",
+            Arc::new(MemTable::try_new(orders_schema.clone(), vec![vec![orders]]).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "customers",
+            Arc::new(MemTable::try_new(customers_schema.clone(), vec![vec![customers]]).unwrap()),
+        )
+        .unwrap();
+        let mut schemas = AHashMap::new();
+        schemas.insert("orders".to_string(), orders_schema);
+        schemas.insert("customers".to_string(), customers_schema);
+        let out_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int32, false),
+            Field::new("customer_id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        (ctx, schemas, out_schema)
+    }
+
+    async fn plan_for(sql: &str) -> ViewPlan {
+        let (_ctx, schemas, out_schema) = join_ctx_and_schemas();
+        build_view_plan(sql, &out_schema, &schemas).await
+    }
+
+    /// #160 regression pin: the SQL planner leaves the ON condition in
+    /// `join.filter`, so this shape must still lower to the incremental
+    /// operator. Before the fix every SQL join view silently ran DiffBased.
+    #[tokio::test]
+    async fn sql_inner_join_lowers_to_incremental() {
+        let plan = plan_for(
+            "SELECT orders.order_id, orders.customer_id, customers.name \
+             FROM orders JOIN customers ON orders.customer_id = customers.customer_id",
+        )
+        .await;
+        assert_eq!(plan.kind(), ViewPlanKind::Incremental);
+        let ViewPlan::Join {
+            left_source,
+            right_source,
+            left_filter,
+            right_filter,
+            ..
+        } = plan
+        else {
+            panic!("expected a join plan");
+        };
+        assert_eq!((left_source.as_str(), right_source.as_str()), ("orders", "customers"));
+        assert!(left_filter.is_none() && right_filter.is_none());
+    }
+
+    /// A WHERE above the join whose conjuncts each touch one side pushes onto
+    /// that side's delta filter (O(Δ) preserved).
+    #[tokio::test]
+    async fn where_above_join_pushes_per_side_filters() {
+        let plan = plan_for(
+            "SELECT orders.order_id, orders.customer_id, customers.name \
+             FROM orders JOIN customers ON orders.customer_id = customers.customer_id \
+             WHERE orders.order_id > 10 AND customers.name = 'Alice'",
+        )
+        .await;
+        let ViewPlan::Join {
+            left_filter,
+            right_filter,
+            ..
+        } = plan
+        else {
+            panic!("expected a join plan, got DiffBased");
+        };
+        assert!(left_filter.is_some(), "left-side WHERE conjunct pushed");
+        assert!(right_filter.is_some(), "right-side WHERE conjunct pushed");
+    }
+
+    /// Right-side WHERE above a LEFT OUTER join changes null-padding
+    /// semantics — must degrade, never push.
+    #[tokio::test]
+    async fn left_outer_with_right_side_where_degrades() {
+        let plan = plan_for(
+            "SELECT orders.order_id, orders.customer_id, customers.name \
+             FROM orders LEFT JOIN customers ON orders.customer_id = customers.customer_id \
+             WHERE customers.name = 'Alice'",
+        )
+        .await;
+        assert_eq!(plan.kind(), ViewPlanKind::DiffBased);
+    }
+
+    /// Non-equi and cross-side predicates cannot be keyed — degrade.
+    #[tokio::test]
+    async fn non_equi_and_cross_side_predicates_degrade() {
+        let non_equi = plan_for(
+            "SELECT orders.order_id, orders.customer_id, customers.name \
+             FROM orders JOIN customers ON orders.customer_id < customers.customer_id",
+        )
+        .await;
+        assert_eq!(non_equi.kind(), ViewPlanKind::DiffBased);
+        let cross_side = plan_for(
+            "SELECT orders.order_id, orders.customer_id, customers.name \
+             FROM orders JOIN customers ON orders.customer_id = customers.customer_id \
+             WHERE orders.order_id > customers.customer_id",
+        )
+        .await;
+        assert_eq!(cross_side.kind(), ViewPlanKind::DiffBased);
     }
 }

@@ -1,5 +1,58 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 (later) — #160 incremental join state: SQL joins were NEVER O(Δ); traces now checkpoint losslessly; multiset snapshots
+
+Session 70fb3928 (took ownership of the engine leg; the June-21 agent
+worktree branches under `.claude/worktrees/` are 3 weeks stale and were NOT
+merged). Three related defects found and fixed while implementing #160:
+
+1. **SQL-registered join views never ran incrementally.** DataFusion's SQL
+   planner leaves `ON a.k = b.k` in `join.filter` (empty `join.on`); the
+   optimizer pass that lifts equi-pairs never runs on the unoptimized plan
+   `build_view_plan` inspects. The matcher required non-empty `join.on` →
+   every join view fell to DiffBased O(state) recompute+diff, silently
+   (ViewPlan::Join was unreachable from SQL). Now: equi-pairs extracted
+   from `join.filter` conjuncts (classified per side via the join input
+   schemas; non-equi/same-side → DiffBased), and `Filter → Join`
+   (WHERE-above-join, the clean_trips shape) decomposes conjuncts by side
+   onto the existing SourceFilter delta filters (right-side pushdown
+   inner-only; LEFT OUTER right/mixed conjuncts bail — null-padding
+   semantics). Regression pins in `plan.rs` tests.
+2. **Join traces are now losslessly serializable** (`Trace::state_bytes` /
+   `decode_state`/`replace_batches` — flattened levelled Z-set as Arrow
+   IPC; `IncrementalJoinOp::state_bytes` = version byte + both traces +
+   LEFT-OUTER key-group weights, decode-all-before-mutate).
+   `ViewPlan::Join` joins the checkpoint plan-state section, so
+   coordinator restarts AND the distributed `delta:step:` executor path
+   restore traces instead of re-seeding from full source snapshots
+   (O(|A|+|B|) rebuild per offloaded tick — the "snapshot diff" #160
+   names). Seeding remains the fallback for pre-#160 checkpoints.
+3. **Multiset materialization** (found by the round-trip test): a source
+   fed 2 duplicate rows materialized as 2 rows on the insert-only fast
+   path but collapsed to 1 on any retraction tick (consolidate +
+   `filter_positive` drops weights) — one retraction then deleted every
+   copy, and view outputs under-counted duplicates vs real SQL. New
+   `DeltaBatch::filter_positive_expanded` (weight k → k rows) used by
+   `apply_delta`, view publication, `Trace::snapshot`, legacy `restore`;
+   the insert-only fast path now requires unit weights (also excluded
+   weight-0 rows it wrongly kept). `restore_delta` deliberately keeps set
+   collapse — stacked-restore idempotency (G2) depends on it; documented.
+   Also: plan building now uses an ephemeral schema-only SessionContext —
+   an empty/emptied source no longer fails `ctx.sql` and pins a restored
+   view to a permanently-failing DiffBased.
+
+Validation: krishiv-delta 114 tests (4 new: trace round-trip incl. weights,
+inner-join multiplicity round-trip, LEFT-OUTER group-weight round-trip,
+truncated-payload rejection), krishiv-ivm 53+5 (new flow-level
+checkpoint_full→restore_full join-trace test proving the restored flow runs
+incrementally and multiplicity survives one-of-two retraction; 4 plan-shape
+pins), krishiv-executor + krishiv-runtime green, clippy (lib, engine
+convention) clean. Remaining #160 follow-ups (scoped honestly, not done):
+join→aggregate composition still DiffBased; trace GC needs a lateness
+column the SQL plan builder never sets (joins GC only via explicit
+LatenessSpec); trace memory is unbounded for unwatermarked sources
+(spill exists for results, not traces).
+
 ## 2026-07-10 — durable CTAS: Iceberg landing for CREATE [OR REPLACE] TABLE … AS SELECT (G17)
 
 The prod clean_trips batch refresh (10.2M-row join, ~14 GB result) failed

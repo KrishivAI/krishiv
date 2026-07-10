@@ -8,6 +8,36 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- **IVM joins actually run incrementally from SQL** (#160, 2026-07-10).
+  The plan matcher read equi-join keys only from the logical plan's
+  `join.on` — but the SQL planner leaves the ON condition in
+  `join.filter` (the optimizer pass that lifts it never runs on the
+  unoptimized plan the matcher inspects), so **every SQL-registered
+  join view silently degraded to O(state) DiffBased** full recompute +
+  diff. Equi-pairs are now extracted from `join.filter`, and a `WHERE`
+  above the join (the `clean_trips` shape) decomposes by side onto the
+  delta filters (right-side pushdown inner-join only — under LEFT
+  OUTER it would change null-padding). Plan building also moved to an
+  ephemeral schema-only context, so an empty/emptied source can no
+  longer fail `ctx.sql` and pin a view to DiffBased after a restore.
+- **Join trace state is checkpointed losslessly** (#160, 2026-07-10).
+  `ViewPlan::Join` had no serializable state, so every
+  `checkpoint_full` restore — coordinator restarts *and* each
+  distributed `delta:step:` executor tick — re-seeded join hash traces
+  from full source snapshots: O(|A|+|B|) rebuild per restore, and the
+  materialized snapshot is a *set*, so duplicate-row multiplicity was
+  reconstructed wrong (one retraction then deleted every copy).
+  Traces (levelled Z-sets) and the LEFT-OUTER key-group weights now
+  serialize via Arrow IPC into the existing plan-state section.
+- **Snapshot materialization uses multiset semantics** (#160,
+  2026-07-10). `apply_delta`/view publication collapsed a net weight-k
+  row to one physical row on any retraction tick (while the insert-only
+  fast path kept physical copies — inconsistent), silently
+  under-counting duplicate rows vs what the equivalent SQL returns.
+  `filter_positive_expanded` materializes weight k as k rows; the
+  insert-only fast path now requires unit weights (it also wrongly
+  admitted weight-0 rows). Legacy `restore_delta` keeps set collapse
+  deliberately — stacked-restore idempotency depends on it (G2).
 - **Keyed partitioner accepts `Utf8View`/`LargeUtf8` string keys**
   (2026-07-10). `partition_record_batches_by_key` rejected any key
   column outside `Int32/Int64/Float64/Utf8/Boolean`, but DataFusion

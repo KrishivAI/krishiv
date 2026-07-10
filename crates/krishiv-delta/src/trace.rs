@@ -296,6 +296,74 @@ impl Trace {
         Ok(removed)
     }
 
+    // ── Checkpoint serialization ─────────────────────────────────────────────
+
+    /// Serialize the Trace's accumulated Z-set losslessly.
+    ///
+    /// Format: `u32 n_batches || (u64 len || serialized DeltaBatch)*` over all
+    /// levels, flattened — the level layout is an internal merge optimization,
+    /// not state; the union of batches (with weights) is the state. Structural
+    /// configuration (schema, key columns, lateness) is *not* serialized: the
+    /// caller restores into a Trace rebuilt with the same constructor arguments.
+    pub fn state_bytes(&self) -> DeltaResult<Vec<u8>> {
+        let batches: Vec<&DeltaBatch> = self.levels.iter().flatten().collect();
+        let mut out = Vec::new();
+        let n = u32::try_from(batches.len())
+            .map_err(|_| DeltaError::Serialization("trace batch count overflows u32".into()))?;
+        out.extend_from_slice(&n.to_le_bytes());
+        for batch in batches {
+            let bytes = crate::delta_batch::serialize_delta_batch(batch)?;
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
+    }
+
+    /// Decode a [`state_bytes`](Self::state_bytes) payload into its batches
+    /// without touching any Trace. Split from [`restore_state_bytes`] so a
+    /// caller restoring *several* traces (the join operator) can decode
+    /// everything first and mutate only when the whole checkpoint is valid.
+    pub fn decode_state(bytes: &[u8]) -> DeltaResult<Vec<DeltaBatch>> {
+        let truncated = || DeltaError::Serialization("trace state truncated".into());
+        let mut pos = 0usize;
+        let n = {
+            let raw = bytes.get(pos..pos + 4).ok_or_else(truncated)?;
+            pos += 4;
+            u32::from_le_bytes(raw.try_into().map_err(|_| truncated())?) as usize
+        };
+        let mut restored: Vec<DeltaBatch> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let raw = bytes.get(pos..pos + 8).ok_or_else(truncated)?;
+            pos += 8;
+            let len = u64::from_le_bytes(raw.try_into().map_err(|_| truncated())?) as usize;
+            let payload = bytes.get(pos..pos + len).ok_or_else(truncated)?;
+            pos += len;
+            restored.push(crate::delta_batch::deserialize_delta_batch(payload)?);
+        }
+        Ok(restored)
+    }
+
+    /// Replace the Trace's accumulated Z-set with the given batches (from
+    /// [`decode_state`](Self::decode_state)).
+    pub fn replace_batches(&mut self, batches: Vec<DeltaBatch>) {
+        self.levels = Default::default();
+        self.total_rows = 0;
+        for batch in batches {
+            self.insert(batch);
+        }
+    }
+
+    /// Replace the Trace's accumulated Z-set with one produced by
+    /// [`state_bytes`](Self::state_bytes). Weights (row multiplicities) are
+    /// preserved exactly — unlike seeding from a materialized snapshot, which
+    /// collapses duplicates to weight 1. Mutates only after the whole payload
+    /// decoded, so a truncated checkpoint cannot leave the trace half-replaced.
+    pub fn restore_state_bytes(&mut self, bytes: &[u8]) -> DeltaResult<()> {
+        let batches = Self::decode_state(bytes)?;
+        self.replace_batches(batches);
+        Ok(())
+    }
+
     // ── Collect all rows ─────────────────────────────────────────────────────
 
     /// Collect all rows with positive net weight (the "current snapshot").
@@ -310,7 +378,9 @@ impl Trace {
         }
         let merged = DeltaBatch::concat(&all)?;
         let consolidated = consolidate_batch(merged, &[], &self.data_schema)?;
-        consolidated.filter_positive()
+        // Multiset semantics: a weight-k row appears k times, so replaying a
+        // trace snapshot as unit inserts reconstructs the multiplicities.
+        consolidated.filter_positive_expanded()
     }
 }
 
@@ -444,5 +514,54 @@ mod tests {
         trace.consolidate().unwrap();
         let snap = trace.snapshot().unwrap();
         assert_eq!(snap.num_rows(), 0);
+    }
+
+    /// #160: state round-trip preserves accumulated weights exactly (a row
+    /// inserted twice restores with weight 2, not 1).
+    #[test]
+    fn trace_state_round_trip_preserves_weights() {
+        let mut trace = Trace::new(id_schema(), &["id"]).unwrap();
+        trace.insert(DeltaBatch::from_inserts(id_batch(&[7])).unwrap());
+        trace.insert(DeltaBatch::from_inserts(id_batch(&[7, 8])).unwrap());
+
+        let bytes = trace.state_bytes().unwrap();
+        let mut restored = Trace::new(id_schema(), &["id"]).unwrap();
+        restored.restore_state_bytes(&bytes).unwrap();
+
+        let probe = restored.probe_by_keys(&id_batch(&[7, 8])).unwrap();
+        let mut weights: Vec<(String, i64)> = (0..probe.num_rows())
+            .map(|i| {
+                let id = probe
+                    .data_batch()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(i);
+                (id.to_string(), probe.weights().value(i))
+            })
+            .collect();
+        weights.sort();
+        // Row 7 may appear as one weight-2 row (consolidated) or two weight-1
+        // rows; either way the accumulated weight must be 2.
+        let total_7: i64 = weights
+            .iter()
+            .filter(|(id, _)| id == "7")
+            .map(|(_, w)| w)
+            .sum();
+        let total_8: i64 = weights
+            .iter()
+            .filter(|(id, _)| id == "8")
+            .map(|(_, w)| w)
+            .sum();
+        assert_eq!(total_7, 2, "duplicate multiplicity must survive restore");
+        assert_eq!(total_8, 1);
+        // Empty trace round-trips too.
+        let empty = Trace::new(id_schema(), &["id"]).unwrap();
+        let empty_bytes = empty.state_bytes().unwrap();
+        let mut restored_empty = Trace::new(id_schema(), &["id"]).unwrap();
+        restored_empty.insert(DeltaBatch::from_inserts(id_batch(&[1])).unwrap());
+        restored_empty.restore_state_bytes(&empty_bytes).unwrap();
+        assert_eq!(restored_empty.total_rows(), 0, "restore replaces state");
     }
 }

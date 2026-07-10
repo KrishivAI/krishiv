@@ -201,6 +201,38 @@ impl DeltaBatch {
         Ok(filter_record_batch(&data, &mask)?)
     }
 
+    /// Materialize the positive part of the Z-set with **multiset semantics**:
+    /// a row with weight `k > 0` appears `k` times in the output. The
+    /// `_weight` column is stripped.
+    ///
+    /// [`filter_positive`](Self::filter_positive) keeps one physical copy per
+    /// positive row regardless of its weight — right for set-shaped consumers,
+    /// but it silently under-counts duplicates when materializing a relation:
+    /// a join output carrying weight 2 must show 2 rows, exactly as the
+    /// equivalent SQL would (#160). Snapshot maintenance (`apply_delta`, view
+    /// publication, trace snapshots) uses this variant.
+    pub fn filter_positive_expanded(&self) -> DeltaResult<RecordBatch> {
+        let weights = self.weights();
+        // Fast path: every weight exactly +1 — the data batch is the answer.
+        if weights.iter().all(|w| w == Some(1)) {
+            return Ok(self.data_batch());
+        }
+        let mut indices: Vec<u64> = Vec::new();
+        for (i, w) in weights.iter().enumerate() {
+            for _ in 0..w.unwrap_or(0).max(0) {
+                indices.push(i as u64);
+            }
+        }
+        let idx = arrow::array::UInt64Array::from(indices);
+        let data = self.data_batch();
+        let cols = data
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::take(c.as_ref(), &idx, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RecordBatch::try_new(data.schema(), cols)?)
+    }
+
     /// Returns a plain `RecordBatch` of rows with weight < 0 (retractions).
     /// The `_weight` column is stripped.
     pub fn filter_negative(&self) -> DeltaResult<RecordBatch> {
