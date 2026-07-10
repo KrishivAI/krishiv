@@ -814,6 +814,46 @@ mod tests {
         assert_eq!(snap2.num_rows(), 1);
     }
 
+    /// The stream bridge feeds whatever encoding the producer used — modern
+    /// DataFusion emits `Utf8View` for string columns — and the flow must
+    /// shard and aggregate it (observed failing on krishiv-prod 2026-07-10:
+    /// "key column 'region' has unsupported type Utf8View").
+    #[tokio::test]
+    async fn feed_snapshot_accepts_utf8view_key() {
+        use arrow::array::StringViewArray;
+
+        fn orders_view(regions: &[&str], amounts: &[i64]) -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("region", DataType::Utf8View, false),
+                    Field::new("amount", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringViewArray::from(regions.to_vec())),
+                    Arc::new(Int64Array::from(amounts.to_vec())),
+                ],
+            )
+            .unwrap()
+        }
+
+        let part = PartitionedIncrementalFlow::new(3, "region");
+        part.register_view(revenue_spec()).unwrap();
+
+        part.feed_snapshot("orders", &[orders_view(&["US", "EU", "US"], &[100, 50, 25])])
+            .unwrap();
+        part.step_datafusion().await.unwrap();
+        let snap1 = part.snapshot("revenue").unwrap().unwrap();
+        assert_eq!(snap1.num_rows(), 2);
+
+        // Second tick: EU drains, US changes. The retraction must route to
+        // the same shard its Utf8View insertion did.
+        part.feed_snapshot("orders", &[orders_view(&["US"], &[200])])
+            .unwrap();
+        part.step_datafusion().await.unwrap();
+        let snap2 = part.snapshot("revenue").unwrap().unwrap();
+        assert_eq!(snap2.num_rows(), 1);
+    }
+
     // ── Constructor / sizing edge cases ───────────────────────────────────────
 
     #[test]
