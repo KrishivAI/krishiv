@@ -203,34 +203,8 @@ pub mod native {
                     .unwrap_or(0));
             }
 
-            let mut snap_props: HashMap<String, String> = kafka_offsets
-                .iter()
-                .map(|(k, v)| (format!("krishiv.kafka.offset.{k}"), v.to_string()))
-                .collect();
-            snap_props.insert(
-                KAFKA_OFFSETS_SUMMARY_KEY.to_string(),
-                kafka_offsets_json(&kafka_offsets),
-            );
-
-            let table = self
-                .catalog
-                .load_table(&self.ident)
-                .await
-                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-
-            let tx = Transaction::new(&table);
-            let action = tx
-                .fast_append()
-                .add_data_files(data_files)
-                .set_snapshot_properties(snap_props);
-            let tx = action
-                .apply(tx)
-                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-
-            let committed = tx
-                .commit(&*self.catalog)
-                .await
-                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            let committed =
+                fast_append_via(&self.catalog, &self.ident, data_files, &kafka_offsets).await?;
 
             // Best-effort recovery hint; the commit above is already durable.
             if let Some(loc) = committed.metadata_location()
@@ -301,10 +275,25 @@ pub mod native {
 
         /// Atomically replace all table data with `batches`.
         ///
-        /// Implemented via catalog drop-and-recreate followed by `prepare`+`commit`
-        /// since iceberg-rust 0.9.1 does not expose an overwrite snapshot action in
-        /// its public Transaction API.  Old data files remain as orphans on disk and
-        /// would be cleaned by a future VACUUM.
+        /// iceberg-rust 0.9.1 exposes no overwrite snapshot action, so the
+        /// replacement is a new table *generation* at the same root. CONN-3
+        /// (crash atomicity, found live by the G8 kill test): the previous
+        /// generation — including the metadata files the version-hint points
+        /// at — must stay untouched until the replacement is fully durable.
+        /// Ordering:
+        ///
+        ///   1. build the new generation (creation metadata + committed
+        ///      snapshot) under a THROWAWAY in-memory catalog over the same
+        ///      root — new uuid-named files, old generation untouched;
+        ///   2. atomically flip the version-hint to the new metadata — the
+        ///      single durable commit point of the overwrite;
+        ///   3. rebind the live catalog: drop the old entry (purges the old
+        ///      generation's metadata files, now unreferenced) and register
+        ///      the new location.
+        ///
+        /// A crash before 2 leaves the hint on the intact old generation; a
+        /// crash after 2 leaves it on the complete new one. Old data files
+        /// and pre-flip orphan metadata are cleaned by a future VACUUM.
         pub async fn overwrite_commit(
             &self,
             batches: Vec<RecordBatch>,
@@ -312,78 +301,71 @@ pub mod native {
             schema_version: &SchemaVersion,
         ) -> Result<i64, LakehouseError> {
             let namespace = self.ident.namespace().clone();
-
-            // Capture the old table's metadata location before dropping so we
-            // can restore it if the new commit fails (M5).
-            let old_metadata_location = match self.catalog.load_table(&self.ident).await {
-                Ok(table) => table.metadata_location().map(String::from),
-                Err(_) => None,
-            };
-
-            // Drop current table — ignore "not found" (first overwrite on empty table).
-            let _ = self.catalog.drop_table(&self.ident).await;
-            // Clear any leftover pending entries (they reference the dropped table).
-            self.pending.lock().await.clear();
-
-            let iceberg_schema = schema_version_to_iceberg(schema_version)?;
             let table_uri = path_to_uri(&self.root)?;
+
+            // 1. New generation under a throwaway catalog (same root/FileIO).
+            let scratch = MemoryCatalogBuilder::default()
+                .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                .load(
+                    "local-overwrite",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), table_uri.clone())]),
+                )
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            let _ = scratch.create_namespace(&namespace, HashMap::new()).await;
+            let iceberg_schema = schema_version_to_iceberg(schema_version)?;
             let creation = TableCreation::builder()
                 .name(self.ident.name().to_string())
                 .schema(iceberg_schema)
                 .location(table_uri)
                 .build();
-            let table = match self.catalog.create_table(&namespace, creation).await {
-                Ok(t) => t,
-                Err(e) => {
-                    // If table creation fails, attempt to recreate the old table
-                    // from its metadata location to avoid data loss.
-                    tracing::warn!(
-                        error = %e,
-                        "overwrite_commit: failed to create replacement table; \
-                         attempting to restore original table"
-                    );
-                    if let Some(ref loc) = old_metadata_location {
-                        let _ = self.catalog.drop_table(&self.ident).await;
-                        let _ = self.catalog.register_table(&self.ident, loc.clone()).await;
-                    }
-                    return Err(LakehouseError::Iceberg(e.to_string()));
-                }
-            };
-            // CONN-1: Write the version-hint AFTER the data commit succeeds,
-            // not before. Writing it here (for the empty recreated table)
-            // would mean a crash between hint-write and data-commit leaves the
-            // version-hint permanently pointing at an empty table → total data
-            // loss on restart.
+            let created = scratch
+                .create_table(&namespace, creation)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
-            if batches.is_empty() {
-                // No data to commit — safe to write hint for the new empty table.
-                if let Some(loc) = table.metadata_location()
-                    && let Err(e) = self.update_version_hint(loc)
-                {
-                    tracing::warn!(
-                        table = %self.ident,
-                        location = loc,
-                        error = %e,
-                        "version hint update failed after overwrite commit; hint may be stale"
-                    );
-                }
-                return Ok(0);
-            }
-            let staged = self.prepare(batches).await?;
-            let committed = self.commit(staged, kafka_offsets).await?;
-            // CONN-1: Now that data is durable, write the version-hint.
-            if let Ok(table) = self.catalog.load_table(&self.ident).await
-                && let Some(loc) = table.metadata_location()
-                && let Err(e) = self.update_version_hint(loc)
-            {
-                tracing::warn!(
-                    table = %self.ident,
-                    location = loc,
-                    error = %e,
-                    "version hint update failed after overwrite commit; hint may be stale"
-                );
-            }
-            Ok(committed)
+            let (new_meta_loc, snapshot_id) = if batches.is_empty() {
+                let loc = created.metadata_location().map(String::from).ok_or_else(|| {
+                    LakehouseError::Iceberg(
+                        "replacement table creation returned no metadata location".into(),
+                    )
+                })?;
+                (loc, 0)
+            } else {
+                let (_, data_file) = self.stage_parquet(&batches)?;
+                let committed =
+                    fast_append_via(&scratch, &self.ident, vec![data_file], &kafka_offsets)
+                        .await?;
+                let loc = committed.metadata_location().map(String::from).ok_or_else(|| {
+                    LakehouseError::Iceberg(
+                        "replacement commit returned no metadata location".into(),
+                    )
+                })?;
+                let snap = committed
+                    .metadata()
+                    .current_snapshot()
+                    .map(|s| s.snapshot_id())
+                    .ok_or_else(|| LakehouseError::Concurrency {
+                        message: "snapshot id missing after overwrite commit".to_string(),
+                    })?;
+                (loc, snap)
+            };
+
+            // 2. Durable commit point: flip the hint to the new generation.
+            self.update_version_hint(&new_meta_loc)?;
+
+            // 3. Rebind the live catalog. drop_table purges the old
+            // generation's metadata files — safe now that the hint moved on.
+            // The scratch catalog is simply dropped from memory (never
+            // drop_table'd), so the new generation's files survive it.
+            let _ = self.catalog.drop_table(&self.ident).await;
+            self.pending.lock().await.clear();
+            self.catalog
+                .register_table(&self.ident, new_meta_loc)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+            Ok(snapshot_id)
         }
 
         /// Record schema evolution in table properties.
@@ -526,6 +508,44 @@ pub mod native {
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
+
+    /// Run one `fast_append` transaction for `ident` on `catalog`, embedding
+    /// `kafka_offsets` in the snapshot summary. Shared by the in-place append
+    /// path and the overwrite path (which commits into a throwaway catalog
+    /// before flipping the version-hint). Does NOT touch the version-hint.
+    async fn fast_append_via(
+        catalog: &MemoryCatalog,
+        ident: &TableIdent,
+        data_files: Vec<iceberg::spec::DataFile>,
+        kafka_offsets: &BTreeMap<String, i64>,
+    ) -> Result<iceberg::table::Table, LakehouseError> {
+        let mut snap_props: HashMap<String, String> = kafka_offsets
+            .iter()
+            .map(|(k, v)| (format!("krishiv.kafka.offset.{k}"), v.to_string()))
+            .collect();
+        snap_props.insert(
+            KAFKA_OFFSETS_SUMMARY_KEY.to_string(),
+            kafka_offsets_json(kafka_offsets),
+        );
+
+        let table = catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .add_data_files(data_files)
+            .set_snapshot_properties(snap_props);
+        let tx = action
+            .apply(tx)
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+        tx.commit(catalog)
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))
+    }
 
     /// CONN-2: Atomically write the version-hint file (temp + fsync + rename +
     /// dir-sync) so a crash or power loss cannot leave a torn hint that makes
@@ -800,6 +820,95 @@ pub mod native {
                     "recovered table must have a committed snapshot"
                 );
             }
+        }
+
+        /// CONN-3 regression (found live by the G8 kill test): a crash in the
+        /// middle of `overwrite_commit` must never leave the version-hint
+        /// dangling. The two durable states an overwrite can leave are (a)
+        /// pre-flip — hint on the old generation with the replacement's
+        /// orphan metadata coexisting in the same dir — and (b) post-flip.
+        /// Both must reopen and read.
+        #[tokio::test]
+        async fn iceberg_native_overwrite_crash_states_stay_readable() {
+            use std::collections::HashMap;
+
+            use iceberg::CatalogBuilder as _;
+            use iceberg::io::LocalFsStorageFactory;
+            use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+
+            let dir = tempfile::tempdir().unwrap();
+            let tpc = IcebergNativeTwoPhaseCommit::open(dir.path(), "test", &schema_version())
+                .await
+                .unwrap();
+            let staged = tpc.prepare(vec![batch(vec![1, 2, 3])]).await.unwrap();
+            tpc.commit(staged, BTreeMap::new()).await.unwrap();
+            drop(tpc);
+
+            // (a) Simulate the pre-flip crash window: a replacement
+            // generation's creation metadata lands in the same dir (what
+            // overwrite_commit's scratch catalog writes first), hint
+            // untouched. Reopen must still read the old generation.
+            {
+                let root = dir.path().canonicalize().unwrap();
+                let uri = url::Url::from_directory_path(&root).unwrap().to_string();
+                let scratch = MemoryCatalogBuilder::default()
+                    .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                    .load(
+                        "local-overwrite",
+                        HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), uri.clone())]),
+                    )
+                    .await
+                    .unwrap();
+                let ns = iceberg::NamespaceIdent::new("default".to_string());
+                let _ = scratch.create_namespace(&ns, HashMap::new()).await;
+                let creation = iceberg::TableCreation::builder()
+                    .name("test".to_string())
+                    .schema(super::schema_version_to_iceberg(&schema_version()).unwrap())
+                    .location(uri)
+                    .build();
+                scratch.create_table(&ns, creation).await.unwrap();
+                // The scratch catalog dies here without drop_table — exactly
+                // like a process crash before the hint flip.
+            }
+            let reopened =
+                IcebergNativeTwoPhaseCommit::open(dir.path(), "test", &schema_version())
+                    .await
+                    .expect("pre-flip crash state must reopen from the old generation");
+            let rows: usize = reopened
+                .read_all()
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            assert_eq!(rows, 3, "old generation must remain fully readable");
+
+            // (b) A completed overwrite: hint target must exist and read back.
+            reopened
+                .overwrite_commit(vec![batch(vec![7, 8])], BTreeMap::new(), &schema_version())
+                .await
+                .unwrap();
+            let hint = std::fs::read_to_string(
+                dir.path().join("metadata").join(super::VERSION_HINT),
+            )
+            .unwrap();
+            let hinted = hint.trim().strip_prefix("file://").unwrap_or(hint.trim());
+            assert!(
+                std::path::Path::new(hinted).exists(),
+                "version-hint must point at an existing metadata file, got {hinted}"
+            );
+            drop(reopened);
+            let after = IcebergNativeTwoPhaseCommit::open(dir.path(), "test", &schema_version())
+                .await
+                .unwrap();
+            let rows: usize = after
+                .read_all()
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            assert_eq!(rows, 2, "post-flip generation must be the new data");
         }
 
         #[tokio::test]
