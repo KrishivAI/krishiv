@@ -863,6 +863,60 @@ SQL correctness corpus (sqllogictest-style), no distributed-scale CI
 publication (roadmap item 5), no soak gate in engine CI (soaks are
 platform-driven).
 
+## 9b. Unintegrated-components sweep (fourteenth pass, 2026-07-10)
+
+Systematic hunt for components not reachable from any execution flow,
+beyond the wire-or-delete items already recorded (§3 schedulers, §4
+barriers/incremental checkpoints, §7c shuffle stores, §8b
+kafka_transactional_sink, early-fire stub, enable_disk_spill).
+
+**Fully dead modules (zero users inside OR outside their crate):**
+
+- `krishiv-dataflow/src/fusion.rs` — `FusedPipeline`/`FusedStage`
+  operator fusion. Built, never called.
+- `krishiv-dataflow/src/delta_join.rs` — a streaming
+  `DeltaJoinOperator`. Ironic orphan: Phase 64's plan says "evaluate
+  the delta-join form" — a first implementation already exists with
+  zero callers.
+- `krishiv-dataflow/src/profile.rs` — `StreamingExecutionProfile` with
+  a `low_latency(max_rows, max_bytes, flush_interval_ms)` constructor:
+  **exactly the batch/linger dial Phase 55's low-latency task
+  specifies**, already written, zero users — and it name-collides with
+  the *wired* `krishiv-proto::StreamingExecutionProfile` (job-spec
+  profile), so any future wiring must resolve the collision first.
+
+**A feature tier not integrated with the distributed/SQL execution
+flow (embedded-API-only):** temporal join, interval join,
+deduplication, side outputs, broadcast state, connected streams, and
+ProcessFunction + timers are all real, tested operators — reachable
+**only** from the embedded Rust `StreamingDataFrame`/process API and
+its Python mirror. The distributed `stream:loop` runtime executes only
+`WindowExecutionSpec` shapes (windows, window-join, CEP), and
+`streaming_window_plan.rs` compiles none of the advanced operators
+from SQL. A user who builds on these operators embedded cannot ever
+run that job distributed, and nothing says so.
+
+**Matrix drift found while verifying:** `join.interval` ("Streaming
+interval join on event-time bounds") is marked **Supported** in the
+grammar feature matrix (`grammar.rs:211-215`) but has **no SQL
+planning/execution path** — the operator is DataFrame-only.
+`join.temporal_as_of` (also marked S) needs the same verification;
+`lakehouse/as_of.rs` is table time-travel, not a temporal join.
+
+**Verified wired this sweep (no action):** `ExecutionModel` (task-
+runner dispatch), `source_throttle` (batch fragment), `transactions`
+(task runner), `barrier_transport` (aligned join/barrier gRPC — the §4
+consumer gap stands), `adaptive` (skew-join optimizer + coordinator),
+`memo`, `queue`, broadcast/process functions (krishiv-api
+process/timers).
+
+→ Phase 51 wire-or-delete gains the dataflow trio (wire decisions:
+profile.rs → Phase 55(e), delta_join.rs → Phase 64, fusion.rs → delete
+unless 55 claims it); Phase 60's matrix-truth task gains
+`join.interval` (+ `join.temporal_as_of` verification); Phase 61 gains
+operator-tier placement honesty (the matrix must carry a placement
+dimension so "supported" says *where*).
+
 ## 10. Verdict → Track 6 (platform phases 51–63)
 
 The engine's architecture (spine, seams, hygiene, certification
