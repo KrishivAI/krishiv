@@ -77,6 +77,61 @@ task-per-partition, shuffle-service reads; its published TPC-H SF100
 result is 2.9× single-node DataFusion. Iceberg split planning gives the
 scan-side parallelism for free (file/split → task), and locality inputs.
 
+## 2b. Batch execution flow, per-task overhead, and the Sail lesson (eighth pass, 2026-07-10)
+
+End-to-end trace of a coordinated batch query (submit →
+`submit_batch_sql_job` → single `task-sql` assignment → executor
+`fragment/batch.rs` → results back through the coordinator), checked
+against Sail (lakehq/sail) — a DataFusion-based Spark replacement
+publishing ~4× overall / up to ~8× per-query (TPC-H-derived, 100 GB:
+Q19 ~7.3×, Q6 ~6.2×) vs Spark with **zero shuffle spill** (Spark wrote
+110 GB) and 22 GB brief peak vs 54 GB resident. Sail's wins come from
+being Rust/Arrow/DataFusion-native — which Krishiv already is — so none
+of that gap separates us; what matters is that Sail keeps data
+**streaming end-to-end with no per-query setup tax**, and Krishiv's
+distributed path currently violates that three ways:
+
+- **Per-task engine setup.** Every task builds a fresh
+  `SqlEngine`/SessionContext, re-registers UDFs, and re-registers the
+  Iceberg REST catalog (`fragment/batch.rs:193-203`). This is exactly
+  the SessionContext-per-tick overhead #102 exposed for IVM (fixed by
+  G14 per-flow reuse) — batch still pays it per task, and Phase 52's
+  N-tasks-per-query multiplies it by N, including per-task catalog
+  metadata HTTP round-trips. Fix: executor-resident engine/session
+  reuse (job-scoped or LRU) + a shared catalog client with cached table
+  metadata.
+- **Eager input materialization.** Only the local-parquet path registers
+  a file-backed provider; shuffle-Flight, object-parquet, connector, and
+  registry partitions are all **fully read into `Vec<RecordBatch>` and
+  registered as MemTables before the query starts**
+  (`fragment/batch.rs:212-265`). That defeats pipelined execution,
+  discards predicate/projection pushdown into those scans, and holds
+  entire inputs in RAM — the anti-Sail pattern (their zero-spill number
+  is streaming Arrow exchange). Fix: streaming `TableProvider`s
+  (shuffle reader as a `RecordBatchStream`; pushdown-capable providers
+  for object/connector partitions). Phase 52's proto plan fragments
+  make this the natural shape: the fragment carries the scan node, the
+  executor builds a stream, never a MemTable.
+- **Sink writes collect the whole result.** The object-parquet sink path
+  calls `collect_with_stats()` — "Sink writes need the full batch set
+  for partition splitting" (`fragment/batch.rs:283-291`) — so a large
+  CTAS/INSERT holds its entire output in executor memory. The inline
+  path is already streamed (execute_stream → spool decision, #156); the
+  sink path must be too — the Phase 52 partition-aware fanout writer
+  consumes the stream batch-by-batch.
+
+What is already right: inline results stream through the spool decision
+on the executor (#156), job-completion waits use Notify (no busy poll),
+and per-task memory limits arm DataFusion spill. The remaining
+coordinator-memory hop for inline results is the control-plane-only
+invariant (§10), already owned by Phase 52.
+
+Yardstick implication (Phase 51): publish an **engine-overhead
+microbenchmark** — the same query via raw DataFusion vs embedded
+session vs coordinated single-task — so the scheduling/serialization
+tax is a tracked number with a budget, the way Sail publishes theirs
+against Spark.
+
 ## 3. Scheduler: sound skeleton, algorithms parked in `cfg(test)`
 
 Production placement is `SlotAwareScheduler` — greedy most-free-slots
@@ -496,6 +551,11 @@ Phase detail, gates, and platform-side seams live in the platform repo:
   comparable intra-node scaling, so Track 6 spends effort on *inter-node*.
 - Apache DataFusion Ballista 53 (May 2026 release): scheduler/executor +
   shuffle architecture on the same DF base; TPC-H SF100 2.9× single-node.
+- Sail (lakehq/sail): DataFusion-based Spark replacement; ~4× overall /
+  up to ~8× per-query vs Spark on TPC-H-derived 100 GB with zero shuffle
+  spill and released-per-query memory — the proof point that the
+  streaming-end-to-end, no-per-query-setup discipline (§2b) is where the
+  headroom is for an engine already on Rust/Arrow/DataFusion.
 - Flink 2.0 disaggregated state / ForSt (VLDB'25) + async execution model;
   credit-based flow control (FLINK-7282) as the streaming data-plane model.
 - Spark AQE (coalesce/skew-split/dynamic broadcast) + runtime filters;
