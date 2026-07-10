@@ -696,12 +696,13 @@ fn source_throttle_table_shared_across_runner_clones() {
 
 /// G7/G8 wiring: a `stream:loop:` cycle whose assignment carries an
 /// `iceberg-sink:` output contract stages its window output into the job's
-/// checkpoint-aligned Iceberg participant, and the checkpoint lifecycle
-/// (barrier pre_commit → complete commit_through) makes it visible as an
-/// Iceberg snapshot. The restore leg aborts uncovered epochs.
+/// Iceberg participant and commits it at cycle end as one cycle-aligned
+/// epoch (the cycle IS the checkpoint boundary for continuous jobs — no
+/// barrier lifecycle ever targets their transient tasks). Committed history
+/// is immutable: a later restore_to cannot roll it back.
 #[cfg(feature = "iceberg")]
 #[tokio::test]
-async fn stream_loop_iceberg_sink_commits_on_checkpoint_and_aborts_on_restore() {
+async fn stream_loop_iceberg_sink_commits_each_cycle_and_restore_keeps_history() {
     use std::sync::Arc;
 
     use krishiv_connectors::TransactionalSinkParticipant as _;
@@ -762,7 +763,8 @@ async fn stream_loop_iceberg_sink_commits_on_checkpoint_and_aborts_on_restore() 
         )
     };
 
-    // Cycle 1: window emitted AND staged into the registered participant.
+    // Cycle 1: window emitted, staged AND committed at cycle end — no manual
+    // barrier driving. Nothing may rest prepared after the cycle returns.
     let out1 = runner
         .execute_streaming_fragment(&make_assignment())
         .await
@@ -773,41 +775,31 @@ async fn stream_loop_iceberg_sink_commits_on_checkpoint_and_aborts_on_restore() 
         "the iceberg sink participant must be registered on first cycle"
     );
 
-    // Barrier epoch 1 (what initiate_checkpoint_for_job runs), then the
-    // checkpoint-complete notification (handle_checkpoint_complete).
-    let log = runner.transaction_log.clone();
-    let job_owned = job.to_owned();
-    tokio::task::spawn_blocking(move || {
-        log.pre_commit(&job_owned, 1).unwrap();
-        assert!(
-            log.commit_through(&job_owned, 1).unwrap() > 0,
-            "epoch 1 must commit staged output"
-        );
-    })
-    .await
-    .unwrap();
-
-    // Cycle 2 stages more output; epoch 2 is prepared but then restore-to-1
-    // rolls it back (recover-and-commit ≤1 / recover-and-abort >1).
+    // Cycle 2 commits its own epoch the same way.
     let out2 = runner
         .execute_streaming_fragment(&make_assignment())
         .await
         .expect("cycle 2 executes");
     assert!(out2.row_count() > 0, "cycle 2 must close the second window");
+
+    // Committed history is immutable: restoring to epoch 1 must neither
+    // commit anything new (nothing is prepared) nor roll back cycle 2.
     let log = runner.transaction_log.clone();
     let job_owned = job.to_owned();
     tokio::task::spawn_blocking(move || {
-        log.pre_commit(&job_owned, 2).unwrap();
         let (committed, aborted) = log.restore_to(&job_owned, 1).unwrap();
-        assert_eq!(committed, 0, "epoch ≤1 already committed");
-        assert!(aborted > 0, "epoch 2 must be rolled back on restore");
+        assert_eq!(
+            (committed, aborted),
+            (0, 0),
+            "cycle-aligned epochs commit at cycle end; nothing rests prepared"
+        );
     })
     .await
     .unwrap();
 
-    // The Iceberg table holds exactly the epoch-1 output: reopen from disk
+    // The Iceberg table holds both cycles' output: reopen from disk
     // (fresh sink over the same root) and count committed rows.
-    let expected = out1.row_count();
+    let expected = out1.row_count() + out2.row_count();
     let committed_rows = tokio::task::spawn_blocking(move || {
         let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
             "placeholder",
@@ -839,7 +831,6 @@ async fn stream_loop_iceberg_sink_commits_on_checkpoint_and_aborts_on_restore() 
     .unwrap();
     assert_eq!(
         committed_rows, expected,
-        "iceberg table must contain exactly the committed epoch-1 window rows \
-         (epoch 2 was aborted by restore)"
+        "iceberg table must contain exactly both cycles' committed window rows"
     );
 }

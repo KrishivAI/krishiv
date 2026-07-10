@@ -1,7 +1,9 @@
 //! Per-job transactional-sink registry for checkpoint-aligned two-phase commit.
 //!
 //! Pipelines that write through a [`TransactionalSinkParticipant`] register it
-//! here keyed by job id.  The checkpoint lifecycle then drives it:
+//! here keyed by job id.  Two lifecycles drive it:
+//!
+//! **Barrier-driven** (long-running stream tasks with a checkpoint coordinator):
 //!
 //! - barrier (`initiate_checkpoint_for_job`): [`TwoPhaseSinkRegistry::pre_commit`]
 //!   stages the open buffer under the barrier epoch *before* the checkpoint ack;
@@ -10,6 +12,16 @@
 //! - `RestoreFromCheckpointCommand`: [`TwoPhaseSinkRegistry::restore_to`]
 //!   commits prepared output covered by the restored checkpoint and aborts
 //!   everything after it (recover-and-commit / recover-and-abort).
+//!
+//! **Cycle-aligned** (continuous `stream:loop` jobs): each completed cycle is
+//! its own epoch, prepared and committed at cycle end via
+//! [`TwoPhaseSinkRegistry::commit_cycle`].  Continuous tasks are transient
+//! (one task per pushed cycle), so no checkpoint coordinator ever targets
+//! them with barriers — and prepared state is process-local, so deferring the
+//! commit to a later heartbeat would only widen the crash window without
+//! adding durability.  Exactly-once end to end comes from the source-offset
+//! protocol: offsets ride in the committed Iceberg snapshot's summary, and a
+//! feeder must consult the table's committed offsets before redelivering.
 
 use std::sync::{Arc, Mutex};
 
@@ -25,6 +37,12 @@ pub type SharedSinkParticipant = Arc<Mutex<dyn TransactionalSinkParticipant>>;
 #[derive(Clone, Default)]
 pub struct TwoPhaseSinkRegistry {
     inner: Arc<DashMap<String, Vec<SharedSinkParticipant>>>,
+    /// Last cycle-aligned epoch handed out per job (see [`Self::commit_cycle`]).
+    /// Process-local by design: a fresh process restarts at 1, which is safe
+    /// because epoch monotonicity is only enforced against in-memory prepared
+    /// state and committed snapshots carry source offsets, not epochs, as
+    /// their recovery contract.
+    cycle_epochs: Arc<DashMap<String, u64>>,
 }
 
 impl std::fmt::Debug for TwoPhaseSinkRegistry {
@@ -148,9 +166,32 @@ impl TwoPhaseSinkRegistry {
         Ok((committed, aborted))
     }
 
+    /// Cycle-aligned commit for continuous `stream:loop` jobs: prepare and
+    /// commit everything staged during the cycle that just completed as one
+    /// epoch.  Returns the committed epoch, or `None` when the job has no
+    /// registered participant.
+    ///
+    /// An error means the cycle's output did NOT durably commit — the caller
+    /// must fail the cycle so the coordinator never persists a snapshot that
+    /// claims the cycle happened (the feeder then redelivers).
+    pub fn commit_cycle(&self, job_id: &str) -> ConnectorResult<Option<u64>> {
+        if !self.has_job(job_id) {
+            return Ok(None);
+        }
+        let epoch = {
+            let mut entry = self.cycle_epochs.entry(job_id.to_owned()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        self.pre_commit(job_id, epoch)?;
+        self.commit_through(job_id, epoch)?;
+        Ok(Some(epoch))
+    }
+
     /// Drop every participant registered for `job_id` (job eviction).
     pub fn remove_job(&self, job_id: &str) {
         self.inner.remove(job_id);
+        self.cycle_epochs.remove(job_id);
     }
 }
 
@@ -220,6 +261,30 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&first, &second), "same participant reused");
         assert_eq!(second.lock().unwrap().open_rows(), 3);
+    }
+
+    #[test]
+    fn commit_cycle_commits_staged_output_under_monotonic_epochs() {
+        let registry = TwoPhaseSinkRegistry::new();
+        let participant = registry
+            .get_or_register("job-d", || {
+                Ok(EpochTransactionLog::new(InMemoryTwoPhaseCommitSink::new()))
+            })
+            .unwrap();
+
+        participant.lock().unwrap().stage(&batch()).unwrap();
+        assert_eq!(registry.commit_cycle("job-d").unwrap(), Some(1));
+        assert!(participant.lock().unwrap().prepared_epochs().is_empty());
+
+        participant.lock().unwrap().stage(&batch()).unwrap();
+        assert_eq!(registry.commit_cycle("job-d").unwrap(), Some(2));
+
+        // No participant registered: explicit None, not an error.
+        assert_eq!(registry.commit_cycle("job-none").unwrap(), None);
+
+        // Eviction resets the cycle-epoch counter with the participants.
+        registry.remove_job("job-d");
+        assert!(!registry.has_job("job-d"));
     }
 
     #[test]

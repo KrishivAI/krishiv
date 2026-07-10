@@ -28,7 +28,9 @@ echo "== cargo build (default features; isolated target dir)"
 
 BIN="$TARGET_DIR/release/krishiv"
 echo "== verify binary (durable-CTAS marker from the lakehouse DML path)"
-if ! strings "$BIN" | grep -q "removed replaced snapshot's data files"; then
+# grep -c, not -q: -q exits at first match and SIGPIPEs `strings`, which
+# pipefail turns into a false FATAL even when the marker is present.
+if [ "$(strings "$BIN" | grep -c "removed replaced snapshot's data files")" -eq 0 ]; then
     echo "FATAL: binary lacks the durable-CTAS lakehouse path — wrong features or stale build" >&2
     exit 1
 fi

@@ -604,11 +604,13 @@ async fn execute_loop_fragment(
         })();
     }
 
-    // G7: when the assignment carries an Iceberg sink contract, stage this
-    // cycle's output into the job's checkpoint-aligned transactional sink.
-    // The rows become visible as an Iceberg snapshot only when the G5
-    // checkpoint lifecycle commits the barrier epoch (initiate → pre_commit,
-    // complete → commit_through, restore → recover-and-commit/abort).
+    // G7/G8: when the assignment carries an Iceberg sink contract, stage this
+    // cycle's output into the job's transactional sink and commit it as one
+    // cycle-aligned epoch. Continuous cycles are transient tasks, so no
+    // barrier lifecycle ever targets them — the cycle IS the checkpoint
+    // boundary (see TwoPhaseSinkRegistry::commit_cycle). A commit failure
+    // fails the cycle, so the coordinator never persists a snapshot claiming
+    // output that isn't durably in the table.
     if let Some(descriptor) =
         crate::fragment::common::iceberg_sink_descriptor(assignment.output_contract())?
     {
@@ -661,11 +663,11 @@ async fn execute_loop_fragment(
 }
 
 /// Stage one continuous cycle's output into the job's Iceberg sink
-/// participant, registering it on first use (G7).
+/// participant (registering it on first use) and commit it as one
+/// cycle-aligned epoch (G7/G8).
 ///
-/// The participant lives in `runner.transaction_log`, so the existing
-/// checkpoint lifecycle drives its two-phase commit without further wiring.
-/// Table open and staging run on a blocking thread: the sink owns its own
+/// The participant lives in `runner.transaction_log`. Table open, staging and
+/// the epoch commit run on a blocking thread: the sink owns its own
 /// single-thread runtime for Iceberg catalog I/O and must not be driven from
 /// an async executor thread.
 #[cfg(feature = "iceberg")]
@@ -730,13 +732,24 @@ async fn stage_iceberg_sink_output(
         for batch in &batches {
             guard.stage(batch)?;
         }
-        guard.stage_source_offsets(&offsets)
+        guard.stage_source_offsets(&offsets)?;
+        drop(guard);
+        // G8: the cycle is the checkpoint boundary — prepare + commit the
+        // staged output as one epoch. On failure the cycle fails and the
+        // feeder redelivers; nothing partial ever reaches the table.
+        let epoch = registry.commit_cycle(&job)?;
+        tracing::info!(
+            job_id = %job,
+            epoch = epoch.unwrap_or(0),
+            "continuous cycle committed to iceberg sink"
+        );
+        Ok(())
     })
     .await
     .map_err(|join_error| ExecutorError::LocalExecution {
         message: format!("iceberg sink staging task panicked: {join_error}"),
     })?
-    .map_err(|error| ExecutorError::LocalExecution {
+    .map_err(|error: krishiv_connectors::ConnectorError| ExecutorError::LocalExecution {
         message: format!("iceberg sink staging failed for job {job_id}: {error}"),
     })
 }
