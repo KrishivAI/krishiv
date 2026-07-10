@@ -163,6 +163,41 @@ Re-confirmed open (post-AUD fixes):
   recompute wins below ~23M rows. The IVM engine is a differentiator on
   paper it cannot yet cash at production scale.
 
+## 5b. Security & durability P0s (external review 2026-07-10, code-verified)
+
+An external engine review surfaced end-to-end security and durability
+gaps this audit's first passes did not cover (they assumed the Phase-27/P0
+security posture was adequate). Verified against the tree:
+
+- **SEC-1 (real): HTTP auth bypass.** `coordinator_http_router`
+  (`krishiv-scheduler/src/coordinator_daemon.rs:527-531`) layers the
+  bearer middleware only on `protected`, then merges `ivm_routes` and
+  `qs_routes` as siblings with no auth — unauthenticated IVM submission
+  and raw queryable-state reads.
+- **SEC-2 (real, asymmetry): Flight SQL authz.** Statement paths
+  fail-closed (`service.rs:371/418/626`); `do_put_prepared_statement_update`
+  (`:730`) and `do_action_fallback` (`:1150`) authenticate without the
+  policy default-deny. (The review's "normal queries fail with no policy"
+  is the intended fail-closed behavior, not a bug.)
+- **DUR-1 (real, batch-sink path): false success.** Publish deferred
+  outside the write lock (`grpc.rs`), failure only in-memory
+  (`coordinator/mod.rs:1724`) → restart can persist `Succeeded` for
+  unpublished output. Needs a persisted `Committing` state.
+- **DUR-2 (real): prepared sink txns not in durable checkpoints.**
+  `EpochTransactionLog.prepared` is in-memory (`two_phase.rs`);
+  `CheckpointMetadata`/`CheckpointAckRequest` carry offsets, no
+  participant/txn refs — offsets can restore past uncommitted output.
+  General-path form of the honest G8 caveat (#171).
+- **STALE — do not action as written:** the review's "G7 is an unsafe
+  uncommitted draft that drops/recreates the table" predates the tree.
+  G7 (`b2dec7b`) + CONN-3 (`9dd1fdf`) are committed; drop/recreate was
+  replaced by the crash-safe `overwrite_commit`
+  (`iceberg_native.rs:~297`, atomic version-hint flip); the Kafka→Iceberg
+  kill-loop it demanded is the certified G8.
+
+→ **Phase 63 (Track 6 GATE 0, P0)** — runs first, gates GA, precedes
+Phase 31. Tasks SEC-1/SEC-2/DUR-1/DUR-2.
+
 ## 6. Fault tolerance & HA
 
 - Coordinator HA: etcd leader election exists behind `feature = "etcd"`

@@ -1,5 +1,25 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 (day, follow-up 5) — external security/durability review triaged → Phase 63 GATE 0 (P0)
+
+User relayed an external engine review claiming the engine isn't ready
+for stable/exactly-once/distributed claims. Verified each finding against
+the tree (audit doc §5b). **Confirmed real, P0:** SEC-1 HTTP auth bypass
+(coordinator_daemon.rs:527-531 merges ivm_routes/qs_routes outside the
+bearer middleware); SEC-2 Flight authz asymmetry (do_put_prepared_update
+:730 / do_action_fallback :1150 skip the default-deny the statement paths
+enforce at :371/418/626); DUR-1 distributed-sink false success (publish
+deferred outside lock in grpc.rs, failure only in-memory at mod.rs:1724 →
+restart persists Succeeded for unpublished output); DUR-2 prepared sink
+txns absent from durable checkpoints (EpochTransactionLog in-memory;
+CheckpointMetadata/Ack carry offsets not txn refs). **STALE:** the "G7
+unsafe uncommitted drop/recreate" finding predates the tree — CONN-3
+(9dd1fdf, committed) replaced it with crash-safe overwrite_commit, and
+the Kafka→Iceberg kill-loop it demanded is the certified G8. **Mischar:**
+statement-path "fails without policy" is intended fail-closed, not a bug.
+Filed **Phase 63 (Track 6 GATE 0, P0)** — runs first, blocks GA, precedes
+Phase 31 — with tasks SEC-1/SEC-2/DUR-1/DUR-2 (#185-189). Docs-only.
+
 ## 2026-07-10 (day, follow-up 4) — sync/async audit leg → folded into Phases 61 (contract) + 51 (hygiene lints)
 
 User asked about sync/async patterns across engine and API. Fourth audit
