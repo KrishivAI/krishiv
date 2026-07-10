@@ -307,6 +307,13 @@ message OutputContractDescriptor {
   string object_base_dir = 3;
   string object_path = 4;
   string shuffle_partition = 5;
+  // Streaming Iceberg sink target (G7).
+  string iceberg_root = 6;
+  string iceberg_table = 7;
+  // "append" | "upsert"
+  string iceberg_mode = 8;
+  repeated string iceberg_key_columns = 9;
+  string iceberg_op_column = 10;
 }
 
 message TaskStatusRequest {
@@ -471,6 +478,7 @@ enum OutputContractDescriptorKind {
   OUTPUT_CONTRACT_DESCRIPTOR_KIND_SHUFFLE = 3;
   OUTPUT_CONTRACT_DESCRIPTOR_KIND_OBJECT_PARQUET_SINK = 4;
   OUTPUT_CONTRACT_DESCRIPTOR_KIND_PARQUET_SINK = 5;
+  OUTPUT_CONTRACT_DESCRIPTOR_KIND_ICEBERG_SINK = 6;
 }
 
 enum OutputContractKind {

@@ -476,6 +476,27 @@ pub(crate) fn parse_object_parquet_sink_spec(
     })
 }
 
+/// Extract the Iceberg streaming-sink descriptor from `contract`, if any.
+///
+/// Accepts the typed `IcebergSink` descriptor and the legacy string form
+/// (`iceberg-sink:<root>|<table>|mode=...`) that reaches assignments via
+/// `TaskSpec::with_sink_contract`. Returns `Ok(None)` when the contract does
+/// not target an Iceberg sink; a present-but-malformed contract fails the
+/// task rather than silently discarding cycle output.
+pub(crate) fn iceberg_sink_descriptor(
+    contract: &OutputContract,
+) -> ExecutorResult<Option<OutputContractDescriptor>> {
+    if let Some(descriptor @ OutputContractDescriptor::IcebergSink { .. }) = contract.descriptor()
+    {
+        return Ok(Some(descriptor.clone()));
+    }
+    match OutputContractDescriptor::parse_iceberg_sink(contract.description()) {
+        None => Ok(None),
+        Some(Ok(descriptor)) => Ok(Some(descriptor)),
+        Some(Err(message)) => Err(ExecutorError::InvalidAssignment { message }),
+    }
+}
+
 /// Write `batches` as a single Parquet object at `object_path` under the
 /// `base_dir` object-store prefix. Overwrites any existing object at the same
 /// path (idempotent re-run of the same task attempt).

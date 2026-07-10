@@ -12,6 +12,8 @@ readme = "README.md"
 
 [features]
 kafka = ["krishiv-connectors/kafka"]
+# G7: checkpoint-aligned streaming Iceberg sink for continuous cycle output.
+iceberg = ["krishiv-connectors/iceberg"]
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]

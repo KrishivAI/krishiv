@@ -604,6 +604,29 @@ async fn execute_loop_fragment(
         })();
     }
 
+    // G7: when the assignment carries an Iceberg sink contract, stage this
+    // cycle's output into the job's checkpoint-aligned transactional sink.
+    // The rows become visible as an Iceberg snapshot only when the G5
+    // checkpoint lifecycle commits the barrier epoch (initiate → pre_commit,
+    // complete → commit_through, restore → recover-and-commit/abort).
+    if let Some(descriptor) =
+        crate::fragment::common::iceberg_sink_descriptor(assignment.output_contract())?
+    {
+        let offsets: std::collections::BTreeMap<String, i64> = runner
+            .checkpoint_runners
+            .get(assignment.task_id())
+            .and_then(|entry| {
+                entry.value().lock().ok().map(|r| {
+                    r.source_offsets
+                        .iter()
+                        .map(|o| (o.partition_id.to_string(), o.offset))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        stage_iceberg_sink_output(runner, job_id, descriptor, &output_batches, offsets).await?;
+    }
+
     let total_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
     let total_batches = output_batches.len();
     let column_count = output_batches.first().map(|b| b.num_columns()).unwrap_or(0);
@@ -635,6 +658,105 @@ async fn execute_loop_fragment(
         output = output.with_state_snapshot(bytes);
     }
     Ok(output)
+}
+
+/// Stage one continuous cycle's output into the job's Iceberg sink
+/// participant, registering it on first use (G7).
+///
+/// The participant lives in `runner.transaction_log`, so the existing
+/// checkpoint lifecycle drives its two-phase commit without further wiring.
+/// Table open and staging run on a blocking thread: the sink owns its own
+/// single-thread runtime for Iceberg catalog I/O and must not be driven from
+/// an async executor thread.
+#[cfg(feature = "iceberg")]
+async fn stage_iceberg_sink_output(
+    runner: &ExecutorTaskRunner,
+    job_id: &str,
+    descriptor: krishiv_proto::OutputContractDescriptor,
+    output_batches: &[arrow::record_batch::RecordBatch],
+    offsets: std::collections::BTreeMap<String, i64>,
+) -> ExecutorResult<()> {
+    use krishiv_connectors::lakehouse::streaming_sink::{
+        IcebergSinkTarget, IcebergStreamingSink, schema_version_from_arrow,
+    };
+
+    if output_batches.is_empty() && offsets.is_empty() {
+        return Ok(());
+    }
+    let krishiv_proto::OutputContractDescriptor::IcebergSink {
+        root,
+        table,
+        mode,
+        key_columns,
+        op_column,
+    } = descriptor
+    else {
+        return Err(ExecutorError::InvalidAssignment {
+            message: "stage_iceberg_sink_output requires an IcebergSink descriptor".into(),
+        });
+    };
+    let Some(schema) = output_batches.first().map(|b| b.schema()) else {
+        // Offsets-only cycle: nothing to stage yet, and the participant may
+        // not exist — skip rather than open a table without a schema.
+        return Ok(());
+    };
+
+    let registry = runner.transaction_log.clone();
+    let job = job_id.to_owned();
+    let batches = output_batches.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let participant = registry.get_or_register(&job, || {
+            let schema_version = schema_version_from_arrow(&schema, op_column.as_deref())?;
+            IcebergStreamingSink::open(
+                IcebergSinkTarget {
+                    root: std::path::PathBuf::from(root),
+                    table,
+                    mode,
+                    key_columns,
+                    op_column,
+                },
+                schema_version,
+            )
+        })?;
+        let mut guard =
+            participant
+                .lock()
+                .map_err(|_| krishiv_connectors::ConnectorError::Protocol {
+                    message: format!(
+                        "iceberg sink participant lock poisoned for job {job}; \
+                         sink state is unreliable — restart the job"
+                    ),
+                })?;
+        for batch in &batches {
+            guard.stage(batch)?;
+        }
+        guard.stage_source_offsets(&offsets)
+    })
+    .await
+    .map_err(|join_error| ExecutorError::LocalExecution {
+        message: format!("iceberg sink staging task panicked: {join_error}"),
+    })?
+    .map_err(|error| ExecutorError::LocalExecution {
+        message: format!("iceberg sink staging failed for job {job_id}: {error}"),
+    })
+}
+
+/// Built without the `iceberg` feature: an assignment that demands an Iceberg
+/// sink must fail loudly instead of silently dropping its output.
+#[cfg(not(feature = "iceberg"))]
+async fn stage_iceberg_sink_output(
+    _runner: &ExecutorTaskRunner,
+    job_id: &str,
+    _descriptor: krishiv_proto::OutputContractDescriptor,
+    _output_batches: &[arrow::record_batch::RecordBatch],
+    _offsets: std::collections::BTreeMap<String, i64>,
+) -> ExecutorResult<()> {
+    Err(ExecutorError::InvalidAssignment {
+        message: format!(
+            "job {job_id} requests an Iceberg sink but this executor was built \
+             without the `iceberg` feature"
+        ),
+    })
 }
 
 async fn read_continuous_registry_sources(

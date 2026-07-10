@@ -6,6 +6,45 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ## [Unreleased]
 
+### Added
+
+- **G7: checkpoint-aligned streaming Iceberg sink** (#89, 2026-07-10).
+  Continuous (`stream:loop:`) jobs can now land cycle output in an Iceberg
+  table under two-phase commit aligned to the G5 checkpoint boundary:
+  - New `OutputContractDescriptor::IcebergSink` (typed + proto wire fields +
+    legacy string form `iceberg-sink:<root>|<table>|mode=…[|keys=…][|op=…]`),
+    and an optional `sink` on continuous registration
+    (`ContinuousSinkSpec`, plain + SQL entry points) that attaches the
+    contract to the job's task spec.
+  - `IcebergStreamingSink` (`krishiv-connectors::lakehouse::streaming_sink`,
+    feature `iceberg`) implements `TransactionalSinkParticipant`: cycle
+    output buffers in the open transaction, the checkpoint **barrier**
+    durably stages it as Parquet before the ack, the checkpoint-**complete**
+    notification commits covered epochs as Iceberg snapshots
+    (`fast_append`; source offsets in the snapshot summary), and **restore**
+    recover-commits ≤ epoch / aborts > epoch. Owns a background-shutdown
+    runtime so dropping a participant from async contexts (job eviction) is
+    safe.
+  - **Row-level ops**: `mode=upsert` replaces rows by key columns and
+    applies `delete` markers from an op column — copy-on-write
+    (read-merge-overwrite) because iceberg-rust 0.9.1 exposes no delete-file
+    write API; merge-on-read equality deletes arrive with the 0.10 bump
+    (#163).
+  - Executor wiring: `execute_loop_fragment` stages output + source offsets
+    into the job's `TwoPhaseSinkRegistry` participant; the existing
+    checkpoint lifecycle (`initiate_checkpoint_for_job` /
+    `handle_checkpoint_complete` / restore) drives commit with no further
+    changes. Built without the `iceberg` feature, an Iceberg-sink
+    assignment fails loudly instead of dropping output. The `local` preset
+    (prod build) now enables the executor's `iceberg` feature.
+  - G8 wiring evidence: `stream_loop_iceberg_sink_commits_on_checkpoint_
+    and_aborts_on_restore` drives two real window cycles through the loop
+    executor, commits epoch 1 via the checkpoint path, restores to epoch 1
+    (aborting epoch 2), and proves the reopened Iceberg table holds exactly
+    the epoch-1 rows. Participant-level recovery (reopen-after-crash,
+    monotonic epochs, offset summaries, upsert/delete) covered in
+    `streaming_sink` tests.
+
 ### Fixed
 
 - **IVM joins actually run incrementally from SQL** (#160, 2026-07-10).

@@ -347,6 +347,18 @@ pub trait TransactionalSinkParticipant: Send {
     /// Stage a batch into the open (pre-barrier) transaction buffer.
     fn stage(&mut self, batch: &arrow::record_batch::RecordBatch) -> ConnectorResult<()>;
 
+    /// Record the latest source offsets observed for the open buffer.
+    ///
+    /// Sinks that can bind source progress to committed output (e.g. Iceberg
+    /// snapshot summary properties) persist these at commit so recovery can
+    /// resume the source from the last visible write. Default: ignored.
+    fn stage_source_offsets(
+        &mut self,
+        _offsets: &std::collections::BTreeMap<String, i64>,
+    ) -> ConnectorResult<()> {
+        Ok(())
+    }
+
     /// Durably prepare the open buffer under `epoch`.
     ///
     /// `epoch` must be greater than every previously prepared epoch.

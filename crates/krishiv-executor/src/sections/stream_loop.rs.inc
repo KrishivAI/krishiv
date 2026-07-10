@@ -693,3 +693,153 @@ fn source_throttle_table_shared_across_runner_clones() {
     clone.source_throttle_limits.check_and_log("src-kafka-1");
     clone.source_throttle_limits.check_and_log("src-kafka-99");
 }
+
+/// G7/G8 wiring: a `stream:loop:` cycle whose assignment carries an
+/// `iceberg-sink:` output contract stages its window output into the job's
+/// checkpoint-aligned Iceberg participant, and the checkpoint lifecycle
+/// (barrier pre_commit → complete commit_through) makes it visible as an
+/// Iceberg snapshot. The restore leg aborts uncovered epochs.
+#[cfg(feature = "iceberg")]
+#[tokio::test]
+async fn stream_loop_iceberg_sink_commits_on_checkpoint_and_aborts_on_restore() {
+    use std::sync::Arc;
+
+    use krishiv_connectors::TransactionalSinkParticipant as _;
+    use krishiv_connectors::lakehouse::{
+        IcebergSinkMode, IcebergSinkTarget, IcebergStreamingSink, schema_version_from_arrow,
+    };
+
+    let table_dir = tempfile::tempdir().unwrap();
+    let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
+    let job = "loop-iceberg-job";
+    let fragment = format!("stream:loop:{job}|{window_spec}");
+    let contract = format!(
+        "iceberg-sink:{}|cycles|mode=append",
+        table_dir.path().display()
+    );
+
+    // Cycle 1 closes window [0,10000) via the event at ts=12000; cycle 2
+    // closes [10000,20000) via ts=25000 but is later rolled back by restore.
+    struct SeqDrainer {
+        inner: std::sync::Mutex<std::collections::VecDeque<Vec<RecordBatch>>>,
+    }
+    impl crate::ContinuousJobDrainer for SeqDrainer {
+        fn drain_job(&self, _job_id: &str) -> Result<Vec<RecordBatch>, String> {
+            Ok(self.inner.lock().unwrap().pop_front().unwrap_or_default())
+        }
+    }
+    let cycle1 = krishiv_common::test_fixtures::make_test_key_ts_batch(
+        vec!["a", "a"],
+        vec![100_i64, 12_000_i64],
+    )
+    .unwrap();
+    let cycle2 =
+        krishiv_common::test_fixtures::make_test_key_ts_batch(vec!["b"], vec![25_000_i64])
+            .unwrap();
+    let drainer = Arc::new(SeqDrainer {
+        inner: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+            vec![cycle1],
+            vec![cycle2],
+        ])),
+    });
+
+    let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
+        .with_continuous_drainer(drainer as Arc<dyn crate::ContinuousJobDrainer>);
+
+    let make_assignment = || {
+        let ids = TaskAttemptRef::new(
+            JobId::try_new(job).unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        ExecutorTaskAssignment::new(
+            ids,
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new(&fragment),
+            OutputContract::new(krishiv_proto::OutputContractKind::Sink, &contract),
+        )
+    };
+
+    // Cycle 1: window emitted AND staged into the registered participant.
+    let out1 = runner
+        .execute_streaming_fragment(&make_assignment())
+        .await
+        .expect("cycle 1 executes");
+    assert!(out1.row_count() > 0, "cycle 1 must close a window");
+    assert!(
+        runner.transaction_log.has_job(job),
+        "the iceberg sink participant must be registered on first cycle"
+    );
+
+    // Barrier epoch 1 (what initiate_checkpoint_for_job runs), then the
+    // checkpoint-complete notification (handle_checkpoint_complete).
+    let log = runner.transaction_log.clone();
+    let job_owned = job.to_owned();
+    tokio::task::spawn_blocking(move || {
+        log.pre_commit(&job_owned, 1).unwrap();
+        assert!(
+            log.commit_through(&job_owned, 1).unwrap() > 0,
+            "epoch 1 must commit staged output"
+        );
+    })
+    .await
+    .unwrap();
+
+    // Cycle 2 stages more output; epoch 2 is prepared but then restore-to-1
+    // rolls it back (recover-and-commit ≤1 / recover-and-abort >1).
+    let out2 = runner
+        .execute_streaming_fragment(&make_assignment())
+        .await
+        .expect("cycle 2 executes");
+    assert!(out2.row_count() > 0, "cycle 2 must close the second window");
+    let log = runner.transaction_log.clone();
+    let job_owned = job.to_owned();
+    tokio::task::spawn_blocking(move || {
+        log.pre_commit(&job_owned, 2).unwrap();
+        let (committed, aborted) = log.restore_to(&job_owned, 1).unwrap();
+        assert_eq!(committed, 0, "epoch ≤1 already committed");
+        assert!(aborted > 0, "epoch 2 must be rolled back on restore");
+    })
+    .await
+    .unwrap();
+
+    // The Iceberg table holds exactly the epoch-1 output: reopen from disk
+    // (fresh sink over the same root) and count committed rows.
+    let expected = out1.row_count();
+    let committed_rows = tokio::task::spawn_blocking(move || {
+        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "placeholder",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]);
+        // Schema only matters at creation; the table already exists on disk.
+        let sv = schema_version_from_arrow(&schema, None).unwrap();
+        let sink = IcebergStreamingSink::open(
+            IcebergSinkTarget {
+                root: table_dir.path().to_path_buf(),
+                table: "cycles".into(),
+                mode: IcebergSinkMode::Append,
+                key_columns: vec![],
+                op_column: None,
+            },
+            sv,
+        )
+        .unwrap();
+        let rows: usize = sink
+            .read_committed()
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        rows
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        committed_rows, expected,
+        "iceberg table must contain exactly the committed epoch-1 window rows \
+         (epoch 2 was aborted by restore)"
+    );
+}

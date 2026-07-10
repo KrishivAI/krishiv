@@ -20,6 +20,9 @@ mod local_delta;
 #[cfg(feature = "iceberg")]
 pub mod maintenance;
 mod partition_spec;
+/// G7: checkpoint-aligned streaming Iceberg sink (append + row-level upsert).
+#[cfg(feature = "iceberg")]
+pub mod streaming_sink;
 /// P12: Streaming Lakehouse Unification — unified streaming source/sink over Delta, Hudi, Paimon.
 pub mod streaming_unify;
 mod two_phase;
@@ -48,6 +51,10 @@ pub use local_delta::{
     DeltaStageHandle, LocalDeltaTwoPhaseCommitSink, read_table_at_timestamp, vacuum_table,
 };
 pub use partition_spec::{PartitionField, PartitionSpecResolver, PartitionSpecVersion};
+#[cfg(feature = "iceberg")]
+pub use streaming_sink::{
+    IcebergSinkMode, IcebergSinkTarget, IcebergStreamingSink, schema_version_from_arrow,
+};
 pub use two_phase::{
     DistributedIcebergCommitCoordinator, IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY,
     MemoryIcebergTwoPhaseCommit, StagedSnapshot, kafka_offsets_json, parse_kafka_offsets_json,

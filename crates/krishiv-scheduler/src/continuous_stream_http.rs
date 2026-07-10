@@ -35,6 +35,61 @@ fn scheduler_status(error: &SchedulerError) -> StatusCode {
 pub struct ContinuousRegisterRequest {
     pub job_id: String,
     pub spec: WindowExecutionSpec,
+    /// Optional streaming Iceberg sink (G7): cycle output is staged under
+    /// checkpoint epochs and committed by the checkpoint lifecycle.
+    #[serde(default)]
+    pub sink: Option<ContinuousSinkSpec>,
+}
+
+/// Streaming Iceberg sink target for a continuous job (G7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuousSinkSpec {
+    /// Local table root directory on the executor host.
+    pub root: String,
+    /// Iceberg table name inside the root.
+    pub table: String,
+    /// `append` (default) or `upsert`.
+    #[serde(default = "default_sink_mode")]
+    pub mode: String,
+    /// Key columns identifying a logical row (required for upsert).
+    #[serde(default)]
+    pub key_columns: Vec<String>,
+    /// Optional column carrying per-row ops (`upsert`/`delete`).
+    #[serde(default)]
+    pub op_column: Option<String>,
+}
+
+fn default_sink_mode() -> String {
+    String::from("append")
+}
+
+impl ContinuousSinkSpec {
+    /// Build the validated string sink contract
+    /// (`iceberg-sink:<root>|<table>|mode=...`) carried on the task spec.
+    fn contract_string(&self) -> crate::SchedulerResult<String> {
+        let mut contract = format!(
+            "{}{}|{}|mode={}",
+            krishiv_proto::ICEBERG_SINK_PREFIX,
+            self.root,
+            self.table,
+            self.mode
+        );
+        if !self.key_columns.is_empty() {
+            contract.push_str(&format!("|keys={}", self.key_columns.join(",")));
+        }
+        if let Some(op) = &self.op_column {
+            contract.push_str(&format!("|op={op}"));
+        }
+        // Validate through the shared parser so a malformed spec is rejected
+        // at registration instead of failing every cycle on the executor.
+        match krishiv_proto::OutputContractDescriptor::parse_iceberg_sink(&contract) {
+            Some(Ok(_)) => Ok(contract),
+            Some(Err(message)) => Err(SchedulerError::InvalidJob { message }),
+            None => Err(SchedulerError::InvalidJob {
+                message: "iceberg sink contract failed to round-trip".into(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -170,8 +225,14 @@ pub async fn api_continuous_register(
     let fragment = TypedTaskFragment::new(ExecutionKind::Streaming, loop_fragment)
         .encode()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let stage = StageSpec::new(stage_id, "continuous-streaming")
-        .with_task(TaskSpec::new(task_id, fragment));
+    let mut task = TaskSpec::new(task_id, fragment);
+    if let Some(sink) = &body.sink {
+        let contract = sink
+            .contract_string()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        task = task.with_sink_contract(contract);
+    }
+    let stage = StageSpec::new(stage_id, "continuous-streaming").with_task(task);
     let spec =
         JobSpec::new(job_id.clone(), "continuous-streaming", JobKind::Streaming).with_stage(stage);
 
@@ -194,6 +255,9 @@ pub struct ContinuousRegisterSqlRequest {
     /// A windowed streaming query:
     /// `SELECT key, AGG(col) FROM TUMBLE(TABLE src, DESCRIPTOR(ts), <ms>) GROUP BY key`.
     pub sql: String,
+    /// Optional streaming Iceberg sink (G7).
+    #[serde(default)]
+    pub sink: Option<ContinuousSinkSpec>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,7 +280,7 @@ pub async fn api_continuous_register_sql(
             tracing::warn!(error = %error, "continuous-register-sql: compile failed");
             StatusCode::BAD_REQUEST
         })?;
-    register_continuous_stream_coordinated(&coordinator, &body.job_id, &plan.spec)
+    register_continuous_stream_with_sink(&coordinator, &body.job_id, &plan.spec, body.sink.as_ref())
         .await
         .map_err(|error| match error {
             ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
@@ -547,6 +611,18 @@ pub async fn register_continuous_stream_coordinated(
     job_id: &str,
     spec: &krishiv_plan::window::WindowExecutionSpec,
 ) -> Result<(), ContinuousStreamError> {
+    register_continuous_stream_with_sink(coordinator, job_id, spec, None).await
+}
+
+/// Register a continuous streaming job, optionally attaching a streaming
+/// Iceberg sink contract (G7) so cycle output lands in an Iceberg table
+/// under checkpoint-aligned two-phase commit.
+pub async fn register_continuous_stream_with_sink(
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    spec: &krishiv_plan::window::WindowExecutionSpec,
+    sink: Option<&ContinuousSinkSpec>,
+) -> Result<(), ContinuousStreamError> {
     use krishiv_plan::window::encode_window_execution_spec;
     use krishiv_plan::{ExecutionKind, TypedTaskFragment};
     use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
@@ -579,8 +655,14 @@ pub async fn register_continuous_stream_coordinated(
                 message: e.to_string(),
             })
         })?;
-    let stage = StageSpec::new(stage_id, "continuous-streaming")
-        .with_task(TaskSpec::new(task_id, fragment));
+    let mut task = TaskSpec::new(task_id, fragment);
+    if let Some(sink) = sink {
+        let contract = sink
+            .contract_string()
+            .map_err(ContinuousStreamError::Scheduler)?;
+        task = task.with_sink_contract(contract);
+    }
+    let stage = StageSpec::new(stage_id, "continuous-streaming").with_task(task);
     let job_spec = JobSpec::new(
         job_id_typed.clone(),
         "continuous-streaming",
@@ -951,6 +1033,7 @@ mod tests {
         let register_req = ContinuousRegisterRequest {
             job_id: "cs-test-job".to_string(),
             spec: tumbling_spec(),
+            sink: None,
         };
         let response = api_continuous_register(State(coordinator.clone()), Json(register_req))
             .await
@@ -1002,6 +1085,7 @@ mod tests {
             Json(ContinuousRegisterRequest {
                 job_id: "cs-list-job".into(),
                 spec: tumbling_spec(),
+                sink: None,
             }),
         )
         .await
@@ -1063,6 +1147,7 @@ mod tests {
         let register_req = ContinuousRegisterRequest {
             job_id: "cs-push-job".to_string(),
             spec: tumbling_spec(),
+            sink: None,
         };
         let _ = api_continuous_register(State(coordinator.clone()), Json(register_req))
             .await
@@ -1091,6 +1176,7 @@ mod tests {
             Json(ContinuousRegisterRequest {
                 job_id: "cs-restore-job".into(),
                 spec: tumbling_spec(),
+                sink: None,
             }),
         )
         .await
@@ -1167,6 +1253,7 @@ mod tests {
             Json(ContinuousRegisterRequest {
                 job_id: "cs-in-process-job".into(),
                 spec: tumbling_spec(),
+                sink: None,
             }),
         )
         .await
@@ -1196,6 +1283,7 @@ mod tests {
         let req = ContinuousRegisterRequest {
             job_id: "".to_string(), // empty id is invalid
             spec: tumbling_spec(),
+            sink: None,
         };
         let result = api_continuous_register(State(coordinator.clone()), Json(req)).await;
         assert!(result.is_err(), "empty job_id must be rejected");
@@ -1212,6 +1300,7 @@ mod tests {
             Json(ContinuousRegisterRequest {
                 job_id: "cs-invalid-window".into(),
                 spec,
+                sink: None,
             }),
         )
         .await
@@ -1235,6 +1324,7 @@ mod tests {
         let request = || ContinuousRegisterRequest {
             job_id: "cs-idempotent-job".to_string(),
             spec: tumbling_spec(),
+            sink: None,
         };
         let first = api_continuous_register(State(coordinator.clone()), Json(request()))
             .await
@@ -1265,6 +1355,7 @@ mod tests {
         let first = ContinuousRegisterRequest {
             job_id: "cs-replace-job".to_string(),
             spec: tumbling_spec(),
+            sink: None,
         };
         let _ = api_continuous_register(State(coordinator.clone()), Json(first))
             .await
@@ -1275,6 +1366,7 @@ mod tests {
         let second = ContinuousRegisterRequest {
             job_id: "cs-replace-job".to_string(),
             spec: changed.clone(),
+            sink: None,
         };
         let resp = api_continuous_register(State(coordinator.clone()), Json(second))
             .await
@@ -1317,6 +1409,7 @@ mod tests {
             Json(ContinuousRegisterRequest {
                 job_id: "cs-collision-id".to_string(),
                 spec: tumbling_spec(),
+                sink: None,
             }),
         )
         .await
@@ -1336,6 +1429,7 @@ mod tests {
             Json(ContinuousRegisterRequest {
                 job_id: "cs-dereg-fresh".into(),
                 spec: tumbling_spec(),
+                sink: None,
             }),
         )
         .await
@@ -1390,6 +1484,7 @@ mod tests {
             Json(ContinuousRegisterRequest {
                 job_id: "cs-busy-job".into(),
                 spec: tumbling_spec(),
+                sink: None,
             }),
         )
         .await
@@ -1418,6 +1513,7 @@ mod tests {
             Json(ContinuousRegisterRequest {
                 job_id: "cs-cycle-job".into(),
                 spec: tumbling_spec(),
+                sink: None,
             }),
         )
         .await
@@ -1512,6 +1608,7 @@ mod tests {
             Json(ContinuousRegisterRequest {
                 job_id: "cs-lost-job".into(),
                 spec: tumbling_spec(),
+                sink: None,
             }),
         )
         .await
@@ -1577,6 +1674,7 @@ mod tests {
             Json(ContinuousRegisterRequest {
                 job_id: "cs-reassign-job".into(),
                 spec: tumbling_spec(),
+                sink: None,
             }),
         )
         .await

@@ -1145,7 +1145,63 @@ pub enum OutputContractDescriptor {
     },
     /// Write Parquet to a local path through the connector sink.
     ParquetSink { path: String },
+    /// Stream continuous-cycle output into an Iceberg table through the
+    /// checkpoint-aligned two-phase commit registry (G7).
+    ///
+    /// Output produced between checkpoint barriers accumulates in the sink's
+    /// open transaction buffer; the barrier stages it durably under the
+    /// checkpoint epoch and the checkpoint-complete notification makes it
+    /// visible as an Iceberg snapshot.
+    IcebergSink {
+        /// Local table root directory (contains `data/` + `metadata/`).
+        root: String,
+        /// Iceberg table name inside the root.
+        table: String,
+        /// Row-level semantics applied at commit.
+        mode: IcebergSinkMode,
+        /// Key columns identifying a logical row (upsert mode only).
+        key_columns: Vec<String>,
+        /// Optional column carrying per-row ops (`upsert` default, `delete`).
+        /// The column is stripped before rows reach the table.
+        op_column: Option<String>,
+    },
 }
+
+/// Row-level write semantics for a streaming Iceberg sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcebergSinkMode {
+    /// Every committed epoch appends its rows (`fast_append`).
+    Append,
+    /// Committed rows replace existing rows with equal key columns;
+    /// rows marked `delete` in the op column remove matching keys.
+    Upsert,
+}
+
+impl IcebergSinkMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Upsert => "upsert",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "append" => Some(Self::Append),
+            "upsert" => Some(Self::Upsert),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for IcebergSinkMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Description prefix for the legacy string form of an Iceberg sink contract.
+pub const ICEBERG_SINK_PREFIX: &str = "iceberg-sink:";
 
 impl OutputContractDescriptor {
     /// Build a legacy-compatible human-readable output descriptor.
@@ -1159,7 +1215,96 @@ impl OutputContractDescriptor {
                 object_path,
             } => format!("object-parquet-sink:{base_dir}:{object_path}"),
             Self::ParquetSink { path } => format!("parquet-sink:{path}"),
+            Self::IcebergSink {
+                root,
+                table,
+                mode,
+                key_columns,
+                op_column,
+            } => {
+                let mut out = format!("{ICEBERG_SINK_PREFIX}{root}|{table}|mode={mode}");
+                if !key_columns.is_empty() {
+                    out.push_str(&format!("|keys={}", key_columns.join(",")));
+                }
+                if let Some(op) = op_column {
+                    out.push_str(&format!("|op={op}"));
+                }
+                out
+            }
         }
+    }
+
+    /// Parse the legacy string form of an Iceberg sink contract
+    /// (`iceberg-sink:<root>|<table>|mode=<append|upsert>[|keys=a,b][|op=col]`).
+    ///
+    /// `|` separates fields because table roots are filesystem paths and may
+    /// contain `:`. Returns `None` when `description` does not carry the
+    /// prefix; returns an error string when it does but is malformed, so
+    /// callers can fail the task instead of silently discarding output.
+    pub fn parse_iceberg_sink(description: &str) -> Option<Result<Self, String>> {
+        let payload = description.trim().strip_prefix(ICEBERG_SINK_PREFIX)?;
+        let mut parts = payload.split('|');
+        let root = match parts.next().map(str::trim) {
+            Some(r) if !r.is_empty() => r.to_owned(),
+            _ => return Some(Err("iceberg-sink contract missing table root".into())),
+        };
+        let table = match parts.next().map(str::trim) {
+            Some(t) if !t.is_empty() => t.to_owned(),
+            _ => return Some(Err("iceberg-sink contract missing table name".into())),
+        };
+        let mut mode = None;
+        let mut key_columns = Vec::new();
+        let mut op_column = None;
+        for field in parts {
+            let field = field.trim();
+            if field.is_empty() {
+                continue;
+            }
+            let Some((k, v)) = field.split_once('=') else {
+                return Some(Err(format!(
+                    "iceberg-sink contract field '{field}' must be key=value"
+                )));
+            };
+            match k.trim() {
+                "mode" => match IcebergSinkMode::parse(v) {
+                    Some(m) => mode = Some(m),
+                    None => {
+                        return Some(Err(format!(
+                            "iceberg-sink mode '{v}' must be append or upsert"
+                        )));
+                    }
+                },
+                "keys" => {
+                    key_columns = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
+                "op" => op_column = Some(v.trim().to_owned()),
+                other => {
+                    return Some(Err(format!(
+                        "unknown iceberg-sink contract field '{other}'"
+                    )));
+                }
+            }
+        }
+        let Some(mode) = mode else {
+            return Some(Err("iceberg-sink contract missing mode field".into()));
+        };
+        if mode == IcebergSinkMode::Upsert && key_columns.is_empty() {
+            return Some(Err(
+                "iceberg-sink upsert mode requires at least one key column".into(),
+            ));
+        }
+        Some(Ok(Self::IcebergSink {
+            root,
+            table,
+            mode,
+            key_columns,
+            op_column,
+        }))
     }
 }
 

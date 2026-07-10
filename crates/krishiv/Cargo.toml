@@ -37,7 +37,7 @@ default = ["local"]
 
 # Build presets
 minimal = []
-local   = ["embedded", "single-node", "jemalloc", "rest-catalog"]
+local   = ["embedded", "single-node", "jemalloc", "rest-catalog", "iceberg"]
 full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "jemalloc"]
 
 # Deployment capability surfaces (gate optional dep families)
@@ -59,7 +59,7 @@ kafka = ["krishiv-connectors/kafka"]
 state = ["krishiv-connectors/state"]
 # krishiv-sql no longer enables Iceberg by default, so the binary's iceberg
 # preset must re-enable it on the SQL layer to keep full/k8s builds unchanged.
-iceberg = ["krishiv-connectors/iceberg", "krishiv-sql/iceberg"]
+iceberg = ["krishiv-connectors/iceberg", "krishiv-sql/iceberg", "krishiv-executor/iceberg"]
 delta = ["krishiv-connectors/delta"]
 # jemalloc: replace the system allocator with jemalloc for lower contention and
 # smaller RSS on multi-threaded workloads. Enabled in all non-minimal presets.

@@ -1446,6 +1446,21 @@ fn output_contract_descriptor_to_wire(
             path: path.clone(),
             ..Default::default()
         },
+        OutputContractDescriptor::IcebergSink {
+            root,
+            table,
+            mode,
+            key_columns,
+            op_column,
+        } => v1::OutputContractDescriptor {
+            kind: v1::OutputContractDescriptorKind::IcebergSink as i32,
+            iceberg_root: root.clone(),
+            iceberg_table: table.clone(),
+            iceberg_mode: mode.as_str().to_owned(),
+            iceberg_key_columns: key_columns.clone(),
+            iceberg_op_column: op_column.clone().unwrap_or_default(),
+            ..Default::default()
+        },
     }
 }
 
@@ -1487,6 +1502,23 @@ fn output_contract_descriptor_from_wire(
         v1::OutputContractDescriptorKind::ParquetSink => {
             require_non_empty(&value.path, "parquet sink path")?;
             Ok(OutputContractDescriptor::ParquetSink { path: value.path })
+        }
+        v1::OutputContractDescriptorKind::IcebergSink => {
+            require_non_empty(&value.iceberg_root, "iceberg sink table root")?;
+            require_non_empty(&value.iceberg_table, "iceberg sink table name")?;
+            let mode = crate::IcebergSinkMode::parse(&value.iceberg_mode).ok_or_else(|| {
+                WireError::new(format!(
+                    "iceberg sink mode '{}' must be append or upsert",
+                    value.iceberg_mode
+                ))
+            })?;
+            Ok(OutputContractDescriptor::IcebergSink {
+                root: value.iceberg_root,
+                table: value.iceberg_table,
+                mode,
+                key_columns: value.iceberg_key_columns,
+                op_column: non_empty_string(value.iceberg_op_column),
+            })
         }
     }
 }

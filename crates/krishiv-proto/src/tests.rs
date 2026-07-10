@@ -170,6 +170,75 @@ mod proto_tests {
     }
 
     #[test]
+    fn iceberg_sink_descriptor_round_trips_through_wire_contract() {
+        let descriptor = OutputContractDescriptor::IcebergSink {
+            root: String::from("/var/lib/krishiv/tables/orders"),
+            table: String::from("orders_live"),
+            mode: crate::IcebergSinkMode::Upsert,
+            key_columns: vec![String::from("window_start"), String::from("key")],
+            op_column: Some(String::from("__op")),
+        };
+        let ids = TaskAttemptRef::new(
+            JobId::try_new("job-iceberg").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        let assignment = ExecutorTaskAssignment::new(
+            ids,
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("stream:loop:job-iceberg|stream:tw:..."),
+            OutputContract::typed(OutputContractKind::Sink, descriptor.clone()),
+        );
+
+        let wire = crate::wire::executor_task_assignment_to_wire(assignment.clone()).unwrap();
+        let round_trip = crate::wire::executor_task_assignment_from_wire(wire).unwrap();
+        assert_eq!(round_trip, assignment);
+
+        // The legacy description parses back to the same typed descriptor, so
+        // string-form sink contracts (TaskSpec::with_sink_contract) stay
+        // equivalent to the typed path.
+        let reparsed = OutputContractDescriptor::parse_iceberg_sink(
+            round_trip.output_contract().description(),
+        )
+        .expect("description carries the iceberg-sink prefix")
+        .expect("well-formed contract");
+        assert_eq!(reparsed, descriptor);
+    }
+
+    #[test]
+    fn iceberg_sink_legacy_parse_rejects_malformed_contracts() {
+        // Upsert without keys is invalid.
+        assert!(
+            OutputContractDescriptor::parse_iceberg_sink("iceberg-sink:/r|t|mode=upsert")
+                .unwrap()
+                .is_err()
+        );
+        // Missing mode is invalid.
+        assert!(
+            OutputContractDescriptor::parse_iceberg_sink("iceberg-sink:/r|t")
+                .unwrap()
+                .is_err()
+        );
+        // Non-iceberg contracts are None, not an error.
+        assert!(
+            OutputContractDescriptor::parse_iceberg_sink("object-parquet-sink:/a:/b").is_none()
+        );
+        // Append without keys is fine.
+        let ok = OutputContractDescriptor::parse_iceberg_sink("iceberg-sink:/r|t|mode=append")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            ok,
+            OutputContractDescriptor::IcebergSink {
+                mode: crate::IcebergSinkMode::Append,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn executor_task_assignment_distinguishes_missing_and_zero_key_group_range() {
         let ids = TaskAttemptRef::new(
             JobId::try_new("job-kg-zero").unwrap(),

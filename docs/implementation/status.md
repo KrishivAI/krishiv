@@ -1,5 +1,51 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 (night) — G7 CLOSED: checkpoint-aligned streaming Iceberg sink + row-level ops (#89); G8 wiring certified single-executor
+
+Session 70fb3928, same leg as #160 below. Continuous `stream:loop:` jobs can
+now land cycle output into an Iceberg table under two-phase commit aligned
+to the G5 checkpoint boundary — the missing piece the platformd kafka_bridge
+existed to work around (see platform ADR-0021 deviation note).
+
+**What shipped** (see CHANGELOG for detail):
+- `OutputContractDescriptor::IcebergSink` — typed descriptor + proto wire
+  fields (kind 6) + legacy `iceberg-sink:<root>|<table>|mode=…` string form
+  with a shared validating parser; round-trip pins in krishiv-proto tests.
+- `IcebergStreamingSink` (connectors, feature `iceberg`): a
+  `TransactionalSinkParticipant` over `IcebergNativeTwoPhaseCommit`.
+  Barrier stages open buffer as durable Parquet BEFORE the checkpoint ack;
+  complete commits covered epochs (fast_append, source offsets in snapshot
+  summary via new trait default method `stage_source_offsets`); restore
+  recover-commits ≤ epoch and aborts > epoch (staged files deleted).
+  Row-level `upsert`/`delete` via key columns + op column, copy-on-write
+  (MoR equality deletes blocked on iceberg-rust 0.10, #163). Runtime drop
+  is `shutdown_background()` — dropping a participant from an async context
+  (job eviction) must not panic (found by the wiring test).
+- `iceberg_native` refactor: public `stage_parquet` (sync staging),
+  retry-safe `append_data_files`, `read_all` (scan → parquet read);
+  prepare/commit now delegate to them.
+- Executor: `execute_loop_fragment` stages cycle output + checkpoint source
+  offsets into the job's `TwoPhaseSinkRegistry` participant
+  (spawn_blocking; open-on-first-cycle). The EXISTING checkpoint lifecycle
+  drives commit — zero changes to barrier/complete/restore paths. New
+  executor feature `iceberg`, enabled by the `local` (prod) preset.
+- Scheduler: continuous registration (plain + SQL) accepts optional
+  `sink: ContinuousSinkSpec`; contract validated at registration and
+  attached via `TaskSpec::with_sink_contract` (both the axum handler and
+  `register_continuous_stream_with_sink`).
+
+**Validation**: krishiv-proto 84, krishiv-scheduler 384, krishiv-connectors
+(+iceberg) 350, krishiv-executor (+iceberg) 235 — all green. Headline test:
+`stream_loop_iceberg_sink_commits_on_checkpoint_and_aborts_on_restore`
+(two real window cycles → epoch-1 commit via checkpoint path → restore
+aborts epoch 2 → reopened table holds exactly epoch-1 rows).
+
+**G8 status**: wiring + recovery semantics certified at single-executor
+level; the distributed-durable LIVE leg (kafka → window → iceberg on k3s
+with executor kills, à la G5 #77) still pending — needs a prod/e2e cluster
+exercise on the next engine deploy. #92/#93 (platform labels from
+capability metadata, replay backfill) remain open.
+
 ## 2026-07-10 (later) — #160 incremental join state: SQL joins were NEVER O(Δ); traces now checkpoint losslessly; multiset snapshots
 
 Session 70fb3928 (took ownership of the engine leg; the June-21 agent

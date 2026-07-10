@@ -99,8 +99,9 @@ pub use ivm_http::{IvmRouterState, ivm_router};
 pub use unified_jobs_http::api_unified_submit;
 pub(crate) mod rocksdb_metadata;
 pub use continuous_stream_http::{
-    ContinuousStreamError, drain_continuous_stream_coordinated, push_continuous_input_coordinated,
-    register_continuous_stream_coordinated, restore_continuous_stream_coordinated,
+    ContinuousSinkSpec, ContinuousStreamError, drain_continuous_stream_coordinated,
+    push_continuous_input_coordinated, register_continuous_stream_coordinated,
+    register_continuous_stream_with_sink, restore_continuous_stream_coordinated,
 };
 pub use grpc::{
     CoordinatorExecutorGrpcService, CoordinatorExecutorTonicService,

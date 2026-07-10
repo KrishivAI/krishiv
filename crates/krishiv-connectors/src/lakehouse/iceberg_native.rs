@@ -139,6 +139,166 @@ pub mod native {
             write_version_hint(&self.root, metadata_location)
         }
 
+        /// Durably stage `batches` as one Parquet file under `{root}/data/`
+        /// and return its `DataFile` descriptor plus the staged path.
+        ///
+        /// Synchronous (plain file I/O) so checkpoint-aligned sinks can stage
+        /// from blocking contexts. The staged file is invisible to readers
+        /// until its `DataFile` is committed via [`Self::append_data_files`];
+        /// an uncommitted staged file is an orphan cleaned by VACUUM.
+        pub fn stage_parquet(
+            &self,
+            batches: &[RecordBatch],
+        ) -> Result<(PathBuf, iceberg::spec::DataFile), LakehouseError> {
+            let staged_id = self.snap_counter.fetch_add(1, Ordering::Relaxed);
+            let file_name = format!("staged-{staged_id:016x}.parquet");
+            let parquet_path = self.root.join("data").join(&file_name);
+            let tmp_path = self.root.join("data").join(format!(".{file_name}.tmp"));
+
+            let (record_count, file_size) = write_parquet_and_measure(&tmp_path, batches)?;
+
+            fs::rename(&tmp_path, &parquet_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            #[cfg(unix)]
+            {
+                if let Ok(dir) = fs::File::open(self.root.join("data")) {
+                    let _ = dir.sync_all();
+                }
+            }
+
+            let file_uri = path_to_uri(&parquet_path)?;
+            let data_file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(file_uri)
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(file_size)
+                .record_count(record_count)
+                .partition(Struct::empty())
+                .partition_spec_id(0)
+                .build()
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+            Ok((parquet_path, data_file))
+        }
+
+        /// Atomically commit already-staged data files via
+        /// `Transaction::fast_append`, embedding `kafka_offsets` in the
+        /// snapshot summary. Retry-safe: the caller keeps the `DataFile`
+        /// descriptors until this returns `Ok`, so a failed transaction can
+        /// simply be retried with the same files.
+        pub async fn append_data_files(
+            &self,
+            data_files: Vec<iceberg::spec::DataFile>,
+            kafka_offsets: BTreeMap<String, i64>,
+        ) -> Result<i64, LakehouseError> {
+            if data_files.is_empty() {
+                let table = self
+                    .catalog
+                    .load_table(&self.ident)
+                    .await
+                    .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+                return Ok(table
+                    .metadata()
+                    .current_snapshot()
+                    .map(|s| s.snapshot_id())
+                    .unwrap_or(0));
+            }
+
+            let mut snap_props: HashMap<String, String> = kafka_offsets
+                .iter()
+                .map(|(k, v)| (format!("krishiv.kafka.offset.{k}"), v.to_string()))
+                .collect();
+            snap_props.insert(
+                KAFKA_OFFSETS_SUMMARY_KEY.to_string(),
+                kafka_offsets_json(&kafka_offsets),
+            );
+
+            let table = self
+                .catalog
+                .load_table(&self.ident)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+            let tx = Transaction::new(&table);
+            let action = tx
+                .fast_append()
+                .add_data_files(data_files)
+                .set_snapshot_properties(snap_props);
+            let tx = action
+                .apply(tx)
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+            let committed = tx
+                .commit(&*self.catalog)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+            // Best-effort recovery hint; the commit above is already durable.
+            if let Some(loc) = committed.metadata_location()
+                && let Err(e) = self.update_version_hint(loc)
+            {
+                tracing::warn!(
+                    table = %self.ident,
+                    location = loc,
+                    error = %e,
+                    "version hint update failed after successful commit; \
+                     hint file may be stale — data is durable in the catalog"
+                );
+            }
+
+            committed
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id())
+                .ok_or_else(|| LakehouseError::Concurrency {
+                    message: "snapshot id missing after commit".to_string(),
+                })
+        }
+
+        /// Read every data file of the current snapshot into Arrow batches.
+        ///
+        /// Returns an empty vec for an empty table. Used by the streaming
+        /// sink's copy-on-write row-level path (upsert/delete).
+        pub async fn read_all(&self) -> Result<Vec<RecordBatch>, LakehouseError> {
+            use futures::TryStreamExt as _;
+
+            let table = self
+                .catalog
+                .load_table(&self.ident)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            if table.metadata().current_snapshot().is_none() {
+                return Ok(vec![]);
+            }
+            let scan = table
+                .scan()
+                .build()
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            let tasks: Vec<iceberg::scan::FileScanTask> = scan
+                .plan_files()
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?
+                .try_collect()
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+            let mut batches = Vec::new();
+            for task in tasks {
+                let path = task.data_file_path();
+                let local = path.strip_prefix("file://").unwrap_or(path);
+                let file =
+                    fs::File::open(local).map_err(|e| LakehouseError::Io(e.to_string()))?;
+                let reader =
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                        .map_err(|e| LakehouseError::Io(e.to_string()))?
+                        .build()
+                        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                for batch in reader {
+                    batches.push(batch.map_err(|e| LakehouseError::Io(e.to_string()))?);
+                }
+            }
+            Ok(batches)
+        }
+
         /// Atomically replace all table data with `batches`.
         ///
         /// Implemented via catalog drop-and-recreate followed by `prepare`+`commit`
@@ -290,9 +450,8 @@ pub mod native {
             &self,
             batches: Vec<RecordBatch>,
         ) -> Result<StagedSnapshot, LakehouseError> {
-            let staged_id = self.snap_counter.fetch_add(1, Ordering::Relaxed);
-
             if batches.is_empty() {
+                let staged_id = self.snap_counter.fetch_add(1, Ordering::Relaxed);
                 self.pending
                     .lock()
                     .await
@@ -303,32 +462,10 @@ pub mod native {
                 });
             }
 
-            let file_name = format!("staged-{staged_id:016x}.parquet");
-            let parquet_path = self.root.join("data").join(&file_name);
-            let tmp_path = self.root.join("data").join(format!(".{file_name}.tmp"));
-
-            let (record_count, file_size) = write_parquet_and_measure(&tmp_path, &batches)?;
-
-            fs::rename(&tmp_path, &parquet_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-            #[cfg(unix)]
-            {
-                if let Ok(dir) = fs::File::open(self.root.join("data")) {
-                    let _ = dir.sync_all();
-                }
-            }
-
-            let file_uri = path_to_uri(&parquet_path)?;
-
-            let data_file = DataFileBuilder::default()
-                .content(DataContentType::Data)
-                .file_path(file_uri)
-                .file_format(DataFileFormat::Parquet)
-                .file_size_in_bytes(file_size)
-                .record_count(record_count)
-                .partition(Struct::empty())
-                .partition_spec_id(0)
-                .build()
-                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+            let (_, data_file) = self.stage_parquet(&batches)?;
+            // stage_parquet consumed one counter value for the file name; take
+            // a fresh one as the pending-map key so ids stay unique.
+            let staged_id = self.snap_counter.fetch_add(1, Ordering::Relaxed);
 
             self.pending.lock().await.insert(
                 staged_id,
@@ -376,58 +513,8 @@ pub mod native {
                     .unwrap_or(0));
             }
 
-            // Encode kafka offsets as snapshot summary properties.
-            let mut snap_props: HashMap<String, String> = kafka_offsets
-                .iter()
-                .map(|(k, v)| (format!("krishiv.kafka.offset.{k}"), v.to_string()))
-                .collect();
-            snap_props.insert(
-                KAFKA_OFFSETS_SUMMARY_KEY.to_string(),
-                kafka_offsets_json(&kafka_offsets),
-            );
-
-            let table = self
-                .catalog
-                .load_table(&self.ident)
+            self.append_data_files(entry.data_files, kafka_offsets)
                 .await
-                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-
-            let tx = Transaction::new(&table);
-            let action = tx
-                .fast_append()
-                .add_data_files(entry.data_files)
-                .set_snapshot_properties(snap_props);
-            let tx = action
-                .apply(tx)
-                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-
-            let committed = tx
-                .commit(&*self.catalog)
-                .await
-                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
-
-            // Persist the new metadata location as a best-effort recovery hint.
-            // The transaction is already committed and durable in the catalog;
-            // a hint-write failure must not surface as a commit failure.
-            if let Some(loc) = committed.metadata_location()
-                && let Err(e) = self.update_version_hint(loc)
-            {
-                tracing::warn!(
-                    table = %self.ident,
-                    location = loc,
-                    error = %e,
-                    "version hint update failed after successful commit; \
-                     hint file may be stale — data is durable in the catalog"
-                );
-            }
-
-            committed
-                .metadata()
-                .current_snapshot()
-                .map(|s| s.snapshot_id())
-                .ok_or_else(|| LakehouseError::Concurrency {
-                    message: "snapshot id missing after commit".to_string(),
-                })
         }
 
         /// Discard a staged snapshot.  The Parquet file remains on disk as an
