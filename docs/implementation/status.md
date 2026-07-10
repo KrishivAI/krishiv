@@ -1,5 +1,40 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 (day, follow-up) — production-readiness audit → Track 6 plan (platform phases 51–60)
+
+User-directed pivot before Phase 31: full code-grounded audit of the engine
+for the production-readiness arc. New document:
+**`docs/implementation/production-readiness-audit-2026-07.md`** — components,
+execution flow, all three engines × three placements, all API surfaces,
+with file:line evidence. Headline findings (all re-verified in code today):
+
+- **Distributed batch SQL is one stage / one task** (`batch_sql.rs`
+  `stage-sql`/`task-sql`) — executors add nothing to a single query; the
+  exchange-staging path exists but creates a task per plan *node* and the
+  SQL translation lowers operators to display strings the executor can't run.
+- **Scheduler algorithms parked in `cfg(test)`**: `LocalityScheduler`,
+  `FairScheduler` (weights dead inside its own loop), `key_group_range_for_task`.
+- **Distributed streaming = exactly one `stream:loop` task per job**; barrier
+  pipeline runs in production with zero live consumers; continuous two-input
+  join rebuilds its operator every cycle.
+- **IVM**: AUD-6 (16 MiB offload cliff, full-state round trip), AUD-7
+  remainder (string group keys), AUD-8 (`concat_batches` growth;
+  `register_lateness` still zero callers), AUD-9 (coverage) re-confirmed open.
+- Incremental checkpoints / DFS state backend / rescaling built in
+  `krishiv-state`, unwired. Coordinator HA behind `etcd` feature, default
+  `single`. `test-python` CI not blocking (the `1694143` compile break proves it).
+
+The plan derived from this lives in the **platform repo**: Track 6, phases
+51–60 (`docs/implementation/phases/phase-51…60`, `plan.md`): 51 baseline
+(wire-or-delete + version train + correctness corpus) → 52 partition-parallel
+batch → 53 scheduler v2 → 54 AQE → 55 key-group parallel streaming →
+56 incremental/disaggregated state → 57 IVM scale-out → 58 HA/fault-tolerance
+GA → 59 interfaces → 60 engine GA gate. SOTA grounding: Ballista 53
+architecture, Flink 2.0 ForSt/disaggregated state, Spark AQE +
+Celeborn/Uniffle shuffle, delay scheduling, morsel-driven parallelism
+(intra-node already covered by DataFusion). Validation: docs-only change;
+no code touched this leg.
+
 ## 2026-07-10 (day) — G8 CERTIFIED live on prod k3s: Kafka → continuous TUMBLE → Iceberg sink, exactly-once through a mid-commit kill (+2 real bugs fixed)
 
 Session 70fb3928 continuation. The G8 live certification leg (platform task

@@ -1,0 +1,261 @@
+# Engine Production-Readiness Audit — 2026-07-10
+
+Code-grounded audit of the engine across components, execution flow
+(source → sink), the three compute engines (batch / delta-batch / streaming),
+the three placements (embedded / single-node / distributed), and every API
+surface (SQL, Rust, Python, Flight SQL, gateway, MCP, connectors). Every
+claim cites code, not docs. This audit is the evidence base for the
+platform plan's **Track 6 (phases 51–60): engine production readiness** —
+the arc that takes the engine from "certified single-path" to a credible
+Spark/Flink alternative for community adoption.
+
+Builds on (does not repeat) the 2026-07-09 core-component audit in
+`status.md` (AUD-1..10): AUD-1..4 + AUD-10 are fixed; **AUD-6, AUD-7
+(aggregate keys), AUD-8, AUD-9 remain open and are re-confirmed in code
+this pass.**
+
+## 1. What the engine is today (verified shape)
+
+- **Workspace**: 25 crates, ~260k LOC Rust, `#![forbid(unsafe_code)]`
+  across core crates, 4 TODO/FIXME markers total outside tests —
+  exceptional hygiene.
+- **Three-engine spine** (`krishiv-engine-core/src/lib.rs`): Batch
+  (Spark-style bounded SQL), Incremental (DBSP/Feldera-style IVM),
+  Streaming (Flink-style event-time + keyed state) — each compiles to a
+  `CompiledJob` run by a `ComputeEngine` over placement-injected
+  `EngineRuntime` services. Engine × placement × API surface are three
+  independent axes; `krishiv-api/src/{conformance,mode_conformance}.rs`
+  test the contract.
+- **Placements**: embedded (`krishiv-runtime/src/in_process.rs`),
+  single-node daemon, distributed (coordinator daemon + executor CLI +
+  optional shuffle/flight services). `just check-{embedded,single-node,
+  distributed,k8s,full}` builds each.
+- **Certified today**: exactly-once Kafka → continuous TUMBLE → Iceberg
+  upsert through a mid-commit kill (G8, 2026-07-10, prod k3s) — one
+  combination, honestly labeled via registry-published delivery metadata.
+
+## 2. Distributed batch: the single-task ceiling (the #1 gap)
+
+**Finding: a distributed batch SQL job is one stage with one task.**
+`submit_batch_sql_job_inner` (`krishiv-scheduler/src/batch_sql.rs:~240`)
+builds exactly `stage-sql` / `task-sql` with fragment `sql: <query>`. The
+whole query executes on **one executor**; DataFusion parallelizes across
+that node's cores, but adding executors adds zero speed to a single
+query. "Distributed" batch SQL is remote execution, not scale-out.
+
+Adjacent evidence:
+
+- **The multi-stage path exists but is unreachable from SQL.**
+  `job_spec_from_exchange_stages` (`krishiv-scheduler/src/job/scheduler.rs:691`)
+  splits a `PhysicalPlan` at `NodeOp::Exchange` boundaries into
+  ShuffleMap/Result stages — but tasks are created **one per plan node**,
+  not per data partition, and the SQL→plan translation
+  (`df_plan_to_krishiv_nodes`, `krishiv-sql/src/lib.rs:2672`) lowers most
+  operators to `NodeOp::Other { description }` (display strings) and
+  `DfPlan::Repartition` to `Partitioning::Unpartitioned`
+  (`lib.rs:2796-2804`). The executor's batch dispatcher has **zero
+  `NodeOp::` handling** (`krishiv-executor/src/fragment/batch.rs`) — the
+  translated plan drives the optimizer (`BroadcastAutoRule`) and EXPLAIN,
+  not execution.
+- **Task fragments are strings.** `TypedTaskFragment` wraps
+  `body: String` (`krishiv-plan/src/task_fragment.rs`); bodies are `sql:`,
+  `stream:loop:`, `delta:step:{job}|{deltas_b64}|{specs_b64}|{state_b64}`.
+  Inline tables ride as base64 Arrow IPC in the assignment
+  (`BatchSqlInlineTable`). There is no partition-addressed,
+  proto-encoded physical plan fragment — the prerequisite for
+  partition-parallel task generation.
+- **The shuffle crate is production-shaped but under-consumed.**
+  `krishiv-shuffle` has hash/range partitioners, sort-shuffle writer +
+  index, disk/object-store/tiered stores, an ESS binary, push-shuffle
+  (T12), spillable buffers under `UnifiedMemoryManager`, and Arrow-IPC
+  Flight transport. Its consumers are the in-memory shuffle fragments and
+  hand-built plans — never a SQL query.
+
+**SOTA direction** (phase 52): Ballista proves the architecture on the
+same DataFusion base — protobuf plan fragments, stage-per-exchange,
+task-per-partition, shuffle-service reads; its published TPC-H SF100
+result is 2.9× single-node DataFusion. Iceberg split planning gives the
+scan-side parallelism for free (file/split → task), and locality inputs.
+
+## 3. Scheduler: sound skeleton, algorithms parked in `cfg(test)`
+
+Production placement is `SlotAwareScheduler` — greedy most-free-slots
+(`krishiv-scheduler/src/job/scheduler.rs:173-233`). What exists but is
+**not wired**:
+
+- `LocalityScheduler` (`scheduler.rs:245`, `#[cfg(test)]`): node-local
+  preference with greedy fallback; rack tier reserved. Tested, no
+  production caller. `ExecutorPlacement::with_locality` is
+  `#[expect(dead_code)]`.
+- `FairScheduler` (`scheduler.rs:338`, `#[cfg(test)]`): namespace pools —
+  and its weight/min-share math is dead code inside its own loop
+  (`let _ = min_share…; let _ = total_weight` at `scheduler.rs:439-440`).
+- `key_group_range_for_task` + `MAX_KEY_GROUPS = 32_768`
+  (`scheduler.rs:15-32`, `#[cfg(test)]`): Flink-style key-group ranges —
+  the foundation for parallel keyed streaming — computed nowhere live.
+
+What IS live and good: SC10 resource-profile executor filtering, SC11
+cascade circuit breaker + IMM-1 per-executor failure threshold, bounded
+assignment fan-out (128 concurrent RPCs, env-tunable), per-endpoint
+channel coalescing (#43/#44), round-robin delivery interleaving,
+admission `QueueManager` with namespace quota snapshots, one-shot hot-key
+`skew_repartition_overrides`, R7.2 adaptive governance types
+(hot-key-split / repartition / source-throttle / slow-sink).
+
+Missing entirely: delay scheduling, speculative execution for stragglers,
+priority/preemption, task-level retry budgets distinct from stage retry
+(P1.24 exists).
+
+## 4. Distributed streaming: one task per job, cycles over RPC
+
+- `prepare_continuous_input_cycle`
+  (`krishiv-scheduler/src/coordinator/task_assignment.rs:285`) **requires
+  exactly one `stream:loop` task per job** and fences one in-flight cycle.
+  Streaming parallelism per job = 1 executor. Input arrives as
+  coordinator-pushed partitions in the assignment payload; output drains
+  back through the coordinator. There is no executor↔executor streaming
+  data plane and no per-channel credit-based flow control (the
+  `krishiv-common/backpressure` credits gate **source admission**, not
+  network channels).
+- **Barrier subsystem: fully built, zero live consumers** (G5 register,
+  re-confirmed): `CheckpointCoordinator::try_tick` + 2s
+  `barrier_dispatch_loop` run in production;
+  `ExecutorTaskRunner::drain_pending_barriers`' only caller is a CLI debug
+  command. Chandy-Lamport aligned two-input join
+  (`execute_window_join_aligned`, `aligned_join.rs`) is unit-tested with
+  no caller; live two-input joins rebuild the operator from scratch every
+  cycle (`fragment/streaming.rs` → plain `execute_window_join`) — a
+  continuous join loses state at every cycle boundary today.
+- Checkpoints are **full-state per cycle**: the executor ships the whole
+  operator snapshot each completed cycle; the coordinator persists it
+  every cycle. `krishiv-state` has `incremental_checkpoint.rs`,
+  `checkpoint/rescaling.rs`, `dfs_backend.rs`, `savepoint.rs`,
+  `migration.rs`, TTL — the only reference to incremental checkpoints
+  outside the crate is the MCP info endpoint. Built, not wired.
+
+**SOTA direction** (phases 55–56): key-group-sharded continuous jobs;
+wire the existing barrier pipeline as the checkpoint driver; Flink-2.0
+style disaggregated state (DFS-primary + local cache — `dfs_backend.rs`
+is the seed) with incremental checkpoints; savepoint compatibility
+windows; unaligned checkpoints later (roadmap already names them).
+
+## 5. Delta-batch / IVM: correct now, doesn't scale yet
+
+Re-confirmed open (post-AUD fixes):
+
+- **AUD-6**: distributed tick ships full state both directions, base64 in
+  a string fragment; `MAX_IVM_OFFLOAD_STATE_BYTES = 16 MiB`
+  (`ivm_http.rs:387`) silently falls back to central compute — distributed
+  IVM never scales past 16 MiB of state; coordinator persists the full
+  snapshot every cycle.
+- **AUD-7 (remainder)**: `GroupStateMap = AHashMap<Vec<Option<String>>, …>`
+  (`krishiv-delta/src/operators/aggregate.rs:299`) — group keys are still
+  string tuples (join **traces** got real state in #160; aggregate keys
+  and trace probe masks remain string-based).
+- **AUD-8**: insert-only snapshot fast path still `concat_batches(prev,
+  delta)` (`operators/stream.rs:151`) — O(n) copy per tick, unbounded
+  memory; **`register_lateness` still has zero callers**, so lateness GC
+  (whose mask AUD-2 fixed) has never actually run.
+- **AUD-9**: O(Δ) plan coverage = bare Aggregate / 2-way equi-Join /
+  Distinct / WHERE-filtered aggregate; HAVING, agg-over-join, UNION,
+  subqueries → DiffBased full recompute + full-output stringify-diff.
+- Standing benchmark verdict (#102/G14): even after ctx-reuse, full
+  recompute wins below ~23M rows. The IVM engine is a differentiator on
+  paper it cannot yet cash at production scale.
+
+## 6. Fault tolerance & HA
+
+- Coordinator HA: etcd leader election exists behind `feature = "etcd"`
+  (`coordinator_daemon.rs:110`, `etcd_lease.rs`, `leadership.rs`);
+  default mode is `single`. Prod runs a single coordinator; failover is
+  restart + `store.rs` NDJSON event-log/snapshot recovery (rotation at
+  64 MiB, bounded ring). RocksDB/etcd metadata backends exist.
+- Executor loss: heartbeat lease → task requeue works (G6 chaos gate 50×
+  in CI; DIST-1 loss-counter reset; #81 cycle-boundary race fixed).
+  No shuffle-output loss recovery (lost map output ⇒ job failure, not
+  stage regeneration) — meaningful once phase 52 makes multi-stage real.
+- No speculative re-execution; no completed-job history service (roadmap
+  names it); chaos gate stuck at N-small (platform task #98,
+  infra-blocked).
+
+## 7. Memory, spill, and large results (healthy)
+
+`krishiv-common/memory_budget` + `UnifiedMemoryManager` feed batch
+fragments, dataflow windows/CEP, and shuffle spillables; executor result
+spool + chunked fetch (#156) removed the OOM path for large results;
+CTAS/DML no longer stream full results over Flight SQL (#162). G2's
+mechanism is verified; the TPC-H-at-RAM benchmark remains blocked on
+hardware headroom. This area needs *benchmark proof*, not rework.
+
+## 8. API surfaces
+
+- **SQL**: DataFusion pinned at 53.1 / arrow 58.3 / iceberg 0.9.1
+  (`Cargo.toml`); upgrade train tracked (#163 for iceberg 0.10 + DF 54
+  alignment). Session layer, prepared statements ($N + JDBC `?` G12),
+  SQLSTATE taxonomy (`krishiv-sql/src/sqlstate`).
+- **Flight SQL**: metadata RPCs + JDBC/ADBC verified (G1);
+  `krishiv-sql-gateway` is explicitly **not** a wire server (API-12
+  header) — an in-process SQLSTATE facade. There is no Postgres/JDBC
+  wire endpoint besides Flight SQL. Query progress + cancellation are
+  roadmap items, not implemented surfaces.
+- **Python**: 12.5k LOC PyO3. A non-compiling `PySession::close` shipped
+  in `1694143` — the per-PR `test-python` CI job did not block it
+  (status.md 2026-07-09); CI honesty gap.
+- **MCP**: 3.3k LOC single file, read-only ops surface. **UI**: 2.4k LOC
+  embedded console. Both fine for scope.
+- **Connectors**: ~30 sources/sinks with SDK, registry, maturity
+  certification (`certification.rs`) — the strongest crate; the platform
+  ADR-0021 confirms it as the connector home.
+
+## 9. Testing & release infrastructure
+
+Strong: per-mode build/test recipes, chaos crate + G6 kill-loop CI gate,
+conformance suites, api-surface freeze (`api/` + CI check), cargo-deny,
+release skill with signed checksums, BENCHMARKING.md discipline. Gaps: no
+SQL correctness corpus (sqllogictest-style), no distributed-scale CI
+(single machine), `test-python` not blocking, no benchmark **history**
+publication (roadmap item 5), no soak gate in engine CI (soaks are
+platform-driven).
+
+## 10. Verdict → Track 6 (platform phases 51–60)
+
+The engine's architecture (spine, seams, hygiene, certification
+discipline) is production-grade; its **scale story is not**: one-task
+batch jobs, one-task streaming jobs, 16 MiB IVM offload, test-gated
+scheduler algorithms, unwired incremental checkpoints/barriers, single
+coordinator. The pattern is consistent — correct narrow paths shipped
+first, scale machinery built but parked. Track 6 wires and proves it, in
+dependency order:
+
+| Phase | Theme | Kills |
+|---|---|---|
+| 51 | Baseline: wire-or-delete audit, version train, correctness corpus, honest CI | parked-subsystem drift; DF 53 pin; test-python gap |
+| 52 | Distributed batch v2: proto fragments, partition-parallel stages, real shuffle | §2 single-task ceiling |
+| 53 | Scheduler v2: locality, fair pools, speculation, priority | §3 cfg(test) algorithms |
+| 54 | AQE + statistics: coalescing, skew split, runtime filters | §3 one-shot skew; no stats |
+| 55 | Streaming v2: key-group parallel jobs, live barriers, continuous joins | §4 one-task streaming; G5 |
+| 56 | State v2: incremental + disaggregated checkpoints, rescaling, savepoint windows | §4 full-state-per-cycle |
+| 57 | IVM scale-out: executor-resident state, arrow-row keys, retention, coverage | §5 AUD-6/7/8/9 |
+| 58 | Fault tolerance GA: coordinator HA, shuffle recovery, history server, chaos matrix | §6 |
+| 59 | Interfaces: progress/cancel, wire protocol decision, Python parity, CI honesty | §8 |
+| 60 | Production GA gate: certified matrix, public benchmarks + history, soak | the launch |
+
+Phase detail, gates, and platform-side seams live in the platform repo:
+`docs/implementation/phases/phase-5N-*.md` and `plan.md` (Track 6).
+
+### SOTA references consulted (2026-07-10)
+
+- Morsel-driven parallelism / NUMA work-stealing (Leis et al., SIGMOD'14) —
+  intra-node scheduling; DataFusion's streaming push model already gets
+  comparable intra-node scaling, so Track 6 spends effort on *inter-node*.
+- Apache DataFusion Ballista 53 (May 2026 release): scheduler/executor +
+  shuffle architecture on the same DF base; TPC-H SF100 2.9× single-node.
+- Flink 2.0 disaggregated state / ForSt (VLDB'25) + async execution model;
+  credit-based flow control (FLINK-7282) as the streaming data-plane model.
+- Spark AQE (coalesce/skew-split/dynamic broadcast) + runtime filters;
+  push-based/remote shuffle (Magnet, Celeborn, Uniffle) as the shuffle
+  service end-state — `krishiv-shuffle`'s ESS/push/tiered stores map to it.
+- Delay scheduling (Zaharia et al., EuroSys'10) for the locality tier;
+  speculative execution per MapReduce/Spark for stragglers.
+- DBSP/Feldera (already the delta crate's declared basis) for IVM
+  operator coverage direction.
