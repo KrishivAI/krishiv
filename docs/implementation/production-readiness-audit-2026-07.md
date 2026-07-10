@@ -644,7 +644,83 @@ GC (`coordinator/checkpoint_ops.rs:547` → `delete_epoch`). Gaps:
   embedded console. Both fine for scope.
 - **Connectors**: ~30 sources/sinks with SDK, registry, maturity
   certification (`certification.rs`) — the strongest crate; the platform
-  ADR-0021 confirms it as the connector home.
+  ADR-0021 confirms it as the connector home. **But see §8b: most of it
+  is unreachable from most API surfaces.**
+
+## 8b. Connector source/sink integrations × SQL/Python/Rust (eleventh pass, 2026-07-10)
+
+Swept every connector in `krishiv-connectors` (~35k lines) and traced
+which API surface can actually reach each one.
+
+**What's built (impressive breadth):** streaming sources Kafka (schema-
+registry Avro/Protobuf deser, full config surface), Kinesis, Pulsar,
+CDC (Debezium envelope decode, `cdc/kafka_source`, offsets, pipeline
+router); batch sources Parquet(+Hive partition discovery), CSV/JSON,
+Avro, S3(+prefix), JDBC/Postgres, Delta (read + time travel), Hudi
+(snapshot/incremental read); sinks Iceberg streaming 2PC (certified
+G7/G8), two-phase Parquet local/S3, Kafka transactional, Cassandra,
+Elasticsearch, HBase, Delta write/merge, Hudi append/upsert, six
+vector sinks; plus capability/maturity metadata (`DeliveryGuarantee`,
+`ConnectorMaturity`), a uniform driver registry, and a certification
+harness.
+
+**The gap is reachability, and the three surfaces disagree wildly:**
+
+- **SQL pipeline DDL** (`CREATE SOURCE … FROM <CONNECTOR>` /
+  `CREATE SINK … INTO <CONNECTOR>`): the execution factory supports
+  **exactly one kind — parquet**
+  (`krishiv-api/pipeline/connector_factory.rs:53-74`). The SQL job
+  compiler's sink path adds csv/json/ndjson/s3 (`sql_job.rs:238-256`).
+  `CREATE EXTERNAL TABLE` covers Parquet + Kafka (`kafka_table.rs`).
+  Kafka-as-pipeline-source, Iceberg-as-SQL-sink, CDC, and every vector/
+  NoSQL sink: **not reachable from SQL** — the platform's primary
+  surface reaches the fewest connectors.
+- **Distributed jobs**: sources are fine — `stream:loop` opens **any**
+  registry connector via `ConnectorConfig` and caches it across cycles
+  (`fragment/streaming.rs:775-812`). Sinks are a closed enum:
+  `OutputContractDescriptor` = inline/local-file/shuffle/parquet/
+  object-parquet/**IcebergSink** (`krishiv-proto/task.rs:1134`) — no
+  Kafka/ES/Cassandra/vector egress from any distributed job.
+- **Rust embedded** (`connector_runtime.rs`): file-shaped kinds only
+  (parquet/csv/json/ndjson/s3/path/prefix).
+- **Python is the broadest surface**: `read_parquet/kafka/iceberg/
+  kinesis/pulsar`, sink classes for Kafka/Iceberg/Cassandra/ES/HBase,
+  seven vector-sink classes, CDC via `pipeline_api`/`incremental`,
+  Delta/Hudi via `lakehouse`. But the Python sinks are **blocking
+  `write_batches` pushes**, not participants in checkpointed streaming
+  pipelines — batch-style parity only.
+- **Three hardcoded factories** implement the same dispatch
+  (`connector_factory.rs`, `sql_job.rs::sink_spec`,
+  `connector_runtime.rs`) instead of resolving through the one registry
+  that already exists — that's why the surfaces drifted.
+
+**Efficiency findings (the §2b anti-pattern again):**
+
+- JDBC source: sqlx `fetch_all` (`jdbc.rs:116,171`) — entire result set
+  into memory; no streaming scan, no predicate pushdown.
+- Delta and Hudi reads: `scan_batches() → Vec<RecordBatch>` — full
+  materialization, no `TableProvider`, no pushdown. Same fix family as
+  the Phase 52 zero-materialization task.
+
+**Wire-or-delete / honesty:**
+
+- `kafka_transactional_sink` has zero users outside the crate — a
+  transactional Kafka **egress** exists but nothing can invoke it
+  (wire decision belongs with the Phase 55 sink-descriptor extension).
+- The certification harness covers **three** backends (in-memory 2PC,
+  local-parquet 2PC, Iceberg native); everything else carries maturity
+  labels without a certified failure matrix.
+- CDC is further along than the platform plan assumes: Debezium decode
+  + offsets + pipeline router are wired into krishiv-api/SQL streaming
+  and Python — platform Phase 31 is orchestration + a Postgres logical-
+  replication source away, not a from-scratch build.
+
+**Direction:** one registry-resolved connector dispatch for all three
+surfaces + a generated reachability matrix (Phase 59); registry-backed
+`CREATE SOURCE/SINK … WITH (connector=…)` SQL front door à la Flink/
+RisingWave (Phase 60); streaming `TableProvider`s for JDBC/Delta/Hudi
+(Phase 52); typed sink descriptors beyond Iceberg — Kafka egress first,
+wiring the parked transactional sink (Phase 55).
 
 ## 9. Testing & release infrastructure
 
