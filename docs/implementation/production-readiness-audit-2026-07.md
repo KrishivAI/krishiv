@@ -314,7 +314,7 @@ SQL correctness corpus (sqllogictest-style), no distributed-scale CI
 publication (roadmap item 5), no soak gate in engine CI (soaks are
 platform-driven).
 
-## 10. Verdict → Track 6 (platform phases 51–60)
+## 10. Verdict → Track 6 (platform phases 51–63)
 
 The engine's architecture (spine, seams, hygiene, certification
 discipline) is production-grade; its **scale story is not**: one-task
@@ -338,6 +338,28 @@ dependency order:
 | 60 | SQL surface completeness: measured Spark-reference parity (JSON/lambda functions, SET/SHOW/USE, matrix drift) | §8 SQL coverage |
 | 61 | Unified DataFrame API: one surface, three engines, PySpark parity; delta-batch demoted to internal protocol; single sync/async contract | §8 API fragmentation + sync/async |
 | 62 | Production GA gate: certified matrix, public benchmarks + history, soak | the launch |
+
+Two cross-cutting observations that individual phases only cover
+implicitly, named here so they don't survive partially (2026-07-10,
+end-of-session review):
+
+- **Coordinator must become control-plane-only.** Every distributed data
+  path today transits the coordinator: batch inline tables ride base64 in
+  assignments (§2), streaming input is coordinator-pushed and output
+  coordinator-drained per cycle (§4), IVM state round-trips per tick with
+  the 16 MiB cliff (§5). Phases 52/55/57 each remove their leg; by Phase
+  58 entry, query data on coordinator RPC is a regression, not a
+  workaround.
+- **The stringly-typed fragment protocol dies once, not per-engine.**
+  `TypedTaskFragment.body: String` with `sql:` / `stream:loop:` /
+  `delta:step:` prefixes spans all three engines; Phase 52's fragment ADR
+  defines the typed proto envelope for all three body kinds, and 55/57
+  adopt it.
+- **SEC-1's pattern needs a surface sweep (SEC-3, Phase 63).** The
+  merged-outside-middleware pattern was verified only on the two routers
+  the external review named; the embedded console, MCP server,
+  metrics/health endpoints, executor-side HTTP, and shuffle/Flight data
+  services have not been audited against it.
 
 Phase detail, gates, and platform-side seams live in the platform repo:
 `docs/implementation/phases/phase-NN-*.md` and `plan.md` (Track 6).
