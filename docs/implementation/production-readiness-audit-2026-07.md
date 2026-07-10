@@ -917,6 +917,130 @@ unless 55 claims it); Phase 60's matrix-truth task gains
 operator-tier placement honesty (the matrix must carry a placement
 dimension so "supported" says *where*).
 
+## 11. Observability, logging, error handling & auth execution-path sweep (fifteenth pass, 2026-07-10)
+
+A sweep of the telemetry crate (`krishiv-metrics`), the coordinator/
+executor auth stack (`krishiv-scheduler/src/auth.rs`, `http_auth.rs`,
+`krishiv-executor/src/grpc.rs`/`barrier_grpc.rs`), the shuffle data plane
+(`krishiv-shuffle`), and error-handling on the serving paths. The
+telemetry and auth *foundations are strong* — the gaps are specific.
+
+**Verified strong (credit, no action):**
+- **OTel tracing is fully wired.** `krishiv_metrics::init` runs in
+  `krishiv/src/main.rs:39` (OTLP opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT`,
+  JSON structured logs, `deployment.target` resource attr). W3C
+  `traceparent`/`tracestate` propagation is real: `inject_trace_context`
+  on outbound coordinator→executor stubs (`task_assignment.rs:49`,
+  `grpc_client.rs:120`, `barrier_dispatch.rs:363`), `extract_trace_context`
+  on the inbound executor/coordinator servers (`transport.rs:684+`,
+  `grpc.rs:874`), and `RemoteSpanContext` carries the decoded context
+  across `tokio::spawn` boundaries.
+- **Prometheus exposition is wired** on the coordinator daemon
+  (`coordinator_daemon.rs:789`) and embedded UI (`handlers.rs:37-43`),
+  with a broad labeled metric set (task attempts, checkpoint epochs,
+  watermarks, source lag, shuffle partitions, state key/bytes) and
+  correct single-HELP/TYPE formatting.
+- **Auth defaults fail closed where it counts.** Coordinator gRPC is
+  **deny-by-default** (`ALLOW_ANONYMOUS=false`; `set_allow_anonymous`
+  refuses in production mode / non-`dev-local` profiles, `auth.rs:423-431`).
+  Executor task + barrier gRPC enforce a bearer token at **startup** in
+  durable/production mode (`validate_task_auth_startup`,
+  `cli.rs:1163-1176`). Token comparison is constant-time
+  (`constant_time_eq`), revocation is fail-closed (reject-all provider,
+  `auth.rs:321-327`), and tokens are hot-reloadable.
+- **Serving paths are panic-free.** Zero `unwrap`/`expect`/`panic!` in the
+  scheduler gRPC, executor gRPC, or streaming-fragment serving code; the
+  24 in `krishiv-flight-sql/src/service.rs` are all under `#[cfg(test)]`.
+
+**Gaps found (code-cited):**
+
+- **LOG-1 (P1, credential in logs).** `extract_auth_context`
+  (`auth.rs:571-586`) stores the *raw bearer token* as
+  `AuthContext::Bearer.subject` — pre-authentication, the subject field
+  **is the token**. The handler keeps that pre-auth context and logs it:
+  ~11 coordinator gRPC handlers do
+  `tracing::debug!(subject = %auth.subject(), …)` (`grpc.rs:48, 93, 134,
+  165, 195, 280, …`), and `auth_interceptor` logs
+  `tracing::warn!(subject = ctx.subject(), …)` on **every rejection**
+  (`auth.rs:551-556`). At `RUST_LOG=debug` a valid coordinator token is
+  written to logs; at the default level an invalid/probed token is written
+  at warn. The post-authentication principal (the real subject) is
+  computed in `validate_grpc_auth_with_provider` but discarded. Fix:
+  never log the credential — log a stable token *hash* or the resolved
+  post-auth subject; make `AuthContext::subject()` redact the raw-token
+  case. → Phase 63 (SEC-5) + Phase 51 redaction lint.
+- **SEC — shuffle data plane fails open with no production guard.**
+  `check_bearer_token` (`shuffle_svc.rs:452-471`) returns `Ok(())` when
+  `KRISHIV_SHUFFLE_TOKEN` is unset, and there is **no durable/production
+  startup guard** forcing the token (unlike the executor's
+  `validate_task_auth_startup` and the coordinator's deny-by-default). The
+  shuffle service moves intermediate query results — real user data — in
+  transit between executors, and can run fully unauthenticated in a
+  distributed-durable deployment with nothing forcing otherwise. The
+  Flight-based shuffle path (`flight.rs:302-321`) authenticates only via a
+  plaintext `u64` `lease_token` in the descriptor — a weak per-partition
+  capability, not transport auth. This is the concrete instance the SEC-3
+  sweep note (§10) predicted for "shuffle/Flight data services." → Phase
+  63 SEC-3.
+- **SEC — OIDC JWT validation algorithm not pinned to the JWKS key type.**
+  `JwtAuthProvider::from_jwks_json` builds keys with
+  `DecodingKey::from_jwk` (asymmetric RSA/EC keys from the JWKS) but leaves
+  `jsonwebtoken::Validation::default()` (`auth.rs:649`), whose
+  `algorithms` is `[HS256]` (jsonwebtoken 9.3.1 `validation.rs:166`).
+  jsonwebtoken rejects any token whose header `alg` is not in
+  `validation.algorithms` (`decoding.rs:228`), so **standard RS256/ES256
+  OIDC tokens are rejected outright** — the OIDC path is effectively
+  broken for mainstream identity providers — and the algorithm is never
+  pinned per key (the JWKS algorithm-confusion footgun class). Fix: set
+  `validation.algorithms` from each JWK's `alg`/`kty`, reject `none` and
+  HMAC families against asymmetric keys, and add a real RS256 round-trip
+  test. Distinct from SEC-4's `jsonwebtoken` dependency advisory — this is
+  a code-level misconfiguration in our own provider. → Phase 63 SEC-6.
+- **OBS-1 — no end-to-end latency metric.** There are stage histograms for
+  gRPC calls, checkpoint commit/alignment/upload, source read, restore,
+  and sink prepare/commit/abort (`counters.rs:143-172`), but **no
+  query-latency and no streaming record ingest→emit latency histogram**.
+  Phase 55's exit gate demands in-engine streaming **p99 ≤ 100 ms** with
+  no metric that measures it; Phase 22/29 latency SLOs likewise have no
+  engine-emitted number to bind to. → Phase 55 (the p99 instrument) +
+  Phase 59 (general instrumentation).
+- **OBS-2 — latency histogram buckets bottom out at 5 ms and are shared
+  `&'static`.** `LATENCY_BUCKETS` (`counters.rs:9-11`) starts at `0.005`
+  and the bucket slice is a single `&'static [f64]` reused by every
+  histogram (`counters.rs:32, 44`). The low-latency streaming loop
+  (Phase 55, 50 µs idle floor) targets sub-millisecond latencies that all
+  collapse into the first bucket — **unmeasurable**. Need per-metric
+  bucket sets with µs-resolution buckets for the streaming/latency
+  histograms. → Phase 55 / Phase 59.
+- **OBS-3 — RPC duration instrumentation is coordinator-only.**
+  `GrpcDurationLayer` is applied only on the coordinator server
+  (`scheduler/grpc.rs:945`); the executor task gRPC, barrier gRPC, and
+  shuffle/Flight servers have no duration layer, so executor-side and
+  data-plane RPC latency is uninstrumented. → Phase 59.
+- **OBS-4 (minor) — internal error strings leak to clients.** gRPC
+  handlers map failures with `tonic::Status::internal(err.to_string())`
+  (6 sites in `executor/grpc.rs`, 5 in `scheduler/grpc.rs`), returning raw
+  internal error detail to the network peer. Low severity (control plane
+  is authenticated) but the error taxonomy should classify what is safe to
+  surface. → Phase 59.
+- **OBS-5 (minor) — logs are always JSON.** `init.rs:187` unconditionally
+  installs `fmt::layer().json()`; every `krishiv` CLI invocation emits
+  JSON to stderr with no pretty/compact option — poor local DX and no
+  format switch. → Phase 51 (small).
+
+**Verified wired (no action):** the `ObservabilityReport` incident-dump
+schema (`observability_report.rs`) is populated by the coordinator
+(`coordinator/observability.rs:95`) and reachable via `krishiv diagnose`;
+system metrics (`system.rs`) are exposed alongside runtime metrics.
+
+→ **Phase 63** gains SEC-5 (credential-in-logs redaction), folds the
+shuffle fail-open + Flight lease-only findings into SEC-3, and adds SEC-6
+(JWT algorithm pinning). **Phase 55** exit gate binds its p99 claim to a
+real ingest→emit latency histogram with µs buckets. **Phase 59** gains an
+observability-instrumentation-completeness task (e2e latency metric,
+per-metric buckets, duration layer on all servers, error-taxonomy hygiene).
+**Phase 51** gains a credential-redaction lint + a log-format option.
+
 ## 10. Verdict → Track 6 (platform phases 51–63)
 
 The engine's architecture (spine, seams, hygiene, certification
@@ -962,7 +1086,12 @@ end-of-session review):
   merged-outside-middleware pattern was verified only on the two routers
   the external review named; the embedded console, MCP server,
   metrics/health endpoints, executor-side HTTP, and shuffle/Flight data
-  services have not been audited against it.
+  services have not been audited against it. The fifteenth pass (§11)
+  closed part of this: the **shuffle data plane fails open** when
+  `KRISHIV_SHUFFLE_TOKEN` is unset with no production startup guard
+  (`shuffle_svc.rs:452-471`), and the Flight shuffle path authenticates
+  only via a plaintext descriptor `lease_token` (`flight.rs:302-321`) —
+  both now folded into SEC-3.
 
 Phase detail, gates, and platform-side seams live in the platform repo:
 `docs/implementation/phases/phase-NN-*.md` and `plan.md` (Track 6).
