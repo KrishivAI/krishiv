@@ -1138,6 +1138,81 @@ aliasing + operator task-slots fix + enable-or-delete
 that reads them. **Phase 55** notes `KRISHIV_STREAM_PROFILE` must reach
 the distributed loop.
 
+## 13. Code cleanup, duplication & crate-structure sweep (seventeenth pass, 2026-07-10)
+
+A sweep for copy-paste, refactor candidates, and crate-boundary health
+across the 25-crate workspace (≈235k LOC).
+
+**Verified strong (credit, no action):**
+- **The crate split is mostly principled.** Clear boundaries for
+  connectors, scheduler, executor, state, shuffle, proto, sql, plan; the
+  `krishiv-engine-core` crate has *correct* dependency hygiene (depends
+  only on `krishiv-common` + `krishiv-proto` + Arrow — no cycle, exactly
+  as its docstring intends).
+- **Feature-gated compilation is clean** (`just lint-features` exists;
+  Phase 51 makes it required).
+
+**Gaps found (code-cited):**
+
+- **STRUCT-1 (architecture vs reality) — the `engine-core` spine is
+  under-adopted.** `krishiv-engine-core` defines the unifying contract the
+  whole design rests on — `EngineKind`, `CompiledJob`, `ComputeEngine`,
+  `EngineRuntime` — and its docstring says "every engine and front-end
+  crate can depend on it without a cycle … every front-end compiles to a
+  single `CompiledJob`." But **none of the six engine crates depend on
+  it**: `krishiv-{delta,ivm,executor,runtime,scheduler,dataflow}` all show
+  `engine-core dep = 0`. The `ComputeEngine`/`CompiledJob` contract is
+  implemented and consumed **only inside `krishiv-api`** (re-exported at
+  `api/lib.rs:83`, used in `session.rs`/`engines.rs`) and `krishiv-bench`.
+  So the "three engines share one execution contract" spine is an
+  *API-layer* abstraction, not the seam the engines actually route
+  through — they are integrated ad-hoc inside `krishiv-api`. This is the
+  structural root of the "stringly-typed fragment protocol" cross-cutting
+  note (§10): the typed contract exists but doesn't bind the engines.
+- **STRUCT-2 (god-crate) — `krishiv-api` is the integration hub, not a
+  thin facade.** 23k LOC depending on **11** workspace crates (connectors,
+  dataflow, delta, engine-core, ivm, plan, runtime, scheduler, sql,
+  state), with `session.rs` at 3,475 lines mixing session lifecycle,
+  engine dispatch, SQL compile, and submission; `engines.rs` (2,216),
+  `streaming_builder.rs` (2,095), and `connector_runtime.rs` (1,845)
+  alongside. This is the integration logic `engine-core` was meant to own
+  (STRUCT-1). Phase 61 already re-layers `StreamingBuilder`/
+  `connector_runtime` beneath the unified surface — the decomposition and
+  the engine-core adoption are the same refactor.
+- **DUP-1 (duplication, security-sensitive) — bearer-token parsing is
+  copy-pasted four times.** Four independent `strip_prefix("Bearer ")`
+  implementations: `extract_auth_context` (`scheduler/auth.rs:571`),
+  `bearer_token_from_metadata` (`executor/grpc.rs:142`),
+  `check_bearer_token` (`shuffle/shuffle_svc.rs:452`), and inline in
+  `flight-sql/service.rs:255`. This is why the §11 LOG-1 token-in-logs
+  defect and the §12 FLAG-2 parse inconsistency are *per-site* problems: a
+  single `krishiv-common` metadata-auth helper would fix credential
+  handling everywhere at once.
+- **DUP-2 (duplication) — boolean-env parsing ×4+ and env-int parsing
+  ×21.** Four truthiness definitions (§12 FLAG-2: `truthy_env`,
+  `parse_bool_env`, `api/session.rs:487`, `mcp/lib.rs:112`) and 21 copies
+  of the `and_then(|v| v.parse().ok())` env-int pattern with ad-hoc
+  defaults. Both collapse into the typed config registry from §12 FLAG-4.
+- **DUP-3 (duplication) — three hardcoded connector factories.**
+  `connector_factory.rs:53-74`, `sql_job.rs::sink_spec`, and
+  `connector_runtime.rs` each hand-map connector kinds instead of resolving
+  through the one registry (§8b). One dispatch retires all three; already
+  owned by Phase 59/60's connector-reachability work.
+- **STRUCT-3 (god-modules) — split by concern.** `sql/lib.rs` (4,386),
+  `api/session.rs` (3,475), `mcp/lib.rs` (3,296), `ivm/flow.rs` (2,912),
+  `catalog/mod.rs` (2,419), `proto/task.rs` (2,034) each carry several
+  responsibilities in one file — a readability/reviewability tax, not a
+  correctness bug. Opportunistic module splits as the owning phases touch
+  them (no big-bang churn).
+
+→ **Phase 51** gains a **shared-helper consolidation** item (bearer-auth,
+boolean, and env-int parsing into `krishiv-common`, converging with the
+§12 config registry) and lists the god-module splits as opportunistic
+hygiene. **Phase 61** gains an **engine-core-as-real-spine** rider: the
+engine crates depend on and implement the `ComputeEngine`/`CompiledJob`
+contract, and `krishiv-api` shrinks to a facade over it. DUP-3 stays with
+the Phase 59/60 connector-reachability task.
+
 ## 10. Verdict → Track 6 (platform phases 51–63)
 
 The engine's architecture (spine, seams, hygiene, certification
