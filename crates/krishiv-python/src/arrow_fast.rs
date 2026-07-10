@@ -192,9 +192,9 @@ mod tests {
 
     #[test]
     fn test_record_batch_to_py_fast_produces_pyarrow_batch() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let batch = test_batch();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let result = record_batch_to_py_fast(py, &batch);
             assert!(result.is_ok(), "fast to_py failed: {:?}", result.err());
             let py_batch = result.unwrap();
@@ -213,10 +213,10 @@ mod tests {
 
     #[test]
     fn test_record_batches_to_py_table() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let batch = test_batch();
         let schema = batch.schema();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let result = record_batches_to_py_table(py, &[batch.clone(), batch], &schema);
             assert!(result.is_ok(), "to_table failed: {:?}", result.err());
             let py_table = result.unwrap();
@@ -230,9 +230,9 @@ mod tests {
 
     #[test]
     fn test_record_batches_to_py_table_empty() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let result = record_batches_to_py_table(py, &[], &schema);
             assert!(result.is_ok(), "empty to_table failed: {:?}", result.err());
         });
@@ -240,10 +240,10 @@ mod tests {
 
     #[test]
     fn test_py_table_to_record_batches() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let batch = test_batch();
         let schema = batch.schema();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let py_table = record_batches_to_py_table(py, &[batch], &schema).unwrap();
             let batches = py_table_to_record_batches(&py_table).unwrap();
             assert_eq!(batches.len(), 1);
@@ -253,9 +253,9 @@ mod tests {
 
     #[test]
     fn test_roundtrip_fast() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let batch = test_batch();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let py_batch = record_batch_to_py_fast(py, &batch).unwrap();
             let back = record_batch_from_py_fast(&py_batch).unwrap();
             assert_eq!(back.num_rows(), 3);

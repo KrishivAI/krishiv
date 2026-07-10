@@ -385,7 +385,7 @@ mod tests {
             true,
         );
         let sink = pl.sink_memory("revenue".to_string());
-        pl.run("once".to_string(), None).unwrap();
+        Python::attach(|py| pl.run(py, "once".to_string(), None)).unwrap();
 
         let out = sink.collect().unwrap();
         assert_eq!(out.len(), 1, "sink should collect one snapshot batch");
@@ -427,9 +427,9 @@ mod tests {
         let sink = pl.sink_memory("clean".to_string());
 
         // validate() must pass for this well-formed pipeline.
-        pl.validate().unwrap();
+        Python::attach(|py| pl.validate(py)).unwrap();
 
-        pl.run("once".to_string(), None).unwrap();
+        Python::attach(|py| pl.run(py, "once".to_string(), None)).unwrap();
         let out = sink.collect().unwrap();
         let total_rows: usize = out.iter().map(|b| b.record_batch().num_rows()).sum();
         assert_eq!(

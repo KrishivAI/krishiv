@@ -533,6 +533,7 @@ mod tests {
             active_views: 2,
             total_output_rows: 5,
             tick: 7,
+            ..Default::default()
         });
         assert_eq!(summary.tick, 7);
         assert_eq!(summary.active_views, 2);
