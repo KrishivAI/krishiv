@@ -215,12 +215,14 @@ Phase 31. Tasks SEC-1/SEC-2/DUR-1/DUR-2.
 
 ## 7. Memory, spill, and large results (healthy)
 
-`krishiv-common/memory_budget` + `UnifiedMemoryManager` feed batch
-fragments, dataflow windows/CEP, and shuffle spillables; executor result
-spool + chunked fetch (#156) removed the OOM path for large results;
-CTAS/DML no longer stream full results over Flight SQL (#162). G2's
-mechanism is verified; the TPC-H-at-RAM benchmark remains blocked on
-hardware headroom. This area needs *benchmark proof*, not rework.
+`krishiv-common/memory_budget` (`MemoryBudget`) feeds batch fragments
+(per-task FairSpillPool limit + optional process-wide budget), dataflow
+windows/CEP, and shuffle spillables; executor result spool + chunked
+fetch (#156) removed the OOM path for large results; CTAS/DML no longer
+stream full results over Flight SQL (#162). G2's mechanism is verified;
+the TPC-H-at-RAM benchmark remains blocked on hardware headroom. Spill
+mechanics need *benchmark proof*, not rework — but the *accounting* is
+per-subsystem islands, not one arbiter (see §7c).
 
 ## 7b. Partitioning across the three engines (sixth pass, 2026-07-10)
 
@@ -261,6 +263,64 @@ hardware headroom. This area needs *benchmark proof*, not rework.
   deliberately keeps one executor per IVM job (executor-resident state
   is the step that pays). Key-group-sharded IVM is recorded in Phase 57
   as an explicit post-phase follow-on, not a GA requirement.
+
+## 7c. Shuffle lifecycle, memory arbitration, watermarks, table maintenance (seventh pass, 2026-07-10)
+
+Component sweep beyond partitioning. What is genuinely wired (no plan
+change needed): shuffle write compression (`shuffle_svc.rs:107` —
+`LocalDiskShuffleStore::with_compression(Lz4)`), shuffle orphan cleanup
+(`orphan.rs` driven from `coordinator_daemon.rs`), and checkpoint epoch
+GC (`coordinator/checkpoint_ops.rs:547` → `delete_epoch`). Gaps:
+
+- **Table maintenance is a toy, and nothing schedules it — the headline
+  of this pass.** The three procedures exist and are SQL-reachable
+  (`CALL system.expire_snapshots|remove_orphan_files|compact_data_files`,
+  `krishiv-sql/lib.rs:2345`), but `compact_data_files`
+  (`lakehouse/maintenance.rs:339`) reads **every data file of the table
+  into a `Vec<RecordBatch>` in process memory** and rewrites it as **one
+  single file via drop+recreate overwrite** — `target_file_size_bytes`
+  is ignored for splitting, memory is O(table), snapshot history/time
+  travel is destroyed by the overwrite, the rewrite sidesteps the G3
+  commit-conflict path (a concurrent committer races the drop+recreate),
+  it is not partition-aware, and delete files are not compacted. And no
+  code anywhere (engine or platform) invokes maintenance automatically:
+  the G7/G8 streaming sink and live tables append files every cycle, so
+  small files and snapshot metadata grow without bound unless an
+  operator manually CALLs a procedure that would OOM on a real table.
+  Every production streaming lakehouse treats scheduled compaction +
+  snapshot expiry as table-stakes (Databricks auto-compaction/OPTIMIZE,
+  Iceberg maintenance actions). → Phase 52 task (compaction as a
+  distributed batch job over the engine's own execution, partition-aware
+  once partitioned writes land, normal-transaction commits under G3
+  conflict handling); platform schedules it for live tables (seam).
+- **Watermarks are a single global max — no per-partition tracking, no
+  min-combine, no idleness handling.** Each streaming cycle reports
+  `max_event_time_ms` over *all* records read
+  (`fragment/streaming.rs:227-346` → `with_watermark_ms`). A Kafka
+  partition lagging cycles behind a fast one already gets its events
+  late-dropped today (the fast partition drags the global watermark
+  forward). Under Phase 55 parallel subtasks this becomes structural:
+  correctness requires per-split watermarks min-combined across splits
+  and subtasks (coordinator/exchange level), plus an idleness timeout so
+  an empty split doesn't stall every downstream window (Flink's
+  per-split watermark + idle-source model). → Phase 55 task.
+- **Memory accounting is three islands; the purpose-built unifier is
+  parked** (the §2/§3 pattern again). Per-task engines each get their
+  own FairSpillPool (task budget, else cgroup-derived env default), with
+  an optional process-wide `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES`
+  reservation layer (unset ⇒ unlimited; 32 MiB min-grant bounds
+  overcommit); dataflow windows/CEP hold their own `MemoryBudget`s;
+  shuffle spillables their own. Nothing arbitrates *across* regions —
+  and the SH7 `UnifiedMemoryManager` (Spark-style
+  Shuffle/Execution/State soft regions, built for exactly this) has
+  **zero callers outside shuffle**; its Execution and State regions are
+  dead. Today state rides the coordinator so executor state pressure is
+  minimal; the moment 52 (real shuffle buffers) and 55/57
+  (executor-resident streaming/IVM state) land on the same process,
+  per-subsystem islands overcommit against each other. → Phase 56 task
+  (one executor-wide arbiter); Phase 51 wire-or-delete also picks up
+  `tiered_store.rs` and `lease_persistence.rs` (no callers outside the
+  shuffle crate) alongside the already-listed push shuffle store.
 
 ## 8. API surfaces
 
