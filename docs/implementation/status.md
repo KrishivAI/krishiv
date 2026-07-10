@@ -1,5 +1,49 @@
 # Krishiv Implementation Status
 
+## 2026-07-10 — durable CTAS: Iceberg landing for CREATE [OR REPLACE] TABLE … AS SELECT (G17)
+
+The prod clean_trips batch refresh (10.2M-row join, ~14 GB result) failed
+every */15 tick on the 2 GiB Flight result guard: the platform's refresh
+path pulled the ENTIRE result out over Flight SQL, base64-JSON'd it, and
+pushed it back into the engine's IVM bridge. Root fix: the engine now owns
+CTAS end-to-end.
+
+- `SqlEngine::sql` intercepts `CREATE [OR REPLACE] TABLE cat.ns.t AS <q>`
+  when `cat` is a registered Iceberg catalog (same seam as the
+  DELETE/UPDATE/MERGE interceptions): executes the inner query as a
+  DataFusion stream and lands it via the new
+  `krishiv_connectors::lakehouse::dml::land_ctas` — rolling Parquet parts
+  (default 512 MiB in-memory Arrow per part; `KRISHIV_CTAS_TARGET_FILE_BYTES`
+  overrides), each uploaded through the table's FileIO *before* the next
+  buffers, then one `fast_append` commit. Peak memory ≈ one part.
+- Replace = drop+recreate at the same location (0.9.1 has no overwrite
+  action), with all data files durable before the metadata swap and a
+  restore attempt if the recreate fails. New tables are created first so
+  the catalog assigns the location. Namespace auto-created.
+- Result is a 1-row landing report (`rows_written, bytes_written,
+  data_files, snapshot_id`) — in coordinator mode the executor runs the
+  whole statement (`fragment "sql: …"` → `engine.sql`), so the report is
+  the only thing that crosses the wire.
+- Arrow→Iceberg schema conversion is hand-rolled
+  (`arrow_schema_to_iceberg_schema`): iceberg-rust 0.9.1 pins arrow 57,
+  workspace is arrow 58, so `iceberg::arrow::*` cannot accept our types.
+  Flat primitives only; timestamps normalized to µs, Date64→Date32;
+  nested types error with direction.
+- Validation: `cargo test -p krishiv-connectors --features iceberg --lib`
+  (342 passed, 6 new land_ctas tests incl. multi-part roll + replace
+  swap), `cargo test -p krishiv-sql --features
+  iceberg-datafusion,local-catalog --lib` (411 passed; 4 new end-to-end
+  CTAS interception tests + parser tests), clippy clean on both.
+- Platform side (krishiv-platform repo): warehouse guard gained
+  `authorize_statement` (CTAS target needs Write, inner relations need
+  Select), the SQL-job seam submits the full statement and decodes the
+  landing report, downstream IVM propagation is capped (readback feed
+  only when `bytes_written` ≤ result cap), legacy inner-query +
+  stream-bridge path kept as fallback for pre-G17 engines.
+- Follow-ups: IVM flows reading Iceberg tables as sources directly (G7
+  leg — removes the propagation cap), manifest-level pruning provider,
+  column stats on written parts (currently none, like the DML path).
+
 ## 2026-07-09 — Iceberg scan audit: multi-file snapshots read ALL files (real data-loss bug fixed)
 
 Audited the governed-Iceberg batch scan path (taxi trips/zones shape) for

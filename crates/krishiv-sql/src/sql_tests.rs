@@ -921,6 +921,127 @@ mod iceberg_catalog_tests {
         assert_eq!(count, 0, "fresh table has no snapshots to expire");
     }
 
+    // ── CTAS (durable CREATE TABLE … AS SELECT) ──────────────────────────────
+
+    async fn count_rows(engine: &SqlEngine, sql: &str) -> usize {
+        let df = engine.sql(sql).await.unwrap();
+        df.collect()
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum()
+    }
+
+    fn first_i64(batches: &[arrow::record_batch::RecordBatch], column: &str) -> i64 {
+        let batch = &batches[0];
+        let idx = batch.schema().index_of(column).unwrap();
+        batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctas_lands_in_iceberg_catalog_and_is_queryable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let engine = SqlEngine::new().with_iceberg_catalog(catalog, "mycat");
+
+        let df = engine
+            .sql(
+                "CREATE TABLE mycat.pipe.trips AS \
+                 SELECT * FROM (VALUES (1, 'ok'), (2, 'ok'), (3, 'bad')) AS t(id, status)",
+            )
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(
+            batches[0].schema().field(0).name(),
+            "rows_written",
+            "durable CTAS must return a landing report, not the result set"
+        );
+        assert_eq!(first_i64(&batches, "rows_written"), 3);
+        assert!(first_i64(&batches, "snapshot_id") > 0);
+
+        // The landed table resolves and scans through the catalog bridge.
+        let rows = count_rows(&engine, "SELECT * FROM mycat.pipe.trips").await;
+        assert_eq!(rows, 3, "landed table must be queryable");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctas_or_replace_swaps_contents() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let engine = SqlEngine::new().with_iceberg_catalog(catalog, "mycat");
+
+        engine
+            .sql("CREATE TABLE mycat.pipe.t AS SELECT * FROM (VALUES (1), (2)) AS t(id)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // Plain CREATE on an existing table errors.
+        let err = engine
+            .sql("CREATE TABLE mycat.pipe.t AS SELECT * FROM (VALUES (9)) AS t(id)")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+
+        engine
+            .sql(
+                "CREATE OR REPLACE TABLE mycat.pipe.t AS \
+                 SELECT * FROM (VALUES (10), (20), (30)) AS t(id)",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows = count_rows(&engine, "SELECT * FROM mycat.pipe.t").await;
+        assert_eq!(rows, 3, "replace must swap, not append");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctas_without_iceberg_target_falls_through_to_datafusion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog = Arc::new(KrishivCatalog::local(dir.path()).await.unwrap());
+        let engine = SqlEngine::new().with_iceberg_catalog(catalog, "mycat");
+
+        // One-part name: session-local DataFusion CTAS, not intercepted.
+        engine
+            .sql("CREATE TABLE scratch AS SELECT * FROM (VALUES (1), (2)) AS t(id)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows = count_rows(&engine, "SELECT * FROM scratch").await;
+        assert_eq!(rows, 2, "session CTAS must keep working");
+    }
+
+    #[test]
+    fn parse_ctas_shapes() {
+        let parsed =
+            crate::parse_ctas("CREATE OR REPLACE TABLE cat.ns.t AS SELECT a FROM src WHERE a > 1")
+                .expect("must parse");
+        assert_eq!(parsed.table_ref, "cat.ns.t");
+        assert!(parsed.or_replace);
+        assert!(parsed.inner_query.to_uppercase().starts_with("SELECT"));
+
+        let plain = crate::parse_ctas("CREATE TABLE ns.t AS SELECT 1").expect("must parse");
+        assert!(!plain.or_replace);
+
+        // Column-list CREATE TABLE (no AS body) is not a CTAS.
+        assert!(crate::parse_ctas("CREATE TABLE ns.t (id INT)").is_none());
+        // Non-CREATE statements are not CTAS.
+        assert!(crate::parse_ctas("SELECT 1").is_none());
+    }
+
     // ── DELETE / UPDATE helpers ───────────────────────────────────────────────
 
     #[test]

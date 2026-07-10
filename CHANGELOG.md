@@ -8,6 +8,26 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **Durable CTAS: `CREATE [OR REPLACE] TABLE <iceberg-table> AS SELECT`
+  lands the result in the Iceberg warehouse** (G17, 2026-07-10). When the
+  target resolves to a registered Iceberg catalog, `SqlEngine::sql`
+  executes the inner query and streams the result into rolling Parquet
+  part files (roll threshold `KRISHIV_CTAS_TARGET_FILE_BYTES`, default
+  512 MiB of in-memory Arrow per part) committed via `fast_append` —
+  peak memory is one part, independent of result size, and the statement
+  returns a 1-row landing report (`rows_written, bytes_written,
+  data_files, snapshot_id`) instead of the result set. Works identically
+  in embedded, single-node, and coordinator modes (the coordinated batch
+  path ships the statement text to an executor, so the write happens
+  near the data and nothing large crosses a wire — previously a pipeline
+  batch refresh streamed the full result over Flight SQL and died on the
+  2 GiB result guard at 14 GB). Replace semantics are drop+recreate with
+  data files written before the metadata swap; non-Iceberg targets fall
+  through to DataFusion's session-local CTAS unchanged. New:
+  `lakehouse::dml::land_ctas[_with_target]`,
+  `arrow_schema_to_iceberg_schema` (hand-rolled — iceberg-rust 0.9.1
+  pins arrow 57 vs workspace 58).
+
 - **Conditional aggregates in streaming windows** (2026-07-09):
   `AGG(x) FILTER (WHERE …)` and the `AGG(CASE WHEN cond THEN x [ELSE
   0|NULL] END)` idiom now compile for TUMBLE/HOP/SESSION windows instead

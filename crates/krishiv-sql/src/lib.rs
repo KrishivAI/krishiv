@@ -1930,6 +1930,68 @@ impl SqlEngine {
             return Ok(self.attach_query_metadata(self.make_sql_df("merge", dataframe), query));
         }
 
+        // ── Intercept CREATE [OR REPLACE] TABLE <iceberg-table> AS <query> ───
+        // Durable CTAS (gap G17): when the target resolves to a registered
+        // Iceberg catalog, execute the inner query on this engine and land
+        // the result stream directly in Iceberg (rolling Parquet parts +
+        // snapshot commit) instead of materializing it as a session table.
+        // The result is a single row of landing counts — the full result set
+        // never crosses a wire. Targets that do not resolve to an Iceberg
+        // catalog fall through to DataFusion's session-local CTAS.
+        #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+        if trimmed.to_ascii_uppercase().starts_with("CREATE ")
+            && let Some(parsed_ctas) = parse_ctas(trimmed)
+            && let Some((iceberg_catalog, table_ident)) =
+                self.resolve_iceberg_table(&parsed_ctas.table_ref)
+        {
+            use arrow::array::{ArrayRef, Int64Array};
+            use arrow::datatypes::{DataType, Field, Schema};
+
+            let dataframe = self.context.sql(&parsed_ctas.inner_query).await?;
+            let stream = dataframe
+                .execute_stream()
+                .await
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
+            let report = krishiv_connectors::lakehouse::dml::land_ctas(
+                iceberg_catalog,
+                &table_ident,
+                parsed_ctas.or_replace,
+                stream,
+            )
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+            // The target table (or its schema) changed under any cached plan.
+            self.invalidate_plan_cache();
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("rows_written", DataType::Int64, false),
+                Field::new("bytes_written", DataType::Int64, false),
+                Field::new("data_files", DataType::Int64, false),
+                Field::new("snapshot_id", DataType::Int64, false),
+            ]));
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(vec![report.rows as i64])),
+                Arc::new(Int64Array::from(vec![report.bytes as i64])),
+                Arc::new(Int64Array::from(vec![report.data_files as i64])),
+                Arc::new(Int64Array::from(vec![report.snapshot_id])),
+            ];
+            let batch =
+                RecordBatch::try_new(schema, columns).map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
+            let res_table = next_ephemeral_name("ctas_result");
+            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
+            let dataframe = self
+                .context
+                .sql(&format!("SELECT * FROM {res_table}"))
+                .await?;
+            return Ok(self.attach_query_metadata(self.make_sql_df("ctas", dataframe), query));
+        }
+
         // ── Intercept CALL system.<proc> ──────────────────────────────────────
         // Route Iceberg maintenance procedures to registered KrishivCatalogs.
         #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
@@ -4129,6 +4191,45 @@ fn parse_dml_delete(stmt: &str) -> Option<(String, String)> {
         .map(|e| e.to_string())
         .unwrap_or_else(|| "TRUE".to_string());
     Some((table_name, predicate))
+}
+
+/// Parsed `CREATE [OR REPLACE] TABLE … AS <query>` statement.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+struct ParsedCtas {
+    /// Dotted target reference exactly as written (`cat.ns.tbl` or `ns.tbl`).
+    table_ref: String,
+    or_replace: bool,
+    /// The inner query text (sqlparser AST rendering of the AS body).
+    inner_query: String,
+}
+
+/// Parse `CREATE [OR REPLACE] TABLE <ref> AS <query>` using the sqlparser AST.
+///
+/// Returns `None` for anything else — plain column-list CREATE TABLE,
+/// CREATE EXTERNAL/TEMPORARY TABLE (DataFusion's own DDL), multi-statement
+/// input, or unparseable text — so callers fall through to DataFusion.
+#[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
+fn parse_ctas(stmt: &str) -> Option<ParsedCtas> {
+    use datafusion::sql::sqlparser::ast::Statement;
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
+
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, stmt).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let Statement::CreateTable(create) = stmts.remove(0) else {
+        return None;
+    };
+    if create.external || create.temporary {
+        return None;
+    }
+    let inner_query = create.query?.to_string();
+    Some(ParsedCtas {
+        table_ref: create.name.to_string(),
+        or_replace: create.or_replace,
+        inner_query,
+    })
 }
 
 /// Parsed UPDATE statement, decomposed into its components for Iceberg DML.

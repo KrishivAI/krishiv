@@ -501,6 +501,419 @@ pub async fn overwrite_table_pub(
     Ok(snapshot_id)
 }
 
+// ── CTAS landing (durable CREATE [OR REPLACE] TABLE … AS SELECT) ─────────────
+
+/// Outcome of a durable CTAS landing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CtasLandingReport {
+    /// Rows written into the new snapshot.
+    pub rows: u64,
+    /// Total bytes of the Parquet data files written.
+    pub bytes: u64,
+    /// Number of data files in the new snapshot.
+    pub data_files: usize,
+    /// New snapshot id, or -1 when the table is empty (no snapshot).
+    pub snapshot_id: i64,
+}
+
+/// Default per-data-file roll threshold for CTAS landing, measured against
+/// the *in-memory* Arrow size of the buffered batches (Parquet output is
+/// typically 2-4× smaller). Override via `KRISHIV_CTAS_TARGET_FILE_BYTES`.
+const CTAS_TARGET_FILE_BYTES_DEFAULT: usize = 512 * 1024 * 1024;
+
+fn ctas_target_file_bytes() -> usize {
+    std::env::var("KRISHIV_CTAS_TARGET_FILE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(CTAS_TARGET_FILE_BYTES_DEFAULT)
+}
+
+/// Convert a workspace-arrow schema to an Iceberg schema with fresh field ids.
+///
+/// Hand-rolled (inverse of the read-side map in
+/// `krishiv-sql/src/catalog/iceberg_table_provider.rs`) because iceberg-rust
+/// 0.9.1 pins arrow 57 while the workspace is on arrow 58, so
+/// `iceberg::arrow::arrow_schema_to_schema` cannot accept our types. Flat
+/// primitive columns only — nested/list/struct results must be flattened in
+/// SQL before a durable CTAS.
+pub fn arrow_schema_to_iceberg_schema(
+    schema: &arrow::datatypes::Schema,
+) -> Result<iceberg::spec::Schema, LakehouseError> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    use iceberg::spec::{NestedField, PrimitiveType, Type};
+
+    let mut fields: Vec<Arc<NestedField>> = Vec::with_capacity(schema.fields().len());
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let prim = match field.data_type() {
+            DataType::Boolean => PrimitiveType::Boolean,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 => PrimitiveType::Int,
+            DataType::Int64 => PrimitiveType::Long,
+            // Unsigned 8/16/32 fit losslessly in a signed long.
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => PrimitiveType::Long,
+            DataType::Float32 => PrimitiveType::Float,
+            DataType::Float64 => PrimitiveType::Double,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => PrimitiveType::String,
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+                PrimitiveType::Binary
+            }
+            DataType::Date32 | DataType::Date64 => PrimitiveType::Date,
+            DataType::Time64(TimeUnit::Microsecond) => PrimitiveType::Time,
+            DataType::Timestamp(_, None) => PrimitiveType::Timestamp,
+            DataType::Timestamp(_, Some(_)) => PrimitiveType::Timestamptz,
+            DataType::Decimal128(precision, scale) if *scale >= 0 && *precision <= 38 => {
+                PrimitiveType::Decimal {
+                    precision: u32::from(*precision),
+                    scale: *scale as u32,
+                }
+            }
+            other => {
+                return Err(LakehouseError::Iceberg(format!(
+                    "durable CTAS cannot map result column '{}' of type {other} to an \
+                     Iceberg type; cast or flatten it in the SELECT",
+                    field.name()
+                )));
+            }
+        };
+        let iceberg_field = if field.is_nullable() {
+            NestedField::optional(idx as i32 + 1, field.name(), Type::Primitive(prim))
+        } else {
+            NestedField::required(idx as i32 + 1, field.name(), Type::Primitive(prim))
+        };
+        fields.push(Arc::new(iceberg_field));
+    }
+    iceberg::spec::Schema::builder()
+        .with_fields(fields)
+        .build()
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))
+}
+
+/// Normalize a batch so its physical Parquet encoding matches the Iceberg
+/// schema produced by [`arrow_schema_to_iceberg_schema`]: timestamps become
+/// microsecond precision (Iceberg v2 has no other unit) and Date64 becomes
+/// Date32. Other columns pass through untouched.
+fn normalize_batch_for_iceberg(batch: &RecordBatch) -> Result<RecordBatch, LakehouseError> {
+    use arrow::datatypes::{DataType, Field, TimeUnit};
+
+    let needs_cast = |dt: &DataType| {
+        matches!(
+            dt,
+            DataType::Timestamp(unit, _) if *unit != TimeUnit::Microsecond
+        ) || matches!(dt, DataType::Date64)
+    };
+    if !batch.schema().fields().iter().any(|f| needs_cast(f.data_type())) {
+        return Ok(batch.clone());
+    }
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let target = match field.data_type() {
+            DataType::Timestamp(unit, tz) if *unit != TimeUnit::Microsecond => {
+                Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
+            }
+            DataType::Date64 => Some(DataType::Date32),
+            _ => None,
+        };
+        match target {
+            Some(target) => {
+                let cast = arrow::compute::cast(column, &target)
+                    .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+                fields.push(Arc::new(Field::new(
+                    field.name(),
+                    target,
+                    field.is_nullable(),
+                )));
+                columns.push(cast);
+            }
+            None => {
+                fields.push(Arc::clone(field));
+                columns.push(Arc::clone(column));
+            }
+        }
+    }
+    RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))
+}
+
+/// Write one Parquet part file from buffered batches and upload it via the
+/// table's FileIO. Returns the Iceberg `DataFile` descriptor.
+async fn write_ctas_part(
+    file_io: &iceberg::io::FileIO,
+    table_location: &str,
+    batches: Vec<RecordBatch>,
+) -> Result<iceberg::spec::DataFile, LakehouseError> {
+    let arrow_schema = batches
+        .first()
+        .ok_or_else(|| LakehouseError::Iceberg("empty part".to_string()))?
+        .schema();
+    let (file_bytes, file_size, record_count) =
+        task::spawn_blocking(move || -> Result<(Vec<u8>, u64, u64), LakehouseError> {
+            let tmp =
+                tempfile::NamedTempFile::new().map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let file = std::fs::File::create(tmp.path())
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let mut writer = ArrowWriter::try_new(file, arrow_schema, None)
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let mut rows = 0u64;
+            for batch in &batches {
+                rows += batch.num_rows() as u64;
+                writer
+                    .write(batch)
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            }
+            writer
+                .close()
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let bytes =
+                std::fs::read(tmp.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let size = bytes.len() as u64;
+            Ok((bytes, size, rows))
+        })
+        .await
+        .map_err(|e| LakehouseError::Io(e.to_string()))??;
+
+    let dest = format!(
+        "{}/data/{}.parquet",
+        table_location.trim_end_matches('/'),
+        uuid::Uuid::new_v4()
+    );
+    let output = file_io
+        .new_output(&dest)
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+    output
+        .write(Bytes::from(file_bytes))
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+    DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(dest)
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(file_size)
+        .record_count(record_count)
+        .partition(Struct::empty())
+        .partition_spec_id(0)
+        .build()
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))
+}
+
+/// Durably land a `CREATE [OR REPLACE] TABLE … AS SELECT` result stream in an
+/// Iceberg table with bounded memory.
+///
+/// The result stream is consumed incrementally into rolling Parquet part
+/// files (roll threshold [`ctas_target_file_bytes`], measured on in-memory
+/// Arrow size), each uploaded through the table's FileIO before the next
+/// part buffers — peak memory is one part, independent of result size. This
+/// is the engine-side fix for pipeline batch refreshes that previously
+/// streamed the whole result out over Flight SQL and back (gap G17).
+///
+/// Replace semantics are drop+recreate (iceberg-rust 0.9.1 has no public
+/// overwrite snapshot action), matching [`overwrite_table_pub`]:
+///
+/// 1. All part files are written and durable *before* the old table is
+///    dropped — the destructive window covers metadata operations only.
+/// 2. If the recreate fails, a restore of the old table is attempted; if
+///    that fails too, a CRITICAL log directs manual intervention.
+///
+/// For a replace the parts are written under the existing table's location
+/// (fresh UUID names cannot collide); for a new table it is created first so
+/// the catalog assigns its location. The final `fast_append` commit makes
+/// the new snapshot visible atomically.
+pub async fn land_ctas(
+    catalog: Arc<dyn Catalog + Send + Sync>,
+    ident: &TableIdent,
+    or_replace: bool,
+    stream: datafusion::execution::SendableRecordBatchStream,
+) -> Result<CtasLandingReport, LakehouseError> {
+    land_ctas_with_target(catalog, ident, or_replace, stream, ctas_target_file_bytes()).await
+}
+
+/// [`land_ctas`] with an explicit per-part roll threshold (bytes of buffered
+/// in-memory Arrow data). Exposed for callers and tests that need to control
+/// file sizing directly instead of via `KRISHIV_CTAS_TARGET_FILE_BYTES`.
+pub async fn land_ctas_with_target(
+    catalog: Arc<dyn Catalog + Send + Sync>,
+    ident: &TableIdent,
+    or_replace: bool,
+    mut stream: datafusion::execution::SendableRecordBatchStream,
+    target_bytes: usize,
+) -> Result<CtasLandingReport, LakehouseError> {
+    use futures::StreamExt as _;
+
+    // Namespace first: some catalogs error (rather than answer false) on
+    // existence probes inside a namespace they have never seen.
+    let ns = ident.namespace();
+    let ns_exists = catalog
+        .namespace_exists(ns)
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+    if !ns_exists {
+        // Tolerate a concurrent create racing us.
+        if let Err(e) = catalog.create_namespace(ns, Default::default()).await
+            && !catalog
+                .namespace_exists(ns)
+                .await
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?
+        {
+            return Err(LakehouseError::Iceberg(e.to_string()));
+        }
+    }
+
+    let exists = catalog
+        .table_exists(ident)
+        .await
+        .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+    if exists && !or_replace {
+        return Err(LakehouseError::Iceberg(format!(
+            "table {ident} already exists; use CREATE OR REPLACE TABLE to replace it"
+        )));
+    }
+
+    let iceberg_schema = arrow_schema_to_iceberg_schema(stream.schema().as_ref())?;
+
+    // Where the part files go, and the FileIO to write them with. For a
+    // replace we write under the existing location before touching metadata;
+    // for a new table we create it first so the catalog assigns a location.
+    let (table_location, file_io, created_fresh) = if exists {
+        let old = catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        (
+            old.metadata().location().to_string(),
+            old.file_io().clone(),
+            false,
+        )
+    } else {
+        let table = catalog
+            .create_table(
+                ident.namespace(),
+                TableCreation::builder()
+                    .name(ident.name().to_string())
+                    .schema(iceberg_schema.clone())
+                    .build(),
+            )
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        (
+            table.metadata().location().to_string(),
+            table.file_io().clone(),
+            true,
+        )
+    };
+
+    // Consume the stream into rolling part files.
+    let mut buffered: Vec<RecordBatch> = Vec::new();
+    let mut buffered_bytes = 0usize;
+    let mut data_files: Vec<iceberg::spec::DataFile> = Vec::new();
+    let mut total_rows = 0u64;
+    let mut total_bytes = 0u64;
+    while let Some(next) = stream.next().await {
+        let batch = next.map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let batch = normalize_batch_for_iceberg(&batch)?;
+        total_rows += batch.num_rows() as u64;
+        buffered_bytes += batch.get_array_memory_size();
+        buffered.push(batch);
+        if buffered_bytes >= target_bytes {
+            let part =
+                write_ctas_part(&file_io, &table_location, std::mem::take(&mut buffered)).await?;
+            buffered_bytes = 0;
+            total_bytes += part.file_size_in_bytes();
+            data_files.push(part);
+        }
+    }
+    if !buffered.is_empty() {
+        let part = write_ctas_part(&file_io, &table_location, std::mem::take(&mut buffered)).await?;
+        total_bytes += part.file_size_in_bytes();
+        data_files.push(part);
+    }
+
+    // Metadata swap: for a replace, drop + recreate at the same location so
+    // the new snapshot references only our files (and picks up the new
+    // schema). All data files above are already durable.
+    let table = if created_fresh {
+        catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?
+    } else {
+        catalog
+            .drop_table(ident)
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        let creation = || {
+            TableCreation::builder()
+                .name(ident.name().to_string())
+                .schema(iceberg_schema.clone())
+                .location(table_location.clone())
+                .build()
+        };
+        match catalog.create_table(ident.namespace(), creation()).await {
+            Ok(t) => t,
+            Err(create_err) => {
+                if let Err(restore_err) =
+                    catalog.create_table(ident.namespace(), creation()).await
+                {
+                    tracing::error!(
+                        table = %ident,
+                        create_error = %create_err,
+                        restore_error = %restore_err,
+                        "CRITICAL: table is invisible after failed CTAS replace and \
+                         restore attempt; manual intervention required"
+                    );
+                }
+                return Err(LakehouseError::Iceberg(create_err.to_string()));
+            }
+        }
+    };
+
+    let files_count = data_files.len();
+    let snapshot_id = if data_files.is_empty() {
+        // Empty result: the (re)created table with no snapshot is the answer.
+        -1
+    } else {
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(data_files);
+        let tx = action
+            .apply(tx)
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        let committed = tx
+            .commit(&*catalog)
+            .await
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+        // Local-FS native tables track the current metadata via a version
+        // hint; object-store tables (REST catalog) do not use one.
+        if table_location.starts_with("file://")
+            && let Some(loc) = committed.metadata_location()
+        {
+            let table_root = std::path::Path::new(table_location.trim_start_matches("file://"));
+            if let Err(e) = super::iceberg_native::native::write_version_hint(table_root, loc) {
+                tracing::warn!(
+                    table = %ident,
+                    location = loc,
+                    error = %e,
+                    "version hint update failed after CTAS commit; hint may be stale"
+                );
+            }
+        }
+        committed
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+            .unwrap_or(-1)
+    };
+
+    Ok(CtasLandingReport {
+        rows: total_rows,
+        bytes: total_bytes,
+        data_files: files_count,
+        snapshot_id,
+    })
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn extract_count(batches: &[RecordBatch]) -> i64 {
@@ -587,5 +1000,183 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(deleted, 0, "empty table: no rows to delete");
+    }
+
+    // ── land_ctas ─────────────────────────────────────────────────────────────
+
+    async fn make_empty_catalog() -> (Arc<dyn Catalog + Send + Sync>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                .load(
+                    "mem",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                )
+                .await
+                .unwrap(),
+        );
+        (catalog as Arc<dyn Catalog + Send + Sync>, dir)
+    }
+
+    async fn stream_of(
+        ctx: &SessionContext,
+        sql: &str,
+    ) -> datafusion::execution::SendableRecordBatchStream {
+        ctx.sql(sql).await.unwrap().execute_stream().await.unwrap()
+    }
+
+    async fn table_rows(
+        catalog: &Arc<dyn Catalog + Send + Sync>,
+        ident: &TableIdent,
+        ctx: &SessionContext,
+    ) -> Vec<RecordBatch> {
+        let table = catalog.load_table(ident).await.unwrap();
+        scan_iceberg_table(&table, ctx).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn land_ctas_creates_new_table_with_rows() {
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "out".into());
+
+        let stream = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS t(id, name)",
+        )
+        .await;
+        let report = land_ctas(Arc::clone(&catalog), &ident, false, stream)
+            .await
+            .unwrap();
+        assert_eq!(report.rows, 3);
+        assert_eq!(report.data_files, 1);
+        assert!(report.snapshot_id > 0, "commit must produce a snapshot");
+        assert!(report.bytes > 0);
+
+        let rows: usize = table_rows(&catalog, &ident, &ctx)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 3, "read back all landed rows");
+    }
+
+    #[tokio::test]
+    async fn land_ctas_replace_swaps_contents_and_schema() {
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "out".into());
+
+        let first = stream_of(&ctx, "SELECT * FROM (VALUES (1), (2)) AS t(id)").await;
+        land_ctas(Arc::clone(&catalog), &ident, false, first)
+            .await
+            .unwrap();
+
+        // CREATE without OR REPLACE on an existing table must fail.
+        let dup = stream_of(&ctx, "SELECT * FROM (VALUES (9)) AS t(id)").await;
+        let err = land_ctas(Arc::clone(&catalog), &ident, false, dup)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "got: {err}"
+        );
+
+        // Replace with a different schema and contents.
+        let second = stream_of(
+            &ctx,
+            "SELECT * FROM (VALUES (10, 'x'), (20, 'y'), (30, 'z')) AS t(id, tag)",
+        )
+        .await;
+        let report = land_ctas(Arc::clone(&catalog), &ident, true, second)
+            .await
+            .unwrap();
+        assert_eq!(report.rows, 3);
+
+        let batches = table_rows(&catalog, &ident, &ctx).await;
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 3, "replace must not append to the old contents");
+        assert_eq!(
+            batches[0].schema().fields().len(),
+            2,
+            "replace must adopt the new schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn land_ctas_rolls_multiple_data_files() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "big".into());
+
+        // Ten explicit source batches; a 1-byte roll threshold rolls a part
+        // per streamed batch.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batches: Vec<RecordBatch> = (0..10)
+            .map(|part| {
+                let start = part * 1000;
+                let values: Vec<i64> = (start..start + 1000).collect();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(values))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let mem = MemTable::try_new(Arc::clone(&schema), vec![batches]).unwrap();
+        ctx.register_table("src", Arc::new(mem)).unwrap();
+        let stream = stream_of(&ctx, "SELECT id FROM src").await;
+        let report = land_ctas_with_target(Arc::clone(&catalog), &ident, false, stream, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(report.rows, 10_000);
+        assert!(
+            report.data_files > 1,
+            "1-byte threshold must roll multiple parts, got {}",
+            report.data_files
+        );
+        let rows: usize = table_rows(&catalog, &ident, &ctx)
+            .await
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 10_000, "all parts must be committed and readable");
+    }
+
+    #[tokio::test]
+    async fn land_ctas_empty_result_creates_empty_table() {
+        let (catalog, _dir) = make_empty_catalog().await;
+        let ctx = SessionContext::new();
+        let ident = TableIdent::new(NamespaceIdent::new("pipe".into()), "empty".into());
+
+        let stream = stream_of(&ctx, "SELECT 1 AS id WHERE FALSE").await;
+        let report = land_ctas(Arc::clone(&catalog), &ident, false, stream)
+            .await
+            .unwrap();
+        assert_eq!(report.rows, 0);
+        assert_eq!(report.data_files, 0);
+        assert_eq!(report.snapshot_id, -1, "empty table has no snapshot");
+        assert!(
+            catalog.table_exists(&ident).await.unwrap(),
+            "empty CTAS must still create the table"
+        );
+    }
+
+    #[test]
+    fn arrow_schema_conversion_rejects_nested_types() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let nested = Schema::new(vec![Field::new(
+            "xs",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        )]);
+        let err = arrow_schema_to_iceberg_schema(&nested).unwrap_err();
+        assert!(err.to_string().contains("cannot map"), "got: {err}");
     }
 }
