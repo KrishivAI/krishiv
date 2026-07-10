@@ -415,6 +415,65 @@ traces; AUD-6's exit adds deltas-not-snapshots; MIN/MAX multisets move
 behind the Phase-56 state/arbiter seam; Phase 64 evaluates the
 delta-join form for multi-way joins at shard scale.
 
+## 5d. Consolidated critical register: correctness, data loss, recovery (2026-07-10)
+
+Every open critical-class finding across the twelve passes, with its
+phase/task home. Two entries are **new this pass** (DUR-5/DUR-6).
+
+**Wrong answers (correctness):**
+
+- Aggregate silent 0.0 coercion — unparseable numeric adds 0 to SUM/AVG
+  (`operators/aggregate.rs:235`, §5c) → Phase 57 AUD-7, **fix-first
+  eligible** (#196).
+- Global-max watermark late-drops lagging Kafka partitions' rows —
+  in-order data on a slow partition is dropped as late today (§7c) →
+  Phase 55 watermarks v2.
+
+**Data loss / durability:**
+
+- **DUR-1** distributed-sink false `Succeeded` (persisted before publish
+  completes) → Phase 63.
+- **DUR-2** prepared sink transactions absent from durable checkpoints
+  (offsets can restore past uncommitted output) → Phase 63.
+- **DUR-5 (new)**: undrained continuous output is **coordinator RAM
+  only** (`job_inline_results: HashMap`, `coordinator/mod.rs:152`) — a
+  coordinator restart between cycle completion and `continuous-drain`
+  loses those windows permanently (input already consumed). Severity
+  context: prod pipeline delivery is queryable-state snapshots + the
+  transactional Iceberg sink (both survive), and the platform bridge
+  drains only to unwedge (discards) — so the loss hits any API consumer
+  using drain as the delivery path. Disposition: label drain
+  best-effort **now** (Phase 63 honesty), retire it as a delivery path
+  when Phase 55's streamed-results task lands.
+- **DUR-6 (new)**: coordinator durable-profile metadata writes use
+  default RocksDB `put_cf` (no `WriteOptions::set_sync`,
+  `rocksdb_metadata.rs:204-314`) — WAL survives process crash but a
+  host/power failure can lose the newest job-state writes on a profile
+  whose contract is fail-closed durability. Decide + document the
+  sync-write policy per profile (sync on the fail-closed profiles, or
+  document the weaker guarantee). Same sweep: `dfs_backend.rs:163`
+  ignores the `sync_all()` result (module currently unwired — rides
+  the Phase 51 wire-or-delete / Phase 56 decision).
+- Platform (#171 family): kafka_bridge runs
+  `enable.auto.commit=true` (`imp.rs:247`) — Kafka offsets commit on a
+  timer regardless of push outcome, so a bridge restart loses buffered
+  messages, on top of the drop-oldest overflow (§4b). Both are the
+  at-most-once behaviors #171's certified feeder protocol replaces.
+
+**Liveness / silent-wrong-behavior:**
+
+- Distributed streaming has no idle tick — quiet source never emits its
+  final windows (§4b) → Phase 55 (#195).
+- `KRISHIV_STREAM_EARLY_FIRE_MS` silent no-op stub (§4b) → Phase 51
+  wire-or-delete / Phase 55.
+- H-6: two executors assigned the same `stream:loop` job collide on the
+  executor map — logged, not prevented (`fragment/streaming.rs:449`) →
+  Phase 55 key-group task removes the constraint properly.
+
+**Security (unchanged, GATE 0):** SEC-1 auth bypass, SEC-2 Flight authz
+asymmetry, SEC-3 surface sweep, SEC-4 advisories (jsonwebtoken
+type-confusion first) → Phase 63, runs before everything.
+
 ## 6. Fault tolerance & HA
 
 - Coordinator HA: etcd leader election exists behind `feature = "etcd"`
@@ -781,6 +840,56 @@ end-of-session review):
 
 Phase detail, gates, and platform-side seams live in the platform repo:
 `docs/implementation/phases/phase-NN-*.md` and `plan.md` (Track 6).
+
+## 10b. Performance program across the engine (consolidated, 2026-07-10)
+
+Every performance item from the twelve passes, in expected-impact order
+within its engine, with its phase home. The recurring theme across all
+three engines is the same: **eager materialization and per-unit-of-work
+setup on hot paths, while purpose-built faster machinery sits parked.**
+
+**Batch** (external yardstick: Sail ~4×/8× vs Spark on the shared DF base):
+1. Zero-materialization + zero-setup hot path — per-task SessionContext/
+   UDF/catalog registration, MemTable inputs, `collect_with_stats` sinks
+   (§2b) → Phase 52 (#194).
+2. Partition-parallel stages + real shuffle (§2) → Phase 52; then AQE
+   coalesce/skew-split/runtime filters (§3) → Phase 54.
+3. Streaming `TableProvider`s for JDBC/Delta/Hudi eager reads (§8b) →
+   Phase 52.
+4. Partitioned Iceberg writes (#191) + distributed compaction (#192) —
+   pruning and small-file health at scale → Phase 52.
+5. Locality-aware + speculative scheduling (parked `LocalityScheduler`)
+   → Phase 53.
+
+**Streaming** (external yardstick: Arroyo ms-latency on the same base):
+1. Low-latency execution loop — promote the embedded loop; kills 2 s
+   linger + per-cycle assignment RPC + O(state)×2 per cycle (§4b) →
+   Phase 55 (#195); seconds → milliseconds in-engine.
+2. Checkpoints at barrier epochs only; incremental + disaggregated state
+   (parked `incremental_checkpoint.rs`/`dfs_backend.rs`) → Phases 55/56.
+3. Key-group parallelism + credit-based exchange (§4) → Phase 55.
+4. Sink commits at epoch boundaries; batch/linger dial → Phase 55.
+
+**IVM** (yardstick: #102 crossover — recompute wins below ~23M rows
+today; target ≤1M):
+1. Executor-resident state; deltas-not-snapshots; no per-tick
+   ctx/plan rebuild (§5, §5c) → Phase 57 AUD-6.
+2. Arrow-row keys AND values — end per-row stringify/parse (§5c) →
+   Phase 57 AUD-7.
+3. O(Δ) view-on-view delta cascade + shared upstream traces (§5c) →
+   Phase 57 AUD-9.
+4. Snapshot retention + lateness GC actually running (§5 AUD-8) →
+   Phase 57.
+5. Key-group sharding, demand-triggered (§5c delta joins) → Phase 64.
+
+**Cross-cutting:**
+1. Executor-wide memory arbitration — one pool, one OOM story; unlocks
+   larger workloads per node (§7c) → Phase 56.
+2. Engine-overhead microbenchmark + recorded baselines — every phase
+   must cite deltas (§2b) → Phase 51; regression budgets ride the
+   platform's Phase 29 program.
+3. Version train (DF 53.1 → current, arrow, iceberg 0.10) — upstream
+   perf work arrives with it (#163) → Phase 51.
 
 ### SOTA references consulted (2026-07-10)
 
