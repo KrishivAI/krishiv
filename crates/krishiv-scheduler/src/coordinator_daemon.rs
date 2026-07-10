@@ -499,16 +499,6 @@ pub fn coordinator_http_router(
         )
         .with_state(coordinator.clone());
 
-    let protected = if http_auth_required(config) {
-        let tokens = resolve_http_bearer_tokens();
-        protected.layer(middleware::from_fn(move |req, next| {
-            let tokens = tokens.clone();
-            async move { require_coordinator_bearer(req, next, &tokens).await }
-        }))
-    } else {
-        protected
-    };
-
     // IVM routes — combined state (registry + coordinator), baked in before merging.
     let ivm_registry = std::sync::Arc::new(crate::ivm::IvmJobRegistry::new());
     let ivm_state = crate::ivm_http::IvmRouterState {
@@ -521,13 +511,29 @@ pub fn coordinator_http_router(
     let qs_routes =
         crate::queryable_state_http::queryable_state_router(coordinator.queryable_state.clone());
 
-    // All sub-routers are Router<()> (state already baked in), so no final
+    // SEC-1 (Phase 63): IVM job submission and queryable-state reads are NOT
+    // public — they must sit behind the same default-deny bearer middleware as
+    // the rest of the protected surface. Fold them into `protected` BEFORE the
+    // auth layer is applied, so a single middleware covers every non-public
+    // route. Previously these merged as siblings of `protected` after the layer,
+    // leaving IVM submission and raw state reads reachable unauthenticated even
+    // when HTTP auth was required.
+    let protected = protected.merge(ivm_routes).merge(qs_routes);
+
+    let protected = if http_auth_required(config) {
+        let tokens = resolve_http_bearer_tokens();
+        protected.layer(middleware::from_fn(move |req, next| {
+            let tokens = tokens.clone();
+            async move { require_coordinator_bearer(req, next, &tokens).await }
+        }))
+    } else {
+        protected
+    };
+
+    // Only `public` (health, readiness, metrics) is exempt from auth. All
+    // sub-routers are Router<()> (state already baked in), so no final
     // .with_state() call is needed here.
-    Router::new()
-        .merge(public)
-        .merge(protected)
-        .merge(ivm_routes)
-        .merge(qs_routes)
+    Router::new().merge(public).merge(protected)
 }
 
 fn http_auth_required(config: &CoordinatorDaemonConfig) -> bool {
@@ -1840,6 +1846,70 @@ mod parse_tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["cancelled"], serde_json::json!(true));
+    }
+
+    /// SEC-1 (Phase 63) regression: IVM job-submission and queryable-state
+    /// routes must sit behind the coordinator bearer middleware. Before the
+    /// fix they merged as siblings of `protected` *after* the auth layer, so
+    /// they served unauthenticated even when HTTP auth was required. With an
+    /// auth-required profile and no configured token, every non-public route —
+    /// protected, IVM, and queryable-state — must be rejected 401, while the
+    /// `public` group (health) stays open.
+    #[tokio::test]
+    async fn sec1_ivm_and_queryable_state_routes_require_auth() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-sec1-http").unwrap(),
+        ));
+
+        // SingleNodeDurable ⇒ requires_http_auth() is true without needing
+        // KRISHIV_PRODUCTION, so the bearer middleware is layered onto the
+        // protected group. No bearer token is configured, so the middleware
+        // rejects every route it covers with 401 (empty-token branch).
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::SingleNodeDurable);
+        let router = coordinator_http_router(coordinator.clone(), &config);
+
+        // Public route stays open.
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK, "/healthz must stay public");
+
+        // Every non-public surface must 401 without a bearer token.
+        for (method, uri) in [
+            ("GET", "/api/v1/executors"),         // protected group (sanity)
+            ("GET", "/api/v1/ivm/jobs"),          // IVM — SEC-1 bypass target
+            ("GET", "/api/v1/jobs/j1/state/op1"), // queryable-state — SEC-1 bypass target
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must require auth (SEC-1)"
+            );
+        }
     }
 
     #[tokio::test]
