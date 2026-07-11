@@ -5524,6 +5524,7 @@ dependencies = [
  "krishiv-dataflow",
  "krishiv-delta",
  "krishiv-engine-core",
+ "krishiv-flight-sql",
  "krishiv-ivm",
  "krishiv-plan",
  "krishiv-runtime",

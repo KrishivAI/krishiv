@@ -862,6 +862,11 @@ impl IncrementalFlow {
             available_schemas.insert(spec.name.clone(), spec.output_schema.clone());
         }
 
+        // Pre-tick view outputs, frozen for operator seeding: a newly built
+        // incremental operator must start from the upstream state *before*
+        // this tick's delta, or applying the delta double-counts it
+        // (view-on-view regression caught by pipeline_temp_view_intermediate).
+        let view_seed_snapshots: HashMap<String, RecordBatch> = view_prev_snapshots.clone();
         // view_full_outputs: pre-populated with prev snapshots for clean views.
         // DiffBased dirty views add their SQL result here during this phase.
         let mut view_full_outputs: HashMap<String, RecordBatch> = view_prev_snapshots;
@@ -1081,7 +1086,7 @@ impl IncrementalFlow {
                     pre_delta_snapshots
                         .get(src)
                         .cloned()
-                        .or_else(|| view_full_outputs.get(src).cloned())
+                        .or_else(|| view_seed_snapshots.get(src).cloned())
                 })
             {
                 tracing::warn!(
@@ -2390,6 +2395,73 @@ mod integration_tests {
             "expected total=350.0, got {}",
             totals.value(0)
         );
+    }
+
+    /// Regression (Phase 51): a downstream view with a fresh incremental
+    /// operator (COUNT over an upstream view) must seed from the upstream's
+    /// **pre-tick** output, not the output already computed this tick —
+    /// otherwise the same tick's delta is applied on top of a snapshot that
+    /// already contains it and the aggregate double-counts.
+    #[tokio::test]
+    async fn view_on_view_incremental_agg_does_not_double_count() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use krishiv_delta::DeltaBatch;
+
+        let flow = IncrementalFlow::new();
+
+        let big_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "big".into(),
+            body_sql: "SELECT id, amount FROM raw WHERE amount > 60".into(),
+            output_schema: big_schema,
+            is_materialized: false,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+        let count_schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "count_big".into(),
+            body_sql: "SELECT COUNT(*) AS n FROM big".into(),
+            output_schema: count_schema,
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+
+        let raw_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let raw_batch = RecordBatch::try_new(
+            raw_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(Int64Array::from(vec![100_i64, 50])),
+            ],
+        )
+        .unwrap();
+        flow.feed("raw", DeltaBatch::from_inserts(raw_batch).unwrap())
+            .unwrap();
+        flow.step_datafusion().await.unwrap();
+
+        let snap = flow
+            .snapshot("count_big")
+            .expect("snapshot call failed")
+            .expect("count_big must have a snapshot");
+        let n = snap
+            .column_by_name("n")
+            .expect("missing n")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("n is not Int64")
+            .value(0);
+        assert_eq!(n, 1, "only the amount=100 row passes the upstream filter");
     }
 
     // ── 3c: serialization versioning ──────────────────────────────────────────

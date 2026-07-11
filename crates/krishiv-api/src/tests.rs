@@ -1339,7 +1339,6 @@ fn multi_source_watermark_window_collect_with_source_column() {
     assert!(!out.is_empty());
 }
 
-#[cfg(feature = "__disabled_flight_test")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_execution_without_fallback_uses_flight_server() {
     use std::net::SocketAddr;
