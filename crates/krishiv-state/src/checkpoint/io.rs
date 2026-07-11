@@ -73,16 +73,14 @@ pub async fn write_epoch_metadata_async(
         .await
 }
 
-/// Update the fast-path epoch hint to `epoch`.
+/// Update the epoch hint to `epoch`.
 ///
 /// This must be called **last** — after both [`write_epoch_metadata`] and
-/// [`write_manifest`] have succeeded.  Writing the hint before the manifest is
-/// present can cause `latest_valid_epoch` to return an epoch that fails
-/// `validate_epoch` on the next restart, forcing a full directory scan.
-///
-/// In the worst case (crash between writing the manifest and writing the hint)
-/// `latest_valid_epoch` simply falls back to scanning `list_valid_epochs`, so
-/// the epoch is not lost — the hint is purely a read-path optimisation.
+/// [`write_manifest`] have succeeded — so the hint only ever names a sealed
+/// epoch.  The hint is informational (operator/tooling visibility and older
+/// readers): [`latest_valid_epoch`] deliberately ignores it, because a crash
+/// between manifest and hint leaves the newest sealed epoch unhinted and a
+/// stale-but-valid hint must not hide that epoch from recovery.
 pub fn write_epoch_hint(
     storage: &dyn CheckpointStorage,
     job_id: &str,
@@ -589,18 +587,29 @@ pub async fn delete_epoch_async(
 }
 
 /// Find the most recent valid epoch.  Returns `Err(NoValidEpoch)` if none.
+///
+/// Deliberately does **not** trust the epoch hint file: a crash between
+/// [`write_manifest`] and [`write_epoch_hint`] leaves the newest sealed epoch
+/// unhinted, and a hint pointing at a still-valid *older* epoch must not hide
+/// it — restoring an older epoch than the sinks committed against re-commits
+/// their transactions, and the [`write_epoch_metadata`] monotonicity guard
+/// (which calls this) would let a restarted coordinator overwrite the sealed
+/// epoch's metadata.  Instead this lists the epoch directory and validates
+/// from the newest epoch downward, skipping invalid or corrupt epochs so a
+/// rotted newest epoch can never brick recovery while an older sealed epoch
+/// exists.  In the common case the newest epoch is sealed, so this costs one
+/// listing plus one validation — the same as the old hint fast path.
 pub fn latest_valid_epoch(storage: &dyn CheckpointStorage, job_id: &str) -> CheckpointResult<u64> {
-    if let Some(hinted) = read_latest_epoch_hint(storage, job_id)?
-        && validate_epoch(storage, job_id, hinted)?
-    {
-        return Ok(hinted);
+    for epoch in epoch_candidates_newest_first(storage.list_dir(&checkpoints_prefix(job_id))?) {
+        match validate_epoch(storage, job_id, epoch) {
+            Ok(true) => return Ok(epoch),
+            // Invalid or corrupt: skip — an older epoch may still be sealed.
+            Ok(false) => {}
+            Err(CheckpointError::Corrupt { .. }) => {}
+            Err(e) => return Err(e),
+        }
     }
-
-    let epochs = list_valid_epochs(storage, job_id)?;
-    epochs
-        .into_iter()
-        .last()
-        .ok_or(CheckpointError::NoValidEpoch)
+    Err(CheckpointError::NoValidEpoch)
 }
 
 /// Async variant of [`latest_valid_epoch`].
@@ -608,45 +617,41 @@ pub async fn latest_valid_epoch_async(
     storage: &dyn CheckpointStorage,
     job_id: &str,
 ) -> CheckpointResult<u64> {
-    if let Some(hinted) = read_latest_epoch_hint_async(storage, job_id).await?
-        && validate_epoch_async(storage, job_id, hinted).await?
-    {
-        return Ok(hinted);
+    let names = storage.list_dir_async(&checkpoints_prefix(job_id)).await?;
+    for epoch in epoch_candidates_newest_first(names) {
+        match validate_epoch_async(storage, job_id, epoch).await {
+            Ok(true) => return Ok(epoch),
+            Ok(false) => {}
+            Err(CheckpointError::Corrupt { .. }) => {}
+            Err(e) => return Err(e),
+        }
     }
-
-    let epochs = list_valid_epochs_async(storage, job_id).await?;
-    epochs
-        .into_iter()
-        .last()
-        .ok_or(CheckpointError::NoValidEpoch)
+    Err(CheckpointError::NoValidEpoch)
 }
 
+fn checkpoints_prefix(job_id: &str) -> String {
+    format!("{job_id}/checkpoints")
+}
+
+fn epoch_candidates_newest_first(names: Vec<String>) -> Vec<u64> {
+    let mut epochs: Vec<u64> = names
+        .into_iter()
+        .filter_map(|name| name.parse::<u64>().ok())
+        .collect();
+    epochs.sort_unstable();
+    epochs.reverse();
+    epochs
+}
+
+/// Read and parse the informational epoch hint.  Test-only since
+/// [`latest_valid_epoch`] stopped consulting the hint; kept to verify that
+/// [`write_epoch_hint`] maintains the file for external tooling.
+#[cfg(test)]
 pub(super) fn read_latest_epoch_hint(
     storage: &dyn CheckpointStorage,
     job_id: &str,
 ) -> CheckpointResult<Option<u64>> {
     let Some(bytes) = storage.read_bytes(&latest_epoch_hint_path(job_id))? else {
-        return Ok(None);
-    };
-    let text = std::str::from_utf8(&bytes).map_err(|error| CheckpointError::Storage {
-        message: format!("latest epoch hint is not valid UTF-8: {error}"),
-    })?;
-    text.trim()
-        .parse::<u64>()
-        .map(Some)
-        .map_err(|error| CheckpointError::Storage {
-            message: format!("latest epoch hint is not a valid u64: {error}"),
-        })
-}
-
-async fn read_latest_epoch_hint_async(
-    storage: &dyn CheckpointStorage,
-    job_id: &str,
-) -> CheckpointResult<Option<u64>> {
-    let Some(bytes) = storage
-        .read_bytes_async(&latest_epoch_hint_path(job_id))
-        .await?
-    else {
         return Ok(None);
     };
     let text = std::str::from_utf8(&bytes).map_err(|error| CheckpointError::Storage {

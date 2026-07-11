@@ -780,7 +780,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // DFS snapshot stores key hashes, not original keys — known design limitation
+    #[ignore = "DFS snapshots store key hashes, not original keys, so load_snapshot cannot \
+                reconstruct get()-able entries — known design limitation (audit §14 TEST-6); \
+                unignore if the snapshot format ever records original keys"]
     fn snapshot_round_trip() {
         let config = temp_config();
         let mut backend = DisaggregatedStateBackend::new(config.clone()).unwrap();
