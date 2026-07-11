@@ -174,7 +174,10 @@ impl AggState {
     /// key. `kind == Int` values are exact up to 2^53; that is fine for ordering.
     fn parse_numeric(input_val_str: &str, kind: NumKind) -> f64 {
         match kind {
-            NumKind::Int => input_val_str.parse::<i64>().map(|v| v as f64).unwrap_or(0.0),
+            NumKind::Int => input_val_str
+                .parse::<i64>()
+                .map(|v| v as f64)
+                .unwrap_or(0.0),
             NumKind::Float => input_val_str.parse::<f64>().unwrap_or(0.0),
         }
     }
@@ -228,7 +231,8 @@ impl AggState {
                     Some(NumKind::Int) => {
                         self.avg_is_integer = true;
                         let v = input_val_str.parse::<i64>().unwrap_or(0);
-                        self.avg_sum_i64 = self.avg_sum_i64.saturating_add(v.saturating_mul(weight));
+                        self.avg_sum_i64 =
+                            self.avg_sum_i64.saturating_add(v.saturating_mul(weight));
                     }
                     _ => {
                         self.avg_is_integer = false;
@@ -244,7 +248,10 @@ impl AggState {
                 if input_val_str == "NULL" {
                     return;
                 }
-                let key = OrdF64(Self::parse_numeric(input_val_str, kind.unwrap_or(NumKind::Float)));
+                let key = OrdF64(Self::parse_numeric(
+                    input_val_str,
+                    kind.unwrap_or(NumKind::Float),
+                ));
                 let entry = self.min_max_set.entry(key).or_insert(0);
                 *entry += weight;
                 if *entry == 0 {
@@ -267,16 +274,14 @@ impl AggState {
                 if self.avg_count_i64 == 0 {
                     None
                 } else if self.avg_is_integer {
-                    Some(AggScalar::F64(self.avg_sum_i64 as f64 / self.avg_count_i64 as f64))
+                    Some(AggScalar::F64(
+                        self.avg_sum_i64 as f64 / self.avg_count_i64 as f64,
+                    ))
                 } else {
                     Some(AggScalar::F64(self.sum / self.avg_count_i64 as f64))
                 }
             }
-            Aggregation::Min { .. } => self
-                .min_max_set
-                .keys()
-                .next()
-                .map(|k| scalar_of(k.0, kind)),
+            Aggregation::Min { .. } => self.min_max_set.keys().next().map(|k| scalar_of(k.0, kind)),
             Aggregation::Max { .. } => self
                 .min_max_set
                 .keys()
@@ -430,8 +435,11 @@ impl IncrementalAggOp {
                 match df.data_type() {
                     DataType::Int64 | DataType::Float64 => {
                         if let Some(slot) = fields.get_mut(n_group + i) {
-                            *slot =
-                                Arc::new(Field::new(agg.output_col(), df.data_type().clone(), true));
+                            *slot = Arc::new(Field::new(
+                                agg.output_col(),
+                                df.data_type().clone(),
+                                true,
+                            ));
                         }
                     }
                     other => {
@@ -1141,7 +1149,10 @@ mod tests {
                 output_col: "total".into(),
             }],
         );
-        assert!(err.is_err(), "SUM over Utf8 must error (→ DiffBased fallback)");
+        assert!(
+            err.is_err(),
+            "SUM over Utf8 must error (→ DiffBased fallback)"
+        );
     }
 
     /// `state_bytes` → `restore_state_bytes` transfers the accumulator

@@ -77,8 +77,12 @@ pub enum WindowAggFilter {
         op: AggFilterCompareOp,
         value: AggFilterValue,
     },
-    IsNull { column: String },
-    IsNotNull { column: String },
+    IsNull {
+        column: String,
+    },
+    IsNotNull {
+        column: String,
+    },
     And(Box<WindowAggFilter>, Box<WindowAggFilter>),
     Or(Box<WindowAggFilter>, Box<WindowAggFilter>),
     Not(Box<WindowAggFilter>),
@@ -653,7 +657,8 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
 
     let agg = match agg_kind.as_deref() {
         None | Some("count") => WindowAgg::count("count"),
-        Some("sum") => WindowAgg { filter: None,
+        Some("sum") => WindowAgg {
+            filter: None,
             kind: WindowAggKind::Sum,
             input_column: agg_col.clone().ok_or_else(|| {
                 PlanError::Parse(String::from(
@@ -662,7 +667,8 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             })?,
             output_column: format!("sum_{}", agg_col.as_deref().unwrap_or("val")),
         },
-        Some("min") => WindowAgg { filter: None,
+        Some("min") => WindowAgg {
+            filter: None,
             kind: WindowAggKind::Min,
             input_column: agg_col.clone().ok_or_else(|| {
                 PlanError::Parse(String::from(
@@ -671,7 +677,8 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             })?,
             output_column: format!("min_{}", agg_col.as_deref().unwrap_or("val")),
         },
-        Some("max") => WindowAgg { filter: None,
+        Some("max") => WindowAgg {
+            filter: None,
             kind: WindowAggKind::Max,
             input_column: agg_col.clone().ok_or_else(|| {
                 PlanError::Parse(String::from(
@@ -680,7 +687,8 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             })?,
             output_column: format!("max_{}", agg_col.as_deref().unwrap_or("val")),
         },
-        Some("avg") => WindowAgg { filter: None,
+        Some("avg") => WindowAgg {
+            filter: None,
             kind: WindowAggKind::Avg,
             input_column: agg_col.clone().ok_or_else(|| {
                 PlanError::Parse(String::from(
@@ -689,7 +697,8 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             })?,
             output_column: format!("avg_{}", agg_col.as_deref().unwrap_or("val")),
         },
-        Some("stddev") => WindowAgg { filter: None,
+        Some("stddev") => WindowAgg {
+            filter: None,
             kind: WindowAggKind::Stddev,
             input_column: agg_col.clone().ok_or_else(|| {
                 PlanError::Parse(String::from(
@@ -804,23 +813,21 @@ mod tests {
     #[test]
     fn filtered_agg_fragment_round_trips_via_json() {
         let mut spec = WindowExecutionSpec::tumbling("k", "ts", 60_000);
-        spec.agg_exprs = vec![
-            WindowAgg {
-                kind: WindowAggKind::Sum,
-                input_column: "size".into(),
-                output_column: "edit_bytes".into(),
-                filter: Some(WindowAggFilter::And(
-                    Box::new(WindowAggFilter::Compare {
-                        column: "kind".into(),
-                        op: AggFilterCompareOp::Eq,
-                        value: AggFilterValue::Utf8("edit".into()),
-                    }),
-                    Box::new(WindowAggFilter::IsNotNull {
-                        column: "size".into(),
-                    }),
-                )),
-            },
-        ];
+        spec.agg_exprs = vec![WindowAgg {
+            kind: WindowAggKind::Sum,
+            input_column: "size".into(),
+            output_column: "edit_bytes".into(),
+            filter: Some(WindowAggFilter::And(
+                Box::new(WindowAggFilter::Compare {
+                    column: "kind".into(),
+                    op: AggFilterCompareOp::Eq,
+                    value: AggFilterValue::Utf8("edit".into()),
+                }),
+                Box::new(WindowAggFilter::IsNotNull {
+                    column: "size".into(),
+                }),
+            )),
+        }];
         let encoded = encode_stream_fragment(&spec).unwrap();
         assert!(
             encoded.starts_with(WINDOW_EXECUTION_SPEC_PREFIX),
@@ -883,7 +890,8 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![
                 WindowAgg::count("event_count"),
-                WindowAgg { filter: None,
+                WindowAgg {
+                    filter: None,
                     kind: WindowAggKind::Sum,
                     input_column: String::from("amount"),
                     output_column: String::from("gross_amount"),
@@ -1099,7 +1107,8 @@ mod tests {
 
         fn arb_agg() -> impl Strategy<Value = WindowAgg> {
             (arb_agg_kind(), "[a-zA-Z0-9_ ]{0,8}", "[a-zA-Z0-9_ ]{0,8}").prop_map(
-                |(kind, input_column, output_column)| WindowAgg { filter: None,
+                |(kind, input_column, output_column)| WindowAgg {
+                    filter: None,
                     kind,
                     input_column,
                     output_column,

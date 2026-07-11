@@ -771,18 +771,20 @@ impl InProcessStreamingRuntime {
         // (eviction drops unclaimed spools).
         {
             let spools = {
-                let mut coord = self
-                    .coordinator
-                    .lock()
-                    .map_err(|_| RuntimeError::InvalidState {
-                        message: "coordinator lock poisoned during result spool claim".into(),
-                    })?;
+                let mut coord =
+                    self.coordinator
+                        .lock()
+                        .map_err(|_| RuntimeError::InvalidState {
+                            message: "coordinator lock poisoned during result spool claim".into(),
+                        })?;
                 coord.take_job_result_spools(&job_id)
             };
             for spool in &spools {
-                output_batches.extend(spool.decode_record_batches().map_err(|e| {
-                    RuntimeError::transport(format!("decode result spool: {e}"))
-                })?);
+                output_batches.extend(
+                    spool.decode_record_batches().map_err(|e| {
+                        RuntimeError::transport(format!("decode result spool: {e}"))
+                    })?,
+                );
             }
         }
 

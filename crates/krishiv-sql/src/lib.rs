@@ -1344,8 +1344,8 @@ impl SqlEngine {
             // SQL, guard, and permission references `main.<ns>.<table>`). Default
             // to that so coordinator-mode `SELECT … FROM main.…` resolves without
             // per-deploy env; `KRISHIV_ICEBERG_REST_NAME` still overrides.
-            let name = std::env::var("KRISHIV_ICEBERG_REST_NAME")
-                .unwrap_or_else(|_| String::from("main"));
+            let name =
+                std::env::var("KRISHIV_ICEBERG_REST_NAME").unwrap_or_else(|_| String::from("main"));
             // When the warehouse is object-store-backed, register an S3 store on
             // this engine's DataFusion runtime so the `ListingTable` the catalog
             // bridge builds can *scan* the Parquet data files (iceberg FileIO

@@ -167,8 +167,8 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
 
         // Spool the chunk stream to disk WITHOUT the coordinator lock; only
         // the final registration takes a brief write lock.
-        let (key, spool) = crate::result_spool::receive_task_result_spool(request.into_inner())
-            .await?;
+        let (key, spool) =
+            crate::result_spool::receive_task_result_spool(request.into_inner()).await?;
         tracing::debug!(
             job_id = %key.job_id,
             task_id = %key.task_id,

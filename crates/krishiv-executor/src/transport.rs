@@ -648,7 +648,11 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
             while let Some(item) = typed_stream.next().await {
                 match item {
                     Ok(chunk) => {
-                        if tx.send(wire::task_result_chunk_to_wire(chunk)).await.is_err() {
+                        if tx
+                            .send(wire::task_result_chunk_to_wire(chunk))
+                            .await
+                            .is_err()
+                        {
                             break; // receiver dropped: call already failed
                         }
                     }

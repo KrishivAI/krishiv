@@ -70,14 +70,15 @@ impl KubernetesControllerRuntime {
         }
 
         if let Some(path) = &config.metadata_path {
-            let mut store = krishiv_scheduler::RocksDbMetadataStore::open(path).map_err(|error| {
-                OperatorError::InvalidResource {
-                    message: format!(
-                        "failed to open metadata store at {}: {error}",
-                        path.display()
-                    ),
-                }
-            })?;
+            let mut store =
+                krishiv_scheduler::RocksDbMetadataStore::open(path).map_err(|error| {
+                    OperatorError::InvalidResource {
+                        message: format!(
+                            "failed to open metadata store at {}: {error}",
+                            path.display()
+                        ),
+                    }
+                })?;
             // DUR-6: fail-closed profiles fsync metadata writes.
             store.set_sync_writes(krishiv_common::profile_requires_fail_closed_metadata(
                 config.durability_profile,

@@ -453,7 +453,10 @@ impl Coordinator {
         } else {
             std::collections::HashSet::new()
         };
-        let lost = self.exec.executors.advance_clock_excluding(ticks, &protected);
+        let lost = self
+            .exec
+            .executors
+            .advance_clock_excluding(ticks, &protected);
         let mut evicted: Vec<ExecutorId> = Vec::new();
         for lost_id in &lost {
             self.handle_executor_loss_for_checkpoints(lost_id);

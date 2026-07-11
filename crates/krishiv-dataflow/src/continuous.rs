@@ -803,7 +803,8 @@ mod tests {
     #[test]
     fn drain_errors_when_aggregate_input_column_is_missing() {
         let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
-        spec.agg_exprs = vec![krishiv_plan::window::WindowAgg { filter: None,
+        spec.agg_exprs = vec![krishiv_plan::window::WindowAgg {
+            filter: None,
             kind: krishiv_plan::window::WindowAggKind::Sum,
             input_column: "amount".into(),
             output_column: "total_amount".into(),
@@ -846,7 +847,8 @@ mod tests {
     #[test]
     fn transactional_drain_errors_when_aggregate_input_column_is_missing() {
         let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
-        spec.agg_exprs = vec![krishiv_plan::window::WindowAgg { filter: None,
+        spec.agg_exprs = vec![krishiv_plan::window::WindowAgg {
+            filter: None,
             kind: krishiv_plan::window::WindowAggKind::Sum,
             input_column: "amount".into(),
             output_column: "total_amount".into(),

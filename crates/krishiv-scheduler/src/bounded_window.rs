@@ -173,10 +173,10 @@ pub async fn execute_bounded_window_coordinated(
                 if matches!(
                     recheck,
                     JobState::Queued
-            | JobState::Accepted
-            | JobState::Planning
-            | JobState::Running
-            | JobState::Committing
+                        | JobState::Accepted
+                        | JobState::Planning
+                        | JobState::Running
+                        | JobState::Committing
                 ) {
                     tokio::select! {
                         _ = state_changed => {}

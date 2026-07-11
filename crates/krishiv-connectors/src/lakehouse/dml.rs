@@ -601,7 +601,12 @@ fn normalize_batch_for_iceberg(batch: &RecordBatch) -> Result<RecordBatch, Lakeh
             DataType::Timestamp(unit, _) if *unit != TimeUnit::Microsecond
         ) || matches!(dt, DataType::Date64)
     };
-    if !batch.schema().fields().iter().any(|f| needs_cast(f.data_type())) {
+    if !batch
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| needs_cast(f.data_type()))
+    {
         return Ok(batch.clone());
     }
     let mut columns = Vec::with_capacity(batch.num_columns());
@@ -650,8 +655,8 @@ async fn write_ctas_part(
         task::spawn_blocking(move || -> Result<(Vec<u8>, u64, u64), LakehouseError> {
             let tmp =
                 tempfile::NamedTempFile::new().map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let file = std::fs::File::create(tmp.path())
-                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let file =
+                std::fs::File::create(tmp.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
             let mut writer = ArrowWriter::try_new(file, arrow_schema, None)
                 .map_err(|e| LakehouseError::Io(e.to_string()))?;
             let mut rows = 0u64;
@@ -664,8 +669,7 @@ async fn write_ctas_part(
             writer
                 .close()
                 .map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let bytes =
-                std::fs::read(tmp.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let bytes = std::fs::read(tmp.path()).map_err(|e| LakehouseError::Io(e.to_string()))?;
             let size = bytes.len() as u64;
             Ok((bytes, size, rows))
         })
@@ -853,7 +857,8 @@ pub async fn land_ctas_with_target(
         }
     }
     if !buffered.is_empty() {
-        let part = write_ctas_part(&file_io, &table_location, std::mem::take(&mut buffered)).await?;
+        let part =
+            write_ctas_part(&file_io, &table_location, std::mem::take(&mut buffered)).await?;
         total_bytes += part.file_size_in_bytes();
         data_files.push(part);
     }
@@ -881,8 +886,7 @@ pub async fn land_ctas_with_target(
         match catalog.create_table(ident.namespace(), creation()).await {
             Ok(t) => t,
             Err(create_err) => {
-                if let Err(restore_err) =
-                    catalog.create_table(ident.namespace(), creation()).await
+                if let Err(restore_err) = catalog.create_table(ident.namespace(), creation()).await
                 {
                     tracing::error!(
                         table = %ident,
@@ -1125,10 +1129,7 @@ mod tests {
         let err = land_ctas(Arc::clone(&catalog), &ident, false, dup)
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("already exists"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("already exists"), "got: {err}");
 
         // Replace with a different schema and contents.
         let second = stream_of(

@@ -76,10 +76,9 @@ pub fn max_grpc_message_bytes() -> usize {
 pub use task::{
     CheckpointCompleteCommand, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse,
     ExecutorTaskAssignment, ICEBERG_SINK_PREFIX, IcebergSinkMode, InitiateCheckpointCommand,
-    InputPartition, InputPartitionDescriptor,
-    KeyGroupRange, MemoryKafkaRecord, MissingShufflePartition, OutputContract,
-    OutputContractDescriptor, OutputContractKind, PlanFragment, RegisterExecutorRequest,
-    RegisterExecutorResponse, RestoreFromCheckpointCommand, TaskAssignment, TaskAttemptRef,
-    PushTaskResultResponse, TaskCancellationRequest, TaskResultChunk, TaskStatusRequest,
-    TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
+    InputPartition, InputPartitionDescriptor, KeyGroupRange, MemoryKafkaRecord,
+    MissingShufflePartition, OutputContract, OutputContractDescriptor, OutputContractKind,
+    PlanFragment, PushTaskResultResponse, RegisterExecutorRequest, RegisterExecutorResponse,
+    RestoreFromCheckpointCommand, TaskAssignment, TaskAttemptRef, TaskCancellationRequest,
+    TaskResultChunk, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
 };

@@ -491,7 +491,8 @@ mod state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
-            agg_exprs: vec![AggExpr { filter: None,
+            agg_exprs: vec![AggExpr {
+                filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
@@ -525,7 +526,8 @@ mod state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
-            agg_exprs: vec![AggExpr { filter: None,
+            agg_exprs: vec![AggExpr {
+                filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
@@ -547,7 +549,8 @@ mod state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 0,
-            agg_exprs: vec![AggExpr { filter: None,
+            agg_exprs: vec![AggExpr {
+                filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
@@ -582,7 +585,8 @@ mod state_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
-            agg_exprs: vec![AggExpr { filter: None,
+            agg_exprs: vec![AggExpr {
+                filter: None,
                 input_column: "v".into(),
                 output_column: "sum_v".into(),
                 function: AggFunction::Sum,
@@ -679,12 +683,14 @@ mod aggregation_proptests {
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![
-                AggExpr { filter: None,
+                AggExpr {
+                    filter: None,
                     function: AggFunction::Count,
                     input_column: String::new(),
                     output_column: "cnt".into(),
                 },
-                AggExpr { filter: None,
+                AggExpr {
+                    filter: None,
                     function: AggFunction::Sum,
                     input_column: "v".into(),
                     output_column: "sum_v".into(),
@@ -959,8 +965,16 @@ mod filter_tests {
                 .unwrap()
                 .value(0)
         };
-        assert_eq!(col("edit_bytes"), 17, "10 + 7; log row filtered, NULL skipped");
-        assert_eq!(col("edits"), 3, "all kind='edit' rows count, NULL v included");
+        assert_eq!(
+            col("edit_bytes"),
+            17,
+            "10 + 7; log row filtered, NULL skipped"
+        );
+        assert_eq!(
+            col("edits"),
+            3,
+            "all kind='edit' rows count, NULL v included"
+        );
         assert_eq!(col("all_bytes"), 22, "10 + 5 + 7; NULL skipped, no filter");
     }
 }

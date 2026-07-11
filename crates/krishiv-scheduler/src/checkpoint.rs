@@ -87,19 +87,21 @@ impl fmt::Debug for CheckpointCoordinator {
 fn collect_sink_transactions<'a>(
     acks: impl Iterator<Item = &'a CheckpointAckRequest>,
 ) -> Vec<krishiv_state::checkpoint::SinkTransactionRef> {
-    let mut by_key: std::collections::BTreeMap<(String, u64), krishiv_state::checkpoint::SinkTransactionRef> =
-        std::collections::BTreeMap::new();
+    let mut by_key: std::collections::BTreeMap<
+        (String, u64),
+        krishiv_state::checkpoint::SinkTransactionRef,
+    > = std::collections::BTreeMap::new();
     for ack in acks {
         for tx in &ack.sink_transactions {
             let key = (tx.sink_id.clone(), tx.epoch);
-            let entry = by_key
-                .entry(key)
-                .or_insert_with(|| krishiv_state::checkpoint::SinkTransactionRef {
+            let entry = by_key.entry(key).or_insert_with(|| {
+                krishiv_state::checkpoint::SinkTransactionRef {
                     sink_id: tx.sink_id.clone(),
                     epoch: tx.epoch,
                     prepare_path: tx.prepare_path.clone(),
                     committed: tx.committed,
-                });
+                }
+            });
             // A committed report is authoritative over a prepared-only one.
             entry.committed = entry.committed || tx.committed;
         }
@@ -914,7 +916,11 @@ mod tests {
         let acks = [ack_a, ack_b];
         let collected = super::collect_sink_transactions(acks.iter());
 
-        assert_eq!(collected.len(), 2, "deduped to one ref per (sink_id, epoch)");
+        assert_eq!(
+            collected.len(),
+            2,
+            "deduped to one ref per (sink_id, epoch)"
+        );
         let sink1 = collected.iter().find(|t| t.sink_id == "sink-1").unwrap();
         assert!(
             sink1.committed,

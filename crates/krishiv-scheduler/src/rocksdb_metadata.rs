@@ -270,7 +270,12 @@ impl MetadataStore for RocksDbMetadataStore {
             .cf_handle(CF_EXECUTORS)
             .ok_or_else(|| Self::store_err("missing executors CF"))?;
         self.db
-            .put_cf_opt(&cf, descriptor.executor_id().as_str(), bytes, &self.write_opts())
+            .put_cf_opt(
+                &cf,
+                descriptor.executor_id().as_str(),
+                bytes,
+                &self.write_opts(),
+            )
             .map_err(Self::store_err)?;
         if let Some(existing) = self
             .executors

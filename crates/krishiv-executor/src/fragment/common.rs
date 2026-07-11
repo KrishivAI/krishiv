@@ -486,8 +486,7 @@ pub(crate) fn parse_object_parquet_sink_spec(
 pub(crate) fn iceberg_sink_descriptor(
     contract: &OutputContract,
 ) -> ExecutorResult<Option<OutputContractDescriptor>> {
-    if let Some(descriptor @ OutputContractDescriptor::IcebergSink { .. }) = contract.descriptor()
-    {
+    if let Some(descriptor @ OutputContractDescriptor::IcebergSink { .. }) = contract.descriptor() {
         return Ok(Some(descriptor.clone()));
     }
     match OutputContractDescriptor::parse_iceberg_sink(contract.description()) {

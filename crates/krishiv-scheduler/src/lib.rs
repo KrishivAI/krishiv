@@ -74,7 +74,6 @@ pub use batch_sql::{
     execute_batch_sql_coordinated, execute_batch_sql_sink_coordinated, submit_batch_sql_job,
 };
 pub use bounded_window::execute_bounded_window_coordinated;
-pub use result_spool::{TaskResultKey, TaskResultSpool};
 pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use config::{CoordinatorConfig, JobSubmitter, TlsConfig};
@@ -96,6 +95,7 @@ pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
 pub use etcd_metadata::EtcdMetadataStore;
 pub use ivm::{IvmJob, IvmJobRegistry, SharedIvmJobRegistry};
 pub use ivm_http::{IvmRouterState, ivm_router};
+pub use result_spool::{TaskResultKey, TaskResultSpool};
 pub use unified_jobs_http::api_unified_submit;
 pub(crate) mod rocksdb_metadata;
 pub use continuous_stream_http::{

@@ -42,7 +42,8 @@ fn streaming_window_preserves_float64_sum() {
         window_size_ms: 10_000,
         slide_ms: None,
         session_gap_ms: None,
-        agg_exprs: vec![WindowAgg { filter: None,
+        agg_exprs: vec![WindowAgg {
+            filter: None,
             kind: WindowAggKind::Sum,
             input_column: "amount".into(),
             output_column: "amount_sum".into(),

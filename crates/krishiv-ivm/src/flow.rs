@@ -261,7 +261,11 @@ impl TickTables<'_> {
         let Some(reg) = self.tracked.as_deref_mut() else {
             return;
         };
-        let stale: Vec<String> = reg.iter().filter(|n| !expected.contains(*n)).cloned().collect();
+        let stale: Vec<String> = reg
+            .iter()
+            .filter(|n| !expected.contains(*n))
+            .cloned()
+            .collect();
         for name in stale {
             let _ = self.ctx.deregister_table(name.as_str());
             reg.remove(&name);

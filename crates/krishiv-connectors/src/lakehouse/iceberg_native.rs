@@ -259,8 +259,7 @@ pub mod native {
             for task in tasks {
                 let path = task.data_file_path();
                 let local = path.strip_prefix("file://").unwrap_or(path);
-                let file =
-                    fs::File::open(local).map_err(|e| LakehouseError::Io(e.to_string()))?;
+                let file = fs::File::open(local).map_err(|e| LakehouseError::Io(e.to_string()))?;
                 let reader =
                     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                         .map_err(|e| LakehouseError::Io(e.to_string()))?
@@ -325,22 +324,27 @@ pub mod native {
                 .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
 
             let (new_meta_loc, snapshot_id) = if batches.is_empty() {
-                let loc = created.metadata_location().map(String::from).ok_or_else(|| {
-                    LakehouseError::Iceberg(
-                        "replacement table creation returned no metadata location".into(),
-                    )
-                })?;
+                let loc = created
+                    .metadata_location()
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        LakehouseError::Iceberg(
+                            "replacement table creation returned no metadata location".into(),
+                        )
+                    })?;
                 (loc, 0)
             } else {
                 let (_, data_file) = self.stage_parquet(&batches)?;
                 let committed =
-                    fast_append_via(&scratch, &self.ident, vec![data_file], &kafka_offsets)
-                        .await?;
-                let loc = committed.metadata_location().map(String::from).ok_or_else(|| {
-                    LakehouseError::Iceberg(
-                        "replacement commit returned no metadata location".into(),
-                    )
-                })?;
+                    fast_append_via(&scratch, &self.ident, vec![data_file], &kafka_offsets).await?;
+                let loc = committed
+                    .metadata_location()
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        LakehouseError::Iceberg(
+                            "replacement commit returned no metadata location".into(),
+                        )
+                    })?;
                 let snap = committed
                     .metadata()
                     .current_snapshot()
@@ -870,10 +874,9 @@ pub mod native {
                 // The scratch catalog dies here without drop_table — exactly
                 // like a process crash before the hint flip.
             }
-            let reopened =
-                IcebergNativeTwoPhaseCommit::open(dir.path(), "test", &schema_version())
-                    .await
-                    .expect("pre-flip crash state must reopen from the old generation");
+            let reopened = IcebergNativeTwoPhaseCommit::open(dir.path(), "test", &schema_version())
+                .await
+                .expect("pre-flip crash state must reopen from the old generation");
             let rows: usize = reopened
                 .read_all()
                 .await
@@ -888,10 +891,9 @@ pub mod native {
                 .overwrite_commit(vec![batch(vec![7, 8])], BTreeMap::new(), &schema_version())
                 .await
                 .unwrap();
-            let hint = std::fs::read_to_string(
-                dir.path().join("metadata").join(super::VERSION_HINT),
-            )
-            .unwrap();
+            let hint =
+                std::fs::read_to_string(dir.path().join("metadata").join(super::VERSION_HINT))
+                    .unwrap();
             let hinted = hint.trim().strip_prefix("file://").unwrap_or(hint.trim());
             assert!(
                 std::path::Path::new(hinted).exists(),

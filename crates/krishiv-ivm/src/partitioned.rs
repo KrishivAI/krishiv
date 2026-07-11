@@ -857,8 +857,11 @@ mod tests {
         let part = PartitionedIncrementalFlow::new(3, "region");
         part.register_view(revenue_spec()).unwrap();
 
-        part.feed_snapshot("orders", &[orders_view(&["US", "EU", "US"], &[100, 50, 25])])
-            .unwrap();
+        part.feed_snapshot(
+            "orders",
+            &[orders_view(&["US", "EU", "US"], &[100, 50, 25])],
+        )
+        .unwrap();
         part.step_datafusion().await.unwrap();
         let snap1 = part.snapshot("revenue").unwrap().unwrap();
         assert_eq!(snap1.num_rows(), 2);

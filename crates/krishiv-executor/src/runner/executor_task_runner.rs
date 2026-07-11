@@ -441,7 +441,9 @@ impl ExecutorTaskRunner {
     /// whether a catalog was registered. Call after `with_udf_limits`, which
     /// replaces the engine.
     pub async fn register_catalog_from_env(&self) -> Result<bool, String> {
-        self.sql_engine.register_iceberg_rest_catalog_from_env().await
+        self.sql_engine
+            .register_iceberg_rest_catalog_from_env()
+            .await
     }
 
     /// Attach a streaming progress callback (GAP-OB-04).

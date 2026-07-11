@@ -35,13 +35,13 @@ pub mod unified_memory_manager;
 pub mod validate;
 pub mod write_commit;
 
-pub use backpressure::BackpressureSignal;
 pub use auth_util::{bearer_token, redact_token};
+pub use backpressure::BackpressureSignal;
+pub use durability::{CheckpointDurability, DurabilityProfile, ShuffleDurability, StateDurability};
 pub use env_registry::{
     EnvIssue, FlagKind, FlagScope, FlagSpec, coordinator_url_env, env_u64, env_usize,
     log_env_issues, truthy_env, validate_env,
 };
-pub use durability::{CheckpointDurability, DurabilityProfile, ShuffleDurability, StateDurability};
 pub use memory_budget::{MemoryBudget, cgroup_memory_limit_bytes};
 pub use panic_util::panic_payload_to_string;
 pub use production::{
@@ -51,9 +51,8 @@ pub use production::{
     forbids_simulation_connectors, is_production_mode, profile_forbids_native_scalar_udfs,
     profile_requires_authenticated_flight, profile_requires_authenticated_shuffle,
     profile_requires_authenticated_ui, profile_requires_durable_window_state,
-    profile_requires_fail_closed_metadata,
-    requires_file_backed_state, requires_http_auth, requires_manual_kafka_commit,
-    resolve_durability_profile,
+    profile_requires_fail_closed_metadata, requires_file_backed_state, requires_http_auth,
+    requires_manual_kafka_commit, resolve_durability_profile,
 };
 pub use stream_quality::{StreamQualityHook, StreamQualityResult};
 pub use unified_memory_manager::{

@@ -220,25 +220,27 @@ fn build_pool_pod(
             containers: vec![Container {
                 name: "executor".to_owned(),
                 image: Some(config.image.clone()),
-                env: Some(vec![
-                    EnvVar {
-                        name: "KRISHIV_COORDINATOR_ENDPOINT".to_owned(),
-                        value: Some(config.coordinator_endpoint.clone()),
+                env: Some(
+                    vec![
+                        EnvVar {
+                            name: "KRISHIV_COORDINATOR_ENDPOINT".to_owned(),
+                            value: Some(config.coordinator_endpoint.clone()),
+                            ..Default::default()
+                        },
+                        EnvVar {
+                            name: "KRISHIV_EXECUTOR_ID".to_owned(),
+                            value: Some(executor_id.to_owned()),
+                            ..Default::default()
+                        },
+                    ]
+                    .into_iter()
+                    .chain(config.task_slots.map(|slots| EnvVar {
+                        name: "KRISHIV_TASK_SLOTS".to_owned(),
+                        value: Some(slots.to_string()),
                         ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KRISHIV_EXECUTOR_ID".to_owned(),
-                        value: Some(executor_id.to_owned()),
-                        ..Default::default()
-                    },
-                ]
-                .into_iter()
-                .chain(config.task_slots.map(|slots| EnvVar {
-                    name: "KRISHIV_TASK_SLOTS".to_owned(),
-                    value: Some(slots.to_string()),
-                    ..Default::default()
-                }))
-                .collect()),
+                    }))
+                    .collect(),
+                ),
                 ..Default::default()
             }],
             ..Default::default()
@@ -269,7 +271,10 @@ mod tests {
         // derives capacity from CPU (the audit FLAG-hardcode bug); Some(n)
         // must inject exactly n.
         let pod = build_pool_pod(&config, "pod-0", "exec-0");
-        let env = pod.spec.as_ref().unwrap().containers[0].env.clone().unwrap();
+        let env = pod.spec.as_ref().unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
         assert!(
             !env.iter().any(|e| e.name == "KRISHIV_TASK_SLOTS"),
             "task_slots: None must not inject KRISHIV_TASK_SLOTS"
@@ -279,7 +284,10 @@ mod tests {
             ..config.clone()
         };
         let pod = build_pool_pod(&pinned, "pod-0", "exec-0");
-        let env = pod.spec.as_ref().unwrap().containers[0].env.clone().unwrap();
+        let env = pod.spec.as_ref().unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
         assert_eq!(
             env.iter()
                 .find(|e| e.name == "KRISHIV_TASK_SLOTS")

@@ -258,11 +258,7 @@ struct LoweredCaseArg {
     filter: WindowAggFilter,
 }
 
-fn lower_case_arg(
-    case: &Expr,
-    kind: WindowAggKind,
-    fname: &str,
-) -> SqlResult<LoweredCaseArg> {
+fn lower_case_arg(case: &Expr, kind: WindowAggKind, fname: &str) -> SqlResult<LoweredCaseArg> {
     let Expr::Case {
         operand,
         conditions,
@@ -464,7 +460,9 @@ fn expr_literal(expr: &Expr) -> Option<AggFilterValue> {
             if let Ok(i) = n.parse::<i64>() {
                 Some(AggFilterValue::Int(i))
             } else {
-                n.parse::<f64>().ok().map(|f| AggFilterValue::Float(FloatLiteral(f)))
+                n.parse::<f64>()
+                    .ok()
+                    .map(|f| AggFilterValue::Float(FloatLiteral(f)))
             }
         }
         Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {

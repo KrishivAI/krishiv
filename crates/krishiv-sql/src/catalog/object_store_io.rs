@@ -333,12 +333,18 @@ mod tests {
         // write + exists + metadata + read
         storage.write(&file, payload.clone()).await.unwrap();
         assert!(storage.exists(&file).await.unwrap());
-        assert_eq!(storage.metadata(&file).await.unwrap().size, payload.len() as u64);
+        assert_eq!(
+            storage.metadata(&file).await.unwrap().size,
+            payload.len() as u64
+        );
         assert_eq!(storage.read(&file).await.unwrap(), payload);
 
         // ranged reader
         let reader = storage.reader(&file).await.unwrap();
-        assert_eq!(reader.read(0..5).await.unwrap(), Bytes::from_static(b"hello"));
+        assert_eq!(
+            reader.read(0..5).await.unwrap(),
+            Bytes::from_static(b"hello")
+        );
 
         // streaming writer
         let file2 = format!("{base}/streamed.txt");
@@ -346,7 +352,10 @@ mod tests {
         w.write(Bytes::from_static(b"ab")).await.unwrap();
         w.write(Bytes::from_static(b"cd")).await.unwrap();
         w.close().await.unwrap();
-        assert_eq!(storage.read(&file2).await.unwrap(), Bytes::from_static(b"abcd"));
+        assert_eq!(
+            storage.read(&file2).await.unwrap(),
+            Bytes::from_static(b"abcd")
+        );
 
         // delete_prefix removes both, exists() then false
         storage.delete_prefix(&base).await.unwrap();

@@ -94,7 +94,9 @@ mod tests {
 
     #[test]
     fn startup_fails_closed_without_token_under_durable_profiles() {
-        assert!(require_shuffle_token_or_fail(false, DurabilityProfile::SingleNodeDurable).is_err());
+        assert!(
+            require_shuffle_token_or_fail(false, DurabilityProfile::SingleNodeDurable).is_err()
+        );
         assert!(
             require_shuffle_token_or_fail(false, DurabilityProfile::DistributedDurable).is_err()
         );

@@ -59,7 +59,8 @@ pub struct LocalWindowExecutionSpec {
 
 impl LocalWindowExecutionSpec {
     pub fn default_count_agg() -> Vec<AggExpr> {
-        vec![AggExpr { filter: None,
+        vec![AggExpr {
+            filter: None,
             function: AggFunction::Count,
             input_column: String::new(),
             output_column: String::from("count"),

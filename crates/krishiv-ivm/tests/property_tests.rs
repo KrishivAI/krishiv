@@ -261,7 +261,10 @@ async fn where_clause_is_honored_by_incremental_aggregate() {
         !s1.degraded_views.contains(&"total".to_string()),
         "filtered aggregate must stay on the O(Δ) path, not degrade to DiffBased"
     );
-    assert_eq!(f64_total(&flow.snapshot("total").unwrap().unwrap(), "total"), 200.0);
+    assert_eq!(
+        f64_total(&flow.snapshot("total").unwrap().unwrap(), "total"),
+        200.0
+    );
 
     // Tick 2: [30, 400] → only 400 passes → cumulative 600 (NOT 680).
     flow.feed(
@@ -285,8 +288,9 @@ async fn filtered_group_by_matches_batch() {
     let flow = IncrementalFlow::new();
     let spec = IncrementalViewSpec {
         name: "revenue".into(),
-        body_sql: "SELECT region, SUM(amount) AS total FROM sales WHERE amount > 100 GROUP BY region"
-            .into(),
+        body_sql:
+            "SELECT region, SUM(amount) AS total FROM sales WHERE amount > 100 GROUP BY region"
+                .into(),
         output_schema: Arc::new(Schema::new(vec![
             Field::new("region", DataType::Utf8, true),
             Field::new("total", DataType::Float64, true),

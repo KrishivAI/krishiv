@@ -11,8 +11,8 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use krishiv_plan::window::{WindowExecutionSpec, decode_window_execution_spec};
 use krishiv_plan::TypedTaskFragment;
+use krishiv_plan::window::{WindowExecutionSpec, decode_window_execution_spec};
 use krishiv_proto::{InputPartition, InputPartitionDescriptor, JobId, JobKind};
 use serde::{Deserialize, Serialize};
 
@@ -274,8 +274,8 @@ pub async fn api_continuous_register(
     State(coordinator): State<SharedCoordinator>,
     Json(body): Json<ContinuousRegisterRequest>,
 ) -> Result<Json<ContinuousRegisterResponse>, StatusCode> {
-    use krishiv_plan::window::encode_window_execution_spec;
     use krishiv_plan::ExecutionKind;
+    use krishiv_plan::window::encode_window_execution_spec;
     use krishiv_proto::{JobSpec, StageId, StageSpec, TaskId, TaskSpec};
     let job_id = JobId::try_new(&body.job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
     let stage_id = StageId::try_new("stage-streaming").map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -344,12 +344,17 @@ pub async fn api_continuous_register_sql(
             tracing::warn!(error = %error, "continuous-register-sql: compile failed");
             StatusCode::BAD_REQUEST
         })?;
-    register_continuous_stream_with_sink(&coordinator, &body.job_id, &plan.spec, body.sink.as_ref())
-        .await
-        .map_err(|error| match error {
-            ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+    register_continuous_stream_with_sink(
+        &coordinator,
+        &body.job_id,
+        &plan.spec,
+        body.sink.as_ref(),
+    )
+    .await
+    .map_err(|error| match error {
+        ContinuousStreamError::Scheduler(e) => scheduler_status(&e),
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
     Ok(Json(ContinuousRegisterSqlResponse {
         success: true,
         source: plan.source,
@@ -1517,7 +1522,10 @@ mod tests {
         let coord = coordinator.read().await;
         let job_id = krishiv_proto::JobId::try_new("cs-replace-job").unwrap();
         let view = continuous_job_view(&coord, &job_id).expect("job present and renderable");
-        assert_eq!(view.spec, changed, "replaced job must carry the new window spec");
+        assert_eq!(
+            view.spec, changed,
+            "replaced job must carry the new window spec"
+        );
     }
 
     /// A non-streaming job holding the same id is a genuine collision -> 409.
@@ -1528,14 +1536,10 @@ mod tests {
         // Submit a plain batch job under the target id.
         {
             let mut coord = coordinator.write().await;
-            let stage = StageSpec::new(
-                krishiv_proto::StageId::try_new("s1").unwrap(),
-                "batch",
-            )
-            .with_task(TaskSpec::new(
-                TaskId::try_new("t1").unwrap(),
-                "batch-task-body",
-            ));
+            let stage =
+                StageSpec::new(krishiv_proto::StageId::try_new("s1").unwrap(), "batch").with_task(
+                    TaskSpec::new(TaskId::try_new("t1").unwrap(), "batch-task-body"),
+                );
             let spec = JobSpec::new(
                 krishiv_proto::JobId::try_new("cs-collision-id").unwrap(),
                 "batch-job",

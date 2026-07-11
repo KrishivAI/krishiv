@@ -749,9 +749,11 @@ async fn stage_iceberg_sink_output(
     .map_err(|join_error| ExecutorError::LocalExecution {
         message: format!("iceberg sink staging task panicked: {join_error}"),
     })?
-    .map_err(|error: krishiv_connectors::ConnectorError| ExecutorError::LocalExecution {
-        message: format!("iceberg sink staging failed for job {job_id}: {error}"),
-    })
+    .map_err(
+        |error: krishiv_connectors::ConnectorError| ExecutorError::LocalExecution {
+            message: format!("iceberg sink staging failed for job {job_id}: {error}"),
+        },
+    )
 }
 
 /// Built without the `iceberg` feature: an assignment that demands an Iceberg

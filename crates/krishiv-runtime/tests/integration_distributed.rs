@@ -1,4 +1,3 @@
-
 //! End-to-end integration tests for distributed execution (InProcessCluster, Flight SQL, coordinator lifecycle).
 
 use std::net::SocketAddr;

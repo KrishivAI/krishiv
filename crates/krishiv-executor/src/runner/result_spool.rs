@@ -163,14 +163,9 @@ pub(crate) async fn drain_stream_with_spool(
         {
             // Overflow: open the spool and move every buffered batch into it.
             let dir = spool_dir();
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| io_err("create result spool dir", &e))?;
+            std::fs::create_dir_all(&dir).map_err(|e| io_err("create result spool dir", &e))?;
             let seq = SPOOL_SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = dir.join(format!(
-                "executor-{}-{}.arrow-ipc",
-                std::process::id(),
-                seq
-            ));
+            let path = dir.join(format!("executor-{}-{}.arrow-ipc", std::process::id(), seq));
             let file =
                 std::fs::File::create(&path).map_err(|e| io_err("create result spool", &e))?;
             let Some(schema) = buffered.first().map(|b| b.schema()) else {
@@ -178,11 +173,9 @@ pub(crate) async fn drain_stream_with_spool(
                     message: "result spool overflow with no buffered batch".to_string(),
                 });
             };
-            let mut w = arrow::ipc::writer::StreamWriter::try_new(
-                std::io::BufWriter::new(file),
-                &schema,
-            )
-            .map_err(|e| io_err("open result spool writer", &e))?;
+            let mut w =
+                arrow::ipc::writer::StreamWriter::try_new(std::io::BufWriter::new(file), &schema)
+                    .map_err(|e| io_err("open result spool writer", &e))?;
             for b in buffered.drain(..) {
                 w.write(&b).map_err(|e| io_err("result spool write", &e))?;
             }
@@ -194,7 +187,9 @@ pub(crate) async fn drain_stream_with_spool(
 
     match (writer, spool_path) {
         (Some(w), Some(path)) => {
-            let mut inner = w.into_inner().map_err(|e| io_err("finish result spool", &e))?;
+            let mut inner = w
+                .into_inner()
+                .map_err(|e| io_err("finish result spool", &e))?;
             use std::io::Write as _;
             inner
                 .flush()
@@ -221,9 +216,8 @@ pub(crate) fn spool_chunk_stream(
     path: PathBuf,
     total_bytes: u64,
 ) -> krishiv_proto::services::TaskResultChunkStream {
-    let stream = futures::stream::try_unfold(
-        (None::<tokio::fs::File>, 0u64),
-        move |(file, sent)| {
+    let stream =
+        futures::stream::try_unfold((None::<tokio::fs::File>, 0u64), move |(file, sent)| {
             let ids = ids.clone();
             let path = path.clone();
             async move {
@@ -232,16 +226,16 @@ pub(crate) fn spool_chunk_stream(
                 }
                 let mut file = match file {
                     Some(f) => f,
-                    None => tokio::fs::File::open(&path).await.map_err(|e| {
-                        tonic::Status::internal(format!("open result spool: {e}"))
-                    })?,
+                    None => tokio::fs::File::open(&path)
+                        .await
+                        .map_err(|e| tonic::Status::internal(format!("open result spool: {e}")))?,
                 };
                 use tokio::io::AsyncReadExt as _;
                 let want = std::cmp::min(RESULT_CHUNK_BYTES as u64, total_bytes - sent) as usize;
                 let mut buf = vec![0u8; want];
-                file.read_exact(&mut buf).await.map_err(|e| {
-                    tonic::Status::internal(format!("read result spool: {e}"))
-                })?;
+                file.read_exact(&mut buf)
+                    .await
+                    .map_err(|e| tonic::Status::internal(format!("read result spool: {e}")))?;
                 let sent = sent + want as u64;
                 let mut chunk = TaskResultChunk::new(ids, buf);
                 if sent >= total_bytes {
@@ -249,8 +243,7 @@ pub(crate) fn spool_chunk_stream(
                 }
                 Ok(Some((chunk, (Some(file), sent))))
             }
-        },
-    );
+        });
     Box::pin(stream)
 }
 
@@ -306,8 +299,7 @@ mod tests {
         // The spool file must decode back to the same rows.
         let file = std::fs::File::open(spool.path()).unwrap();
         let reader =
-            arrow::ipc::reader::StreamReader::try_new(std::io::BufReader::new(file), None)
-                .unwrap();
+            arrow::ipc::reader::StreamReader::try_new(std::io::BufReader::new(file), None).unwrap();
         let decoded: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
         let rows: usize = decoded.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 2000);

@@ -285,11 +285,9 @@ mod tests {
             let path = dir.path().join(format!("part-{i}.parquet"));
             let file = std::fs::File::create(&path).unwrap();
             let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from(vals))],
-            )
-            .unwrap();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))])
+                    .unwrap();
             writer.write(&batch).unwrap();
             writer.close().unwrap();
             paths.push(path.to_str().unwrap().to_string());

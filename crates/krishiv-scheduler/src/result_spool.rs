@@ -66,9 +66,8 @@ impl TaskResultSpool {
     pub fn decode_record_batches(
         &self,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, arrow::error::ArrowError> {
-        let file = std::fs::File::open(&self.path).map_err(|e| {
-            arrow::error::ArrowError::IoError(format!("open result spool: {e}"), e)
-        })?;
+        let file = std::fs::File::open(&self.path)
+            .map_err(|e| arrow::error::ArrowError::IoError(format!("open result spool: {e}"), e))?;
         let reader =
             arrow::ipc::reader::StreamReader::try_new(std::io::BufReader::new(file), None)?;
         reader.collect()

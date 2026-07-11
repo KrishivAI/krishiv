@@ -315,11 +315,13 @@ pub(crate) async fn execute_batch_fragment(
         // small results stay in memory; large ones overflow to disk and are
         // delivered to the coordinator in bounded PushTaskResult chunks, so
         // executor memory never holds the whole result.
-        let (stream, stats_handle) = dataframe.execute_stream_with_stats().await.map_err(
-            |error| ExecutorError::LocalExecution {
-                message: error.to_string(),
-            },
-        )?;
+        let (stream, stats_handle) =
+            dataframe
+                .execute_stream_with_stats()
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: error.to_string(),
+                })?;
         let (drained, shape) = crate::runner::result_spool::drain_stream_with_spool(
             stream,
             crate::runner::result_spool::inline_result_max_bytes(),
@@ -338,8 +340,9 @@ pub(crate) async fn execute_batch_fragment(
             spill_bytes: sql_stats.spill_bytes,
             serialized_bytes: 0,
         };
-        let output = ExecutorTaskOutput::sql(shape.row_count, shape.batch_count, shape.column_count)
-            .with_runtime_stats(runtime_stats);
+        let output =
+            ExecutorTaskOutput::sql(shape.row_count, shape.batch_count, shape.column_count)
+                .with_runtime_stats(runtime_stats);
         return Ok(match drained {
             crate::runner::result_spool::DrainedResult::Inline(batches) => {
                 output.with_record_batches(batches)
@@ -510,7 +513,10 @@ async fn execute_shuffle_write_fragment(
     );
     // Coordinator-mode catalog support: register the platform Iceberg REST
     // catalog from KRISHIV_ICEBERG_REST_* so governed tables resolve. Non-fatal.
-    if let Err(error) = limited_engine.register_iceberg_rest_catalog_from_env().await {
+    if let Err(error) = limited_engine
+        .register_iceberg_rest_catalog_from_env()
+        .await
+    {
         tracing::warn!(%error, "iceberg REST catalog registration from env failed");
     }
     load_input_tables(
@@ -744,7 +750,10 @@ async fn execute_inmem_shuffle_write(
     );
     // Coordinator-mode catalog support: register the platform Iceberg REST
     // catalog from KRISHIV_ICEBERG_REST_* so governed tables resolve. Non-fatal.
-    if let Err(error) = limited_engine.register_iceberg_rest_catalog_from_env().await {
+    if let Err(error) = limited_engine
+        .register_iceberg_rest_catalog_from_env()
+        .await
+    {
         tracing::warn!(%error, "iceberg REST catalog registration from env failed");
     }
     let num_partitions = write_cfg.num_partitions as u32;

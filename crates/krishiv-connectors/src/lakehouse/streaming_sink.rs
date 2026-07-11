@@ -104,10 +104,7 @@ impl IcebergStreamingSink {
     /// Open (or create) the target table and return a ready participant.
     ///
     /// Blocking: call via `spawn_blocking` from async contexts.
-    pub fn open(
-        target: IcebergSinkTarget,
-        schema_version: SchemaVersion,
-    ) -> ConnectorResult<Self> {
+    pub fn open(target: IcebergSinkTarget, schema_version: SchemaVersion) -> ConnectorResult<Self> {
         if target.mode == IcebergSinkMode::Upsert && target.key_columns.is_empty() {
             return Err(ConnectorError::Protocol {
                 message: "iceberg streaming sink: upsert mode requires key columns".into(),
@@ -150,9 +147,7 @@ impl IcebergStreamingSink {
     // error, not a recoverable condition.
     #[allow(clippy::expect_used)]
     fn rt(&self) -> &tokio::runtime::Runtime {
-        self.runtime
-            .as_ref()
-            .expect("runtime present until drop")
+        self.runtime.as_ref().expect("runtime present until drop")
     }
 
     /// Read the committed table contents (testing/inspection).
@@ -213,13 +208,11 @@ impl IcebergStreamingSink {
                 upserts.push(batch.clone());
                 continue;
             };
-            let op_fmt = ArrayFormatter::try_new(
-                batch.column(op_idx).as_ref(),
-                &FormatOptions::default(),
-            )
-            .map_err(|e| ConnectorError::Schema {
-                message: format!("iceberg streaming sink: op column format: {e}"),
-            })?;
+            let op_fmt =
+                ArrayFormatter::try_new(batch.column(op_idx).as_ref(), &FormatOptions::default())
+                    .map_err(|e| ConnectorError::Schema {
+                    message: format!("iceberg streaming sink: op column format: {e}"),
+                })?;
             let mut keep = Vec::with_capacity(batch.num_rows());
             for row in 0..batch.num_rows() {
                 let op = op_fmt.value(row).to_string().to_lowercase();
@@ -413,15 +406,14 @@ pub fn schema_version_from_arrow(
         if Some(field.name().as_str()) == op_column {
             continue;
         }
-        let data_type = arrow_type_to_iceberg_str(field.data_type()).ok_or_else(|| {
-            ConnectorError::Schema {
+        let data_type =
+            arrow_type_to_iceberg_str(field.data_type()).ok_or_else(|| ConnectorError::Schema {
                 message: format!(
                     "iceberg streaming sink: unsupported column type {} for '{}'",
                     field.data_type(),
                     field.name()
                 ),
-            }
-        })?;
+            })?;
         fields.push(SchemaField {
             id,
             name: field.name().clone(),

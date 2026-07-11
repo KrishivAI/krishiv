@@ -185,10 +185,8 @@ impl ExecutorRegistry {
         let retention_ticks = self.heartbeat_timeout_ticks.saturating_mul(40).max(360);
         let current_tick = self.current_tick;
         self.executors.retain(|_, executor| {
-            !(matches!(
-                executor.state,
-                ExecutorState::Lost | ExecutorState::Removed
-            ) && current_tick.saturating_sub(executor.last_heartbeat_tick) >= retention_ticks)
+            !(matches!(executor.state, ExecutorState::Lost | ExecutorState::Removed)
+                && current_tick.saturating_sub(executor.last_heartbeat_tick) >= retention_ticks)
         });
 
         for executor in self.executors.values_mut() {

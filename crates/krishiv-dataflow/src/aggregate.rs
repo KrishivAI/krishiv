@@ -27,9 +27,7 @@ pub(crate) fn eval_agg_filter(
 ) -> ExecResult<BooleanArray> {
     use arrow::compute::kernels::boolean::{and_kleene, not, or_kleene};
     match filter {
-        WindowAggFilter::Compare { column, op, value } => {
-            eval_compare(batch, column, *op, value)
-        }
+        WindowAggFilter::Compare { column, op, value } => eval_compare(batch, column, *op, value),
         WindowAggFilter::IsNull { column } => {
             let col = filter_column(batch, column)?;
             arrow::compute::is_null(col.as_ref()).map_err(filter_arrow_err)
@@ -92,16 +90,12 @@ fn eval_compare(
 
     let col = filter_column(batch, column)?;
     let result = match (col.data_type(), value) {
-        (DataType::Utf8, AggFilterValue::Utf8(s)) => cmp_datum(
-            op,
-            col,
-            &Scalar::new(StringArray::from(vec![s.as_str()])),
-        ),
-        (DataType::Boolean, AggFilterValue::Bool(b)) => cmp_datum(
-            op,
-            col,
-            &Scalar::new(BooleanArray::from(vec![*b])),
-        ),
+        (DataType::Utf8, AggFilterValue::Utf8(s)) => {
+            cmp_datum(op, col, &Scalar::new(StringArray::from(vec![s.as_str()])))
+        }
+        (DataType::Boolean, AggFilterValue::Bool(b)) => {
+            cmp_datum(op, col, &Scalar::new(BooleanArray::from(vec![*b])))
+        }
         (DataType::Int32 | DataType::Int64, AggFilterValue::Int(v)) => {
             let cast = arrow::compute::cast(col, &DataType::Int64).map_err(filter_arrow_err)?;
             cmp_datum(op, &cast, &Scalar::new(Int64Array::from(vec![*v])))
@@ -960,7 +954,8 @@ mod tests {
 
     #[test]
     fn count_overflow_returns_error() {
-        let exprs = vec![AggExpr { filter: None,
+        let exprs = vec![AggExpr {
+            filter: None,
             function: AggFunction::Count,
             input_column: String::new(),
             output_column: "cnt".into(),
@@ -982,7 +977,8 @@ mod tests {
 
     #[test]
     fn sum_overflow_returns_error() {
-        let exprs = vec![AggExpr { filter: None,
+        let exprs = vec![AggExpr {
+            filter: None,
             function: AggFunction::Sum,
             input_column: "v".into(),
             output_column: "sum_v".into(),
@@ -1003,7 +999,8 @@ mod tests {
     }
 
     fn stddev_state_over(values: Vec<i64>) -> AggState {
-        let exprs = vec![AggExpr { filter: None,
+        let exprs = vec![AggExpr {
+            filter: None,
             function: AggFunction::Stddev,
             input_column: "v".into(),
             output_column: "sd_v".into(),

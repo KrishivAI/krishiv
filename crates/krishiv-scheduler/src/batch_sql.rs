@@ -123,10 +123,10 @@ pub async fn execute_batch_sql_coordinated(
                 if matches!(
                     recheck_state,
                     JobState::Queued
-            | JobState::Accepted
-            | JobState::Planning
-            | JobState::Running
-            | JobState::Committing
+                        | JobState::Accepted
+                        | JobState::Planning
+                        | JobState::Running
+                        | JobState::Committing
                 ) {
                     tokio::select! {
                         _ = state_changed => {}
@@ -205,10 +205,10 @@ pub async fn execute_batch_sql_sink_coordinated(
                 if matches!(
                     recheck_state,
                     JobState::Queued
-            | JobState::Accepted
-            | JobState::Planning
-            | JobState::Running
-            | JobState::Committing
+                        | JobState::Accepted
+                        | JobState::Planning
+                        | JobState::Running
+                        | JobState::Committing
                 ) {
                     tokio::select! {
                         _ = state_changed => {}

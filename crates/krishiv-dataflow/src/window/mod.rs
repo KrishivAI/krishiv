@@ -482,7 +482,8 @@ mod watermark_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
-            agg_exprs: vec![AggExpr { filter: None,
+            agg_exprs: vec![AggExpr {
+                filter: None,
                 function: crate::AggFunction::Count,
                 input_column: String::new(),
                 output_column: "count".into(),
@@ -533,7 +534,8 @@ mod watermark_tests {
             key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
-            agg_exprs: vec![AggExpr { filter: None,
+            agg_exprs: vec![AggExpr {
+                filter: None,
                 function: crate::AggFunction::Count,
                 input_column: String::new(),
                 output_column: "count".into(),

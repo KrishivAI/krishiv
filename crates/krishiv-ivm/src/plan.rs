@@ -442,9 +442,7 @@ fn try_build_from_logical(
         // shapes are resolved inside the aggregate/distinct builders; a bare
         // filtered scan stays DiffBased).
         LogicalPlan::Filter(f) => match f.input.as_ref() {
-            LogicalPlan::Join(join) => {
-                build_join_plan(join, Some(&f.predicate), available_schemas)
-            }
+            LogicalPlan::Join(join) => build_join_plan(join, Some(&f.predicate), available_schemas),
             _ => None,
         },
         // DISTINCT — the inner plan is the first (and only) input.
@@ -517,9 +515,13 @@ fn build_agg_plan(
     // AUD-3: honor the view's declared output column types (SUM(Int64)→Int64
     // unless the view declares otherwise) so the incremental snapshot matches
     // the registered contract.
-    let op =
-        IncrementalAggOp::new_with_output_schema(input_schema, group_by, aggregations, output_schema)
-            .ok()?;
+    let op = IncrementalAggOp::new_with_output_schema(
+        input_schema,
+        group_by,
+        aggregations,
+        output_schema,
+    )
+    .ok()?;
     Some(ViewPlan::Aggregate { source, op, filter })
 }
 
@@ -918,7 +920,10 @@ mod tests {
         else {
             panic!("expected a join plan");
         };
-        assert_eq!((left_source.as_str(), right_source.as_str()), ("orders", "customers"));
+        assert_eq!(
+            (left_source.as_str(), right_source.as_str()),
+            ("orders", "customers")
+        );
         assert!(left_filter.is_none() && right_filter.is_none());
     }
 

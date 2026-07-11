@@ -75,7 +75,10 @@ async fn checkpoint_barrier_integration() {
     assert_eq!(ack.task_id, "task-0");
     let handle = ack.state_handle.expect("ack carries a state handle");
     assert_eq!(handle.backend_kind, "fjall");
-    assert_eq!(handle.checkpoint_uri, "file:///tmp/krishiv-checkpoints/cp-7");
+    assert_eq!(
+        handle.checkpoint_uri,
+        "file:///tmp/krishiv-checkpoints/cp-7"
+    );
     assert_eq!(handle.key_group_range_end, 32_767);
 
     let injected = runner.await.expect("runner task");
