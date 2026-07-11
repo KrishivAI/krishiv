@@ -11,7 +11,6 @@
 
 #![cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -124,10 +123,6 @@ impl fmt::Debug for IcebergCatalogBridge {
 }
 
 impl CatalogProvider for IcebergCatalogBridge {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -191,10 +186,6 @@ impl fmt::Debug for IcebergSchemaBridge {
 
 #[async_trait::async_trait]
 impl SchemaProvider for IcebergSchemaBridge {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());

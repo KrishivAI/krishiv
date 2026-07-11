@@ -1,6 +1,5 @@
 //! Register delta/hudi URI tables with DataFusion (R18 S1.2, S2.3).
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -87,10 +86,6 @@ struct DeltaScanProvider {
 
 #[async_trait]
 impl TableProvider for DeltaScanProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -127,10 +122,6 @@ struct HudiScanProvider {
 
 #[async_trait]
 impl TableProvider for HudiScanProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

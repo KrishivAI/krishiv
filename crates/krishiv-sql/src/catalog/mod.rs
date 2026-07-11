@@ -639,7 +639,7 @@ impl SchemaRegistry for InMemorySchemaRegistry {
 ///
 /// [`SessionContext`]: datafusion::prelude::SessionContext
 pub mod datafusion_bridge {
-    use std::any::Any;
+
     use std::fmt;
     use std::sync::{Arc, RwLock};
 
@@ -701,10 +701,6 @@ pub mod datafusion_bridge {
     }
 
     impl CatalogProvider for DataFusionCatalogBridge {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema_names(&self) -> Vec<String> {
             vec![self.schema_name.clone()]
         }
@@ -736,10 +732,6 @@ pub mod datafusion_bridge {
 
     #[async_trait::async_trait]
     impl SchemaProvider for DataFusionSchemaBridge {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn table_names(&self) -> Vec<String> {
             let catalog = self.catalog.read().unwrap_or_else(|p| p.into_inner());
             use super::CatalogProvider as KrishivCatalogProvider;
@@ -1998,20 +1990,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // DataFusion bridge: as_any returns self
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn datafusion_bridge_as_any() {
-        use datafusion::catalog::CatalogProvider as DfCatalogProvider;
-
-        let catalog = std::sync::Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
-        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
-        assert!(
-            bridge
-                .as_any()
-                .downcast_ref::<super::datafusion_bridge::DataFusionCatalogBridge>()
-                .is_some()
-        );
-    }
 
     // -----------------------------------------------------------------------
     // DataFusion bridge: schema_names returns single "public"

@@ -1,7 +1,6 @@
 //! DataFusion `TableProviderFactory` implementations backed by
 //! [`krishiv_connectors::ConnectorRegistry`].
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -244,10 +243,6 @@ impl std::fmt::Debug for BoundedConnectorProvider {
 
 #[async_trait]
 impl TableProvider for BoundedConnectorProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
