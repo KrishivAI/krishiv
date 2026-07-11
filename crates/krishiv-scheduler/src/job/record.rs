@@ -167,6 +167,45 @@ impl JobRecord {
             .map(|s| s.stage_id().clone())
             .collect();
 
+        // Shuffle locations for dfplan tasks (Phase 52): where each stage's
+        // map tasks reported their shuffle output. Downstream dfplan tasks
+        // receive these as ShuffleFlight input partitions so executors can
+        // fetch partitions written on other executors; an empty endpoint
+        // means the writer's local (in-process) store and is not forwarded.
+        // Keyed by the map task's ShuffleWriteConfig stage id — the
+        // `shuffle_stage_key` sub-stage wire contract.
+        let mut shuffle_location_inputs: std::collections::HashMap<StageId, Vec<InputPartition>> =
+            std::collections::HashMap::new();
+        for stage in &self.stages {
+            let mut locations = Vec::new();
+            for task in &stage.tasks {
+                let Some(write_cfg) = task.spec.shuffle_write() else {
+                    continue;
+                };
+                let Some(meta) = &task.output_metadata else {
+                    continue;
+                };
+                for p in meta.shuffle_partitions() {
+                    if p.flight_endpoint.is_empty() {
+                        continue;
+                    }
+                    locations.push(InputPartition::typed(
+                        format!("shuffle-{}-p{}", write_cfg.stage_id, p.partition_id),
+                        InputPartitionDescriptor::ShuffleFlight {
+                            table_name: String::from("__dfplan_shuffle"),
+                            flight_endpoint: p.flight_endpoint.clone(),
+                            job_id: self.spec.job_id().clone(),
+                            upstream_stage_id: write_cfg.stage_id.clone(),
+                            partition_id: p.partition_id,
+                        },
+                    ));
+                }
+            }
+            if !locations.is_empty() {
+                shuffle_location_inputs.insert(stage.stage_id().clone(), locations);
+            }
+        }
+
         for stage in &mut self.stages {
             let stage_id = stage.stage_id().clone();
             let stage_parallelism = stage.tasks.len();
@@ -222,35 +261,49 @@ impl JobRecord {
                     })?;
                     let task_description = task.spec.description().to_owned();
                     let task_timeout_secs = task.spec.task_timeout_secs();
-                    let input_partitions = if let Some(tables) = batch_sql_tables {
-                        tables
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, table)| {
-                                InputPartition::new(format!("parquet-{idx}"), String::new())
-                                    .with_descriptor(InputPartitionDescriptor::LocalParquet {
-                                        table_name: table.table_name.clone(),
-                                        path: table.path.to_string_lossy().into_owned(),
-                                    })
-                            })
-                            .collect()
-                    } else if let Some(parts_by_task) = task_inline_partitions {
-                        parts_by_task.get(task.task_id()).cloned().ok_or_else(|| {
-                            SchedulerError::InvalidJob {
-                                message: format!(
-                                    "task {} has no registered task-scoped input partition",
-                                    task.task_id()
-                                ),
-                            }
-                        })?
-                    } else if let Some(parts) = inline_partitions {
-                        parts.to_vec()
-                    } else {
-                        vec![InputPartition::new(
-                            task.task_id().as_str(),
-                            task_description.clone(),
-                        )]
-                    };
+                    let input_partitions =
+                        if krishiv_sql::distributed_plan::is_dfplan_body(&task_body) {
+                            // dfplan tasks carry scans inside the encoded plan;
+                            // their only inputs are the upstream shuffle
+                            // locations (empty for map stages and for
+                            // single-executor jobs — local store reads).
+                            stage
+                                .spec
+                                .upstream_stage_ids()
+                                .iter()
+                                .filter_map(|up| shuffle_location_inputs.get(up))
+                                .flatten()
+                                .cloned()
+                                .collect()
+                        } else if let Some(tables) = batch_sql_tables {
+                            tables
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, table)| {
+                                    InputPartition::new(format!("parquet-{idx}"), String::new())
+                                        .with_descriptor(InputPartitionDescriptor::LocalParquet {
+                                            table_name: table.table_name.clone(),
+                                            path: table.path.to_string_lossy().into_owned(),
+                                        })
+                                })
+                                .collect()
+                        } else if let Some(parts_by_task) = task_inline_partitions {
+                            parts_by_task.get(task.task_id()).cloned().ok_or_else(|| {
+                                SchedulerError::InvalidJob {
+                                    message: format!(
+                                        "task {} has no registered task-scoped input partition",
+                                        task.task_id()
+                                    ),
+                                }
+                            })?
+                        } else if let Some(parts) = inline_partitions {
+                            parts.to_vec()
+                        } else {
+                            vec![InputPartition::new(
+                                task.task_id().as_str(),
+                                task_description.clone(),
+                            )]
+                        };
                     let mut assignment = ExecutorTaskAssignment::new(
                         TaskAttemptRef::new(
                             self.spec.job_id().clone(),

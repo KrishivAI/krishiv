@@ -604,14 +604,15 @@ pub(crate) async fn write_object_parquet_sink_for_task(
 /// Default is 8 simultaneous in-flight requests per executor. Configurable via
 /// `KRISHIV_SHUFFLE_FETCH_CONCURRENCY`. Shared across all tasks running on the
 /// same executor process to prevent thundering-herd on shuffle services.
-static SHUFFLE_FETCH_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
-    let concurrency = std::env::var("KRISHIV_SHUFFLE_FETCH_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(8);
-    Arc::new(tokio::sync::Semaphore::new(concurrency))
-});
+pub(crate) static SHUFFLE_FETCH_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| {
+        let concurrency = std::env::var("KRISHIV_SHUFFLE_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8);
+        Arc::new(tokio::sync::Semaphore::new(concurrency))
+    });
 
 /// Multiple partitions sharing the same table name are merged so the engine sees
 /// one logical table regardless of how many physical shuffle partitions were read.

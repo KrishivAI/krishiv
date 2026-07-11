@@ -745,19 +745,21 @@ async fn execute_shuffle_write_fragment(
     Ok(output)
 }
 
-/// Execute a typed R4a shuffle-write task backed by `InMemoryShuffleStore`.
-/// Shuffle reads for decoded dfplan fragments: in-memory store lookups keyed
-/// by the `shuffle_stage_key(stage, map_task)` wire contract shared with the
+/// Shuffle reads for decoded dfplan fragments, keyed by the
+/// `shuffle_stage_key(stage, map_task)` wire contract shared with the
 /// coordinator's staged-job builder.
 ///
-/// A missing partition reads as empty. That is correct only while all
-/// upstream map tasks wrote to this executor's store — which holds today
-/// because staged jobs are emitted only where coordinator and executor share
-/// one process. Remote (multi-executor) fetch lands with the shuffle-flight
-/// wiring leg of Phase 52.
+/// Partitions written on this executor are read from the local store (a
+/// local miss reads as empty — map tasks write every partition, including
+/// empty ones). Partitions whose map task ran on another executor are
+/// fetched over Arrow Flight from the locations the coordinator attached to
+/// the assignment (`InputPartitionDescriptor::ShuffleFlight`); there a
+/// missing partition is an error, never silently empty.
 struct InmemDfplanShuffleReader {
     store: std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
     job_id: String,
+    /// `(sub-stage key, partition) → flight endpoint` for remote partitions.
+    remote_endpoints: std::collections::HashMap<(String, u32), String>,
 }
 
 // Manual impl: `ShuffleBackend` itself does not derive Debug.
@@ -786,12 +788,37 @@ impl krishiv_sql::distributed_plan::ShufflePartitionReader for InmemDfplanShuffl
                 });
             }
         };
+        let stage_key =
+            krishiv_sql::distributed_plan::shuffle_stage_key(upstream_stage_index, map_task_index);
+
+        if let Some(endpoint) = self.remote_endpoints.get(&(stage_key.clone(), partition)) {
+            let endpoint = endpoint.clone();
+            let job_id = self.job_id.clone();
+            return Box::pin(async move {
+                let _permit = super::common::SHUFFLE_FETCH_SEMAPHORE
+                    .acquire()
+                    .await
+                    .map_err(|_| String::from("shuffle fetch semaphore closed"))?;
+                krishiv_shuffle::flight::FlightShuffleClient::fetch_with_retry(
+                    &endpoint,
+                    &job_id,
+                    &stage_key,
+                    partition,
+                    krishiv_shuffle::flight::FetchRetryPolicy::from_env(),
+                )
+                .await
+                .map_err(|e| {
+                    format!(
+                        "dfplan shuffle-flight fetch failed (endpoint={endpoint} \
+                         stage={stage_key} partition={partition}): {e}"
+                    )
+                })
+            });
+        }
+
         let id = PartitionId {
             job_id: self.job_id.clone(),
-            stage_id: krishiv_sql::distributed_plan::shuffle_stage_key(
-                upstream_stage_index,
-                map_task_index,
-            ),
+            stage_id: stage_key,
             partition,
         };
         let store = std::sync::Arc::clone(&self.store);
@@ -837,10 +864,34 @@ async fn execute_dfplan_fragment(
             .with_udf_limits(udf_limits),
     );
     let job_id = assignment.job_id().as_str();
+    // This executor's advertised shuffle endpoint: partitions recorded under
+    // it (or under no endpoint) are local; everything else is fetched.
+    let own_endpoint = runner
+        .shuffle
+        .as_ref()
+        .map(|c| c.flight_endpoint.clone())
+        .unwrap_or_default();
+    let remote_endpoints: std::collections::HashMap<(String, u32), String> = assignment
+        .input_partitions()
+        .iter()
+        .filter_map(|p| match p.descriptor() {
+            Some(krishiv_proto::InputPartitionDescriptor::ShuffleFlight {
+                flight_endpoint,
+                upstream_stage_id,
+                partition_id,
+                ..
+            }) if !flight_endpoint.is_empty() && *flight_endpoint != own_endpoint => Some((
+                (upstream_stage_id.as_str().to_owned(), *partition_id),
+                flight_endpoint.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
     let reader: Arc<dyn krishiv_sql::distributed_plan::ShufflePartitionReader> =
         Arc::new(InmemDfplanShuffleReader {
             store: Arc::clone(&store),
             job_id: job_id.to_owned(),
+            remote_endpoints,
         });
     let (schema, mut stream) = krishiv_sql::distributed_plan::execute_dfplan_body(
         fragment,
@@ -925,7 +976,14 @@ async fn execute_dfplan_fragment(
                 .map_err(|e| ExecutorError::LocalExecution {
                     message: format!("dfplan shuffle write failed for partition {p}: {e}"),
                 })?;
-            outputs.push(krishiv_proto::ShufflePartitionOutput::inline(p, size_bytes));
+            // Advertise this executor's shuffle flight endpoint so the
+            // coordinator can route downstream tasks on other executors
+            // here ("" = in-process only, local store reads).
+            outputs.push(krishiv_proto::ShufflePartitionOutput::new(
+                p,
+                size_bytes,
+                own_endpoint.as_str(),
+            ));
         }
         return Ok(ExecutorTaskOutput::shuffle_write(total_rows, outputs));
     }
@@ -952,6 +1010,7 @@ async fn execute_dfplan_fragment(
     })
 }
 
+/// Execute a typed R4a shuffle-write task backed by `InMemoryShuffleStore`.
 async fn execute_inmem_shuffle_write(
     assignment: &ExecutorTaskAssignment,
     write_cfg: &krishiv_proto::ShuffleWriteConfig,
